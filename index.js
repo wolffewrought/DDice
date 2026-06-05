@@ -12,7 +12,8 @@ const path = require('path');
 //  DATABASE
 // ─────────────────────────────────────────────
 
-const db = new Database(path.join(__dirname, 'ttrpg.db'));
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'ttrpg.db');
+const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
 db.exec(`
@@ -39,6 +40,14 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS heal_charges (
     guild_id TEXT NOT NULL, user_id TEXT NOT NULL, current INTEGER DEFAULT 3,
     PRIMARY KEY (guild_id, user_id)
+  );
+  CREATE TABLE IF NOT EXISTS player_tags (
+    guild_id TEXT NOT NULL, user_id TEXT NOT NULL, tag_name TEXT NOT NULL,
+    PRIMARY KEY (guild_id, user_id, tag_name)
+  );
+  CREATE TABLE IF NOT EXISTS custom_tags (
+    guild_id TEXT NOT NULL, tag_name TEXT NOT NULL, emoji TEXT NOT NULL,
+    PRIMARY KEY (guild_id, tag_name)
   );
 `);
 
@@ -89,6 +98,42 @@ function getHealCharges(gid, uid, max) {
 function setHealCharges(gid, uid, cur) {
   db.prepare('INSERT OR REPLACE INTO heal_charges (guild_id,user_id,current) VALUES (?,?,?)').run(gid, uid, cur);
 }
+// ── Tag helpers ──────────────────────────────────────────────────────────────
+const PRESET_TAGS = {
+  'Hero of Kalidale': '⧜️',
+  'Expeditioners': '📜',
+};
+
+function getPlayerTags(gid, uid) {
+  return db.prepare('SELECT tag_name FROM player_tags WHERE guild_id=? AND user_id=?').all(gid, uid).map(r => r.tag_name);
+}
+function assignTag(gid, uid, tagName) {
+  db.prepare('INSERT OR IGNORE INTO player_tags (guild_id, user_id, tag_name) VALUES (?,?,?)').run(gid, uid, tagName);
+}
+function removeTag(gid, uid, tagName) {
+  db.prepare('DELETE FROM player_tags WHERE guild_id=? AND user_id=? AND tag_name=?').run(gid, uid, tagName);
+}
+function getCustomTags(gid) {
+  return db.prepare('SELECT * FROM custom_tags WHERE guild_id=?').all(gid);
+}
+function addCustomTag(gid, tagName, emoji) {
+  db.prepare('INSERT OR REPLACE INTO custom_tags (guild_id, tag_name, emoji) VALUES (?,?,?)').run(gid, tagName, emoji);
+}
+function deleteCustomTag(gid, tagName) {
+  db.prepare('DELETE FROM custom_tags WHERE guild_id=? AND tag_name=?').run(gid, tagName);
+  // Also remove from all players
+  db.prepare('DELETE FROM player_tags WHERE guild_id=? AND tag_name=?').run(gid, tagName);
+}
+function resolveTagEmoji(gid, tagName) {
+  if (PRESET_TAGS[tagName]) return PRESET_TAGS[tagName];
+  const custom = db.prepare('SELECT emoji FROM custom_tags WHERE guild_id=? AND tag_name=?').get(gid, tagName);
+  return custom ? custom.emoji : '🏷️';
+}
+function getAllAvailableTags(gid) {
+  const customs = getCustomTags(gid).map(t => t.tag_name);
+  return [...Object.keys(PRESET_TAGS), ...customs];
+}
+
 function saveProfile(gid, uid, slot, snap) {
   db.prepare(`INSERT OR REPLACE INTO profile_saves (guild_id,user_id,slot_name,snapshot,saved_at) VALUES (?,?,?,?,datetime('now'))`).run(gid, uid, slot, JSON.stringify(snap));
 }
@@ -186,7 +231,7 @@ function buildRollLine(result, mode, critType) {
   return `🎲  ${result.notation} ${ml} → [${result.chosen}, ${result.dropped}]${modStr} = ${ts}`;
 }
 
-function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharges, flavour, total, critType }) {
+function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharges, flavour, total, critType, tags, gid }) {
   const lines = [];
   const lc = critPrefix(critType);
   if (label) lines.push(`${lc}**${label}**${isReroll ? ' *(reroll)*' : ''}`);
@@ -194,6 +239,10 @@ function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharg
   lines.push(rollLine, '');
   lines.push('─────────────────────────────');
   lines.push(`⚔️  ${char.displayName}`);
+  // Tags above knight order
+  if (tags && tags.length > 0 && gid) {
+    tags.forEach(t => lines.push(`${resolveTagEmoji(gid, t)}  ${t}`));
+  }
   if (char.order_name) lines.push(`${KNIGHT_EMOJIS[char.order_name]??'⚪'}  ${char.order_name}`);
   lines.push(`❤️  HP${pad(char.hp_current)} / ${maxHp(char)}`);
   lines.push(`🔄  Rerolls${pad(char.rerolls_current)} / ${maxRerolls(char)}`);
@@ -266,7 +315,8 @@ async function sendRollEmbed(message, rollLine, label, isReroll, uid, flavour, t
     const maxCharges = cfg.heal_charges ?? 3;
     const healRow = getHealCharges(gid, uid, maxCharges);
     const displayName = await getDisplayName(message.guild, uid);
-    return message.reply(buildRollEmbed({ rollLine, label, isReroll, char: { ...char, displayName }, healCharges: healRow.current, maxCharges, flavour, total, critType }));
+    const tags = getPlayerTags(gid, uid);
+    return message.reply(buildRollEmbed({ rollLine, label, isReroll, char: { ...char, displayName }, healCharges: healRow.current, maxCharges, flavour, total, critType, tags, gid }));
   }
   return message.reply(buildPlainRoll({ rollLine, label, isReroll, flavour, total, critType }));
 }
@@ -490,6 +540,22 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('save').setDescription('Snapshot current tracker state').addStringOption(o=>o.setName('slotname').setDescription('Name for this save').setRequired(true)))
     .addSubcommand(s=>s.setName('load').setDescription('Restore a saved snapshot').addStringOption(o=>o.setName('slotname').setDescription('Name of the save to load').setRequired(true)))
     .addSubcommand(s=>s.setName('saves').setDescription('List all your saved snapshots')),
+
+  new SlashCommandBuilder()
+    .setName('tag').setDescription('Manage player tags (GM only)')
+    .addSubcommand(s=>s.setName('assign').setDescription('Assign a tag to a player')
+      .addUserOption(o=>o.setName('user').setDescription('Target player').setRequired(true))
+      .addStringOption(o=>o.setName('tag').setDescription('Tag name').setRequired(true)))
+    .addSubcommand(s=>s.setName('remove').setDescription('Remove a tag from a player')
+      .addUserOption(o=>o.setName('user').setDescription('Target player').setRequired(true))
+      .addStringOption(o=>o.setName('tag').setDescription('Tag name').setRequired(true)))
+    .addSubcommand(s=>s.setName('list').setDescription('List tags for a player')
+      .addUserOption(o=>o.setName('user').setDescription('Target player').setRequired(false)))
+    .addSubcommand(s=>s.setName('custom').setDescription('Manage custom tags')
+      .addStringOption(o=>o.setName('action').setDescription('Action').setRequired(true)
+        .addChoices({name:'Create',value:'create'},{name:'Delete',value:'delete'},{name:'List',value:'list'}))
+      .addStringOption(o=>o.setName('emoji').setDescription('Emoji for the tag (create only)').setRequired(false))
+      .addStringOption(o=>o.setName('name').setDescription('Tag name (create/delete)').setRequired(false))),
 
   new SlashCommandBuilder()
     .setName('p').setDescription('Shorthand for /profile')
@@ -871,6 +937,69 @@ async function handleSheetImport(message, parsed) {
   await message.reply(lines.join('\n'));
 }
 
+async function handleTag(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const sub = interaction.options.getSubcommand();
+
+  // All tag commands are GM only
+  if (!(await isGm(interaction.guild, uid)))
+    return interaction.reply({ content: '❌ Only GMs can manage tags.', ephemeral: true });
+
+  if (sub === 'assign') {
+    const targetUser = interaction.options.getUser('user');
+    const tagName = interaction.options.getString('tag');
+    const available = getAllAvailableTags(gid);
+    if (!available.includes(tagName))
+      return interaction.reply({ content: `❌ Unknown tag. Available: ${available.join(', ')}`, ephemeral: true });
+    assignTag(gid, targetUser.id, tagName);
+    const emoji = resolveTagEmoji(gid, tagName);
+    return interaction.reply({ content: `${emoji} **${tagName}** assigned to <@${targetUser.id}>.` });
+  }
+
+  if (sub === 'remove') {
+    const targetUser = interaction.options.getUser('user');
+    const tagName = interaction.options.getString('tag');
+    removeTag(gid, targetUser.id, tagName);
+    return interaction.reply({ content: `✅ **${tagName}** removed from <@${targetUser.id}>.` });
+  }
+
+  if (sub === 'list') {
+    const targetUser = interaction.options.getUser('user') || interaction.user;
+    const tags = getPlayerTags(gid, targetUser.id);
+    if (!tags.length) return interaction.reply({ content: `<@${targetUser.id}> has no tags assigned.`, ephemeral: true });
+    const lines = tags.map(t => `${resolveTagEmoji(gid, t)}  ${t}`);
+    return interaction.reply({ content: `**Tags for <@${targetUser.id}>:**\n${lines.join('\n')}`, ephemeral: true });
+  }
+
+  if (sub === 'custom') {
+    const action = interaction.options.getString('action');
+
+    if (action === 'create') {
+      const emoji = interaction.options.getString('emoji');
+      const name = interaction.options.getString('name');
+      if (!emoji || !name) return interaction.reply({ content: '❌ Please provide both an emoji and a name.', ephemeral: true });
+      addCustomTag(gid, name, emoji);
+      return interaction.reply({ content: `${emoji} Custom tag **${name}** created.` });
+    }
+
+    if (action === 'delete') {
+      const name = interaction.options.getString('name');
+      if (!name) return interaction.reply({ content: '❌ Please provide the tag name to delete.', ephemeral: true });
+      deleteCustomTag(gid, name);
+      return interaction.reply({ content: `✅ Custom tag **${name}** deleted and removed from all players.` });
+    }
+
+    if (action === 'list') {
+      const customs = getCustomTags(gid);
+      const presets = Object.entries(PRESET_TAGS).map(([n,e]) => `${e}  ${n} *(preset)*`);
+      const customLines = customs.map(t => `${t.emoji}  ${t.tag_name}`);
+      const all = [...presets, ...customLines];
+      if (!all.length) return interaction.reply({ content: 'No tags defined for this server.', ephemeral: true });
+      return interaction.reply({ content: `**Available Tags:**\n${all.join('\n')}`, ephemeral: true });
+    }
+  }
+}
+
 // ─────────────────────────────────────────────
 //  BOT CLIENT
 // ─────────────────────────────────────────────
@@ -887,6 +1016,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'config') return handleConfig(interaction);
     if (interaction.commandName === 'char') return handleChar(interaction);
     if (interaction.commandName === 'profile' || interaction.commandName === 'p') return handleProfile(interaction);
+    if (interaction.commandName === 'tag') return handleTag(interaction);
   } catch (err) {
     console.error(err);
     if (!interaction.replied) interaction.reply({ content: '❌ Something went wrong.', ephemeral: true });
