@@ -4,7 +4,7 @@
 // ============================================================
 
 require('dotenv').config();
-const { Client, GatewayIntentBits, Collection, SlashCommandBuilder, PermissionFlagsBits, REST, Routes } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, REST, Routes } = require('discord.js');
 const Database = require('better-sqlite3');
 const path = require('path');
 
@@ -17,165 +17,137 @@ db.pragma('journal_mode = WAL');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS characters (
-    guild_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    order_name TEXT DEFAULT NULL,
-    str INTEGER DEFAULT 0,
-    con INTEGER DEFAULT 0,
-    dex INTEGER DEFAULT 0,
-    wis INTEGER DEFAULT 0,
-    lck INTEGER DEFAULT 0,
-    hp_current INTEGER DEFAULT 0,
-    rerolls_current INTEGER DEFAULT 0,
-    profile_enabled INTEGER DEFAULT 1,
+    guild_id TEXT NOT NULL, user_id TEXT NOT NULL, order_name TEXT DEFAULT NULL,
+    str INTEGER DEFAULT 0, con INTEGER DEFAULT 0, dex INTEGER DEFAULT 0,
+    wis INTEGER DEFAULT 0, lck INTEGER DEFAULT 0,
+    hp_current INTEGER DEFAULT 0, rerolls_current INTEGER DEFAULT 0, profile_enabled INTEGER DEFAULT 1,
     PRIMARY KEY (guild_id, user_id)
   );
   CREATE TABLE IF NOT EXISTS profile_saves (
-    guild_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    slot_name TEXT NOT NULL,
-    snapshot TEXT NOT NULL,
-    saved_at TEXT NOT NULL,
+    guild_id TEXT NOT NULL, user_id TEXT NOT NULL, slot_name TEXT NOT NULL,
+    snapshot TEXT NOT NULL, saved_at TEXT NOT NULL,
     PRIMARY KEY (guild_id, user_id, slot_name)
   );
   CREATE TABLE IF NOT EXISTS roll_history (
-    guild_id TEXT NOT NULL,
-    channel_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    notation TEXT NOT NULL,
-    label TEXT DEFAULT NULL,
-    saved_at TEXT NOT NULL,
+    guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, user_id TEXT NOT NULL,
+    notation TEXT NOT NULL, label TEXT DEFAULT NULL, saved_at TEXT NOT NULL,
     PRIMARY KEY (guild_id, channel_id, user_id)
   );
   CREATE TABLE IF NOT EXISTS guild_config (
-    guild_id TEXT PRIMARY KEY,
-    gm_role_id TEXT DEFAULT NULL,
-    heal_charges INTEGER DEFAULT 3
+    guild_id TEXT PRIMARY KEY, gm_role_id TEXT DEFAULT NULL, heal_charges INTEGER DEFAULT 3
   );
   CREATE TABLE IF NOT EXISTS heal_charges (
-    guild_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    current INTEGER DEFAULT 3,
+    guild_id TEXT NOT NULL, user_id TEXT NOT NULL, current INTEGER DEFAULT 3,
     PRIMARY KEY (guild_id, user_id)
   );
 `);
 
-function getChar(guildId, userId) {
-  return db.prepare('SELECT * FROM characters WHERE guild_id = ? AND user_id = ?').get(guildId, userId);
+function getChar(gid, uid) {
+  return db.prepare('SELECT * FROM characters WHERE guild_id=? AND user_id=?').get(gid, uid);
 }
-
-function upsertChar(guildId, userId, fields) {
-  const existing = getChar(guildId, userId);
-  if (!existing) {
-    db.prepare(`INSERT INTO characters (guild_id, user_id, order_name, str, con, dex, wis, lck, hp_current, rerolls_current, profile_enabled)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(guildId, userId, fields.order_name ?? null,
-        fields.str ?? 0, fields.con ?? 0, fields.dex ?? 0, fields.wis ?? 0, fields.lck ?? 0,
-        fields.hp_current ?? 0, fields.rerolls_current ?? 0, fields.profile_enabled ?? 1);
+function upsertChar(gid, uid, fields) {
+  const ex = getChar(gid, uid);
+  if (!ex) {
+    db.prepare(`INSERT INTO characters (guild_id,user_id,order_name,str,con,dex,wis,lck,hp_current,rerolls_current,profile_enabled) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(gid, uid, fields.order_name??null, fields.str??0, fields.con??0, fields.dex??0, fields.wis??0, fields.lck??0, fields.hp_current??0, fields.rerolls_current??0, fields.profile_enabled??1);
   } else {
-    const updates = Object.entries(fields).map(([k]) => `${k} = ?`).join(', ');
-    db.prepare(`UPDATE characters SET ${updates} WHERE guild_id = ? AND user_id = ?`)
-      .run(...Object.values(fields), guildId, userId);
+    const sets = Object.entries(fields).map(([k])=>`${k}=?`).join(',');
+    db.prepare(`UPDATE characters SET ${sets} WHERE guild_id=? AND user_id=?`).run(...Object.values(fields), gid, uid);
   }
-  return getChar(guildId, userId);
+  return getChar(gid, uid);
 }
-
-function setStatAndDerive(guildId, userId, stat, value) {
-  let char = getChar(guildId, userId);
-  if (!char) { upsertChar(guildId, userId, {}); char = getChar(guildId, userId); }
-  const updates = { [stat]: value };
-  if (stat === 'con') updates.hp_current = value + 2;
-  if (stat === 'lck') updates.rerolls_current = value;
-  upsertChar(guildId, userId, updates);
-  return getChar(guildId, userId);
+function setStatAndDerive(gid, uid, stat, val) {
+  let ch = getChar(gid, uid);
+  if (!ch) { upsertChar(gid, uid, {}); ch = getChar(gid, uid); }
+  const upd = { [stat]: val };
+  if (stat === 'con') upd.hp_current = val + 2;
+  if (stat === 'lck') upd.rerolls_current = val;
+  upsertChar(gid, uid, upd);
+  return getChar(gid, uid);
 }
-
-function saveRoll(guildId, channelId, userId, notation, label) {
-  db.prepare(`INSERT OR REPLACE INTO roll_history (guild_id, channel_id, user_id, notation, label, saved_at)
-    VALUES (?, ?, ?, ?, ?, datetime('now'))`).run(guildId, channelId, userId, notation, label ?? null);
+function saveRoll(gid, cid, uid, notation, label) {
+  db.prepare(`INSERT OR REPLACE INTO roll_history (guild_id,channel_id,user_id,notation,label,saved_at) VALUES (?,?,?,?,?,datetime('now'))`).run(gid, cid, uid, notation, label??null);
 }
-
-function getLastRoll(guildId, channelId, userId) {
-  return db.prepare('SELECT * FROM roll_history WHERE guild_id = ? AND channel_id = ? AND user_id = ?').get(guildId, channelId, userId);
+function getLastRoll(gid, cid, uid) {
+  return db.prepare('SELECT * FROM roll_history WHERE guild_id=? AND channel_id=? AND user_id=?').get(gid, cid, uid);
 }
-
-function getConfig(guildId) {
-  let config = db.prepare('SELECT * FROM guild_config WHERE guild_id = ?').get(guildId);
-  if (!config) { db.prepare('INSERT INTO guild_config (guild_id) VALUES (?)').run(guildId); config = db.prepare('SELECT * FROM guild_config WHERE guild_id = ?').get(guildId); }
-  return config;
+function getConfig(gid) {
+  let c = db.prepare('SELECT * FROM guild_config WHERE guild_id=?').get(gid);
+  if (!c) { db.prepare('INSERT INTO guild_config (guild_id) VALUES (?)').run(gid); c = db.prepare('SELECT * FROM guild_config WHERE guild_id=?').get(gid); }
+  return c;
 }
-
-function setConfig(guildId, fields) {
-  getConfig(guildId);
-  const updates = Object.entries(fields).map(([k]) => `${k} = ?`).join(', ');
-  db.prepare(`UPDATE guild_config SET ${updates} WHERE guild_id = ?`).run(...Object.values(fields), guildId);
+function setConfig(gid, fields) {
+  getConfig(gid);
+  const sets = Object.entries(fields).map(([k])=>`${k}=?`).join(',');
+  db.prepare(`UPDATE guild_config SET ${sets} WHERE guild_id=?`).run(...Object.values(fields), gid);
 }
-
-function getHealCharges(guildId, userId, maxCharges) {
-  let row = db.prepare('SELECT * FROM heal_charges WHERE guild_id = ? AND user_id = ?').get(guildId, userId);
-  if (!row) { db.prepare('INSERT INTO heal_charges (guild_id, user_id, current) VALUES (?, ?, ?)').run(guildId, userId, maxCharges); row = db.prepare('SELECT * FROM heal_charges WHERE guild_id = ? AND user_id = ?').get(guildId, userId); }
-  return row;
+function getHealCharges(gid, uid, max) {
+  let r = db.prepare('SELECT * FROM heal_charges WHERE guild_id=? AND user_id=?').get(gid, uid);
+  if (!r) { db.prepare('INSERT INTO heal_charges (guild_id,user_id,current) VALUES (?,?,?)').run(gid, uid, max); r = db.prepare('SELECT * FROM heal_charges WHERE guild_id=? AND user_id=?').get(gid, uid); }
+  return r;
 }
-
-function setHealCharges(guildId, userId, current) {
-  db.prepare('INSERT OR REPLACE INTO heal_charges (guild_id, user_id, current) VALUES (?, ?, ?)').run(guildId, userId, current);
+function setHealCharges(gid, uid, cur) {
+  db.prepare('INSERT OR REPLACE INTO heal_charges (guild_id,user_id,current) VALUES (?,?,?)').run(gid, uid, cur);
 }
-
-function saveProfile(guildId, userId, slotName, snapshot) {
-  db.prepare(`INSERT OR REPLACE INTO profile_saves (guild_id, user_id, slot_name, snapshot, saved_at)
-    VALUES (?, ?, ?, ?, datetime('now'))`).run(guildId, userId, slotName, JSON.stringify(snapshot));
+function saveProfile(gid, uid, slot, snap) {
+  db.prepare(`INSERT OR REPLACE INTO profile_saves (guild_id,user_id,slot_name,snapshot,saved_at) VALUES (?,?,?,?,datetime('now'))`).run(gid, uid, slot, JSON.stringify(snap));
 }
-
-function loadProfile(guildId, userId, slotName) {
-  const row = db.prepare('SELECT * FROM profile_saves WHERE guild_id = ? AND user_id = ? AND slot_name = ?').get(guildId, userId, slotName);
-  return row ? JSON.parse(row.snapshot) : null;
+function loadProfile(gid, uid, slot) {
+  const r = db.prepare('SELECT * FROM profile_saves WHERE guild_id=? AND user_id=? AND slot_name=?').get(gid, uid, slot);
+  return r ? JSON.parse(r.snapshot) : null;
 }
-
-function listProfiles(guildId, userId) {
-  return db.prepare('SELECT slot_name, saved_at FROM profile_saves WHERE guild_id = ? AND user_id = ? ORDER BY saved_at DESC').all(guildId, userId);
+function listProfiles(gid, uid) {
+  return db.prepare('SELECT slot_name,saved_at FROM profile_saves WHERE guild_id=? AND user_id=? ORDER BY saved_at DESC').all(gid, uid);
 }
-
-function maxHp(char) { return (char?.con ?? 0) + 2; }
-function maxRerolls(char) { return char?.lck ?? 0; }
-function isWhiteKnight(char) { return char?.order_name === 'White Knight' && char?.wis >= 5; }
+function maxHp(ch) { return (ch?.con ?? 0) + 2; }
+function maxRerolls(ch) { return ch?.lck ?? 0; }
+function isWhiteKnight(ch) { return ch?.order_name === 'White Knight' && ch?.wis >= 5; }
 
 // ─────────────────────────────────────────────
 //  DICE
 // ─────────────────────────────────────────────
 
-function parseNotation(notation) {
-  const match = notation.trim().match(/^(\d+)d(\d+)([+-]\d+)?$/i);
-  if (!match) return null;
-  return { dice: parseInt(match[1]), sides: parseInt(match[2]), modifier: match[3] ? parseInt(match[3]) : 0 };
+function parseNotation(n) {
+  const m = n.trim().match(/^(\d+)d(\d+)([+-]\d+)?$/i);
+  if (!m) return null;
+  return { dice: parseInt(m[1]), sides: parseInt(m[2]), modifier: m[3] ? parseInt(m[3]) : 0 };
 }
-
 function rollDie(sides) { return Math.floor(Math.random() * sides) + 1; }
-
 function rollNotation(notation) {
-  const parsed = parseNotation(notation);
-  if (!parsed) return null;
-  const { dice, sides, modifier } = parsed;
-  const rolls = Array.from({ length: dice }, () => rollDie(sides));
+  const p = parseNotation(notation);
+  if (!p) return null;
+  const rolls = Array.from({ length: p.dice }, () => rollDie(p.sides));
   const sum = rolls.reduce((a, b) => a + b, 0);
-  return { dice, sides, modifier, rolls, sum, total: sum + modifier, notation };
+  return { dice: p.dice, sides: p.sides, modifier: p.modifier, rolls, sum, total: sum + p.modifier, notation };
 }
-
 function rollAdvantage(notation) {
-  const parsed = parseNotation(notation);
-  if (!parsed) return null;
-  const { sides, modifier } = parsed;
-  const r1 = rollDie(sides), r2 = rollDie(sides);
+  const p = parseNotation(notation); if (!p) return null;
+  const r1 = rollDie(p.sides), r2 = rollDie(p.sides);
   const chosen = Math.max(r1, r2), dropped = Math.min(r1, r2);
-  return { chosen, dropped, rolls: [r1, r2], modifier, total: chosen + modifier, natural: chosen, notation };
+  return { chosen, dropped, rolls: [r1, r2], modifier: p.modifier, total: chosen + p.modifier, sides: p.sides, notation };
+}
+function rollDisadvantage(notation) {
+  const p = parseNotation(notation); if (!p) return null;
+  const r1 = rollDie(p.sides), r2 = rollDie(p.sides);
+  const chosen = Math.min(r1, r2), dropped = Math.max(r1, r2);
+  return { chosen, dropped, rolls: [r1, r2], modifier: p.modifier, total: chosen + p.modifier, sides: p.sides, notation };
 }
 
-function rollDisadvantage(notation) {
-  const parsed = parseNotation(notation);
-  if (!parsed) return null;
-  const { sides, modifier } = parsed;
-  const r1 = rollDie(sides), r2 = rollDie(sides);
-  const chosen = Math.min(r1, r2), dropped = Math.max(r1, r2);
-  return { chosen, dropped, rolls: [r1, r2], modifier, total: chosen + modifier, natural: chosen, notation };
+// ─────────────────────────────────────────────
+//  CRIT DETECTION
+// ─────────────────────────────────────────────
+
+function detectCrit(result, mode) {
+  if (mode === 'adv' || mode === 'dis') {
+    if (result.chosen === result.sides) return 'crit';
+    if (result.chosen === 1) return 'fail';
+    return null;
+  }
+  if (result.rolls.length === 1) {
+    if (result.rolls[0] === result.sides) return 'crit';
+    if (result.rolls[0] === 1) return 'fail';
+  }
+  return null;
 }
 
 // ─────────────────────────────────────────────
@@ -183,35 +155,46 @@ function rollDisadvantage(notation) {
 // ─────────────────────────────────────────────
 
 const KNIGHT_EMOJIS = {
-  'White Knight': '⚪', 'Black Knight': '⚫', 'Gold Knight': '🟡',
-  'Grey Knight': '🩶', 'Blue Knight': '🔵', 'Purple Knight': '🟣',
-  'Green Knight': '🟢', 'Red Knight': '🔴',
+  'White Knight':'⚪','Black Knight':'⚫','Gold Knight':'🟡',
+  'Grey Knight':'🩶','Blue Knight':'🔵','Purple Knight':'🟣',
+  'Green Knight':'🟢','Red Knight':'🔴',
 };
 
-function pad(val, width = 10) {
-  const str = String(val ?? 0);
-  return ' '.repeat(Math.max(1, width - str.length)) + str;
+function pad(val, w=10) {
+  const s = String(val??0);
+  return ' '.repeat(Math.max(1, w - s.length)) + s;
 }
 
-function buildRollLine(result, mode = 'normal') {
-  const { notation, modifier } = result;
-  const modStr = modifier > 0 ? ` +${modifier}` : modifier < 0 ? ` ${modifier}` : '';
-  if (mode === 'normal') {
-    return `🎲  ${notation} → [${result.rolls.join(', ')}]${modStr} = **${result.total}**`;
-  }
-  const modeLabel = mode === 'adv' ? '(advantage)' : '(disadvantage)';
-  return `🎲  ${notation} ${modeLabel} → [${result.chosen}, ${result.dropped}]${modStr} = **${result.total}**`;
+function critPrefix(critType) {
+  if (critType === 'crit') return '🟡 ';
+  if (critType === 'fail') return '🔴 ';
+  return '';
 }
 
-function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharges }) {
+function totalStr(total, critType) {
+  if (critType === 'crit') return `🟡 **${total}**`;
+  if (critType === 'fail') return `🔴 **${total}**`;
+  return `**${total}**`;
+}
+
+function buildRollLine(result, mode, critType) {
+  const mod = result.modifier;
+  const modStr = mod > 0 ? ` +${mod}` : mod < 0 ? ` ${mod}` : '';
+  const ts = totalStr(result.total, critType);
+  if (mode === 'normal') return `🎲  ${result.notation} → [${result.rolls.join(', ')}]${modStr} = ${ts}`;
+  const ml = mode === 'adv' ? '(advantage)' : '(disadvantage)';
+  return `🎲  ${result.notation} ${ml} → [${result.chosen}, ${result.dropped}]${modStr} = ${ts}`;
+}
+
+function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharges, flavour, total, critType }) {
   const lines = [];
-  if (label) lines.push(`**${label}**${isReroll ? ' *(reroll)*' : ''}`);
+  const lc = critPrefix(critType);
+  if (label) lines.push(`${lc}**${label}**${isReroll ? ' *(reroll)*' : ''}`);
   else if (isReroll) lines.push('*(reroll)*');
-  lines.push(rollLine);
-  lines.push('');
+  lines.push(rollLine, '');
   lines.push('─────────────────────────────');
   lines.push(`⚔️  ${char.displayName}`);
-  if (char.order_name) lines.push(`${KNIGHT_EMOJIS[char.order_name] ?? '⚪'}  ${char.order_name}`);
+  if (char.order_name) lines.push(`${KNIGHT_EMOJIS[char.order_name]??'⚪'}  ${char.order_name}`);
   lines.push(`❤️  HP${pad(char.hp_current)} / ${maxHp(char)}`);
   lines.push(`🔄  Rerolls${pad(char.rerolls_current)} / ${maxRerolls(char)}`);
   if (isWhiteKnight(char)) lines.push(`🛡️  Heal${pad(healCharges)} / ${maxCharges}`);
@@ -221,14 +204,25 @@ function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharg
   lines.push(`⚡  DEX${pad(char.dex)}`);
   lines.push(`🧠  WIS${pad(char.wis)}`);
   lines.push(`🍀  LCK${pad(char.lck)}`);
+  if (flavour) {
+    lines.push('', '─────────────────────────────');
+    lines.push(`**${label??'roll'}** — ${totalStr(total, critType)}`);
+    lines.push(`*${flavour}*`);
+  }
   return lines.join('\n');
 }
 
-function buildPlainRoll({ rollLine, label, isReroll }) {
+function buildPlainRoll({ rollLine, label, isReroll, flavour, total, critType }) {
   const lines = [];
-  if (label) lines.push(`**${label}**${isReroll ? ' *(reroll)*' : ''}`);
+  const lc = critPrefix(critType);
+  if (label) lines.push(`${lc}**${label}**${isReroll ? ' *(reroll)*' : ''}`);
   else if (isReroll) lines.push('*(reroll)*');
   lines.push(rollLine);
+  if (flavour) {
+    lines.push('', '─────────────────────────────');
+    lines.push(`**${label??'roll'}** — ${totalStr(total, critType)}`);
+    lines.push(`*${flavour}*`);
+  }
   return lines.join('\n');
 }
 
@@ -236,321 +230,453 @@ function buildPlainRoll({ rollLine, label, isReroll }) {
 //  HELPERS
 // ─────────────────────────────────────────────
 
-function parseRollInput(input) {
-  const match = input.match(/^(\d+d\d+(?:[+-]\d+)?)\s*(.*)?$/i);
-  if (!match) return null;
-  return { notation: match[1], label: match[2]?.trim() || null };
-}
+const STATS = ['str','con','dex','wis','lck'];
 
-async function getDisplayName(guild, userId) {
-  try {
-    const member = await guild.members.fetch(userId);
-    return member.nickname || member.user.username;
-  } catch { return 'Unknown'; }
-}
-
-async function isGm(guild, userId) {
-  const config = getConfig(guild.id);
-  if (!config.gm_role_id) return false;
-  try {
-    const member = await guild.members.fetch(userId);
-    return member.roles.cache.has(config.gm_role_id);
-  } catch { return false; }
-}
-
-async function sendRollEmbed(message, rollLine, label, isReroll, userId) {
-  const guildId = message.guild.id;
-  const char = getChar(guildId, userId);
-  const profileEnabled = char?.profile_enabled === 1;
-
-  if (profileEnabled && char) {
-    const config = getConfig(guildId);
-    const maxCharges = config.heal_charges ?? 3;
-    const healRow = getHealCharges(guildId, userId, maxCharges);
-    const displayName = await getDisplayName(message.guild, userId);
-    return message.reply(buildRollEmbed({ rollLine, label, isReroll, char: { ...char, displayName }, healCharges: healRow.current, maxCharges }));
+function parseRollInput(input, char) {
+  const [rollPart, ...fp] = input.split('\n');
+  const flavour = fp.join('\n').trim() || null;
+  const trimmed = rollPart.trim().toLowerCase();
+  // Stat quick roll
+  if (STATS.includes(trimmed)) {
+    const val = char?.[trimmed] ?? 0;
+    return { notation: `1d20+${val}`, label: trimmed, flavour };
   }
-  return message.reply(buildPlainRoll({ rollLine, label, isReroll }));
+  const m = rollPart.trim().match(/^(\d+d\d+(?:[+-]\d+)?)\s*(.*)?$/i);
+  if (!m) return null;
+  return { notation: m[1], label: m[2]?.trim() || null, flavour };
+}
+
+async function getDisplayName(guild, uid) {
+  try { const mb = await guild.members.fetch(uid); return mb.nickname || mb.user.username; }
+  catch { return 'Unknown'; }
+}
+
+async function isGm(guild, uid) {
+  const cfg = getConfig(guild.id);
+  if (!cfg.gm_role_id) return false;
+  try { const mb = await guild.members.fetch(uid); return mb.roles.cache.has(cfg.gm_role_id); }
+  catch { return false; }
+}
+
+async function sendRollEmbed(message, rollLine, label, isReroll, uid, flavour, total, critType) {
+  const gid = message.guild.id;
+  const char = getChar(gid, uid);
+  if (char?.profile_enabled === 1) {
+    const cfg = getConfig(gid);
+    const maxCharges = cfg.heal_charges ?? 3;
+    const healRow = getHealCharges(gid, uid, maxCharges);
+    const displayName = await getDisplayName(message.guild, uid);
+    return message.reply(buildRollEmbed({ rollLine, label, isReroll, char: { ...char, displayName }, healCharges: healRow.current, maxCharges, flavour, total, critType }));
+  }
+  return message.reply(buildPlainRoll({ rollLine, label, isReroll, flavour, total, critType }));
+}
+
+
+// ─────────────────────────────────────────────
+//  CHARACTER SHEET EXPORT
+// ─────────────────────────────────────────────
+
+const ORDER_PALETTE = {
+  'White Knight':  { bg: '#f5f0e8', accent: '#c0c0c0', text: '#2a2a2a', border: '#a0a0a0', crest: '⚪' },
+  'Black Knight':  { bg: '#1a1a1a', accent: '#4a4a4a', text: '#e8e8e8', border: '#666666', crest: '⚫' },
+  'Gold Knight':   { bg: '#fdf3d0', accent: '#c8971a', text: '#2a1a00', border: '#c8971a', crest: '🟡' },
+  'Grey Knight':   { bg: '#e8e8e8', accent: '#7a8a9a', text: '#2a2a2a', border: '#7a8a9a', crest: '🩶' },
+  'Blue Knight':   { bg: '#e8f0f8', accent: '#1a5fa8', text: '#0a1a2a', border: '#1a5fa8', crest: '🔵' },
+  'Purple Knight': { bg: '#f0e8f8', accent: '#6a1a9a', text: '#1a0a2a', border: '#6a1a9a', crest: '🟣' },
+  'Green Knight':  { bg: '#e8f5e8', accent: '#1a7a3a', text: '#0a1a0a', border: '#1a7a3a', crest: '🟢' },
+  'Red Knight':    { bg: '#f8e8e8', accent: '#9a1a1a', text: '#2a0a0a', border: '#9a1a1a', crest: '🔴' },
+};
+const DEFAULT_PALETTE = { bg: '#f5f0e8', accent: '#8b7355', text: '#2a2a2a', border: '#8b7355', crest: '⚔️' };
+
+
+async function generateCharImage(char, displayName, healCharges, maxCharges) {
+  let createCanvas, loadImage;
+  try {
+    ({ createCanvas } = require('@napi-rs/canvas'));
+  } catch {
+    return null; // canvas not available
+  }
+
+  const pal = ORDER_PALETTE[char.order_name] || DEFAULT_PALETTE;
+  const W = 420, H = 620;
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext('2d');
+
+  // ── Background ──────────────────────────────────────────────────────────────
+  ctx.fillStyle = pal.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Parchment texture overlay (subtle noise via gradient bands)
+  for (let i = 0; i < H; i += 3) {
+    const alpha = (Math.random() * 0.03).toFixed(3);
+    ctx.fillStyle = `rgba(0,0,0,${alpha})`;
+    ctx.fillRect(0, i, W, 1);
+  }
+
+  // ── Outer border ────────────────────────────────────────────────────────────
+  ctx.strokeStyle = pal.border;
+  ctx.lineWidth = 6;
+  ctx.strokeRect(10, 10, W - 20, H - 20);
+
+  // Inner border
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(16, 16, W - 32, H - 32);
+
+  // ── Corner ornaments ────────────────────────────────────────────────────────
+  const corners = [[22,22],[W-22,22],[22,H-22],[W-22,H-22]];
+  ctx.fillStyle = pal.accent;
+  corners.forEach(([x,y]) => {
+    ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI*2); ctx.fill();
+  });
+
+  // ── Crest / Order symbol ─────────────────────────────────────────────────────
+  ctx.font = '52px serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(pal.crest, W/2, 90);
+
+  // ── Player name ──────────────────────────────────────────────────────────────
+  ctx.fillStyle = pal.text;
+  ctx.font = 'bold 26px serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(displayName, W/2, 125);
+
+  // ── Order name ───────────────────────────────────────────────────────────────
+  ctx.fillStyle = pal.accent;
+  ctx.font = 'italic 16px serif';
+  ctx.fillText(char.order_name || 'No Order', W/2, 148);
+
+  // ── Divider ──────────────────────────────────────────────────────────────────
+  ctx.strokeStyle = pal.border;
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(30, 162); ctx.lineTo(W-30, 162); ctx.stroke();
+
+  // ── Tracker rows ─────────────────────────────────────────────────────────────
+  const trackers = [
+    { label: '❤️  HP', value: `${char.hp_current} / ${maxHp(char)}` },
+    { label: '🔄  Rerolls', value: `${char.rerolls_current} / ${maxRerolls(char)}` },
+  ];
+  if (isWhiteKnight(char)) trackers.push({ label: '🛡️  Heal', value: `${healCharges} / ${maxCharges}` });
+
+  let y = 195;
+  trackers.forEach(({ label, value }) => {
+    ctx.fillStyle = pal.text;
+    ctx.font = '16px serif';
+    ctx.textAlign = 'left'; ctx.fillText(label, 40, y);
+    ctx.font = 'bold 16px serif';
+    ctx.textAlign = 'right'; ctx.fillText(value, W-40, y);
+    y += 30;
+  });
+
+  // ── Divider ──────────────────────────────────────────────────────────────────
+  y += 8;
+  ctx.strokeStyle = pal.border; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(30, y); ctx.lineTo(W-30, y); ctx.stroke();
+  y += 20;
+
+  // ── Stat rows ────────────────────────────────────────────────────────────────
+  const stats = [
+    { label: '💪  STR', value: char.str },
+    { label: '🫀  CON', value: char.con },
+    { label: '⚡  DEX', value: char.dex },
+    { label: '🧠  WIS', value: char.wis },
+    { label: '🍀  LCK', value: char.lck },
+  ];
+  stats.forEach(({ label, value }) => {
+    ctx.fillStyle = pal.text;
+    ctx.font = '16px serif';
+    ctx.textAlign = 'left'; ctx.fillText(label, 40, y);
+    ctx.font = 'bold 20px serif';
+    ctx.fillStyle = pal.accent;
+    ctx.textAlign = 'right'; ctx.fillText(String(value), W-40, y);
+    y += 32;
+  });
+
+  // ── Footer ───────────────────────────────────────────────────────────────────
+  ctx.strokeStyle = pal.border; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(30, H-35); ctx.lineTo(W-30, H-35); ctx.stroke();
+  ctx.fillStyle = pal.accent;
+  ctx.font = 'italic 11px serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('Knight Order Registry', W/2, H-18);
+
+  return canvas.toBuffer('image/png');
+}
+
+async function handleCharExport(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const mode = interaction.options.getString('format') || 'text';
+  const tu = interaction.options.getUser('user') || interaction.user;
+  const tid = tu.id;
+  const char = getChar(gid, tid);
+  if (!char) return interaction.reply({ content: '❌ No character found. Use `/char set` to get started.', ephemeral: true });
+
+  const dn = await getDisplayName(interaction.guild, tid);
+  const cfg = getConfig(gid); const mc = cfg.heal_charges ?? 3;
+  const hr = getHealCharges(gid, tid, mc);
+  const kn = char.order_name ? `${KNIGHT_EMOJIS[char.order_name]??'⚪'}  ${char.order_name}` : 'No order set';
+  const hm = maxHp(char), rm = maxRerolls(char);
+
+  // ── Text export ──────────────────────────────────────────────────────────────
+  const textLines = [
+    '```',
+    `  ${dn}`,
+    `  ${char.order_name || 'No Order'}`,
+    '',
+    `  HP       ${char.hp_current} / ${hm}`,
+    `  Rerolls  ${char.rerolls_current} / ${rm}`,
+  ];
+  if (isWhiteKnight(char)) textLines.push(`  Heal     ${hr.current} / ${mc}`);
+  textLines.push('', `  STR  ${char.str}`, `  CON  ${char.con}`, `  DEX  ${char.dex}`, `  WIS  ${char.wis}`, `  LCK  ${char.lck}`, '```');
+  const textContent = textLines.join('\n');
+
+  if (mode === 'text') {
+    return interaction.reply({ content: textContent });
+  }
+
+  // ── Image export ─────────────────────────────────────────────────────────────
+  await interaction.deferReply();
+  const imgBuffer = await generateCharImage(char, dn, hr.current, mc);
+  if (!imgBuffer) {
+    return interaction.editReply({ content: textContent + '\n*Image generation unavailable — install `@napi-rs/canvas` to enable.*' });
+  }
+
+  const { AttachmentBuilder } = require('discord.js');
+  const attachment = new AttachmentBuilder(imgBuffer, { name: `${dn.replace(/\s+/g,'-')}-sheet.png` });
+  return interaction.editReply({ content: textContent, files: [attachment] });
 }
 
 // ─────────────────────────────────────────────
 //  SLASH COMMAND DEFINITIONS
 // ─────────────────────────────────────────────
 
-const KNIGHTS = ['White Knight', 'Black Knight', 'Gold Knight', 'Grey Knight', 'Blue Knight', 'Purple Knight', 'Green Knight', 'Red Knight'];
+const KNIGHTS = ['White Knight','Black Knight','Gold Knight','Grey Knight','Blue Knight','Purple Knight','Green Knight','Red Knight'];
 
 const slashCommands = [
   new SlashCommandBuilder()
-    .setName('config')
-    .setDescription('Server configuration (Admin only)')
+    .setName('config').setDescription('Server configuration (Admin only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addSubcommand(s => s.setName('gmrole').setDescription('Set the GM role').addRoleOption(o => o.setName('role').setDescription('The GM role').setRequired(true)))
-    .addSubcommand(s => s.setName('heal').setDescription('Set max Heal charges for White Knights').addIntegerOption(o => o.setName('charges').setDescription('Number of charges').setRequired(true).setMinValue(1).setMaxValue(10))),
+    .addSubcommand(s=>s.setName('gmrole').setDescription('Set the GM role').addRoleOption(o=>o.setName('role').setDescription('The GM role').setRequired(true)))
+    .addSubcommand(s=>s.setName('heal').setDescription('Set max Heal charges for White Knights').addIntegerOption(o=>o.setName('charges').setDescription('Number of charges').setRequired(true).setMinValue(1).setMaxValue(10))),
 
   new SlashCommandBuilder()
-    .setName('char')
-    .setDescription('Character setup and display')
-    .addSubcommand(s => s.setName('set').setDescription('Set a character stat or field')
-      .addStringOption(o => o.setName('field').setDescription('Field to set').setRequired(true)
-        .addChoices({ name: 'Order', value: 'order' }, { name: 'STR', value: 'str' }, { name: 'CON', value: 'con' }, { name: 'DEX', value: 'dex' }, { name: 'WIS', value: 'wis' }, { name: 'LCK', value: 'lck' }))
-      .addStringOption(o => o.setName('value').setDescription('Value to set').setRequired(true))
-      .addUserOption(o => o.setName('user').setDescription('Target user (GM only)').setRequired(false)))
-    .addSubcommand(s => s.setName('show').setDescription('Display a character card').addUserOption(o => o.setName('user').setDescription('User to show').setRequired(false))),
+    .setName('char').setDescription('Character setup and display')
+    .addSubcommand(s=>s.setName('set').setDescription('Set a character stat or field')
+      .addStringOption(o=>o.setName('field').setDescription('Field to set').setRequired(true)
+        .addChoices({name:'Order',value:'order'},{name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
+      .addStringOption(o=>o.setName('value').setDescription('Value to set').setRequired(true))
+      .addUserOption(o=>o.setName('user').setDescription('Target user (GM only)').setRequired(false)))
+    .addSubcommand(s=>s.setName('show').setDescription('Display a character card').addUserOption(o=>o.setName('user').setDescription('User to show').setRequired(false)))
+    .addSubcommand(s=>s.setName('export').setDescription('Export your character sheet')
+      .addStringOption(o=>o.setName('format').setDescription('Export format').setRequired(false)
+        .addChoices({name:'Text',value:'text'},{name:'Image',value:'image'}))
+      .addUserOption(o=>o.setName('user').setDescription('User to export').setRequired(false))),
 
   new SlashCommandBuilder()
-    .setName('profile')
-    .setDescription('Manage your roll card profile')
-    .addSubcommand(s => s.setName('on').setDescription('Enable profile embed, max HP and rerolls'))
-    .addSubcommand(s => s.setName('off').setDescription('Disable profile embed'))
-    .addSubcommand(s => s.setName('show').setDescription('Preview your profile without rolling'))
-    .addSubcommand(s => s.setName('save').setDescription('Snapshot current tracker state').addStringOption(o => o.setName('slotname').setDescription('Name for this save').setRequired(true)))
-    .addSubcommand(s => s.setName('load').setDescription('Restore a saved snapshot').addStringOption(o => o.setName('slotname').setDescription('Name of the save to load').setRequired(true)))
-    .addSubcommand(s => s.setName('saves').setDescription('List all your saved snapshots')),
+    .setName('profile').setDescription('Manage your roll card profile')
+    .addSubcommand(s=>s.setName('on').setDescription('Enable profile embed, max HP and rerolls'))
+    .addSubcommand(s=>s.setName('off').setDescription('Disable profile embed'))
+    .addSubcommand(s=>s.setName('show').setDescription('Preview your profile without rolling'))
+    .addSubcommand(s=>s.setName('save').setDescription('Snapshot current tracker state').addStringOption(o=>o.setName('slotname').setDescription('Name for this save').setRequired(true)))
+    .addSubcommand(s=>s.setName('load').setDescription('Restore a saved snapshot').addStringOption(o=>o.setName('slotname').setDescription('Name of the save to load').setRequired(true)))
+    .addSubcommand(s=>s.setName('saves').setDescription('List all your saved snapshots')),
 
   new SlashCommandBuilder()
-    .setName('p')
-    .setDescription('Shorthand for /profile')
-    .addSubcommand(s => s.setName('on').setDescription('Enable profile embed, max HP and rerolls'))
-    .addSubcommand(s => s.setName('off').setDescription('Disable profile embed'))
-    .addSubcommand(s => s.setName('show').setDescription('Preview your profile without rolling'))
-    .addSubcommand(s => s.setName('save').setDescription('Snapshot current tracker state').addStringOption(o => o.setName('slotname').setDescription('Name for this save').setRequired(true)))
-    .addSubcommand(s => s.setName('load').setDescription('Restore a saved snapshot').addStringOption(o => o.setName('slotname').setDescription('Name of the save to load').setRequired(true)))
-    .addSubcommand(s => s.setName('saves').setDescription('List all your saved snapshots')),
+    .setName('p').setDescription('Shorthand for /profile')
+    .addSubcommand(s=>s.setName('on').setDescription('Enable profile embed, max HP and rerolls'))
+    .addSubcommand(s=>s.setName('off').setDescription('Disable profile embed'))
+    .addSubcommand(s=>s.setName('show').setDescription('Preview your profile without rolling'))
+    .addSubcommand(s=>s.setName('save').setDescription('Snapshot current tracker state').addStringOption(o=>o.setName('slotname').setDescription('Name for this save').setRequired(true)))
+    .addSubcommand(s=>s.setName('load').setDescription('Restore a saved snapshot').addStringOption(o=>o.setName('slotname').setDescription('Name of the save to load').setRequired(true)))
+    .addSubcommand(s=>s.setName('saves').setDescription('List all your saved snapshots')),
 ];
 
 // ─────────────────────────────────────────────
-//  SLASH COMMAND HANDLERS
+//  SLASH HANDLERS
 // ─────────────────────────────────────────────
 
 async function handleConfig(interaction) {
-  const sub = interaction.options.getSubcommand();
-  const guildId = interaction.guild.id;
+  const sub = interaction.options.getSubcommand(), gid = interaction.guild.id;
   if (sub === 'gmrole') {
     const role = interaction.options.getRole('role');
-    setConfig(guildId, { gm_role_id: role.id });
+    setConfig(gid, { gm_role_id: role.id });
     return interaction.reply({ content: `✅ GM role set to **${role.name}**.`, ephemeral: true });
   }
   if (sub === 'heal') {
     const charges = interaction.options.getInteger('charges');
-    setConfig(guildId, { heal_charges: charges });
+    setConfig(gid, { heal_charges: charges });
     return interaction.reply({ content: `✅ White Knight Heal charges set to **${charges}**.`, ephemeral: true });
   }
 }
 
 async function handleChar(interaction) {
-  const sub = interaction.options.getSubcommand();
-  const guildId = interaction.guild.id;
-  const callerId = interaction.user.id;
-
+  const sub = interaction.options.getSubcommand(), gid = interaction.guild.id, callerId = interaction.user.id;
   if (sub === 'set') {
     const field = interaction.options.getString('field');
     const value = interaction.options.getString('value');
     const targetUser = interaction.options.getUser('user');
     const targetId = targetUser ? targetUser.id : callerId;
-
-    if (targetId !== callerId && !(await isGm(interaction.guild, callerId))) {
+    if (targetId !== callerId && !(await isGm(interaction.guild, callerId)))
       return interaction.reply({ content: '❌ Only GMs can modify other players\' stats.', ephemeral: true });
-    }
-
     if (field === 'order') {
-      const knight = KNIGHTS.find(k => k.toLowerCase() === value.toLowerCase());
+      const knight = KNIGHTS.find(k=>k.toLowerCase()===value.toLowerCase());
       if (!knight) return interaction.reply({ content: `❌ Choose from: ${KNIGHTS.join(', ')}`, ephemeral: true });
-      upsertChar(guildId, targetId, { order_name: knight });
-      const updatedChar = getChar(guildId, targetId);
-      if (!isWhiteKnight(updatedChar)) setHealCharges(guildId, targetId, 0);
-      else { const cfg = getConfig(guildId); setHealCharges(guildId, targetId, cfg.heal_charges ?? 3); }
-      return interaction.reply({ content: `${KNIGHT_EMOJIS[knight] ?? '⚪'} Order set to **${knight}**${targetId !== callerId ? ` for <@${targetId}>` : ''}.` });
+      upsertChar(gid, targetId, { order_name: knight });
+      const upd = getChar(gid, targetId);
+      if (!isWhiteKnight(upd)) setHealCharges(gid, targetId, 0);
+      else { const cfg = getConfig(gid); setHealCharges(gid, targetId, cfg.heal_charges??3); }
+      return interaction.reply({ content: `${KNIGHT_EMOJIS[knight]??'⚪'} Order set to **${knight}**${targetId!==callerId?` for <@${targetId}>`:''}.` });
     }
-
-    if (['str', 'con', 'dex', 'wis', 'lck'].includes(field)) {
+    if (STATS.includes(field)) {
       const num = parseInt(value);
-      if (isNaN(num) || num < 0) return interaction.reply({ content: '❌ Value must be a positive number.', ephemeral: true });
-      const updatedChar = setStatAndDerive(guildId, targetId, field, num);
-      if (field === 'wis') {
-        if (isWhiteKnight(updatedChar)) { const cfg = getConfig(guildId); setHealCharges(guildId, targetId, cfg.heal_charges ?? 3); }
-        else setHealCharges(guildId, targetId, 0);
+      if (isNaN(num)||num<0) return interaction.reply({ content: '❌ Value must be a positive number.', ephemeral: true });
+      const upd = setStatAndDerive(gid, targetId, field, num);
+      if (field==='wis') {
+        if (isWhiteKnight(upd)) { const cfg=getConfig(gid); setHealCharges(gid,targetId,cfg.heal_charges??3); }
+        else setHealCharges(gid,targetId,0);
       }
       let extra = '';
-      if (field === 'con') extra = ` HP maxed to **${updatedChar.hp_current} / ${maxHp(updatedChar)}**`;
-      if (field === 'lck') extra = ` Rerolls maxed to **${updatedChar.rerolls_current} / ${maxRerolls(updatedChar)}**`;
-      return interaction.reply({ content: `✅ ${field.toUpperCase()} set to **${num}**${targetId !== callerId ? ` for <@${targetId}>` : ''}.${extra}` });
+      if (field==='con') extra=` HP maxed to **${upd.hp_current} / ${maxHp(upd)}**`;
+      if (field==='lck') extra=` Rerolls maxed to **${upd.rerolls_current} / ${maxRerolls(upd)}**`;
+      return interaction.reply({ content: `✅ ${field.toUpperCase()} set to **${num}**${targetId!==callerId?` for <@${targetId}>`:''}.${extra}` });
     }
   }
-
+  if (sub === 'export') return handleCharExport(interaction);
   if (sub === 'show') {
-    const targetUser = interaction.options.getUser('user') || interaction.user;
-    const targetId = targetUser.id;
-    const char = getChar(guildId, targetId);
+    const tu = interaction.options.getUser('user') || interaction.user, tid = tu.id;
+    const char = getChar(gid, tid);
     if (!char) return interaction.reply({ content: '❌ No character found. Use `/char set` to get started.', ephemeral: true });
-    const displayName = await getDisplayName(interaction.guild, targetId);
-    const cfg = getConfig(guildId);
-    const maxCharges = cfg.heal_charges ?? 3;
-    const healRow = getHealCharges(guildId, targetId, maxCharges);
-    const knight = char.order_name ? `${KNIGHT_EMOJIS[char.order_name] ?? '⚪'}  ${char.order_name}` : 'No order set';
-    const lines = [
-      `⚔️  **${displayName}**`, knight,
-      `❤️  HP          ${char.hp_current} / ${maxHp(char)}`,
-      `🔄  Rerolls      ${char.rerolls_current} / ${maxRerolls(char)}`,
-    ];
-    if (isWhiteKnight(char)) lines.push(`🛡️  Heal         ${healRow.current} / ${maxCharges}`);
+    const dn = await getDisplayName(interaction.guild, tid);
+    const cfg = getConfig(gid); const mc = cfg.heal_charges??3;
+    const hr = getHealCharges(gid, tid, mc);
+    const kn = char.order_name ? `${KNIGHT_EMOJIS[char.order_name]??'⚪'}  ${char.order_name}` : 'No order set';
+    const lines = [`⚔️  **${dn}**`, kn, `❤️  HP          ${char.hp_current} / ${maxHp(char)}`, `🔄  Rerolls      ${char.rerolls_current} / ${maxRerolls(char)}`];
+    if (isWhiteKnight(char)) lines.push(`🛡️  Heal         ${hr.current} / ${mc}`);
     lines.push('', `💪  STR         ${char.str}`, `🫀  CON         ${char.con}`, `⚡  DEX         ${char.dex}`, `🧠  WIS         ${char.wis}`, `🍀  LCK         ${char.lck}`);
     return interaction.reply({ content: lines.join('\n') });
   }
 }
 
 async function handleProfile(interaction) {
-  const sub = interaction.options.getSubcommand();
-  const guildId = interaction.guild.id;
-  const userId = interaction.user.id;
-
+  const sub = interaction.options.getSubcommand(), gid = interaction.guild.id, uid = interaction.user.id;
   if (sub === 'on') {
-    let char = getChar(guildId, userId);
-    if (!char) { upsertChar(guildId, userId, {}); char = getChar(guildId, userId); }
-    upsertChar(guildId, userId, { profile_enabled: 1, hp_current: maxHp(char), rerolls_current: maxRerolls(char) });
-    if (isWhiteKnight(char)) { const cfg = getConfig(guildId); setHealCharges(guildId, userId, cfg.heal_charges ?? 3); }
+    let ch = getChar(gid, uid);
+    if (!ch) { upsertChar(gid, uid, {}); ch = getChar(gid, uid); }
+    upsertChar(gid, uid, { profile_enabled:1, hp_current:maxHp(ch), rerolls_current:maxRerolls(ch) });
+    if (isWhiteKnight(ch)) { const cfg=getConfig(gid); setHealCharges(gid,uid,cfg.heal_charges??3); }
     return interaction.reply({ content: '✅ Profile enabled. HP and rerolls maxed out.', ephemeral: true });
   }
-
   if (sub === 'off') {
-    upsertChar(guildId, userId, { profile_enabled: 0 });
+    upsertChar(gid, uid, { profile_enabled: 0 });
     return interaction.reply({ content: '⏸️ Profile disabled. Rolls will post as plain text.', ephemeral: true });
   }
-
   if (sub === 'show') {
-    const char = getChar(guildId, userId);
-    if (!char) return interaction.reply({ content: '❌ No character set up. Use `/char set` first.', ephemeral: true });
-    const displayName = await getDisplayName(interaction.guild, userId);
-    const cfg = getConfig(guildId);
-    const maxCharges = cfg.heal_charges ?? 3;
-    const healRow = getHealCharges(guildId, userId, maxCharges);
-    const knight = char.order_name ? `${KNIGHT_EMOJIS[char.order_name] ?? '⚪'}  ${char.order_name}` : 'No order set';
-    const lines = [
-      `⚔️  **${displayName}**`, knight,
-      `❤️  HP          ${char.hp_current} / ${maxHp(char)}`,
-      `🔄  Rerolls      ${char.rerolls_current} / ${maxRerolls(char)}`,
-    ];
-    if (isWhiteKnight(char)) lines.push(`🛡️  Heal         ${healRow.current} / ${maxCharges}`);
-    lines.push('', `💪  STR         ${char.str}`, `🫀  CON         ${char.con}`, `⚡  DEX         ${char.dex}`, `🧠  WIS         ${char.wis}`, `🍀  LCK         ${char.lck}`);
+    const ch = getChar(gid, uid);
+    if (!ch) return interaction.reply({ content: '❌ No character set up. Use `/char set` first.', ephemeral: true });
+    const dn = await getDisplayName(interaction.guild, uid);
+    const cfg = getConfig(gid); const mc = cfg.heal_charges??3;
+    const hr = getHealCharges(gid, uid, mc);
+    const kn = ch.order_name ? `${KNIGHT_EMOJIS[ch.order_name]??'⚪'}  ${ch.order_name}` : 'No order set';
+    const lines = [`⚔️  **${dn}**`, kn, `❤️  HP          ${ch.hp_current} / ${maxHp(ch)}`, `🔄  Rerolls      ${ch.rerolls_current} / ${maxRerolls(ch)}`];
+    if (isWhiteKnight(ch)) lines.push(`🛡️  Heal         ${hr.current} / ${mc}`);
+    lines.push('', `💪  STR         ${ch.str}`, `🫀  CON         ${ch.con}`, `⚡  DEX         ${ch.dex}`, `🧠  WIS         ${ch.wis}`, `🍀  LCK         ${ch.lck}`);
     return interaction.reply({ content: lines.join('\n'), ephemeral: true });
   }
-
   if (sub === 'save') {
-    const slotName = interaction.options.getString('slotname');
-    const char = getChar(guildId, userId);
-    if (!char) return interaction.reply({ content: '❌ No character to save.', ephemeral: true });
-    const cfg = getConfig(guildId);
-    const healRow = getHealCharges(guildId, userId, cfg.heal_charges ?? 3);
-    saveProfile(guildId, userId, slotName, { ...char, heal_current: healRow.current });
-    return interaction.reply({ content: `💾 Profile saved as **${slotName}**.`, ephemeral: true });
+    const slot = interaction.options.getString('slotname');
+    const ch = getChar(gid, uid);
+    if (!ch) return interaction.reply({ content: '❌ No character to save.', ephemeral: true });
+    const cfg = getConfig(gid);
+    const hr = getHealCharges(gid, uid, cfg.heal_charges??3);
+    saveProfile(gid, uid, slot, { ...ch, heal_current: hr.current });
+    return interaction.reply({ content: `💾 Profile saved as **${slot}**.`, ephemeral: true });
   }
-
   if (sub === 'load') {
-    const slotName = interaction.options.getString('slotname');
-    const snapshot = loadProfile(guildId, userId, slotName);
-    if (!snapshot) return interaction.reply({ content: `❌ No save found with name **${slotName}**.`, ephemeral: true });
-    upsertChar(guildId, userId, { hp_current: snapshot.hp_current, rerolls_current: snapshot.rerolls_current, str: snapshot.str, con: snapshot.con, dex: snapshot.dex, wis: snapshot.wis, lck: snapshot.lck, order_name: snapshot.order_name, profile_enabled: snapshot.profile_enabled });
-    setHealCharges(guildId, userId, snapshot.heal_current ?? 0);
-    return interaction.reply({ content: `📂 Profile **${slotName}** loaded.`, ephemeral: true });
+    const slot = interaction.options.getString('slotname');
+    const snap = loadProfile(gid, uid, slot);
+    if (!snap) return interaction.reply({ content: `❌ No save found with name **${slot}**.`, ephemeral: true });
+    upsertChar(gid, uid, { hp_current:snap.hp_current, rerolls_current:snap.rerolls_current, str:snap.str, con:snap.con, dex:snap.dex, wis:snap.wis, lck:snap.lck, order_name:snap.order_name, profile_enabled:snap.profile_enabled });
+    setHealCharges(gid, uid, snap.heal_current??0);
+    return interaction.reply({ content: `📂 Profile **${slot}** loaded.`, ephemeral: true });
   }
-
   if (sub === 'saves') {
-    const saves = listProfiles(guildId, userId);
+    const saves = listProfiles(gid, uid);
     if (!saves.length) return interaction.reply({ content: '❌ No saved profiles found.', ephemeral: true });
-    return interaction.reply({ content: `📋 Your saves:\n${saves.map(s => `• **${s.slot_name}** — ${s.saved_at}`).join('\n')}`, ephemeral: true });
+    return interaction.reply({ content: `📋 Your saves:\n${saves.map(s=>`• **${s.slot_name}** — ${s.saved_at}`).join('\n')}`, ephemeral: true });
   }
 }
 
 // ─────────────────────────────────────────────
-//  PREFIX COMMAND HANDLERS
+//  PREFIX HANDLERS
 // ─────────────────────────────────────────────
 
 async function handleRoll(message, rest, mode, isReroll) {
-  const guildId = message.guild.id;
-  const channelId = message.channel.id;
-  const userId = message.author.id;
-
-  let notation, label;
+  const gid = message.guild.id, cid = message.channel.id, uid = message.author.id;
+  let notation, label, flavour;
 
   if (isReroll) {
-    const last = getLastRoll(guildId, channelId, userId);
+    const last = getLastRoll(gid, cid, uid);
     if (!last) return message.reply('❌ No previous roll found in this channel.');
+    const ch = getChar(gid, uid);
+    if (!ch || ch.rerolls_current <= 0) return message.reply('❌ No rerolls remaining.');
     notation = last.notation;
-    label = rest.trim() || last.label;
-    // Deduct reroll token
-    const char = getChar(guildId, userId);
-    if (char && char.rerolls_current > 0) upsertChar(guildId, userId, { rerolls_current: char.rerolls_current - 1 });
+    const [rl, ...fp] = rest.split('\n');
+    label = rl.trim() || last.label;
+    flavour = fp.join('\n').trim() || null;
+    upsertChar(gid, uid, { rerolls_current: ch.rerolls_current - 1 });
   } else {
-    const parsed = parseRollInput(rest);
-    if (!parsed) return message.reply('❌ Invalid notation. Try `r1d20+5 attack` or `r2d6`.');
+    const ch = getChar(gid, uid);
+    const parsed = parseRollInput(rest, ch);
+    if (!parsed) return message.reply('❌ Invalid notation. Try `r1d20+5 attack`, `r2d6`, or `r str`.');
     notation = parsed.notation;
     label = parsed.label;
+    flavour = parsed.flavour;
   }
 
   let result;
   if (mode === 'adv') result = rollAdvantage(notation);
   else if (mode === 'dis') result = rollDisadvantage(notation);
   else result = rollNotation(notation);
-
   if (!result) return message.reply('❌ Could not parse dice notation.');
 
-  saveRoll(guildId, channelId, userId, notation, label);
-  const rollLine = buildRollLine(result, mode);
-  await sendRollEmbed(message, rollLine, label, isReroll, userId);
+  saveRoll(gid, cid, uid, notation, label);
+  const critType = detectCrit(result, mode);
+  const rollLine = buildRollLine(result, mode, critType);
+  await sendRollEmbed(message, rollLine, label, false, uid, flavour, result.total, critType);
 }
 
 async function handleHeal(message, rest) {
-  const guildId = message.guild.id;
-  const userId = message.author.id;
-
-  // Require a target mention: !heal @user
+  const gid = message.guild.id, uid = message.author.id;
   const mentionMatch = rest.match(/^<@!?(\d+)>/);
   if (!mentionMatch) return message.reply('❌ You must target a player. Usage: `!heal @user`');
   const targetId = mentionMatch[1];
-  if (targetId === userId) return message.reply('❌ You cannot heal yourself.');
-
-  const char = getChar(guildId, userId);
+  if (targetId === uid) return message.reply('❌ You cannot heal yourself.');
+  const char = getChar(gid, uid);
   if (!char) return message.reply('❌ No character found. Use `/char set` first.');
   if (!isWhiteKnight(char)) return message.reply('❌ Only White Knights with WIS 5 can use Heal.');
-
-  const targetChar = getChar(guildId, targetId);
+  const targetChar = getChar(gid, targetId);
   if (!targetChar) return message.reply('❌ Target has no character set up.');
-
-  const cfg = getConfig(guildId);
-  const maxCharges = cfg.heal_charges ?? 3;
-  const healRow = getHealCharges(guildId, userId, maxCharges);
-  if (healRow.current <= 0) return message.reply('❌ No Heal charges remaining.');
-
+  const cfg = getConfig(gid); const mc = cfg.heal_charges??3;
+  const hr = getHealCharges(gid, uid, mc);
+  if (hr.current <= 0) return message.reply('❌ No Heal charges remaining.');
   const result = rollNotation(`1d20+${char.wis}`);
-  const naturalRoll = result.rolls[0];
-  const total = result.total;
-
-  // Get target display name for result text
-  const targetName = await getDisplayName(message.guild, targetId);
-
+  const nat = result.rolls[0], total = result.total;
+  const tn = await getDisplayName(message.guild, targetId);
   let healAmount = 0, chargesUsed = 0, resultText = '';
-  if (naturalRoll === 20) { healAmount = 2; chargesUsed = 0; resultText = `*Natural 20! 2 HP restored to ${targetName}. No charge consumed.*`; }
-  else if (total >= 20) { healAmount = 2; chargesUsed = 1; resultText = `*2 HP restored to ${targetName}. 1 charge consumed.*`; }
-  else if (naturalRoll === 1) { chargesUsed = Math.min(2, healRow.current); resultText = `*Natural 1! No heal. ${chargesUsed} charges consumed.*`; }
-  else { chargesUsed = 1; resultText = `*No heal. 1 charge consumed.*`; }
-
-  // Apply heal to target, not caster
-  const targetHpMax = maxHp(targetChar);
-  const newTargetHp = Math.min(targetChar.hp_current + healAmount, targetHpMax);
-  const newCharges = Math.max(0, healRow.current - chargesUsed);
-
-  upsertChar(guildId, targetId, { hp_current: newTargetHp });
-  setHealCharges(guildId, userId, newCharges);
-
-  // Embed shows the White Knight's card (caster)
-  const updatedChar = getChar(guildId, userId);
-  const displayName = await getDisplayName(message.guild, userId);
+  if (nat === 20) { healAmount=2; chargesUsed=0; resultText=`*Natural 20! 2 HP restored to ${tn}. No charge consumed.*`; }
+  else if (total >= 20) { healAmount=2; chargesUsed=1; resultText=`*2 HP restored to ${tn}. 1 charge consumed.*`; }
+  else if (nat === 1) { chargesUsed=Math.min(2,hr.current); resultText=`*Natural 1! No heal. ${chargesUsed} charges consumed.*`; }
+  else { chargesUsed=1; resultText=`*No heal. 1 charge consumed.*`; }
+  const newTHp = Math.min(targetChar.hp_current + healAmount, maxHp(targetChar));
+  const newCharges = Math.max(0, hr.current - chargesUsed);
+  upsertChar(gid, targetId, { hp_current: newTHp });
+  setHealCharges(gid, uid, newCharges);
+  const upd = getChar(gid, uid);
+  const dn = await getDisplayName(message.guild, uid);
   const modStr = char.wis > 0 ? ` +${char.wis}` : '';
-  const rollLine = `🎲  1d20+${char.wis} → [${naturalRoll}]${modStr} = **${total}**`;
-
-  const profileEnabled = char.profile_enabled === 1;
+  const rollLine = `🎲  1d20+${char.wis} → [${nat}]${modStr} = **${total}**`;
   let content;
-  if (profileEnabled) {
-    content = buildRollEmbed({ rollLine, label: 'heal', isReroll: false, char: { ...updatedChar, displayName }, healCharges: newCharges, maxCharges });
+  if (char.profile_enabled === 1) {
+    content = buildRollEmbed({ rollLine, label:'heal', isReroll:false, char:{...upd,displayName:dn}, healCharges:newCharges, maxCharges:mc, flavour:null, total, critType:null });
     content += `\n${resultText}`;
   } else {
     content = `**heal**\n${rollLine}\n${resultText}`;
@@ -559,48 +685,92 @@ async function handleHeal(message, rest) {
 }
 
 async function handleHp(message, rest) {
-  const guildId = message.guild.id;
-  const userId = message.author.id;
-  const mentionMatch = rest.match(/^<@!?(\d+)>\s*([+-]\d+)$/);
-  const selfMatch = rest.match(/^([+-]\d+)$/);
-
+  const gid = message.guild.id, uid = message.author.id;
+  const mm = rest.match(/^<@!?(\d+)>\s*([+-]\d+)$/), sm = rest.match(/^([+-]\d+)$/);
   let targetId, amount;
-  if (mentionMatch) {
-    if (!(await isGm(message.guild, userId))) return message.reply('❌ Only GMs can modify other players\' HP.');
-    targetId = mentionMatch[1]; amount = parseInt(mentionMatch[2]);
-  } else if (selfMatch) {
-    targetId = userId; amount = parseInt(selfMatch[1]);
-  } else return message.reply('❌ Usage: `!hp +5` or `!hp @user -3`');
-
-  const char = getChar(guildId, targetId);
-  if (!char) return message.reply('❌ No character found for that user.');
-  const hpMax = maxHp(char);
-  const newHp = Math.max(0, Math.min(char.hp_current + amount, hpMax));
-  upsertChar(guildId, targetId, { hp_current: newHp });
-  const direction = amount > 0 ? '💚 Healed' : '🩸 Damaged';
-  await message.reply(`${direction} ${Math.abs(amount)} HP — ${targetId === userId ? 'Your' : `<@${targetId}>'s`} HP: **${newHp} / ${hpMax}**`);
+  if (mm) {
+    if (!(await isGm(message.guild, uid))) return message.reply('❌ Only GMs can modify other players\' HP.');
+    targetId=mm[1]; amount=parseInt(mm[2]);
+  } else if (sm) { targetId=uid; amount=parseInt(sm[1]); }
+  else return message.reply('❌ Usage: `!hp +5` or `!hp @user -3`');
+  const ch = getChar(gid, targetId);
+  if (!ch) return message.reply('❌ No character found for that user.');
+  const hm = maxHp(ch);
+  const newHp = Math.max(0, Math.min(ch.hp_current + amount, hm));
+  upsertChar(gid, targetId, { hp_current: newHp });
+  const dir = amount > 0 ? '💚 Healed' : '🩸 Damaged';
+  await message.reply(`${dir} ${Math.abs(amount)} HP — ${targetId===uid?'Your':`<@${targetId}>'s`} HP: **${newHp} / ${hm}**`);
 }
 
 async function handleRerolls(message, rest) {
-  const guildId = message.guild.id;
-  const userId = message.author.id;
-  const mentionMatch = rest.match(/^<@!?(\d+)>\s*([+-]\d+)$/);
-  const selfMatch = rest.match(/^([+-]\d+)$/);
-
+  const gid = message.guild.id, uid = message.author.id;
+  const mm = rest.match(/^<@!?(\d+)>\s*([+-]\d+)$/), sm = rest.match(/^([+-]\d+)$/);
   let targetId, amount;
-  if (mentionMatch) {
-    if (!(await isGm(message.guild, userId))) return message.reply('❌ Only GMs can modify other players\' rerolls.');
-    targetId = mentionMatch[1]; amount = parseInt(mentionMatch[2]);
-  } else if (selfMatch) {
-    targetId = userId; amount = parseInt(selfMatch[1]);
-  } else return message.reply('❌ Usage: `!rerolls +1` or `!rerolls @user -1`');
+  if (mm) {
+    if (!(await isGm(message.guild, uid))) return message.reply('❌ Only GMs can modify other players\' rerolls.');
+    targetId=mm[1]; amount=parseInt(mm[2]);
+  } else if (sm) { targetId=uid; amount=parseInt(sm[1]); }
+  else return message.reply('❌ Usage: `!rerolls +1` or `!rerolls @user -1`');
+  const ch = getChar(gid, targetId);
+  if (!ch) return message.reply('❌ No character found for that user.');
+  const rm = maxRerolls(ch);
+  const newR = Math.max(0, Math.min(ch.rerolls_current + amount, rm));
+  upsertChar(gid, targetId, { rerolls_current: newR });
+  await message.reply(`🔄 ${targetId===uid?'Your':`<@${targetId}>'s`} Rerolls: **${newR} / ${rm}**`);
+}
 
-  const char = getChar(guildId, targetId);
-  if (!char) return message.reply('❌ No character found for that user.');
-  const rerollMax = maxRerolls(char);
-  const newRerolls = Math.max(0, Math.min(char.rerolls_current + amount, rerollMax));
-  upsertChar(guildId, targetId, { rerolls_current: newRerolls });
-  await message.reply(`🔄 ${targetId === userId ? 'Your' : `<@${targetId}>'s`} Rerolls: **${newRerolls} / ${rerollMax}**`);
+async function handleRest(message, rest, type) {
+  const gid = message.guild.id, uid = message.author.id;
+  const mm = rest.match(/^<@!?(\d+)>/);
+  let targetId = uid;
+  if (mm) {
+    if (!(await isGm(message.guild, uid))) return message.reply('❌ Only GMs can apply rests to other players.');
+    targetId = mm[1];
+  }
+  const ch = getChar(gid, targetId);
+  if (!ch) return message.reply('❌ No character found.');
+  const cfg = getConfig(gid); const mc = cfg.heal_charges??3;
+  const hm = maxHp(ch), rm = maxRerolls(ch);
+  const tn = targetId === uid ? 'Your' : `<@${targetId}>'s`;
+  let newHp, newR, newHeal, label;
+  if (type==='lrest') { newHp=hm; newR=rm; newHeal=mc; label='🌙 Long Rest'; }
+  else if (type==='srest') { newHp=Math.floor(hm/2); newR=Math.floor(rm/2); newHeal=Math.floor(mc/2); label='☀️ Short Rest'; }
+  else if (type==='hpfull') { newHp=hm; newR=ch.rerolls_current; newHeal=null; label='❤️ HP Restored'; }
+  else if (type==='hphalf') { newHp=Math.floor(hm/2); newR=ch.rerolls_current; newHeal=null; label='❤️ HP Half Restored'; }
+  upsertChar(gid, targetId, { hp_current:newHp, rerolls_current:newR });
+  if (newHeal !== null && isWhiteKnight(ch)) setHealCharges(gid, targetId, newHeal);
+  const lines = [`${label} applied to ${tn} character.`, `❤️ HP: **${newHp} / ${hm}**`, `🔄 Rerolls: **${newR} / ${rm}**`];
+  if (newHeal !== null && isWhiteKnight(ch)) lines.push(`🛡️ Heal: **${newHeal} / ${mc}**`);
+  await message.reply(lines.join('\n'));
+}
+
+async function handleGmRoll(message, rest, secret) {
+  const gid = message.guild.id, uid = message.author.id;
+  if (!(await isGm(message.guild, uid))) return message.reply('❌ Only GMs can use GM rolls.');
+  const parsed = parseRollInput(rest, null);
+  if (!parsed) return message.reply('❌ Invalid notation. Try `gmr 1d20+5 perception`.');
+  const result = rollNotation(parsed.notation);
+  if (!result) return message.reply('❌ Could not parse dice notation.');
+  const critType = detectCrit(result, 'normal');
+  const rollLine = buildRollLine(result, 'normal', critType);
+  const lc = critPrefix(critType);
+  const lines = [];
+  if (parsed.label) lines.push(`${lc}**${parsed.label}**`);
+  lines.push(rollLine);
+  if (parsed.flavour) {
+    lines.push('', '─────────────────────────────');
+    lines.push(`**${parsed.label??'roll'}** — ${totalStr(result.total, critType)}`);
+    lines.push(`*${parsed.flavour}*`);
+  }
+  const content = lines.join('\n');
+  if (secret) {
+    try {
+      await message.author.send(`🔒 **Secret GM Roll**\n${content}`);
+      await message.reply('🔒 Roll sent to your DMs.');
+    } catch { await message.reply('❌ Could not DM you. Check your privacy settings.'); }
+  } else {
+    await message.reply(content);
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -628,24 +798,26 @@ client.on('interactionCreate', async interaction => {
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
   const content = message.content.trim();
-
-  // Match all prefix variants
-  const match = content.match(/^(!?)(roll|r(?:ra|rd|r(?:a|d)?)?|ra|rd|rr(?:a|d)?|heal|h|hp|rerolls)(\d.*|\s.*|$)/i);
+  const match = content.match(/^(!?)(gmrs?|lrest|srest|hpfull|hphalf|roll|r(?:ra|rd|r(?:a|d)?)?|ra|rd|rr(?:a|d)?|heal|h|hp|rerolls)(\d.*|\s.*|[\n].*|$)/i);
   if (!match) return;
-
   const raw = (match[1] + match[2]).toLowerCase().replace(/^!/, '');
   const rest = (match[3] ?? '').trim();
-
   try {
-    if (raw === 'r' || raw === 'roll') return handleRoll(message, rest, 'normal', false);
-    if (raw === 'ra') return handleRoll(message, rest, 'adv', false);
-    if (raw === 'rd') return handleRoll(message, rest, 'dis', false);
-    if (raw === 'rr') return handleRoll(message, rest, 'normal', true);
-    if (raw === 'rra') return handleRoll(message, rest, 'adv', true);
-    if (raw === 'rrd') return handleRoll(message, rest, 'dis', true);
-    if (raw === 'heal' || raw === 'h') return handleHeal(message, rest);
-    if (raw === 'hp') return handleHp(message, rest);
-    if (raw === 'rerolls') return handleRerolls(message, rest);
+    if (raw==='r'||raw==='roll') return handleRoll(message, rest, 'normal', false);
+    if (raw==='ra') return handleRoll(message, rest, 'adv', false);
+    if (raw==='rd') return handleRoll(message, rest, 'dis', false);
+    if (raw==='rr') return handleRoll(message, rest, 'normal', true);
+    if (raw==='rra') return handleRoll(message, rest, 'adv', true);
+    if (raw==='rrd') return handleRoll(message, rest, 'dis', true);
+    if (raw==='heal'||raw==='h') return handleHeal(message, rest);
+    if (raw==='hp') return handleHp(message, rest);
+    if (raw==='rerolls') return handleRerolls(message, rest);
+    if (raw==='lrest') return handleRest(message, rest, 'lrest');
+    if (raw==='srest') return handleRest(message, rest, 'srest');
+    if (raw==='hpfull') return handleRest(message, rest, 'hpfull');
+    if (raw==='hphalf') return handleRest(message, rest, 'hphalf');
+    if (raw==='gmr') return handleGmRoll(message, rest, false);
+    if (raw==='gmrs') return handleGmRoll(message, rest, true);
   } catch (err) {
     console.error(err);
     message.reply('❌ Something went wrong.');
@@ -662,8 +834,6 @@ client.on('messageCreate', async message => {
     console.log('Registering slash commands...');
     await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: slashCommands.map(c => c.toJSON()) });
     console.log('✅ Slash commands registered.');
-  } catch (err) {
-    console.error('Failed to register slash commands:', err);
-  }
+  } catch (err) { console.error('Failed to register slash commands:', err); }
   client.login(process.env.DISCORD_TOKEN);
 })();

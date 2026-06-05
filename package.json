@@ -7,6 +7,7 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^0.1.44",
     "better-sqlite3": "^9.4.3",
     "discord.js": "^14.14.1",
     "dotenv": "^16.4.5"
