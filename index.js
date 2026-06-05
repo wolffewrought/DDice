@@ -498,12 +498,22 @@ async function handleRoll(message, rest, mode, isReroll) {
   await sendRollEmbed(message, rollLine, label, isReroll, userId);
 }
 
-async function handleHeal(message) {
+async function handleHeal(message, rest) {
   const guildId = message.guild.id;
   const userId = message.author.id;
+
+  // Require a target mention: !heal @user
+  const mentionMatch = rest.match(/^<@!?(\d+)>/);
+  if (!mentionMatch) return message.reply('❌ You must target a player. Usage: `!heal @user`');
+  const targetId = mentionMatch[1];
+  if (targetId === userId) return message.reply('❌ You cannot heal yourself.');
+
   const char = getChar(guildId, userId);
   if (!char) return message.reply('❌ No character found. Use `/char set` first.');
   if (!isWhiteKnight(char)) return message.reply('❌ Only White Knights with WIS 5 can use Heal.');
+
+  const targetChar = getChar(guildId, targetId);
+  if (!targetChar) return message.reply('❌ Target has no character set up.');
 
   const cfg = getConfig(guildId);
   const maxCharges = cfg.heal_charges ?? 3;
@@ -514,17 +524,24 @@ async function handleHeal(message) {
   const naturalRoll = result.rolls[0];
   const total = result.total;
 
-  let healAmount = 0, chargesUsed = 0, resultText = '';
-  if (naturalRoll === 20) { healAmount = 2; chargesUsed = 0; resultText = '*Natural 20! 2 HP restored. No charge consumed.*'; }
-  else if (total >= 20) { healAmount = 2; chargesUsed = 1; resultText = '*2 HP restored. 1 charge consumed.*'; }
-  else if (naturalRoll === 1) { chargesUsed = Math.min(2, healRow.current); resultText = `*Natural 1! No heal. ${chargesUsed} charges consumed.*`; }
-  else { chargesUsed = 1; resultText = '*No heal. 1 charge consumed.*'; }
+  // Get target display name for result text
+  const targetName = await getDisplayName(message.guild, targetId);
 
-  const newHp = Math.min(char.hp_current + healAmount, maxHp(char));
+  let healAmount = 0, chargesUsed = 0, resultText = '';
+  if (naturalRoll === 20) { healAmount = 2; chargesUsed = 0; resultText = `*Natural 20! 2 HP restored to ${targetName}. No charge consumed.*`; }
+  else if (total >= 20) { healAmount = 2; chargesUsed = 1; resultText = `*2 HP restored to ${targetName}. 1 charge consumed.*`; }
+  else if (naturalRoll === 1) { chargesUsed = Math.min(2, healRow.current); resultText = `*Natural 1! No heal. ${chargesUsed} charges consumed.*`; }
+  else { chargesUsed = 1; resultText = `*No heal. 1 charge consumed.*`; }
+
+  // Apply heal to target, not caster
+  const targetHpMax = maxHp(targetChar);
+  const newTargetHp = Math.min(targetChar.hp_current + healAmount, targetHpMax);
   const newCharges = Math.max(0, healRow.current - chargesUsed);
-  upsertChar(guildId, userId, { hp_current: newHp });
+
+  upsertChar(guildId, targetId, { hp_current: newTargetHp });
   setHealCharges(guildId, userId, newCharges);
 
+  // Embed shows the White Knight's card (caster)
   const updatedChar = getChar(guildId, userId);
   const displayName = await getDisplayName(message.guild, userId);
   const modStr = char.wis > 0 ? ` +${char.wis}` : '';
@@ -626,7 +643,7 @@ client.on('messageCreate', async message => {
     if (raw === 'rr') return handleRoll(message, rest, 'normal', true);
     if (raw === 'rra') return handleRoll(message, rest, 'adv', true);
     if (raw === 'rrd') return handleRoll(message, rest, 'dis', true);
-    if (raw === 'heal' || raw === 'h') return handleHeal(message);
+    if (raw === 'heal' || raw === 'h') return handleHeal(message, rest);
     if (raw === 'hp') return handleHp(message, rest);
     if (raw === 'rerolls') return handleRerolls(message, rest);
   } catch (err) {
