@@ -419,6 +419,17 @@ async function handleCharExport(interaction) {
   // ── Text export ──────────────────────────────────────────────────────────────
   const textLines = [
     '```',
+    '[TTRPG SHEET]',
+    `NAME:${dn}`,
+    `ORDER:${char.order_name || ''}`,
+    `STR:${char.str}`,
+    `CON:${char.con}`,
+    `DEX:${char.dex}`,
+    `WIS:${char.wis}`,
+    `LCK:${char.lck}`,
+    `HP:${char.hp_current}`,
+    `REROLLS:${char.rerolls_current}`,
+    '',
     `  ${dn}`,
     `  ${char.order_name || 'No Order'}`,
     '',
@@ -773,6 +784,93 @@ async function handleGmRoll(message, rest, secret) {
   }
 }
 
+
+function parseSheetImport(text) {
+  // Strip code block markers
+  const clean = text.replace(/```/g, '').trim();
+  if (!clean.includes('[TTRPG SHEET]')) return null;
+
+  const lines = clean.split('\n');
+  const data = {};
+  lines.forEach(line => {
+    const [key, ...rest] = line.split(':');
+    if (key && rest.length) data[key.trim()] = rest.join(':').trim();
+  });
+
+  // Validate required fields
+  const required = ['STR','CON','DEX','WIS','LCK'];
+  for (const f of required) {
+    if (data[f] === undefined || isNaN(parseInt(data[f]))) return null;
+  }
+
+  return {
+    order_name: data['ORDER'] || null,
+    str: parseInt(data['STR']),
+    con: parseInt(data['CON']),
+    dex: parseInt(data['DEX']),
+    wis: parseInt(data['WIS']),
+    lck: parseInt(data['LCK']),
+    hp_current: data['HP'] ? parseInt(data['HP']) : null,
+    rerolls_current: data['REROLLS'] ? parseInt(data['REROLLS']) : null,
+  };
+}
+
+async function handleSheetImport(message, parsed) {
+  const gid = message.guild.id, uid = message.author.id;
+
+  // Check if GM is importing for someone else via mention
+  const mentionMatch = message.content.match(/<@!?(\d+)>/);
+  let targetId = uid;
+  if (mentionMatch && mentionMatch[1] !== uid) {
+    if (!(await isGm(message.guild, uid))) return message.reply('\u274c Only GMs can import sheets for other players.');
+    targetId = mentionMatch[1];
+  }
+
+  const KNIGHTS = ['White Knight','Black Knight','Gold Knight','Grey Knight','Blue Knight','Purple Knight','Green Knight','Red Knight'];
+
+  // Validate order
+  if (parsed.order_name && !KNIGHTS.includes(parsed.order_name)) {
+    parsed.order_name = null;
+  }
+
+  // Apply stats — derive HP max and reroll max from CON and LCK
+  const hpMax = parsed.con + 2;
+  const rerollMax = parsed.lck;
+
+  // Use imported current values if valid, otherwise max out
+  const hpCurrent = (parsed.hp_current !== null && parsed.hp_current <= hpMax) ? parsed.hp_current : hpMax;
+  const rerollsCurrent = (parsed.rerolls_current !== null && parsed.rerolls_current <= rerollMax) ? parsed.rerolls_current : rerollMax;
+
+  upsertChar(gid, targetId, {
+    order_name: parsed.order_name,
+    str: parsed.str, con: parsed.con, dex: parsed.dex,
+    wis: parsed.wis, lck: parsed.lck,
+    hp_current: hpCurrent,
+    rerolls_current: rerollsCurrent,
+  });
+
+  // Handle heal charges for White Knight
+  const updatedChar = getChar(gid, targetId);
+  if (isWhiteKnight(updatedChar)) {
+    const cfg = getConfig(gid);
+    setHealCharges(gid, targetId, cfg.heal_charges ?? 3);
+  } else {
+    setHealCharges(gid, targetId, 0);
+  }
+
+  const targetName = targetId === uid ? 'Your' : `<@${targetId}>'s`;
+  const orderLine = parsed.order_name ? `${KNIGHT_EMOJIS[parsed.order_name]??'⚪'} ${parsed.order_name}` : 'No order';
+  const lines = [
+    `\u2705 ${targetName} character sheet imported.`,
+    orderLine,
+    `\u2764\ufe0f HP: **${hpCurrent} / ${hpMax}**`,
+    `\U0001f504 Rerolls: **${rerollsCurrent} / ${rerollMax}**`,
+    '',
+    `\U0001f4aa STR ${parsed.str}  \U0001fac0 CON ${parsed.con}  \u26a1 DEX ${parsed.dex}  \U0001f9e0 WIS ${parsed.wis}  \U0001f340 LCK ${parsed.lck}`,
+  ];
+  await message.reply(lines.join('\n'));
+}
+
 // ─────────────────────────────────────────────
 //  BOT CLIENT
 // ─────────────────────────────────────────────
@@ -798,6 +896,16 @@ client.on('interactionCreate', async interaction => {
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
   const content = message.content.trim();
+
+  // Sheet import detection — check before prefix matching
+  if (content.includes('[TTRPG SHEET]')) {
+    const parsed = parseSheetImport(content);
+    if (parsed) {
+      try { return await handleSheetImport(message, parsed); }
+      catch (err) { console.error(err); return message.reply('\u274c Failed to import sheet.'); }
+    }
+  }
+
   const match = content.match(/^(!?)(gmrs?|lrest|srest|hpfull|hphalf|roll|r(?:ra|rd|r(?:a|d)?)?|ra|rd|rr(?:a|d)?|heal|h|hp|rerolls)(\d.*|\s.*|[\n].*|$)/i);
   if (!match) return;
   const raw = (match[1] + match[2]).toLowerCase().replace(/^!/, '');
