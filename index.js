@@ -259,9 +259,11 @@ function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharg
   lines.push(`🧠  WIS${pad(char.wis)}`);
   lines.push(`🍀  LCK${pad(char.lck)}`);
   if (flavour) {
+    // Collapse multiline flavour into single block, strip trailing asterisks from markdown collisions
+    const cleanFlavour = flavour.replace(/\n/g, ' ').replace(/\*+$/, '').trim();
     lines.push('', '─────────────────────────────');
     lines.push(`**${label??'roll'}** — ${totalStr(total, critType)}`);
-    lines.push(`*${flavour}*`);
+    lines.push(`*${cleanFlavour}*`);
   }
   return lines.join('\n');
 }
@@ -273,9 +275,10 @@ function buildPlainRoll({ rollLine, label, isReroll, flavour, total, critType })
   else if (isReroll) lines.push('*(reroll)*');
   lines.push(rollLine);
   if (flavour) {
+    const cleanFlavour = flavour.replace(/\n/g, ' ').replace(/\*+$/, '').trim();
     lines.push('', '─────────────────────────────');
     lines.push(`**${label??'roll'}** — ${totalStr(total, critType)}`);
-    lines.push(`*${flavour}*`);
+    lines.push(`*${cleanFlavour}*`);
   }
   return lines.join('\n');
 }
