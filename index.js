@@ -260,13 +260,7 @@ function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharg
   lines.push(`🍀  LCK${pad(char.lck)}`);
   if (flavour) {
     // Collapse multiline flavour into single block, strip trailing asterisks from markdown collisions
-    const cleanFlavour = flavour.split(/\n/).map(l => l.trim()).filter(l => l.length > 0).map(l => {
-      // If already wrapped in ** (bold) or * (italic), leave as-is
-      if (/^\*\*.*\*\*$/.test(l)) return l; // bold
-      if (/^\*[^*].*[^*]\*$/.test(l) || /^\*[^*]\*$/.test(l)) return l; // italic
-      // Otherwise wrap in italic
-      return `*${l}*`;
-    }).join('\n\n');
+    const cleanFlavour = flavour.split(/\n/).map(l => l.trim()).filter(l => l.length > 0).join('\n\n');
     lines.push('', '─────────────────────────────');
     lines.push(`**${label??'roll'}** — ${totalStr(total, critType)}`);
     lines.push('');
@@ -282,13 +276,7 @@ function buildPlainRoll({ rollLine, label, isReroll, flavour, total, critType })
   else if (isReroll) lines.push('*(reroll)*');
   lines.push(rollLine);
   if (flavour) {
-    const cleanFlavour = flavour.split(/\n/).map(l => l.trim()).filter(l => l.length > 0).map(l => {
-      // If already wrapped in ** (bold) or * (italic), leave as-is
-      if (/^\*\*.*\*\*$/.test(l)) return l; // bold
-      if (/^\*[^*].*[^*]\*$/.test(l) || /^\*[^*]\*$/.test(l)) return l; // italic
-      // Otherwise wrap in italic
-      return `*${l}*`;
-    }).join('\n\n');
+    const cleanFlavour = flavour.split(/\n/).map(l => l.trim()).filter(l => l.length > 0).join('\n\n');
     lines.push('', '─────────────────────────────');
     lines.push(`**${label??'roll'}** — ${totalStr(total, critType)}`);
     lines.push('');
