@@ -1285,15 +1285,20 @@ client.on('ready', () => console.log(`✅ Bot online as ${client.user.tag}`));
 client.on('interactionCreate', async interaction => {
   // Handle autocomplete for NPC name fields
   if (interaction.isAutocomplete()) {
-    if (interaction.commandName === 'pr') {
-      const focused = interaction.options.getFocused();
-      const npcs = getAllNpcs(interaction.guild.id);
-      const filtered = npcs
-        .filter(n => n.name.toLowerCase().includes(focused.toLowerCase()))
-        .slice(0, 25)
-        .map(n => ({ name: n.name, value: n.name }));
-      return interaction.respond(filtered);
-    }
+    try {
+      if (interaction.commandName === 'pr' || interaction.commandName === 'npc') {
+        const focusedOption = interaction.options.getFocused(true);
+        if (focusedOption.name === 'name') {
+          const focused = focusedOption.value;
+          const npcs = getAllNpcs(interaction.guild.id);
+          const filtered = npcs
+            .filter(n => n.name.toLowerCase().includes(focused.toLowerCase()))
+            .slice(0, 25)
+            .map(n => ({ name: n.name, value: n.name }));
+          return await interaction.respond(filtered);
+        }
+      }
+    } catch (err) { console.error('Autocomplete error:', err); }
     return;
   }
 
