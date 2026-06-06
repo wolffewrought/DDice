@@ -714,16 +714,18 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('delete').setDescription('Delete an NPC').addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true)))
     .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server'))
     .addSubcommand(s=>s.setName('reroll').setDescription('Reroll the last NPC roll (costs 1 reroll token)')
-      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))),
 
   new SlashCommandBuilder()
     .setName('pr').setDescription('Roll or manage NPCs as a GM persona (GM only)')
     .addSubcommand(s=>s.setName('roll').setDescription('Roll as an NPC via webhook')
-      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('notation').setDescription('Dice notation e.g. 1d20+5').setRequired(true))
-      .addStringOption(o=>o.setName('label').setDescription('Roll label e.g. atk').setRequired(false))
+      .addStringOption(o=>o.setName('stat').setDescription('Stat label (optional)').setRequired(false)
+        .addChoices({name:'STR',value:'STR'},{name:'CON',value:'CON'},{name:'DEX',value:'DEX'},{name:'WIS',value:'WIS'},{name:'LCK',value:'LCK'}))
+      .addStringOption(o=>o.setName('label').setDescription('Additional label (optional)').setRequired(false))
       .addStringOption(o=>o.setName('flavour').setDescription('Flavour text').setRequired(false))
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'})))
@@ -1281,6 +1283,20 @@ const client = new Client({
 client.on('ready', () => console.log(`✅ Bot online as ${client.user.tag}`));
 
 client.on('interactionCreate', async interaction => {
+  // Handle autocomplete for NPC name fields
+  if (interaction.isAutocomplete()) {
+    if (interaction.commandName === 'pr') {
+      const focused = interaction.options.getFocused();
+      const npcs = getAllNpcs(interaction.guild.id);
+      const filtered = npcs
+        .filter(n => n.name.toLowerCase().includes(focused.toLowerCase()))
+        .slice(0, 25)
+        .map(n => ({ name: n.name, value: n.name }));
+      return interaction.respond(filtered);
+    }
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
   try {
     if (interaction.commandName === 'config') return handleConfig(interaction);
@@ -2032,10 +2048,13 @@ async function handlePr(interaction) {
   if (sub === 'roll') {
     const name     = interaction.options.getString('name');
     const notation = interaction.options.getString('notation');
-    const label    = interaction.options.getString('label') ?? null;
+    const stat     = interaction.options.getString('stat') ?? null;
+    const labelRaw = interaction.options.getString('label') ?? null;
     const flavour  = interaction.options.getString('flavour') ?? null;
     const rollType = interaction.options.getString('roll') ?? 'normal';
     const mode     = rollType === 'adv' ? 'adv' : rollType === 'dis' ? 'dis' : 'normal';
+    // Combine stat and label: stat first, then label, separated by ' — '
+    const label = stat && labelRaw ? `${stat} — ${labelRaw}` : stat ?? labelRaw ?? null;
 
     const npc = getNpc(gid, name);
     if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found. Create it first with \`/npc create\`.`, ephemeral: true });
