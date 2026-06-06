@@ -685,6 +685,22 @@ const slashCommands = [
     .setName('stat').setDescription('Show stat descriptions'),
 
   new SlashCommandBuilder()
+    .setName('roll').setDescription('Roll dice with full options')
+    .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
+      .addChoices(
+        {name:'Normal (default)',value:'normal'},
+        {name:'Advantage',value:'adv'},
+        {name:'Disadvantage',value:'dis'},
+        {name:'Reroll',value:'rr'},
+        {name:'Reroll with Advantage',value:'rra'},
+        {name:'Reroll with Disadvantage',value:'rrd'}
+      ))
+    .addStringOption(o=>o.setName('notation').setDescription('Dice notation e.g. 1d20+5').setRequired(false))
+    .addStringOption(o=>o.setName('label').setDescription('Roll label e.g. atk').setRequired(false))
+    .addStringOption(o=>o.setName('flavour').setDescription('Flavour text').setRequired(false))
+    .addBooleanOption(o=>o.setName('success').setDescription('Show success outcome').setRequired(false)),
+
+  new SlashCommandBuilder()
     .setName('npc').setDescription('Manage NPCs (GM only)')
     .addSubcommand(s=>s.setName('create').setDescription('Create an NPC')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
@@ -726,36 +742,22 @@ const slashCommands = [
       .addUserOption(o=>o.setName('p4').setDescription('Fighter 4').setRequired(false))
       .addUserOption(o=>o.setName('p5').setDescription('Fighter 5').setRequired(false))
       .addUserOption(o=>o.setName('p6').setDescription('Fighter 6').setRequired(false)))
-    .addSubcommand(s=>s.setName('atk').setDescription('Attack a target (normal roll)')
+    .addSubcommand(s=>s.setName('atk').setDescription('Attack a target')
+      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
       .addStringOption(o=>o.setName('stat').setDescription('Stat to attack with').setRequired(true)
         .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
       .addUserOption(o=>o.setName('target').setDescription('Player to attack').setRequired(true))
       .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
-    .addSubcommand(s=>s.setName('atkadv').setDescription('Attack with advantage')
-      .addStringOption(o=>o.setName('stat').setDescription('Stat to attack with').setRequired(true)
-        .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
-      .addUserOption(o=>o.setName('target').setDescription('Player to attack').setRequired(true))
-      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
-    .addSubcommand(s=>s.setName('atkdis').setDescription('Attack with disadvantage')
-      .addStringOption(o=>o.setName('stat').setDescription('Stat to attack with').setRequired(true)
-        .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
-      .addUserOption(o=>o.setName('target').setDescription('Player to attack').setRequired(true))
-      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
-    .addSubcommand(s=>s.setName('def').setDescription('Defend (normal roll)')
+    .addSubcommand(s=>s.setName('def').setDescription('Defend against the current attack')
+      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
       .addStringOption(o=>o.setName('stat').setDescription('Stat to defend with').setRequired(true)
         .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
       .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
-    .addSubcommand(s=>s.setName('defadv').setDescription('Defend with advantage')
-      .addStringOption(o=>o.setName('stat').setDescription('Stat to defend with').setRequired(true)
-        .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
-      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
-    .addSubcommand(s=>s.setName('defdis').setDescription('Defend with disadvantage')
-      .addStringOption(o=>o.setName('stat').setDescription('Stat to defend with').setRequired(true)
-        .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
-      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
-    .addSubcommand(s=>s.setName('rr').setDescription('Reroll last fight roll (costs 1 reroll token)'))
-    .addSubcommand(s=>s.setName('ra').setDescription('Reroll last fight roll with advantage (costs 1 reroll token)'))
-    .addSubcommand(s=>s.setName('rd').setDescription('Reroll last fight roll with disadvantage (costs 1 reroll token)'))
+    .addSubcommand(s=>s.setName('rr').setDescription('Reroll last fight roll (costs 1 reroll token)')
+      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'})))
     .addSubcommand(s=>s.setName('resolve').setDescription('Resolve the current exchange'))
     .addSubcommand(s=>s.setName('forfeit').setDescription('Concede the fight'))
     .addSubcommand(s=>s.setName('status').setDescription('Show current fight status'))
@@ -1275,6 +1277,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'profile' || interaction.commandName === 'p') return handleProfile(interaction);
     if (interaction.commandName === 'tag') return handleTag(interaction);
     if (interaction.commandName === 'stat') return handleStat(interaction);
+    if (interaction.commandName === 'roll') return handleSlashRoll(interaction);
     if (interaction.commandName === 'fight') return handleFight(interaction);
     if (interaction.commandName === 'npc') return handleNpc(interaction);
     if (interaction.commandName === 'pr') return handlePr(interaction);
@@ -1455,7 +1458,7 @@ async function handleFight(interaction) {
   }
 
   // ── ATK (normal / adv / dis) ──────────────────────────────────────────────
-  if (sub === 'atk' || sub === 'atkadv' || sub === 'atkdis') {
+  if (sub === 'atk') {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
 
@@ -1473,7 +1476,7 @@ async function handleFight(interaction) {
     const stat = interaction.options.getString('stat');
     const target = interaction.options.getUser('target');
     const flavour = interaction.options.getString('flavour') ?? null;
-    const mode = sub === 'atkadv' ? 'adv' : sub === 'atkdis' ? 'dis' : 'normal';
+    const mode = interaction.options.getString('roll') ?? 'normal';
 
     if (!turnOrder.includes(target.id)) return interaction.reply({ content: '❌ That player is not in this fight.', ephemeral: true });
     if (target.id === uid) return interaction.reply({ content: '❌ You cannot target yourself.', ephemeral: true });
@@ -1522,7 +1525,7 @@ async function handleFight(interaction) {
   }
 
   // ── DEF (normal / adv / dis) ──────────────────────────────────────────────
-  if (sub === 'def' || sub === 'defadv' || sub === 'defdis') {
+  if (sub === 'def') {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
     if (fight.phase !== 'defend') return interaction.reply({ content: '❌ No attack to defend against yet.', ephemeral: true });
@@ -1535,7 +1538,7 @@ async function handleFight(interaction) {
 
     const stat = interaction.options.getString('stat');
     const flavour = interaction.options.getString('flavour') ?? null;
-    const mode = sub === 'defadv' ? 'adv' : sub === 'defdis' ? 'dis' : 'normal';
+    const mode = interaction.options.getString('roll') ?? 'normal';
 
     const char = getChar(gid, uid);
     const statVal = char?.[stat] ?? 0;
@@ -1570,7 +1573,7 @@ async function handleFight(interaction) {
   }
 
   // ── REROLLS ────────────────────────────────────────────────────────────────
-  if (sub === 'rr' || sub === 'ra' || sub === 'rd') {
+  if (sub === 'rr') {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
 
@@ -1585,7 +1588,7 @@ async function handleFight(interaction) {
     if (!char || char.rerolls_current <= 0) return interaction.reply({ content: '❌ No rerolls remaining.', ephemeral: true });
     upsertChar(gid, uid, { rerolls_current: char.rerolls_current - 1 });
 
-    const mode = sub === 'ra' ? 'adv' : sub === 'rd' ? 'dis' : 'normal';
+    const mode = interaction.options.getString('roll') ?? 'normal';
     const stat = isAttacker ? fight.atk_stat : fight.def_stat;
     if (!stat) return interaction.reply({ content: '❌ No roll to reroll yet.', ephemeral: true });
 
@@ -1793,6 +1796,81 @@ async function handleFight(interaction) {
     upsertFight(gid, cid, { state: 'idle', turn_order: '[]' });
     return interaction.reply({ content: '🛑 Fight ended by GM. HP states preserved.' });
   }
+}
+
+async function handleSlashRoll(interaction) {
+  const gid = interaction.guild.id;
+  const uid = interaction.user.id;
+  const rollType = interaction.options.getString('roll') ?? 'normal';
+  const notation = interaction.options.getString('notation');
+  const label = interaction.options.getString('label') ?? null;
+  const flavour = interaction.options.getString('flavour') ?? null;
+  const successCheck = interaction.options.getBoolean('success') ?? false;
+
+  const isReroll = rollType === 'rr' || rollType === 'rra' || rollType === 'rrd';
+  const mode = rollType === 'adv' || rollType === 'rra' ? 'adv'
+             : rollType === 'dis' || rollType === 'rrd' ? 'dis'
+             : 'normal';
+
+  let finalNotation = notation;
+  let finalLabel = label;
+  let finalFlavour = flavour;
+
+  if (isReroll) {
+    const last = getLastRoll(gid, interaction.channel.id, uid);
+    if (!last) return interaction.reply({ content: '❌ No previous roll found in this channel.', ephemeral: true });
+    const char = getChar(gid, uid);
+    if (!char || char.rerolls_current <= 0) return interaction.reply({ content: '❌ No rerolls remaining.', ephemeral: true });
+    upsertChar(gid, uid, { rerolls_current: char.rerolls_current - 1 });
+    finalNotation = last.notation;
+    finalLabel = label || last.label;
+  } else {
+    // Stat quick roll
+    if (notation && ['str','con','dex','wis','lck'].includes(notation.toLowerCase())) {
+      const char = getChar(gid, uid);
+      const statVal = char?.[notation.toLowerCase()] ?? 0;
+      finalNotation = `1d20+${statVal}`;
+      finalLabel = label || notation.toLowerCase();
+    } else if (!notation) {
+      return interaction.reply({ content: '❌ Please provide a dice notation e.g. 1d20+5', ephemeral: true });
+    }
+  }
+
+  let result;
+  if (mode === 'adv') result = rollAdvantage(finalNotation);
+  else if (mode === 'dis') result = rollDisadvantage(finalNotation);
+  else result = rollNotation(finalNotation);
+
+  if (!result) return interaction.reply({ content: '❌ Could not parse dice notation.', ephemeral: true });
+
+  saveRoll(gid, interaction.channel.id, uid, finalNotation, finalLabel);
+  const critType = detectCrit(result, mode);
+  const naturalRoll = mode === 'normal' ? result.rolls?.[0] : result.chosen;
+  const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides ?? 20) : null;
+  const rollLine = buildRollLine(result, mode, critType, successResult);
+
+  // Build flavour lines
+  let cleanFlavour = null;
+  if (finalFlavour) {
+    cleanFlavour = finalFlavour.split('\n').map(l => l.trim()).filter(l => l.length > 0).join('\n\n');
+  }
+
+  const char = getChar(gid, uid);
+  const profileEnabled = char?.profile_enabled === 1;
+  let content;
+  if (profileEnabled && char) {
+    const cfg = getConfig(gid);
+    const maxCharges = cfg.heal_charges ?? 3;
+    const healRow = getHealCharges(gid, uid, maxCharges);
+    const tags = getPlayerTags(gid, uid);
+    let displayName = interaction.user.username;
+    try { const m = await interaction.guild.members.fetch(uid); displayName = m.nickname || m.user.username; } catch {}
+    content = buildRollEmbed({ rollLine, label: finalLabel, isReroll, char: { ...char, displayName }, healCharges: healRow.current, maxCharges, flavour: cleanFlavour, total: result.total, critType, tags, gid });
+  } else {
+    content = buildPlainRoll({ rollLine, label: finalLabel, isReroll, flavour: cleanFlavour, total: result.total, critType });
+  }
+
+  await interaction.reply({ content });
 }
 
 // ─────────────────────────────────────────────
