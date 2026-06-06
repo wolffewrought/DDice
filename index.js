@@ -63,6 +63,17 @@ db.exec(`
     guild_id TEXT NOT NULL, tag_name TEXT NOT NULL, emoji TEXT NOT NULL,
     PRIMARY KEY (guild_id, tag_name)
   );
+  CREATE TABLE IF NOT EXISTS npc_categories (
+    guild_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    PRIMARY KEY (guild_id, name)
+  );
+  CREATE TABLE IF NOT EXISTS npc_category_members (
+    guild_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    npc_name TEXT NOT NULL,
+    PRIMARY KEY (guild_id, category, npc_name)
+  );
   CREATE TABLE IF NOT EXISTS npcs (
     guild_id TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -210,6 +221,35 @@ function setNpcWebhook(gid, name, webhookId, webhookToken) {
 
 // Blank silhouette as base64 data URI fallback
 const BLANK_AVATAR = 'https://cdn.discordapp.com/embed/avatars/0.png';
+
+// ── NPC Category helpers ──────────────────────────────────────────────────────
+function getCategories(gid) {
+  return db.prepare('SELECT name FROM npc_categories WHERE guild_id=? ORDER BY name').all(gid).map(r=>r.name);
+}
+function createCategory(gid, name) {
+  db.prepare('INSERT OR IGNORE INTO npc_categories (guild_id, name) VALUES (?,?)').run(gid, name);
+}
+function deleteCategory(gid, name) {
+  db.prepare('DELETE FROM npc_categories WHERE guild_id=? AND name=?').run(gid, name);
+  db.prepare('DELETE FROM npc_category_members WHERE guild_id=? AND category=?').run(gid, name);
+}
+function assignNpcToCategory(gid, npcName, category) {
+  db.prepare('INSERT OR IGNORE INTO npc_category_members (guild_id, category, npc_name) VALUES (?,?,?)').run(gid, category, npcName);
+}
+function removeNpcFromCategory(gid, npcName, category) {
+  db.prepare('DELETE FROM npc_category_members WHERE guild_id=? AND category=? AND npc_name=?').run(gid, category, npcName);
+}
+function getNpcsInCategory(gid, category) {
+  return db.prepare('SELECT npc_name FROM npc_category_members WHERE guild_id=? AND category=? ORDER BY npc_name').all(gid, category).map(r=>r.npc_name);
+}
+function getCategoriesForNpc(gid, npcName) {
+  return db.prepare('SELECT category FROM npc_category_members WHERE guild_id=? AND npc_name=? ORDER BY category').all(gid, npcName).map(r=>r.category);
+}
+function getUncategorisedNpcs(gid) {
+  const all = getAllNpcs(gid).map(n=>n.name);
+  const categorised = db.prepare('SELECT DISTINCT npc_name FROM npc_category_members WHERE guild_id=?').all(gid).map(r=>r.npc_name);
+  return all.filter(n => !categorised.includes(n));
+}
 
 // ── Fight helpers ─────────────────────────────────────────────────────────────
 function getFight(gid, cid) {
@@ -716,11 +756,23 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('reroll').setDescription('Reroll the last NPC roll (costs 1 reroll token)')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
-        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))),
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'})))
+    .addSubcommand(s=>s.setName('categorylist').setDescription('List all NPC categories'))
+    .addSubcommand(s=>s.setName('categorycreate').setDescription('Create a new NPC category')
+      .addStringOption(o=>o.setName('name').setDescription('Category name').setRequired(true)))
+    .addSubcommand(s=>s.setName('categorydelete').setDescription('Delete an NPC category')
+      .addStringOption(o=>o.setName('name').setDescription('Category name').setRequired(true)))
+    .addSubcommand(s=>s.setName('categoryassign').setDescription('Assign an NPC to a category')
+      .addStringOption(o=>o.setName('npc').setDescription('NPC name').setRequired(true))
+      .addStringOption(o=>o.setName('category').setDescription('Category name').setRequired(true)))
+    .addSubcommand(s=>s.setName('categoryremove').setDescription('Remove an NPC from a category')
+      .addStringOption(o=>o.setName('npc').setDescription('NPC name').setRequired(true))
+      .addStringOption(o=>o.setName('category').setDescription('Category name').setRequired(true))),
 
   new SlashCommandBuilder()
     .setName('pr').setDescription('Roll or manage NPCs as a GM persona (GM only)')
     .addSubcommand(s=>s.setName('roll').setDescription('Roll as an NPC via webhook')
+      .addStringOption(o=>o.setName('category').setDescription('Filter by category').setRequired(false))
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('notation').setDescription('Dice notation e.g. 1d20+5 (default: 1d20)').setRequired(false))
       .addStringOption(o=>o.setName('stat').setDescription('Stat label (optional — auto adds modifier)').setRequired(false)
@@ -1280,7 +1332,13 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers],
 });
 
-client.on('ready', () => console.log(`✅ Bot online as ${client.user.tag}`));
+client.on('ready', async () => {
+  console.log(`✅ Bot online as ${client.user.tag}`);
+  // Re-register commands for each guild with current NPC list
+  for (const guild of client.guilds.cache.values()) {
+    await registerSlashCommands(guild.id).catch(console.error);
+  }
+});
 
 client.on('interactionCreate', async interaction => {
   // Handle autocomplete for NPC name fields
@@ -1402,13 +1460,49 @@ client.on('messageCreate', async message => {
 //  REGISTER SLASH COMMANDS + LOGIN
 // ─────────────────────────────────────────────
 
-(async () => {
+async function registerSlashCommands(guildId) {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   try {
-    console.log('Registering slash commands...');
-    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: slashCommands.map(c => c.toJSON()) });
+    let commands = slashCommands;
+    if (guildId) {
+      const npcList = getAllNpcs(guildId);
+      const categories = getCategories(guildId);
+      const uncategorised = getUncategorisedNpcs(guildId);
+
+      if (npcList.length > 0 || categories.length > 0) {
+        commands = slashCommands.map(cmd => {
+          if (cmd.name !== 'pr') return cmd;
+          const json = JSON.parse(JSON.stringify(cmd.toJSON()));
+
+          json.options.forEach(sub => {
+            if (sub.name === 'roll' || sub.name === 'reroll') {
+              // Set category choices
+              const catOpt = sub.options?.find(o => o.name === 'category');
+              if (catOpt) {
+                const catChoices = ['Uncategorised', ...categories].slice(0, 25).map(c => ({ name: c, value: c }));
+                catOpt.choices = catChoices;
+              }
+
+              // Set NPC name choices — all NPCs by default
+              const nameOpt = sub.options?.find(o => o.name === 'name');
+              if (nameOpt && npcList.length > 0) {
+                nameOpt.autocomplete = false;
+                nameOpt.choices = npcList.slice(0, 25).map(n => ({ name: n.name, value: n.name }));
+              }
+            }
+          });
+          return { toJSON: () => json };
+        });
+      }
+    }
+    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands.map(c => c.toJSON()) });
     console.log('✅ Slash commands registered.');
   } catch (err) { console.error('Failed to register slash commands:', err); }
+}
+
+(async () => {
+  console.log('Registering slash commands...');
+  await registerSlashCommands(null);
   client.login(process.env.DISCORD_TOKEN);
 })();
 // ─────────────────────────────────────────────
@@ -1937,6 +2031,8 @@ async function handleNpc(interaction) {
     const order = interaction.options.getString('order') ?? null;
     upsertNpc(gid, name, { str, con, dex, wis, lck, order_name: order });
     const orderLine = order ? ` | ${KNIGHT_EMOJIS[order]??'⚪'} ${order}` : '';
+    // Re-register slash commands so new NPC appears in dropdown
+    registerSlashCommands(gid).catch(console.error);
     return interaction.reply({ content: `✅ NPC **${name}** created.${orderLine}\n💡 Upload an image to the NPC channel with \`${name}\` as the message text to set their avatar.` });
   }
 
@@ -1953,6 +2049,8 @@ async function handleNpc(interaction) {
       } catch {}
     }
     deleteNpc(gid, name);
+    // Re-register slash commands so deleted NPC is removed from dropdown
+    registerSlashCommands(gid).catch(console.error);
     return interaction.reply({ content: `🗑️ NPC **${name}** deleted.` });
   }
 
@@ -1966,6 +2064,43 @@ async function handleNpc(interaction) {
       lines.push(`• **${n.name}**${order}${img} — STR ${n.str} CON ${n.con} DEX ${n.dex} WIS ${n.wis} LCK ${n.lck} | ❤️ ${n.hp_current}/${n.con+2}`);
     });
     return interaction.reply({ content: lines.join('\n') });
+
+  if (sub === 'categorycreate') {
+    const name = interaction.options.getString('name');
+    createCategory(gid, name);
+    registerSlashCommands(gid).catch(console.error);
+    return interaction.reply({ content: `\u2705 Category **${name}** created.` });
+  }
+  if (sub === 'categorydelete') {
+    const name = interaction.options.getString('name');
+    deleteCategory(gid, name);
+    registerSlashCommands(gid).catch(console.error);
+    return interaction.reply({ content: `Category **${name}** deleted.` });
+  }
+  if (sub === 'categorylist') {
+    const cats = getCategories(gid);
+    const uncategorised = getUncategorisedNpcs(gid);
+    const lines2 = ['**NPC Categories:**', ''];
+    cats.forEach(c => { const m = getNpcsInCategory(gid, c); lines2.push(`- **${c}** (${m.length}): ${m.join(', ')||'empty'}`); });
+    if (uncategorised.length) lines2.push(`- **Uncategorised** (${uncategorised.length}): ${uncategorised.join(', ')}`);
+    return interaction.reply({ content: lines2.join('\n') });
+  }
+  if (sub === 'categoryassign') {
+    const npcName = interaction.options.getString('npc');
+    const category = interaction.options.getString('category');
+    if (!getNpc(gid, npcName)) return interaction.reply({ content: 'NPC not found.', ephemeral: true });
+    if (!getCategories(gid).includes(category)) return interaction.reply({ content: 'Category not found.', ephemeral: true });
+    assignNpcToCategory(gid, npcName, category);
+    registerSlashCommands(gid).catch(console.error);
+    return interaction.reply({ content: `**${npcName}** added to **${category}**.` });
+  }
+  if (sub === 'categoryremove') {
+    const npcName = interaction.options.getString('npc');
+    const category = interaction.options.getString('category');
+    removeNpcFromCategory(gid, npcName, category);
+    registerSlashCommands(gid).catch(console.error);
+    return interaction.reply({ content: `**${npcName}** removed from **${category}**.` });
+  }
   }
 }
 
