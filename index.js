@@ -737,7 +737,11 @@ const slashCommands = [
       .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
         .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'})))
     .addSubcommand(s=>s.setName('delete').setDescription('Delete an NPC').addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true)))
-    .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server')),
+    .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server'))
+    .addSubcommand(s=>s.setName('reroll').setDescription('Reroll the last NPC roll (costs 1 reroll token)')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))),
 
   new SlashCommandBuilder()
     .setName('fight').setDescription('Manage a fight between players')
