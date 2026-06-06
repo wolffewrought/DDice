@@ -1061,10 +1061,11 @@ client.on('messageCreate', async message => {
     }
   }
 
-  const match = content.match(/^(!?)(gmrs?|lrest|srest|hpfull|hphalf|roll|r(?:ra|rd|r(?:a|d)?)?|ra|rd|rr(?:a|d)?|heal|h|hp|rerolls)(\d.*|\s.*|[\n].*|$)/i);
+  const match = content.match(/^(!?)(gmrs?|lrest|srest|hpfull|hphalf|roll|r(?:ra|rd|r(?:a|d)?)?|ra|rd|rr(?:a|d)?|heal|h|hp|rerolls)([\s\S]*)/i);
   if (!match) return;
   const raw = (match[1] + match[2]).toLowerCase().replace(/^!/, '');
-  const rest = (match[3] ?? '').trim();
+  // Preserve newlines for flavour text — only trim leading spaces on first line
+  const rest = (match[3] ?? '').replace(/^[ \t]+/, '');
   try {
     if (raw==='r'||raw==='roll') return handleRoll(message, rest, 'normal', false);
     if (raw==='ra') return handleRoll(message, rest, 'adv', false);
