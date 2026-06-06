@@ -722,8 +722,8 @@ const slashCommands = [
     .setName('pr').setDescription('Roll or manage NPCs as a GM persona (GM only)')
     .addSubcommand(s=>s.setName('roll').setDescription('Roll as an NPC via webhook')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
-      .addStringOption(o=>o.setName('notation').setDescription('Dice notation e.g. 1d20+5').setRequired(true))
-      .addStringOption(o=>o.setName('stat').setDescription('Stat label (optional)').setRequired(false)
+      .addStringOption(o=>o.setName('notation').setDescription('Dice notation e.g. 1d20+5 (default: 1d20)').setRequired(false))
+      .addStringOption(o=>o.setName('stat').setDescription('Stat label (optional — auto adds modifier)').setRequired(false)
         .addChoices({name:'STR',value:'STR'},{name:'CON',value:'CON'},{name:'DEX',value:'DEX'},{name:'WIS',value:'WIS'},{name:'LCK',value:'LCK'}))
       .addStringOption(o=>o.setName('label').setDescription('Additional label (optional)').setRequired(false))
       .addStringOption(o=>o.setName('flavour').setDescription('Flavour text').setRequired(false))
@@ -2047,7 +2047,7 @@ async function handlePr(interaction) {
 
   if (sub === 'roll') {
     const name     = interaction.options.getString('name');
-    const notation = interaction.options.getString('notation');
+    const notationRaw = interaction.options.getString('notation') ?? '1d20';
     const stat     = interaction.options.getString('stat') ?? null;
     const labelRaw = interaction.options.getString('label') ?? null;
     const flavour  = interaction.options.getString('flavour') ?? null;
@@ -2058,6 +2058,21 @@ async function handlePr(interaction) {
 
     const npc = getNpc(gid, name);
     if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found. Create it first with \`/npc create\`.`, ephemeral: true });
+
+    // Apply stat modifier to notation
+    let notation = notationRaw;
+    if (stat) {
+      const statKey = stat.toLowerCase();
+      const statVal = npc[statKey] ?? 0;
+      if (statVal !== 0) {
+        // Check if notation already has a modifier
+        if (/[+-]\d+$/.test(notation)) {
+          notation = notation + (statVal >= 0 ? `+${statVal}` : `${statVal}`);
+        } else {
+          notation = notation + (statVal >= 0 ? `+${statVal}` : `${statVal}`);
+        }
+      }
+    }
 
     let result;
     if (mode === 'adv') result = rollAdvantage(notation);
