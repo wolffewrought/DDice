@@ -21,6 +21,10 @@ const db = new Database(DB_PATH);
 console.log('Database path:', DB_PATH);
 db.pragma('journal_mode = WAL');
 
+// ── Schema migrations ─────────────────────────────────────────────────────────
+try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_channel_id TEXT DEFAULT NULL'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS characters (
     guild_id TEXT NOT NULL, user_id TEXT NOT NULL, order_name TEXT DEFAULT NULL,
@@ -756,7 +760,7 @@ async function handleConfig(interaction) {
   if (sub === 'npcchannel') {
     const channel = interaction.options.getChannel('channel');
     setConfig(gid, { npc_channel_id: channel.id });
-    return interaction.reply({ content: `✅ NPC image channel set to <#${channel.id}>. GMs can now upload images there with the NPC name as the message text.`, ephemeral: true });
+    return interaction.reply({ content: `✅ NPC image channel set to <#${channel.id}>. Upload images there with the NPC name as the message text to set avatars.`, ephemeral: true });
   }
 }
 
