@@ -1087,6 +1087,14 @@ client.on('messageCreate', async message => {
     if (raw==='hphalf') return handleRest(message, rest, 'hphalf');
     if (raw==='gmr') return handleGmRoll(message, rest, false);
     if (raw==='gmrs') return handleGmRoll(message, rest, true);
+    // Bare dice notation fallback e.g. 1d20+5
+    const bareMatch = content.match(/^(\d+d\d+(?:[+-]\d+)?)([ \t].*)?(\n[\s\S]*)?$/i);
+    if (bareMatch) {
+      const sameLineRest = (bareMatch[2] ?? '').trim();
+      const flavourRest = bareMatch[3] ?? '';
+      const bareRest = bareMatch[1] + (sameLineRest ? ' ' + sameLineRest : '') + flavourRest;
+      return handleRoll(message, bareRest, 'normal', false);
+    }
   } catch (err) {
     console.error(err);
     message.reply('❌ Something went wrong.');
