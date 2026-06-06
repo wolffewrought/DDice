@@ -773,11 +773,16 @@ async function handleHeal(message, rest) {
 
 async function handleHp(message, rest) {
   const gid = message.guild.id, uid = message.author.id;
-  const mm = rest.match(/^<@!?(\d+)>\s*([+-]\d+)$/), sm = rest.match(/^([+-]\d+)$/);
+  const mm  = rest.match(/^<@!?(\d+)>\s*([+-]\d+)$/);
+  const mm2 = rest.match(/^([+-]\d+)\s*<@!?(\d+)>$/);
+  const sm  = rest.match(/^([+-]\d+)$/);
   let targetId, amount;
   if (mm) {
     if (!(await isGm(message.guild, uid))) return message.reply('❌ Only GMs can modify other players\' HP.');
     targetId=mm[1]; amount=parseInt(mm[2]);
+  } else if (mm2) {
+    if (!(await isGm(message.guild, uid))) return message.reply('❌ Only GMs can modify other players\' HP.');
+    targetId=mm2[2]; amount=parseInt(mm2[1]);
   } else if (sm) { targetId=uid; amount=parseInt(sm[1]); }
   else return message.reply('❌ Usage: `!hp +5` or `!hp @user -3`');
   const ch = getChar(gid, targetId);
@@ -791,11 +796,16 @@ async function handleHp(message, rest) {
 
 async function handleRerolls(message, rest) {
   const gid = message.guild.id, uid = message.author.id;
-  const mm = rest.match(/^<@!?(\d+)>\s*([+-]\d+)$/), sm = rest.match(/^([+-]\d+)$/);
+  const mm  = rest.match(/^<@!?(\d+)>\s*([+-]\d+)$/);
+  const mm2 = rest.match(/^([+-]\d+)\s*<@!?(\d+)>$/);
+  const sm  = rest.match(/^([+-]\d+)$/);
   let targetId, amount;
   if (mm) {
     if (!(await isGm(message.guild, uid))) return message.reply('❌ Only GMs can modify other players\' rerolls.');
     targetId=mm[1]; amount=parseInt(mm[2]);
+  } else if (mm2) {
+    if (!(await isGm(message.guild, uid))) return message.reply('❌ Only GMs can modify other players\' rerolls.');
+    targetId=mm2[2]; amount=parseInt(mm2[1]);
   } else if (sm) { targetId=uid; amount=parseInt(sm[1]); }
   else return message.reply('❌ Usage: `!rerolls +1` or `!rerolls @user -1`');
   const ch = getChar(gid, targetId);
