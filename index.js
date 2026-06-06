@@ -1958,15 +1958,20 @@ async function handlePr(interaction) {
     const notation = interaction.options.getString('notation');
     const label    = interaction.options.getString('label') ?? null;
     const flavour  = interaction.options.getString('flavour') ?? null;
+    const rollType = interaction.options.getString('roll') ?? 'normal';
+    const mode     = rollType === 'adv' ? 'adv' : rollType === 'dis' ? 'dis' : 'normal';
 
     const npc = getNpc(gid, name);
     if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found. Create it first with \`/npc create\`.`, ephemeral: true });
 
-    const result = rollNotation(notation);
+    let result;
+    if (mode === 'adv') result = rollAdvantage(notation);
+    else if (mode === 'dis') result = rollDisadvantage(notation);
+    else result = rollNotation(notation);
     if (!result) return interaction.reply({ content: '❌ Invalid dice notation.', ephemeral: true });
 
-    const critType = detectCrit(result, 'normal');
-    const rollLine = buildRollLine(result, 'normal', critType, null);
+    const critType = detectCrit(result, mode);
+    const rollLine = buildRollLine(result, mode, critType, null);
 
     // Build embed text
     const lines = [];
