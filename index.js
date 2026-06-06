@@ -978,6 +978,26 @@ async function handleTag(interaction) {
       const emoji = interaction.options.getString('emoji');
       const name = interaction.options.getString('name');
       if (!emoji || !name) return interaction.reply({ content: '❌ Please provide both an emoji and a name.', ephemeral: true });
+
+      // Validate emoji format
+      const isUnicodeEmoji = /^\p{Emoji}/u.test(emoji);
+      const isCustomEmoji = /^<a?:[a-zA-Z0-9_]+:\d+>$/.test(emoji);
+      const looksLikeName = /^:[a-zA-Z0-9_]+:$/.test(emoji);
+
+      if (looksLikeName) {
+        return interaction.reply({
+          content: `❌ **${emoji}** looks like an emoji name, not the emoji itself.\n\nTo get the correct format:\n1. Type \`\\${emoji}\` in any channel and send it\n2. Discord will show the full ID like \`<:name:123456789>\`\n3. Copy that and use it as the emoji`,
+          ephemeral: true
+        });
+      }
+
+      if (!isUnicodeEmoji && !isCustomEmoji) {
+        return interaction.reply({
+          content: `❌ Invalid emoji format. Use either:\n• A standard emoji: \`⚔️\`\n• A server emoji ID: \`<:emojiname:123456789012345678>\`\n\nTo get a server emoji ID, type \`\\:emojiname:\` in chat and copy the result.`,
+          ephemeral: true
+        });
+      }
+
       addCustomTag(gid, name, emoji);
       return interaction.reply({ content: `${emoji} Custom tag **${name}** created.` });
     }
