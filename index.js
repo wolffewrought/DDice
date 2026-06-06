@@ -12,12 +12,13 @@ const path = require('path');
 //  DATABASE
 // ─────────────────────────────────────────────
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'ttrpg.db');
-// Ensure the directory exists before opening the database
 const fs = require('fs');
+// Always write to the persistent volume path, fall back to local for dev
+const DB_PATH = '/app/data/ttrpg.db';
 const dbDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
 const db = new Database(DB_PATH);
+console.log('Database path:', DB_PATH);
 db.pragma('journal_mode = WAL');
 
 db.exec(`
