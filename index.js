@@ -641,7 +641,7 @@ const slashCommands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand(s=>s.setName('gmrole').setDescription('Set the GM role').addRoleOption(o=>o.setName('role').setDescription('The GM role').setRequired(true)))
     .addSubcommand(s=>s.setName('heal').setDescription('Set max Heal charges for White Knights').addIntegerOption(o=>o.setName('charges').setDescription('Number of charges').setRequired(true).setMinValue(1).setMaxValue(10)))
-    .addSubcommand(s=>s.setName('npcchannel').setDescription('Set the NPC image bank channel').addChannelOption(o=>o.setName('channel').setDescription('The channel for NPC images').setRequired(true))),
+    .addSubcommand(s=>s.setName('npcchannel').setDescription('Set the NPC image bank channel').addStringOption(o=>o.setName('channel').setDescription('Channel ID or #channel mention').setRequired(true))),
 
   new SlashCommandBuilder()
     .setName('char').setDescription('Character setup and display')
@@ -790,9 +790,10 @@ async function handleConfig(interaction) {
     return interaction.reply({ content: `✅ White Knight Heal charges set to **${charges}**.`, ephemeral: true });
   }
   if (sub === 'npcchannel') {
-    const channel = interaction.options.getChannel('channel');
-    setConfig(gid, { npc_channel_id: channel.id });
-    return interaction.reply({ content: `✅ NPC image channel set to <#${channel.id}>. Upload images there with the NPC name as the message text to set avatars.`, ephemeral: true });
+    const raw = interaction.options.getString('channel');
+    const channelId = raw.replace(/[<#>]/g, '').trim();
+    setConfig(gid, { npc_channel_id: channelId });
+    return interaction.reply({ content: `✅ NPC image channel set to <#${channelId}>. Upload images there with the NPC name as the message text to set avatars.`, ephemeral: true });
   }
 }
 
