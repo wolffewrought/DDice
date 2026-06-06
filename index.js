@@ -40,7 +40,7 @@ db.exec(`
     PRIMARY KEY (guild_id, channel_id, user_id)
   );
   CREATE TABLE IF NOT EXISTS guild_config (
-    guild_id TEXT PRIMARY KEY, gm_role_id TEXT DEFAULT NULL, heal_charges INTEGER DEFAULT 3
+    guild_id TEXT PRIMARY KEY, gm_role_id TEXT DEFAULT NULL, heal_charges INTEGER DEFAULT 3, npc_channel_id TEXT DEFAULT NULL
   );
   CREATE TABLE IF NOT EXISTS heal_charges (
     guild_id TEXT NOT NULL, user_id TEXT NOT NULL, current INTEGER DEFAULT 3,
@@ -53,6 +53,38 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS custom_tags (
     guild_id TEXT NOT NULL, tag_name TEXT NOT NULL, emoji TEXT NOT NULL,
     PRIMARY KEY (guild_id, tag_name)
+  );
+  CREATE TABLE IF NOT EXISTS npcs (
+    guild_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    order_name TEXT DEFAULT NULL,
+    str INTEGER DEFAULT 0,
+    con INTEGER DEFAULT 0,
+    dex INTEGER DEFAULT 0,
+    wis INTEGER DEFAULT 0,
+    lck INTEGER DEFAULT 0,
+    hp_current INTEGER DEFAULT 0,
+    image_url TEXT DEFAULT NULL,
+    webhook_id TEXT DEFAULT NULL,
+    webhook_token TEXT DEFAULT NULL,
+    PRIMARY KEY (guild_id, name)
+  );
+  CREATE TABLE IF NOT EXISTS fights (
+    guild_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'idle',
+    turn_order TEXT NOT NULL DEFAULT '[]',
+    turn_index INTEGER NOT NULL DEFAULT 0,
+    phase TEXT NOT NULL DEFAULT 'attack',
+    current_target TEXT DEFAULT NULL,
+    atk_roll INTEGER DEFAULT NULL,
+    atk_nat INTEGER DEFAULT NULL,
+    atk_stat TEXT DEFAULT NULL,
+    def_roll INTEGER DEFAULT NULL,
+    def_nat INTEGER DEFAULT NULL,
+    def_stat TEXT DEFAULT NULL,
+    hp_state TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (guild_id, channel_id)
   );
 `);
 
@@ -134,6 +166,59 @@ function resolveTagEmoji(gid, tagName) {
   const custom = db.prepare('SELECT emoji FROM custom_tags WHERE guild_id=? AND tag_name=?').get(gid, tagName);
   return custom ? custom.emoji : '🏷️';
 }
+// ── NPC helpers ───────────────────────────────────────────────────────────────
+function getNpc(gid, name) {
+  return db.prepare('SELECT * FROM npcs WHERE guild_id=? AND name=?').get(gid, name);
+}
+function getAllNpcs(gid) {
+  return db.prepare('SELECT * FROM npcs WHERE guild_id=? ORDER BY name').all(gid);
+}
+function upsertNpc(gid, name, fields) {
+  const ex = getNpc(gid, name);
+  if (!ex) {
+    db.prepare('INSERT INTO npcs (guild_id, name, order_name, str, con, dex, wis, lck, hp_current, image_url, webhook_id, webhook_token) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(gid, name, fields.order_name??null, fields.str??0, fields.con??0, fields.dex??0, fields.wis??0, fields.lck??0,
+        (fields.con??0)+2, fields.image_url??null, fields.webhook_id??null, fields.webhook_token??null);
+  } else {
+    const sets = Object.entries(fields).map(([k])=>`${k}=?`).join(',');
+    db.prepare(`UPDATE npcs SET ${sets} WHERE guild_id=? AND name=?`).run(...Object.values(fields), gid, name);
+  }
+  return getNpc(gid, name);
+}
+function deleteNpc(gid, name) {
+  db.prepare('DELETE FROM npcs WHERE guild_id=? AND name=?').run(gid, name);
+}
+function setNpcImage(gid, name, url) {
+  db.prepare('UPDATE npcs SET image_url=? WHERE guild_id=? AND name=?').run(url, gid, name);
+}
+function setNpcWebhook(gid, name, webhookId, webhookToken) {
+  db.prepare('UPDATE npcs SET webhook_id=?, webhook_token=? WHERE guild_id=? AND name=?').run(webhookId, webhookToken, gid, name);
+}
+
+// Blank silhouette as base64 data URI fallback
+const BLANK_AVATAR = 'https://cdn.discordapp.com/embed/avatars/0.png';
+
+// ── Fight helpers ─────────────────────────────────────────────────────────────
+function getFight(gid, cid) {
+  return db.prepare('SELECT * FROM fights WHERE guild_id=? AND channel_id=?').get(gid, cid);
+}
+function upsertFight(gid, cid, fields) {
+  const ex = getFight(gid, cid);
+  if (!ex) {
+    db.prepare('INSERT INTO fights (guild_id, channel_id, state, turn_order, turn_index, phase, current_target, atk_roll, atk_nat, atk_stat, def_roll, def_nat, def_stat, hp_state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(gid, cid, fields.state??'idle', fields.turn_order??'[]', fields.turn_index??0, fields.phase??'attack',
+        fields.current_target??null, fields.atk_roll??null, fields.atk_nat??null, fields.atk_stat??null,
+        fields.def_roll??null, fields.def_nat??null, fields.def_stat??null, fields.hp_state??'{}');
+  } else {
+    const sets = Object.entries(fields).map(([k])=>`${k}=?`).join(',');
+    db.prepare(`UPDATE fights SET ${sets} WHERE guild_id=? AND channel_id=?`).run(...Object.values(fields), gid, cid);
+  }
+  return getFight(gid, cid);
+}
+function deleteFight(gid, cid) {
+  db.prepare('DELETE FROM fights WHERE guild_id=? AND channel_id=?').run(gid, cid);
+}
+
 function getAllAvailableTags(gid) {
   const customs = getCustomTags(gid).map(t => t.tag_name);
   return [...Object.keys(PRESET_TAGS), ...customs];
@@ -248,7 +333,7 @@ function buildRollLine(result, mode, critType, successResult) {
   const suffix = successResult ? `  ${successResult.emoji} ${successResult.label}` : '';
   if (mode === 'normal') return `🎲  ${result.notation} → [${result.rolls.join(', ')}]${modStr} = ${ts}${suffix}`;
   const ml = mode === 'adv' ? '(advantage)' : '(disadvantage)';
-  return `🎲  ${result.notation} ${ml} → [${result.chosen}, ${result.dropped}]${modStr} = ${ts}${suffix}`;
+  return `🎲  ${result.notation} ${ml} → [${result.chosen}, ~~${result.dropped}~~]${modStr} = ${ts}${suffix}`;
 }
 
 function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharges, flavour, total, critType, tags, gid }) {
@@ -542,7 +627,8 @@ const slashCommands = [
     .setName('config').setDescription('Server configuration (Admin only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand(s=>s.setName('gmrole').setDescription('Set the GM role').addRoleOption(o=>o.setName('role').setDescription('The GM role').setRequired(true)))
-    .addSubcommand(s=>s.setName('heal').setDescription('Set max Heal charges for White Knights').addIntegerOption(o=>o.setName('charges').setDescription('Number of charges').setRequired(true).setMinValue(1).setMaxValue(10))),
+    .addSubcommand(s=>s.setName('heal').setDescription('Set max Heal charges for White Knights').addIntegerOption(o=>o.setName('charges').setDescription('Number of charges').setRequired(true).setMinValue(1).setMaxValue(10)))
+    .addSubcommand(s=>s.setName('npcchannel').setDescription('Set the NPC image bank channel').addChannelOption(o=>o.setName('channel').setDescription('The channel for NPC images').setRequired(true))),
 
   new SlashCommandBuilder()
     .setName('char').setDescription('Character setup and display')
@@ -586,6 +672,62 @@ const slashCommands = [
     .setName('stat').setDescription('Show stat descriptions'),
 
   new SlashCommandBuilder()
+    .setName('npc').setDescription('Manage NPCs (GM only)')
+    .addSubcommand(s=>s.setName('create').setDescription('Create an NPC')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addIntegerOption(o=>o.setName('str').setDescription('Strength').setRequired(true))
+      .addIntegerOption(o=>o.setName('con').setDescription('Constitution').setRequired(true))
+      .addIntegerOption(o=>o.setName('dex').setDescription('Dexterity').setRequired(true))
+      .addIntegerOption(o=>o.setName('wis').setDescription('Wisdom').setRequired(true))
+      .addIntegerOption(o=>o.setName('lck').setDescription('Luck').setRequired(true))
+      .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
+        .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'})))
+    .addSubcommand(s=>s.setName('delete').setDescription('Delete an NPC').addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true)))
+    .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server')),
+
+  new SlashCommandBuilder()
+    .setName('pr').setDescription('Roll or manage NPCs as a GM persona (GM only)')
+    .addSubcommand(s=>s.setName('roll').setDescription('Roll as an NPC via webhook')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addStringOption(o=>o.setName('notation').setDescription('Dice notation e.g. 1d20+5').setRequired(true))
+      .addStringOption(o=>o.setName('label').setDescription('Roll label e.g. atk').setRequired(false))
+      .addStringOption(o=>o.setName('flavour').setDescription('Flavour text').setRequired(false)))
+    .addSubcommand(s=>s.setName('create').setDescription('Create an NPC')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addIntegerOption(o=>o.setName('str').setDescription('Strength').setRequired(true))
+      .addIntegerOption(o=>o.setName('con').setDescription('Constitution').setRequired(true))
+      .addIntegerOption(o=>o.setName('dex').setDescription('Dexterity').setRequired(true))
+      .addIntegerOption(o=>o.setName('wis').setDescription('Wisdom').setRequired(true))
+      .addIntegerOption(o=>o.setName('lck').setDescription('Luck').setRequired(true))
+      .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
+        .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'})))
+    .addSubcommand(s=>s.setName('delete').setDescription('Delete an NPC').addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true)))
+    .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server')),
+
+  new SlashCommandBuilder()
+    .setName('fight').setDescription('Manage a fight between players')
+    .addSubcommand(s=>s.setName('start').setDescription('Start a fight')
+      .addUserOption(o=>o.setName('p1').setDescription('Fighter 1').setRequired(true))
+      .addUserOption(o=>o.setName('p2').setDescription('Fighter 2').setRequired(true))
+      .addUserOption(o=>o.setName('p3').setDescription('Fighter 3').setRequired(false))
+      .addUserOption(o=>o.setName('p4').setDescription('Fighter 4').setRequired(false))
+      .addUserOption(o=>o.setName('p5').setDescription('Fighter 5').setRequired(false))
+      .addUserOption(o=>o.setName('p6').setDescription('Fighter 6').setRequired(false)))
+    .addSubcommand(s=>s.setName('atk').setDescription('Attack a target')
+      .addStringOption(o=>o.setName('stat').setDescription('Stat to attack with').setRequired(true)
+        .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
+      .addUserOption(o=>o.setName('target').setDescription('Player to attack').setRequired(true))
+      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
+    .addSubcommand(s=>s.setName('def').setDescription('Defend against the current attack')
+      .addStringOption(o=>o.setName('stat').setDescription('Stat to defend with').setRequired(true)
+        .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
+      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
+    .addSubcommand(s=>s.setName('resolve').setDescription('Resolve the current exchange'))
+    .addSubcommand(s=>s.setName('forfeit').setDescription('Concede the fight'))
+    .addSubcommand(s=>s.setName('status').setDescription('Show current fight status'))
+    .addSubcommand(s=>s.setName('end').setDescription('End the fight (GM only)')),
+
+  new SlashCommandBuilder()
     .setName('p').setDescription('Shorthand for /profile')
     .addSubcommand(s=>s.setName('on').setDescription('Enable profile embed, max HP and rerolls'))
     .addSubcommand(s=>s.setName('off').setDescription('Disable profile embed'))
@@ -610,6 +752,11 @@ async function handleConfig(interaction) {
     const charges = interaction.options.getInteger('charges');
     setConfig(gid, { heal_charges: charges });
     return interaction.reply({ content: `✅ White Knight Heal charges set to **${charges}**.`, ephemeral: true });
+  }
+  if (sub === 'npcchannel') {
+    const channel = interaction.options.getChannel('channel');
+    setConfig(gid, { npc_channel_id: channel.id });
+    return interaction.reply({ content: `✅ NPC image channel set to <#${channel.id}>. GMs can now upload images there with the NPC name as the message text.`, ephemeral: true });
   }
 }
 
@@ -1094,6 +1241,9 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'profile' || interaction.commandName === 'p') return handleProfile(interaction);
     if (interaction.commandName === 'tag') return handleTag(interaction);
     if (interaction.commandName === 'stat') return handleStat(interaction);
+    if (interaction.commandName === 'fight') return handleFight(interaction);
+    if (interaction.commandName === 'npc') return handleNpc(interaction);
+    if (interaction.commandName === 'pr') return handlePr(interaction);
   } catch (err) {
     console.error(err);
     if (!interaction.replied) interaction.reply({ content: '❌ Something went wrong.', ephemeral: true });
@@ -1103,6 +1253,25 @@ client.on('interactionCreate', async interaction => {
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
   const content = message.content.trim();
+
+  // NPC image bank — detect image uploads in npc channel
+  if (message.attachments.size > 0) {
+    const cfg = getConfig(message.guild.id);
+    if (cfg.npc_channel_id && message.channel.id === cfg.npc_channel_id) {
+      const npcName = message.content.trim();
+      if (npcName) {
+        const npc = getNpc(message.guild.id, npcName);
+        if (npc) {
+          const imageUrl = message.attachments.first().url;
+          setNpcImage(message.guild.id, npcName, imageUrl);
+          // Reset webhook so it gets recreated with new avatar
+          setNpcWebhook(message.guild.id, npcName, null, null);
+          message.react('✅').catch(()=>{});
+        }
+      }
+      return; // Don't process as commands
+    }
+  }
 
   // Sheet import detection — check before prefix matching
   if (content.includes('[TTRPG SHEET]')) {
@@ -1163,3 +1332,503 @@ client.on('messageCreate', async message => {
   } catch (err) { console.error('Failed to register slash commands:', err); }
   client.login(process.env.DISCORD_TOKEN);
 })();
+// ─────────────────────────────────────────────
+//  FIGHT SYSTEM
+// ─────────────────────────────────────────────
+
+const STAT_LABELS = { str:'STR', con:'CON', dex:'DEX', wis:'WIS', lck:'LCK' };
+
+function fightTotalStr(total, nat, sides) {
+  const isCrit = nat === sides;
+  const isFail = nat === 1;
+  if (isCrit) return `🟡 **${total}**`;
+  if (isFail) return `🔴 **${total}**`;
+  return `**${total}**`;
+}
+
+function resolveDamage(atkRoll, atkNat, atkSides, defRoll, defNat, defSides) {
+  let dmg = 0;
+  const hit = atkRoll >= defRoll;
+  if (hit) {
+    dmg = 1;
+    if (atkNat === atkSides) dmg += 1; // attacker nat max
+    if (defNat === 1) dmg += 1;        // defender nat 1
+    if (atkNat === atkSides && defNat === 1) dmg += 1; // both — total 4
+  }
+  return { hit, dmg };
+}
+
+async function handleFight(interaction) {
+  const sub = interaction.options.getSubcommand();
+  const gid = interaction.guild.id;
+  const cid = interaction.channel.id;
+  const uid = interaction.user.id;
+
+  // ── START ──────────────────────────────────────────────────────────────────
+  if (sub === 'start') {
+    const existing = getFight(gid, cid);
+    if (existing && existing.state !== 'idle') {
+      return interaction.reply({ content: '❌ A fight is already in progress in this channel. Use `/fight end` to stop it first.', ephemeral: true });
+    }
+
+    const playerOptions = ['p1','p2','p3','p4','p5','p6'];
+    const fighters = [];
+    for (const opt of playerOptions) {
+      const u = interaction.options.getUser(opt);
+      if (u) fighters.push(u.id);
+    }
+    if (fighters.length < 2) return interaction.reply({ content: '❌ Need at least 2 fighters.', ephemeral: true });
+
+    // Roll initiative for each fighter
+    const initiatives = [];
+    const hpState = {};
+    for (const fid of fighters) {
+      const char = getChar(gid, fid);
+      const dex = char?.dex ?? 0;
+      const roll = rollDie(20);
+      const total = roll + dex;
+      const member = await interaction.guild.members.fetch(fid).catch(()=>null);
+      const name = member?.nickname || member?.user.username || fid;
+      const hp = char ? char.hp_current : 0;
+      hpState[fid] = hp;
+      initiatives.push({ id: fid, name, roll, dex, total });
+    }
+
+    // Sort by total descending, ties broken by raw roll
+    initiatives.sort((a,b) => b.total - a.total || b.roll - a.roll);
+
+    const turnOrder = initiatives.map(i => i.id);
+    const lines = ['⚔️ **Fight started! Initiative order:**', ''];
+    initiatives.forEach((f,i) => {
+      lines.push(`${i+1}. **${f.name}** — 1d20+${f.dex} → [${f.roll}] = **${f.total}**`);
+    });
+    lines.push('');
+    const first = initiatives[0];
+    lines.push(`🎯 **${first.name}** goes first! Use \`/fight atk\` to attack.`);
+
+    upsertFight(gid, cid, {
+      state: 'active',
+      turn_order: JSON.stringify(turnOrder),
+      turn_index: 0,
+      phase: 'attack',
+      current_target: null,
+      atk_roll: null, atk_nat: null, atk_stat: null,
+      def_roll: null, def_nat: null, def_stat: null,
+      hp_state: JSON.stringify(hpState),
+    });
+
+    return interaction.reply({ content: lines.join('\n') });
+  }
+
+  // ── ATK ────────────────────────────────────────────────────────────────────
+  if (sub === 'atk') {
+    const fight = getFight(gid, cid);
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+
+    const turnOrder = JSON.parse(fight.turn_order);
+    const currentId = turnOrder[fight.turn_index];
+
+    if (uid !== currentId) {
+      const member = await interaction.guild.members.fetch(currentId).catch(()=>null);
+      const name = member?.nickname || member?.user.username || 'their turn';
+      return interaction.reply({ content: `⚠️ It's **${name}**'s turn to attack.`, ephemeral: false });
+    }
+
+    if (fight.phase !== 'attack') return interaction.reply({ content: '❌ Waiting for defender to roll first.', ephemeral: true });
+
+    const stat = interaction.options.getString('stat');
+    const target = interaction.options.getUser('target');
+    const flavour = interaction.options.getString('flavour') ?? null;
+
+    if (!turnOrder.includes(target.id)) return interaction.reply({ content: '❌ That player is not in this fight.', ephemeral: true });
+    if (target.id === uid) return interaction.reply({ content: '❌ You cannot target yourself.', ephemeral: true });
+
+    const hpState = JSON.parse(fight.hp_state);
+    if (hpState[target.id] !== undefined && hpState[target.id] <= 0) {
+      return interaction.reply({ content: '❌ That player is already down.', ephemeral: true });
+    }
+
+    const char = getChar(gid, uid);
+    const statVal = char?.[stat] ?? 0;
+    const nat = rollDie(20);
+    const total = nat + statVal;
+
+    const member = await interaction.guild.members.fetch(uid).catch(()=>null);
+    const name = member?.nickname || member?.user.username || uid;
+    const targetMember = await interaction.guild.members.fetch(target.id).catch(()=>null);
+    const targetName = targetMember?.nickname || targetMember?.user.username || target.id;
+
+    const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
+    const ts = fightTotalStr(total, nat, 20);
+    const rollLine = `⚔️  1d20+${STAT_LABELS[stat]} → [${nat}]${modStr} = ${ts}`;
+
+    const lines = [`**${name}** attacks **${targetName}** with ${STAT_LABELS[stat]}!`, rollLine];
+    if (flavour) lines.push('', `*${flavour}*`);
+    lines.push('', `🛡️ **${targetName}** — use \`/fight def\` to defend.`);
+
+    upsertFight(gid, cid, {
+      phase: 'defend',
+      current_target: target.id,
+      atk_roll: total,
+      atk_nat: nat,
+      atk_stat: stat,
+      def_roll: null, def_nat: null, def_stat: null,
+    });
+
+    // Save roll for rerolls
+    saveRoll(gid, cid, uid, `1d20+${statVal}`, `atk ${STAT_LABELS[stat]}`);
+    return interaction.reply({ content: lines.join('\n') });
+  }
+
+  // ── DEF ────────────────────────────────────────────────────────────────────
+  if (sub === 'def') {
+    const fight = getFight(gid, cid);
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    if (fight.phase !== 'defend') return interaction.reply({ content: '❌ No attack to defend against yet.', ephemeral: true });
+
+    const turnOrder = JSON.parse(fight.turn_order);
+    if (uid !== fight.current_target) {
+      const member = await interaction.guild.members.fetch(fight.current_target).catch(()=>null);
+      const name = member?.nickname || member?.user.username || 'the target';
+      return interaction.reply({ content: `⚠️ **${name}** is the one defending.`, ephemeral: false });
+    }
+
+    const stat = interaction.options.getString('stat');
+    const flavour = interaction.options.getString('flavour') ?? null;
+
+    const char = getChar(gid, uid);
+    const statVal = char?.[stat] ?? 0;
+    const nat = rollDie(20);
+    const total = nat + statVal;
+
+    const member = await interaction.guild.members.fetch(uid).catch(()=>null);
+    const name = member?.nickname || member?.user.username || uid;
+
+    const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
+    const ts = fightTotalStr(total, nat, 20);
+    const rollLine = `🛡️  1d20+${STAT_LABELS[stat]} → [${nat}]${modStr} = ${ts}`;
+
+    const lines = [`**${name}** defends with ${STAT_LABELS[stat]}!`, rollLine];
+    if (flavour) lines.push('', `*${flavour}*`);
+    lines.push('', '⚡ Use `/fight resolve` to resolve this exchange.');
+
+    upsertFight(gid, cid, {
+      def_roll: total,
+      def_nat: nat,
+      def_stat: stat,
+    });
+
+    saveRoll(gid, cid, uid, `1d20+${statVal}`, `def ${STAT_LABELS[stat]}`);
+    return interaction.reply({ content: lines.join('\n') });
+  }
+
+  // ── RESOLVE ────────────────────────────────────────────────────────────────
+  if (sub === 'resolve') {
+    const fight = getFight(gid, cid);
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    if (fight.phase !== 'defend' || fight.def_roll === null) return interaction.reply({ content: '❌ Both attack and defend rolls needed before resolving.', ephemeral: true });
+
+    const turnOrder = JSON.parse(fight.turn_order);
+    const attackerId = turnOrder[fight.turn_index];
+    const defenderId = fight.current_target;
+    const hpState = JSON.parse(fight.hp_state);
+
+    const { hit, dmg } = resolveDamage(
+      fight.atk_roll, fight.atk_nat, 20,
+      fight.def_roll, fight.def_nat, 20
+    );
+
+    const atkMember = await interaction.guild.members.fetch(attackerId).catch(()=>null);
+    const defMember = await interaction.guild.members.fetch(defenderId).catch(()=>null);
+    const atkName = atkMember?.nickname || atkMember?.user.username || attackerId;
+    const defName = defMember?.nickname || defMember?.user.username || defenderId;
+
+    const lines = ['─────────────────────────────', '⚔️  **Exchange Resolved**', ''];
+    lines.push(`${atkName} (**${STAT_LABELS[fight.atk_stat]}**): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
+    lines.push(`${defName} (**${STAT_LABELS[fight.def_stat]}**): ${fightTotalStr(fight.def_roll, fight.def_nat, 20)}`);
+    lines.push('');
+
+    if (hit) {
+      const prevHp = hpState[defenderId] ?? 0;
+      const newHp = prevHp - dmg;
+      hpState[defenderId] = newHp;
+      // Also update character db
+      upsertChar(gid, defenderId, { hp_current: newHp });
+      lines.push(`💥 **${atkName}** hits **${defName}** for **${dmg}** damage!`);
+      lines.push(`❤️ ${defName} HP: **${prevHp} → ${newHp}**`);
+
+      if (newHp <= 0) {
+        lines.push('', `💀 **${defName}** has been knocked down! HP: **${newHp}**`);
+        // Remove from turn order
+        const newOrder = turnOrder.filter(id => id !== defenderId);
+        if (newOrder.length <= 1) {
+          const winnerId = newOrder[0];
+          const winMember = await interaction.guild.members.fetch(winnerId).catch(()=>null);
+          const winName = winMember?.nickname || winMember?.user.username || winnerId;
+          lines.push(`\n🏆 **${winName}** wins the fight!`);
+          upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState) });
+          return interaction.reply({ content: lines.join('\n') });
+        }
+        // Advance turn
+        const newIndex = fight.turn_index % newOrder.length;
+        const nextId = newOrder[newIndex];
+        const nextMember = await interaction.guild.members.fetch(nextId).catch(()=>null);
+        const nextName = nextMember?.nickname || nextMember?.user.username || nextId;
+        lines.push(`\n🎯 **${nextName}**'s turn to attack!`);
+        upsertFight(gid, cid, {
+          turn_order: JSON.stringify(newOrder),
+          turn_index: newIndex,
+          phase: 'attack',
+          current_target: null,
+          atk_roll: null, atk_nat: null, atk_stat: null,
+          def_roll: null, def_nat: null, def_stat: null,
+          hp_state: JSON.stringify(hpState),
+        });
+        return interaction.reply({ content: lines.join('\n') });
+      }
+    } else {
+      lines.push(`🛡️ **${defName}** blocks the attack! No damage.`);
+    }
+
+    // Advance turn to next active fighter
+    let nextIndex = (fight.turn_index + 1) % turnOrder.length;
+    // Skip downed fighters
+    let safety = 0;
+    while (hpState[turnOrder[nextIndex]] !== undefined && hpState[turnOrder[nextIndex]] <= 0 && safety < turnOrder.length) {
+      nextIndex = (nextIndex + 1) % turnOrder.length;
+      safety++;
+    }
+    const nextId = turnOrder[nextIndex];
+    const nextMember = await interaction.guild.members.fetch(nextId).catch(()=>null);
+    const nextName = nextMember?.nickname || nextMember?.user.username || nextId;
+    lines.push(`\n🎯 **${nextName}**'s turn to attack!`);
+
+    upsertFight(gid, cid, {
+      turn_index: nextIndex,
+      phase: 'attack',
+      current_target: null,
+      atk_roll: null, atk_nat: null, atk_stat: null,
+      def_roll: null, def_nat: null, def_stat: null,
+      hp_state: JSON.stringify(hpState),
+    });
+
+    return interaction.reply({ content: lines.join('\n') });
+  }
+
+  // ── FORFEIT ────────────────────────────────────────────────────────────────
+  if (sub === 'forfeit') {
+    const fight = getFight(gid, cid);
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+
+    const turnOrder = JSON.parse(fight.turn_order);
+    if (!turnOrder.includes(uid)) return interaction.reply({ content: '❌ You are not in this fight.', ephemeral: true });
+
+    const member = await interaction.guild.members.fetch(uid).catch(()=>null);
+    const name = member?.nickname || member?.user.username || uid;
+    const hpState = JSON.parse(fight.hp_state);
+
+    // HP state preserved as-is
+    const newOrder = turnOrder.filter(id => id !== uid);
+    const lines = [`🏳️ **${name}** forfeits the fight! Their HP remains at **${hpState[uid] ?? 0}**.`];
+
+    if (newOrder.length <= 1) {
+      if (newOrder.length === 1) {
+        const winMember = await interaction.guild.members.fetch(newOrder[0]).catch(()=>null);
+        const winName = winMember?.nickname || winMember?.user.username || newOrder[0];
+        lines.push(`🏆 **${winName}** wins!`);
+      }
+      upsertFight(gid, cid, { state: 'idle', turn_order: '[]' });
+    } else {
+      let newIndex = fight.turn_index % newOrder.length;
+      const nextId = newOrder[newIndex];
+      const nextMember = await interaction.guild.members.fetch(nextId).catch(()=>null);
+      const nextName = nextMember?.nickname || nextMember?.user.username || nextId;
+      lines.push(`🎯 Fight continues — **${nextName}**'s turn!`);
+      upsertFight(gid, cid, {
+        turn_order: JSON.stringify(newOrder),
+        turn_index: newIndex,
+        phase: 'attack',
+        current_target: null,
+        atk_roll: null, atk_nat: null, def_roll: null, def_nat: null,
+      });
+    }
+
+    return interaction.reply({ content: lines.join('\n') });
+  }
+
+  // ── STATUS ─────────────────────────────────────────────────────────────────
+  if (sub === 'status') {
+    const fight = getFight(gid, cid);
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: false });
+
+    const turnOrder = JSON.parse(fight.turn_order);
+    const hpState = JSON.parse(fight.hp_state);
+    const currentId = turnOrder[fight.turn_index];
+
+    const lines = ['⚔️ **Fight Status**', ''];
+    for (let i = 0; i < turnOrder.length; i++) {
+      const fid = turnOrder[i];
+      const m = await interaction.guild.members.fetch(fid).catch(()=>null);
+      const n = m?.nickname || m?.user.username || fid;
+      const hp = hpState[fid] ?? '?';
+      const arrow = fid === currentId ? ' ◀ current' : '';
+      const char = getChar(gid, fid);
+      const hpMax = char ? maxHp(char) : '?';
+      lines.push(`${i+1}. **${n}** — ❤️ ${hp} / ${hpMax}${arrow}`);
+    }
+    lines.push('');
+    lines.push(`Phase: **${fight.phase === 'attack' ? 'Waiting for attack' : 'Waiting for defence'}**`);
+    if (fight.atk_roll) lines.push(`Latest attack roll: **${fight.atk_roll}** (${STAT_LABELS[fight.atk_stat] ?? '?'})`);
+    if (fight.def_roll) lines.push(`Latest defence roll: **${fight.def_roll}** (${STAT_LABELS[fight.def_stat] ?? '?'})`);
+
+    return interaction.reply({ content: lines.join('\n') });
+  }
+
+  // ── END (GM only) ──────────────────────────────────────────────────────────
+  if (sub === 'end') {
+    if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can end a fight.', ephemeral: true });
+    const fight = getFight(gid, cid);
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight to end.', ephemeral: true });
+    upsertFight(gid, cid, { state: 'idle', turn_order: '[]' });
+    return interaction.reply({ content: '🛑 Fight ended by GM. HP states preserved.' });
+  }
+}
+
+// ─────────────────────────────────────────────
+//  NPC SYSTEM
+// ─────────────────────────────────────────────
+
+async function handleNpc(interaction) {
+  const sub = interaction.options.getSubcommand();
+  const gid = interaction.guild.id;
+  const uid = interaction.user.id;
+
+  if (!(await isGm(interaction.guild, uid)))
+    return interaction.reply({ content: '❌ Only GMs can manage NPCs.', ephemeral: true });
+
+  if (sub === 'create' || sub === 'pr_create') {
+    const name = interaction.options.getString('name');
+    const str  = interaction.options.getInteger('str');
+    const con  = interaction.options.getInteger('con');
+    const dex  = interaction.options.getInteger('dex');
+    const wis  = interaction.options.getInteger('wis');
+    const lck  = interaction.options.getInteger('lck');
+    const order = interaction.options.getString('order') ?? null;
+    upsertNpc(gid, name, { str, con, dex, wis, lck, order_name: order });
+    const orderLine = order ? ` | ${KNIGHT_EMOJIS[order]??'⚪'} ${order}` : '';
+    return interaction.reply({ content: `✅ NPC **${name}** created.${orderLine}\n💡 Upload an image to the NPC channel with \`${name}\` as the message text to set their avatar.` });
+  }
+
+  if (sub === 'delete') {
+    const name = interaction.options.getString('name');
+    const npc = getNpc(gid, name);
+    if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found.`, ephemeral: true });
+    // Delete webhook if exists
+    if (npc.webhook_id && npc.webhook_token) {
+      try {
+        const { WebhookClient } = require('discord.js');
+        const wh = new WebhookClient({ id: npc.webhook_id, token: npc.webhook_token });
+        await wh.delete();
+      } catch {}
+    }
+    deleteNpc(gid, name);
+    return interaction.reply({ content: `🗑️ NPC **${name}** deleted.` });
+  }
+
+  if (sub === 'list') {
+    const npcs = getAllNpcs(gid);
+    if (!npcs.length) return interaction.reply({ content: '❌ No NPCs created yet. Use `/npc create` to add one.', ephemeral: true });
+    const lines = ['**🎭 NPCs on this server:**', ''];
+    npcs.forEach(n => {
+      const order = n.order_name ? ` ${KNIGHT_EMOJIS[n.order_name]??'⚪'} ${n.order_name}` : '';
+      const img = n.image_url ? ' 🖼️' : '';
+      lines.push(`• **${n.name}**${order}${img} — STR ${n.str} CON ${n.con} DEX ${n.dex} WIS ${n.wis} LCK ${n.lck} | ❤️ ${n.hp_current}/${n.con+2}`);
+    });
+    return interaction.reply({ content: lines.join('\n') });
+  }
+}
+
+async function handlePr(interaction) {
+  const sub = interaction.options.getSubcommand();
+  const gid = interaction.guild.id;
+  const uid = interaction.user.id;
+
+  if (!(await isGm(interaction.guild, uid)))
+    return interaction.reply({ content: '❌ Only GMs can use NPC commands.', ephemeral: true });
+
+  // Delegate create/delete/list to handleNpc
+  if (sub === 'create' || sub === 'delete' || sub === 'list') {
+    return handleNpc(interaction);
+  }
+
+  if (sub === 'roll') {
+    const name     = interaction.options.getString('name');
+    const notation = interaction.options.getString('notation');
+    const label    = interaction.options.getString('label') ?? null;
+    const flavour  = interaction.options.getString('flavour') ?? null;
+
+    const npc = getNpc(gid, name);
+    if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found. Create it first with \`/npc create\`.`, ephemeral: true });
+
+    const result = rollNotation(notation);
+    if (!result) return interaction.reply({ content: '❌ Invalid dice notation.', ephemeral: true });
+
+    const critType = detectCrit(result, 'normal');
+    const rollLine = buildRollLine(result, 'normal', critType, null);
+
+    // Build embed text
+    const lines = [];
+    if (label) lines.push(`${critPrefix(critType)}**${label}**`);
+    lines.push(rollLine);
+    lines.push('');
+    lines.push('─────────────────────────────');
+    lines.push(`⚔️  ${npc.name}`);
+    if (npc.order_name) lines.push(`${KNIGHT_EMOJIS[npc.order_name]??'⚪'}  ${npc.order_name}`);
+    lines.push(`❤️  HP${pad(npc.hp_current)} / ${npc.con + 2}`);
+    lines.push(`🔄  Rerolls${pad(npc.lck)} / ${npc.lck}`);
+    lines.push('');
+    lines.push(`💪  STR${pad(npc.str)}`);
+    lines.push(`🫀  CON${pad(npc.con)}`);
+    lines.push(`⚡  DEX${pad(npc.dex)}`);
+    lines.push(`🧠  WIS${pad(npc.wis)}`);
+    lines.push(`🍀  LCK${pad(npc.lck)}`);
+    if (flavour) {
+      lines.push('');
+      lines.push('─────────────────────────────');
+      lines.push(`**${label??'roll'}** — ${totalStr(result.total, critType)}`);
+      lines.push(flavour);
+    }
+    const content = lines.join('\n');
+
+    // Get or create webhook for this NPC
+    let webhookClient;
+    try {
+      const { WebhookClient } = require('discord.js');
+      if (npc.webhook_id && npc.webhook_token) {
+        webhookClient = new WebhookClient({ id: npc.webhook_id, token: npc.webhook_token });
+      } else {
+        // Create a new webhook in this channel
+        const webhook = await interaction.channel.createWebhook({
+          name: npc.name,
+          avatar: npc.image_url ?? BLANK_AVATAR,
+          reason: `NPC webhook for ${npc.name}`,
+        });
+        setNpcWebhook(gid, npc.name, webhook.id, webhook.token);
+        webhookClient = new WebhookClient({ id: webhook.id, token: webhook.token });
+      }
+
+      await interaction.deferReply({ ephemeral: true });
+      await webhookClient.send({
+        content,
+        username: npc.name,
+        avatarURL: npc.image_url ?? BLANK_AVATAR,
+      });
+      return interaction.editReply({ content: `✅ Posted as **${npc.name}**.` });
+    } catch (err) {
+      console.error('Webhook error:', err);
+      // Fallback to regular reply if webhook fails
+      await interaction.reply({ content });
+    }
+  }
+}
+
