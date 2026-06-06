@@ -100,7 +100,7 @@ function setHealCharges(gid, uid, cur) {
 }
 // ── Tag helpers ──────────────────────────────────────────────────────────────
 const PRESET_TAGS = {
-  'Hero of Kalidale': '⧜️',
+  'Hero of Kalidale': '⚜️',
   'Expeditioners': '📜',
 };
 
