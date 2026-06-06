@@ -685,7 +685,7 @@ const slashCommands = [
     .setName('stat').setDescription('Show stat descriptions'),
 
   new SlashCommandBuilder()
-    .setName('roll').setDescription('Roll dice with full options')
+    .setName('dr').setDescription('Roll dice with full options')
     .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
       .addChoices(
         {name:'Normal (default)',value:'normal'},
@@ -1277,7 +1277,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'profile' || interaction.commandName === 'p') return handleProfile(interaction);
     if (interaction.commandName === 'tag') return handleTag(interaction);
     if (interaction.commandName === 'stat') return handleStat(interaction);
-    if (interaction.commandName === 'roll') return handleSlashRoll(interaction);
+    if (interaction.commandName === 'dr') return handleSlashRoll(interaction);
     if (interaction.commandName === 'fight') return handleFight(interaction);
     if (interaction.commandName === 'npc') return handleNpc(interaction);
     if (interaction.commandName === 'pr') return handlePr(interaction);
