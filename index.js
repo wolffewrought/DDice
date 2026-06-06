@@ -1319,6 +1319,16 @@ client.on('messageCreate', async message => {
     }
   }
 
+  // Bare dice notation — check before prefix matching so 1d20 works with no prefix
+  const earlyBareMatch = content.match(/^(\d+d\d+(?:[+-]\d+)?)([ \t].*)?([\s\S]*)?$/i);
+  if (earlyBareMatch) {
+    const sameLineRest = (earlyBareMatch[2] ?? '').trim();
+    const flavourRest = earlyBareMatch[3] ?? '';
+    const bareRest = earlyBareMatch[1] + (sameLineRest ? ' ' + sameLineRest : '') + flavourRest;
+    try { return await handleRoll(message, bareRest, 'normal', false); }
+    catch (err) { console.error(err); return message.reply('\u274c Something went wrong.'); }
+  }
+
   const match = content.match(/^(!?|\?)(gmrs?|lrest|srest|hpfull|hphalf|rerolls|roll|rra|rrd|rr|ra|rd|r|heal|hp|h)([\s\S]*)/i);
   if (!match) return;
   const prefix = match[1];
