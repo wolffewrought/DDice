@@ -201,6 +201,20 @@ function detectCrit(result, mode) {
 }
 
 // ─────────────────────────────────────────────
+//  SUCCESS SYSTEM
+// ─────────────────────────────────────────────
+
+function getSuccessResult(total, naturalRoll, sides) {
+  // Natural max or min override modifiers
+  if (naturalRoll === sides) return { label: 'Critical Success', emoji: '🌟', crit: 'crit' };
+  if (naturalRoll === 1)     return { label: 'Critical Fail',    emoji: '💀', crit: 'fail' };
+  // Final total determines outcome
+  if (total >= 15) return { label: 'Success',         emoji: '✅',  crit: null };
+  if (total >= 10) return { label: 'Partial Success', emoji: '⚡',  crit: null };
+  return            { label: 'Fail',            emoji: '❌',  crit: null };
+}
+
+// ─────────────────────────────────────────────
 //  EMBED BUILDER
 // ─────────────────────────────────────────────
 
@@ -227,13 +241,14 @@ function totalStr(total, critType) {
   return `**${total}**`;
 }
 
-function buildRollLine(result, mode, critType) {
+function buildRollLine(result, mode, critType, successResult) {
   const mod = result.modifier;
   const modStr = mod > 0 ? ` +${mod}` : mod < 0 ? ` ${mod}` : '';
   const ts = totalStr(result.total, critType);
-  if (mode === 'normal') return `🎲  ${result.notation} → [${result.rolls.join(', ')}]${modStr} = ${ts}`;
+  const suffix = successResult ? `  ${successResult.emoji} ${successResult.label}` : '';
+  if (mode === 'normal') return `🎲  ${result.notation} → [${result.rolls.join(', ')}]${modStr} = ${ts}${suffix}`;
   const ml = mode === 'adv' ? '(advantage)' : '(disadvantage)';
-  return `🎲  ${result.notation} ${ml} → [${result.chosen}, ${result.dropped}]${modStr} = ${ts}`;
+  return `🎲  ${result.notation} ${ml} → [${result.chosen}, ${result.dropped}]${modStr} = ${ts}${suffix}`;
 }
 
 function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharges, flavour, total, critType, tags, gid }) {
@@ -568,6 +583,9 @@ const slashCommands = [
       .addStringOption(o=>o.setName('name').setDescription('Tag name (create/delete)').setRequired(false))),
 
   new SlashCommandBuilder()
+    .setName('stat').setDescription('Show stat descriptions'),
+
+  new SlashCommandBuilder()
     .setName('p').setDescription('Shorthand for /profile')
     .addSubcommand(s=>s.setName('on').setDescription('Enable profile embed, max HP and rerolls'))
     .addSubcommand(s=>s.setName('off').setDescription('Disable profile embed'))
@@ -696,7 +714,7 @@ async function handleProfile(interaction) {
 //  PREFIX HANDLERS
 // ─────────────────────────────────────────────
 
-async function handleRoll(message, rest, mode, isReroll) {
+async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
   const gid = message.guild.id, cid = message.channel.id, uid = message.author.id;
   let notation, label, flavour;
 
@@ -727,7 +745,10 @@ async function handleRoll(message, rest, mode, isReroll) {
 
   saveRoll(gid, cid, uid, notation, label);
   const critType = detectCrit(result, mode);
-  const rollLine = buildRollLine(result, mode, critType);
+  const naturalRoll = mode === 'normal' ? result.rolls[0] : result.chosen;
+  const sides = result.sides ?? (mode === 'normal' ? result.sides : result.sides);
+  const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides ?? result.sides) : null;
+  const rollLine = buildRollLine(result, mode, critType, successResult);
   await sendRollEmbed(message, rollLine, label, false, uid, flavour, result.total, critType);
 }
 
@@ -1040,6 +1061,21 @@ async function handleTag(interaction) {
   }
 }
 
+async function handleStat(interaction) {
+  const lines = [
+    '**Strength** (**STR**) – Physical power, melee combat.',
+    '',
+    '**Constitution** (**CON**) – Durability, health.',
+    '',
+    '**Dexterity** (**DEX**) – Agility, ranged/finesse combat.',
+    '',
+    '**Wisdom** (**WIS**) – Insight, tactical awareness.',
+    '',
+    '**Luck** (**LUCK**) – Fortune, chance-based effects.',
+  ];
+  return interaction.reply({ content: lines.join('\n'), ephemeral: false });
+}
+
 // ─────────────────────────────────────────────
 //  BOT CLIENT
 // ─────────────────────────────────────────────
@@ -1057,6 +1093,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'char') return handleChar(interaction);
     if (interaction.commandName === 'profile' || interaction.commandName === 'p') return handleProfile(interaction);
     if (interaction.commandName === 'tag') return handleTag(interaction);
+    if (interaction.commandName === 'stat') return handleStat(interaction);
   } catch (err) {
     console.error(err);
     if (!interaction.replied) interaction.reply({ content: '❌ Something went wrong.', ephemeral: true });
@@ -1076,18 +1113,20 @@ client.on('messageCreate', async message => {
     }
   }
 
-  const match = content.match(/^(!?)(gmrs?|lrest|srest|hpfull|hphalf|rerolls|roll|rra|rrd|rr|ra|rd|r|heal|hp|h)([\s\S]*)/i);
+  const match = content.match(/^(!?|\?)(gmrs?|lrest|srest|hpfull|hphalf|rerolls|roll|rra|rrd|rr|ra|rd|r|heal|hp|h)([\s\S]*)/i);
   if (!match) return;
-  const raw = (match[1] + match[2]).toLowerCase().replace(/^!/, '');
+  const prefix = match[1];
+  const successCheck = prefix === '?';
+  const raw = match[2].toLowerCase();
   // Preserve newlines for flavour text — only trim leading spaces on first line
   const rest = (match[3] ?? '').replace(/^[ \t]+/, '');
   try {
-    if (raw==='r'||raw==='roll') return handleRoll(message, rest, 'normal', false);
-    if (raw==='ra') return handleRoll(message, rest, 'adv', false);
-    if (raw==='rd') return handleRoll(message, rest, 'dis', false);
-    if (raw==='rr') return handleRoll(message, rest, 'normal', true);
-    if (raw==='rra') return handleRoll(message, rest, 'adv', true);
-    if (raw==='rrd') return handleRoll(message, rest, 'dis', true);
+    if (raw==='r'||raw==='roll') return handleRoll(message, rest, 'normal', false, successCheck);
+    if (raw==='ra') return handleRoll(message, rest, 'adv', false, successCheck);
+    if (raw==='rd') return handleRoll(message, rest, 'dis', false, successCheck);
+    if (raw==='rr') return handleRoll(message, rest, 'normal', true, successCheck);
+    if (raw==='rra') return handleRoll(message, rest, 'adv', true, successCheck);
+    if (raw==='rrd') return handleRoll(message, rest, 'dis', true, successCheck);
     if (raw==='heal'||raw==='h') return handleHeal(message, rest);
     if (raw==='hp') return handleHp(message, rest);
     if (raw==='rerolls') return handleRerolls(message, rest);
