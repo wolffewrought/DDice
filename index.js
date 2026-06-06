@@ -1066,7 +1066,7 @@ client.on('messageCreate', async message => {
     }
   }
 
-  const match = content.match(/^(!?)(gmrs?|lrest|srest|hpfull|hphalf|roll|r(?:ra|rd|r(?:a|d)?)?|ra|rd|rr(?:a|d)?|heal|h|hp|rerolls)([\s\S]*)/i);
+  const match = content.match(/^(!?)(gmrs?|lrest|srest|hpfull|hphalf|roll|rra|rrd|rr|ra|rd|r|heal|h|hp|rerolls)([\s\S]*)/i);
   if (!match) return;
   const raw = (match[1] + match[2]).toLowerCase().replace(/^!/, '');
   // Preserve newlines for flavour text — only trim leading spaces on first line
