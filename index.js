@@ -13,6 +13,10 @@ const path = require('path');
 // ─────────────────────────────────────────────
 
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'ttrpg.db');
+// Ensure the directory exists before opening the database
+const fs = require('fs');
+const dbDir = path.dirname(DB_PATH);
+if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
