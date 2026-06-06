@@ -712,7 +712,11 @@ const slashCommands = [
       .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
         .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'})))
     .addSubcommand(s=>s.setName('delete').setDescription('Delete an NPC').addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true)))
-    .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server')),
+    .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server'))
+    .addSubcommand(s=>s.setName('reroll').setDescription('Reroll the last NPC roll (costs 1 reroll token)')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))),
 
   new SlashCommandBuilder()
     .setName('pr').setDescription('Roll or manage NPCs as a GM persona (GM only)')
@@ -1953,6 +1957,74 @@ async function handlePr(interaction) {
     return handleNpc(interaction);
   }
 
+  if (sub === 'reroll') {
+    const name     = interaction.options.getString('name');
+    const rollType = interaction.options.getString('roll') ?? 'normal';
+    const mode     = rollType === 'adv' ? 'adv' : rollType === 'dis' ? 'dis' : 'normal';
+
+    const npc = getNpc(gid, name);
+    if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found.`, ephemeral: true });
+
+    // Check NPC reroll tokens (based on LCK)
+    if (npc.lck <= 0) return interaction.reply({ content: `❌ **${name}** has no reroll tokens (LCK is 0).`, ephemeral: true });
+
+    // Get last roll for this NPC in this channel
+    const last = getLastRoll(gid, interaction.channel.id, `npc_${name}`);
+    if (!last) return interaction.reply({ content: `❌ No previous roll found for **${name}** in this channel.`, ephemeral: true });
+
+    // Deduct reroll — track via hp_current field repurposed as reroll tracker
+    // Actually use a separate counter: store in npc rerolls_used field
+    // For simplicity track rerolls remaining as lck - used; decrement lck by 1 temporarily
+    upsertNpc(gid, name, { lck: npc.lck - 1 });
+
+    let result;
+    if (mode === 'adv') result = rollAdvantage(last.notation);
+    else if (mode === 'dis') result = rollDisadvantage(last.notation);
+    else result = rollNotation(last.notation);
+    if (!result) return interaction.reply({ content: '❌ Could not reroll.', ephemeral: true });
+
+    const updatedNpc = getNpc(gid, name);
+    saveRoll(gid, interaction.channel.id, `npc_${name}`, last.notation, last.label);
+
+    const critType = detectCrit(result, mode);
+    const rollLine = buildRollLine(result, mode, critType, null);
+    const lines = [];
+    if (last.label) lines.push(`${critPrefix(critType)}**${last.label}** *(reroll)*`);
+    else lines.push('*(reroll)*');
+    lines.push(rollLine, '');
+    lines.push('─────────────────────────────');
+    lines.push(`⚔️  ${npc.name}`);
+    if (npc.order_name) lines.push(`${KNIGHT_EMOJIS[npc.order_name]??'⚪'}  ${npc.order_name}`);
+    lines.push(`❤️  HP${pad(npc.hp_current)} / ${npc.con + 2}`);
+    lines.push(`🔄  Rerolls${pad(updatedNpc.lck)} / ${npc.lck}`);
+    lines.push('');
+    lines.push(`💪  STR${pad(npc.str)}`);
+    lines.push(`🫀  CON${pad(npc.con)}`);
+    lines.push(`⚡  DEX${pad(npc.dex)}`);
+    lines.push(`🧠  WIS${pad(npc.wis)}`);
+    lines.push(`🍀  LCK${pad(updatedNpc.lck)}`);
+
+    const content2 = lines.join('\n');
+
+    try {
+      const { WebhookClient } = require('discord.js');
+      await interaction.deferReply({ ephemeral: true });
+      let webhookClient;
+      if (npc.webhook_id && npc.webhook_token) {
+        webhookClient = new WebhookClient({ id: npc.webhook_id, token: npc.webhook_token });
+      } else {
+        const webhook = await interaction.channel.createWebhook({ name: npc.name, avatar: npc.image_url ?? BLANK_AVATAR, reason: `NPC webhook for ${npc.name}` });
+        setNpcWebhook(gid, npc.name, webhook.id, webhook.token);
+        webhookClient = new WebhookClient({ id: webhook.id, token: webhook.token });
+      }
+      await webhookClient.send({ content: content2, username: npc.name, avatarURL: npc.image_url ?? BLANK_AVATAR });
+      return interaction.editReply({ content: `✅ Rerolled as **${npc.name}**. Rerolls remaining: ${updatedNpc.lck}` });
+    } catch (err) {
+      console.error('Webhook error:', err);
+      return interaction.reply({ content: content2 });
+    }
+  }
+
   if (sub === 'roll') {
     const name     = interaction.options.getString('name');
     const notation = interaction.options.getString('notation');
@@ -1996,6 +2068,9 @@ async function handlePr(interaction) {
       lines.push(flavour);
     }
     const content = lines.join('\n');
+
+    // Save roll history for NPC reroll
+    saveRoll(gid, interaction.channel.id, `npc_${npc.name}`, notation, label);
 
     // Get or create webhook for this NPC
     let webhookClient;
