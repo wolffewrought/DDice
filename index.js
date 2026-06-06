@@ -24,6 +24,11 @@ db.pragma('journal_mode = WAL');
 // ── Schema migrations ─────────────────────────────────────────────────────────
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_channel_id TEXT DEFAULT NULL'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
+try { db.exec("ALTER TABLE fights ADD COLUMN atk_mode TEXT DEFAULT 'normal'"); } catch {}
+try { db.exec('ALTER TABLE fights ADD COLUMN atk_sides INTEGER DEFAULT 20'); } catch {}
+try { db.exec("ALTER TABLE fights ADD COLUMN def_mode TEXT DEFAULT 'normal'"); } catch {}
+try { db.exec('ALTER TABLE fights ADD COLUMN def_sides INTEGER DEFAULT 20'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS characters (
@@ -84,9 +89,13 @@ db.exec(`
     atk_roll INTEGER DEFAULT NULL,
     atk_nat INTEGER DEFAULT NULL,
     atk_stat TEXT DEFAULT NULL,
+    atk_mode TEXT DEFAULT 'normal',
+    atk_sides INTEGER DEFAULT 20,
     def_roll INTEGER DEFAULT NULL,
     def_nat INTEGER DEFAULT NULL,
     def_stat TEXT DEFAULT NULL,
+    def_mode TEXT DEFAULT 'normal',
+    def_sides INTEGER DEFAULT 20,
     hp_state TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY (guild_id, channel_id)
   );
@@ -717,15 +726,36 @@ const slashCommands = [
       .addUserOption(o=>o.setName('p4').setDescription('Fighter 4').setRequired(false))
       .addUserOption(o=>o.setName('p5').setDescription('Fighter 5').setRequired(false))
       .addUserOption(o=>o.setName('p6').setDescription('Fighter 6').setRequired(false)))
-    .addSubcommand(s=>s.setName('atk').setDescription('Attack a target')
+    .addSubcommand(s=>s.setName('atk').setDescription('Attack a target (normal roll)')
       .addStringOption(o=>o.setName('stat').setDescription('Stat to attack with').setRequired(true)
         .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
       .addUserOption(o=>o.setName('target').setDescription('Player to attack').setRequired(true))
       .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
-    .addSubcommand(s=>s.setName('def').setDescription('Defend against the current attack')
+    .addSubcommand(s=>s.setName('atkadv').setDescription('Attack with advantage')
+      .addStringOption(o=>o.setName('stat').setDescription('Stat to attack with').setRequired(true)
+        .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
+      .addUserOption(o=>o.setName('target').setDescription('Player to attack').setRequired(true))
+      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
+    .addSubcommand(s=>s.setName('atkdis').setDescription('Attack with disadvantage')
+      .addStringOption(o=>o.setName('stat').setDescription('Stat to attack with').setRequired(true)
+        .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
+      .addUserOption(o=>o.setName('target').setDescription('Player to attack').setRequired(true))
+      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
+    .addSubcommand(s=>s.setName('def').setDescription('Defend (normal roll)')
       .addStringOption(o=>o.setName('stat').setDescription('Stat to defend with').setRequired(true)
         .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
       .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
+    .addSubcommand(s=>s.setName('defadv').setDescription('Defend with advantage')
+      .addStringOption(o=>o.setName('stat').setDescription('Stat to defend with').setRequired(true)
+        .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
+      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
+    .addSubcommand(s=>s.setName('defdis').setDescription('Defend with disadvantage')
+      .addStringOption(o=>o.setName('stat').setDescription('Stat to defend with').setRequired(true)
+        .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
+      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
+    .addSubcommand(s=>s.setName('rr').setDescription('Reroll last fight roll (costs 1 reroll token)'))
+    .addSubcommand(s=>s.setName('ra').setDescription('Reroll last fight roll with advantage (costs 1 reroll token)'))
+    .addSubcommand(s=>s.setName('rd').setDescription('Reroll last fight roll with disadvantage (costs 1 reroll token)'))
     .addSubcommand(s=>s.setName('resolve').setDescription('Resolve the current exchange'))
     .addSubcommand(s=>s.setName('forfeit').setDescription('Concede the fight'))
     .addSubcommand(s=>s.setName('status').setDescription('Show current fight status'))
@@ -1424,8 +1454,8 @@ async function handleFight(interaction) {
     return interaction.reply({ content: lines.join('\n') });
   }
 
-  // ── ATK ────────────────────────────────────────────────────────────────────
-  if (sub === 'atk') {
+  // ── ATK (normal / adv / dis) ──────────────────────────────────────────────
+  if (sub === 'atk' || sub === 'atkadv' || sub === 'atkdis') {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
 
@@ -1443,6 +1473,7 @@ async function handleFight(interaction) {
     const stat = interaction.options.getString('stat');
     const target = interaction.options.getUser('target');
     const flavour = interaction.options.getString('flavour') ?? null;
+    const mode = sub === 'atkadv' ? 'adv' : sub === 'atkdis' ? 'dis' : 'normal';
 
     if (!turnOrder.includes(target.id)) return interaction.reply({ content: '❌ That player is not in this fight.', ephemeral: true });
     if (target.id === uid) return interaction.reply({ content: '❌ You cannot target yourself.', ephemeral: true });
@@ -1454,43 +1485,48 @@ async function handleFight(interaction) {
 
     const char = getChar(gid, uid);
     const statVal = char?.[stat] ?? 0;
-    const nat = rollDie(20);
-    const total = nat + statVal;
+    let nat, total, rollLine;
+    const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
+
+    if (mode === 'adv') {
+      const r1 = rollDie(20), r2 = rollDie(20);
+      nat = Math.max(r1, r2); const dropped = Math.min(r1, r2);
+      total = nat + statVal;
+      rollLine = `⚔️  1d20+${STAT_LABELS[stat]} (advantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+    } else if (mode === 'dis') {
+      const r1 = rollDie(20), r2 = rollDie(20);
+      nat = Math.min(r1, r2); const dropped = Math.max(r1, r2);
+      total = nat + statVal;
+      rollLine = `⚔️  1d20+${STAT_LABELS[stat]} (disadvantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+    } else {
+      nat = rollDie(20); total = nat + statVal;
+      rollLine = `⚔️  1d20+${STAT_LABELS[stat]} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+    }
 
     const member = await interaction.guild.members.fetch(uid).catch(()=>null);
     const name = member?.nickname || member?.user.username || uid;
     const targetMember = await interaction.guild.members.fetch(target.id).catch(()=>null);
     const targetName = targetMember?.nickname || targetMember?.user.username || target.id;
 
-    const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
-    const ts = fightTotalStr(total, nat, 20);
-    const rollLine = `⚔️  1d20+${STAT_LABELS[stat]} → [${nat}]${modStr} = ${ts}`;
-
     const lines = [`**${name}** attacks **${targetName}** with ${STAT_LABELS[stat]}!`, rollLine];
     if (flavour) lines.push('', `*${flavour}*`);
     lines.push('', `🛡️ **${targetName}** — use \`/fight def\` to defend.`);
 
     upsertFight(gid, cid, {
-      phase: 'defend',
-      current_target: target.id,
-      atk_roll: total,
-      atk_nat: nat,
-      atk_stat: stat,
-      def_roll: null, def_nat: null, def_stat: null,
+      phase: 'defend', current_target: target.id,
+      atk_roll: total, atk_nat: nat, atk_stat: stat, atk_mode: mode, atk_sides: 20,
+      def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
     });
-
-    // Save roll for rerolls
     saveRoll(gid, cid, uid, `1d20+${statVal}`, `atk ${STAT_LABELS[stat]}`);
     return interaction.reply({ content: lines.join('\n') });
   }
 
-  // ── DEF ────────────────────────────────────────────────────────────────────
-  if (sub === 'def') {
+  // ── DEF (normal / adv / dis) ──────────────────────────────────────────────
+  if (sub === 'def' || sub === 'defadv' || sub === 'defdis') {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
     if (fight.phase !== 'defend') return interaction.reply({ content: '❌ No attack to defend against yet.', ephemeral: true });
 
-    const turnOrder = JSON.parse(fight.turn_order);
     if (uid !== fight.current_target) {
       const member = await interaction.guild.members.fetch(fight.current_target).catch(()=>null);
       const name = member?.nickname || member?.user.username || 'the target';
@@ -1499,30 +1535,91 @@ async function handleFight(interaction) {
 
     const stat = interaction.options.getString('stat');
     const flavour = interaction.options.getString('flavour') ?? null;
+    const mode = sub === 'defadv' ? 'adv' : sub === 'defdis' ? 'dis' : 'normal';
 
     const char = getChar(gid, uid);
     const statVal = char?.[stat] ?? 0;
-    const nat = rollDie(20);
-    const total = nat + statVal;
+    const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
+    let nat, total, rollLine;
+
+    if (mode === 'adv') {
+      const r1 = rollDie(20), r2 = rollDie(20);
+      nat = Math.max(r1, r2); const dropped = Math.min(r1, r2);
+      total = nat + statVal;
+      rollLine = `🛡️  1d20+${STAT_LABELS[stat]} (advantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+    } else if (mode === 'dis') {
+      const r1 = rollDie(20), r2 = rollDie(20);
+      nat = Math.min(r1, r2); const dropped = Math.max(r1, r2);
+      total = nat + statVal;
+      rollLine = `🛡️  1d20+${STAT_LABELS[stat]} (disadvantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+    } else {
+      nat = rollDie(20); total = nat + statVal;
+      rollLine = `🛡️  1d20+${STAT_LABELS[stat]} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+    }
 
     const member = await interaction.guild.members.fetch(uid).catch(()=>null);
     const name = member?.nickname || member?.user.username || uid;
 
-    const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
-    const ts = fightTotalStr(total, nat, 20);
-    const rollLine = `🛡️  1d20+${STAT_LABELS[stat]} → [${nat}]${modStr} = ${ts}`;
-
     const lines = [`**${name}** defends with ${STAT_LABELS[stat]}!`, rollLine];
     if (flavour) lines.push('', `*${flavour}*`);
-    lines.push('', '⚡ Use `/fight resolve` to resolve this exchange.');
+    lines.push('', '⚡ Use \`/fight resolve\` to resolve this exchange.');
 
-    upsertFight(gid, cid, {
-      def_roll: total,
-      def_nat: nat,
-      def_stat: stat,
-    });
-
+    upsertFight(gid, cid, { def_roll: total, def_nat: nat, def_stat: stat, def_mode: mode, def_sides: 20 });
     saveRoll(gid, cid, uid, `1d20+${statVal}`, `def ${STAT_LABELS[stat]}`);
+    return interaction.reply({ content: lines.join('\n') });
+  }
+
+  // ── REROLLS ────────────────────────────────────────────────────────────────
+  if (sub === 'rr' || sub === 'ra' || sub === 'rd') {
+    const fight = getFight(gid, cid);
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+
+    const turnOrder = JSON.parse(fight.turn_order);
+    const isAttacker = turnOrder[fight.turn_index] === uid;
+    const isDefender = fight.current_target === uid && fight.phase === 'defend';
+
+    if (!isAttacker && !isDefender) return interaction.reply({ content: '❌ It is not your turn to reroll.', ephemeral: true });
+
+    // Check reroll tokens
+    const char = getChar(gid, uid);
+    if (!char || char.rerolls_current <= 0) return interaction.reply({ content: '❌ No rerolls remaining.', ephemeral: true });
+    upsertChar(gid, uid, { rerolls_current: char.rerolls_current - 1 });
+
+    const mode = sub === 'ra' ? 'adv' : sub === 'rd' ? 'dis' : 'normal';
+    const stat = isAttacker ? fight.atk_stat : fight.def_stat;
+    if (!stat) return interaction.reply({ content: '❌ No roll to reroll yet.', ephemeral: true });
+
+    const statVal = char?.[stat] ?? 0;
+    const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
+    let nat, total, rollLine;
+    const icon = isAttacker ? '⚔️' : '🛡️';
+
+    if (mode === 'adv') {
+      const r1 = rollDie(20), r2 = rollDie(20);
+      nat = Math.max(r1, r2); const dropped = Math.min(r1, r2);
+      total = nat + statVal;
+      rollLine = `${icon}  1d20+${STAT_LABELS[stat]} (advantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+    } else if (mode === 'dis') {
+      const r1 = rollDie(20), r2 = rollDie(20);
+      nat = Math.min(r1, r2); const dropped = Math.max(r1, r2);
+      total = nat + statVal;
+      rollLine = `${icon}  1d20+${STAT_LABELS[stat]} (disadvantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+    } else {
+      nat = rollDie(20); total = nat + statVal;
+      rollLine = `${icon}  1d20+${STAT_LABELS[stat]} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+    }
+
+    const member = await interaction.guild.members.fetch(uid).catch(()=>null);
+    const name = member?.nickname || member?.user.username || uid;
+    const lines = [`**${name}** rerolls *(reroll)* — ${isAttacker ? 'attack' : 'defence'} with ${STAT_LABELS[stat]}!`, rollLine];
+    lines.push('', '⚡ Use \`/fight resolve\` to resolve this exchange.');
+
+    if (isAttacker) {
+      upsertFight(gid, cid, { atk_roll: total, atk_nat: nat, atk_mode: mode });
+    } else {
+      upsertFight(gid, cid, { def_roll: total, def_nat: nat, def_mode: mode });
+    }
+
     return interaction.reply({ content: lines.join('\n') });
   }
 
