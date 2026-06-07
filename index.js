@@ -753,10 +753,6 @@ const slashCommands = [
         .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'})))
     .addSubcommand(s=>s.setName('delete').setDescription('Delete an NPC').addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true)))
     .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server'))
-    .addSubcommand(s=>s.setName('reroll').setDescription('Reroll the last NPC roll (costs 1 reroll token)')
-      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
-      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
-        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'})))
     .addSubcommand(s=>s.setName('categorylist').setDescription('List all NPC categories'))
     .addSubcommand(s=>s.setName('categorycreate').setDescription('Create a new NPC category')
       .addStringOption(o=>o.setName('name').setDescription('Category name').setRequired(true)))
@@ -772,8 +768,8 @@ const slashCommands = [
   new SlashCommandBuilder()
     .setName('pr').setDescription('Roll or manage NPCs as a GM persona (GM only)')
     .addSubcommand(s=>s.setName('roll').setDescription('Roll as an NPC via webhook')
-      .addStringOption(o=>o.setName('category').setDescription('Filter by category').setRequired(false))
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('category').setDescription('Filter by category').setRequired(false))
       .addStringOption(o=>o.setName('notation').setDescription('Dice notation e.g. 1d20+5 (default: 1d20)').setRequired(false))
       .addStringOption(o=>o.setName('stat').setDescription('Stat label (optional — auto adds modifier)').setRequired(false)
         .addChoices({name:'STR',value:'STR'},{name:'CON',value:'CON'},{name:'DEX',value:'DEX'},{name:'WIS',value:'WIS'},{name:'LCK',value:'LCK'}))
@@ -791,11 +787,7 @@ const slashCommands = [
       .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
         .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'})))
     .addSubcommand(s=>s.setName('delete').setDescription('Delete an NPC').addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true)))
-    .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server'))
-    .addSubcommand(s=>s.setName('reroll').setDescription('Reroll the last NPC roll (costs 1 reroll token)')
-      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
-      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
-        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))),
+    .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server')),
 
   new SlashCommandBuilder()
     .setName('fight').setDescription('Manage a fight between players')
