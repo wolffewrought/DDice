@@ -2495,9 +2495,10 @@ let player;
 (async () => {
 try {
   const { Player } = require('discord-player');
-  const { SpotifyExtractor, SoundCloudExtractor, YoutubeExtractor, AttachmentExtractor } = require('@discord-player/extractor');
+  const { SpotifyExtractor, SoundCloudExtractor, AttachmentExtractor } = require('@discord-player/extractor');
+  const { YoutubeiExtractor } = require('discord-player-youtubei');
   player = new Player(client, { skipFFmpeg: false });
-  await player.extractors.register(YoutubeExtractor, {});
+  await player.extractors.register(YoutubeiExtractor, {});
   await player.extractors.register(SpotifyExtractor, {});
   await player.extractors.register(SoundCloudExtractor, {});
   await player.extractors.register(AttachmentExtractor, {});
