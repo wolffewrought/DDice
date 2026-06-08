@@ -23,6 +23,7 @@ db.pragma('journal_mode = WAL');
 
 // ── Schema migrations ─────────────────────────────────────────────────────────
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_channel_id TEXT DEFAULT NULL'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_channel_id TEXT DEFAULT NULL'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
 try { db.exec("ALTER TABLE characters ADD COLUMN class TEXT DEFAULT NULL"); } catch {}
 try { db.exec("ALTER TABLE characters ADD COLUMN weapon1 TEXT DEFAULT NULL"); } catch {}
@@ -321,7 +322,11 @@ function isWhiteKnight(ch) { return ch?.order_name === 'White Knight' && ch?.wis
 function parseNotation(n) {
   const m = n.trim().match(/^(\d+)d(\d+)([+-]\d+)?$/i);
   if (!m) return null;
-  return { dice: parseInt(m[1]), sides: parseInt(m[2]), modifier: m[3] ? parseInt(m[3]) : 0 };
+  const dice = parseInt(m[1]), sides = parseInt(m[2]);
+  // Sane limits to prevent abuse (e.g. r999999d999999)
+  if (dice < 1 || dice > 100) return null;
+  if (sides < 1 || sides > 1000) return null;
+  return { dice, sides, modifier: m[3] ? parseInt(m[3]) : 0 };
 }
 function rollDie(sides) { return Math.floor(Math.random() * sides) + 1; }
 function rollNotation(notation) {
@@ -710,7 +715,8 @@ const slashCommands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand(s=>s.setName('gmrole').setDescription('Set the GM role').addRoleOption(o=>o.setName('role').setDescription('The GM role').setRequired(true)))
     .addSubcommand(s=>s.setName('heal').setDescription('Set max Heal charges for White Knights').addIntegerOption(o=>o.setName('charges').setDescription('Number of charges').setRequired(true).setMinValue(1).setMaxValue(10)))
-    .addSubcommand(s=>s.setName('npcchannel').setDescription('Set the NPC image bank channel').addStringOption(o=>o.setName('channel').setDescription('Channel ID or #channel mention').setRequired(true))),
+    .addSubcommand(s=>s.setName('npcchannel').setDescription('Set the NPC image bank channel').addStringOption(o=>o.setName('channel').setDescription('Channel ID or #channel mention').setRequired(true)))
+    .addSubcommand(s=>s.setName('cleanwebhooks').setDescription('Remove orphaned NPC webhooks to free up Discord limits')),
 
   new SlashCommandBuilder()
     .setName('char').setDescription('Character setup and display')
@@ -770,6 +776,28 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('stat').setDescription('Show stat descriptions'),
+
+  new SlashCommandBuilder()
+    .setName('help').setDescription('Show all commands by category')
+    .addStringOption(o=>o.setName('category').setDescription('Specific category to view').setRequired(false)
+      .addChoices(
+        {name:'Dice Rolling',value:'dice'},
+        {name:'Character Sheet',value:'character'},
+        {name:'HP, Healing & Rerolls',value:'hp'},
+        {name:'Fights',value:'fight'},
+        {name:'NPCs',value:'npc'},
+        {name:'Tags',value:'tags'},
+        {name:'GM & Config',value:'gm'}
+      )),
+
+  new SlashCommandBuilder()
+    .setName('lastroll').setDescription('Show your most recent roll in this channel'),
+
+  new SlashCommandBuilder()
+    .setName('backup').setDescription('Database backup (GM only)')
+    .addSubcommand(s=>s.setName('now').setDescription('Export the database to this channel'))
+    .addSubcommand(s=>s.setName('auto').setDescription('Toggle daily automatic backups')
+      .addStringOption(o=>o.setName('channel').setDescription('Channel for backups (or type off to disable)').setRequired(true))),
 
   new SlashCommandBuilder()
     .setName('weapon').setDescription('Manage the server weapon list (GM only)')
@@ -908,16 +936,51 @@ async function handleConfig(interaction) {
     return interaction.reply({ content: `✅ NPC image channel set to <#${channelId}>. Upload images there with the NPC name as the message text to set avatars.`, ephemeral: true });
   }
 
+  if (sub === 'cleanwebhooks') {
+    await interaction.deferReply({ ephemeral: true });
+    try {
+      // Gather webhook IDs currently in use by NPCs
+      const activeWebhookIds = new Set(
+        db.prepare('SELECT webhook_id FROM npcs WHERE guild_id=? AND webhook_id IS NOT NULL').all(gid).map(r => r.webhook_id)
+      );
+      let removed = 0, checked = 0;
+      // Scan all text channels for webhooks created by this bot
+      const channels = await interaction.guild.channels.fetch();
+      for (const [, ch] of channels) {
+        if (!ch || typeof ch.fetchWebhooks !== 'function') continue;
+        let hooks;
+        try { hooks = await ch.fetchWebhooks(); } catch { continue; }
+        for (const [, hook] of hooks) {
+          // Only touch webhooks this bot owns
+          if (hook.owner?.id !== client.user.id) continue;
+          checked++;
+          if (!activeWebhookIds.has(hook.id)) {
+            try { await hook.delete('DDice orphaned webhook cleanup'); removed++; } catch {}
+          }
+        }
+      }
+      return interaction.editReply({ content: `🧹 Webhook cleanup complete. Checked ${checked} bot webhook(s), removed ${removed} orphaned one(s).` });
+    } catch (err) {
+      console.error('Webhook cleanup error:', err);
+      return interaction.editReply({ content: `❌ Cleanup failed: ${err.message}` });
+    }
+  }
+
 }
 
 async function handleChar(interaction) {
   const sub = interaction.options.getSubcommand(), gid = interaction.guild.id, callerId = interaction.user.id;
   if (sub === 'create') {
     const targetUser = interaction.options.getUser('user');
-    const isGmUser = await isGm(interaction.guild, uid);
+    const isGmUser = await isGm(interaction.guild, callerId);
     if (targetUser && !isGmUser) return interaction.reply({ content: '❌ Only GMs can set stats for other players.', ephemeral: true });
-    const targetId = targetUser?.id ?? uid;
+    const targetId = targetUser?.id ?? callerId;
     const updates = {};
+    // Validate stat ranges (0-99)
+    for (const stat of ['str','con','dex','wis','lck']) {
+      const v = interaction.options.getInteger(stat);
+      if (v !== null && (v < 0 || v > 99)) return interaction.reply({ content: `❌ ${stat.toUpperCase()} must be between 0 and 99.`, ephemeral: true });
+    }
     const str = interaction.options.getInteger('str'); if (str !== null) updates.str = str;
     const con = interaction.options.getInteger('con'); if (con !== null) { updates.con = con; updates.hp_current = con + 2; }
     const dex = interaction.options.getInteger('dex'); if (dex !== null) updates.dex = dex;
@@ -955,6 +1018,7 @@ async function handleChar(interaction) {
     if (STATS.includes(field)) {
       const num = parseInt(value);
       if (isNaN(num)||num<0) return interaction.reply({ content: '❌ Value must be a positive number.', ephemeral: true });
+      if (num > 99) return interaction.reply({ content: '❌ Stat values are capped at 99.', ephemeral: true });
       const upd = setStatAndDerive(gid, targetId, field, num);
       if (field==='wis') {
         if (isWhiteKnight(upd)) { const cfg=getConfig(gid); setHealCharges(gid,targetId,cfg.heal_charges??3); }
@@ -971,9 +1035,12 @@ async function handleChar(interaction) {
         const validEmojis = ['⚔️', '🗡️', '🏹', '🔱', '⛏️', '🛡️', '🪄'];
         if (!validEmojis.includes(value)) return interaction.reply({ content: `❌ Choose from: ${validEmojis.join(' ')}`, ephemeral: true });
       }
+      if (['class','weapon1','weapon2'].includes(field) && value.length > 50) {
+        return interaction.reply({ content: '❌ That name is too long (max 50 characters).', ephemeral: true });
+      }
       upsertChar(gid, targetId, { [field]: value });
       const label = { class:'Class', weapon1:'Weapon 1', weapon2:'Weapon 2', weapon1emoji:'Weapon 1 Emoji', weapon2emoji:'Weapon 2 Emoji' }[field];
-      return interaction.reply({ content: `✅ **${label}** set to **${value}**${targetId!==callerId?` for <@${targetId}>`:''}.\`` });
+      return interaction.reply({ content: `✅ **${label}** set to **${value}**${targetId!==callerId?` for <@${targetId}>`:''}.` });
     }
   }
   if (sub === 'export') return handleCharExport(interaction);
@@ -1421,6 +1488,8 @@ client.on('ready', async () => {
   for (const guild of client.guilds.cache.values()) {
     await registerSlashCommands(guild.id).catch(console.error);
   }
+  startBackupScheduler();
+  console.log('✅ Backup scheduler started');
 });
 
 client.on('interactionCreate', async interaction => {
@@ -1443,6 +1512,14 @@ client.on('interactionCreate', async interaction => {
     return;
   }
 
+  // Handle confirmation buttons
+  if (interaction.isButton()) {
+    if (interaction.customId.startsWith('confirm:') || interaction.customId.startsWith('cancel:')) {
+      return handleConfirmButton(interaction);
+    }
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
   try {
     if (interaction.commandName === 'config') return await handleConfig(interaction);
@@ -1455,9 +1532,22 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'npc') return await handleNpc(interaction);
     if (interaction.commandName === 'pr') return await handlePr(interaction);
     if (interaction.commandName === 'weapon') return await handleWeapon(interaction);
+    if (interaction.commandName === 'help') return await handleHelp(interaction);
+    if (interaction.commandName === 'lastroll') return await handleLastRoll(interaction);
+    if (interaction.commandName === 'backup') return await handleBackup(interaction);
   } catch (err) {
-    console.error(err);
-    if (!interaction.replied && !interaction.deferred) interaction.reply({ content: '❌ Something went wrong.', ephemeral: true }).catch(()=>{});
+    console.error(`[${interaction.commandName}] error:`, err);
+    // Build a helpful error message
+    let msg = '❌ Something went wrong';
+    if (err.code === 50013) msg = '❌ I don\'t have permission to do that. Check my role permissions.';
+    else if (err.code === 50001) msg = '❌ I can\'t access that channel.';
+    else if (err.code === 10003) msg = '❌ That channel no longer exists.';
+    else if (err.code === 50035) msg = '❌ Invalid input — please check the values you entered.';
+    else if (err.message?.includes('Missing Permissions')) msg = '❌ I\'m missing permissions for that action.';
+    else if (err.message) msg = `❌ ${err.message.slice(0, 150)}`;
+    const payload = { content: msg, ephemeral: true };
+    if (interaction.replied || interaction.deferred) interaction.followUp(payload).catch(()=>{});
+    else interaction.reply(payload).catch(()=>{});
   }
 });
 
@@ -2057,8 +2147,10 @@ async function handleFight(interaction) {
     if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can end a fight.', ephemeral: true });
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight to end.', ephemeral: true });
-    upsertFight(gid, cid, { state: 'idle', turn_order: '[]' });
-    return interaction.reply({ content: '🛑 Fight ended by GM. HP states preserved.' });
+    return requestConfirm(interaction, 'End the current fight? Turn order clears but HP states are preserved.', async () => {
+      upsertFight(gid, cid, { state: 'idle', turn_order: '[]' });
+      return '🛑 Fight ended by GM. HP states preserved.';
+    });
   }
 }
 
@@ -2151,11 +2243,15 @@ async function handleNpc(interaction) {
 
   if (sub === 'create' || sub === 'pr_create') {
     const name = interaction.options.getString('name');
+    if (name.length > 50) return interaction.reply({ content: '❌ NPC name is too long (max 50 characters).', ephemeral: true });
     const str  = interaction.options.getInteger('str');
     const con  = interaction.options.getInteger('con');
     const dex  = interaction.options.getInteger('dex');
     const wis  = interaction.options.getInteger('wis');
     const lck  = interaction.options.getInteger('lck');
+    for (const [n,v] of [['STR',str],['CON',con],['DEX',dex],['WIS',wis],['LCK',lck]]) {
+      if (v !== null && (v < 0 || v > 99)) return interaction.reply({ content: `❌ ${n} must be between 0 and 99.`, ephemeral: true });
+    }
     const order = interaction.options.getString('order') ?? null;
     upsertNpc(gid, name, { str, con, dex, wis, lck, order_name: order });
     const orderLine = order ? ` | ${KNIGHT_EMOJIS[order]??'⚪'} ${order}` : '';
@@ -2167,18 +2263,19 @@ async function handleNpc(interaction) {
     const name = interaction.options.getString('name');
     const npc = getNpc(gid, name);
     if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found.`, ephemeral: true });
-    // Delete webhook if exists
-    if (npc.webhook_id && npc.webhook_token) {
-      try {
-        const { WebhookClient } = require('discord.js');
-        const wh = new WebhookClient({ id: npc.webhook_id, token: npc.webhook_token });
-        await wh.delete();
-      } catch {}
-    }
-    deleteNpc(gid, name);
-    // Re-register slash commands so deleted NPC is removed from dropdown
-    await interaction.reply({ content: `🗑️ NPC **${name}** deleted.` });
-    registerSlashCommands(gid).catch(console.error);
+    return requestConfirm(interaction, `Delete NPC **${name}**? This removes their stats and avatar permanently.`, async () => {
+      // Delete webhook if exists
+      if (npc.webhook_id && npc.webhook_token) {
+        try {
+          const { WebhookClient } = require('discord.js');
+          const wh = new WebhookClient({ id: npc.webhook_id, token: npc.webhook_token });
+          await wh.delete();
+        } catch {}
+      }
+      deleteNpc(gid, name);
+      registerSlashCommands(gid).catch(console.error);
+      return `🗑️ NPC **${name}** deleted.`;
+    });
   }
 
   if (sub === 'list') {
@@ -2202,10 +2299,12 @@ async function handleNpc(interaction) {
   }
   if (sub === 'categorydelete') {
     const name = interaction.options.getString('name');
-    deleteCategory(gid, name);
-    await interaction.reply({ content: `🗑️ Category **${name}** deleted. Menus updating...` });
-    registerSlashCommands(gid).catch(console.error);
-    return;
+    if (!getCategories(gid).includes(name)) return interaction.reply({ content: `❌ Category **${name}** not found.`, ephemeral: true });
+    return requestConfirm(interaction, `Delete category **${name}**? NPCs in it won't be deleted — they'll just become uncategorised.`, async () => {
+      deleteCategory(gid, name);
+      registerSlashCommands(gid).catch(console.error);
+      return `🗑️ Category **${name}** deleted.`;
+    });
   }
   if (sub === 'categorylist') {
     const cats = getCategories(gid);
@@ -2443,10 +2542,12 @@ async function handleWeapon(interaction) {
   }
   if (sub === 'remove') {
     const name = interaction.options.getString('name');
-    removeWeapon(gid, name);
-    await interaction.reply({ content: `🗑️ **${name}** removed from the weapon list. Menus updating...` });
-    registerSlashCommands(gid).catch(console.error);
-    return;
+    if (!getWeapons(gid).includes(name)) return interaction.reply({ content: `❌ **${name}** isn't in the weapon list.`, ephemeral: true });
+    return requestConfirm(interaction, `Remove **${name}** from the server weapon list?`, async () => {
+      removeWeapon(gid, name);
+      registerSlashCommands(gid).catch(console.error);
+      return `🗑️ **${name}** removed from the weapon list.`;
+    });
   }
   if (sub === 'list') {
     const weapons = getWeapons(gid);
@@ -2456,104 +2557,230 @@ async function handleWeapon(interaction) {
 }
 
 // ─────────────────────────────────────────────
-//  WEAPON SYSTEM
+//  HELP COMMAND
 // ─────────────────────────────────────────────
 
-async function handleWeapon(interaction) {
+const HELP_CATEGORIES = {
+  dice: {
+    title: '🎲 Dice Rolling',
+    body: [
+      '`1d20` or `r1d20+5` — roll dice (prefix `r`, `!r`, `!roll`, or bare notation)',
+      '`r1d20+5 label` — add a label; new lines become *italic* / **bold** flavour',
+      '`ra1d20+5` — roll with **advantage** (drops lowest)',
+      '`rd1d20+5` — roll with **disadvantage** (drops highest)',
+      '`rr` / `rra` / `rrd` — reroll (costs a token)',
+      '`r str` / `con` / `dex` / `wis` / `lck` — quick stat roll',
+      '`?1d20+5` — success check (crit/success/fail tiers)',
+      '`/dr` — slash version with dropdowns for roll type & success',
+    ],
+  },
+  character: {
+    title: '📜 Character Sheet',
+    body: [
+      '`/char create` — set up a full character at once (stats, order, class, weapons)',
+      '`/char set field:STR value:14` — set one field at a time',
+      '`/char show [user]` — view a character sheet',
+      '`/char export [format:Image]` — export your sheet as text or image',
+      '`/profile on/off/show/save/load/saves` — manage profile display & snapshots',
+      '`/weapon add/remove/list` — manage the server weapon list (GM)',
+    ],
+  },
+  hp: {
+    title: '❤️ HP, Healing & Rerolls',
+    body: [
+      '`!hp +5` / `!hp -3` — adjust your HP (or `!hp @user +5`)',
+      '`!heal @user` / `!h @user` — White Knight heal (WIS ≥ 5 only)',
+      '`!rerolls +1` / `!rerolls @user -1` — adjust reroll tokens',
+      '`lrest` / `srest` — long/short rest · `hpfull` / `hphalf` — set HP',
+    ],
+  },
+  fight: {
+    title: '⚔️ Fights',
+    body: [
+      '`/fight start @p1 @p2 npc:Name` — begin a fight',
+      '`/fight atk stat:str target:@user` — attack',
+      '`/fight def stat:dex` — defend',
+      '`/fight rr` — reroll (costs a token) · `/fight resolve` — resolve a clash',
+      '`/fight status` — show current fight · `/fight forfeit` — drop out',
+      '`/fight end` — end the fight (GM)',
+    ],
+  },
+  npc: {
+    title: '🎭 NPCs',
+    body: [
+      '`/npc create name:X str:N ...` — create an NPC (GM)',
+      '`/npc list` · `/npc delete name:X`',
+      '`/npc categorycreate/categorydelete/categorylist` — manage categories',
+      '`/npc categoryassign/categoryremove` — sort NPCs into categories',
+      '`/pr roll category:X name:Y notation:1d20 stat:STR` — roll as an NPC',
+      '`/pr reroll name:X` — reroll an NPC roll (costs a token)',
+      '💡 Upload an image to the NPC channel with the NPC name to set an avatar',
+    ],
+  },
+  tags: {
+    title: '🏷️ Tags',
+    body: [
+      '`/tag assign user:@player tag:X` — give a player a tag (GM)',
+      '`/tag remove user:@player tag:X` — remove a tag',
+      '`/tag list` — show all tags',
+      '`/tag custom action:Create emoji:⚜️ name:MyTag` — manage custom tags',
+    ],
+  },
+  gm: {
+    title: '🛠️ GM & Config',
+    body: [
+      '`/config gmrole @role` — set the GM role',
+      '`/config heal charges:N` — set default heal charges',
+      '`/config npcchannel #channel` — set the NPC avatar channel',
+      '`/config cleanwebhooks` — remove orphaned NPC webhooks',
+      '`gmr` / `gmrs 1d20+5` — public / secret GM roll',
+      '`/backup now` — export the database · `/backup auto` — daily backups',
+      '`/stat` — show stat descriptions · `/help` — this menu',
+    ],
+  },
+};
+
+async function handleHelp(interaction) {
+  const cat = interaction.options.getString('category');
+  if (cat && HELP_CATEGORIES[cat]) {
+    const c = HELP_CATEGORIES[cat];
+    return interaction.reply({ content: `**${c.title}**\n${c.body.join('\n')}`, ephemeral: true });
+  }
+  // Overview of all categories
+  const lines = ['**🎲 DDice — Command Help**', '', 'Use `/help category:X` for details on each group.', ''];
+  for (const key of Object.keys(HELP_CATEGORIES)) {
+    const c = HELP_CATEGORIES[key];
+    lines.push(`${c.title} — \`/help category:${key}\``);
+  }
+  lines.push('', '_Most dice commands also work with the `r` prefix or bare notation (e.g. `1d20`)._');
+  return interaction.reply({ content: lines.join('\n'), ephemeral: true });
+}
+
+// ─────────────────────────────────────────────
+//  LAST ROLL COMMAND
+// ─────────────────────────────────────────────
+
+async function handleLastRoll(interaction) {
+  const gid = interaction.guild.id;
+  const uid = interaction.user.id;
+  const last = getLastRoll(gid, interaction.channel.id, uid);
+  if (!last) return interaction.reply({ content: '❌ You haven\'t rolled anything in this channel yet.', ephemeral: true });
+  const label = last.label ? ` *(${last.label})*` : '';
+  return interaction.reply({ content: `🎲 Your last roll here: \`${last.notation}\`${label}\n_Rolled at ${last.saved_at} UTC._\nUse \`rr\` to reroll it (costs a token).`, ephemeral: true });
+}
+
+// ─────────────────────────────────────────────
+//  BACKUP SYSTEM
+// ─────────────────────────────────────────────
+
+async function handleBackup(interaction) {
   const sub = interaction.options.getSubcommand();
   const gid = interaction.guild.id;
   const uid = interaction.user.id;
 
   if (!(await isGm(interaction.guild, uid)))
-    return interaction.reply({ content: '❌ Only GMs can manage the weapon list.', ephemeral: true });
+    return interaction.reply({ content: '❌ Only GMs can manage backups.', ephemeral: true });
 
-  if (sub === 'add') {
-    const name = interaction.options.getString('name');
-    addWeapon(gid, name);
-    await interaction.reply({ content: `✅ **${name}** added to the weapon list. Menus updating...` });
-    registerSlashCommands(gid).catch(console.error);
+  if (sub === 'now') {
+    await interaction.deferReply({ ephemeral: true });
+    try {
+      const { AttachmentBuilder } = require('discord.js');
+      const dbPath = DB_PATH;
+      const fs = require('fs');
+      if (!fs.existsSync(dbPath)) return interaction.editReply({ content: '❌ Database file not found.' });
+      const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+      const attachment = new AttachmentBuilder(dbPath, { name: `ddice-backup-${stamp}.db` });
+      await interaction.editReply({ content: `✅ Database backup (${(fs.statSync(dbPath).size/1024).toFixed(1)} KB). Save this file somewhere safe.`, files: [attachment] });
+    } catch (err) {
+      console.error('Backup error:', err);
+      return interaction.editReply({ content: `❌ Backup failed: ${err.message}` });
+    }
     return;
   }
-  if (sub === 'remove') {
-    const name = interaction.options.getString('name');
-    removeWeapon(gid, name);
-    await interaction.reply({ content: `🗑️ **${name}** removed from the weapon list. Menus updating...` });
-    registerSlashCommands(gid).catch(console.error);
-    return;
-  }
-  if (sub === 'list') {
-    const weapons = getWeapons(gid);
-    if (!weapons.length) return interaction.reply({ content: '❌ No weapons added yet. Use `/weapon add` to add one.', ephemeral: true });
-    return interaction.reply({ content: `**⚔️ Server Weapons:**\n${weapons.map(w=>`• ${w}`).join('\n')}` });
+
+  if (sub === 'auto') {
+    const raw = interaction.options.getString('channel');
+    if (raw.toLowerCase() === 'off') {
+      setConfig(gid, { backup_channel_id: null });
+      return interaction.reply({ content: '✅ Daily automatic backups disabled.', ephemeral: true });
+    }
+    const channelId = raw.replace(/[<#>]/g, '').trim();
+    setConfig(gid, { backup_channel_id: channelId });
+    return interaction.reply({ content: `✅ Daily automatic backups enabled — will post to <#${channelId}> every 24 hours.`, ephemeral: true });
   }
 }
 
-// ─────────────────────────────────────────────
-// ─────────────────────────────────────────────
-
-// ─────────────────────────────────────────────
-//  WEAPON SYSTEM
-// ─────────────────────────────────────────────
-
-async function handleWeapon(interaction) {
-  const sub = interaction.options.getSubcommand();
-  const gid = interaction.guild.id;
-  const uid = interaction.user.id;
-
-  if (!(await isGm(interaction.guild, uid)))
-    return interaction.reply({ content: '❌ Only GMs can manage the weapon list.', ephemeral: true });
-
-  if (sub === 'add') {
-    const name = interaction.options.getString('name');
-    addWeapon(gid, name);
-    await interaction.reply({ content: `✅ **${name}** added to the weapon list. Menus updating...` });
-    registerSlashCommands(gid).catch(console.error);
-    return;
-  }
-  if (sub === 'remove') {
-    const name = interaction.options.getString('name');
-    removeWeapon(gid, name);
-    await interaction.reply({ content: `🗑️ **${name}** removed from the weapon list. Menus updating...` });
-    registerSlashCommands(gid).catch(console.error);
-    return;
-  }
-  if (sub === 'list') {
-    const weapons = getWeapons(gid);
-    if (!weapons.length) return interaction.reply({ content: '❌ No weapons added yet. Use `/weapon add` to add one.', ephemeral: true });
-    return interaction.reply({ content: `**⚔️ Server Weapons:**\n${weapons.map(w=>`• ${w}`).join('\n')}` });
-  }
+// Daily automatic backup task
+function startBackupScheduler() {
+  setInterval(async () => {
+    try {
+      const fs = require('fs');
+      const { AttachmentBuilder } = require('discord.js');
+      const dbPath = DB_PATH;
+      if (!fs.existsSync(dbPath)) return;
+      const rows = db.prepare('SELECT guild_id, backup_channel_id FROM guild_config WHERE backup_channel_id IS NOT NULL').all();
+      for (const row of rows) {
+        try {
+          const ch = await client.channels.fetch(row.backup_channel_id);
+          if (!ch) continue;
+          const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+          const attachment = new AttachmentBuilder(dbPath, { name: `ddice-backup-${stamp}.db` });
+          await ch.send({ content: `🗄️ Daily automatic backup — ${new Date().toUTCString()}`, files: [attachment] });
+        } catch (e) { console.error('Auto-backup failed for guild', row.guild_id, e.message); }
+      }
+    } catch (err) { console.error('Backup scheduler error:', err.message); }
+  }, 24 * 60 * 60 * 1000); // every 24 hours
 }
 
 // ─────────────────────────────────────────────
-//  WEAPON SYSTEM
+//  CONFIRMATION BUTTON SYSTEM
 // ─────────────────────────────────────────────
 
-async function handleWeapon(interaction) {
-  const sub = interaction.options.getSubcommand();
-  const gid = interaction.guild.id;
-  const uid = interaction.user.id;
+// Pending destructive actions keyed by a short token
+const pendingConfirms = new Map();
 
-  if (!(await isGm(interaction.guild, uid)))
-    return interaction.reply({ content: '❌ Only GMs can manage the weapon list.', ephemeral: true });
-
-  if (sub === 'add') {
-    const name = interaction.options.getString('name');
-    addWeapon(gid, name);
-    await interaction.reply({ content: `✅ **${name}** added to the weapon list. Menus updating...` });
-    registerSlashCommands(gid).catch(console.error);
-    return;
-  }
-  if (sub === 'remove') {
-    const name = interaction.options.getString('name');
-    removeWeapon(gid, name);
-    await interaction.reply({ content: `🗑️ **${name}** removed from the weapon list. Menus updating...` });
-    registerSlashCommands(gid).catch(console.error);
-    return;
-  }
-  if (sub === 'list') {
-    const weapons = getWeapons(gid);
-    if (!weapons.length) return interaction.reply({ content: '❌ No weapons added yet. Use `/weapon add` to add one.', ephemeral: true });
-    return interaction.reply({ content: `**⚔️ Server Weapons:**\n${weapons.map(w=>`• ${w}`).join('\n')}` });
-  }
+function makeConfirmButtons(token) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`confirm:${token}`).setLabel('Confirm').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`cancel:${token}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+  );
+  return row;
 }
 
+// Ask for confirmation. `action` is an async fn run if confirmed.
+async function requestConfirm(interaction, promptText, action) {
+  const token = `${interaction.user.id}_${Date.now()}_${Math.floor(Math.random()*1000)}`;
+  pendingConfirms.set(token, { action, userId: interaction.user.id, expires: Date.now() + 60000 });
+  // Auto-expire after 60s
+  setTimeout(() => pendingConfirms.delete(token), 60000);
+  await interaction.reply({ content: `⚠️ ${promptText}`, components: [makeConfirmButtons(token)], ephemeral: true });
+}
+
+async function handleConfirmButton(interaction) {
+  const [decision, token] = interaction.customId.split(':');
+  const pending = pendingConfirms.get(token);
+
+  if (!pending) {
+    return interaction.update({ content: '⏰ This confirmation has expired. Please run the command again.', components: [] }).catch(()=>{});
+  }
+  if (interaction.user.id !== pending.userId) {
+    return interaction.reply({ content: '❌ This confirmation isn\'t for you.', ephemeral: true }).catch(()=>{});
+  }
+
+  pendingConfirms.delete(token);
+
+  if (decision === 'cancel') {
+    return interaction.update({ content: '❌ Cancelled — nothing was changed.', components: [] }).catch(()=>{});
+  }
+
+  // Confirmed — run the action
+  try {
+    await interaction.update({ content: '⏳ Working...', components: [] });
+    const result = await pending.action();
+    await interaction.editReply({ content: result || '✅ Done.', components: [] });
+  } catch (err) {
+    console.error('Confirm action error:', err);
+    await interaction.editReply({ content: `❌ Action failed: ${err.message}`, components: [] }).catch(()=>{});
+  }
+}
