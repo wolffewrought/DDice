@@ -1432,7 +1432,7 @@ async function handleStat(interaction) {
 // ─────────────────────────────────────────────
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates],
 });
 
 client.on('ready', async () => {
@@ -2492,11 +2492,12 @@ async function handleWeapon(interaction) {
 // ─────────────────────────────────────────────
 
 let player;
+(async () => {
 try {
   const { Player } = require('discord-player');
-  const { YoutubeiExtractor } = require('@discord-player/extractor');
+  const { DefaultExtractors } = require('@discord-player/extractor');
   player = new Player(client, { skipFFmpeg: false });
-  player.extractors.register(YoutubeiExtractor, {});
+  await player.extractors.loadMulti(DefaultExtractors);
 
   player.events.on('emptyQueue', (queue) => {
     queue.metadata?.channel?.send('🎵 Queue finished. Bot will leave in 15 minutes if no music is added.');
@@ -2521,6 +2522,7 @@ try {
 } catch (err) {
   console.error('Music player failed to init:', err.message);
 }
+})()
 
 
 // ─────────────────────────────────────────────
