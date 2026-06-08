@@ -2746,7 +2746,13 @@ async function handleMusic(interaction) {
           adapterCreator: interaction.guild.voiceAdapterCreator,
           selfDeaf: true,
         });
-        await entersState(state.connection, VoiceConnectionStatus.Ready, 10_000);
+        try {
+          await entersState(state.connection, VoiceConnectionStatus.Ready, 30_000);
+        } catch (err) {
+          state.connection.destroy();
+          state.connection = null;
+          throw new Error('Could not connect to voice channel. Check bot has Connect and Speak permissions.');
+        }
       }
 
       // Create player
