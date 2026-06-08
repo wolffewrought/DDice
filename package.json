@@ -10,6 +10,11 @@
     "@napi-rs/canvas": "^0.1.44",
     "better-sqlite3": "^9.4.3",
     "discord.js": "^14.14.1",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "@discord-player/extractor": "^4.5.0",
+    "discord-player": "^6.7.1",
+    "play-dl": "^1.9.7",
+    "@discordjs/opus": "^0.9.0",
+    "ffmpeg-static": "^5.2.0"
   }
 }
