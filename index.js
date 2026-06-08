@@ -1521,9 +1521,25 @@ client.on('messageCreate', async message => {
       const audioExts = ['.mp3','.wav','.ogg','.flac','.aac','.m4a','.opus','.webm'];
       const isAudio = audioExts.some(ext => attachment.name?.toLowerCase().endsWith(ext));
       if (trackName && isAudio) {
-        upsertTrack(message.guild.id, trackName, attachment.url, message.id, message.channel.id);
-        message.react('✅').catch(()=>{});
-        registerSlashCommands(message.guild.id).catch(console.error);
+        try {
+          // Download to local storage to avoid CDN expiry
+          const https = require('https');
+          const fss = require('fs');
+          const musicDir = '/app/data/music';
+          if (!fss.existsSync(musicDir)) fss.mkdirSync(musicDir, { recursive: true });
+          const ext = attachment.name.split('.').pop();
+          const localPath = `${musicDir}/${message.guild.id}_${trackName.replace(/[^a-zA-Z0-9]/g,'_')}.${ext}`;
+          await new Promise((resolve, reject) => {
+            const file = fss.createWriteStream(localPath);
+            https.get(attachment.url, res => { res.pipe(file); file.on('finish', () => { file.close(); resolve(); }); }).on('error', reject);
+          });
+          upsertTrack(message.guild.id, trackName, localPath, message.id, message.channel.id);
+          message.react('✅').catch(()=>{});
+          registerSlashCommands(message.guild.id).catch(console.error);
+        } catch(err) {
+          console.error('Music download error:', err.message);
+          message.react('❌').catch(()=>{});
+        }
       }
       return;
     }
@@ -2753,19 +2769,8 @@ async function handleMusic(interaction) {
         state.player.on('error', err => console.error('Audio player error:', err.message));
       }
 
-      // Fetch fresh URL from Discord message to avoid CDN expiry
-      let streamUrl = track.url;
-      if (track.message_id && track.channel_id) {
-        try {
-          const ch = await interaction.guild.channels.fetch(track.channel_id);
-          const msg = await ch.messages.fetch(track.message_id);
-          const att = msg.attachments.first();
-          if (att) {
-            streamUrl = att.url;
-            upsertTrack(interaction.guild.id, name, att.url, track.message_id, track.channel_id);
-          }
-        } catch (e) { console.error('URL refresh failed:', e.message); }
-      }
+      // Use local file path for reliable streaming
+      const streamUrl = track.url;
       const resource = createAudioResource(streamUrl, { inputType: StreamType.Arbitrary, inlineVolume: true });
       resource.volume?.setVolume(1);
       state.player.play(resource);
