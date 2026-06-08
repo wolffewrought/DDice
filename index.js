@@ -2495,9 +2495,12 @@ let player;
 (async () => {
 try {
   const { Player } = require('discord-player');
-  const { DefaultExtractors } = require('@discord-player/extractor');
+  const { SpotifyExtractor, SoundCloudExtractor, YoutubeExtractor, AttachmentExtractor } = require('@discord-player/extractor');
   player = new Player(client, { skipFFmpeg: false });
-  await player.extractors.loadMulti(DefaultExtractors);
+  await player.extractors.register(YoutubeExtractor, {});
+  await player.extractors.register(SpotifyExtractor, {});
+  await player.extractors.register(SoundCloudExtractor, {});
+  await player.extractors.register(AttachmentExtractor, {});
 
   player.events.on('emptyQueue', (queue) => {
     queue.metadata?.channel?.send('🎵 Queue finished. Bot will leave in 15 minutes if no music is added.');
