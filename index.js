@@ -1354,18 +1354,18 @@ client.on('interactionCreate', async interaction => {
 
   if (!interaction.isChatInputCommand()) return;
   try {
-    if (interaction.commandName === 'config') return handleConfig(interaction);
-    if (interaction.commandName === 'char') return handleChar(interaction);
-    if (interaction.commandName === 'profile' || interaction.commandName === 'p') return handleProfile(interaction);
-    if (interaction.commandName === 'tag') return handleTag(interaction);
-    if (interaction.commandName === 'stat') return handleStat(interaction);
-    if (interaction.commandName === 'dr') return handleSlashRoll(interaction);
-    if (interaction.commandName === 'fight') return handleFight(interaction);
-    if (interaction.commandName === 'npc') return handleNpc(interaction);
-    if (interaction.commandName === 'pr') return handlePr(interaction);
+    if (interaction.commandName === 'config') return await handleConfig(interaction);
+    if (interaction.commandName === 'char') return await handleChar(interaction);
+    if (interaction.commandName === 'profile' || interaction.commandName === 'p') return await handleProfile(interaction);
+    if (interaction.commandName === 'tag') return await handleTag(interaction);
+    if (interaction.commandName === 'stat') return await handleStat(interaction);
+    if (interaction.commandName === 'dr') return await handleSlashRoll(interaction);
+    if (interaction.commandName === 'fight') return await handleFight(interaction);
+    if (interaction.commandName === 'npc') return await handleNpc(interaction);
+    if (interaction.commandName === 'pr') return await handlePr(interaction);
   } catch (err) {
     console.error(err);
-    if (!interaction.replied) interaction.reply({ content: '❌ Something went wrong.', ephemeral: true });
+    if (!interaction.replied && !interaction.deferred) interaction.reply({ content: '❌ Something went wrong.', ephemeral: true }).catch(()=>{});
   }
 });
 
