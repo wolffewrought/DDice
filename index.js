@@ -2056,6 +2056,7 @@ async function handleNpc(interaction) {
       lines.push(`• **${n.name}**${order}${img} — STR ${n.str} CON ${n.con} DEX ${n.dex} WIS ${n.wis} LCK ${n.lck} | ❤️ ${n.hp_current}/${n.con+2}`);
     });
     return interaction.reply({ content: lines.join('\n') });
+  }
 
   if (sub === 'categorycreate') {
     const name = interaction.options.getString('name');
@@ -2096,7 +2097,6 @@ async function handleNpc(interaction) {
     await interaction.reply({ content: `✅ **${npcName}** removed from **${category}**. Menus updating...` });
     registerSlashCommands(gid).catch(console.error);
     return;
-  }
   }
 }
 
