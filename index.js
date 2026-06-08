@@ -30,6 +30,8 @@ try { db.exec("ALTER TABLE characters ADD COLUMN weapon2 TEXT DEFAULT NULL"); } 
 try { db.exec("ALTER TABLE characters ADD COLUMN weapon1emoji TEXT DEFAULT '⚔️'"); } catch {}
 try { db.exec("ALTER TABLE characters ADD COLUMN weapon2emoji TEXT DEFAULT '🗡️'"); } catch {}
 try { db.exec("CREATE TABLE IF NOT EXISTS weapons (guild_id TEXT NOT NULL, name TEXT NOT NULL, PRIMARY KEY (guild_id, name))"); } catch {}
+try { db.exec("CREATE TABLE IF NOT EXISTS tracks (guild_id TEXT NOT NULL, name TEXT NOT NULL, url TEXT NOT NULL, PRIMARY KEY (guild_id, name))"); } catch {}
+try { db.exec("ALTER TABLE guild_config ADD COLUMN music_channel_id TEXT DEFAULT NULL"); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN atk_mode TEXT DEFAULT 'normal'"); } catch {}
 try { db.exec('ALTER TABLE fights ADD COLUMN atk_sides INTEGER DEFAULT 20'); } catch {}
@@ -71,6 +73,12 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS custom_tags (
     guild_id TEXT NOT NULL, tag_name TEXT NOT NULL, emoji TEXT NOT NULL,
     PRIMARY KEY (guild_id, tag_name)
+  );
+  CREATE TABLE IF NOT EXISTS tracks (
+    guild_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    PRIMARY KEY (guild_id, name)
   );
   CREATE TABLE IF NOT EXISTS weapons (
     guild_id TEXT NOT NULL,
@@ -235,6 +243,20 @@ function setNpcWebhook(gid, name, webhookId, webhookToken) {
 
 // Blank silhouette as base64 data URI fallback
 const BLANK_AVATAR = 'https://cdn.discordapp.com/embed/avatars/0.png';
+
+// ── Track helpers ─────────────────────────────────────────────────────────────
+function getTracks(gid) {
+  return db.prepare('SELECT name, url FROM tracks WHERE guild_id=? ORDER BY name').all(gid);
+}
+function getTrack(gid, name) {
+  return db.prepare('SELECT * FROM tracks WHERE guild_id=? AND name=?').get(gid, name);
+}
+function upsertTrack(gid, name, url) {
+  db.prepare('INSERT OR REPLACE INTO tracks (guild_id, name, url) VALUES (?,?,?)').run(gid, name, url);
+}
+function deleteTrack(gid, name) {
+  db.prepare('DELETE FROM tracks WHERE guild_id=? AND name=?').run(gid, name);
+}
 
 // ── Weapon helpers ────────────────────────────────────────────────────────────
 function getWeapons(gid) {
@@ -712,7 +734,8 @@ const slashCommands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand(s=>s.setName('gmrole').setDescription('Set the GM role').addRoleOption(o=>o.setName('role').setDescription('The GM role').setRequired(true)))
     .addSubcommand(s=>s.setName('heal').setDescription('Set max Heal charges for White Knights').addIntegerOption(o=>o.setName('charges').setDescription('Number of charges').setRequired(true).setMinValue(1).setMaxValue(10)))
-    .addSubcommand(s=>s.setName('npcchannel').setDescription('Set the NPC image bank channel').addStringOption(o=>o.setName('channel').setDescription('Channel ID or #channel mention').setRequired(true))),
+    .addSubcommand(s=>s.setName('npcchannel').setDescription('Set the NPC image bank channel').addStringOption(o=>o.setName('channel').setDescription('Channel ID or #channel mention').setRequired(true)))
+    .addSubcommand(s=>s.setName('musicchannel').setDescription('Set the music library channel').addStringOption(o=>o.setName('channel').setDescription('Channel ID or #channel mention').setRequired(true))),
 
   new SlashCommandBuilder()
     .setName('char').setDescription('Character setup and display')
@@ -774,23 +797,17 @@ const slashCommands = [
     .setName('stat').setDescription('Show stat descriptions'),
 
   new SlashCommandBuilder()
-    .setName('music').setDescription('Music player')
-    .addSubcommand(s=>s.setName('play').setDescription('Play a song or add to queue')
-      .addStringOption(o=>o.setName('query').setDescription('Song name, YouTube URL, Spotify URL or SoundCloud URL').setRequired(true)))
-    .addSubcommand(s=>s.setName('skip').setDescription('Skip the current track'))
+    .setName('music').setDescription('Music player (GM only)')
+    .addSubcommand(s=>s.setName('play').setDescription('Play a track from the library')
+      .addStringOption(o=>o.setName('track').setDescription('Track name').setRequired(true)))
+    .addSubcommand(s=>s.setName('stop').setDescription('Stop playback and leave voice channel'))
     .addSubcommand(s=>s.setName('pause').setDescription('Pause playback'))
     .addSubcommand(s=>s.setName('resume').setDescription('Resume playback'))
-    .addSubcommand(s=>s.setName('stop').setDescription('Stop and clear the queue'))
-    .addSubcommand(s=>s.setName('queue').setDescription('Show the current queue'))
-    .addSubcommand(s=>s.setName('nowplaying').setDescription('Show the current track'))
-    .addSubcommand(s=>s.setName('volume').setDescription('Set volume (0-100)')
-      .addIntegerOption(o=>o.setName('level').setDescription('Volume level').setRequired(true).setMinValue(0).setMaxValue(100)))
-    .addSubcommand(s=>s.setName('shuffle').setDescription('Shuffle the queue'))
     .addSubcommand(s=>s.setName('loop').setDescription('Toggle loop mode'))
-    .addSubcommand(s=>s.setName('remove').setDescription('Remove a track from the queue')
-      .addIntegerOption(o=>o.setName('position').setDescription('Queue position to remove').setRequired(true).setMinValue(1)))
-    .addSubcommand(s=>s.setName('radio').setDescription('Play a radio station')
-      .addStringOption(o=>o.setName('station').setDescription('Station name or genre').setRequired(true))),
+    .addSubcommand(s=>s.setName('nowplaying').setDescription('Show current track'))
+    .addSubcommand(s=>s.setName('list').setDescription('List all tracks in the library'))
+    .addSubcommand(s=>s.setName('remove').setDescription('Remove a track from the library')
+      .addStringOption(o=>o.setName('track').setDescription('Track name').setRequired(true))),
 
   new SlashCommandBuilder()
     .setName('weapon').setDescription('Manage the server weapon list (GM only)')
@@ -927,6 +944,12 @@ async function handleConfig(interaction) {
     const channelId = raw.replace(/[<#>]/g, '').trim();
     setConfig(gid, { npc_channel_id: channelId });
     return interaction.reply({ content: `✅ NPC image channel set to <#${channelId}>. Upload images there with the NPC name as the message text to set avatars.`, ephemeral: true });
+  }
+  if (sub === 'musicchannel') {
+    const raw = interaction.options.getString('channel');
+    const channelId = raw.replace(/[<#>]/g, '').trim();
+    setConfig(gid, { music_channel_id: channelId });
+    return interaction.reply({ content: `✅ Music library channel set to <#${channelId}>. GMs can upload audio files there with the track name as the message text.`, ephemeral: true });
   }
 }
 
@@ -1486,6 +1509,24 @@ client.on('messageCreate', async message => {
   if (message.author.bot) return;
   const content = message.content.trim();
 
+  // Music library — detect audio uploads in music channel
+  if (message.attachments.size > 0) {
+    const cfg = getConfig(message.guild.id);
+    if (cfg.music_channel_id && message.channel.id === cfg.music_channel_id) {
+      if (!(await isGm(message.guild, message.author.id))) return;
+      const trackName = message.content.trim();
+      const attachment = message.attachments.first();
+      const audioExts = ['.mp3','.wav','.ogg','.flac','.aac','.m4a','.opus','.webm'];
+      const isAudio = audioExts.some(ext => attachment.name?.toLowerCase().endsWith(ext));
+      if (trackName && isAudio) {
+        upsertTrack(message.guild.id, trackName, attachment.url);
+        message.react('✅').catch(()=>{});
+        registerSlashCommands(message.guild.id).catch(console.error);
+      }
+      return;
+    }
+  }
+
   // NPC image bank — detect image uploads in npc channel
   if (message.attachments.size > 0) {
     const cfg = getConfig(message.guild.id);
@@ -1514,18 +1555,6 @@ client.on('messageCreate', async message => {
     }
   }
 
-  // Music prefix commands (m!)
-  if (content.startsWith('m!')) {
-    const [cmd, ...args] = content.slice(2).trim().split(/\s+/);
-    const rest = args.join(' ');
-    const musicCmds = ['play','skip','pause','resume','stop','queue','q','np','nowplaying','volume','shuffle','loop','remove','radio'];
-    if (musicCmds.includes(cmd.toLowerCase())) {
-      return handleMusicPrefix(message, cmd.toLowerCase(), rest).catch(err => {
-        console.error('Music prefix error:', err);
-        message.reply('❌ Something went wrong with the music player.');
-      });
-    }
-  }
 
   // Bare dice notation — check before prefix matching so 1d20 works with no prefix
   const earlyBareMatch = content.match(/^(\d+d\d+(?:[+-]\d+)?)([ \t].*)?([\s\S]*)?$/i);
@@ -1631,7 +1660,25 @@ async function registerSlashCommands(guildId) {
         });
       }
 
-      // ── /char: inject weapon choices ────────────────────────────────────────
+      // ── /music: inject track choices ──────────────────────────────────────────
+      const trackList = getTracks(guildId);
+      if (trackList.length > 0) {
+        const trackChoices = trackList.slice(0, 25).map(t => ({ name: t.name, value: t.name }));
+        commands = commands.map(cmd => {
+          const raw = typeof cmd.toJSON === 'function' ? cmd.toJSON() : cmd;
+          if (raw.name !== 'music') return cmd;
+          const json = JSON.parse(JSON.stringify(raw));
+          json.options.forEach(sub => {
+            if (sub.name === 'play' || sub.name === 'remove') {
+              const opt = sub.options?.find(o => o.name === 'track');
+              if (opt) opt.choices = trackChoices;
+            }
+          });
+          return { toJSON: () => json };
+        });
+      }
+
+      // ── /char: inject weapon choices ────────────────────────────────────────────────────────────────────────
       const weapons = getWeapons(guildId);
       if (weapons.length > 0) {
         const weaponChoices = weapons.slice(0, 25).map(w => ({ name: w, value: w }));
@@ -2488,6 +2535,39 @@ async function handleWeapon(interaction) {
 }
 
 // ─────────────────────────────────────────────
+//  WEAPON SYSTEM
+// ─────────────────────────────────────────────
+
+async function handleWeapon(interaction) {
+  const sub = interaction.options.getSubcommand();
+  const gid = interaction.guild.id;
+  const uid = interaction.user.id;
+
+  if (!(await isGm(interaction.guild, uid)))
+    return interaction.reply({ content: '❌ Only GMs can manage the weapon list.', ephemeral: true });
+
+  if (sub === 'add') {
+    const name = interaction.options.getString('name');
+    addWeapon(gid, name);
+    await interaction.reply({ content: `✅ **${name}** added to the weapon list. Menus updating...` });
+    registerSlashCommands(gid).catch(console.error);
+    return;
+  }
+  if (sub === 'remove') {
+    const name = interaction.options.getString('name');
+    removeWeapon(gid, name);
+    await interaction.reply({ content: `🗑️ **${name}** removed from the weapon list. Menus updating...` });
+    registerSlashCommands(gid).catch(console.error);
+    return;
+  }
+  if (sub === 'list') {
+    const weapons = getWeapons(gid);
+    if (!weapons.length) return interaction.reply({ content: '❌ No weapons added yet. Use `/weapon add` to add one.', ephemeral: true });
+    return interaction.reply({ content: `**⚔️ Server Weapons:**\n${weapons.map(w=>`• ${w}`).join('\n')}` });
+  }
+}
+
+// ─────────────────────────────────────────────
 //  MUSIC PLAYER SETUP
 // ─────────────────────────────────────────────
 
@@ -2496,10 +2576,10 @@ let player;
 try {
   const { Player } = require('discord-player');
   const { SpotifyExtractor, SoundCloudExtractor, YoutubeExtractor, AttachmentExtractor } = require('@discord-player/extractor');
+  const ytdl = require('@distube/ytdl-core');
   player = new Player(client, { skipFFmpeg: false });
-  // Use play-dl as stream bridge for YouTube
-  const playdl = require('play-dl');
-  await player.extractors.register(YoutubeExtractor, { streamLibrary: playdl });
+  // Use @distube/ytdl-core as stream bridge - actively maintained fork
+  await player.extractors.register(YoutubeExtractor, { streamLibrary: ytdl });
   await player.extractors.register(SpotifyExtractor, {});
   await player.extractors.register(SoundCloudExtractor, {});
   await player.extractors.register(AttachmentExtractor, {});
@@ -2744,3 +2824,132 @@ async function handleMusicPrefix(message, cmd, rest) {
     return message.reply(mode === QueueRepeatMode.QUEUE ? '🔁 Loop on.' : '➡️ Loop off.');
   }
 }
+
+// ─────────────────────────────────────────────
+//  MUSIC SYSTEM
+// ─────────────────────────────────────────────
+
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState, StreamType } = require('@discordjs/voice');
+
+// Per-guild music state
+const musicState = new Map();
+
+function getMusicState(gid) {
+  if (!musicState.has(gid)) musicState.set(gid, { connection: null, player: null, currentTrack: null, loop: false });
+  return musicState.get(gid);
+}
+
+async function handleMusic(interaction) {
+  const sub = interaction.options.getSubcommand();
+  const gid = interaction.guild.id;
+  const uid = interaction.user.id;
+
+  if (!(await isGm(interaction.guild, uid)))
+    return interaction.reply({ content: '❌ Only GMs can control music.', ephemeral: true });
+
+  const state = getMusicState(gid);
+
+  if (sub === 'list') {
+    const tracks = getTracks(gid);
+    if (!tracks.length) return interaction.reply({ content: '❌ No tracks in the library yet. Upload audio files to the music channel.', ephemeral: true });
+    const lines = ['**🎵 Music Library:**', ''];
+    tracks.forEach((t, i) => lines.push(`${i+1}. **${t.name}**`));
+    return interaction.reply({ content: lines.join('\n') });
+  }
+
+  if (sub === 'remove') {
+    const name = interaction.options.getString('track');
+    const track = getTrack(gid, name);
+    if (!track) return interaction.reply({ content: `❌ Track **${name}** not found.`, ephemeral: true });
+    deleteTrack(gid, name);
+    return interaction.reply({ content: `🗑️ **${name}** removed from the library.` });
+  }
+
+  if (sub === 'stop') {
+    if (state.player) state.player.stop();
+    if (state.connection) state.connection.destroy();
+    state.connection = null; state.player = null; state.currentTrack = null;
+    musicState.set(gid, state);
+    return interaction.reply({ content: '⏹️ Music stopped.' });
+  }
+
+  if (sub === 'pause') {
+    if (!state.player) return interaction.reply({ content: '❌ Nothing playing.', ephemeral: true });
+    state.player.pause();
+    return interaction.reply({ content: '⏸️ Paused.' });
+  }
+
+  if (sub === 'resume') {
+    if (!state.player) return interaction.reply({ content: '❌ Nothing playing.', ephemeral: true });
+    state.player.unpause();
+    return interaction.reply({ content: '▶️ Resumed.' });
+  }
+
+  if (sub === 'loop') {
+    state.loop = !state.loop;
+    musicState.set(gid, state);
+    return interaction.reply({ content: state.loop ? '🔁 Loop enabled.' : '➡️ Loop disabled.' });
+  }
+
+  if (sub === 'nowplaying') {
+    if (!state.currentTrack) return interaction.reply({ content: '❌ Nothing playing.', ephemeral: true });
+    return interaction.reply({ content: `🎵 Now playing: **${state.currentTrack}**${state.loop ? ' 🔁' : ''}` });
+  }
+
+  if (sub === 'play') {
+    const name = interaction.options.getString('track');
+    const track = getTrack(gid, name);
+    if (!track) return interaction.reply({ content: `❌ Track **${name}** not found in the library. Use \`/music list\` to see available tracks.`, ephemeral: true });
+
+    const member = interaction.member;
+    const voiceChannel = member.voice?.channel;
+    if (!voiceChannel) return interaction.reply({ content: '❌ You need to be in a voice channel first.', ephemeral: true });
+
+    await interaction.deferReply();
+
+    try {
+      // Create or reuse connection
+      if (!state.connection || state.connection.state.status === VoiceConnectionStatus.Destroyed) {
+        state.connection = joinVoiceChannel({
+          channelId: voiceChannel.id,
+          guildId: gid,
+          adapterCreator: interaction.guild.voiceAdapterCreator,
+          selfDeaf: true,
+        });
+        await entersState(state.connection, VoiceConnectionStatus.Ready, 10_000);
+      }
+
+      // Create player
+      if (!state.player) {
+        state.player = createAudioPlayer();
+        state.connection.subscribe(state.player);
+
+        state.player.on(AudioPlayerStatus.Idle, () => {
+          if (state.loop && state.currentTrack) {
+            // Replay current track
+            const t = getTrack(gid, state.currentTrack);
+            if (t) {
+              const resource = createAudioResource(t.url, { inputType: StreamType.Arbitrary, inlineVolume: true });
+              resource.volume?.setVolume(1);
+              state.player.play(resource);
+            }
+          }
+        });
+
+        state.player.on('error', err => console.error('Audio player error:', err.message));
+      }
+
+      const resource = createAudioResource(track.url, { inputType: StreamType.Arbitrary, inlineVolume: true });
+      resource.volume?.setVolume(1);
+      state.player.play(resource);
+      state.currentTrack = name;
+      musicState.set(gid, state);
+
+      return interaction.editReply({ content: `🎵 Now playing: **${name}**` });
+    } catch (err) {
+      console.error('Music play error:', err);
+      return interaction.editReply({ content: `❌ Could not play track: ${err.message}` });
+    }
+  }
+}
+
