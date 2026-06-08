@@ -78,6 +78,8 @@ db.exec(`
     guild_id TEXT NOT NULL,
     name TEXT NOT NULL,
     url TEXT NOT NULL,
+    message_id TEXT DEFAULT NULL,
+    channel_id TEXT DEFAULT NULL,
     PRIMARY KEY (guild_id, name)
   );
   CREATE TABLE IF NOT EXISTS weapons (
@@ -251,8 +253,8 @@ function getTracks(gid) {
 function getTrack(gid, name) {
   return db.prepare('SELECT * FROM tracks WHERE guild_id=? AND name=?').get(gid, name);
 }
-function upsertTrack(gid, name, url) {
-  db.prepare('INSERT OR REPLACE INTO tracks (guild_id, name, url) VALUES (?,?,?)').run(gid, name, url);
+function upsertTrack(gid, name, url, messageId, channelId) {
+  db.prepare('INSERT OR REPLACE INTO tracks (guild_id, name, url, message_id, channel_id) VALUES (?,?,?,?,?)').run(gid, name, url, messageId||null, channelId||null);
 }
 function deleteTrack(gid, name) {
   db.prepare('DELETE FROM tracks WHERE guild_id=? AND name=?').run(gid, name);
@@ -1519,7 +1521,7 @@ client.on('messageCreate', async message => {
       const audioExts = ['.mp3','.wav','.ogg','.flac','.aac','.m4a','.opus','.webm'];
       const isAudio = audioExts.some(ext => attachment.name?.toLowerCase().endsWith(ext));
       if (trackName && isAudio) {
-        upsertTrack(message.guild.id, trackName, attachment.url);
+        upsertTrack(message.guild.id, trackName, attachment.url, message.id, message.channel.id);
         message.react('✅').catch(()=>{});
         registerSlashCommands(message.guild.id).catch(console.error);
       }
@@ -2751,7 +2753,20 @@ async function handleMusic(interaction) {
         state.player.on('error', err => console.error('Audio player error:', err.message));
       }
 
-      const resource = createAudioResource(track.url, { inputType: StreamType.Arbitrary, inlineVolume: true });
+      // Fetch fresh URL from Discord message to avoid CDN expiry
+      let streamUrl = track.url;
+      if (track.message_id && track.channel_id) {
+        try {
+          const ch = await interaction.guild.channels.fetch(track.channel_id);
+          const msg = await ch.messages.fetch(track.message_id);
+          const att = msg.attachments.first();
+          if (att) {
+            streamUrl = att.url;
+            upsertTrack(interaction.guild.id, name, att.url, track.message_id, track.channel_id);
+          }
+        } catch (e) { console.error('URL refresh failed:', e.message); }
+      }
+      const resource = createAudioResource(streamUrl, { inputType: StreamType.Arbitrary, inlineVolume: true });
       resource.volume?.setVolume(1);
       state.player.play(resource);
       state.currentTrack = name;
