@@ -24,6 +24,13 @@ db.pragma('journal_mode = WAL');
 // ── Schema migrations ─────────────────────────────────────────────────────────
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_channel_id TEXT DEFAULT NULL'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
+try { db.exec("ALTER TABLE characters ADD COLUMN class TEXT DEFAULT NULL"); } catch {}
+try { db.exec("ALTER TABLE characters ADD COLUMN weapon1 TEXT DEFAULT NULL"); } catch {}
+try { db.exec("ALTER TABLE characters ADD COLUMN weapon2 TEXT DEFAULT NULL"); } catch {}
+try { db.exec("ALTER TABLE characters ADD COLUMN weapon1emoji TEXT DEFAULT '⚔️'"); } catch {}
+try { db.exec("ALTER TABLE characters ADD COLUMN weapon2emoji TEXT DEFAULT '🗡️'"); } catch {}
+try { db.exec("CREATE TABLE IF NOT EXISTS weapons (guild_id TEXT NOT NULL, name TEXT NOT NULL, PRIMARY KEY (guild_id, name))"); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN atk_mode TEXT DEFAULT 'normal'"); } catch {}
 try { db.exec('ALTER TABLE fights ADD COLUMN atk_sides INTEGER DEFAULT 20'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN def_mode TEXT DEFAULT 'normal'"); } catch {}
@@ -33,6 +40,8 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 
 db.exec(`
   CREATE TABLE IF NOT EXISTS characters (
     guild_id TEXT NOT NULL, user_id TEXT NOT NULL, order_name TEXT DEFAULT NULL,
+    class TEXT DEFAULT NULL, weapon1 TEXT DEFAULT NULL, weapon2 TEXT DEFAULT NULL,
+    weapon1emoji TEXT DEFAULT '⚔️', weapon2emoji TEXT DEFAULT '🗡️',
     str INTEGER DEFAULT 0, con INTEGER DEFAULT 0, dex INTEGER DEFAULT 0,
     wis INTEGER DEFAULT 0, lck INTEGER DEFAULT 0,
     hp_current INTEGER DEFAULT 0, rerolls_current INTEGER DEFAULT 0, profile_enabled INTEGER DEFAULT 1,
@@ -62,6 +71,11 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS custom_tags (
     guild_id TEXT NOT NULL, tag_name TEXT NOT NULL, emoji TEXT NOT NULL,
     PRIMARY KEY (guild_id, tag_name)
+  );
+  CREATE TABLE IF NOT EXISTS weapons (
+    guild_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    PRIMARY KEY (guild_id, name)
   );
   CREATE TABLE IF NOT EXISTS npc_categories (
     guild_id TEXT NOT NULL,
@@ -221,6 +235,17 @@ function setNpcWebhook(gid, name, webhookId, webhookToken) {
 
 // Blank silhouette as base64 data URI fallback
 const BLANK_AVATAR = 'https://cdn.discordapp.com/embed/avatars/0.png';
+
+// ── Weapon helpers ────────────────────────────────────────────────────────────
+function getWeapons(gid) {
+  return db.prepare('SELECT name FROM weapons WHERE guild_id=? ORDER BY name').all(gid).map(r=>r.name);
+}
+function addWeapon(gid, name) {
+  db.prepare('INSERT OR IGNORE INTO weapons (guild_id, name) VALUES (?,?)').run(gid, name);
+}
+function removeWeapon(gid, name) {
+  db.prepare('DELETE FROM weapons WHERE guild_id=? AND name=?').run(gid, name);
+}
 
 // ── NPC Category helpers ──────────────────────────────────────────────────────
 function getCategories(gid) {
@@ -402,6 +427,7 @@ function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharg
     tags.forEach(t => lines.push(`${resolveTagEmoji(gid, t)}  ${t}`));
   }
   if (char.order_name) lines.push(`${KNIGHT_EMOJIS[char.order_name]??'⚪'}  ${char.order_name}`);
+  if (char.class) lines.push(`🏅  ${char.class}`);
   lines.push(`❤️  HP${pad(char.hp_current)} / ${maxHp(char)}`);
   lines.push(`🔄  Rerolls${pad(char.rerolls_current)} / ${maxRerolls(char)}`);
   if (isWhiteKnight(char)) lines.push(`🛡️  Heal${pad(healCharges)} / ${maxCharges}`);
@@ -411,6 +437,11 @@ function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharg
   lines.push(`⚡  DEX${pad(char.dex)}`);
   lines.push(`🧠  WIS${pad(char.wis)}`);
   lines.push(`🍀  LCK${pad(char.lck)}`);
+  if (char.weapon1 || char.weapon2) {
+    lines.push('');
+    if (char.weapon1) lines.push(`${char.weapon1emoji??'⚔️'}  ${char.weapon1}`);
+    if (char.weapon2) lines.push(`${char.weapon2emoji??'🗡️'}  ${char.weapon2}`);
+  }
   if (flavour) {
     // Collapse multiline flavour into single block, strip trailing asterisks from markdown collisions
     const cleanFlavour = flavour.split(/\n/).map(l => l.trim()).filter(l => l.length > 0).join('\n\n');
@@ -687,9 +718,27 @@ const slashCommands = [
     .setName('char').setDescription('Character setup and display')
     .addSubcommand(s=>s.setName('set').setDescription('Set a character stat or field')
       .addStringOption(o=>o.setName('field').setDescription('Field to set').setRequired(true)
-        .addChoices({name:'Order',value:'order'},{name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
+        .addChoices(
+          {name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},
+          {name:'WIS',value:'wis'},{name:'LCK',value:'lck'},{name:'Order',value:'order'},
+          {name:'Class',value:'class'},{name:'Weapon 1',value:'weapon1'},{name:'Weapon 2',value:'weapon2'},
+          {name:'Weapon 1 Emoji',value:'weapon1emoji'},{name:'Weapon 2 Emoji',value:'weapon2emoji'}
+        ))
       .addStringOption(o=>o.setName('value').setDescription('Value to set').setRequired(true))
       .addUserOption(o=>o.setName('user').setDescription('Target user (GM only)').setRequired(false)))
+    .addSubcommand(s=>s.setName('create').setDescription('Set up a full character at once')
+      .addIntegerOption(o=>o.setName('str').setDescription('Strength').setRequired(false))
+      .addIntegerOption(o=>o.setName('con').setDescription('Constitution').setRequired(false))
+      .addIntegerOption(o=>o.setName('dex').setDescription('Dexterity').setRequired(false))
+      .addIntegerOption(o=>o.setName('wis').setDescription('Wisdom').setRequired(false))
+      .addIntegerOption(o=>o.setName('lck').setDescription('Luck').setRequired(false))
+      .addStringOption(o=>o.setName('order').setDescription('Knight order').setRequired(false)
+        .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'}))
+      .addStringOption(o=>o.setName('class').setDescription('Character class').setRequired(false)
+        .addChoices({name:'Hero',value:'Hero'},{name:'Vanguard',value:'Vanguard'},{name:'Defender',value:'Defender'},{name:'Siege Knight',value:'Siege Knight'}))
+      .addStringOption(o=>o.setName('weapon1').setDescription('Weapon slot 1').setRequired(false))
+      .addStringOption(o=>o.setName('weapon2').setDescription('Weapon slot 2').setRequired(false))
+      .addUserOption(o=>o.setName('user').setDescription('Target player (GM only)').setRequired(false)))
     .addSubcommand(s=>s.setName('show').setDescription('Display a character card').addUserOption(o=>o.setName('user').setDescription('User to show').setRequired(false)))
     .addSubcommand(s=>s.setName('export').setDescription('Export your character sheet')
       .addStringOption(o=>o.setName('format').setDescription('Export format').setRequired(false)
@@ -723,6 +772,14 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('stat').setDescription('Show stat descriptions'),
+
+  new SlashCommandBuilder()
+    .setName('weapon').setDescription('Manage the server weapon list (GM only)')
+    .addSubcommand(s=>s.setName('add').setDescription('Add a weapon to the server list')
+      .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true)))
+    .addSubcommand(s=>s.setName('remove').setDescription('Remove a weapon from the server list')
+      .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true)))
+    .addSubcommand(s=>s.setName('list').setDescription('List all server weapons')),
 
   new SlashCommandBuilder()
     .setName('dr').setDescription('Roll dice with full options')
@@ -856,6 +913,30 @@ async function handleConfig(interaction) {
 
 async function handleChar(interaction) {
   const sub = interaction.options.getSubcommand(), gid = interaction.guild.id, callerId = interaction.user.id;
+  if (sub === 'create') {
+    const targetUser = interaction.options.getUser('user');
+    const isGmUser = await isGm(interaction.guild, uid);
+    if (targetUser && !isGmUser) return interaction.reply({ content: '❌ Only GMs can set stats for other players.', ephemeral: true });
+    const targetId = targetUser?.id ?? uid;
+    const updates = {};
+    const str = interaction.options.getInteger('str'); if (str !== null) updates.str = str;
+    const con = interaction.options.getInteger('con'); if (con !== null) { updates.con = con; updates.hp_current = con + 2; }
+    const dex = interaction.options.getInteger('dex'); if (dex !== null) updates.dex = dex;
+    const wis = interaction.options.getInteger('wis'); if (wis !== null) updates.wis = wis;
+    const lck = interaction.options.getInteger('lck'); if (lck !== null) { updates.lck = lck; updates.rerolls_current = lck; }
+    const order = interaction.options.getString('order'); if (order) updates.order_name = order;
+    const charClass = interaction.options.getString('class'); if (charClass) updates.class = charClass;
+    const weapon1 = interaction.options.getString('weapon1'); if (weapon1) updates.weapon1 = weapon1;
+    const weapon2 = interaction.options.getString('weapon2'); if (weapon2) updates.weapon2 = weapon2;
+    if (Object.keys(updates).length === 0) return interaction.reply({ content: '❌ No fields provided.', ephemeral: true });
+    upsertChar(gid, targetId, updates);
+    const mention = targetUser ? `<@${targetId}>` : 'Your';
+    const summary = Object.entries(updates)
+      .filter(([k]) => !['hp_current','rerolls_current'].includes(k))
+      .map(([k,v]) => `**${k.toUpperCase()}**: ${v}`).join(', ');
+    return interaction.reply({ content: `✅ ${mention} character updated — ${summary}` });
+  }
+
   if (sub === 'set') {
     const field = interaction.options.getString('field');
     const value = interaction.options.getString('value');
@@ -884,6 +965,16 @@ async function handleChar(interaction) {
       if (field==='con') extra=` HP maxed to **${upd.hp_current} / ${maxHp(upd)}**`;
       if (field==='lck') extra=` Rerolls maxed to **${upd.rerolls_current} / ${maxRerolls(upd)}**`;
       return interaction.reply({ content: `✅ ${field.toUpperCase()} set to **${num}**${targetId!==callerId?` for <@${targetId}>`:''}.${extra}` });
+    }
+    // Handle class, weapon and weapon emoji fields
+    if (['class','weapon1','weapon2','weapon1emoji','weapon2emoji'].includes(field)) {
+      if (field === 'weapon1emoji' || field === 'weapon2emoji') {
+        const validEmojis = ['⚔️', '🗡️', '🏹', '🔱', '⛏️', '🛡️', '🪄'];
+        if (!validEmojis.includes(value)) return interaction.reply({ content: `❌ Choose from: ${validEmojis.join(' ')}`, ephemeral: true });
+      }
+      upsertChar(gid, targetId, { [field]: value });
+      const label = { class:'Class', weapon1:'Weapon 1', weapon2:'Weapon 2', weapon1emoji:'Weapon 1 Emoji', weapon2emoji:'Weapon 2 Emoji' }[field];
+      return interaction.reply({ content: `✅ **${label}** set to **${value}**${targetId!==callerId?` for <@${targetId}>`:''}.\`` });
     }
   }
   if (sub === 'export') return handleCharExport(interaction);
@@ -1364,6 +1455,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'fight') return await handleFight(interaction);
     if (interaction.commandName === 'npc') return await handleNpc(interaction);
     if (interaction.commandName === 'pr') return await handlePr(interaction);
+    if (interaction.commandName === 'weapon') return await handleWeapon(interaction);
   } catch (err) {
     console.error(err);
     if (!interaction.replied && !interaction.deferred) interaction.reply({ content: '❌ Something went wrong.', ephemeral: true }).catch(()=>{});
@@ -1480,12 +1572,50 @@ async function registerSlashCommands(guildId) {
                 catOpt.choices = catChoices;
               }
 
-              // Set NPC name choices — all NPCs by default
+              // NPC names with category prefix — categorised first, then uncategorised
               const nameOpt = sub.options?.find(o => o.name === 'name');
               if (nameOpt && npcList.length > 0) {
                 nameOpt.autocomplete = false;
-                nameOpt.choices = npcList.slice(0, 25).map(n => ({ name: n.name, value: n.name }));
+                const categorised = [];
+                const uncatNpcs = [];
+                npcList.forEach(n => {
+                  const cats = getCategoriesForNpc(guildId, n.name);
+                  if (cats.length > 0) {
+                    cats.forEach(c => categorised.push({ name: `[${c}] ${n.name}`, value: n.name }));
+                  } else {
+                    uncatNpcs.push({ name: n.name, value: n.name });
+                  }
+                });
+                const seen = new Set();
+                nameOpt.choices = [...categorised, ...uncatNpcs].filter(c => {
+                  if (seen.has(c.value)) return false;
+                  seen.add(c.value); return true;
+                }).slice(0, 25);
               }
+            }
+          });
+          return { toJSON: () => json };
+        });
+      }
+
+      // ── /char: inject weapon choices ────────────────────────────────────────
+      const weapons = getWeapons(guildId);
+      if (weapons.length > 0) {
+        const weaponChoices = weapons.slice(0, 25).map(w => ({ name: w, value: w }));
+        commands = commands.map(cmd => {
+          if (cmd.name !== 'char' && cmd.toJSON) {
+            const json = cmd.toJSON ? cmd.toJSON() : cmd;
+            if (json.name !== 'char') return cmd;
+          }
+          const raw = typeof cmd.toJSON === 'function' ? cmd.toJSON() : cmd;
+          if (raw.name !== 'char') return cmd;
+          const json = JSON.parse(JSON.stringify(raw));
+          json.options.forEach(sub => {
+            if (sub.name === 'create') {
+              ['weapon1','weapon2'].forEach(wf => {
+                const opt = sub.options?.find(o => o.name === wf);
+                if (opt) opt.choices = weaponChoices;
+              });
             }
           });
           return { toJSON: () => json };
@@ -2028,9 +2158,8 @@ async function handleNpc(interaction) {
     const order = interaction.options.getString('order') ?? null;
     upsertNpc(gid, name, { str, con, dex, wis, lck, order_name: order });
     const orderLine = order ? ` | ${KNIGHT_EMOJIS[order]??'⚪'} ${order}` : '';
-    // Re-register slash commands so new NPC appears in dropdown
+    await interaction.reply({ content: `✅ NPC **${name}** created.${orderLine}\n💡 Upload an image to the NPC channel with \`${name}\` as the message text to set their avatar.` });
     registerSlashCommands(gid).catch(console.error);
-    return interaction.reply({ content: `✅ NPC **${name}** created.${orderLine}\n💡 Upload an image to the NPC channel with \`${name}\` as the message text to set their avatar.` });
   }
 
   if (sub === 'delete') {
@@ -2047,8 +2176,8 @@ async function handleNpc(interaction) {
     }
     deleteNpc(gid, name);
     // Re-register slash commands so deleted NPC is removed from dropdown
+    await interaction.reply({ content: `🗑️ NPC **${name}** deleted.` });
     registerSlashCommands(gid).catch(console.error);
-    return interaction.reply({ content: `🗑️ NPC **${name}** deleted.` });
   }
 
   if (sub === 'list') {
@@ -2191,15 +2320,22 @@ async function handlePr(interaction) {
     const name     = interaction.options.getString('name');
     const notationRaw = interaction.options.getString('notation') ?? '1d20';
     const stat     = interaction.options.getString('stat') ?? null;
+
+    const npc = getNpc(gid, name);
+    if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found.`, ephemeral: true });
+
+    // Validate NPC is in selected category
+    if (category !== 'all') {
+      const npcCats = getCategoriesForNpc(gid, name);
+      const inCategory = category === 'Uncategorised' ? npcCats.length === 0 : npcCats.includes(category);
+      if (!inCategory) return interaction.reply({ content: `❌ **${name}** is not in the **${category}** category.`, ephemeral: true });
+    }
     const labelRaw = interaction.options.getString('label') ?? null;
     const flavour  = interaction.options.getString('flavour') ?? null;
     const rollType = interaction.options.getString('roll') ?? 'normal';
     const mode     = rollType === 'adv' ? 'adv' : rollType === 'dis' ? 'dis' : 'normal';
     // Combine stat and label: stat first, then label, separated by ' — '
     const label = stat && labelRaw ? `${stat} — ${labelRaw}` : stat ?? labelRaw ?? null;
-
-    const npc = getNpc(gid, name);
-    if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found. Create it first with \`/npc create\`.`, ephemeral: true });
 
     // Apply stat modifier to notation
     let notation = notationRaw;
@@ -2284,3 +2420,36 @@ async function handlePr(interaction) {
   }
 }
 
+
+// ─────────────────────────────────────────────
+//  WEAPON SYSTEM
+// ─────────────────────────────────────────────
+
+async function handleWeapon(interaction) {
+  const sub = interaction.options.getSubcommand();
+  const gid = interaction.guild.id;
+  const uid = interaction.user.id;
+
+  if (!(await isGm(interaction.guild, uid)))
+    return interaction.reply({ content: '❌ Only GMs can manage the weapon list.', ephemeral: true });
+
+  if (sub === 'add') {
+    const name = interaction.options.getString('name');
+    addWeapon(gid, name);
+    await interaction.reply({ content: `✅ **${name}** added to the weapon list. Menus updating...` });
+    registerSlashCommands(gid).catch(console.error);
+    return;
+  }
+  if (sub === 'remove') {
+    const name = interaction.options.getString('name');
+    removeWeapon(gid, name);
+    await interaction.reply({ content: `🗑️ **${name}** removed from the weapon list. Menus updating...` });
+    registerSlashCommands(gid).catch(console.error);
+    return;
+  }
+  if (sub === 'list') {
+    const weapons = getWeapons(gid);
+    if (!weapons.length) return interaction.reply({ content: '❌ No weapons added yet. Use `/weapon add` to add one.', ephemeral: true });
+    return interaction.reply({ content: `**⚔️ Server Weapons:**\n${weapons.map(w=>`• ${w}`).join('\n')}` });
+  }
+}
