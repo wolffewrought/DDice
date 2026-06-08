@@ -2495,10 +2495,11 @@ let player;
 (async () => {
 try {
   const { Player } = require('discord-player');
-  const { SpotifyExtractor, SoundCloudExtractor, AttachmentExtractor } = require('@discord-player/extractor');
-  const { YoutubeiExtractor } = require('discord-player-youtubei');
+  const { SpotifyExtractor, SoundCloudExtractor, YoutubeExtractor, AttachmentExtractor } = require('@discord-player/extractor');
   player = new Player(client, { skipFFmpeg: false });
-  await player.extractors.register(YoutubeiExtractor, {});
+  // Use play-dl as stream bridge for YouTube
+  const playdl = require('play-dl');
+  await player.extractors.register(YoutubeExtractor, { streamLibrary: playdl });
   await player.extractors.register(SpotifyExtractor, {});
   await player.extractors.register(SoundCloudExtractor, {});
   await player.extractors.register(AttachmentExtractor, {});
