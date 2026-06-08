@@ -774,6 +774,25 @@ const slashCommands = [
     .setName('stat').setDescription('Show stat descriptions'),
 
   new SlashCommandBuilder()
+    .setName('music').setDescription('Music player')
+    .addSubcommand(s=>s.setName('play').setDescription('Play a song or add to queue')
+      .addStringOption(o=>o.setName('query').setDescription('Song name, YouTube URL, Spotify URL or SoundCloud URL').setRequired(true)))
+    .addSubcommand(s=>s.setName('skip').setDescription('Skip the current track'))
+    .addSubcommand(s=>s.setName('pause').setDescription('Pause playback'))
+    .addSubcommand(s=>s.setName('resume').setDescription('Resume playback'))
+    .addSubcommand(s=>s.setName('stop').setDescription('Stop and clear the queue'))
+    .addSubcommand(s=>s.setName('queue').setDescription('Show the current queue'))
+    .addSubcommand(s=>s.setName('nowplaying').setDescription('Show the current track'))
+    .addSubcommand(s=>s.setName('volume').setDescription('Set volume (0-100)')
+      .addIntegerOption(o=>o.setName('level').setDescription('Volume level').setRequired(true).setMinValue(0).setMaxValue(100)))
+    .addSubcommand(s=>s.setName('shuffle').setDescription('Shuffle the queue'))
+    .addSubcommand(s=>s.setName('loop').setDescription('Toggle loop mode'))
+    .addSubcommand(s=>s.setName('remove').setDescription('Remove a track from the queue')
+      .addIntegerOption(o=>o.setName('position').setDescription('Queue position to remove').setRequired(true).setMinValue(1)))
+    .addSubcommand(s=>s.setName('radio').setDescription('Play a radio station')
+      .addStringOption(o=>o.setName('station').setDescription('Station name or genre').setRequired(true))),
+
+  new SlashCommandBuilder()
     .setName('weapon').setDescription('Manage the server weapon list (GM only)')
     .addSubcommand(s=>s.setName('add').setDescription('Add a weapon to the server list')
       .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true)))
@@ -1456,6 +1475,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'npc') return await handleNpc(interaction);
     if (interaction.commandName === 'pr') return await handlePr(interaction);
     if (interaction.commandName === 'weapon') return await handleWeapon(interaction);
+    if (interaction.commandName === 'music') return await handleMusic(interaction);
   } catch (err) {
     console.error(err);
     if (!interaction.replied && !interaction.deferred) interaction.reply({ content: '❌ Something went wrong.', ephemeral: true }).catch(()=>{});
@@ -1491,6 +1511,19 @@ client.on('messageCreate', async message => {
     if (parsed) {
       try { return await handleSheetImport(message, parsed); }
       catch (err) { console.error(err); return message.reply('\u274c Failed to import sheet.'); }
+    }
+  }
+
+  // Music prefix commands (m!)
+  if (content.startsWith('m!')) {
+    const [cmd, ...args] = content.slice(2).trim().split(/\s+/);
+    const rest = args.join(' ');
+    const musicCmds = ['play','skip','pause','resume','stop','queue','q','np','nowplaying','volume','shuffle','loop','remove','radio'];
+    if (musicCmds.includes(cmd.toLowerCase())) {
+      return handleMusicPrefix(message, cmd.toLowerCase(), rest).catch(err => {
+        console.error('Music prefix error:', err);
+        message.reply('❌ Something went wrong with the music player.');
+      });
     }
   }
 
@@ -2451,5 +2484,256 @@ async function handleWeapon(interaction) {
     const weapons = getWeapons(gid);
     if (!weapons.length) return interaction.reply({ content: '❌ No weapons added yet. Use `/weapon add` to add one.', ephemeral: true });
     return interaction.reply({ content: `**⚔️ Server Weapons:**\n${weapons.map(w=>`• ${w}`).join('\n')}` });
+  }
+}
+
+// ─────────────────────────────────────────────
+//  MUSIC PLAYER SETUP
+// ─────────────────────────────────────────────
+
+let player;
+try {
+  const { Player } = require('discord-player');
+  const { YoutubeiExtractor } = require('@discord-player/extractor');
+  player = new Player(client, { skipFFmpeg: false });
+  player.extractors.register(YoutubeiExtractor, {});
+
+  player.events.on('emptyQueue', (queue) => {
+    queue.metadata?.channel?.send('🎵 Queue finished. Bot will leave in 15 minutes if no music is added.');
+    queue._leaveTimer = setTimeout(() => {
+      try { if (queue.connection) queue.delete(); } catch {}
+    }, 15 * 60 * 1000);
+  });
+
+  player.events.on('playerStart', (queue, track) => {
+    if (queue._leaveTimer) { clearTimeout(queue._leaveTimer); queue._leaveTimer = null; }
+    queue.metadata?.channel?.send(`🎶 Now playing: **${track.title}** by **${track.author}** [${track.duration}]`);
+  });
+
+  player.events.on('emptyChannel', (queue) => {
+    queue.metadata?.channel?.send('👋 Voice channel empty — leaving.');
+    try { queue.delete(); } catch {}
+  });
+
+  player.events.on('error', (queue, err) => console.error('Player error:', err.message));
+  player.events.on('playerError', (queue, err) => console.error('Player error:', err.message));
+  console.log('✅ Music player ready');
+} catch (err) {
+  console.error('Music player failed to init:', err.message);
+}
+
+
+// ─────────────────────────────────────────────
+//  MUSIC HANDLER
+// ─────────────────────────────────────────────
+
+async function handleMusic(interaction) {
+  if (!player) return interaction.reply({ content: '❌ Music player is not available. Check Railway logs.', ephemeral: true });
+
+  const sub = interaction.options.getSubcommand();
+  const member = interaction.member;
+  const voiceChannel = member.voice?.channel;
+
+  if (['play','radio'].includes(sub) && !voiceChannel)
+    return interaction.reply({ content: '❌ You need to be in a voice channel first.', ephemeral: true });
+
+  const queue = player.nodes.get(interaction.guild);
+
+  // ── PLAY ─────────────────────────────────────────────────────────────────
+  if (sub === 'play') {
+    const query = interaction.options.getString('query');
+    await interaction.deferReply();
+
+    try {
+      const { track } = await player.play(voiceChannel, query, {
+        nodeOptions: {
+          metadata: { channel: interaction.channel },
+          selfDeaf: true,
+          volume: 50,
+          leaveOnEmpty: false,
+          leaveOnEnd: false,
+        }
+      });
+      return interaction.editReply({ content: `✅ Added **${track.title}** by **${track.author}** [${track.duration}] to the queue.` });
+    } catch (err) {
+      console.error('Play error:', err);
+      return interaction.editReply({ content: `❌ Could not play that track: ${err.message}` });
+    }
+  }
+
+  // ── RADIO ────────────────────────────────────────────────────────────────
+  if (sub === 'radio') {
+    const station = interaction.options.getString('station');
+    await interaction.deferReply();
+    try {
+      const { track } = await player.play(voiceChannel, `${station} radio`, {
+        nodeOptions: { metadata: { channel: interaction.channel }, selfDeaf: true, volume: 50 }
+      });
+      return interaction.editReply({ content: `📻 Tuning into **${track.title}**...` });
+    } catch (err) {
+      return interaction.editReply({ content: `❌ Could not find that radio station: ${err.message}` });
+    }
+  }
+
+  if (!queue || !queue.isPlaying()) {
+    if (['skip','pause','resume','stop','shuffle','loop','remove','volume','nowplaying'].includes(sub))
+      return interaction.reply({ content: '❌ Nothing is playing right now.', ephemeral: true });
+  }
+
+  // ── SKIP ─────────────────────────────────────────────────────────────────
+  if (sub === 'skip') {
+    queue.node.skip();
+    return interaction.reply({ content: '⏭️ Skipped!' });
+  }
+
+  // ── PAUSE ────────────────────────────────────────────────────────────────
+  if (sub === 'pause') {
+    if (queue.node.isPaused()) return interaction.reply({ content: '⏸️ Already paused.', ephemeral: true });
+    queue.node.pause();
+    return interaction.reply({ content: '⏸️ Paused.' });
+  }
+
+  // ── RESUME ───────────────────────────────────────────────────────────────
+  if (sub === 'resume') {
+    if (!queue.node.isPaused()) return interaction.reply({ content: '▶️ Already playing.', ephemeral: true });
+    queue.node.resume();
+    return interaction.reply({ content: '▶️ Resumed.' });
+  }
+
+  // ── STOP ─────────────────────────────────────────────────────────────────
+  if (sub === 'stop') {
+    queue.delete();
+    return interaction.reply({ content: '⏹️ Stopped and cleared the queue.' });
+  }
+
+  // ── VOLUME ───────────────────────────────────────────────────────────────
+  if (sub === 'volume') {
+    const level = interaction.options.getInteger('level');
+    queue.node.setVolume(level);
+    return interaction.reply({ content: `🔊 Volume set to **${level}%**` });
+  }
+
+  // ── SHUFFLE ──────────────────────────────────────────────────────────────
+  if (sub === 'shuffle') {
+    queue.tracks.shuffle();
+    return interaction.reply({ content: '🔀 Queue shuffled!' });
+  }
+
+  // ── LOOP ─────────────────────────────────────────────────────────────────
+  if (sub === 'loop') {
+    const { QueueRepeatMode } = require('discord-player');
+    const mode = queue.repeatMode === QueueRepeatMode.OFF ? QueueRepeatMode.QUEUE : QueueRepeatMode.OFF;
+    queue.setRepeatMode(mode);
+    return interaction.reply({ content: mode === QueueRepeatMode.QUEUE ? '🔁 Loop enabled.' : '➡️ Loop disabled.' });
+  }
+
+  // ── REMOVE ───────────────────────────────────────────────────────────────
+  if (sub === 'remove') {
+    const pos = interaction.options.getInteger('position') - 1;
+    const track = queue.tracks.at(pos);
+    if (!track) return interaction.reply({ content: '❌ No track at that position.', ephemeral: true });
+    queue.node.remove(track);
+    return interaction.reply({ content: `🗑️ Removed **${track.title}** from the queue.` });
+  }
+
+  // ── NOW PLAYING ───────────────────────────────────────────────────────────
+  if (sub === 'nowplaying') {
+    const track = queue.currentTrack;
+    if (!track) return interaction.reply({ content: '❌ Nothing is playing.', ephemeral: true });
+    const bar = queue.node.createProgressBar();
+    return interaction.reply({ content: `🎶 **Now Playing:**\n**${track.title}** by **${track.author}**\n${bar}\n🔊 Volume: ${queue.node.volume}%` });
+  }
+
+  // ── QUEUE ────────────────────────────────────────────────────────────────
+  if (sub === 'queue') {
+    const current = queue.currentTrack;
+    const tracks = queue.tracks.toArray();
+    const lines = ['**🎵 Music Queue:**', ''];
+    if (current) lines.push(`▶️ **Now:** ${current.title} [${current.duration}]`);
+    if (tracks.length === 0) {
+      lines.push('📭 Queue is empty.');
+    } else {
+      tracks.slice(0, 10).forEach((t, i) => lines.push(`${i+1}. **${t.title}** [${t.duration}]`));
+      if (tracks.length > 10) lines.push(`...and ${tracks.length - 10} more`);
+    }
+    return interaction.reply({ content: lines.join('\n') });
+  }
+}
+
+// ─────────────────────────────────────────────
+//  MUSIC PREFIX HANDLER (m! prefix)
+// ─────────────────────────────────────────────
+
+async function handleMusicPrefix(message, cmd, rest) {
+  if (!player) return message.reply('❌ Music player is not available.');
+  const voiceChannel = message.member?.voice?.channel;
+  const queue = player.nodes.get(message.guild);
+
+  if (['play','radio'].includes(cmd) && !voiceChannel)
+    return message.reply('❌ Join a voice channel first.');
+
+  if (cmd === 'play') {
+    if (!rest) return message.reply('❌ Usage: `m!play song name or URL`');
+    try {
+      const { track } = await player.play(voiceChannel, rest, {
+        nodeOptions: { metadata: { channel: message.channel }, selfDeaf: true, volume: 50, leaveOnEmpty: false, leaveOnEnd: false }
+      });
+      return message.reply(`✅ Added **${track.title}** [${track.duration}] to the queue.`);
+    } catch (err) {
+      return message.reply(`❌ Could not play: ${err.message}`);
+    }
+  }
+
+  if (cmd === 'radio') {
+    if (!rest) return message.reply('❌ Usage: `m!radio station name`');
+    try {
+      const { track } = await player.play(voiceChannel, `${rest} radio`, {
+        nodeOptions: { metadata: { channel: message.channel }, selfDeaf: true, volume: 50 }
+      });
+      return message.reply(`📻 Tuning into **${track.title}**...`);
+    } catch (err) {
+      return message.reply(`❌ Could not find station: ${err.message}`);
+    }
+  }
+
+  if (!queue || !queue.isPlaying()) return message.reply('❌ Nothing is playing.');
+
+  if (cmd === 'skip') { queue.node.skip(); return message.reply('⏭️ Skipped!'); }
+  if (cmd === 'pause') { queue.node.pause(); return message.reply('⏸️ Paused.'); }
+  if (cmd === 'resume') { queue.node.resume(); return message.reply('▶️ Resumed.'); }
+  if (cmd === 'stop') { queue.delete(); return message.reply('⏹️ Stopped.'); }
+  if (cmd === 'shuffle') { queue.tracks.shuffle(); return message.reply('🔀 Shuffled!'); }
+  if (cmd === 'np' || cmd === 'nowplaying') {
+    const t = queue.currentTrack;
+    if (!t) return message.reply('❌ Nothing playing.');
+    return message.reply(`🎶 **${t.title}** by **${t.author}** [${t.duration}]\n${queue.node.createProgressBar()}`);
+  }
+  if (cmd === 'volume') {
+    const vol = parseInt(rest);
+    if (isNaN(vol) || vol < 0 || vol > 100) return message.reply('❌ Volume must be 0-100.');
+    queue.node.setVolume(vol);
+    return message.reply(`🔊 Volume: **${vol}%**`);
+  }
+  if (cmd === 'queue' || cmd === 'q') {
+    const tracks = queue.tracks.toArray();
+    const current = queue.currentTrack;
+    const lines = ['**🎵 Queue:**'];
+    if (current) lines.push(`▶️ ${current.title}`);
+    tracks.slice(0,10).forEach((t,i)=>lines.push(`${i+1}. ${t.title}`));
+    if (tracks.length > 10) lines.push(`...and ${tracks.length-10} more`);
+    return message.reply(lines.join('\n'));
+  }
+  if (cmd === 'remove') {
+    const pos = parseInt(rest) - 1;
+    const t = queue.tracks.at(pos);
+    if (!t) return message.reply('❌ No track at that position.');
+    queue.node.remove(t);
+    return message.reply(`🗑️ Removed **${t.title}**.`);
+  }
+  if (cmd === 'loop') {
+    const { QueueRepeatMode } = require('discord-player');
+    const mode = queue.repeatMode === QueueRepeatMode.OFF ? QueueRepeatMode.QUEUE : QueueRepeatMode.OFF;
+    queue.setRepeatMode(mode);
+    return message.reply(mode === QueueRepeatMode.QUEUE ? '🔁 Loop on.' : '➡️ Loop off.');
   }
 }
