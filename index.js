@@ -768,8 +768,9 @@ const slashCommands = [
   new SlashCommandBuilder()
     .setName('pr').setDescription('Roll or manage NPCs as a GM persona (GM only)')
     .addSubcommand(s=>s.setName('roll').setDescription('Roll as an NPC via webhook')
+      .addStringOption(o=>o.setName('category').setDescription('Filter NPCs by category').setRequired(true)
+        .addChoices({name:'All',value:'all'}))
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
-      .addStringOption(o=>o.setName('category').setDescription('Filter by category').setRequired(false))
       .addStringOption(o=>o.setName('notation').setDescription('Dice notation e.g. 1d20+5 (default: 1d20)').setRequired(false))
       .addStringOption(o=>o.setName('stat').setDescription('Stat label (optional — auto adds modifier)').setRequired(false)
         .addChoices({name:'STR',value:'STR'},{name:'CON',value:'CON'},{name:'DEX',value:'DEX'},{name:'WIS',value:'WIS'},{name:'LCK',value:'LCK'}))
@@ -1468,10 +1469,14 @@ async function registerSlashCommands(guildId) {
 
           json.options.forEach(sub => {
             if (sub.name === 'roll' || sub.name === 'reroll') {
-              // Set category choices
+              // Set category choices — All + each category + Uncategorised
               const catOpt = sub.options?.find(o => o.name === 'category');
               if (catOpt) {
-                const catChoices = ['Uncategorised', ...categories].slice(0, 25).map(c => ({ name: c, value: c }));
+                const catChoices = [
+                  { name: 'All', value: 'all' },
+                  ...categories.map(c => ({ name: c, value: c })),
+                  { name: 'Uncategorised', value: 'Uncategorised' }
+                ].slice(0, 25);
                 catOpt.choices = catChoices;
               }
 
@@ -2182,6 +2187,7 @@ async function handlePr(interaction) {
   }
 
   if (sub === 'roll') {
+    const category = interaction.options.getString('category') ?? 'all';
     const name     = interaction.options.getString('name');
     const notationRaw = interaction.options.getString('notation') ?? '1d20';
     const stat     = interaction.options.getString('stat') ?? null;
