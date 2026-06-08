@@ -2060,38 +2060,42 @@ async function handleNpc(interaction) {
   if (sub === 'categorycreate') {
     const name = interaction.options.getString('name');
     createCategory(gid, name);
+    await interaction.reply({ content: `✅ Category **${name}** created. Menus updating...` });
     registerSlashCommands(gid).catch(console.error);
-    return interaction.reply({ content: `\u2705 Category **${name}** created.` });
+    return;
   }
   if (sub === 'categorydelete') {
     const name = interaction.options.getString('name');
     deleteCategory(gid, name);
+    await interaction.reply({ content: `🗑️ Category **${name}** deleted. Menus updating...` });
     registerSlashCommands(gid).catch(console.error);
-    return interaction.reply({ content: `Category **${name}** deleted.` });
+    return;
   }
   if (sub === 'categorylist') {
     const cats = getCategories(gid);
     const uncategorised = getUncategorisedNpcs(gid);
-    const lines2 = ['**NPC Categories:**', ''];
-    cats.forEach(c => { const m = getNpcsInCategory(gid, c); lines2.push(`- **${c}** (${m.length}): ${m.join(', ')||'empty'}`); });
-    if (uncategorised.length) lines2.push(`- **Uncategorised** (${uncategorised.length}): ${uncategorised.join(', ')}`);
+    const lines2 = ['**📂 NPC Categories:**', ''];
+    cats.forEach(c => { const m = getNpcsInCategory(gid, c); lines2.push(`• **${c}** (${m.length}): ${m.join(', ')||'empty'}`); });
+    if (uncategorised.length) lines2.push(`• **Uncategorised** (${uncategorised.length}): ${uncategorised.join(', ')}`);
     return interaction.reply({ content: lines2.join('\n') });
   }
   if (sub === 'categoryassign') {
     const npcName = interaction.options.getString('npc');
     const category = interaction.options.getString('category');
-    if (!getNpc(gid, npcName)) return interaction.reply({ content: 'NPC not found.', ephemeral: true });
-    if (!getCategories(gid).includes(category)) return interaction.reply({ content: 'Category not found.', ephemeral: true });
+    if (!getNpc(gid, npcName)) return interaction.reply({ content: `❌ NPC **${npcName}** not found.`, ephemeral: true });
+    if (!getCategories(gid).includes(category)) return interaction.reply({ content: `❌ Category **${category}** not found.`, ephemeral: true });
     assignNpcToCategory(gid, npcName, category);
+    await interaction.reply({ content: `✅ **${npcName}** added to **${category}**. Menus updating...` });
     registerSlashCommands(gid).catch(console.error);
-    return interaction.reply({ content: `**${npcName}** added to **${category}**.` });
+    return;
   }
   if (sub === 'categoryremove') {
     const npcName = interaction.options.getString('npc');
     const category = interaction.options.getString('category');
     removeNpcFromCategory(gid, npcName, category);
+    await interaction.reply({ content: `✅ **${npcName}** removed from **${category}**. Menus updating...` });
     registerSlashCommands(gid).catch(console.error);
-    return interaction.reply({ content: `**${npcName}** removed from **${category}**.` });
+    return;
   }
   }
 }
