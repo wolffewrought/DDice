@@ -2078,6 +2078,33 @@ function autoDefendStat(stats) {
 // Roll a d20 + modifier, returning { nat, total }.
 function autoRoll(mod) { const nat = rollDie(20); return { nat, total: nat + mod }; }
 
+// Post a message into a channel AS an NPC (via its webhook, with name + avatar),
+// matching how /pr posts. Falls back to a plain channel.send if the webhook fails.
+async function postAsNpc(channel, gid, npcName, content) {
+  const npc = getNpc(gid, npcName);
+  try {
+    const { WebhookClient } = require('discord.js');
+    let webhookClient;
+    if (npc && npc.webhook_id && npc.webhook_token) {
+      webhookClient = new WebhookClient({ id: npc.webhook_id, token: npc.webhook_token });
+    } else {
+      const webhook = await channel.createWebhook({
+        name: npcName,
+        avatar: npc?.image_url ?? BLANK_AVATAR,
+        reason: `NPC webhook for ${npcName}`,
+      });
+      if (npc) setNpcWebhook(gid, npcName, webhook.id, webhook.token);
+      webhookClient = new WebhookClient({ id: webhook.id, token: webhook.token });
+    }
+    await webhookClient.send({ content, username: npcName, avatarURL: npc?.image_url ?? BLANK_AVATAR });
+    return true;
+  } catch (err) {
+    console.error('postAsNpc webhook error:', err.message);
+    await channel.send(content).catch(()=>{});
+    return false;
+  }
+}
+
 // In an auto_npc fight, perform the current NPC's attack automatically against a
 // random living opponent, then leave the (human) target to defend manually.
 // If the next current fighter is also an NPC after resolution, the resolve handler
@@ -2107,14 +2134,14 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
     def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
   });
 
-  const lines = [`🤖 **${attacker.name} 🎭** (auto) attacks **${targetF.name}${targetF.isNpc?' 🎭':''}** with ${STAT_LABELS[stat]}!`,
-    `⚔️  1d20+${STAT_LABELS[stat]} → [${a.nat}] = ${fightTotalStr(a.total, a.nat, 20)}`];
-  if (targetF.isNpc) {
-    lines.push('', `🛡️ **${targetF.name}** is also an NPC — a GM resolves with \`/fight def npc:${targetF.name}\` then \`/fight resolve\`.`);
-  } else {
-    lines.push('', `🛡️ **${targetF.name}** — use \`/fight def\` to defend, then \`/fight resolve\`.`);
-  }
-  await channel.send(lines.join('\n')).catch(()=>{});
+  // The NPC's own action posts AS the NPC (webhook); the defend prompt is a system note.
+  const npcLine = `⚔️ attacks **${targetF.name}${targetF.isNpc?' 🎭':''}** with ${STAT_LABELS[stat]} — 1d20+${STAT_LABELS[stat]} → [${a.nat}] = ${fightTotalStr(a.total, a.nat, 20)}`;
+  await postAsNpc(channel, gid, attacker.name, npcLine);
+
+  const prompt = targetF.isNpc
+    ? `🛡️ **${targetF.name}** is also an NPC — a GM resolves with \`/fight def npc:${targetF.name}\` then \`/fight resolve\`.`
+    : `🛡️ **${targetF.name}** — use \`/fight def\` to defend, then \`/fight resolve\`.`;
+  await channel.send(prompt).catch(()=>{});
   return true;
 }
 
@@ -2359,18 +2386,32 @@ async function handleFight(interaction) {
       const a = autoRoll(atkF.stats[aStat] ?? 0), d = autoRoll(defF.stats[dStat] ?? 0);
       const { hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20);
 
-      const L = ['─────────────────────────────',
-        `**Round ${round}** — ${atkF.name}${atkF.isNpc?' 🎭':''} attacks ${defF.name}${defF.isNpc?' 🎭':''}`,
-        `⚔️ ${STAT_LABELS[aStat]} → [${a.nat}] = ${fightTotalStr(a.total, a.nat, 20)}`,
-        `🛡️ ${STAT_LABELS[dStat]} → [${d.nat}] = ${fightTotalStr(d.total, d.nat, 20)}`];
+      // Round header (system line)
+      await sleep(900);
+      await send(`─────────────────────────────\n**Round ${round}**`);
+
+      // Attacker's action — posts AS the NPC if it's an NPC, else a normal line
+      const atkLine = `⚔️ attacks **${defF.name}${defF.isNpc?' 🎭':''}** with ${STAT_LABELS[aStat]} — 1d20+${STAT_LABELS[aStat]} → [${a.nat}] = ${fightTotalStr(a.total, a.nat, 20)}`;
+      await sleep(700);
+      if (atkF.isNpc) await postAsNpc(channel, gid, atkF.name, atkLine);
+      else await send(`**${atkF.name}** ${atkLine}`);
+
+      // Defender's action — same treatment
+      const defLine = `🛡️ defends with ${STAT_LABELS[dStat]} — 1d20+${STAT_LABELS[dStat]} → [${d.nat}] = ${fightTotalStr(d.total, d.nat, 20)}`;
+      await sleep(700);
+      if (defF.isNpc) await postAsNpc(channel, gid, defF.name, defLine);
+      else await send(`**${defF.name}** ${defLine}`);
+
+      // Outcome (system line)
+      let outcome;
       if (hit) {
         hp[defenderId] -= dmg;
-        L.push('', `💥 Hit for **${dmg}**! ${defF.name} HP: **${hp[defenderId] + dmg} → ${Math.max(hp[defenderId],0)}**`);
-        if (hp[defenderId] <= 0) L.push('', `💀 **${defF.name}** is knocked down!`);
+        outcome = `💥 Hit for **${dmg}**! ${defF.name} HP: **${hp[defenderId] + dmg} → ${Math.max(hp[defenderId],0)}**`;
+        if (hp[defenderId] <= 0) outcome += `\n💀 **${defF.name}** is knocked down!`;
       } else {
-        L.push('', `🛡️ **${defF.name}** blocks — no damage.`);
+        outcome = `🛡️ **${defF.name}** blocks — no damage.`;
       }
-      await sleep(1100); await send(L.join('\n'));
+      await sleep(700); await send(outcome);
 
       idx = (idx + 1) % order.length;
       if (idx === 0) round++;
