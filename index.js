@@ -44,6 +44,7 @@ try { db.exec("ALTER TABLE fights ADD COLUMN atk_mode TEXT DEFAULT 'normal'"); }
 try { db.exec('ALTER TABLE fights ADD COLUMN atk_sides INTEGER DEFAULT 20'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN def_mode TEXT DEFAULT 'normal'"); } catch {}
 try { db.exec('ALTER TABLE fights ADD COLUMN def_sides INTEGER DEFAULT 20'); } catch {}
+try { db.exec('ALTER TABLE fights ADD COLUMN auto_npc INTEGER DEFAULT 0'); } catch {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS characters (
@@ -968,22 +969,36 @@ const slashCommands = [
   new SlashCommandBuilder()
     .setName('fight').setDescription('Manage a fight between players')
     .addSubcommand(s=>s.setName('start').setDescription('Start a fight')
-      .addUserOption(o=>o.setName('p1').setDescription('Fighter 1').setRequired(true))
-      .addUserOption(o=>o.setName('p2').setDescription('Fighter 2').setRequired(true))
-      .addUserOption(o=>o.setName('p3').setDescription('Fighter 3').setRequired(false))
-      .addUserOption(o=>o.setName('p4').setDescription('Fighter 4').setRequired(false))
-      .addUserOption(o=>o.setName('p5').setDescription('Fighter 5').setRequired(false))
-      .addUserOption(o=>o.setName('p6').setDescription('Fighter 6').setRequired(false)))
+      .addStringOption(o=>o.setName('players').setDescription('Players to include — @mention them, space-separated').setRequired(false))
+      .addStringOption(o=>o.setName('npcs').setDescription('GM NPCs to include — names, comma-separated').setRequired(false))
+      .addBooleanOption(o=>o.setName('manual').setDescription('Skip initiative roll and use the order you listed fighters in').setRequired(false)))
+    .addSubcommand(s=>s.setName('addnpc').setDescription('Add GM NPCs to the current fight (GM only)')
+      .addStringOption(o=>o.setName('npc').setDescription('NPC(s) to add — names, comma-separated').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('auto').setDescription('Auto-run a fight (GM only)')
+      .addStringOption(o=>o.setName('mode').setDescription('How to run it').setRequired(true)
+        .addChoices(
+          {name:'Full — bot rolls for everyone to a winner',value:'full'},
+          {name:'NPCs only — bot takes NPC turns, players play manually',value:'npconly'},
+          {name:'Demo — example fighters, just a showcase',value:'demo'},
+        ))
+      .addStringOption(o=>o.setName('players').setDescription('Players to include — @mention them, space-separated (full mode)').setRequired(false))
+      .addStringOption(o=>o.setName('npcs').setDescription('GM NPCs to include — names, comma-separated').setRequired(false)))
+    .addSubcommand(s=>s.setName('order').setDescription('Set the turn order (GM) — list fighters in the order you want')
+      .addStringOption(o=>o.setName('players').setDescription('Players in order — @mention them, space-separated').setRequired(false))
+      .addStringOption(o=>o.setName('sequence').setDescription('Full order incl. NPCs — e.g. @Alice, Goblin, @Bob, Orc').setRequired(false)))
     .addSubcommand(s=>s.setName('atk').setDescription('Attack a target')
       .addStringOption(o=>o.setName('stat').setDescription('Stat to attack with').setRequired(true)
         .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
-      .addUserOption(o=>o.setName('target').setDescription('Player to attack').setRequired(true))
+      .addUserOption(o=>o.setName('target').setDescription('Player to attack').setRequired(false))
+      .addStringOption(o=>o.setName('target_npc').setDescription('NPC to attack instead of a player').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('npc').setDescription('Attack AS this NPC (GM, when it is the NPC\'s turn)').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
       .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
     .addSubcommand(s=>s.setName('def').setDescription('Defend against the current attack')
       .addStringOption(o=>o.setName('stat').setDescription('Stat to defend with').setRequired(true)
         .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
+      .addStringOption(o=>o.setName('npc').setDescription('Defend AS this NPC (GM, when the NPC is the target)').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
       .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
@@ -1750,6 +1765,17 @@ client.on('interactionCreate', async interaction => {
         console.log(`Autocomplete responding with ${filtered.length} NPCs`);
         return await interaction.respond(filtered);
       }
+      // Fight NPC fields — suggest server NPC names
+      if (interaction.commandName === 'fight' &&
+          (focusedOption.name === 'npc' || focusedOption.name === 'target_npc')) {
+        const focused = (focusedOption.value || '').toString().toLowerCase();
+        const npcs = getAllNpcs(interaction.guild.id);
+        const filtered = npcs
+          .filter(n => n.name.toLowerCase().includes(focused))
+          .slice(0, 25)
+          .map(n => ({ name: n.name, value: n.name }));
+        return await interaction.respond(filtered);
+      }
       // Weapon name autocomplete — server weapon list + whatever the user is typing
       if (interaction.commandName === 'char' && (focusedOption.name === 'weapon1' || focusedOption.name === 'weapon2')) {
         const focused = (focusedOption.value || '').toString();
@@ -1980,6 +2006,118 @@ function resolveDamage(atkRoll, atkNat, atkSides, defRoll, defNat, defSides) {
   return { hit, dmg };
 }
 
+// ── Fighter identity helpers (mixed players + NPCs) ───────────────────────────
+// A fighter id is either a Discord user id (all digits) or "npc:<Name>".
+const NPC_PREFIX = 'npc:';
+function isNpcFighter(id) { return typeof id === 'string' && id.startsWith(NPC_PREFIX); }
+function npcFighterId(name) { return NPC_PREFIX + name; }
+function npcNameFromFighter(id) { return isNpcFighter(id) ? id.slice(NPC_PREFIX.length) : null; }
+
+// Resolve a fighter id to { id, name, stats, isNpc }. stats has str/con/dex/wis/lck.
+async function resolveFighter(guild, gid, fid) {
+  if (isNpcFighter(fid)) {
+    const name = npcNameFromFighter(fid);
+    const npc = getNpc(gid, name);
+    return {
+      id: fid, name, isNpc: true,
+      stats: npc ? { str:npc.str, con:npc.con, dex:npc.dex, wis:npc.wis, lck:npc.lck } : { str:0,con:0,dex:0,wis:0,lck:0 },
+      maxHp: npc ? npc.con + 2 : 0,
+    };
+  }
+  const member = await guild.members.fetch(fid).catch(()=>null);
+  const name = member?.nickname || member?.user.username || fid;
+  const char = getChar(gid, fid);
+  return {
+    id: fid, name, isNpc: false,
+    stats: char ? { str:char.str, con:char.con, dex:char.dex, wis:char.wis, lck:char.lck } : { str:0,con:0,dex:0,wis:0,lck:0 },
+    maxHp: char ? maxHp(char) : 0,
+  };
+}
+
+// Persist a fighter's current HP to the right table (character vs npc).
+function setFighterHp(gid, fid, hp) {
+  if (isNpcFighter(fid)) {
+    upsertNpc(gid, npcNameFromFighter(fid), { hp_current: hp });
+  } else {
+    upsertChar(gid, fid, { hp_current: hp });
+  }
+}
+
+// Parse "@Alice @Bob" (or raw ids) into an ordered, de-duplicated list of user ids.
+function parsePlayerMentions(str) {
+  if (!str) return [];
+  const ids = [];
+  const re = /<@!?(\d+)>|\b(\d{15,21})\b/g;
+  let m;
+  while ((m = re.exec(str)) !== null) {
+    const id = m[1] || m[2];
+    if (id && !ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
+
+// Parse "Goblin, Cave Orc, Boss" into a trimmed, de-duplicated list of names.
+function parseNpcNames(str) {
+  if (!str) return [];
+  const names = [];
+  for (const raw of str.split(',')) {
+    const n = raw.trim();
+    if (n && !names.includes(n)) names.push(n);
+  }
+  return names;
+}
+
+// Pick a sensible attacking stat for an auto fighter (highest of str/dex).
+function autoAttackStat(stats) {
+  return (stats.str ?? 0) >= (stats.dex ?? 0) ? 'str' : 'dex';
+}
+// Pick a sensible defending stat (highest of dex/con).
+function autoDefendStat(stats) {
+  return (stats.dex ?? 0) >= (stats.con ?? 0) ? 'dex' : 'con';
+}
+// Roll a d20 + modifier, returning { nat, total }.
+function autoRoll(mod) { const nat = rollDie(20); return { nat, total: nat + mod }; }
+
+// In an auto_npc fight, perform the current NPC's attack automatically against a
+// random living opponent, then leave the (human) target to defend manually.
+// If the next current fighter is also an NPC after resolution, the resolve handler
+// will call this again. Returns true if it acted.
+async function runAutoNpcTurn(guild, gid, cid, channel) {
+  const fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active' || !fight.auto_npc) return false;
+  if (fight.phase !== 'attack') return false;
+  const order = JSON.parse(fight.turn_order);
+  const hpState = JSON.parse(fight.hp_state);
+  const attackerId = order[fight.turn_index];
+  if (!isNpcFighter(attackerId)) return false; // current fighter is a player — wait for them
+
+  const attacker = await resolveFighter(guild, gid, attackerId);
+  // pick a random living opponent
+  const opponents = order.filter(fid => fid !== attackerId && (hpState[fid] ?? 0) > 0);
+  if (!opponents.length) return false;
+  const targetId = opponents[Math.floor(Math.random() * opponents.length)];
+  const targetF = await resolveFighter(guild, gid, targetId);
+
+  const stat = autoAttackStat(attacker.stats);
+  const a = autoRoll(attacker.stats[stat] ?? 0);
+
+  upsertFight(gid, cid, {
+    phase: 'defend', current_target: targetId,
+    atk_roll: a.total, atk_nat: a.nat, atk_stat: stat, atk_mode: 'normal', atk_sides: 20,
+    def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
+  });
+
+  const lines = [`🤖 **${attacker.name} 🎭** (auto) attacks **${targetF.name}${targetF.isNpc?' 🎭':''}** with ${STAT_LABELS[stat]}!`,
+    `⚔️  1d20+${STAT_LABELS[stat]} → [${a.nat}] = ${fightTotalStr(a.total, a.nat, 20)}`];
+  if (targetF.isNpc) {
+    lines.push('', `🛡️ **${targetF.name}** is also an NPC — a GM resolves with \`/fight def npc:${targetF.name}\` then \`/fight resolve\`.`);
+  } else {
+    lines.push('', `🛡️ **${targetF.name}** — use \`/fight def\` to defend, then \`/fight resolve\`.`);
+  }
+  await channel.send(lines.join('\n')).catch(()=>{});
+  return true;
+}
+
 async function handleFight(interaction) {
   const sub = interaction.options.getSubcommand();
   const gid = interaction.guild.id;
@@ -1993,27 +2131,62 @@ async function handleFight(interaction) {
       return interaction.reply({ content: '❌ A fight is already in progress in this channel. Use `/fight end` to stop it first.', ephemeral: true });
     }
 
-    const playerOptions = ['p1','p2','p3','p4','p5','p6'];
     const fighters = [];
-    for (const opt of playerOptions) {
-      const u = interaction.options.getUser(opt);
-      if (u) fighters.push(u.id);
+    // Players from the @mention list
+    for (const id of parsePlayerMentions(interaction.options.getString('players'))) {
+      fighters.push(id);
     }
-    if (fighters.length < 2) return interaction.reply({ content: '❌ Need at least 2 fighters.', ephemeral: true });
+    // GM NPCs from the comma list (only a GM may add NPCs)
+    const npcNames = parseNpcNames(interaction.options.getString('npcs'));
+    if (npcNames.length && !(await isGm(interaction.guild, uid))) {
+      return interaction.reply({ content: '❌ Only GMs can add NPCs to a fight.', ephemeral: true });
+    }
+    for (const n of npcNames) {
+      if (!getNpc(gid, n)) return interaction.reply({ content: `❌ NPC **${n}** not found. Create it with \`/npc create\` first.`, ephemeral: true });
+      const fid = npcFighterId(n);
+      if (!fighters.includes(fid)) fighters.push(fid);
+    }
+    // Guard against duplicate fighters
+    if (new Set(fighters).size !== fighters.length) {
+      return interaction.reply({ content: '❌ A fighter was listed more than once.', ephemeral: true });
+    }
+    if (fighters.length < 2) return interaction.reply({ content: '❌ Need at least 2 fighters. Add players via `players:` (@mention them) and/or NPCs via `npcs:` (comma-separated names).', ephemeral: true });
 
-    // Roll initiative for each fighter
+    const manual = interaction.options.getBoolean('manual') ?? false;
+
+    if (manual) {
+      // Skip initiative — keep the order the fighters were listed in
+      const hpState = {};
+      const ordered = [];
+      for (const fid of fighters) {
+        const f = await resolveFighter(interaction.guild, gid, fid);
+        hpState[fid] = f.isNpc ? (getNpc(gid, f.name)?.hp_current ?? 0) : (getChar(gid, fid)?.hp_current ?? 0);
+        ordered.push({ id: fid, name: f.name, isNpc: f.isNpc });
+      }
+      const turnOrder = ordered.map(o => o.id);
+      const lines = ['⚔️ **Fight started! Turn order (manual):**', ''];
+      ordered.forEach((f,i) => lines.push(`${i+1}. **${f.name}**${f.isNpc ? ' 🎭' : ''}`));
+      lines.push('', `🎯 **${ordered[0].name}** goes first!${ordered[0].isNpc ? ' (GM acts with `npc:`)' : ' Use `/fight atk` to attack.'}`);
+      upsertFight(gid, cid, {
+        state: 'active', turn_order: JSON.stringify(turnOrder), turn_index: 0,
+        phase: 'attack', current_target: null,
+        atk_roll: null, atk_nat: null, atk_stat: null,
+        def_roll: null, def_nat: null, def_stat: null,
+        hp_state: JSON.stringify(hpState),
+      });
+      return interaction.reply({ content: lines.join('\n') });
+    }
+
+    // Roll initiative for each fighter (players and NPCs alike)
     const initiatives = [];
     const hpState = {};
     for (const fid of fighters) {
-      const char = getChar(gid, fid);
-      const dex = char?.dex ?? 0;
+      const f = await resolveFighter(interaction.guild, gid, fid);
+      const dex = f.stats.dex ?? 0;
       const roll = rollDie(20);
       const total = roll + dex;
-      const member = await interaction.guild.members.fetch(fid).catch(()=>null);
-      const name = member?.nickname || member?.user.username || fid;
-      const hp = char ? char.hp_current : 0;
-      hpState[fid] = hp;
-      initiatives.push({ id: fid, name, roll, dex, total });
+      hpState[fid] = f.isNpc ? (getNpc(gid, f.name)?.hp_current ?? 0) : (getChar(gid, fid)?.hp_current ?? 0);
+      initiatives.push({ id: fid, name: f.name, roll, dex, total, isNpc: f.isNpc });
     }
 
     // Sort by total descending, ties broken by raw roll
@@ -2022,11 +2195,11 @@ async function handleFight(interaction) {
     const turnOrder = initiatives.map(i => i.id);
     const lines = ['⚔️ **Fight started! Initiative order:**', ''];
     initiatives.forEach((f,i) => {
-      lines.push(`${i+1}. **${f.name}** — 1d20+${f.dex} → [${f.roll}] = **${f.total}**`);
+      lines.push(`${i+1}. **${f.name}**${f.isNpc ? ' 🎭' : ''} — 🎲 [${f.roll}] + ⚡ ${f.dex} DEX = **${f.total} initiative**`);
     });
     lines.push('');
     const first = initiatives[0];
-    lines.push(`🎯 **${first.name}** goes first! Use \`/fight atk\` to attack.`);
+    lines.push(`🎯 **${first.name}** goes first!${first.isNpc ? ' (GM acts with `npc:`)' : ' Use `/fight atk` to attack.'}`);
 
     upsertFight(gid, cid, {
       state: 'active',
@@ -2042,6 +2215,240 @@ async function handleFight(interaction) {
     return interaction.reply({ content: lines.join('\n') });
   }
 
+  // ── ADDNPC (add one or more GM NPCs to an active fight) ───────────────────
+  if (sub === 'addnpc') {
+    if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can add NPCs to a fight.', ephemeral: true });
+    const fight = getFight(gid, cid);
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+
+    const names = parseNpcNames(interaction.options.getString('npc'));
+    if (!names.length) return interaction.reply({ content: '❌ Name at least one NPC.', ephemeral: true });
+
+    const turnOrder = JSON.parse(fight.turn_order);
+    const hpState = JSON.parse(fight.hp_state);
+    const added = [];
+    for (const npcName of names) {
+      const npc = getNpc(gid, npcName);
+      if (!npc) return interaction.reply({ content: `❌ NPC **${npcName}** not found.`, ephemeral: true });
+      const fid = npcFighterId(npcName);
+      if (turnOrder.includes(fid)) return interaction.reply({ content: `❌ **${npcName}** is already in this fight.`, ephemeral: true });
+      const roll = rollDie(20);
+      const total = roll + (npc.dex ?? 0);
+      hpState[fid] = npc.hp_current;
+      turnOrder.push(fid);
+      added.push(`🎭 **${npcName}** — 🎲 [${roll}] + ⚡ ${npc.dex} DEX = **${total} initiative**`);
+    }
+    upsertFight(gid, cid, { turn_order: JSON.stringify(turnOrder), hp_state: JSON.stringify(hpState) });
+    return interaction.reply({ content: [`**Joined the fight** (added to the end of the turn order — use \`/fight order\` to reposition):`, '', ...added].join('\n') });
+  }
+
+  // ── AUTO (auto-run a fight: full / npconly / demo) ────────────────────────
+  if (sub === 'auto') {
+    if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can use /fight auto.', ephemeral: true });
+    const mode = interaction.options.getString('mode');
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const channel = interaction.channel;
+    const send = async (txt) => { await channel.send(txt).catch(()=>{}); };
+
+    // ---- DEMO: throwaway example fighters, nothing persisted ----
+    if (mode === 'demo') {
+      const existing = getFight(gid, cid);
+      if (existing && existing.state !== 'idle') return interaction.reply({ content: '❌ Finish or `/fight end` the current fight first.', ephemeral: true });
+      await interaction.reply({ content: '🎬 **Running a demo fight with two example combatants...**' });
+      const A = { name: 'Sir Aldric (demo)', dex: 4, str: 5, hp: 7 };
+      const B = { name: 'Cave Troll (demo)', dex: 2, str: 6, hp: 8 };
+      const aInit = rollDie(20) + A.dex, bInit = rollDie(20) + B.dex;
+      const order = aInit >= bInit ? [A, B] : [B, A];
+      await sleep(900);
+      await send(['⚔️ **Demo fight — initiative:**', '', `1. **${order[0].name}**`, `2. **${order[1].name}**`, '', `🎯 **${order[0].name}** goes first!`].join('\n'));
+      let turn = 0, round = 1, safety = 0;
+      while (A.hp > 0 && B.hp > 0 && safety < 12) {
+        safety++;
+        const atk = order[turn % 2], def = order[(turn + 1) % 2];
+        await sleep(1100);
+        const a = autoRoll(atk.str), d = autoRoll(def.dex);
+        const { hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20);
+        const lines = ['─────────────────────────────', `**Round ${round}** — ${atk.name} attacks ${def.name}`,
+          `⚔️ STR → [${a.nat}] +${atk.str} = ${fightTotalStr(a.total, a.nat, 20)}`,
+          `🛡️ DEX → [${d.nat}] +${def.dex} = ${fightTotalStr(d.total, d.nat, 20)}`];
+        if (hit) { def.hp -= dmg; lines.push('', `💥 Hit for **${dmg}**! ${def.name} HP: **${def.hp + dmg} → ${Math.max(def.hp,0)}**`); if (def.hp <= 0) lines.push('', `💀 **${def.name}** is knocked down!`); }
+        else lines.push('', `🛡️ **${def.name}** blocks — no damage.`);
+        await send(lines.join('\n'));
+        turn++; if (turn % 2 === 0) round++;
+      }
+      await sleep(900);
+      const winner = A.hp > 0 ? A : B;
+      await send(`\n🏆 **${winner.name}** wins the demo fight!\n\n*That's the basic flow: initiative → attack vs defend → damage on a hit. In a real fight, players use \`/fight atk\` and \`/fight def\`, and a GM acts for NPCs with the \`npc:\` option (or runs \`/fight auto\` in full / NPCs-only mode).*`);
+      return;
+    }
+
+    // ---- Build the real fighter roster from the named players + NPCs ----
+    const fighters = [];
+    for (const id of parsePlayerMentions(interaction.options.getString('players'))) fighters.push(id);
+    const npcNames = parseNpcNames(interaction.options.getString('npcs'));
+    for (const n of npcNames) {
+      if (!getNpc(gid, n)) return interaction.reply({ content: `❌ NPC **${n}** not found.`, ephemeral: true });
+      const fid = npcFighterId(n);
+      if (!fighters.includes(fid)) fighters.push(fid);
+    }
+    if (new Set(fighters).size !== fighters.length) return interaction.reply({ content: '❌ A fighter was listed more than once.', ephemeral: true });
+    if (fighters.length < 2) return interaction.reply({ content: '❌ Need at least 2 fighters. Use `players:` (@mention) and/or `npcs:` (comma-separated).', ephemeral: true });
+
+    // Resolve everyone up front
+    const F = {}; // fid -> resolved fighter (+ live hp)
+    for (const fid of fighters) {
+      const rf = await resolveFighter(interaction.guild, gid, fid);
+      F[fid] = rf;
+    }
+
+    // Initiative for all
+    const inits = fighters.map(fid => ({ fid, roll: 0, total: 0 }));
+    for (const it of inits) { const r = rollDie(20); it.roll = r; it.total = r + (F[it.fid].stats.dex ?? 0); }
+    inits.sort((a,b) => b.total - a.total || b.roll - a.roll);
+    const order = inits.map(i => i.fid);
+
+    // Live HP for each fighter (from their sheet's current HP)
+    const hp = {};
+    for (const fid of fighters) {
+      hp[fid] = F[fid].isNpc ? (getNpc(gid, F[fid].name)?.hp_current ?? 0) : (getChar(gid, fid)?.hp_current ?? 0);
+    }
+
+    // ---- NPCONLY: set up a real, persisted fight where the bot will auto-take NPC turns ----
+    if (mode === 'npconly') {
+      const existing = getFight(gid, cid);
+      if (existing && existing.state !== 'idle') return interaction.reply({ content: '❌ Finish or `/fight end` the current fight first.', ephemeral: true });
+      const hpState = {}; for (const fid of fighters) hpState[fid] = hp[fid];
+      upsertFight(gid, cid, {
+        state: 'active', turn_order: JSON.stringify(order), turn_index: 0,
+        phase: 'attack', current_target: null,
+        atk_roll: null, atk_nat: null, atk_stat: null,
+        def_roll: null, def_nat: null, def_stat: null,
+        hp_state: JSON.stringify(hpState), auto_npc: 1,
+      });
+      const lines = ['⚔️ **Fight started! (NPCs auto-piloted)**', '', '**Initiative:**'];
+      inits.forEach((it,i)=>{ const f=F[it.fid]; lines.push(`${i+1}. **${f.name}${f.isNpc?' 🎭':''}** — 🎲 [${it.roll}] + ⚡ ${f.stats.dex} DEX = **${it.total}**`); });
+      const firstF = F[order[0]];
+      lines.push('', firstF.isNpc ? `🤖 **${firstF.name}** is an NPC — the bot will take its turn automatically.` : `🎯 **${firstF.name}** goes first! Use \`/fight atk\` to attack.`);
+      await interaction.reply({ content: lines.join('\n') });
+      // If the first fighter is an NPC, kick off its turn
+      if (firstF.isNpc) { await sleep(1200); await runAutoNpcTurn(interaction.guild, gid, cid, channel); }
+      return;
+    }
+
+    // ---- FULL: bot rolls everything to a winner, persists final HP, stores nothing ongoing ----
+    await interaction.reply({ content: '🎬 **Auto-resolving the fight...**' });
+    const lines0 = ['⚔️ **Initiative:**'];
+    inits.forEach((it,i)=>{ const f=F[it.fid]; lines0.push(`${i+1}. **${f.name}${f.isNpc?' 🎭':''}** — 🎲 [${it.roll}] + ⚡ ${f.stats.dex} DEX = **${it.total}**`); });
+    await sleep(800); await send(lines0.join('\n'));
+
+    const alive = () => order.filter(fid => hp[fid] > 0);
+    let idx = 0, round = 1, safety = 0;
+    while (alive().length > 1 && safety < 200) {
+      safety++;
+      // find next living attacker starting at idx
+      let guard = 0;
+      while (hp[order[idx]] <= 0 && guard < order.length) { idx = (idx + 1) % order.length; guard++; }
+      const attackerId = order[idx];
+      // pick a random living opponent
+      const opponents = alive().filter(fid => fid !== attackerId);
+      if (!opponents.length) break;
+      const defenderId = opponents[Math.floor(Math.random() * opponents.length)];
+
+      const atkF = F[attackerId], defF = F[defenderId];
+      const aStat = autoAttackStat(atkF.stats), dStat = autoDefendStat(defF.stats);
+      const a = autoRoll(atkF.stats[aStat] ?? 0), d = autoRoll(defF.stats[dStat] ?? 0);
+      const { hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20);
+
+      const L = ['─────────────────────────────',
+        `**Round ${round}** — ${atkF.name}${atkF.isNpc?' 🎭':''} attacks ${defF.name}${defF.isNpc?' 🎭':''}`,
+        `⚔️ ${STAT_LABELS[aStat]} → [${a.nat}] = ${fightTotalStr(a.total, a.nat, 20)}`,
+        `🛡️ ${STAT_LABELS[dStat]} → [${d.nat}] = ${fightTotalStr(d.total, d.nat, 20)}`];
+      if (hit) {
+        hp[defenderId] -= dmg;
+        L.push('', `💥 Hit for **${dmg}**! ${defF.name} HP: **${hp[defenderId] + dmg} → ${Math.max(hp[defenderId],0)}**`);
+        if (hp[defenderId] <= 0) L.push('', `💀 **${defF.name}** is knocked down!`);
+      } else {
+        L.push('', `🛡️ **${defF.name}** blocks — no damage.`);
+      }
+      await sleep(1100); await send(L.join('\n'));
+
+      idx = (idx + 1) % order.length;
+      if (idx === 0) round++;
+    }
+
+    // Persist final HP to real sheets
+    for (const fid of fighters) setFighterHp(gid, fid, hp[fid]);
+
+    await sleep(800);
+    const survivors = alive();
+    if (survivors.length === 1) {
+      const w = F[survivors[0]];
+      await send(`\n🏆 **${w.name}${w.isNpc?' 🎭':''}** wins the fight! Final HP has been saved to all combatants' sheets.`);
+    } else {
+      await send(`\n⚖️ The fight ended without a clear winner. Final HP saved to all combatants' sheets.`);
+    }
+    return;
+  }
+
+  // ── ORDER (rearrange turn order of an active fight) ───────────────────────
+  if (sub === 'order') {
+    if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can change the turn order.', ephemeral: true });
+    const fight = getFight(gid, cid);
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+
+    const currentOrder = JSON.parse(fight.turn_order);
+    const seqStr = interaction.options.getString('sequence');
+    const playersStr = interaction.options.getString('players');
+
+    let newOrder = [];
+    if (seqStr) {
+      // Comma-separated, preserving order. Each item is either a mention or an NPC name.
+      for (const raw of seqStr.split(',')) {
+        const item = raw.trim();
+        if (!item) continue;
+        const m = item.match(/<@!?(\d+)>|^(\d{15,21})$/);
+        if (m) {
+          newOrder.push(m[1] || m[2]);
+        } else {
+          // Treat as an NPC name — match against the fight's NPC fighters (case-insensitive)
+          const match = currentOrder.find(fid => isNpcFighter(fid) && npcNameFromFighter(fid).toLowerCase() === item.toLowerCase());
+          newOrder.push(match || npcFighterId(item));
+        }
+      }
+    } else if (playersStr) {
+      newOrder = parsePlayerMentions(playersStr);
+    } else {
+      return interaction.reply({ content: '❌ Provide a `sequence` (e.g. `@Alice, Goblin, @Bob`) or a `players` list.', ephemeral: true });
+    }
+
+    // The new order must contain exactly the same fighters as the current fight
+    const sameSet = newOrder.length === currentOrder.length &&
+      newOrder.every(id => currentOrder.includes(id)) &&
+      new Set(newOrder).size === newOrder.length;
+    if (!sameSet) {
+      const roster = [];
+      for (const fid of currentOrder) {
+        const f = await resolveFighter(interaction.guild, gid, fid);
+        roster.push(`• ${f.name}${f.isNpc ? ' (NPC)' : ''}`);
+      }
+      return interaction.reply({ content: `❌ The new order must list every current fighter exactly once — no additions, removals, or duplicates.\n\n**Current fighters:**\n${roster.join('\n')}\n\nList them in order in \`sequence\`, separated by commas — @mention players and type NPC names (e.g. \`@Alice, Goblin, @Bob\`).`, ephemeral: true });
+    }
+
+    // Keep the same fighter on their turn if possible, else reset to the top
+    const currentActiveId = currentOrder[fight.turn_index];
+    const newIndex = Math.max(0, newOrder.indexOf(currentActiveId));
+
+    upsertFight(gid, cid, { turn_order: JSON.stringify(newOrder), turn_index: newIndex });
+
+    const lines = ['🔀 **Turn order updated:**', ''];
+    for (let i = 0; i < newOrder.length; i++) {
+      const f = await resolveFighter(interaction.guild, gid, newOrder[i]);
+      const marker = i === newIndex ? '  ⬅️ current turn' : '';
+      lines.push(`${i+1}. **${f.name}${f.isNpc ? ' 🎭' : ''}**${marker}`);
+    }
+    return interaction.reply({ content: lines.join('\n') });
+  }
+
   // ── ATK (normal / adv / dis) ──────────────────────────────────────────────
   if (sub === 'atk') {
     const fight = getFight(gid, cid);
@@ -2049,30 +2456,49 @@ async function handleFight(interaction) {
 
     const turnOrder = JSON.parse(fight.turn_order);
     const currentId = turnOrder[fight.turn_index];
+    const npcActAs = interaction.options.getString('npc'); // GM acting as an NPC
 
-    if (uid !== currentId) {
-      const member = await interaction.guild.members.fetch(currentId).catch(()=>null);
-      const name = member?.nickname || member?.user.username || 'their turn';
-      return interaction.reply({ content: `⚠️ It's **${name}**'s turn to attack.`, ephemeral: false });
+    // Determine who is acting (a user, or a GM-controlled NPC)
+    let actorId;
+    if (npcActAs) {
+      if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can act as an NPC.', ephemeral: true });
+      actorId = npcFighterId(npcActAs);
+      if (!isNpcFighter(currentId) || currentId !== actorId) {
+        const cur = await resolveFighter(interaction.guild, gid, currentId);
+        return interaction.reply({ content: `⚠️ It's **${cur.name}**'s turn, not **${npcActAs}**'s.`, ephemeral: true });
+      }
+    } else {
+      actorId = uid;
+      if (uid !== currentId) {
+        const cur = await resolveFighter(interaction.guild, gid, currentId);
+        const hint = cur.isNpc ? ` (a GM must act with \`npc:${cur.name}\`)` : '';
+        return interaction.reply({ content: `⚠️ It's **${cur.name}**'s turn to attack.${hint}`, ephemeral: false });
+      }
     }
 
     if (fight.phase !== 'attack') return interaction.reply({ content: '❌ Waiting for defender to roll first.', ephemeral: true });
 
     const stat = interaction.options.getString('stat');
-    const target = interaction.options.getUser('target');
+    const targetUser = interaction.options.getUser('target');
+    const targetNpc = interaction.options.getString('target_npc');
     const flavour = interaction.options.getString('flavour') ?? null;
     const mode = interaction.options.getString('roll') ?? 'normal';
 
-    if (!turnOrder.includes(target.id)) return interaction.reply({ content: '❌ That player is not in this fight.', ephemeral: true });
-    if (target.id === uid) return interaction.reply({ content: '❌ You cannot target yourself.', ephemeral: true });
+    if (!targetUser && !targetNpc) return interaction.reply({ content: '❌ Pick a `target` (player) or `target_npc` (NPC) to attack.', ephemeral: true });
+    if (targetUser && targetNpc) return interaction.reply({ content: '❌ Choose either a player target or an NPC target, not both.', ephemeral: true });
+    const targetId = targetNpc ? npcFighterId(targetNpc) : targetUser.id;
+
+    if (!turnOrder.includes(targetId)) return interaction.reply({ content: '❌ That target is not in this fight.', ephemeral: true });
+    if (targetId === actorId) return interaction.reply({ content: '❌ You cannot target yourself.', ephemeral: true });
 
     const hpState = JSON.parse(fight.hp_state);
-    if (hpState[target.id] !== undefined && hpState[target.id] <= 0) {
-      return interaction.reply({ content: '❌ That player is already down.', ephemeral: true });
+    if (hpState[targetId] !== undefined && hpState[targetId] <= 0) {
+      return interaction.reply({ content: '❌ That target is already down.', ephemeral: true });
     }
 
-    const char = getChar(gid, uid);
-    const statVal = char?.[stat] ?? 0;
+    const actor = await resolveFighter(interaction.guild, gid, actorId);
+    const targetF = await resolveFighter(interaction.guild, gid, targetId);
+    const statVal = actor.stats[stat] ?? 0;
     let nat, total, rollLine;
     const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
 
@@ -2091,21 +2517,20 @@ async function handleFight(interaction) {
       rollLine = `⚔️  1d20+${STAT_LABELS[stat]} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
 
-    const member = await interaction.guild.members.fetch(uid).catch(()=>null);
-    const name = member?.nickname || member?.user.username || uid;
-    const targetMember = await interaction.guild.members.fetch(target.id).catch(()=>null);
-    const targetName = targetMember?.nickname || targetMember?.user.username || target.id;
+    const name = actor.name + (actor.isNpc ? ' 🎭' : '');
+    const targetName = targetF.name + (targetF.isNpc ? ' 🎭' : '');
 
     const lines = [`**${name}** attacks **${targetName}** with ${STAT_LABELS[stat]}!`, rollLine];
     if (flavour) lines.push('', `*${flavour}*`);
-    lines.push('', `🛡️ **${targetName}** — use \`/fight def\` to defend.`);
+    const defHint = targetF.isNpc ? `🛡️ A GM defends for **${targetF.name}** with \`/fight def npc:${targetF.name}\`.` : `🛡️ **${targetF.name}** — use \`/fight def\` to defend.`;
+    lines.push('', defHint);
 
     upsertFight(gid, cid, {
-      phase: 'defend', current_target: target.id,
+      phase: 'defend', current_target: targetId,
       atk_roll: total, atk_nat: nat, atk_stat: stat, atk_mode: mode, atk_sides: 20,
       def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
     });
-    saveRoll(gid, cid, uid, `1d20+${statVal}`, `atk ${STAT_LABELS[stat]}`);
+    if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, `atk ${STAT_LABELS[stat]}`);
     return interaction.reply({ content: lines.join('\n') });
   }
 
@@ -2115,18 +2540,32 @@ async function handleFight(interaction) {
     if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
     if (fight.phase !== 'defend') return interaction.reply({ content: '❌ No attack to defend against yet.', ephemeral: true });
 
-    if (uid !== fight.current_target) {
-      const member = await interaction.guild.members.fetch(fight.current_target).catch(()=>null);
-      const name = member?.nickname || member?.user.username || 'the target';
-      return interaction.reply({ content: `⚠️ **${name}** is the one defending.`, ephemeral: false });
+    const npcActAs = interaction.options.getString('npc'); // GM defending as an NPC
+    const targetId = fight.current_target;
+
+    let defenderId;
+    if (npcActAs) {
+      if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can defend as an NPC.', ephemeral: true });
+      defenderId = npcFighterId(npcActAs);
+      if (!isNpcFighter(targetId) || targetId !== defenderId) {
+        const tf = await resolveFighter(interaction.guild, gid, targetId);
+        return interaction.reply({ content: `⚠️ **${tf.name}** is the one defending, not **${npcActAs}**.`, ephemeral: true });
+      }
+    } else {
+      defenderId = uid;
+      if (uid !== targetId) {
+        const tf = await resolveFighter(interaction.guild, gid, targetId);
+        const hint = tf.isNpc ? ` (a GM defends with \`npc:${tf.name}\`)` : '';
+        return interaction.reply({ content: `⚠️ **${tf.name}** is the one defending.${hint}`, ephemeral: false });
+      }
     }
 
     const stat = interaction.options.getString('stat');
     const flavour = interaction.options.getString('flavour') ?? null;
     const mode = interaction.options.getString('roll') ?? 'normal';
 
-    const char = getChar(gid, uid);
-    const statVal = char?.[stat] ?? 0;
+    const defender = await resolveFighter(interaction.guild, gid, defenderId);
+    const statVal = defender.stats[stat] ?? 0;
     const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
     let nat, total, rollLine;
 
@@ -2145,15 +2584,14 @@ async function handleFight(interaction) {
       rollLine = `🛡️  1d20+${STAT_LABELS[stat]} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
 
-    const member = await interaction.guild.members.fetch(uid).catch(()=>null);
-    const name = member?.nickname || member?.user.username || uid;
+    const name = defender.name + (defender.isNpc ? ' 🎭' : '');
 
     const lines = [`**${name}** defends with ${STAT_LABELS[stat]}!`, rollLine];
     if (flavour) lines.push('', `*${flavour}*`);
-    lines.push('', '⚡ Use \`/fight resolve\` to resolve this exchange.');
+    lines.push('', '⚡ Use `/fight resolve` to resolve this exchange.');
 
     upsertFight(gid, cid, { def_roll: total, def_nat: nat, def_stat: stat, def_mode: mode, def_sides: 20 });
-    saveRoll(gid, cid, uid, `1d20+${statVal}`, `def ${STAT_LABELS[stat]}`);
+    if (!defender.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, `def ${STAT_LABELS[stat]}`);
     return interaction.reply({ content: lines.join('\n') });
   }
 
@@ -2227,10 +2665,10 @@ async function handleFight(interaction) {
       fight.def_roll, fight.def_nat, 20
     );
 
-    const atkMember = await interaction.guild.members.fetch(attackerId).catch(()=>null);
-    const defMember = await interaction.guild.members.fetch(defenderId).catch(()=>null);
-    const atkName = atkMember?.nickname || atkMember?.user.username || attackerId;
-    const defName = defMember?.nickname || defMember?.user.username || defenderId;
+    const atkF = await resolveFighter(interaction.guild, gid, attackerId);
+    const defF = await resolveFighter(interaction.guild, gid, defenderId);
+    const atkName = atkF.name + (atkF.isNpc ? ' 🎭' : '');
+    const defName = defF.name + (defF.isNpc ? ' 🎭' : '');
 
     const lines = ['─────────────────────────────', '⚔️  **Exchange Resolved**', ''];
     lines.push(`${atkName} (**${STAT_LABELS[fight.atk_stat]}**): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
@@ -2241,8 +2679,8 @@ async function handleFight(interaction) {
       const prevHp = hpState[defenderId] ?? 0;
       const newHp = prevHp - dmg;
       hpState[defenderId] = newHp;
-      // Also update character db
-      upsertChar(gid, defenderId, { hp_current: newHp });
+      // Persist to the right table (character or NPC)
+      setFighterHp(gid, defenderId, newHp);
       lines.push(`💥 **${atkName}** hits **${defName}** for **${dmg}** damage!`);
       lines.push(`❤️ ${defName} HP: **${prevHp} → ${newHp}**`);
 
@@ -2251,19 +2689,17 @@ async function handleFight(interaction) {
         // Remove from turn order
         const newOrder = turnOrder.filter(id => id !== defenderId);
         if (newOrder.length <= 1) {
-          const winnerId = newOrder[0];
-          const winMember = await interaction.guild.members.fetch(winnerId).catch(()=>null);
-          const winName = winMember?.nickname || winMember?.user.username || winnerId;
-          lines.push(`\n🏆 **${winName}** wins the fight!`);
+          const winF = await resolveFighter(interaction.guild, gid, newOrder[0]);
+          lines.push(`\n🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** wins the fight!`);
           upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState) });
           return interaction.reply({ content: lines.join('\n') });
         }
         // Advance turn
         const newIndex = fight.turn_index % newOrder.length;
-        const nextId = newOrder[newIndex];
-        const nextMember = await interaction.guild.members.fetch(nextId).catch(()=>null);
-        const nextName = nextMember?.nickname || nextMember?.user.username || nextId;
-        lines.push(`\n🎯 **${nextName}**'s turn to attack!`);
+        const nextF = await resolveFighter(interaction.guild, gid, newOrder[newIndex]);
+        const autoOn = !!fight.auto_npc;
+        const nextHint = (nextF.isNpc && !autoOn) ? ` (GM acts with \`npc:${nextF.name}\`)` : '';
+        lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${nextHint}`);
         upsertFight(gid, cid, {
           turn_order: JSON.stringify(newOrder),
           turn_index: newIndex,
@@ -2273,7 +2709,9 @@ async function handleFight(interaction) {
           def_roll: null, def_nat: null, def_stat: null,
           hp_state: JSON.stringify(hpState),
         });
-        return interaction.reply({ content: lines.join('\n') });
+        await interaction.reply({ content: lines.join('\n') });
+        if (autoOn && nextF.isNpc) { await new Promise(r=>setTimeout(r,1200)); await runAutoNpcTurn(interaction.guild, gid, cid, interaction.channel); }
+        return;
       }
     } else {
       lines.push(`🛡️ **${defName}** blocks the attack! No damage.`);
@@ -2287,10 +2725,10 @@ async function handleFight(interaction) {
       nextIndex = (nextIndex + 1) % turnOrder.length;
       safety++;
     }
-    const nextId = turnOrder[nextIndex];
-    const nextMember = await interaction.guild.members.fetch(nextId).catch(()=>null);
-    const nextName = nextMember?.nickname || nextMember?.user.username || nextId;
-    lines.push(`\n🎯 **${nextName}**'s turn to attack!`);
+    const nextF = await resolveFighter(interaction.guild, gid, turnOrder[nextIndex]);
+    const autoOn = !!fight.auto_npc;
+    const nextHint = (nextF.isNpc && !autoOn) ? ` (GM acts with \`npc:${nextF.name}\`)` : '';
+    lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${nextHint}`);
 
     upsertFight(gid, cid, {
       turn_index: nextIndex,
@@ -2301,7 +2739,9 @@ async function handleFight(interaction) {
       hp_state: JSON.stringify(hpState),
     });
 
-    return interaction.reply({ content: lines.join('\n') });
+    await interaction.reply({ content: lines.join('\n') });
+    if (autoOn && nextF.isNpc) { await new Promise(r=>setTimeout(r,1200)); await runAutoNpcTurn(interaction.guild, gid, cid, interaction.channel); }
+    return;
   }
 
   // ── FORFEIT ────────────────────────────────────────────────────────────────
@@ -2322,17 +2762,15 @@ async function handleFight(interaction) {
 
     if (newOrder.length <= 1) {
       if (newOrder.length === 1) {
-        const winMember = await interaction.guild.members.fetch(newOrder[0]).catch(()=>null);
-        const winName = winMember?.nickname || winMember?.user.username || newOrder[0];
-        lines.push(`🏆 **${winName}** wins!`);
+        const winF = await resolveFighter(interaction.guild, gid, newOrder[0]);
+        lines.push(`🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** wins!`);
       }
       upsertFight(gid, cid, { state: 'idle', turn_order: '[]' });
     } else {
       let newIndex = fight.turn_index % newOrder.length;
-      const nextId = newOrder[newIndex];
-      const nextMember = await interaction.guild.members.fetch(nextId).catch(()=>null);
-      const nextName = nextMember?.nickname || nextMember?.user.username || nextId;
-      lines.push(`🎯 Fight continues — **${nextName}**'s turn!`);
+      const nextF = await resolveFighter(interaction.guild, gid, newOrder[newIndex]);
+      const nextHint = nextF.isNpc ? ` (GM acts with \`npc:${nextF.name}\`)` : '';
+      lines.push(`🎯 Fight continues — **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn!${nextHint}`);
       upsertFight(gid, cid, {
         turn_order: JSON.stringify(newOrder),
         turn_index: newIndex,
@@ -2357,13 +2795,11 @@ async function handleFight(interaction) {
     const lines = ['⚔️ **Fight Status**', ''];
     for (let i = 0; i < turnOrder.length; i++) {
       const fid = turnOrder[i];
-      const m = await interaction.guild.members.fetch(fid).catch(()=>null);
-      const n = m?.nickname || m?.user.username || fid;
+      const f = await resolveFighter(interaction.guild, gid, fid);
       const hp = hpState[fid] ?? '?';
       const arrow = fid === currentId ? ' ◀ current' : '';
-      const char = getChar(gid, fid);
-      const hpMax = char ? maxHp(char) : '?';
-      lines.push(`${i+1}. **${n}** — ❤️ ${hp} / ${hpMax}${arrow}`);
+      const hpMax = f.maxHp || '?';
+      lines.push(`${i+1}. **${f.name}${f.isNpc ? ' 🎭' : ''}** — ❤️ ${hp} / ${hpMax}${arrow}`);
     }
     lines.push('');
     lines.push(`Phase: **${fight.phase === 'attack' ? 'Waiting for attack' : 'Waiting for defence'}**`);
@@ -2829,12 +3265,18 @@ const HELP_CATEGORIES = {
   fight: {
     title: '⚔️ Fights',
     body: [
-      '`/fight start @p1 @p2 npc:Name` — begin a fight',
-      '`/fight atk stat:str target:@user` — attack',
-      '`/fight def stat:dex` — defend',
+      '`/fight start players:@a @b npcs:Goblin, Orc` — begin a fight with any number of players and GM NPCs (auto-rolls DEX initiative)',
+      '`/fight start ... manual:true` — keep the order you listed fighters in (no roll)',
+      '`/fight addnpc npc:Goblin, Orc` — add one or more NPCs mid-fight',
+      '`/fight order sequence:@a, Goblin, @b` — set the turn order, players and NPCs (GM)',
+      '`/fight atk stat:str target:@user` — attack a player · add `target_npc:Name` to hit an NPC',
+      '`/fight atk stat:str npc:Goblin target:@user` — GM attacks AS an NPC on its turn',
+      '`/fight def stat:dex` — defend · GM defends as an NPC with `npc:Name`',
       '`/fight rr` — reroll (costs a token) · `/fight resolve` — resolve a clash',
       '`/fight status` — show current fight · `/fight forfeit` — drop out',
-      '`/fight end` — end the fight (GM)',
+      '`/fight auto mode:Full players:@a npcs:Orc` — bot resolves the whole fight (GM)',
+      '`/fight auto mode:NPCs only ...` — bot plays NPC turns, players play manually (GM)',
+      '`/fight auto mode:Demo` — example showcase fight · `/fight end` — end the fight (GM)',
     ],
   },
   npc: {
