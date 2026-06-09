@@ -215,7 +215,12 @@ function resolveTagEmoji(gid, tagName) {
 }
 // ── NPC helpers ───────────────────────────────────────────────────────────────
 function getNpc(gid, name) {
-  return db.prepare('SELECT * FROM npcs WHERE guild_id=? AND name=?').get(gid, name);
+  // Exact match first, then fall back to case-insensitive so "goblin" finds "Goblin"
+  let row = db.prepare('SELECT * FROM npcs WHERE guild_id=? AND name=?').get(gid, name);
+  if (!row && name) {
+    row = db.prepare('SELECT * FROM npcs WHERE guild_id=? AND LOWER(name)=LOWER(?)').get(gid, name);
+  }
+  return row;
 }
 function getAllNpcs(gid) {
   return db.prepare('SELECT * FROM npcs WHERE guild_id=? ORDER BY name').all(gid);
@@ -2078,6 +2083,29 @@ function autoDefendStat(stats) {
 // Roll a d20 + modifier, returning { nat, total }.
 function autoRoll(mod) { const nat = rollDie(20); return { nat, total: nat + mod }; }
 
+// Build a character-shaped object for buildRollEmbed from any fighter id.
+// Players use their real character row; NPCs are adapted from the NPC record.
+async function fighterCharCard(guild, gid, fid) {
+  if (isNpcFighter(fid)) {
+    const name = npcNameFromFighter(fid);
+    const npc = getNpc(gid, name) || {};
+    return {
+      displayName: name + ' 🎭',
+      order_name: npc.order_name || null,
+      class: null,
+      hp_current: npc.hp_current ?? 0,
+      rerolls_current: 0,
+      str: npc.str ?? 0, con: npc.con ?? 0, dex: npc.dex ?? 0, wis: npc.wis ?? 0, lck: npc.lck ?? 0,
+      weapon1: null, weapon2: null, weapon1emoji: null, weapon2emoji: null,
+      _isNpc: true,
+    };
+  }
+  const member = await guild.members.fetch(fid).catch(()=>null);
+  const displayName = member?.nickname || member?.user.username || fid;
+  const char = getChar(gid, fid);
+  return char ? { ...char, displayName } : { displayName, order_name:null, class:null, hp_current:0, rerolls_current:0, str:0,con:0,dex:0,wis:0,lck:0, weapon1:null,weapon2:null };
+}
+
 // Post a message into a channel AS an NPC (via its webhook, with name + avatar),
 // matching how /pr posts. Falls back to a plain channel.send if the webhook fails.
 async function postAsNpc(channel, gid, npcName, content) {
@@ -2169,8 +2197,9 @@ async function handleFight(interaction) {
       return interaction.reply({ content: '❌ Only GMs can add NPCs to a fight.', ephemeral: true });
     }
     for (const n of npcNames) {
-      if (!getNpc(gid, n)) return interaction.reply({ content: `❌ NPC **${n}** not found. Create it with \`/npc create\` first.`, ephemeral: true });
-      const fid = npcFighterId(n);
+      const npc = getNpc(gid, n);
+      if (!npc) return interaction.reply({ content: `❌ NPC **${n}** not found. Separate multiple NPCs with **commas** (e.g. \`npcs:Goblin, Orc, Rat\`), and check the spelling. Create new ones with \`/npc create\`.`, ephemeral: true });
+      const fid = npcFighterId(npc.name); // use the canonical stored name, not the typed casing
       if (!fighters.includes(fid)) fighters.push(fid);
     }
     // Guard against duplicate fighters
@@ -2220,7 +2249,9 @@ async function handleFight(interaction) {
     initiatives.sort((a,b) => b.total - a.total || b.roll - a.roll);
 
     const turnOrder = initiatives.map(i => i.id);
-    const lines = ['⚔️ **Fight started! Initiative order:**', ''];
+    const npcCount = initiatives.filter(i => i.isNpc).length;
+    const playerCount = initiatives.length - npcCount;
+    const lines = [`⚔️ **Fight started!** ${playerCount} player${playerCount===1?'':'s'} + ${npcCount} NPC${npcCount===1?'':'s'} — initiative order:`, ''];
     initiatives.forEach((f,i) => {
       lines.push(`${i+1}. **${f.name}**${f.isNpc ? ' 🎭' : ''} — 🎲 [${f.roll}] + ⚡ ${f.dex} DEX = **${f.total} initiative**`);
     });
@@ -2257,13 +2288,13 @@ async function handleFight(interaction) {
     for (const npcName of names) {
       const npc = getNpc(gid, npcName);
       if (!npc) return interaction.reply({ content: `❌ NPC **${npcName}** not found.`, ephemeral: true });
-      const fid = npcFighterId(npcName);
-      if (turnOrder.includes(fid)) return interaction.reply({ content: `❌ **${npcName}** is already in this fight.`, ephemeral: true });
+      const fid = npcFighterId(npc.name); // canonical stored name
+      if (turnOrder.includes(fid)) return interaction.reply({ content: `❌ **${npc.name}** is already in this fight.`, ephemeral: true });
       const roll = rollDie(20);
       const total = roll + (npc.dex ?? 0);
       hpState[fid] = npc.hp_current;
       turnOrder.push(fid);
-      added.push(`🎭 **${npcName}** — 🎲 [${roll}] + ⚡ ${npc.dex} DEX = **${total} initiative**`);
+      added.push(`🎭 **${npc.name}** — 🎲 [${roll}] + ⚡ ${npc.dex} DEX = **${total} initiative**`);
     }
     upsertFight(gid, cid, { turn_order: JSON.stringify(turnOrder), hp_state: JSON.stringify(hpState) });
     return interaction.reply({ content: [`**Joined the fight** (added to the end of the turn order — use \`/fight order\` to reposition):`, '', ...added].join('\n') });
@@ -2314,8 +2345,9 @@ async function handleFight(interaction) {
     for (const id of parsePlayerMentions(interaction.options.getString('players'))) fighters.push(id);
     const npcNames = parseNpcNames(interaction.options.getString('npcs'));
     for (const n of npcNames) {
-      if (!getNpc(gid, n)) return interaction.reply({ content: `❌ NPC **${n}** not found.`, ephemeral: true });
-      const fid = npcFighterId(n);
+      const npc = getNpc(gid, n);
+      if (!npc) return interaction.reply({ content: `❌ NPC **${n}** not found.`, ephemeral: true });
+      const fid = npcFighterId(npc.name); // canonical stored name
       if (!fighters.includes(fid)) fighters.push(fid);
     }
     if (new Set(fighters).size !== fighters.length) return interaction.reply({ content: '❌ A fighter was listed more than once.', ephemeral: true });
@@ -2558,13 +2590,17 @@ async function handleFight(interaction) {
       rollLine = `⚔️  1d20+${STAT_LABELS[stat]} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
 
-    const name = actor.name + (actor.isNpc ? ' 🎭' : '');
     const targetName = targetF.name + (targetF.isNpc ? ' 🎭' : '');
+    const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
+    const actorCard = await fighterCharCard(interaction.guild, gid, actorId);
 
-    const lines = [`**${name}** attacks **${targetName}** with ${STAT_LABELS[stat]}!`, rollLine];
-    if (flavour) lines.push('', `*${flavour}*`);
+    const headerLabel = `⚔️ Attacks ${targetName} with ${STAT_LABELS[stat]}`;
+    const card = buildRollEmbed({
+      rollLine, label: headerLabel, isReroll: false,
+      char: actorCard, healCharges: 0, maxCharges: 0,
+      flavour: flavour || null, total, critType, tags: null, gid,
+    });
     const defHint = targetF.isNpc ? `🛡️ A GM defends for **${targetF.name}** with \`/fight def npc:${targetF.name}\`.` : `🛡️ **${targetF.name}** — use \`/fight def\` to defend.`;
-    lines.push('', defHint);
 
     upsertFight(gid, cid, {
       phase: 'defend', current_target: targetId,
@@ -2572,7 +2608,13 @@ async function handleFight(interaction) {
       def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
     });
     if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, `atk ${STAT_LABELS[stat]}`);
-    return interaction.reply({ content: lines.join('\n') });
+    if (actor.isNpc) {
+      // Post the NPC's card through its webhook, ack the GM privately
+      await postAsNpc(interaction.channel, gid, actor.name, card);
+      await interaction.channel.send(defHint).catch(()=>{});
+      return interaction.reply({ content: `✅ Attacked as **${actor.name}**.`, ephemeral: true });
+    }
+    return interaction.reply({ content: `${card}\n\n${defHint}` });
   }
 
   // ── DEF (normal / adv / dis) ──────────────────────────────────────────────
@@ -2625,15 +2667,22 @@ async function handleFight(interaction) {
       rollLine = `🛡️  1d20+${STAT_LABELS[stat]} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
 
-    const name = defender.name + (defender.isNpc ? ' 🎭' : '');
-
-    const lines = [`**${name}** defends with ${STAT_LABELS[stat]}!`, rollLine];
-    if (flavour) lines.push('', `*${flavour}*`);
-    lines.push('', '⚡ Use `/fight resolve` to resolve this exchange.');
+    const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
+    const defCard = await fighterCharCard(interaction.guild, gid, defenderId);
+    const card = buildRollEmbed({
+      rollLine, label: `🛡️ Defends with ${STAT_LABELS[stat]}`, isReroll: false,
+      char: defCard, healCharges: 0, maxCharges: 0,
+      flavour: flavour || null, total, critType, tags: null, gid,
+    });
 
     upsertFight(gid, cid, { def_roll: total, def_nat: nat, def_stat: stat, def_mode: mode, def_sides: 20 });
     if (!defender.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, `def ${STAT_LABELS[stat]}`);
-    return interaction.reply({ content: lines.join('\n') });
+    if (defender.isNpc) {
+      await postAsNpc(interaction.channel, gid, defender.name, card);
+      await interaction.channel.send('⚡ Use `/fight resolve` to resolve this exchange.').catch(()=>{});
+      return interaction.reply({ content: `✅ Defended as **${defender.name}**.`, ephemeral: true });
+    }
+    return interaction.reply({ content: `${card}\n\n⚡ Use \`/fight resolve\` to resolve this exchange.` });
   }
 
   // ── REROLLS ────────────────────────────────────────────────────────────────
