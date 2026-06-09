@@ -25,6 +25,15 @@ db.pragma('journal_mode = WAL');
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_channel_id TEXT DEFAULT NULL'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_channel_id TEXT DEFAULT NULL'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
+// Rest restore amounts. Stored as text tokens so GMs can use either form:
+//   "100%" = percentage of that resource's max   |   "3" = flat, set the value to exactly 3
+// Defaults: Long rest = full (100%). Short rest = HP only (50%), no rerolls/heal.
+try { db.exec("ALTER TABLE guild_config ADD COLUMN lrest_hp TEXT DEFAULT '100%'"); } catch {}
+try { db.exec("ALTER TABLE guild_config ADD COLUMN lrest_rerolls TEXT DEFAULT '100%'"); } catch {}
+try { db.exec("ALTER TABLE guild_config ADD COLUMN lrest_heal TEXT DEFAULT '100%'"); } catch {}
+try { db.exec("ALTER TABLE guild_config ADD COLUMN srest_hp TEXT DEFAULT '50%'"); } catch {}
+try { db.exec("ALTER TABLE guild_config ADD COLUMN srest_rerolls TEXT DEFAULT '0%'"); } catch {}
+try { db.exec("ALTER TABLE guild_config ADD COLUMN srest_heal TEXT DEFAULT '0%'"); } catch {}
 try { db.exec("ALTER TABLE characters ADD COLUMN class TEXT DEFAULT NULL"); } catch {}
 try { db.exec("ALTER TABLE characters ADD COLUMN weapon1 TEXT DEFAULT NULL"); } catch {}
 try { db.exec("ALTER TABLE characters ADD COLUMN weapon2 TEXT DEFAULT NULL"); } catch {}
@@ -244,6 +253,28 @@ function addWeapon(gid, name) {
 }
 function removeWeapon(gid, name) {
   db.prepare('DELETE FROM weapons WHERE guild_id=? AND name=?').run(gid, name);
+}
+
+// ── Weapon emoji validation ───────────────────────────────────────────────────
+const STANDARD_WEAPON_EMOJIS = ['⚔️', '🗡️', '🏹', '🔱', '⛏️', '🛡️', '🪄'];
+// Accept a standard emoji, OR a custom emoji tag (<:name:id> / <a:name:id>) that
+// belongs to this guild. Returns the cleaned value to store, or null if invalid.
+function validateWeaponEmoji(guild, value) {
+  if (!value) return null;
+  const v = value.trim();
+  if (STANDARD_WEAPON_EMOJIS.includes(v)) return v;
+  // Custom emoji tag?
+  const m = v.match(/^<(a?):(\w+):(\d+)>$/);
+  if (m) {
+    const id = m[3];
+    // Confirm the emoji exists on this server
+    if (guild?.emojis?.cache?.has(id)) return v;
+    return null;
+  }
+  // Allow any single standard unicode emoji the user typed (lenient fallback)
+  // Reject long strings / plain text
+  if (v.length <= 8 && !/[a-zA-Z0-9]/.test(v)) return v;
+  return null;
 }
 
 // ── NPC Category helpers ──────────────────────────────────────────────────────
@@ -545,7 +576,12 @@ async function generateCharImage(char, displayName, healCharges, maxCharges) {
   }
 
   const pal = ORDER_PALETTE[char.order_name] || DEFAULT_PALETTE;
-  const W = 420, H = 620;
+  const W = 420;
+  // Dynamic height: base + extra for class line + weapon lines
+  let H = 620;
+  if (char.class) H += 18;
+  const weaponCount = (char.weapon1?1:0) + (char.weapon2?1:0);
+  if (weaponCount) H += 16 + weaponCount * 26;
   const canvas = createCanvas(W, H);
   const ctx = canvas.getContext('2d');
 
@@ -592,10 +628,17 @@ async function generateCharImage(char, displayName, healCharges, maxCharges) {
   ctx.font = 'italic 16px serif';
   ctx.fillText(char.order_name || 'No Order', W/2, 148);
 
+  // ── Class ────────────────────────────────────────────────────────────────────
+  if (char.class) {
+    ctx.fillStyle = pal.text;
+    ctx.font = '13px serif';
+    ctx.fillText(`🏅 ${char.class}`, W/2, 168);
+  }
+
   // ── Divider ──────────────────────────────────────────────────────────────────
   ctx.strokeStyle = pal.border;
   ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(30, 162); ctx.lineTo(W-30, 162); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(30, char.class ? 180 : 162); ctx.lineTo(W-30, char.class ? 180 : 162); ctx.stroke();
 
   // ── Tracker rows ─────────────────────────────────────────────────────────────
   const trackers = [
@@ -604,7 +647,7 @@ async function generateCharImage(char, displayName, healCharges, maxCharges) {
   ];
   if (isWhiteKnight(char)) trackers.push({ label: '🛡️  Heal', value: `${healCharges} / ${maxCharges}` });
 
-  let y = 195;
+  let y = char.class ? 213 : 195;
   trackers.forEach(({ label, value }) => {
     ctx.fillStyle = pal.text;
     ctx.font = '16px serif';
@@ -638,6 +681,24 @@ async function generateCharImage(char, displayName, healCharges, maxCharges) {
     y += 32;
   });
 
+  // ── Weapons ──────────────────────────────────────────────────────────────────
+  if (char.weapon1 || char.weapon2) {
+    // Canvas can't render Discord custom emojis (<:name:id>) — fall back to a sword glyph
+    const imgEmoji = (e, fallback) => (e && /^<a?:\w+:\d+>$/.test(e)) ? fallback : (e || fallback);
+    y += 4;
+    ctx.strokeStyle = pal.border; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(30, y-12); ctx.lineTo(W-30, y-12); ctx.stroke();
+    y += 6;
+    if (char.weapon1) {
+      ctx.fillStyle = pal.text; ctx.font = '15px serif'; ctx.textAlign = 'left';
+      ctx.fillText(`${imgEmoji(char.weapon1emoji, '⚔️')}  ${char.weapon1}`, 40, y); y += 26;
+    }
+    if (char.weapon2) {
+      ctx.fillStyle = pal.text; ctx.font = '15px serif'; ctx.textAlign = 'left';
+      ctx.fillText(`${imgEmoji(char.weapon2emoji, '🗡️')}  ${char.weapon2}`, 40, y); y += 26;
+    }
+  }
+
   // ── Footer ───────────────────────────────────────────────────────────────────
   ctx.strokeStyle = pal.border; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(30, H-35); ctx.lineTo(W-30, H-35); ctx.stroke();
@@ -669,6 +730,7 @@ async function handleCharExport(interaction) {
     '[TTRPG SHEET]',
     `NAME:${dn}`,
     `ORDER:${char.order_name || ''}`,
+    `CLASS:${char.class || ''}`,
     `STR:${char.str}`,
     `CON:${char.con}`,
     `DEX:${char.dex}`,
@@ -676,15 +738,28 @@ async function handleCharExport(interaction) {
     `LCK:${char.lck}`,
     `HP:${char.hp_current}`,
     `REROLLS:${char.rerolls_current}`,
+    `WEAPON1:${char.weapon1 || ''}`,
+    `WEAPON1EMOJI:${char.weapon1emoji || '⚔️'}`,
+    `WEAPON2:${char.weapon2 || ''}`,
+    `WEAPON2EMOJI:${char.weapon2emoji || '🗡️'}`,
     '',
     `  ${dn}`,
     `  ${char.order_name || 'No Order'}`,
+  ];
+  if (char.class) textLines.push(`  ${char.class}`);
+  textLines.push(
     '',
     `  HP       ${char.hp_current} / ${hm}`,
     `  Rerolls  ${char.rerolls_current} / ${rm}`,
-  ];
+  );
   if (isWhiteKnight(char)) textLines.push(`  Heal     ${hr.current} / ${mc}`);
-  textLines.push('', `  STR  ${char.str}`, `  CON  ${char.con}`, `  DEX  ${char.dex}`, `  WIS  ${char.wis}`, `  LCK  ${char.lck}`, '```');
+  textLines.push('', `  STR  ${char.str}`, `  CON  ${char.con}`, `  DEX  ${char.dex}`, `  WIS  ${char.wis}`, `  LCK  ${char.lck}`);
+  if (char.weapon1 || char.weapon2) {
+    textLines.push('');
+    if (char.weapon1) textLines.push(`  ${char.weapon1emoji||'⚔️'}  ${char.weapon1}`);
+    if (char.weapon2) textLines.push(`  ${char.weapon2emoji||'🗡️'}  ${char.weapon2}`);
+  }
+  textLines.push('```');
   const textContent = textLines.join('\n');
 
   if (mode === 'text') {
@@ -716,6 +791,12 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('gmrole').setDescription('Set the GM role').addRoleOption(o=>o.setName('role').setDescription('The GM role').setRequired(true)))
     .addSubcommand(s=>s.setName('heal').setDescription('Set max Heal charges for White Knights').addIntegerOption(o=>o.setName('charges').setDescription('Number of charges').setRequired(true).setMinValue(1).setMaxValue(10)))
     .addSubcommand(s=>s.setName('npcchannel').setDescription('Set the NPC image bank channel').addStringOption(o=>o.setName('channel').setDescription('Channel ID or #channel mention').setRequired(true)))
+    .addSubcommand(s=>s.setName('rest').setDescription('Set how much a rest restores (e.g. 50% or a flat number like 3)')
+      .addStringOption(o=>o.setName('type').setDescription('Which rest to configure').setRequired(true)
+        .addChoices({name:'Long Rest',value:'lrest'},{name:'Short Rest',value:'srest'}))
+      .addStringOption(o=>o.setName('hp').setDescription('HP restored — "50%" of max, or a flat number like "3"').setRequired(false))
+      .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored — "50%" of max, or a flat number like "1"').setRequired(false))
+      .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored — "50%" of max, or a flat number like "2"').setRequired(false)))
     .addSubcommand(s=>s.setName('cleanwebhooks').setDescription('Remove orphaned NPC webhooks to free up Discord limits')),
 
   new SlashCommandBuilder()
@@ -740,8 +821,19 @@ const slashCommands = [
         .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'}))
       .addStringOption(o=>o.setName('class').setDescription('Character class').setRequired(false)
         .addChoices({name:'Hero',value:'Hero'},{name:'Vanguard',value:'Vanguard'},{name:'Defender',value:'Defender'},{name:'Siege Knight',value:'Siege Knight'}))
-      .addStringOption(o=>o.setName('weapon1').setDescription('Weapon slot 1').setRequired(false))
-      .addStringOption(o=>o.setName('weapon2').setDescription('Weapon slot 2').setRequired(false))
+      .addStringOption(o=>o.setName('weapon1emoji').setDescription('Emoji for weapon slot 1').setRequired(false)
+        .addChoices({name:'⚔️ Swords',value:'⚔️'},{name:'🗡️ Dagger',value:'🗡️'},{name:'🏹 Bow',value:'🏹'},{name:'🔱 Trident',value:'🔱'},{name:'⛏️ Pickaxe',value:'⛏️'},{name:'🛡️ Shield',value:'🛡️'},{name:'🪄 Wand',value:'🪄'}))
+      .addStringOption(o=>o.setName('weapon1').setDescription('Weapon slot 1 — pick from list or type your own').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('weapon2emoji').setDescription('Emoji for weapon slot 2').setRequired(false)
+        .addChoices({name:'⚔️ Swords',value:'⚔️'},{name:'🗡️ Dagger',value:'🗡️'},{name:'🏹 Bow',value:'🏹'},{name:'🔱 Trident',value:'🔱'},{name:'⛏️ Pickaxe',value:'⛏️'},{name:'🛡️ Shield',value:'🛡️'},{name:'🪄 Wand',value:'🪄'}))
+      .addStringOption(o=>o.setName('weapon2').setDescription('Weapon slot 2 — pick from list or type your own').setRequired(false).setAutocomplete(true))
+      .addUserOption(o=>o.setName('user').setDescription('Target player (GM only)').setRequired(false)))
+    .addSubcommand(s=>s.setName('weaponemoji').setDescription('Set the emoji for a weapon slot')
+      .addStringOption(o=>o.setName('slot').setDescription('Which weapon slot').setRequired(true)
+        .addChoices({name:'Weapon 1',value:'weapon1emoji'},{name:'Weapon 2',value:'weapon2emoji'}))
+      .addStringOption(o=>o.setName('emoji').setDescription('Pick a standard emoji').setRequired(false)
+        .addChoices({name:'⚔️ Swords',value:'⚔️'},{name:'🗡️ Dagger',value:'🗡️'},{name:'🏹 Bow',value:'🏹'},{name:'🔱 Trident',value:'🔱'},{name:'⛏️ Pickaxe',value:'⛏️'},{name:'🛡️ Shield',value:'🛡️'},{name:'🪄 Wand',value:'🪄'}))
+      .addStringOption(o=>o.setName('custom').setDescription('Or paste a server custom emoji (overrides the dropdown)').setRequired(false))
       .addUserOption(o=>o.setName('user').setDescription('Target player (GM only)').setRequired(false)))
     .addSubcommand(s=>s.setName('show').setDescription('Display a character card').addUserOption(o=>o.setName('user').setDescription('User to show').setRequired(false)))
     .addSubcommand(s=>s.setName('export').setDescription('Export your character sheet')
@@ -936,6 +1028,56 @@ async function handleConfig(interaction) {
     return interaction.reply({ content: `✅ NPC image channel set to <#${channelId}>. Upload images there with the NPC name as the message text to set avatars.`, ephemeral: true });
   }
 
+  if (sub === 'rest') {
+    const type = interaction.options.getString('type'); // lrest or srest
+    const hp = interaction.options.getString('hp');
+    const rerolls = interaction.options.getString('rerolls');
+    const heal = interaction.options.getString('heal');
+    const cfg = getConfig(gid);
+    const restName = type === 'lrest' ? 'Long Rest' : 'Short Rest';
+
+    // Defaults for display when a column is null
+    const dFallback = type === 'lrest' ? {hp:'100%',rr:'100%',heal:'100%'} : {hp:'50%',rr:'0%',heal:'0%'};
+    const cur = {
+      hp:   cfg[`${type}_hp`]      ?? dFallback.hp,
+      rr:   cfg[`${type}_rerolls`] ?? dFallback.rr,
+      heal: cfg[`${type}_heal`]    ?? dFallback.heal,
+    };
+
+    // Describe a stored token in plain language
+    const describe = (tok) => {
+      const t = String(tok).trim();
+      if (t.endsWith('%')) return t === '0%' ? 'nothing' : `${t} of max`;
+      return `set to ${t}`;
+    };
+
+    // If no values supplied, just show current settings
+    if (hp === null && rerolls === null && heal === null) {
+      return interaction.reply({ content: `⚙️ **${restName}** currently restores:\n❤️ HP: **${describe(cur.hp)}**\n🔄 Rerolls: **${describe(cur.rr)}**\n🛡️ Heal: **${describe(cur.heal)}**\n\nProvide \`hp\`, \`rerolls\`, and/or \`heal\` to change them. Use a percentage like \`50%\` or a flat number like \`3\`.`, ephemeral: true });
+    }
+
+    // Validate a token: must be "N%" or a plain whole number N (>= 0)
+    const validTok = (v) => {
+      const t = String(v).trim();
+      if (/^\d+%$/.test(t)) return t;
+      if (/^\d+$/.test(t)) return t;
+      return null;
+    };
+
+    const updates = {};
+    for (const [opt, col, key] of [[hp,'hp','hp'],[rerolls,'rerolls','rr'],[heal,'heal','heal']]) {
+      if (opt === null) continue;
+      const v = validTok(opt);
+      if (v === null) {
+        return interaction.reply({ content: `❌ \`${opt}\` isn't valid. Use a percentage like \`50%\` or a flat whole number like \`3\`.`, ephemeral: true });
+      }
+      updates[`${type}_${col}`] = v;
+      cur[key] = v;
+    }
+    setConfig(gid, updates);
+    return interaction.reply({ content: `✅ **${restName}** now restores:\n❤️ HP: **${describe(cur.hp)}**\n🔄 Rerolls: **${describe(cur.rr)}**\n🛡️ Heal: **${describe(cur.heal)}**`, ephemeral: true });
+  }
+
   if (sub === 'cleanwebhooks') {
     await interaction.deferReply({ ephemeral: true });
     try {
@@ -990,6 +1132,18 @@ async function handleChar(interaction) {
     const charClass = interaction.options.getString('class'); if (charClass) updates.class = charClass;
     const weapon1 = interaction.options.getString('weapon1'); if (weapon1) updates.weapon1 = weapon1;
     const weapon2 = interaction.options.getString('weapon2'); if (weapon2) updates.weapon2 = weapon2;
+    const weapon1emoji = interaction.options.getString('weapon1emoji');
+    if (weapon1emoji) {
+      const c1 = validateWeaponEmoji(interaction.guild, weapon1emoji);
+      if (!c1) return interaction.reply({ content: `❌ Weapon 1 emoji invalid — use a standard emoji (${STANDARD_WEAPON_EMOJIS.join(' ')}) or a server custom emoji.`, ephemeral: true });
+      updates.weapon1emoji = c1;
+    }
+    const weapon2emoji = interaction.options.getString('weapon2emoji');
+    if (weapon2emoji) {
+      const c2 = validateWeaponEmoji(interaction.guild, weapon2emoji);
+      if (!c2) return interaction.reply({ content: `❌ Weapon 2 emoji invalid — use a standard emoji (${STANDARD_WEAPON_EMOJIS.join(' ')}) or a server custom emoji.`, ephemeral: true });
+      updates.weapon2emoji = c2;
+    }
     if (Object.keys(updates).length === 0) return interaction.reply({ content: '❌ No fields provided.', ephemeral: true });
     upsertChar(gid, targetId, updates);
     const mention = targetUser ? `<@${targetId}>` : 'Your';
@@ -997,6 +1151,24 @@ async function handleChar(interaction) {
       .filter(([k]) => !['hp_current','rerolls_current'].includes(k))
       .map(([k,v]) => `**${k.toUpperCase()}**: ${v}`).join(', ');
     return interaction.reply({ content: `✅ ${mention} character updated — ${summary}` });
+  }
+
+  if (sub === 'weaponemoji') {
+    const slot = interaction.options.getString('slot'); // weapon1emoji or weapon2emoji
+    const emoji = interaction.options.getString('emoji');     // from dropdown
+    const custom = interaction.options.getString('custom');   // pasted server emoji
+    const targetUser = interaction.options.getUser('user');
+    const targetId = targetUser ? targetUser.id : callerId;
+    if (targetId !== callerId && !(await isGm(interaction.guild, callerId)))
+      return interaction.reply({ content: '❌ Only GMs can modify other players\' characters.', ephemeral: true });
+    // Custom (pasted) emoji takes priority over the dropdown
+    const chosen = (custom && custom.trim()) ? custom.trim() : emoji;
+    if (!chosen) return interaction.reply({ content: `❌ Pick a standard emoji from the dropdown, or paste a server custom emoji in the **custom** field.`, ephemeral: true });
+    const cleaned = validateWeaponEmoji(interaction.guild, chosen);
+    if (!cleaned) return interaction.reply({ content: `❌ That isn't a valid emoji. Use a standard emoji (${STANDARD_WEAPON_EMOJIS.join(' ')}) or one of this server's own custom emojis.`, ephemeral: true });
+    upsertChar(gid, targetId, { [slot]: cleaned });
+    const slotLabel = slot === 'weapon1emoji' ? 'Weapon 1' : 'Weapon 2';
+    return interaction.reply({ content: `✅ ${slotLabel} emoji set to ${cleaned}${targetId!==callerId?` for <@${targetId}>`:''}.` });
   }
 
   if (sub === 'set') {
@@ -1032,14 +1204,17 @@ async function handleChar(interaction) {
     // Handle class, weapon and weapon emoji fields
     if (['class','weapon1','weapon2','weapon1emoji','weapon2emoji'].includes(field)) {
       if (field === 'weapon1emoji' || field === 'weapon2emoji') {
-        const validEmojis = ['⚔️', '🗡️', '🏹', '🔱', '⛏️', '🛡️', '🪄'];
-        if (!validEmojis.includes(value)) return interaction.reply({ content: `❌ Choose from: ${validEmojis.join(' ')}`, ephemeral: true });
+        const cleaned = validateWeaponEmoji(interaction.guild, value);
+        if (!cleaned) return interaction.reply({ content: `❌ Use a standard emoji (${STANDARD_WEAPON_EMOJIS.join(' ')}) or one of this server's custom emojis.`, ephemeral: true });
+        upsertChar(gid, targetId, { [field]: cleaned });
+        const lbl = field === 'weapon1emoji' ? 'Weapon 1 Emoji' : 'Weapon 2 Emoji';
+        return interaction.reply({ content: `✅ **${lbl}** set to ${cleaned}${targetId!==callerId?` for <@${targetId}>`:''}.` });
       }
       if (['class','weapon1','weapon2'].includes(field) && value.length > 50) {
         return interaction.reply({ content: '❌ That name is too long (max 50 characters).', ephemeral: true });
       }
       upsertChar(gid, targetId, { [field]: value });
-      const label = { class:'Class', weapon1:'Weapon 1', weapon2:'Weapon 2', weapon1emoji:'Weapon 1 Emoji', weapon2emoji:'Weapon 2 Emoji' }[field];
+      const label = { class:'Class', weapon1:'Weapon 1', weapon2:'Weapon 2' }[field];
       return interaction.reply({ content: `✅ **${label}** set to **${value}**${targetId!==callerId?` for <@${targetId}>`:''}.` });
     }
   }
@@ -1052,9 +1227,16 @@ async function handleChar(interaction) {
     const cfg = getConfig(gid); const mc = cfg.heal_charges??3;
     const hr = getHealCharges(gid, tid, mc);
     const kn = char.order_name ? `${KNIGHT_EMOJIS[char.order_name]??'⚪'}  ${char.order_name}` : 'No order set';
-    const lines = [`⚔️  **${dn}**`, kn, `❤️  HP          ${char.hp_current} / ${maxHp(char)}`, `🔄  Rerolls      ${char.rerolls_current} / ${maxRerolls(char)}`];
+    const lines = [`⚔️  **${dn}**`, kn];
+    if (char.class) lines.push(`🏅  ${char.class}`);
+    lines.push(`❤️  HP          ${char.hp_current} / ${maxHp(char)}`, `🔄  Rerolls      ${char.rerolls_current} / ${maxRerolls(char)}`);
     if (isWhiteKnight(char)) lines.push(`🛡️  Heal         ${hr.current} / ${mc}`);
     lines.push('', `💪  STR         ${char.str}`, `🫀  CON         ${char.con}`, `⚡  DEX         ${char.dex}`, `🧠  WIS         ${char.wis}`, `🍀  LCK         ${char.lck}`);
+    if (char.weapon1 || char.weapon2) {
+      lines.push('');
+      if (char.weapon1) lines.push(`${char.weapon1emoji??'⚔️'}  ${char.weapon1}`);
+      if (char.weapon2) lines.push(`${char.weapon2emoji??'🗡️'}  ${char.weapon2}`);
+    }
     return interaction.reply({ content: lines.join('\n') });
   }
 }
@@ -1079,9 +1261,16 @@ async function handleProfile(interaction) {
     const cfg = getConfig(gid); const mc = cfg.heal_charges??3;
     const hr = getHealCharges(gid, uid, mc);
     const kn = ch.order_name ? `${KNIGHT_EMOJIS[ch.order_name]??'⚪'}  ${ch.order_name}` : 'No order set';
-    const lines = [`⚔️  **${dn}**`, kn, `❤️  HP          ${ch.hp_current} / ${maxHp(ch)}`, `🔄  Rerolls      ${ch.rerolls_current} / ${maxRerolls(ch)}`];
+    const lines = [`⚔️  **${dn}**`, kn];
+    if (ch.class) lines.push(`🏅  ${ch.class}`);
+    lines.push(`❤️  HP          ${ch.hp_current} / ${maxHp(ch)}`, `🔄  Rerolls      ${ch.rerolls_current} / ${maxRerolls(ch)}`);
     if (isWhiteKnight(ch)) lines.push(`🛡️  Heal         ${hr.current} / ${mc}`);
     lines.push('', `💪  STR         ${ch.str}`, `🫀  CON         ${ch.con}`, `⚡  DEX         ${ch.dex}`, `🧠  WIS         ${ch.wis}`, `🍀  LCK         ${ch.lck}`);
+    if (ch.weapon1 || ch.weapon2) {
+      lines.push('');
+      if (ch.weapon1) lines.push(`${ch.weapon1emoji??'⚔️'}  ${ch.weapon1}`);
+      if (ch.weapon2) lines.push(`${ch.weapon2emoji??'🗡️'}  ${ch.weapon2}`);
+    }
     return interaction.reply({ content: lines.join('\n'), ephemeral: true });
   }
   if (sub === 'save') {
@@ -1235,6 +1424,25 @@ async function handleRerolls(message, rest) {
   await message.reply(`🔄 ${targetId===uid?'Your':`<@${targetId}>'s`} Rerolls: **${newR} / ${rm}**`);
 }
 
+// Resolve a rest token against a resource max.
+//   "100%" / "50%" -> percentage of max (capped at max, uncapped input allowed)
+//   "3"            -> flat: set the resource to exactly 3 (capped at max)
+// Returns { value, changed } — changed=false means "don't touch this resource".
+function resolveRestToken(token, max, fallback) {
+  let raw = (token === null || token === undefined || token === '') ? fallback : String(token).trim();
+  if (raw === null || raw === undefined) return { value: null, changed: false };
+  raw = String(raw).trim();
+  if (raw.endsWith('%')) {
+    const p = parseInt(raw.slice(0, -1), 10);
+    if (isNaN(p) || p <= 0) return { value: null, changed: false };
+    return { value: Math.min(max, Math.floor(max * p / 100)), changed: true };
+  }
+  // Flat whole number — set the value to exactly this (clamped to max)
+  const n = parseInt(raw, 10);
+  if (isNaN(n) || n < 0) return { value: null, changed: false };
+  return { value: Math.min(max, n), changed: true };
+}
+
 async function handleRest(message, rest, type) {
   const gid = message.guild.id, uid = message.author.id;
   const mm = rest.match(/^<@!?(\d+)>/);
@@ -1248,15 +1456,39 @@ async function handleRest(message, rest, type) {
   const cfg = getConfig(gid); const mc = cfg.heal_charges??3;
   const hm = maxHp(ch), rm = maxRerolls(ch);
   const tn = targetId === uid ? 'Your' : `<@${targetId}>'s`;
-  let newHp, newR, newHeal, label;
-  if (type==='lrest') { newHp=hm; newR=rm; newHeal=mc; label='🌙 Long Rest'; }
-  else if (type==='srest') { newHp=Math.floor(hm/2); newR=Math.floor(rm/2); newHeal=Math.floor(mc/2); label='☀️ Short Rest'; }
-  else if (type==='hpfull') { newHp=hm; newR=ch.rerolls_current; newHeal=null; label='❤️ HP Restored'; }
-  else if (type==='hphalf') { newHp=Math.floor(hm/2); newR=ch.rerolls_current; newHeal=null; label='❤️ HP Half Restored'; }
-  upsertChar(gid, targetId, { hp_current:newHp, rerolls_current:newR });
-  if (newHeal !== null && isWhiteKnight(ch)) setHealCharges(gid, targetId, newHeal);
-  const lines = [`${label} applied to ${tn} character.`, `❤️ HP: **${newHp} / ${hm}**`, `🔄 Rerolls: **${newR} / ${rm}**`];
-  if (newHeal !== null && isWhiteKnight(ch)) lines.push(`🛡️ Heal: **${newHeal} / ${mc}**`);
+
+  let label, hpTok, rTok, healTok;
+  if (type==='lrest') {
+    label = '🌙 Long Rest';
+    hpTok = cfg.lrest_hp; rTok = cfg.lrest_rerolls; healTok = cfg.lrest_heal;
+    hpTok ??= '100%'; rTok ??= '100%'; healTok ??= '100%';
+  } else if (type==='srest') {
+    label = '☀️ Short Rest';
+    hpTok = cfg.srest_hp; rTok = cfg.srest_rerolls; healTok = cfg.srest_heal;
+    hpTok ??= '50%'; rTok ??= '0%'; healTok ??= '0%';
+  } else if (type==='hpfull') {
+    // HP-only commands ignore rest config entirely
+    upsertChar(gid, targetId, { hp_current: hm });
+    return message.reply([`❤️ HP Restored applied to ${tn} character.`, `❤️ HP: **${hm} / ${hm}**`].join('\n'));
+  } else if (type==='hphalf') {
+    const half = Math.floor(hm/2);
+    upsertChar(gid, targetId, { hp_current: half });
+    return message.reply([`❤️ HP Half Restored applied to ${tn} character.`, `❤️ HP: **${half} / ${hm}**`].join('\n'));
+  }
+
+  // Long / short rest: resolve each resource's token and only touch ones that change
+  const lines = [`${label} applied to ${tn} character.`];
+  const updates = {};
+  const hpR = resolveRestToken(hpTok, hm, '0%');
+  if (hpR.changed) { updates.hp_current = hpR.value; lines.push(`❤️ HP: **${hpR.value} / ${hm}**`); }
+  const rR = resolveRestToken(rTok, rm, '0%');
+  if (rR.changed) { updates.rerolls_current = rR.value; lines.push(`🔄 Rerolls: **${rR.value} / ${rm}**`); }
+  if (Object.keys(updates).length) upsertChar(gid, targetId, updates);
+  const healR = resolveRestToken(healTok, mc, '0%');
+  if (healR.changed && isWhiteKnight(ch)) {
+    setHealCharges(gid, targetId, healR.value);
+    lines.push(`🛡️ Heal: **${healR.value} / ${mc}**`);
+  }
   await message.reply(lines.join('\n'));
 }
 
@@ -1310,6 +1542,7 @@ function parseSheetImport(text) {
 
   return {
     order_name: data['ORDER'] || null,
+    class: data['CLASS'] || null,
     str: parseInt(data['STR']),
     con: parseInt(data['CON']),
     dex: parseInt(data['DEX']),
@@ -1317,6 +1550,10 @@ function parseSheetImport(text) {
     lck: parseInt(data['LCK']),
     hp_current: data['HP'] ? parseInt(data['HP']) : null,
     rerolls_current: data['REROLLS'] ? parseInt(data['REROLLS']) : null,
+    weapon1: data['WEAPON1'] || null,
+    weapon1emoji: data['WEAPON1EMOJI'] || null,
+    weapon2: data['WEAPON2'] || null,
+    weapon2emoji: data['WEAPON2EMOJI'] || null,
   };
 }
 
@@ -1348,10 +1585,15 @@ async function handleSheetImport(message, parsed) {
 
   upsertChar(gid, targetId, {
     order_name: parsed.order_name,
+    class: parsed.class || null,
     str: parsed.str, con: parsed.con, dex: parsed.dex,
     wis: parsed.wis, lck: parsed.lck,
     hp_current: hpCurrent,
     rerolls_current: rerollsCurrent,
+    weapon1: parsed.weapon1 || null,
+    weapon1emoji: validateWeaponEmoji(message.guild, parsed.weapon1emoji) || '⚔️',
+    weapon2: parsed.weapon2 || null,
+    weapon2emoji: validateWeaponEmoji(message.guild, parsed.weapon2emoji) || '🗡️',
   });
 
   // Handle heal charges for White Knight
@@ -1507,6 +1749,18 @@ client.on('interactionCreate', async interaction => {
           .map(n => ({ name: n.name, value: n.name }));
         console.log(`Autocomplete responding with ${filtered.length} NPCs`);
         return await interaction.respond(filtered);
+      }
+      // Weapon name autocomplete — server weapon list + whatever the user is typing
+      if (interaction.commandName === 'char' && (focusedOption.name === 'weapon1' || focusedOption.name === 'weapon2')) {
+        const focused = (focusedOption.value || '').toString();
+        const weapons = getWeapons(interaction.guild.id);
+        const matches = weapons.filter(w => w.toLowerCase().includes(focused.toLowerCase()));
+        const choices = matches.slice(0, 24).map(w => ({ name: w, value: w }));
+        // Always let the player keep their own free text as the first option
+        if (focused.trim() && !weapons.some(w => w.toLowerCase() === focused.toLowerCase())) {
+          choices.unshift({ name: `✏️ Use: ${focused.slice(0, 80)}`, value: focused.slice(0, 100) });
+        }
+        return await interaction.respond(choices.slice(0, 25));
       }
     } catch (err) { console.error('Autocomplete error:', err); }
     return;
@@ -1689,29 +1943,6 @@ async function registerSlashCommands(guildId) {
         });
       }
 
-      // ── /char: inject weapon choices ────────────────────────────────────────────────────────────────────────
-      const weapons = getWeapons(guildId);
-      if (weapons.length > 0) {
-        const weaponChoices = weapons.slice(0, 25).map(w => ({ name: w, value: w }));
-        commands = commands.map(cmd => {
-          if (cmd.name !== 'char' && cmd.toJSON) {
-            const json = cmd.toJSON ? cmd.toJSON() : cmd;
-            if (json.name !== 'char') return cmd;
-          }
-          const raw = typeof cmd.toJSON === 'function' ? cmd.toJSON() : cmd;
-          if (raw.name !== 'char') return cmd;
-          const json = JSON.parse(JSON.stringify(raw));
-          json.options.forEach(sub => {
-            if (sub.name === 'create') {
-              ['weapon1','weapon2'].forEach(wf => {
-                const opt = sub.options?.find(o => o.name === wf);
-                if (opt) opt.choices = weaponChoices;
-              });
-            }
-          });
-          return { toJSON: () => json };
-        });
-      }
     }
     await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands.map(c => c.toJSON()) });
     console.log('✅ Slash commands registered.');
@@ -2577,8 +2808,9 @@ const HELP_CATEGORIES = {
   character: {
     title: '📜 Character Sheet',
     body: [
-      '`/char create` — set up a full character at once (stats, order, class, weapons)',
+      '`/char create` — set up a full character at once (stats, order, class, weapons, weapon emojis)',
       '`/char set field:STR value:14` — set one field at a time',
+      '`/char weaponemoji slot:Weapon 1 emoji:⚔️` — pick a weapon slot emoji',
       '`/char show [user]` — view a character sheet',
       '`/char export [format:Image]` — export your sheet as text or image',
       '`/profile on/off/show/save/load/saves` — manage profile display & snapshots',
@@ -2591,7 +2823,7 @@ const HELP_CATEGORIES = {
       '`!hp +5` / `!hp -3` — adjust your HP (or `!hp @user +5`)',
       '`!heal @user` / `!h @user` — White Knight heal (WIS ≥ 5 only)',
       '`!rerolls +1` / `!rerolls @user -1` — adjust reroll tokens',
-      '`lrest` / `srest` — long/short rest · `hpfull` / `hphalf` — set HP',
+      '`lrest` — full rest (HP, rerolls, heal) · `srest` — short rest (HP only by default) · `hpfull` / `hphalf` — set HP',
     ],
   },
   fight: {
@@ -2632,6 +2864,7 @@ const HELP_CATEGORIES = {
       '`/config gmrole @role` — set the GM role',
       '`/config heal charges:N` — set default heal charges',
       '`/config npcchannel #channel` — set the NPC avatar channel',
+      '`/config rest type:Short Rest hp:50% rerolls:0%` — tune what a rest restores (use % of max or a flat number)',
       '`/config cleanwebhooks` — remove orphaned NPC webhooks',
       '`gmr` / `gmrs 1d20+5` — public / secret GM roll',
       '`/backup now` — export the database · `/backup auto` — daily backups',
