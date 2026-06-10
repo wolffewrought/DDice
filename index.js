@@ -933,6 +933,11 @@ const slashCommands = [
       .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
         .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'})))
     .addSubcommand(s=>s.setName('delete').setDescription('Delete an NPC').addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true)))
+    .addSubcommand(s=>s.setName('hp').setDescription('Set or restore an NPC HP (omit value for a full heal)')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('value').setDescription('Exact HP to set (omit = full heal)').setRequired(false).setMinValue(-99).setMaxValue(99)))
+    .addSubcommand(s=>s.setName('heal').setDescription('Fully heal NPCs — "all" or comma-separated names')
+      .addStringOption(o=>o.setName('names').setDescription('"all", or NPC names separated by commas').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server'))
     .addSubcommand(s=>s.setName('categorylist').setDescription('List all NPC categories'))
     .addSubcommand(s=>s.setName('categorycreate').setDescription('Create a new NPC category')
@@ -1770,6 +1775,21 @@ client.on('interactionCreate', async interaction => {
         console.log(`Autocomplete responding with ${filtered.length} NPCs`);
         return await interaction.respond(filtered);
       }
+      // /npc heal names — comma-aware: complete the segment after the last comma, offer "all"
+      if (interaction.commandName === 'npc' && focusedOption.name === 'names') {
+        const typed = (focusedOption.value || '').toString();
+        const lastComma = typed.lastIndexOf(',');
+        const head = lastComma === -1 ? '' : typed.slice(0, lastComma + 1) + ' ';
+        const seg = (lastComma === -1 ? typed : typed.slice(lastComma + 1)).trim().toLowerCase();
+        const already = new Set(lastComma === -1 ? [] : parseNpcNames(typed.slice(0, lastComma + 1)).map(s => s.toLowerCase()));
+        const npcs = getAllNpcs(interaction.guild.id).filter(n => !already.has(n.name.toLowerCase()));
+        const choices = npcs
+          .filter(n => n.name.toLowerCase().includes(seg))
+          .slice(0, 24)
+          .map(n => ({ name: (head + n.name).slice(0, 100), value: (head + n.name).slice(0, 100) }));
+        if (!head && 'all'.startsWith(seg)) choices.unshift({ name: 'all — every NPC on the server', value: 'all' });
+        return await interaction.respond(choices.slice(0, 25));
+      }
       // Fight NPC fields — suggest server NPC names
       if (interaction.commandName === 'fight' &&
           (focusedOption.name === 'npc' || focusedOption.name === 'target_npc')) {
@@ -2080,6 +2100,41 @@ function autoFightStat(stats) {
 // Roll a d20 + modifier, returning { nat, total }.
 function autoRoll(mod) { const nat = rollDie(20); return { nat, total: nat + mod }; }
 
+// Split a fighter id list into those able to fight (HP > 0) and those downed.
+async function partitionDowned(guild, gid, fighters) {
+  const active = [], downed = [];
+  for (const fid of fighters) {
+    const f = await resolveFighter(guild, gid, fid);
+    const cur = f.isNpc ? (getNpc(gid, f.name)?.hp_current ?? 0) : (getChar(gid, fid)?.hp_current ?? 0);
+    (cur > 0 ? active : downed).push({ fid, name: f.name, isNpc: f.isNpc, hp: cur });
+  }
+  return { active, downed };
+}
+
+// Warning line listing fighters left out for being at 0 HP or less.
+function downedWarning(downed) {
+  if (!downed.length) return null;
+  const names = downed.map(d => `**${d.name}**${d.isNpc ? ' 🎭' : ''} (❤️ ${d.hp})`).join(', ');
+  return `⚠️ Left out — knocked down: ${names}. Restore NPCs with \`/npc hp\`, players with \`hpfull @user\` or a rest.`;
+}
+
+// Build the same roll card a manual /fight atk or /fight def produces,
+// for an automatic best-stat roll (stat tracker + exact dice breakdown).
+async function autoFightCard(guild, gid, fighter, kind, stat, nat, total, targetName) {
+  const statVal = fighter.stats[stat] ?? 0;
+  const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
+  const icon = kind === 'atk' ? '⚔️' : '🛡️';
+  const rollLine = `${icon}  1d20+${STAT_LABELS[stat]} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+  const label = kind === 'atk' ? `⚔️ Attacks ${targetName} with ${STAT_LABELS[stat]}` : `🛡️ Defends with ${STAT_LABELS[stat]}`;
+  const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
+  const charCard = await fighterCharCard(guild, gid, fighter.id);
+  return buildRollEmbed({
+    rollLine, label, isReroll: false,
+    char: charCard, healCharges: 0, maxCharges: 0,
+    flavour: null, total, critType, tags: null, gid,
+  });
+}
+
 // Build a character-shaped object for buildRollEmbed from any fighter id.
 // Players use their real character row; NPCs are adapted from the NPC record.
 async function fighterCharCard(guild, gid, fid) {
@@ -2159,9 +2214,9 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
     def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
   });
 
-  // The NPC's own action posts AS the NPC (webhook); the defend prompt is a system note.
-  const npcLine = `⚔️ attacks **${targetF.name}${targetF.isNpc?' 🎭':''}** with ${STAT_LABELS[stat]} — 1d20+${STAT_LABELS[stat]} → [${a.nat}] = ${fightTotalStr(a.total, a.nat, 20)}`;
-  await postAsNpc(channel, gid, attacker.name, npcLine);
+  // The NPC's own roll card posts AS the NPC (webhook), matching manual rolls.
+  const atkCard = await autoFightCard(guild, gid, attacker, 'atk', stat, a.nat, a.total, `${targetF.name}${targetF.isNpc ? ' 🎭' : ''}`);
+  await postAsNpc(channel, gid, attacker.name, atkCard);
 
   // NPC targets are defended automatically by the chain — only prompt players.
   if (!targetF.isNpc) {
@@ -2183,8 +2238,8 @@ async function autoNpcDefend(guild, gid, cid, channel) {
 
   upsertFight(gid, cid, { def_roll: d.total, def_nat: d.nat, def_stat: stat, def_mode: 'normal', def_sides: 20 });
 
-  const defLine = `🛡️ defends with ${STAT_LABELS[stat]} — 1d20+${STAT_LABELS[stat]} → [${d.nat}] = ${fightTotalStr(d.total, d.nat, 20)}`;
-  await postAsNpc(channel, gid, defender.name, defLine);
+  const defCard = await autoFightCard(guild, gid, defender, 'def', stat, d.nat, d.total, null);
+  await postAsNpc(channel, gid, defender.name, defCard);
   return true;
 }
 
@@ -2328,6 +2383,16 @@ async function handleFight(interaction) {
     if (new Set(fighters).size !== fighters.length) {
       return interaction.reply({ content: '❌ A fighter was listed more than once.', ephemeral: true });
     }
+
+    // Leave out anyone already knocked down (they'd silently never act)
+    const { active: startActive, downed: startDowned } = await partitionDowned(interaction.guild, gid, fighters);
+    const startWarn = downedWarning(startDowned);
+    if (startActive.length < 2) {
+      return interaction.reply({ content: `❌ Need at least 2 fighters with HP above 0.${startWarn ? `\n${startWarn}` : ''}`, ephemeral: true });
+    }
+    fighters.length = 0; fighters.push(...startActive.map(a => a.fid));
+    if (startWarn) await interaction.channel.send(startWarn).catch(()=>{});
+
     if (fighters.length < 2) return interaction.reply({ content: '❌ Need at least 2 fighters. Add players via `players:` (@mention them) and/or NPCs via `npcs:` (comma-separated names).', ephemeral: true });
 
     const manual = interaction.options.getBoolean('manual') ?? false;
@@ -2410,6 +2475,7 @@ async function handleFight(interaction) {
     for (const npcName of names) {
       const npc = getNpc(gid, npcName);
       if (!npc) return interaction.reply({ content: `❌ NPC **${npcName}** not found.`, ephemeral: true });
+      if ((npc.hp_current ?? 0) <= 0) return interaction.reply({ content: `❌ **${npc.name}** is knocked down (❤️ ${npc.hp_current}). Restore with \`/npc hp name:${npc.name}\` first.`, ephemeral: true });
       const fid = npcFighterId(npc.name); // canonical stored name
       if (turnOrder.includes(fid)) return interaction.reply({ content: `❌ **${npc.name}** is already in this fight.`, ephemeral: true });
       const roll = rollDie(20);
@@ -2474,6 +2540,16 @@ async function handleFight(interaction) {
       if (!fighters.includes(fid)) fighters.push(fid);
     }
     if (new Set(fighters).size !== fighters.length) return interaction.reply({ content: '❌ A fighter was listed more than once.', ephemeral: true });
+
+    // Leave out anyone already knocked down (they'd silently never act)
+    const { active: autoActive, downed: autoDowned } = await partitionDowned(interaction.guild, gid, fighters);
+    const autoWarn = downedWarning(autoDowned);
+    if (autoActive.length < 2) {
+      return interaction.reply({ content: `❌ Need at least 2 fighters with HP above 0.${autoWarn ? `\n${autoWarn}` : ''}`, ephemeral: true });
+    }
+    fighters.length = 0; fighters.push(...autoActive.map(a => a.fid));
+    if (autoWarn) await interaction.channel.send(autoWarn).catch(()=>{});
+
     if (fighters.length < 2) return interaction.reply({ content: '❌ Need at least 2 fighters. Use `players:` (@mention) and/or `npcs:` (comma-separated).', ephemeral: true });
 
     // Resolve everyone up front
@@ -2524,13 +2600,16 @@ async function handleFight(interaction) {
     await sleep(800); await send(lines0.join('\n'));
 
     const alive = () => order.filter(fid => hp[fid] > 0);
-    let idx = 0, round = 1, safety = 0;
+    let idx = 0, round = 1, safety = 0, lastPos = -1;
     while (alive().length > 1 && safety < 200) {
       safety++;
       // find next living attacker starting at idx
       let guard = 0;
       while (hp[order[idx]] <= 0 && guard < order.length) { idx = (idx + 1) % order.length; guard++; }
       const attackerId = order[idx];
+      // a new round starts whenever the turn pointer wraps past the top of the order
+      if (idx <= lastPos) round++;
+      lastPos = idx;
       // pick a random living opponent
       const opponents = alive().filter(fid => fid !== attackerId);
       if (!opponents.length) break;
@@ -2545,22 +2624,23 @@ async function handleFight(interaction) {
       await sleep(900);
       await send(`─────────────────────────────\n**Round ${round}**`);
 
-      // Attacker's action — posts AS the NPC if it's an NPC, else a normal line
-      const atkLine = `⚔️ attacks **${defF.name}${defF.isNpc?' 🎭':''}** with ${STAT_LABELS[aStat]} — 1d20+${STAT_LABELS[aStat]} → [${a.nat}] = ${fightTotalStr(a.total, a.nat, 20)}`;
+      // Attacker's roll card — posts AS the NPC if it's an NPC, else a normal card
+      const atkCard = await autoFightCard(interaction.guild, gid, atkF, 'atk', aStat, a.nat, a.total, `${defF.name}${defF.isNpc?' 🎭':''}`);
       await sleep(700);
-      if (atkF.isNpc) await postAsNpc(channel, gid, atkF.name, atkLine);
-      else await send(`**${atkF.name}** ${atkLine}`);
+      if (atkF.isNpc) await postAsNpc(channel, gid, atkF.name, atkCard);
+      else await send(atkCard);
 
-      // Defender's action — same treatment
-      const defLine = `🛡️ defends with ${STAT_LABELS[dStat]} — 1d20+${STAT_LABELS[dStat]} → [${d.nat}] = ${fightTotalStr(d.total, d.nat, 20)}`;
+      // Defender's roll card — same treatment
+      const defCard = await autoFightCard(interaction.guild, gid, defF, 'def', dStat, d.nat, d.total, null);
       await sleep(700);
-      if (defF.isNpc) await postAsNpc(channel, gid, defF.name, defLine);
-      else await send(`**${defF.name}** ${defLine}`);
+      if (defF.isNpc) await postAsNpc(channel, gid, defF.name, defCard);
+      else await send(defCard);
 
       // Outcome (system line)
       let outcome;
       if (hit) {
         hp[defenderId] -= dmg;
+        setFighterHp(gid, defenderId, hp[defenderId]); // keep sheets live so the next card is accurate
         outcome = `💥 Hit for **${dmg}**! ${defF.name} HP: **${hp[defenderId] + dmg} → ${Math.max(hp[defenderId],0)}**`;
         if (hp[defenderId] <= 0) outcome += `\n💀 **${defF.name}** is knocked down!`;
       } else {
@@ -2569,7 +2649,6 @@ async function handleFight(interaction) {
       await sleep(700); await send(outcome);
 
       idx = (idx + 1) % order.length;
-      if (idx === 0) round++;
     }
 
     // Persist final HP to real sheets
@@ -3169,6 +3248,41 @@ async function handleNpc(interaction) {
     });
   }
 
+  if (sub === 'hp') {
+    const name = interaction.options.getString('name');
+    const npc = getNpc(gid, name);
+    if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found.`, ephemeral: true });
+    const max = npc.con + 2;
+    const raw = interaction.options.getInteger('value');
+    const newHp = raw === null ? max : Math.min(raw, max);
+    upsertNpc(gid, npc.name, { hp_current: newHp });
+    const note = raw !== null && raw > max ? ` (capped at max)` : raw === null ? ' — fully healed' : '';
+    return interaction.reply({ content: `❤️ **${npc.name}** HP set to **${newHp} / ${max}**${note}.` });
+  }
+
+  if (sub === 'heal') {
+    const raw = (interaction.options.getString('names') || '').trim();
+    let targets;
+    if (raw.toLowerCase() === 'all') {
+      targets = getAllNpcs(gid);
+      if (!targets.length) return interaction.reply({ content: '❌ No NPCs created yet. Use `/npc create` to add one.', ephemeral: true });
+    } else {
+      targets = [];
+      for (const n of parseNpcNames(raw)) {
+        const npc = getNpc(gid, n);
+        if (!npc) return interaction.reply({ content: `❌ NPC **${n}** not found. Separate multiple NPCs with **commas** (e.g. \`names:Goblin, Orc\`), or use \`names:all\`.`, ephemeral: true });
+        if (!targets.some(t => t.name === npc.name)) targets.push(npc);
+      }
+      if (!targets.length) return interaction.reply({ content: '❌ Name at least one NPC, or use `names:all`.', ephemeral: true });
+    }
+    const lines = targets.map(npc => {
+      const max = npc.con + 2;
+      upsertNpc(gid, npc.name, { hp_current: max });
+      return `❤️ **${npc.name}** — **${max} / ${max}**`;
+    });
+    return interaction.reply({ content: [`✨ Fully healed **${targets.length}** NPC${targets.length === 1 ? '' : 's'}:`, '', ...lines].join('\n') });
+  }
+
   if (sub === 'list') {
     const npcs = getAllNpcs(gid);
     if (!npcs.length) return interaction.reply({ content: '❌ No NPCs created yet. Use `/npc create` to add one.', ephemeral: true });
@@ -3507,6 +3621,8 @@ const HELP_CATEGORIES = {
     title: '🎭 NPCs',
     body: [
       '`/npc create name:X str:N ...` — create an NPC (GM)',
+      '`/npc hp name:X value:N` — set an NPC\'s HP · omit value for a full heal (GM)',
+      '`/npc heal names:all` · `/npc heal names:Goblin, Orc` — fully heal NPCs (GM)',
       '`/npc list` · `/npc delete name:X`',
       '`/npc categorycreate/categorydelete/categorylist` — manage categories',
       '`/npc categoryassign/categoryremove` — sort NPCs into categories',
