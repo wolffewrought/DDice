@@ -2072,13 +2072,10 @@ function parseNpcNames(str) {
   return names;
 }
 
-// Pick a sensible attacking stat for an auto fighter (highest of str/dex).
-function autoAttackStat(stats) {
+// Pick the stat an auto fighter rolls with — always the highest of STR/DEX,
+// for both attack and defence (ties go to STR).
+function autoFightStat(stats) {
   return (stats.str ?? 0) >= (stats.dex ?? 0) ? 'str' : 'dex';
-}
-// Pick a sensible defending stat (highest of dex/con).
-function autoDefendStat(stats) {
-  return (stats.dex ?? 0) >= (stats.con ?? 0) ? 'dex' : 'con';
 }
 // Roll a d20 + modifier, returning { nat, total }.
 function autoRoll(mod) { const nat = rollDie(20); return { nat, total: nat + mod }; }
@@ -2153,7 +2150,7 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   const targetId = opponents[Math.floor(Math.random() * opponents.length)];
   const targetF = await resolveFighter(guild, gid, targetId);
 
-  const stat = autoAttackStat(attacker.stats);
+  const stat = autoFightStat(attacker.stats);
   const a = autoRoll(attacker.stats[stat] ?? 0);
 
   upsertFight(gid, cid, {
@@ -2166,11 +2163,136 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   const npcLine = `⚔️ attacks **${targetF.name}${targetF.isNpc?' 🎭':''}** with ${STAT_LABELS[stat]} — 1d20+${STAT_LABELS[stat]} → [${a.nat}] = ${fightTotalStr(a.total, a.nat, 20)}`;
   await postAsNpc(channel, gid, attacker.name, npcLine);
 
-  const prompt = targetF.isNpc
-    ? `🛡️ **${targetF.name}** is also an NPC — a GM resolves with \`/fight def npc:${targetF.name}\` then \`/fight resolve\`.`
-    : `🛡️ **${targetF.name}** — use \`/fight def\` to defend, then \`/fight resolve\`.`;
-  await channel.send(prompt).catch(()=>{});
+  // NPC targets are defended automatically by the chain — only prompt players.
+  if (!targetF.isNpc) {
+    await channel.send(`🛡️ **${targetF.name}** — use \`/fight def\` to defend, then \`/fight resolve\`.`).catch(()=>{});
+  }
   return true;
+}
+
+// In an auto_npc fight, roll the targeted NPC's defence automatically
+// (best of STR/DEX) and post it under the NPC's name. Returns true if it acted.
+async function autoNpcDefend(guild, gid, cid, channel) {
+  const fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active' || !fight.auto_npc) return false;
+  if (fight.phase !== 'defend' || !isNpcFighter(fight.current_target)) return false;
+
+  const defender = await resolveFighter(guild, gid, fight.current_target);
+  const stat = autoFightStat(defender.stats);
+  const d = autoRoll(defender.stats[stat] ?? 0);
+
+  upsertFight(gid, cid, { def_roll: d.total, def_nat: d.nat, def_stat: stat, def_mode: 'normal', def_sides: 20 });
+
+  const defLine = `🛡️ defends with ${STAT_LABELS[stat]} — 1d20+${STAT_LABELS[stat]} → [${d.nat}] = ${fightTotalStr(d.total, d.nat, 20)}`;
+  await postAsNpc(channel, gid, defender.name, defLine);
+  return true;
+}
+
+// Auto-mode twin of the `/fight resolve` handler (channel-send based).
+// Computes damage from the stored rolls, persists HP, handles knockdown /
+// win / turn advance, and posts the summary. Returns true if the fight continues.
+// Keep the rules here in lockstep with the `resolve` subcommand in handleFight.
+async function autoResolveExchange(guild, gid, cid, channel) {
+  const fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active' || fight.phase !== 'defend' || fight.def_roll === null) return false;
+
+  const turnOrder = JSON.parse(fight.turn_order);
+  const attackerId = turnOrder[fight.turn_index];
+  const defenderId = fight.current_target;
+  const hpState = JSON.parse(fight.hp_state);
+
+  const { hit, dmg } = resolveDamage(
+    fight.atk_roll, fight.atk_nat, 20,
+    fight.def_roll, fight.def_nat, 20
+  );
+
+  const atkF = await resolveFighter(guild, gid, attackerId);
+  const defF = await resolveFighter(guild, gid, defenderId);
+  const atkName = atkF.name + (atkF.isNpc ? ' 🎭' : '');
+  const defName = defF.name + (defF.isNpc ? ' 🎭' : '');
+
+  const lines = ['─────────────────────────────', '⚔️  **Exchange Resolved**', ''];
+  lines.push(`${atkName} (**${STAT_LABELS[fight.atk_stat]}**): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
+  lines.push(`${defName} (**${STAT_LABELS[fight.def_stat]}**): ${fightTotalStr(fight.def_roll, fight.def_nat, 20)}`);
+  lines.push('');
+
+  if (hit) {
+    const prevHp = hpState[defenderId] ?? 0;
+    const newHp = prevHp - dmg;
+    hpState[defenderId] = newHp;
+    setFighterHp(gid, defenderId, newHp);
+    lines.push(`💥 **${atkName}** hits **${defName}** for **${dmg}** damage!`);
+    lines.push(`❤️ ${defName} HP: **${prevHp} → ${newHp}**`);
+
+    if (newHp <= 0) {
+      lines.push('', `💀 **${defName}** has been knocked down! HP: **${newHp}**`);
+      const newOrder = turnOrder.filter(id => id !== defenderId);
+      if (newOrder.length <= 1) {
+        const winF = await resolveFighter(guild, gid, newOrder[0]);
+        lines.push(`\n🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** wins the fight!`);
+        upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState) });
+        await channel.send(lines.join('\n')).catch(()=>{});
+        return false;
+      }
+      const newIndex = fight.turn_index % newOrder.length;
+      const nextF = await resolveFighter(guild, gid, newOrder[newIndex]);
+      lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!`);
+      upsertFight(gid, cid, {
+        turn_order: JSON.stringify(newOrder), turn_index: newIndex,
+        phase: 'attack', current_target: null,
+        atk_roll: null, atk_nat: null, atk_stat: null,
+        def_roll: null, def_nat: null, def_stat: null,
+        hp_state: JSON.stringify(hpState),
+      });
+      await channel.send(lines.join('\n')).catch(()=>{});
+      return true;
+    }
+  } else {
+    lines.push(`🛡️ **${defName}** blocks the attack! No damage.`);
+  }
+
+  // Advance turn to next active fighter
+  let nextIndex = (fight.turn_index + 1) % turnOrder.length;
+  let safety = 0;
+  while (hpState[turnOrder[nextIndex]] !== undefined && hpState[turnOrder[nextIndex]] <= 0 && safety < turnOrder.length) {
+    nextIndex = (nextIndex + 1) % turnOrder.length;
+    safety++;
+  }
+  const nextF = await resolveFighter(guild, gid, turnOrder[nextIndex]);
+  lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!`);
+  upsertFight(gid, cid, {
+    turn_index: nextIndex, phase: 'attack', current_target: null,
+    atk_roll: null, atk_nat: null, atk_stat: null,
+    def_roll: null, def_nat: null, def_stat: null,
+    hp_state: JSON.stringify(hpState),
+  });
+  await channel.send(lines.join('\n')).catch(()=>{});
+  return true;
+}
+
+// Drive automatic NPC actions in an NPCs-only fight: take NPC attacks,
+// auto-defend when an NPC is the target, and resolve — looping until a
+// player needs to act or the fight ends.
+async function runAutoNpcChain(guild, gid, cid, channel) {
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  let safety = 0;
+  while (safety++ < 60) {
+    const fight = getFight(gid, cid);
+    if (!fight || fight.state !== 'active' || !fight.auto_npc) return;
+    if (fight.phase === 'attack') {
+      const acted = await runAutoNpcTurn(guild, gid, cid, channel);
+      if (!acted) return; // a player's turn — wait for them
+      await sleep(1100);
+    } else if (fight.phase === 'defend') {
+      if (!isNpcFighter(fight.current_target)) return; // a player defends manually
+      const defended = await autoNpcDefend(guild, gid, cid, channel);
+      if (!defended) return;
+      await sleep(900);
+      const cont = await autoResolveExchange(guild, gid, cid, channel);
+      if (!cont) return;
+      await sleep(1100);
+    } else return;
+  }
 }
 
 async function handleFight(interaction) {
@@ -2324,11 +2446,12 @@ async function handleFight(interaction) {
         safety++;
         const atk = order[turn % 2], def = order[(turn + 1) % 2];
         await sleep(1100);
-        const a = autoRoll(atk.str), d = autoRoll(def.dex);
+        const aStat = autoFightStat(atk), dStat = autoFightStat(def);
+        const a = autoRoll(atk[aStat]), d = autoRoll(def[dStat]);
         const { hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20);
         const lines = ['─────────────────────────────', `**Round ${round}** — ${atk.name} attacks ${def.name}`,
-          `⚔️ STR → [${a.nat}] +${atk.str} = ${fightTotalStr(a.total, a.nat, 20)}`,
-          `🛡️ DEX → [${d.nat}] +${def.dex} = ${fightTotalStr(d.total, d.nat, 20)}`];
+          `⚔️ ${STAT_LABELS[aStat]} → [${a.nat}] +${atk[aStat]} = ${fightTotalStr(a.total, a.nat, 20)}`,
+          `🛡️ ${STAT_LABELS[dStat]} → [${d.nat}] +${def[dStat]} = ${fightTotalStr(d.total, d.nat, 20)}`];
         if (hit) { def.hp -= dmg; lines.push('', `💥 Hit for **${dmg}**! ${def.name} HP: **${def.hp + dmg} → ${Math.max(def.hp,0)}**`); if (def.hp <= 0) lines.push('', `💀 **${def.name}** is knocked down!`); }
         else lines.push('', `🛡️ **${def.name}** blocks — no damage.`);
         await send(lines.join('\n'));
@@ -2390,7 +2513,7 @@ async function handleFight(interaction) {
       lines.push('', firstF.isNpc ? `🤖 **${firstF.name}** is an NPC — the bot will take its turn automatically.` : `🎯 **${firstF.name}** goes first! Use \`/fight atk\` to attack.`);
       await interaction.reply({ content: lines.join('\n') });
       // If the first fighter is an NPC, kick off its turn
-      if (firstF.isNpc) { await sleep(1200); await runAutoNpcTurn(interaction.guild, gid, cid, channel); }
+      if (firstF.isNpc) { await sleep(1200); await runAutoNpcChain(interaction.guild, gid, cid, channel); }
       return;
     }
 
@@ -2414,7 +2537,7 @@ async function handleFight(interaction) {
       const defenderId = opponents[Math.floor(Math.random() * opponents.length)];
 
       const atkF = F[attackerId], defF = F[defenderId];
-      const aStat = autoAttackStat(atkF.stats), dStat = autoDefendStat(defF.stats);
+      const aStat = autoFightStat(atkF.stats), dStat = autoFightStat(defF.stats);
       const a = autoRoll(atkF.stats[aStat] ?? 0), d = autoRoll(defF.stats[dStat] ?? 0);
       const { hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20);
 
@@ -2600,7 +2723,10 @@ async function handleFight(interaction) {
       char: actorCard, healCharges: 0, maxCharges: 0,
       flavour: flavour || null, total, critType, tags: null, gid,
     });
-    const defHint = targetF.isNpc ? `🛡️ A GM defends for **${targetF.name}** with \`/fight def npc:${targetF.name}\`.` : `🛡️ **${targetF.name}** — use \`/fight def\` to defend.`;
+    const autoOn = !!fight.auto_npc;
+    const defHint = targetF.isNpc
+      ? (autoOn ? `🤖 **${targetF.name}** defends automatically...` : `🛡️ A GM defends for **${targetF.name}** with \`/fight def npc:${targetF.name}\`.`)
+      : `🛡️ **${targetF.name}** — use \`/fight def\` to defend.`;
 
     upsertFight(gid, cid, {
       phase: 'defend', current_target: targetId,
@@ -2612,9 +2738,16 @@ async function handleFight(interaction) {
       // Post the NPC's card through its webhook, ack the GM privately
       await postAsNpc(interaction.channel, gid, actor.name, card);
       await interaction.channel.send(defHint).catch(()=>{});
-      return interaction.reply({ content: `✅ Attacked as **${actor.name}**.`, ephemeral: true });
+      await interaction.reply({ content: `✅ Attacked as **${actor.name}**.`, ephemeral: true });
+    } else {
+      await interaction.reply({ content: `${card}\n\n${defHint}` });
     }
-    return interaction.reply({ content: `${card}\n\n${defHint}` });
+    // NPCs-only mode: the bot rolls the targeted NPC's defence and resolves.
+    if (autoOn && targetF.isNpc) {
+      await new Promise(r=>setTimeout(r,1200));
+      await runAutoNpcChain(interaction.guild, gid, cid, interaction.channel);
+    }
+    return;
   }
 
   // ── DEF (normal / adv / dis) ──────────────────────────────────────────────
@@ -2740,6 +2873,7 @@ async function handleFight(interaction) {
   }
 
   // ── RESOLVE ────────────────────────────────────────────────────────────────
+  // Rule changes here must be mirrored in autoResolveExchange (the auto-mode twin).
   if (sub === 'resolve') {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
@@ -2800,7 +2934,7 @@ async function handleFight(interaction) {
           hp_state: JSON.stringify(hpState),
         });
         await interaction.reply({ content: lines.join('\n') });
-        if (autoOn && nextF.isNpc) { await new Promise(r=>setTimeout(r,1200)); await runAutoNpcTurn(interaction.guild, gid, cid, interaction.channel); }
+        if (autoOn && nextF.isNpc) { await new Promise(r=>setTimeout(r,1200)); await runAutoNpcChain(interaction.guild, gid, cid, interaction.channel); }
         return;
       }
     } else {
@@ -2830,7 +2964,7 @@ async function handleFight(interaction) {
     });
 
     await interaction.reply({ content: lines.join('\n') });
-    if (autoOn && nextF.isNpc) { await new Promise(r=>setTimeout(r,1200)); await runAutoNpcTurn(interaction.guild, gid, cid, interaction.channel); }
+    if (autoOn && nextF.isNpc) { await new Promise(r=>setTimeout(r,1200)); await runAutoNpcChain(interaction.guild, gid, cid, interaction.channel); }
     return;
   }
 
