@@ -47,6 +47,7 @@ try { db.exec('ALTER TABLE fights ADD COLUMN def_sides INTEGER DEFAULT 20'); } c
 try { db.exec('ALTER TABLE fights ADD COLUMN auto_npc INTEGER DEFAULT 0'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN rr_state TEXT DEFAULT '{}'"); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_rr_threshold INTEGER DEFAULT 8'); } catch {}
+try { db.exec("ALTER TABLE fights ADD COLUMN log_state TEXT DEFAULT '{}'"); } catch {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS characters (
@@ -140,6 +141,20 @@ db.exec(`
 function getChar(gid, uid) {
   return db.prepare('SELECT * FROM characters WHERE guild_id=? AND user_id=?').get(gid, uid);
 }
+// Mirror a fighter's new sheet HP into any active fight that contains them,
+// so mid-fight heals / GM adjustments aren't overwritten on the next resolve.
+function syncFightHp(gid, fid, newHp) {
+  const fights = db.prepare("SELECT channel_id, hp_state FROM fights WHERE guild_id=? AND state='active'").all(gid);
+  for (const f of fights) {
+    const hpState = JSON.parse(f.hp_state || '{}');
+    if (Object.prototype.hasOwnProperty.call(hpState, fid)) {
+      hpState[fid] = newHp;
+      db.prepare('UPDATE fights SET hp_state=? WHERE guild_id=? AND channel_id=?')
+        .run(JSON.stringify(hpState), gid, f.channel_id);
+    }
+  }
+}
+
 function upsertChar(gid, uid, fields) {
   const ex = getChar(gid, uid);
   if (!ex) {
@@ -149,6 +164,7 @@ function upsertChar(gid, uid, fields) {
     const sets = Object.entries(fields).map(([k])=>`${k}=?`).join(',');
     db.prepare(`UPDATE characters SET ${sets} WHERE guild_id=? AND user_id=?`).run(...Object.values(fields), gid, uid);
   }
+  if ('hp_current' in fields) syncFightHp(gid, uid, fields.hp_current);
   return getChar(gid, uid);
 }
 function setStatAndDerive(gid, uid, stat, val) {
@@ -238,6 +254,10 @@ function upsertNpc(gid, name, fields) {
     db.prepare(`UPDATE npcs SET ${sets} WHERE guild_id=? AND name=?`).run(...Object.values(fields), gid, name);
   }
   return getNpc(gid, name);
+  if ('hp_current' in fields) {
+    const canonical = getNpc(gid, name)?.name ?? name;
+    syncFightHp(gid, npcFighterId(canonical), fields.hp_current);
+  }
 }
 function deleteNpc(gid, name) {
   db.prepare('DELETE FROM npcs WHERE guild_id=? AND name=?').run(gid, name);
@@ -942,6 +962,11 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('value').setDescription('Exact HP to set (omit = full heal)').setRequired(false).setMinValue(-99).setMaxValue(99)))
     .addSubcommand(s=>s.setName('heal').setDescription('Fully heal NPCs — "all" or comma-separated names')
       .addStringOption(o=>o.setName('names').setDescription('"all", or NPC names separated by commas').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('copy').setDescription('Duplicate an NPC under a new name (fresh full HP)')
+      .addStringOption(o=>o.setName('name').setDescription('NPC to copy').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('new_name').setDescription('Name for the copy').setRequired(true)))
+    .addSubcommand(s=>s.setName('show').setDescription('Show one NPC\'s full stat block')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server'))
     .addSubcommand(s=>s.setName('categorylist').setDescription('List all NPC categories'))
     .addSubcommand(s=>s.setName('categorycreate').setDescription('Create a new NPC category')
@@ -996,7 +1021,8 @@ const slashCommands = [
           {name:'Demo — example fighters, just a showcase',value:'demo'},
         ))
       .addStringOption(o=>o.setName('players').setDescription('Players to include — @mention them, space-separated (full mode)').setRequired(false))
-      .addStringOption(o=>o.setName('npcs').setDescription('GM NPCs to include — names, comma-separated').setRequired(false)))
+      .addStringOption(o=>o.setName('npcs').setDescription('GM NPCs to include — names, comma-separated').setRequired(false))
+      .addStringOption(o=>o.setName('teams').setDescription('Full mode sides: "@a @b vs Goblin, Orc" — overrides players/npcs').setRequired(false)))
     .addSubcommand(s=>s.setName('order').setDescription('Set the turn order (GM) — list fighters in the order you want')
       .addStringOption(o=>o.setName('players').setDescription('Players in order — @mention them, space-separated').setRequired(false))
       .addStringOption(o=>o.setName('sequence').setDescription('Full order incl. NPCs — e.g. @Alice, Goblin, @Bob, Orc').setRequired(false)))
@@ -1022,6 +1048,13 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('resolve').setDescription('Resolve the current exchange'))
     .addSubcommand(s=>s.setName('refill').setDescription('Refill NPC reroll tokens to their LCK (GM)')
       .addStringOption(o=>o.setName('npcs').setDescription('"all", or NPC names separated by commas').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('hp').setDescription('Set a fighter\'s HP mid-fight — sheet and fight stay in sync (GM)')
+      .addIntegerOption(o=>o.setName('value').setDescription('Exact HP to set').setRequired(true).setMinValue(-99).setMaxValue(99))
+      .addUserOption(o=>o.setName('target').setDescription('Player to adjust').setRequired(false))
+      .addStringOption(o=>o.setName('target_npc').setDescription('NPC to adjust').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('kick').setDescription('Remove a fighter from the fight without ending it (GM)')
+      .addUserOption(o=>o.setName('target').setDescription('Player to remove').setRequired(false))
+      .addStringOption(o=>o.setName('target_npc').setDescription('NPC to remove').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('forfeit').setDescription('Concede the fight'))
     .addSubcommand(s=>s.setName('status').setDescription('Show current fight status'))
     .addSubcommand(s=>s.setName('end').setDescription('End the fight (GM only)')),
@@ -2182,6 +2215,7 @@ async function applyAutoNpcRerolls(guild, gid, cid, channel) {
     rr[fid] = (rr[fid] ?? 0) - 1;
     if (kind === 'atk') upsertFight(gid, cid, { atk_roll: roll.total, atk_nat: roll.nat, rr_state: JSON.stringify(rr) });
     else upsertFight(gid, cid, { def_roll: roll.total, def_nat: roll.nat, rr_state: JSON.stringify(rr) });
+    bumpFightLog(gid, cid, (log, ensure) => { ensure(fid).rr++; });
     let targetName = null;
     if (kind === 'atk') {
       const tF = await resolveFighter(guild, gid, defenderId);
@@ -2202,6 +2236,87 @@ async function applyAutoNpcRerolls(guild, gid, cid, channel) {
   ({ hit } = resolveDamage(fight.atk_roll, fight.atk_nat, 20, fight.def_roll, fight.def_nat, 20));
   if (!hit && fight.atk_nat <= rrMax) await tryReroll(attackerId, 'atk');
   return getFight(gid, cid);
+}
+
+// Resolve a /fight subcommand's target / target_npc pair to a fighter id in
+// the given fight, or an error string. Exactly one of the two must be set.
+function resolveFightTarget(interaction, gid, fight) {
+  const targetUser = interaction.options.getUser('target');
+  const targetNpcName = interaction.options.getString('target_npc');
+  if (!!targetUser === !!targetNpcName) return { error: '❌ Pick exactly one of `target` or `target_npc`.' };
+  let fid;
+  if (targetUser) fid = targetUser.id;
+  else {
+    const npc = getNpc(gid, targetNpcName);
+    if (!npc) return { error: `❌ NPC **${targetNpcName}** not found.` };
+    fid = npcFighterId(npc.name);
+  }
+  if (!JSON.parse(fight.turn_order).includes(fid)) return { error: '❌ That fighter is not in this fight.' };
+  return { fid };
+}
+
+// ── Fight log & recap ────────────────────────────────────────────────────────
+// log_state: { exchanges: n, f: { fid: { dealt, taken, crit, fumble, rr } } }
+function bumpFightLog(gid, cid, mutate) {
+  const fight = getFight(gid, cid);
+  if (!fight) return;
+  const log = JSON.parse(fight.log_state || '{}');
+  log.f = log.f || {};
+  mutate(log, (fid) => (log.f[fid] = log.f[fid] || { dealt: 0, taken: 0, crit: 0, fumble: 0, rr: 0 }));
+  upsertFight(gid, cid, { log_state: JSON.stringify(log) });
+}
+
+// Record one resolved exchange into a log object (shared by DB fights and full-auto's in-memory log).
+function recordExchange(log, ensure, attackerId, defenderId, atkNat, defNat, hit, dmg) {
+  log.exchanges = (log.exchanges || 0) + 1;
+  const a = ensure(attackerId), d = ensure(defenderId);
+  if (atkNat === 20) a.crit++;
+  if (atkNat === 1) a.fumble++;
+  if (defNat === 20) d.crit++;
+  if (defNat === 1) d.fumble++;
+  if (hit) { a.dealt += dmg; d.taken += dmg; }
+}
+
+// Render the recap lines for a finished fight.
+async function buildFightRecap(guild, gid, log) {
+  const entries = Object.entries(log?.f ?? {});
+  if (!entries.length) return [];
+  const lines = ['', `📜 **Fight Recap** — ${log.exchanges ?? 0} exchange${(log.exchanges ?? 0) === 1 ? '' : 's'}`];
+  entries.sort((x, y) => (y[1].dealt ?? 0) - (x[1].dealt ?? 0));
+  for (const [fid, st] of entries) {
+    const f = await resolveFighter(guild, gid, fid);
+    const bits = [`dealt **${st.dealt ?? 0}**`, `taken **${st.taken ?? 0}**`];
+    if (st.crit) bits.push(`💥 ${st.crit} nat-20${st.crit > 1 ? 's' : ''}`);
+    if (st.fumble) bits.push(`🔻 ${st.fumble} nat-1${st.fumble > 1 ? 's' : ''}`);
+    if (st.rr) bits.push(`🔁 ${st.rr} reroll${st.rr > 1 ? 's' : ''}`);
+    lines.push(`**${f.name}${f.isNpc ? ' 🎭' : ''}** — ${bits.join(' · ')}`);
+  }
+  return lines;
+}
+
+// Expand category tokens in an NPC list, keeping unknown tokens as-is so the
+// caller's normal "NPC not found" handling reports them.
+function expandNpcList(gid, str) {
+  const { names, missingCats } = expandNpcTokens(gid, str);
+  // Unknown categories fall through as literal names → caller's not-found error fires
+  return [...names, ...missingCats.map(c => 'category:' + c)];
+}
+
+// Expand "category:Bandits" tokens in a comma-separated NPC list into the
+// category's members (case-insensitive category match). Returns { names, missingCats }.
+function expandNpcTokens(gid, str) {
+  const names = [], missingCats = [];
+  for (const tok of parseNpcNames(str)) {
+    const m = /^category:(.+)$/i.exec(tok);
+    if (m) {
+      const wanted = m[1].trim().toLowerCase();
+      const cat = getCategories(gid).find(c => c.toLowerCase() === wanted);
+      const members = cat ? getNpcsInCategory(gid, cat) : [];
+      if (!members.length) missingCats.push(m[1].trim());
+      for (const n of members) if (!names.includes(n)) names.push(n);
+    } else if (!names.includes(tok)) names.push(tok);
+  }
+  return { names, missingCats };
 }
 
 // Build a character-shaped object for buildRollEmbed from any fighter id.
@@ -2339,6 +2454,9 @@ async function autoResolveExchange(guild, gid, cid, channel) {
   const atkName = atkF.name + (atkF.isNpc ? ' 🎭' : '');
   const defName = defF.name + (defF.isNpc ? ' 🎭' : '');
 
+  bumpFightLog(gid, cid, (log, ensure) =>
+    recordExchange(log, ensure, attackerId, defenderId, fight.atk_nat, fight.def_nat, hit, dmg));
+
   const lines = ['─────────────────────────────', '⚔️  **Exchange Resolved**', ''];
   lines.push(`${atkName} (**${STAT_LABELS[fight.atk_stat]}**): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
   lines.push(`${defName} (**${STAT_LABELS[fight.def_stat]}**): ${fightTotalStr(fight.def_roll, fight.def_nat, 20)}`);
@@ -2358,6 +2476,8 @@ async function autoResolveExchange(guild, gid, cid, channel) {
       if (newOrder.length <= 1) {
         const winF = await resolveFighter(guild, gid, newOrder[0]);
         lines.push(`\n🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** wins the fight!`);
+        const endLog = JSON.parse(getFight(gid, cid)?.log_state || '{}');
+        lines.push(...await buildFightRecap(guild, gid, endLog));
         upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState) });
         await channel.send(lines.join('\n')).catch(()=>{});
         return false;
@@ -2444,7 +2564,7 @@ async function handleFight(interaction) {
       fighters.push(id);
     }
     // GM NPCs from the comma list (only a GM may add NPCs)
-    const npcNames = parseNpcNames(interaction.options.getString('npcs'));
+    const npcNames = expandNpcList(gid, interaction.options.getString('npcs'));
     if (npcNames.length && !(await isGm(interaction.guild, uid))) {
       return interaction.reply({ content: '❌ Only GMs can add NPCs to a fight.', ephemeral: true });
     }
@@ -2459,6 +2579,8 @@ async function handleFight(interaction) {
       return interaction.reply({ content: '❌ A fighter was listed more than once.', ephemeral: true });
     }
 
+    if (fighters.length < 2) return interaction.reply({ content: '❌ Need at least 2 fighters. Add players via `players:` (@mention them) and/or NPCs via `npcs:` (comma-separated names).', ephemeral: true });
+
     // Leave out anyone already knocked down (they'd silently never act)
     const { active: startActive, downed: startDowned } = await partitionDowned(interaction.guild, gid, fighters);
     const startWarn = downedWarning(startDowned);
@@ -2467,8 +2589,6 @@ async function handleFight(interaction) {
     }
     fighters.length = 0; fighters.push(...startActive.map(a => a.fid));
     if (startWarn) await interaction.channel.send(startWarn).catch(()=>{});
-
-    if (fighters.length < 2) return interaction.reply({ content: '❌ Need at least 2 fighters. Add players via `players:` (@mention them) and/or NPCs via `npcs:` (comma-separated names).', ephemeral: true });
 
     const manual = interaction.options.getBoolean('manual') ?? false;
 
@@ -2545,7 +2665,7 @@ async function handleFight(interaction) {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
 
-    const names = parseNpcNames(interaction.options.getString('npc'));
+    const names = expandNpcList(gid, interaction.options.getString('npc'));
     if (!names.length) return interaction.reply({ content: '❌ Name at least one NPC.', ephemeral: true });
 
     const turnOrder = JSON.parse(fight.turn_order);
@@ -2569,6 +2689,68 @@ async function handleFight(interaction) {
     return interaction.reply({ content: [`**Joined the fight** (added to the end of the turn order — use \`/fight order\` to reposition):`, '', ...added].join('\n') });
   }
 
+  // ── HP (GM sets a fighter's HP mid-fight; sheet + fight stay in sync) ─────
+  if (sub === 'hp') {
+    if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can adjust fight HP.', ephemeral: true });
+    const fight = getFight(gid, cid);
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    const t = resolveFightTarget(interaction, gid, fight);
+    if (t.error) return interaction.reply({ content: t.error, ephemeral: true });
+    const fid = t.fid;
+    const f = await resolveFighter(interaction.guild, gid, fid);
+    const value = interaction.options.getInteger('value');
+    const newHp = Math.min(value, f.maxHp || value);
+    const prev = JSON.parse(fight.hp_state)[fid] ?? '?';
+    setFighterHp(gid, fid, newHp); // sheet write → syncFightHp mirrors into hp_state
+    const note = value > (f.maxHp || value) ? ' (capped at max)' : '';
+    const down = newHp <= 0 ? ` 💀 **${f.name}** is at 0 or less and will be skipped.` : '';
+    return interaction.reply({ content: `❤️ **${f.name}${f.isNpc ? ' 🎭' : ''}** HP: **${prev} → ${newHp}**${note}.${down}` });
+  }
+
+  // ── KICK (remove a fighter without ending the fight) ──────────────────────
+  if (sub === 'kick') {
+    if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can kick fighters.', ephemeral: true });
+    const fight = getFight(gid, cid);
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    const t = resolveFightTarget(interaction, gid, fight);
+    if (t.error) return interaction.reply({ content: t.error, ephemeral: true });
+    const fid = t.fid;
+    const turnOrder = JSON.parse(fight.turn_order);
+    const removedPos = turnOrder.indexOf(fid);
+
+    const f = await resolveFighter(interaction.guild, gid, fid);
+    const hpState = JSON.parse(fight.hp_state);
+    const rrState = JSON.parse(fight.rr_state || '{}');
+    const newOrder = turnOrder.filter(id => id !== fid);
+    delete hpState[fid]; delete rrState[fid];
+    const lines = [`👢 **${f.name}${f.isNpc ? ' 🎭' : ''}** has been removed from the fight.`];
+
+    if (newOrder.length <= 1) {
+      if (newOrder.length === 1) {
+        const winF = await resolveFighter(interaction.guild, gid, newOrder[0]);
+        lines.push(`🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** wins!`);
+      }
+      lines.push(...await buildFightRecap(interaction.guild, gid, JSON.parse(fight.log_state || '{}')));
+      upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState) });
+      return interaction.reply({ content: lines.join('\n') });
+    }
+
+    let newIndex = (removedPos < fight.turn_index ? fight.turn_index - 1 : fight.turn_index) % newOrder.length;
+    const patch = { turn_order: JSON.stringify(newOrder), turn_index: newIndex,
+                    hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState) };
+    // If the pending exchange involved them, reset it
+    const attackerId = turnOrder[fight.turn_index];
+    if (fight.phase === 'defend' && (fid === attackerId || fid === fight.current_target)) {
+      Object.assign(patch, { phase: 'attack', current_target: null,
+        atk_roll: null, atk_nat: null, atk_stat: null, def_roll: null, def_nat: null, def_stat: null });
+      lines.push('↩️ The pending exchange was reset.');
+    }
+    upsertFight(gid, cid, patch);
+    const nextF = await resolveFighter(interaction.guild, gid, newOrder[newIndex]);
+    lines.push(`🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack.`);
+    return interaction.reply({ content: lines.join('\n') });
+  }
+
   // ── REFILL (restore NPC reroll tokens mid-fight) ──────────────────────────
   if (sub === 'refill') {
     if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can refill NPC rerolls.', ephemeral: true });
@@ -2583,7 +2765,7 @@ async function handleFight(interaction) {
       if (!targets.length) return interaction.reply({ content: '❌ No NPCs in this fight.', ephemeral: true });
     } else {
       targets = [];
-      for (const n of parseNpcNames(raw)) {
+      for (const n of expandNpcList(gid, raw)) {
         const npc = getNpc(gid, n);
         if (!npc) return interaction.reply({ content: `❌ NPC **${n}** not found.`, ephemeral: true });
         if (!turnOrder.includes(npcFighterId(npc.name))) return interaction.reply({ content: `❌ **${npc.name}** isn't in this fight.`, ephemeral: true });
@@ -2642,16 +2824,49 @@ async function handleFight(interaction) {
     }
 
     // ---- Build the real fighter roster from the named players + NPCs ----
+    // Parse one side of a teams string into fighter ids (mentions + NPC names/categories)
+    const parseSide = (text) => {
+      const ids = [];
+      for (const id of parsePlayerMentions(text)) ids.push(id);
+      const rest = text.replace(/<@!?\d+>/g, ' ');
+      for (const n of expandNpcList(gid, rest)) {
+        const npc = getNpc(gid, n);
+        if (!npc) return { error: `❌ NPC **${n}** not found.` };
+        const fid = npcFighterId(npc.name);
+        if (!ids.includes(fid)) ids.push(fid);
+      }
+      return { ids };
+    };
+
+    const teamsRaw = (interaction.options.getString('teams') || '').trim();
+    const sideOf = {}; // fid -> 1|2 when teams are in play (full mode only)
+    let useTeams = false;
     const fighters = [];
-    for (const id of parsePlayerMentions(interaction.options.getString('players'))) fighters.push(id);
-    const npcNames = parseNpcNames(interaction.options.getString('npcs'));
-    for (const n of npcNames) {
-      const npc = getNpc(gid, n);
-      if (!npc) return interaction.reply({ content: `❌ NPC **${n}** not found.`, ephemeral: true });
-      const fid = npcFighterId(npc.name); // canonical stored name
-      if (!fighters.includes(fid)) fighters.push(fid);
+
+    if (teamsRaw && mode === 'full') {
+      const parts = teamsRaw.split(/\s+vs\s+/i);
+      if (parts.length !== 2) return interaction.reply({ content: '❌ Teams format: `teams:@a @b vs Goblin, Orc` (exactly one "vs").', ephemeral: true });
+      const s1 = parseSide(parts[0]), s2 = parseSide(parts[1]);
+      if (s1.error) return interaction.reply({ content: s1.error, ephemeral: true });
+      if (s2.error) return interaction.reply({ content: s2.error, ephemeral: true });
+      if (!s1.ids.length || !s2.ids.length) return interaction.reply({ content: '❌ Both teams need at least one fighter.', ephemeral: true });
+      for (const fid of s1.ids) { if (sideOf[fid]) return interaction.reply({ content: '❌ A fighter appears on both teams.', ephemeral: true }); sideOf[fid] = 1; fighters.push(fid); }
+      for (const fid of s2.ids) { if (sideOf[fid]) return interaction.reply({ content: '❌ A fighter appears on both teams.', ephemeral: true }); sideOf[fid] = 2; fighters.push(fid); }
+      useTeams = true;
+    } else {
+      if (teamsRaw) return interaction.reply({ content: '❌ `teams:` only applies to `mode:Full`.', ephemeral: true });
+      for (const id of parsePlayerMentions(interaction.options.getString('players'))) fighters.push(id);
+      const npcNames = expandNpcList(gid, interaction.options.getString('npcs'));
+      for (const n of npcNames) {
+        const npc = getNpc(gid, n);
+        if (!npc) return interaction.reply({ content: `❌ NPC **${n}** not found. Tip: \`category:Name\` adds a whole category.`, ephemeral: true });
+        const fid = npcFighterId(npc.name); // canonical stored name
+        if (!fighters.includes(fid)) fighters.push(fid);
+      }
     }
     if (new Set(fighters).size !== fighters.length) return interaction.reply({ content: '❌ A fighter was listed more than once.', ephemeral: true });
+
+    if (fighters.length < 2) return interaction.reply({ content: '❌ Need at least 2 fighters. Use `players:` (@mention) and/or `npcs:` (comma-separated).', ephemeral: true });
 
     // Leave out anyone already knocked down (they'd silently never act)
     const { active: autoActive, downed: autoDowned } = await partitionDowned(interaction.guild, gid, fighters);
@@ -2660,9 +2875,11 @@ async function handleFight(interaction) {
       return interaction.reply({ content: `❌ Need at least 2 fighters with HP above 0.${autoWarn ? `\n${autoWarn}` : ''}`, ephemeral: true });
     }
     fighters.length = 0; fighters.push(...autoActive.map(a => a.fid));
+    if (useTeams) {
+      const t1 = fighters.some(fid => sideOf[fid] === 1), t2 = fighters.some(fid => sideOf[fid] === 2);
+      if (!t1 || !t2) return interaction.reply({ content: `❌ Team ${t1 ? 2 : 1} has no able fighters.${autoWarn ? `\n${autoWarn}` : ''}`, ephemeral: true });
+    }
     if (autoWarn) await interaction.channel.send(autoWarn).catch(()=>{});
-
-    if (fighters.length < 2) return interaction.reply({ content: '❌ Need at least 2 fighters. Use `players:` (@mention) and/or `npcs:` (comma-separated).', ephemeral: true });
 
     // Resolve everyone up front
     const F = {}; // fid -> resolved fighter (+ live hp)
@@ -2715,8 +2932,12 @@ async function handleFight(interaction) {
     await sleep(800); await send(lines0.join('\n'));
 
     const alive = () => order.filter(fid => hp[fid] > 0);
+    const sideAlive = (t) => order.some(fid => sideOf[fid] === t && hp[fid] > 0);
+    const fightOn = () => useTeams ? (sideAlive(1) && sideAlive(2)) : alive().length > 1;
+    const autoLog = { exchanges: 0, f: {} };
+    const ensureLog = (fid) => (autoLog.f[fid] = autoLog.f[fid] || { dealt: 0, taken: 0, crit: 0, fumble: 0, rr: 0 });
     let idx = 0, round = 1, safety = 0, lastPos = -1;
-    while (alive().length > 1 && safety < 200) {
+    while (fightOn() && safety < 200) {
       safety++;
       // find next living attacker starting at idx
       let guard = 0;
@@ -2726,7 +2947,7 @@ async function handleFight(interaction) {
       if (idx <= lastPos) round++;
       lastPos = idx;
       // pick a random living opponent
-      const opponents = alive().filter(fid => fid !== attackerId);
+      const opponents = alive().filter(fid => useTeams ? sideOf[fid] !== sideOf[attackerId] : fid !== attackerId);
       if (!opponents.length) break;
       const defenderId = opponents[Math.floor(Math.random() * opponents.length)];
 
@@ -2751,7 +2972,7 @@ async function handleFight(interaction) {
       if (defF.isNpc) await postAsNpc(channel, gid, defF.name, defCard);
       else await send(defCard);
 
-      // NPC reroll window: only on a poor natural die (≤ NPC_RR_NAT_MAX) —
+      // NPC reroll window: only on a poor natural die (≤ guild threshold) —
       // defender answers an incoming hit, attacker a block
       const rrMax = getNpcRrThreshold(gid);
       if (hit && d.nat <= rrMax && defF.isNpc && (rrTokens[defenderId] ?? 0) > 0) {
@@ -2761,6 +2982,7 @@ async function handleFight(interaction) {
         await send(`🔁 **${defF.name}** 🎭 spends a reroll token! (${rrTokens[defenderId]} left)`);
         const rrCard = await autoFightCard(interaction.guild, gid, defF, 'def', dStat, d.nat, d.total, null, true);
         await postAsNpc(channel, gid, defF.name, rrCard);
+        ensureLog(defenderId).rr++;
         ({ hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20));
       }
       if (!hit && a.nat <= rrMax && atkF.isNpc && (rrTokens[attackerId] ?? 0) > 0) {
@@ -2770,8 +2992,11 @@ async function handleFight(interaction) {
         await send(`🔁 **${atkF.name}** 🎭 spends a reroll token! (${rrTokens[attackerId]} left)`);
         const rrCard = await autoFightCard(interaction.guild, gid, atkF, 'atk', aStat, a.nat, a.total, `${defF.name}${defF.isNpc?' 🎭':''}`, true);
         await postAsNpc(channel, gid, atkF.name, rrCard);
+        ensureLog(attackerId).rr++;
         ({ hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20));
       }
+
+      recordExchange(autoLog, ensureLog, attackerId, defenderId, a.nat, d.nat, hit, dmg);
 
       // Outcome (system line)
       let outcome;
@@ -2793,12 +3018,19 @@ async function handleFight(interaction) {
 
     await sleep(800);
     const survivors = alive();
-    if (survivors.length === 1) {
+    let winLine;
+    if (useTeams && (sideAlive(1) !== sideAlive(2))) {
+      const winner = sideAlive(1) ? 1 : 2;
+      const names = survivors.filter(fid => sideOf[fid] === winner).map(fid => `**${F[fid].name}${F[fid].isNpc?' 🎭':''}**`).join(', ');
+      winLine = `\n🏆 **Team ${winner}** wins the fight! Survivors: ${names}. Final HP has been saved to all combatants' sheets.`;
+    } else if (!useTeams && survivors.length === 1) {
       const w = F[survivors[0]];
-      await send(`\n🏆 **${w.name}${w.isNpc?' 🎭':''}** wins the fight! Final HP has been saved to all combatants' sheets.`);
+      winLine = `\n🏆 **${w.name}${w.isNpc?' 🎭':''}** wins the fight! Final HP has been saved to all combatants' sheets.`;
     } else {
-      await send(`\n⚖️ The fight ended without a clear winner. Final HP saved to all combatants' sheets.`);
+      winLine = `\n⚖️ The fight ended without a clear winner. Final HP saved to all combatants' sheets.`;
     }
+    const recapLines = await buildFightRecap(interaction.guild, gid, autoLog);
+    await send(winLine + (recapLines.length ? '\n' + recapLines.join('\n') : ''));
     return;
   }
 
@@ -3045,14 +3277,17 @@ async function handleFight(interaction) {
 
     if (!isAttacker && !isDefender) return interaction.reply({ content: '❌ It is not your turn to reroll.', ephemeral: true });
 
+    // Make sure there's actually a roll to reroll BEFORE spending the token
+    const stat = isAttacker ? fight.atk_stat : fight.def_stat;
+    if (!stat) return interaction.reply({ content: '❌ No roll to reroll yet.', ephemeral: true });
+
     // Check reroll tokens
     const char = getChar(gid, uid);
     if (!char || char.rerolls_current <= 0) return interaction.reply({ content: '❌ No rerolls remaining.', ephemeral: true });
     upsertChar(gid, uid, { rerolls_current: char.rerolls_current - 1 });
+    bumpFightLog(gid, cid, (log, ensure) => { ensure(uid).rr++; });
 
     const mode = interaction.options.getString('roll') ?? 'normal';
-    const stat = isAttacker ? fight.atk_stat : fight.def_stat;
-    if (!stat) return interaction.reply({ content: '❌ No roll to reroll yet.', ephemeral: true });
 
     const statVal = char?.[stat] ?? 0;
     const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
@@ -3111,6 +3346,9 @@ async function handleFight(interaction) {
       fight.def_roll, fight.def_nat, 20
     );
 
+    bumpFightLog(gid, cid, (log, ensure) =>
+      recordExchange(log, ensure, attackerId, defenderId, fight.atk_nat, fight.def_nat, hit, dmg));
+
     const atkF = await resolveFighter(interaction.guild, gid, attackerId);
     const defF = await resolveFighter(interaction.guild, gid, defenderId);
     const atkName = atkF.name + (atkF.isNpc ? ' 🎭' : '');
@@ -3137,6 +3375,8 @@ async function handleFight(interaction) {
         if (newOrder.length <= 1) {
           const winF = await resolveFighter(interaction.guild, gid, newOrder[0]);
           lines.push(`\n🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** wins the fight!`);
+          const endLog = JSON.parse(getFight(gid, cid)?.log_state || '{}');
+          lines.push(...await buildFightRecap(interaction.guild, gid, endLog));
           upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState) });
           return interaction.reply({ content: lines.join('\n') });
         }
@@ -3211,6 +3451,7 @@ async function handleFight(interaction) {
         const winF = await resolveFighter(interaction.guild, gid, newOrder[0]);
         lines.push(`🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** wins!`);
       }
+      lines.push(...await buildFightRecap(interaction.guild, gid, JSON.parse(fight.log_state || '{}')));
       upsertFight(gid, cid, { state: 'idle', turn_order: '[]' });
     } else {
       let newIndex = fight.turn_index % newOrder.length;
@@ -3263,8 +3504,10 @@ async function handleFight(interaction) {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight to end.', ephemeral: true });
     return requestConfirm(interaction, 'End the current fight? Turn order clears but HP states are preserved.', async () => {
+      const endLog = JSON.parse(getFight(gid, cid)?.log_state || '{}');
+      const recap = await buildFightRecap(interaction.guild, gid, endLog);
       upsertFight(gid, cid, { state: 'idle', turn_order: '[]' });
-      return '🛑 Fight ended by GM. HP states preserved.';
+      return ['🛑 Fight ended by GM. HP states preserved.', ...recap].join('\n');
     });
   }
 }
@@ -3413,7 +3656,7 @@ async function handleNpc(interaction) {
       if (!targets.length) return interaction.reply({ content: '❌ No NPCs created yet. Use `/npc create` to add one.', ephemeral: true });
     } else {
       targets = [];
-      for (const n of parseNpcNames(raw)) {
+      for (const n of expandNpcList(gid, raw)) {
         const npc = getNpc(gid, n);
         if (!npc) return interaction.reply({ content: `❌ NPC **${n}** not found. Separate multiple NPCs with **commas** (e.g. \`names:Goblin, Orc\`), or use \`names:all\`.`, ephemeral: true });
         if (!targets.some(t => t.name === npc.name)) targets.push(npc);
@@ -3426,6 +3669,37 @@ async function handleNpc(interaction) {
       return `❤️ **${npc.name}** — **${max} / ${max}**`;
     });
     return interaction.reply({ content: [`✨ Fully healed **${targets.length}** NPC${targets.length === 1 ? '' : 's'}:`, '', ...lines].join('\n') });
+  }
+
+  if (sub === 'copy') {
+    const srcName = interaction.options.getString('name');
+    const newName = (interaction.options.getString('new_name') || '').trim();
+    const src = getNpc(gid, srcName);
+    if (!src) return interaction.reply({ content: `❌ NPC **${srcName}** not found.`, ephemeral: true });
+    if (!newName) return interaction.reply({ content: '❌ Give the copy a name.', ephemeral: true });
+    if (newName.length > 60) return interaction.reply({ content: '❌ Name too long (max 60 characters).', ephemeral: true });
+    if (getNpc(gid, newName)) return interaction.reply({ content: `❌ An NPC named **${getNpc(gid, newName).name}** already exists.`, ephemeral: true });
+    upsertNpc(gid, newName, {
+      order_name: src.order_name, str: src.str, con: src.con, dex: src.dex, wis: src.wis, lck: src.lck,
+      hp_current: src.con + 2, image_url: src.image_url ?? null,
+    });
+    return interaction.reply({ content: `🎭 Copied **${src.name}** → **${newName}** (fresh ❤️ ${src.con + 2} / ${src.con + 2}${src.image_url ? ', avatar carried over' : ''}).` });
+  }
+
+  if (sub === 'show') {
+    const name = interaction.options.getString('name');
+    const npc = getNpc(gid, name);
+    if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found.`, ephemeral: true });
+    const cats = getCategoriesForNpc(gid, npc.name);
+    const lines = [
+      `🎭 **${npc.name}**${npc.order_name ? ` · ${npc.order_name}` : ''}`,
+      '─────────────────────────────',
+      `💪 STR ${npc.str}   🛡️ CON ${npc.con}   ⚡ DEX ${npc.dex}`,
+      `🦉 WIS ${npc.wis}   🍀 LCK ${npc.lck}`,
+      `❤️ HP **${npc.hp_current} / ${npc.con + 2}**   🔁 ${Math.max(0, npc.lck ?? 0)} reroll token${(npc.lck ?? 0) === 1 ? '' : 's'} per fight`,
+      `🖼️ Avatar: ${npc.image_url ? 'set' : '—'}${cats.length ? `   📁 ${cats.join(', ')}` : ''}`,
+    ];
+    return interaction.reply({ content: lines.join('\n') });
   }
 
   if (sub === 'list') {
@@ -3759,6 +4033,11 @@ const HELP_CATEGORIES = {
       '`/fight status` — show current fight · `/fight forfeit` — drop out',
       '`/fight auto mode:Full players:@a npcs:Orc` — bot resolves the whole fight (GM)',
       '`/fight refill npcs:all` — refill NPC reroll tokens to their LCK (GM)',
+      '`/fight hp value:N target:@a` / `target_npc:Orc` — set HP mid-fight, sheet synced (GM)',
+      '`/fight kick target:@a` / `target_npc:Orc` — remove a fighter, fight continues (GM)',
+      '`/fight auto mode:Full teams:@a @b vs Goblin, Orc` — party-vs-monsters sides (GM)',
+      'NPC lists accept `category:Name` to add a whole category at once',
+      'A 📜 recap (damage, crits, rerolls) posts whenever a fight ends',
       '`/fight auto mode:NPCs only ...` — bot plays NPC turns, players play manually (GM)',
       '`/fight auto mode:Demo` — example showcase fight · `/fight end` — end the fight (GM)',
     ],
@@ -3769,6 +4048,8 @@ const HELP_CATEGORIES = {
       '`/npc create name:X str:N ...` — create an NPC (GM)',
       '`/npc hp name:X value:N` — set an NPC\'s HP · omit value for a full heal (GM)',
       '`/npc heal names:all` · `/npc heal names:Goblin, Orc` — fully heal NPCs (GM)',
+      '`/npc copy name:Goblin new_name:Goblin 2` — duplicate an NPC (GM)',
+      '`/npc show name:Goblin` — full stat block for one NPC',
       '`/npc list` · `/npc delete name:X`',
       '`/npc categorycreate/categorydelete/categorylist` — manage categories',
       '`/npc categoryassign/categoryremove` — sort NPCs into categories',
