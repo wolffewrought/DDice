@@ -45,6 +45,8 @@ try { db.exec('ALTER TABLE fights ADD COLUMN atk_sides INTEGER DEFAULT 20'); } c
 try { db.exec("ALTER TABLE fights ADD COLUMN def_mode TEXT DEFAULT 'normal'"); } catch {}
 try { db.exec('ALTER TABLE fights ADD COLUMN def_sides INTEGER DEFAULT 20'); } catch {}
 try { db.exec('ALTER TABLE fights ADD COLUMN auto_npc INTEGER DEFAULT 0'); } catch {}
+try { db.exec("ALTER TABLE fights ADD COLUMN rr_state TEXT DEFAULT '{}'"); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_rr_threshold INTEGER DEFAULT 8'); } catch {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS characters (
@@ -803,6 +805,8 @@ const slashCommands = [
       .addStringOption(o=>o.setName('hp').setDescription('HP restored — "50%" of max, or a flat number like "3"').setRequired(false))
       .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored — "50%" of max, or a flat number like "1"').setRequired(false))
       .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored — "50%" of max, or a flat number like "2"').setRequired(false)))
+    .addSubcommand(s=>s.setName('npcreroll').setDescription('NPC auto-reroll threshold: natural die ≤ N (0 disables)')
+      .addIntegerOption(o=>o.setName('threshold').setDescription('1–19, or 0 to disable (default 8); omit to show current').setRequired(false).setMinValue(0).setMaxValue(19)))
     .addSubcommand(s=>s.setName('cleanwebhooks').setDescription('Remove orphaned NPC webhooks to free up Discord limits')),
 
   new SlashCommandBuilder()
@@ -1016,6 +1020,8 @@ const slashCommands = [
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'})))
     .addSubcommand(s=>s.setName('resolve').setDescription('Resolve the current exchange'))
+    .addSubcommand(s=>s.setName('refill').setDescription('Refill NPC reroll tokens to their LCK (GM)')
+      .addStringOption(o=>o.setName('npcs').setDescription('"all", or NPC names separated by commas').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('forfeit').setDescription('Concede the fight'))
     .addSubcommand(s=>s.setName('status').setDescription('Show current fight status'))
     .addSubcommand(s=>s.setName('end').setDescription('End the fight (GM only)')),
@@ -1040,6 +1046,16 @@ async function handleConfig(interaction) {
     const role = interaction.options.getRole('role');
     setConfig(gid, { gm_role_id: role.id });
     return interaction.reply({ content: `✅ GM role set to **${role.name}**.`, ephemeral: true });
+  }
+  if (sub === 'npcreroll') {
+    const v = interaction.options.getInteger('threshold');
+    if (v === null) {
+      const cur = getNpcRrThreshold(gid);
+      const state = cur === 0 ? '**disabled**' : `natural die **≤ ${cur}**`;
+      return interaction.reply({ content: `🔁 NPC auto-rerolls: ${state}${cur === NPC_RR_NAT_MAX ? ' (default)' : ''}. Set with \`/config npcreroll threshold:N\` — 0 disables.`, ephemeral: true });
+    }
+    setConfig(gid, { npc_rr_threshold: v });
+    return interaction.reply({ content: v === 0 ? '✅ NPC auto-rerolls **disabled**.' : `✅ NPCs now auto-reroll on a natural die of **${v} or less**.`, ephemeral: true });
   }
   if (sub === 'heal') {
     const charges = interaction.options.getInteger('charges');
@@ -1775,8 +1791,10 @@ client.on('interactionCreate', async interaction => {
         console.log(`Autocomplete responding with ${filtered.length} NPCs`);
         return await interaction.respond(filtered);
       }
-      // /npc heal names — comma-aware: complete the segment after the last comma, offer "all"
-      if (interaction.commandName === 'npc' && focusedOption.name === 'names') {
+      // Comma-aware NPC lists (/npc heal names, /fight refill npcs):
+      // complete the segment after the last comma, offer "all"
+      if ((interaction.commandName === 'npc' && focusedOption.name === 'names') ||
+          (interaction.commandName === 'fight' && focusedOption.name === 'npcs')) {
         const typed = (focusedOption.value || '').toString();
         const lastComma = typed.lastIndexOf(',');
         const head = lastComma === -1 ? '' : typed.slice(0, lastComma + 1) + ' ';
@@ -2100,6 +2118,14 @@ function autoFightStat(stats) {
 // Roll a d20 + modifier, returning { nat, total }.
 function autoRoll(mod) { const nat = rollDie(20); return { nat, total: nat + mod }; }
 
+// Default: auto NPCs only spend a reroll token when the natural die was this or lower.
+const NPC_RR_NAT_MAX = 8;
+// Per-guild override via /config npcreroll (0 disables auto rerolls entirely).
+function getNpcRrThreshold(gid) {
+  const v = getConfig(gid)?.npc_rr_threshold;
+  return (v === null || v === undefined) ? NPC_RR_NAT_MAX : v;
+}
+
 // Split a fighter id list into those able to fight (HP > 0) and those downed.
 async function partitionDowned(guild, gid, fighters) {
   const active = [], downed = [];
@@ -2120,7 +2146,7 @@ function downedWarning(downed) {
 
 // Build the same roll card a manual /fight atk or /fight def produces,
 // for an automatic best-stat roll (stat tracker + exact dice breakdown).
-async function autoFightCard(guild, gid, fighter, kind, stat, nat, total, targetName) {
+async function autoFightCard(guild, gid, fighter, kind, stat, nat, total, targetName, isReroll = false) {
   const statVal = fighter.stats[stat] ?? 0;
   const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
   const icon = kind === 'atk' ? '⚔️' : '🛡️';
@@ -2129,10 +2155,53 @@ async function autoFightCard(guild, gid, fighter, kind, stat, nat, total, target
   const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
   const charCard = await fighterCharCard(guild, gid, fighter.id);
   return buildRollEmbed({
-    rollLine, label, isReroll: false,
+    rollLine, label, isReroll,
     char: charCard, healCharges: 0, maxCharges: 0,
     flavour: null, total, critType, tags: null, gid,
   });
+}
+
+// Give auto-piloted NPCs their reroll moment before an exchange resolves:
+// a defender about to be hit, then an attacker who was blocked, may each
+// spend one LCK reroll token (seeded per fight) on a fresh roll.
+// Returns the up-to-date fight row.
+async function applyAutoNpcRerolls(guild, gid, cid, channel) {
+  let fight = getFight(gid, cid);
+  if (!fight || !fight.auto_npc) return fight;
+  const rr = JSON.parse(fight.rr_state || '{}');
+  const turnOrder = JSON.parse(fight.turn_order);
+  const attackerId = turnOrder[fight.turn_index];
+  const defenderId = fight.current_target;
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  const tryReroll = async (fid, kind) => {
+    if (!isNpcFighter(fid) || (rr[fid] ?? 0) <= 0) return;
+    const f = await resolveFighter(guild, gid, fid);
+    const stat = kind === 'atk' ? fight.atk_stat : fight.def_stat;
+    const roll = autoRoll(f.stats[stat] ?? 0);
+    rr[fid] = (rr[fid] ?? 0) - 1;
+    if (kind === 'atk') upsertFight(gid, cid, { atk_roll: roll.total, atk_nat: roll.nat, rr_state: JSON.stringify(rr) });
+    else upsertFight(gid, cid, { def_roll: roll.total, def_nat: roll.nat, rr_state: JSON.stringify(rr) });
+    let targetName = null;
+    if (kind === 'atk') {
+      const tF = await resolveFighter(guild, gid, defenderId);
+      targetName = `${tF.name}${tF.isNpc ? ' 🎭' : ''}`;
+    }
+    await sleep(700);
+    await channel.send(`🔁 **${f.name}** 🎭 spends a reroll token! (${rr[fid]} left)`).catch(()=>{});
+    const card = await autoFightCard(guild, gid, f, kind, stat, roll.nat, roll.total, targetName, true);
+    await postAsNpc(channel, gid, f.name, card);
+    fight = getFight(gid, cid);
+  };
+
+  // Defender reacts first — only when the hit would land AND its natural die was poor (≤ guild threshold)
+  const rrMax = getNpcRrThreshold(gid);
+  let { hit } = resolveDamage(fight.atk_roll, fight.atk_nat, 20, fight.def_roll, fight.def_nat, 20);
+  if (hit && fight.def_nat <= rrMax) await tryReroll(defenderId, 'def');
+  // Attacker answers a block — likewise only on a poor natural die
+  ({ hit } = resolveDamage(fight.atk_roll, fight.atk_nat, 20, fight.def_roll, fight.def_nat, 20));
+  if (!hit && fight.atk_nat <= rrMax) await tryReroll(attackerId, 'atk');
+  return getFight(gid, cid);
 }
 
 // Build a character-shaped object for buildRollEmbed from any fighter id.
@@ -2248,8 +2317,12 @@ async function autoNpcDefend(guild, gid, cid, channel) {
 // win / turn advance, and posts the summary. Returns true if the fight continues.
 // Keep the rules here in lockstep with the `resolve` subcommand in handleFight.
 async function autoResolveExchange(guild, gid, cid, channel) {
-  const fight = getFight(gid, cid);
+  let fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active' || fight.phase !== 'defend' || fight.def_roll === null) return false;
+
+  // NPC reroll window: defender may answer an incoming hit, attacker a block
+  fight = await applyAutoNpcRerolls(guild, gid, cid, channel);
+  if (!fight || fight.state !== 'active') return false;
 
   const turnOrder = JSON.parse(fight.turn_order);
   const attackerId = turnOrder[fight.turn_index];
@@ -2331,7 +2404,7 @@ async function autoResolveExchange(guild, gid, cid, channel) {
 async function runAutoNpcChain(guild, gid, cid, channel) {
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   let safety = 0;
-  while (safety++ < 60) {
+  while (safety++ < 300) {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active' || !fight.auto_npc) return;
     if (fight.phase === 'attack') {
@@ -2348,6 +2421,8 @@ async function runAutoNpcChain(guild, gid, cid, channel) {
       await sleep(1100);
     } else return;
   }
+  // Safety cap reached — tell the GM instead of stalling silently
+  await channel.send('⚠️ Auto chain paused after a very long fight (safety limit). Use `/fight status` to review, `/fight resolve` to continue a pending exchange, or `/fight end`.').catch(()=>{});
 }
 
 async function handleFight(interaction) {
@@ -2400,10 +2475,12 @@ async function handleFight(interaction) {
     if (manual) {
       // Skip initiative — keep the order the fighters were listed in
       const hpState = {};
+      const rrState = {};
       const ordered = [];
       for (const fid of fighters) {
         const f = await resolveFighter(interaction.guild, gid, fid);
         hpState[fid] = f.isNpc ? (getNpc(gid, f.name)?.hp_current ?? 0) : (getChar(gid, fid)?.hp_current ?? 0);
+        if (f.isNpc) rrState[fid] = Math.max(0, f.stats.lck ?? 0);
         ordered.push({ id: fid, name: f.name, isNpc: f.isNpc });
       }
       const turnOrder = ordered.map(o => o.id);
@@ -2415,7 +2492,7 @@ async function handleFight(interaction) {
         phase: 'attack', current_target: null,
         atk_roll: null, atk_nat: null, atk_stat: null,
         def_roll: null, def_nat: null, def_stat: null,
-        hp_state: JSON.stringify(hpState),
+        hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState),
       });
       return interaction.reply({ content: lines.join('\n') });
     }
@@ -2423,12 +2500,14 @@ async function handleFight(interaction) {
     // Roll initiative for each fighter (players and NPCs alike)
     const initiatives = [];
     const hpState = {};
+    const rrState = {};
     for (const fid of fighters) {
       const f = await resolveFighter(interaction.guild, gid, fid);
       const dex = f.stats.dex ?? 0;
       const roll = rollDie(20);
       const total = roll + dex;
       hpState[fid] = f.isNpc ? (getNpc(gid, f.name)?.hp_current ?? 0) : (getChar(gid, fid)?.hp_current ?? 0);
+      if (f.isNpc) rrState[fid] = Math.max(0, f.stats.lck ?? 0);
       initiatives.push({ id: fid, name: f.name, roll, dex, total, isNpc: f.isNpc });
     }
 
@@ -2454,7 +2533,7 @@ async function handleFight(interaction) {
       current_target: null,
       atk_roll: null, atk_nat: null, atk_stat: null,
       def_roll: null, def_nat: null, def_stat: null,
-      hp_state: JSON.stringify(hpState),
+      hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState),
     });
 
     return interaction.reply({ content: lines.join('\n') });
@@ -2471,6 +2550,7 @@ async function handleFight(interaction) {
 
     const turnOrder = JSON.parse(fight.turn_order);
     const hpState = JSON.parse(fight.hp_state);
+    const rrState = JSON.parse(fight.rr_state || '{}');
     const added = [];
     for (const npcName of names) {
       const npc = getNpc(gid, npcName);
@@ -2481,11 +2561,43 @@ async function handleFight(interaction) {
       const roll = rollDie(20);
       const total = roll + (npc.dex ?? 0);
       hpState[fid] = npc.hp_current;
+      rrState[fid] = Math.max(0, npc.lck ?? 0);
       turnOrder.push(fid);
       added.push(`🎭 **${npc.name}** — 🎲 [${roll}] + ⚡ ${npc.dex} DEX = **${total} initiative**`);
     }
-    upsertFight(gid, cid, { turn_order: JSON.stringify(turnOrder), hp_state: JSON.stringify(hpState) });
+    upsertFight(gid, cid, { turn_order: JSON.stringify(turnOrder), hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState) });
     return interaction.reply({ content: [`**Joined the fight** (added to the end of the turn order — use \`/fight order\` to reposition):`, '', ...added].join('\n') });
+  }
+
+  // ── REFILL (restore NPC reroll tokens mid-fight) ──────────────────────────
+  if (sub === 'refill') {
+    if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can refill NPC rerolls.', ephemeral: true });
+    const fight = getFight(gid, cid);
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    const turnOrder = JSON.parse(fight.turn_order);
+    const rrState = JSON.parse(fight.rr_state || '{}');
+    const raw = (interaction.options.getString('npcs') || '').trim();
+    let targets;
+    if (raw.toLowerCase() === 'all') {
+      targets = turnOrder.filter(isNpcFighter).map(fid => getNpc(gid, npcNameFromFighter(fid))).filter(Boolean);
+      if (!targets.length) return interaction.reply({ content: '❌ No NPCs in this fight.', ephemeral: true });
+    } else {
+      targets = [];
+      for (const n of parseNpcNames(raw)) {
+        const npc = getNpc(gid, n);
+        if (!npc) return interaction.reply({ content: `❌ NPC **${n}** not found.`, ephemeral: true });
+        if (!turnOrder.includes(npcFighterId(npc.name))) return interaction.reply({ content: `❌ **${npc.name}** isn't in this fight.`, ephemeral: true });
+        if (!targets.some(t => t.name === npc.name)) targets.push(npc);
+      }
+      if (!targets.length) return interaction.reply({ content: '❌ Name at least one NPC, or use `npcs:all`.', ephemeral: true });
+    }
+    const lines = targets.map(npc => {
+      const fid = npcFighterId(npc.name);
+      rrState[fid] = Math.max(0, npc.lck ?? 0);
+      return `🔁 **${npc.name}** 🎭 — **${rrState[fid]}** reroll token${rrState[fid] === 1 ? '' : 's'}`;
+    });
+    upsertFight(gid, cid, { rr_state: JSON.stringify(rrState) });
+    return interaction.reply({ content: ['✨ **NPC rerolls refilled:**', '', ...lines].join('\n') });
   }
 
   // ── AUTO (auto-run a fight: full / npconly / demo) ────────────────────────
@@ -2567,8 +2679,10 @@ async function handleFight(interaction) {
 
     // Live HP for each fighter (from their sheet's current HP)
     const hp = {};
+    const rrTokens = {}; // per-fight NPC reroll tokens (LCK) — full mode
     for (const fid of fighters) {
       hp[fid] = F[fid].isNpc ? (getNpc(gid, F[fid].name)?.hp_current ?? 0) : (getChar(gid, fid)?.hp_current ?? 0);
+      if (F[fid].isNpc) rrTokens[fid] = Math.max(0, F[fid].stats.lck ?? 0);
     }
 
     // ---- NPCONLY: set up a real, persisted fight where the bot will auto-take NPC turns ----
@@ -2576,12 +2690,13 @@ async function handleFight(interaction) {
       const existing = getFight(gid, cid);
       if (existing && existing.state !== 'idle') return interaction.reply({ content: '❌ Finish or `/fight end` the current fight first.', ephemeral: true });
       const hpState = {}; for (const fid of fighters) hpState[fid] = hp[fid];
+      const rrState = {}; for (const fid of fighters) if (F[fid].isNpc) rrState[fid] = Math.max(0, F[fid].stats.lck ?? 0);
       upsertFight(gid, cid, {
         state: 'active', turn_order: JSON.stringify(order), turn_index: 0,
         phase: 'attack', current_target: null,
         atk_roll: null, atk_nat: null, atk_stat: null,
         def_roll: null, def_nat: null, def_stat: null,
-        hp_state: JSON.stringify(hpState), auto_npc: 1,
+        hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState), auto_npc: 1,
       });
       const lines = ['⚔️ **Fight started! (NPCs auto-piloted)**', '', '**Initiative:**'];
       inits.forEach((it,i)=>{ const f=F[it.fid]; lines.push(`${i+1}. **${f.name}${f.isNpc?' 🎭':''}** — 🎲 [${it.roll}] + ⚡ ${f.stats.dex} DEX = **${it.total}**`); });
@@ -2617,8 +2732,8 @@ async function handleFight(interaction) {
 
       const atkF = F[attackerId], defF = F[defenderId];
       const aStat = autoFightStat(atkF.stats), dStat = autoFightStat(defF.stats);
-      const a = autoRoll(atkF.stats[aStat] ?? 0), d = autoRoll(defF.stats[dStat] ?? 0);
-      const { hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20);
+      let a = autoRoll(atkF.stats[aStat] ?? 0), d = autoRoll(defF.stats[dStat] ?? 0);
+      let { hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20);
 
       // Round header (system line)
       await sleep(900);
@@ -2635,6 +2750,28 @@ async function handleFight(interaction) {
       await sleep(700);
       if (defF.isNpc) await postAsNpc(channel, gid, defF.name, defCard);
       else await send(defCard);
+
+      // NPC reroll window: only on a poor natural die (≤ NPC_RR_NAT_MAX) —
+      // defender answers an incoming hit, attacker a block
+      const rrMax = getNpcRrThreshold(gid);
+      if (hit && d.nat <= rrMax && defF.isNpc && (rrTokens[defenderId] ?? 0) > 0) {
+        rrTokens[defenderId]--;
+        d = autoRoll(defF.stats[dStat] ?? 0);
+        await sleep(800);
+        await send(`🔁 **${defF.name}** 🎭 spends a reroll token! (${rrTokens[defenderId]} left)`);
+        const rrCard = await autoFightCard(interaction.guild, gid, defF, 'def', dStat, d.nat, d.total, null, true);
+        await postAsNpc(channel, gid, defF.name, rrCard);
+        ({ hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20));
+      }
+      if (!hit && a.nat <= rrMax && atkF.isNpc && (rrTokens[attackerId] ?? 0) > 0) {
+        rrTokens[attackerId]--;
+        a = autoRoll(atkF.stats[aStat] ?? 0);
+        await sleep(800);
+        await send(`🔁 **${atkF.name}** 🎭 spends a reroll token! (${rrTokens[attackerId]} left)`);
+        const rrCard = await autoFightCard(interaction.guild, gid, atkF, 'atk', aStat, a.nat, a.total, `${defF.name}${defF.isNpc?' 🎭':''}`, true);
+        await postAsNpc(channel, gid, atkF.name, rrCard);
+        ({ hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20));
+      }
 
       // Outcome (system line)
       let outcome;
@@ -2954,9 +3091,15 @@ async function handleFight(interaction) {
   // ── RESOLVE ────────────────────────────────────────────────────────────────
   // Rule changes here must be mirrored in autoResolveExchange (the auto-mode twin).
   if (sub === 'resolve') {
-    const fight = getFight(gid, cid);
+    let fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
     if (fight.phase !== 'defend' || fight.def_roll === null) return interaction.reply({ content: '❌ Both attack and defend rolls needed before resolving.', ephemeral: true });
+
+    // NPC reroll window in auto mode: defender may answer an incoming hit, attacker a block
+    if (fight.auto_npc) {
+      fight = await applyAutoNpcRerolls(interaction.guild, gid, cid, interaction.channel);
+      if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ The fight is no longer active.', ephemeral: true });
+    }
 
     const turnOrder = JSON.parse(fight.turn_order);
     const attackerId = turnOrder[fight.turn_index];
@@ -3093,6 +3236,7 @@ async function handleFight(interaction) {
 
     const turnOrder = JSON.parse(fight.turn_order);
     const hpState = JSON.parse(fight.hp_state);
+    const rrState = JSON.parse(fight.rr_state || '{}');
     const currentId = turnOrder[fight.turn_index];
 
     const lines = ['⚔️ **Fight Status**', ''];
@@ -3102,7 +3246,8 @@ async function handleFight(interaction) {
       const hp = hpState[fid] ?? '?';
       const arrow = fid === currentId ? ' ◀ current' : '';
       const hpMax = f.maxHp || '?';
-      lines.push(`${i+1}. **${f.name}${f.isNpc ? ' 🎭' : ''}** — ❤️ ${hp} / ${hpMax}${arrow}`);
+      const rrNote = f.isNpc && fight.auto_npc ? ` · 🔁 ${rrState[fid] ?? 0}` : '';
+      lines.push(`${i+1}. **${f.name}${f.isNpc ? ' 🎭' : ''}** — ❤️ ${hp} / ${hpMax}${rrNote}${arrow}`);
     }
     lines.push('');
     lines.push(`Phase: **${fight.phase === 'attack' ? 'Waiting for attack' : 'Waiting for defence'}**`);
@@ -3613,6 +3758,7 @@ const HELP_CATEGORIES = {
       '`/fight rr` — reroll (costs a token) · `/fight resolve` — resolve a clash',
       '`/fight status` — show current fight · `/fight forfeit` — drop out',
       '`/fight auto mode:Full players:@a npcs:Orc` — bot resolves the whole fight (GM)',
+      '`/fight refill npcs:all` — refill NPC reroll tokens to their LCK (GM)',
       '`/fight auto mode:NPCs only ...` — bot plays NPC turns, players play manually (GM)',
       '`/fight auto mode:Demo` — example showcase fight · `/fight end` — end the fight (GM)',
     ],
@@ -3645,6 +3791,7 @@ const HELP_CATEGORIES = {
     body: [
       '`/config gmrole @role` — set the GM role',
       '`/config heal charges:N` — set default heal charges',
+      '`/config npcreroll threshold:N` — NPC auto-reroll on nat ≤ N · 0 disables · omit to show',
       '`/config npcchannel #channel` — set the NPC avatar channel',
       '`/config rest type:Short Rest hp:50% rerolls:0%` — tune what a rest restores (use % of max or a flat number)',
       '`/config cleanwebhooks` — remove orphaned NPC webhooks',
