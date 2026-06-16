@@ -540,11 +540,13 @@ const STATS = ['str','con','dex','wis','lck'];
 function parseRollInput(input, char) {
   const [rollPart, ...fp] = input.split('\n');
   const flavour = fp.join('\n').trim() || null;
-  const trimmed = rollPart.trim().toLowerCase();
-  // Stat quick roll
-  if (STATS.includes(trimmed)) {
-    const val = char?.[trimmed] ?? 0;
-    return { notation: `1d20+${val}`, label: trimmed, flavour };
+  const trimmed = rollPart.trim();
+  // Stat quick roll — "str" alone, or "str <label>" (e.g. "str heavy swing")
+  const statMatch = trimmed.match(/^(str|con|dex|wis|lck)(?:\s+(.*))?$/i);
+  if (statMatch) {
+    const stat = statMatch[1].toLowerCase();
+    const val = char?.[stat] ?? 0;
+    return { notation: `1d20+${val}`, label: statMatch[2]?.trim() || stat, flavour };
   }
   const m = rollPart.trim().match(/^(\d+d\d+(?:[+-]\d+)?)\s*(.*)?$/i);
   if (!m) return null;
@@ -1949,6 +1951,28 @@ client.on('messageCreate', async message => {
     const bareRest = earlyBareMatch[1] + (sameLineRest ? ' ' + sameLineRest : '') + flavourRest;
     try { return await handleRoll(message, bareRest, 'normal', false); }
     catch (err) { console.error(err); return message.reply('\u274c Something went wrong.'); }
+  }
+
+  // Bare stat shorthand — type a stat name to quick-roll 1d20+stat with no prefix.
+  // Optional ? prefix for a success check, optional reroll suffix (rr / rra / rrd),
+  // and an optional label/flavour after a space or newline. Examples:
+  //   str            → roll 1d20+STR
+  //   ?dex atk       → success-check 1d20+DEX, labelled "atk"
+  //   strrr          → reroll your last roll (1 token), STR set
+  //   conrra sneak   → reroll with advantage, labelled "sneak"
+  const statShort = content.match(/^(\?)?(str|con|dex|wis|lck)(rr[ad]?)?(?:([ \t][\s\S]*)|(\n[\s\S]*))?$/i);
+  if (statShort) {
+    const sc = statShort[1] === '?';
+    const stat = statShort[2].toLowerCase();
+    const rerollSet = (statShort[3] || '').toLowerCase(); // '', 'rr', 'rra', 'rrd'
+    const trailing = (statShort[4] ?? statShort[5] ?? '').replace(/^[ \t]+/, '');
+    const mode = rerollSet === 'rra' ? 'adv' : rerollSet === 'rrd' ? 'dis' : 'normal';
+    const isReroll = rerollSet.startsWith('rr');
+    // For a fresh roll, hand handleRoll the stat name so it resolves to 1d20+stat.
+    // For a reroll, the label/flavour ride along; the stat set just picks adv/dis.
+    const payload = isReroll ? trailing : (stat + (trailing ? ' ' + trailing : ''));
+    try { return await handleRoll(message, payload, mode, isReroll, sc); }
+    catch (err) { console.error(err); return message.reply('❌ Something went wrong.'); }
   }
 
   const match = content.match(/^(!?|\?)(gmrs?|lrest|srest|hpfull|hphalf|rerolls|roll|rra|rrd|rr|ra|rd|r|heal|hp|h)([\s\S]*)/i);
@@ -3993,7 +4017,8 @@ const HELP_CATEGORIES = {
       '`ra1d20+5` — roll with **advantage** (drops lowest)',
       '`rd1d20+5` — roll with **disadvantage** (drops highest)',
       '`rr` / `rra` / `rrd` — reroll (costs a token)',
-      '`r str` / `con` / `dex` / `wis` / `lck` — quick stat roll',
+      '`str` / `con` / `dex` / `wis` / `lck` — quick stat roll (the `r` prefix is optional)',
+      '`strrr` / `dexrra` / `conrrd` — reroll using a stat set · add a label like `strrr atk`',
       '`?1d20+5` — success check (crit/success/fail tiers)',
       '`/dr` — slash version with dropdowns for roll type & success',
     ],
