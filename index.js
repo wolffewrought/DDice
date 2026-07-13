@@ -47,8 +47,35 @@ try { db.exec('ALTER TABLE fights ADD COLUMN def_sides INTEGER DEFAULT 20'); } c
 try { db.exec('ALTER TABLE fights ADD COLUMN auto_npc INTEGER DEFAULT 0'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN rr_state TEXT DEFAULT '{}'"); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_rr_threshold INTEGER DEFAULT 8'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN fight_ping INTEGER DEFAULT 0'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN log_state TEXT DEFAULT '{}'"); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN effect_state TEXT DEFAULT '{}'"); } catch {}
+try {
+  // Unified event log for merit changes (kind='merit'). Amount is signed; reason
+  // is free text; quest_number links quest-driven awards. Read by /merit history.
+  db.exec(`CREATE TABLE IF NOT EXISTS history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    user_id TEXT,
+    amount INTEGER,
+    reason TEXT,
+    quest_number INTEGER,
+    actor_id TEXT,
+    created_at INTEGER NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_history_guild_user ON history (guild_id, user_id, id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_history_guild_kind ON history (guild_id, kind, id)');
+  // Last finished fight per channel, so a GM can re-post the recap with /fight log.
+  db.exec(`CREATE TABLE IF NOT EXISTS fight_archive (
+    guild_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    log_state TEXT NOT NULL DEFAULT '{}',
+    roster TEXT NOT NULL DEFAULT '[]',
+    ended_at INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, channel_id)
+  )`);
+} catch (e) { console.error('history schema', e); }
 try { db.exec('ALTER TABLE characters ADD COLUMN merits INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN rank_name TEXT'); } catch {}
 try {
@@ -198,6 +225,42 @@ function syncFightHp(gid, fid, newHp) {
   }
 }
 
+// ── History / audit log ───────────────────────────────────────────────────────
+// One row per meaningful event. kind='merit' for now; the shape is generic so
+// other event kinds can be added later without a migration.
+function logHistory(gid, { kind, userId = null, amount = null, reason = null, questNumber = null, actorId = null }) {
+  db.prepare(`INSERT INTO history (guild_id, kind, user_id, amount, reason, quest_number, actor_id, created_at)
+              VALUES (?,?,?,?,?,?,?,?)`).run(gid, kind, userId, amount, reason, questNumber, actorId, Date.now());
+}
+// Recent merit events for one player, newest first.
+function getMeritHistory(gid, uid, limit = 20) {
+  return db.prepare("SELECT * FROM history WHERE guild_id=? AND kind='merit' AND user_id=? ORDER BY id DESC LIMIT ?").all(gid, uid, limit);
+}
+// Recent merit events server-wide, newest first.
+function getRecentMeritHistory(gid, limit = 20) {
+  return db.prepare("SELECT * FROM history WHERE guild_id=? AND kind='merit' ORDER BY id DESC LIMIT ?").all(gid, limit);
+}
+
+// ── Fight archive (last finished fight per channel, for /fight log) ────────────
+function archiveFight(gid, cid, logState, roster) {
+  db.prepare(`INSERT INTO fight_archive (guild_id, channel_id, log_state, roster, ended_at)
+              VALUES (?,?,?,?,?)
+              ON CONFLICT(guild_id, channel_id) DO UPDATE SET log_state=excluded.log_state, roster=excluded.roster, ended_at=excluded.ended_at`)
+    .run(gid, cid, JSON.stringify(logState || {}), JSON.stringify(roster || []), Date.now());
+}
+function getArchivedFight(gid, cid) {
+  return db.prepare('SELECT * FROM fight_archive WHERE guild_id=? AND channel_id=?').get(gid, cid);
+}
+
+// ── Quest archive read (completed quests a player was on) ──────────────────────
+function getPlayerCompletedQuests(gid, uid) {
+  return db.prepare(`SELECT q.number, q.name, q.merit_reward
+                     FROM quests q JOIN quest_members m
+                     ON q.guild_id=m.guild_id AND q.number=m.number
+                     WHERE q.guild_id=? AND m.user_id=? AND m.state='party' AND q.status='completed'
+                     ORDER BY q.number DESC`).all(gid, uid);
+}
+
 function upsertChar(gid, uid, fields) {
   const ex = getChar(gid, uid);
   if (!ex) {
@@ -294,6 +357,10 @@ function removeQuestMember(gid, number, uid) {
 // "#001-Goblin Cave"
 function questTag(quest) {
   return `#${String(quest.number).padStart(3, '0')}-${quest.name}`;
+}
+// "12 Jan 2026" — for history timestamps (epoch ms)
+function formatHistDate(ms) {
+  return new Date(ms).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
 }
 
 function setStatAndDerive(gid, uid, stat, val) {
@@ -993,6 +1060,8 @@ const slashCommands = [
       .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored — "50%" of max, or a flat number like "2"').setRequired(false)))
     .addSubcommand(s=>s.setName('npcreroll').setDescription('NPC auto-reroll threshold: natural die ≤ N (0 disables)')
       .addIntegerOption(o=>o.setName('threshold').setDescription('1–19, or 0 to disable (default 8); omit to show current').setRequired(false).setMinValue(0).setMaxValue(19)))
+    .addSubcommand(s=>s.setName('fightping').setDescription('@-mention players when it becomes their turn in a fight')
+      .addBooleanOption(o=>o.setName('enabled').setDescription('true = ping, false = silent (default); omit to show current').setRequired(false)))
     .addSubcommand(s=>s.setName('cleanwebhooks').setDescription('Remove orphaned NPC webhooks to free up Discord limits')),
 
   new SlashCommandBuilder()
@@ -1135,7 +1204,8 @@ const slashCommands = [
       .addStringOption(o=>o.setName('new_name').setDescription('Name for the copy').setRequired(true)))
     .addSubcommand(s=>s.setName('show').setDescription('Show one NPC\'s full stat block')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server'))
+    .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server')
+      .addStringOption(o=>o.setName('category').setDescription('Only show NPCs in this category').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('categorylist').setDescription('List all NPC categories'))
     .addSubcommand(s=>s.setName('categorycreate').setDescription('Create a new NPC category')
       .addStringOption(o=>o.setName('name').setDescription('Category name').setRequired(true)))
@@ -1225,6 +1295,8 @@ const slashCommands = [
       .addStringOption(o=>o.setName('target_npc').setDescription('NPC to remove').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('forfeit').setDescription('Concede the fight'))
     .addSubcommand(s=>s.setName('status').setDescription('Show current fight status'))
+    .addSubcommand(s=>s.setName('log').setDescription('Re-post the recap of the last finished fight in this channel'))
+    .addSubcommand(s=>s.setName('skip').setDescription('Skip the current turn without removing anyone (GM)'))
     .addSubcommand(s=>s.setName('end').setDescription('End the fight (GM only)')),
 
   new SlashCommandBuilder()
@@ -1249,6 +1321,8 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('amount').setDescription('Exact merit total').setRequired(true).setMinValue(0).setMaxValue(99999)))
     .addSubcommand(s=>s.setName('view').setDescription('View merits and rank progress')
       .addUserOption(o=>o.setName('user').setDescription('Player (defaults to you)').setRequired(false)))
+    .addSubcommand(s=>s.setName('history').setDescription('Merit history — one player\'s timeline, or recent server activity')
+      .addUserOption(o=>o.setName('user').setDescription('Player (omit for recent server-wide activity)').setRequired(false)))
     .addSubcommand(s=>s.setName('leaderboard').setDescription('Show the server merit leaderboard')),
 
   new SlashCommandBuilder()
@@ -1290,6 +1364,8 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('roster').setDescription('Show a quest\'s applicants and party')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('log').setDescription('Completed quests a player was on')
+      .addUserOption(o=>o.setName('user').setDescription('Player (defaults to you)').setRequired(false)))
     .addSubcommand(s=>s.setName('approve').setDescription('Approve an applicant onto the party (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addUserOption(o=>o.setName('user').setDescription('Applicant to approve').setRequired(true))
@@ -1318,6 +1394,15 @@ async function handleConfig(interaction) {
     const role = interaction.options.getRole('role');
     setConfig(gid, { gm_role_id: role.id });
     return interaction.reply({ content: `✅ GM role set to **${role.name}**.`, ephemeral: true });
+  }
+  if (sub === 'fightping') {
+    const v = interaction.options.getBoolean('enabled');
+    if (v === null) {
+      const cur = !!getConfig(gid)?.fight_ping;
+      return interaction.reply({ content: `🔔 Turn pings are **${cur ? 'on' : 'off'}**${cur ? '' : ' (default)'}. Set with \`/config fightping enabled:true\`.`, ephemeral: true });
+    }
+    setConfig(gid, { fight_ping: v ? 1 : 0 });
+    return interaction.reply({ content: v ? '🔔 Turn pings **on** — players get an @mention when it\'s their turn.' : '🔕 Turn pings **off**.' });
   }
   if (sub === 'npcreroll') {
     const v = interaction.options.getInteger('threshold');
@@ -2080,6 +2165,15 @@ client.on('interactionCreate', async interaction => {
         return await interaction.respond(choices);
       }
 
+      if (interaction.commandName === 'npc' && focusedOption.name === 'category') {
+        const v = String(focusedOption.value).toLowerCase();
+        const choices = getCategories(interaction.guild.id)
+          .filter(c => c.toLowerCase().includes(v))
+          .slice(0, 25)
+          .map(c => ({ name: c.slice(0, 100), value: c }));
+        return await interaction.respond(choices);
+      }
+
       if ((interaction.commandName === 'pr' || interaction.commandName === 'npc') && focusedOption.name === 'name') {
         const focused = focusedOption.value;
         const npcs = getAllNpcs(interaction.guild.id);
@@ -2541,6 +2635,11 @@ function getNpcRrThreshold(gid) {
   const v = getConfig(gid)?.npc_rr_threshold;
   return (v === null || v === undefined) ? NPC_RR_NAT_MAX : v;
 }
+// Optional real @mention when announcing a player's turn (opt-in: /config fightping).
+function turnPing(gid, f) {
+  if (!f || f.isNpc || !getConfig(gid)?.fight_ping) return '';
+  return ` <@${f.id}>`;
+}
 
 // Split a fighter id list into those able to fight (HP > 0) and those downed.
 async function partitionDowned(guild, gid, fighters) {
@@ -2883,13 +2982,14 @@ async function autoResolveExchange(guild, gid, cid, channel) {
         lines.push(`\n🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** wins the fight!`);
         const endLog = JSON.parse(getFight(gid, cid)?.log_state || '{}');
         lines.push(...await buildFightRecap(guild, gid, endLog));
+        archiveFight(gid, cid, endLog, turnOrder);
         upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState) });
         await channel.send(lines.join('\n')).catch(()=>{});
         return false;
       }
       const newIndex = fight.turn_index % newOrder.length;
       const nextF = await resolveFighter(guild, gid, newOrder[newIndex]);
-      lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!`);
+      lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${turnPing(gid, nextF)}`);
       upsertFight(gid, cid, {
         turn_order: JSON.stringify(newOrder), turn_index: newIndex,
         phase: 'attack', current_target: null,
@@ -2913,7 +3013,7 @@ async function autoResolveExchange(guild, gid, cid, channel) {
     safety++;
   }
   const nextF = await resolveFighter(guild, gid, turnOrder[nextIndex]);
-  lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!`);
+  lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${turnPing(gid, nextF)}`);
   upsertFight(gid, cid, {
     turn_index: nextIndex, phase: 'attack', current_target: null,
     atk_roll: null, atk_nat: null, atk_stat: null,
@@ -3012,7 +3112,7 @@ async function handleFight(interaction) {
       const turnOrder = ordered.map(o => o.id);
       const lines = ['⚔️ **Fight started! Turn order (manual):**', ''];
       ordered.forEach((f,i) => lines.push(`${i+1}. **${f.name}**${f.isNpc ? ' 🎭' : ''}`));
-      lines.push('', `🎯 **${ordered[0].name}** goes first!${ordered[0].isNpc ? ' (GM acts with `npc:`)' : ' Use `/fight atk` to attack.'}`);
+      lines.push('', `🎯 **${ordered[0].name}** goes first!${ordered[0].isNpc ? ' (GM acts with `npc:`)' : ' Use `/fight atk` to attack.'}${turnPing(gid, ordered[0])}`);
       upsertFight(gid, cid, {
         state: 'active', turn_order: JSON.stringify(turnOrder), turn_index: 0,
         phase: 'attack', current_target: null,
@@ -3049,7 +3149,7 @@ async function handleFight(interaction) {
     });
     lines.push('');
     const first = initiatives[0];
-    lines.push(`🎯 **${first.name}** goes first!${first.isNpc ? ' (GM acts with `npc:`)' : ' Use `/fight atk` to attack.'}`);
+    lines.push(`🎯 **${first.name}** goes first!${first.isNpc ? ' (GM acts with `npc:`)' : ' Use `/fight atk` to attack.'}${turnPing(gid, first)}`);
 
     upsertFight(gid, cid, {
       state: 'active',
@@ -3137,7 +3237,9 @@ async function handleFight(interaction) {
         const winF = await resolveFighter(interaction.guild, gid, newOrder[0]);
         lines.push(`🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** wins!`);
       }
-      lines.push(...await buildFightRecap(interaction.guild, gid, JSON.parse(fight.log_state || '{}')));
+      const kickLog = JSON.parse(fight.log_state || '{}');
+      lines.push(...await buildFightRecap(interaction.guild, gid, kickLog));
+      archiveFight(gid, cid, kickLog, turnOrder);
       upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState) });
       return interaction.reply({ content: lines.join('\n') });
     }
@@ -3154,7 +3256,7 @@ async function handleFight(interaction) {
     }
     upsertFight(gid, cid, patch);
     const nextF = await resolveFighter(interaction.guild, gid, newOrder[newIndex]);
-    lines.push(`🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack.`);
+    lines.push(`🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack.${turnPing(gid, nextF)}`);
     return interaction.reply({ content: lines.join('\n') });
   }
 
@@ -3326,7 +3428,7 @@ async function handleFight(interaction) {
       const lines = ['⚔️ **Fight started! (NPCs auto-piloted)**', '', '**Initiative:**'];
       inits.forEach((it,i)=>{ const f=F[it.fid]; lines.push(`${i+1}. **${f.name}${f.isNpc?' 🎭':''}** — 🎲 [${it.roll}] + ⚡ ${f.stats.dex} DEX = **${it.total}**`); });
       const firstF = F[order[0]];
-      lines.push('', firstF.isNpc ? `🤖 **${firstF.name}** is an NPC — the bot will take its turn automatically.` : `🎯 **${firstF.name}** goes first! Use \`/fight atk\` to attack.`);
+      lines.push('', firstF.isNpc ? `🤖 **${firstF.name}** is an NPC — the bot will take its turn automatically.` : `🎯 **${firstF.name}** goes first! Use \`/fight atk\` to attack.${turnPing(gid, firstF)}`);
       await interaction.reply({ content: lines.join('\n') });
       // If the first fighter is an NPC, kick off its turn
       if (firstF.isNpc) { await sleep(1200); await runAutoNpcChain(interaction.guild, gid, cid, channel); }
@@ -3451,6 +3553,7 @@ async function handleFight(interaction) {
     } else {
       winLine = `\n⚖️ The fight ended without a clear winner. Final HP saved to all combatants' sheets.`;
     }
+    archiveFight(gid, interaction.channel.id, autoLog, order);
     const recapLines = await buildFightRecap(interaction.guild, gid, autoLog);
     await send(winLine + (recapLines.length ? '\n' + recapLines.join('\n') : ''));
     return;
@@ -3826,6 +3929,7 @@ async function handleFight(interaction) {
           lines.push(`\n🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** wins the fight!`);
           const endLog = JSON.parse(getFight(gid, cid)?.log_state || '{}');
           lines.push(...await buildFightRecap(interaction.guild, gid, endLog));
+          archiveFight(gid, cid, endLog, turnOrder);
           upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState) });
           return interaction.reply({ content: lines.join('\n') });
         }
@@ -3834,7 +3938,7 @@ async function handleFight(interaction) {
         const nextF = await resolveFighter(interaction.guild, gid, newOrder[newIndex]);
         const autoOn = !!fight.auto_npc;
         const nextHint = (nextF.isNpc && !autoOn) ? ` (GM acts with \`npc:${nextF.name}\`)` : '';
-        lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${nextHint}`);
+        lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${nextHint}${turnPing(gid, nextF)}`);
         upsertFight(gid, cid, {
           turn_order: JSON.stringify(newOrder),
           turn_index: newIndex,
@@ -3864,7 +3968,7 @@ async function handleFight(interaction) {
     const nextF = await resolveFighter(interaction.guild, gid, turnOrder[nextIndex]);
     const autoOn = !!fight.auto_npc;
     const nextHint = (nextF.isNpc && !autoOn) ? ` (GM acts with \`npc:${nextF.name}\`)` : '';
-    lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${nextHint}`);
+    lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${nextHint}${turnPing(gid, nextF)}`);
 
     upsertFight(gid, cid, {
       turn_index: nextIndex,
@@ -3901,13 +4005,15 @@ async function handleFight(interaction) {
         const winF = await resolveFighter(interaction.guild, gid, newOrder[0]);
         lines.push(`🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** wins!`);
       }
-      lines.push(...await buildFightRecap(interaction.guild, gid, JSON.parse(fight.log_state || '{}')));
+      const ffLog = JSON.parse(fight.log_state || '{}');
+      lines.push(...await buildFightRecap(interaction.guild, gid, ffLog));
+      archiveFight(gid, cid, ffLog, turnOrder);
       upsertFight(gid, cid, { state: 'idle', turn_order: '[]' });
     } else {
       let newIndex = fight.turn_index % newOrder.length;
       const nextF = await resolveFighter(interaction.guild, gid, newOrder[newIndex]);
       const nextHint = nextF.isNpc ? ` (GM acts with \`npc:${nextF.name}\`)` : '';
-      lines.push(`🎯 Fight continues — **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn!${nextHint}`);
+      lines.push(`🎯 Fight continues — **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn!${nextHint}${turnPing(gid, nextF)}`);
       upsertFight(gid, cid, {
         turn_order: JSON.stringify(newOrder),
         turn_index: newIndex,
@@ -3954,14 +4060,58 @@ async function handleFight(interaction) {
     return interaction.reply({ content: lines.join('\n') });
   }
 
+  // ── LOG (re-post the last finished fight's recap) ──────────────────────────
+  if (sub === 'log') {
+    const arch = getArchivedFight(gid, cid);
+    if (!arch) return interaction.reply({ content: '📋 No finished fight recorded in this channel yet.', ephemeral: true });
+    const log = JSON.parse(arch.log_state || '{}');
+    const recap = await buildFightRecap(interaction.guild, gid, log);
+    if (!recap.length) return interaction.reply({ content: '📋 The last fight here ended before any exchanges were resolved.', ephemeral: true });
+    const lines = [`📜 **Last fight in this channel** — ended ${formatHistDate(arch.ended_at)}`, ...recap.slice(1)];
+    return replyLong(interaction, lines);
+  }
+
+  // ── SKIP (pass the current turn; the fighter stays in the fight) ───────────
+  if (sub === 'skip') {
+    if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can skip turns.', ephemeral: true });
+    const fight = getFight(gid, cid);
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    const turnOrder = JSON.parse(fight.turn_order);
+    const hpState = JSON.parse(fight.hp_state || '{}');
+    const attackerId = turnOrder[fight.turn_index];
+    const waitedOnId = fight.phase === 'defend' ? fight.current_target : attackerId;
+    const waitedF = await resolveFighter(interaction.guild, gid, waitedOnId);
+    const lines = [`⏭️ **${waitedF.name}${waitedF.isNpc ? ' 🎭' : ''}**'s turn skipped by the GM — they stay in the fight.`];
+
+    const patch = {};
+    if (fight.phase === 'defend') {
+      Object.assign(patch, { phase: 'attack', current_target: null,
+        atk_roll: null, atk_nat: null, atk_stat: null, def_roll: null, def_nat: null, def_stat: null });
+      lines.push('↩️ The pending exchange was reset.');
+    }
+    // Advance past the current attacker, skipping anyone knocked down
+    let nextIndex = (fight.turn_index + 1) % turnOrder.length;
+    let safety = 0;
+    while ((hpState[turnOrder[nextIndex]] ?? 0) <= 0 && safety < turnOrder.length) {
+      nextIndex = (nextIndex + 1) % turnOrder.length; safety++;
+    }
+    patch.turn_index = nextIndex;
+    upsertFight(gid, cid, patch);
+    const nextF = await resolveFighter(interaction.guild, gid, turnOrder[nextIndex]);
+    lines.push(`🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack.${turnPing(gid, nextF)}`);
+    return interaction.reply({ content: lines.join('\n') });
+  }
+
   // ── END (GM only) ──────────────────────────────────────────────────────────
   if (sub === 'end') {
     if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can end a fight.', ephemeral: true });
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight to end.', ephemeral: true });
     return requestConfirm(interaction, 'End the current fight? Turn order clears but HP states are preserved.', async () => {
-      const endLog = JSON.parse(getFight(gid, cid)?.log_state || '{}');
+      const endRow = getFight(gid, cid);
+      const endLog = JSON.parse(endRow?.log_state || '{}');
       const recap = await buildFightRecap(interaction.guild, gid, endLog);
+      archiveFight(gid, cid, endLog, JSON.parse(endRow?.turn_order || '[]'));
       upsertFight(gid, cid, { state: 'idle', turn_order: '[]' });
       return ['🛑 Fight ended by GM. HP states preserved.', ...recap].join('\n');
     });
@@ -4159,9 +4309,19 @@ async function handleNpc(interaction) {
   }
 
   if (sub === 'list') {
-    const npcs = getAllNpcs(gid);
+    let npcs = getAllNpcs(gid);
     if (!npcs.length) return interaction.reply({ content: '❌ No NPCs created yet. Use `/npc create` to add one.', ephemeral: true });
-    const lines = ['**🎭 NPCs on this server:**', ''];
+    const wantCat = (interaction.options.getString('category') || '').trim();
+    let header = '**🎭 NPCs on this server:**';
+    if (wantCat) {
+      const cat = getCategories(gid).find(c => c.toLowerCase() === wantCat.toLowerCase());
+      if (!cat) return interaction.reply({ content: `❌ No category named **${wantCat}**. Categories: ${getCategories(gid).join(', ') || 'none'}.`, ephemeral: true });
+      const members = new Set(getNpcsInCategory(gid, cat));
+      npcs = npcs.filter(n => members.has(n.name));
+      if (!npcs.length) return interaction.reply({ content: `📁 Category **${cat}** has no NPCs.`, ephemeral: true });
+      header = `**🎭 NPCs — 📁 ${cat}:**`;
+    }
+    const lines = [header, ''];
     npcs.forEach(n => {
       const order = n.order_name ? ` ${KNIGHT_EMOJIS[n.order_name]??'⚪'} ${n.order_name}` : '';
       const img = n.image_url ? ' 🖼️' : '';
@@ -4496,6 +4656,8 @@ const HELP_CATEGORIES = {
       '`/fight auto mode:Full teams:@a @b vs Goblin, Orc` — party-vs-monsters sides (GM)',
       'NPC lists accept `category:Name` to add a whole category at once',
       'A 📜 recap (damage, crits, rerolls) posts whenever a fight ends',
+      '`/fight log` — re-post the last finished fight\'s recap in this channel',
+      '`/fight skip` — skip the current turn; the fighter stays in the fight (GM)',
       '`/fight auto mode:NPCs only ...` — bot plays NPC turns, players play manually (GM)',
       '`/fight auto mode:Demo` — example showcase fight · `/fight end` — end the fight (GM)',
     ],
@@ -4508,6 +4670,7 @@ const HELP_CATEGORIES = {
       '`/npc heal names:all` · `/npc heal names:Goblin, Orc` — fully heal NPCs (GM)',
       '`/npc copy name:Goblin new_name:Goblin 2` — duplicate an NPC (GM)',
       '`/npc show name:Goblin` — full stat block for one NPC',
+      '`/npc list category:Bandits` — list only one category\'s NPCs',
       '`/npc list` · `/npc delete name:X`',
       '`/npc categorycreate/categorydelete/categorylist` — manage categories',
       '`/npc categoryassign/categoryremove` — sort NPCs into categories',
@@ -4531,6 +4694,7 @@ const HELP_CATEGORIES = {
       '`/config gmrole @role` — set the GM role',
       '`/config heal charges:N` — set default heal charges',
       '`/config npcreroll threshold:N` — NPC auto-reroll on nat ≤ N · 0 disables · omit to show',
+      '`/config fightping enabled:true` — @-mention players on their turn · off by default (Admin)',
       '`/config npcchannel #channel` — set the NPC avatar channel',
       '`/config rest type:Short Rest hp:50% rerolls:0%` — tune what a rest restores (use % of max or a flat number)',
       '`/config cleanwebhooks` — remove orphaned NPC webhooks',
@@ -4544,6 +4708,7 @@ const HELP_CATEGORIES = {
     body: [
       '`/merit view [user]` — see merits, current rank, and how many to the next',
       '`/merit leaderboard` — top earners on the server',
+      '`/merit history [user]` — a player\'s merit timeline, or recent server activity',
       '`/merit add @user [amount]` — award merits (GM) · `/merit remove` · `/merit set`',
       '`/rank list` — view ranks and thresholds',
       '`/rank add name:Knight threshold:5` — create/update a rank (GM)',
@@ -4560,6 +4725,7 @@ const HELP_CATEGORIES = {
       '`/quest show number:N` — full quest details · `/quest roster number:N` — applicants & party',
       '`/quest apply number:N` — apply to join (or tap **Apply** on the post)',
       '`/quest withdraw number:N` — leave or cancel your application',
+      '`/quest log [user]` — completed quests a player was on',
       '`/quest create name:Goblin Cave objectives:... merit_reward:2 party_size:4 hard_cap:true` — (GM)',
       '`/quest post number:N [channel]` — post it as an embed with an Apply button (GM)',
       '`/quest approve number:N @user [force]` — approve an applicant; `force` overrides a hard cap (GM)',
@@ -4720,6 +4886,31 @@ async function handleMerit(interaction) {
     return interaction.reply({ content: lines.join('\n') });
   }
 
+  if (sub === 'history') {
+    const target = interaction.options.getUser('user');
+    const nameCache = new Map();
+    if (target) {
+      const rows = getMeritHistory(gid, target.id, 20);
+      if (!rows.length) return interaction.reply({ content: `📋 No merit history for **${await getDisplayName(interaction.guild, target.id)}** yet.`, ephemeral: true });
+      const nm = await getDisplayNameCached(interaction.guild, target.id, nameCache);
+      const lines = [`🎖️ **${nm}** — merit history (latest ${rows.length})`, ''];
+      for (const r of rows) {
+        const sign = (r.amount ?? 0) >= 0 ? `+${r.amount}` : `${r.amount}`;
+        lines.push(`**${sign}** — ${r.reason ?? '—'} · ${formatHistDate(r.created_at)}`);
+      }
+      return replyLong(interaction, lines);
+    }
+    const rows = getRecentMeritHistory(gid, 20);
+    if (!rows.length) return interaction.reply({ content: '📋 No merit activity recorded yet.', ephemeral: true });
+    const lines = ['🎖️ **Recent merit activity**', ''];
+    for (const r of rows) {
+      const nm = await getDisplayNameCached(interaction.guild, r.user_id, nameCache);
+      const sign = (r.amount ?? 0) >= 0 ? `+${r.amount}` : `${r.amount}`;
+      lines.push(`**${sign}** ${nm} — ${r.reason ?? '—'} · ${formatHistDate(r.created_at)}`);
+    }
+    return replyLong(interaction, lines);
+  }
+
   // add / remove / set are GM-only
   if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can change merits.', ephemeral: true });
   const target = interaction.options.getUser('user');
@@ -4729,6 +4920,7 @@ async function handleMerit(interaction) {
     const amt = interaction.options.getInteger('amount') ?? 1;
     const before = getMerits(gid, target.id);
     const after = addMerits(gid, target.id, sub === 'add' ? amt : -amt);
+    logHistory(gid, { kind: 'merit', userId: target.id, amount: after - before, reason: 'manual by GM', actorId: uid });
     const { current, next } = rankProgress(gid, after);
     const ch = getChar(gid, target.id);
     const lines = [`🎖️ **${name}**: ${before} → **${after}** merit${after === 1 ? '' : 's'} (${sub === 'add' ? '+' : '−'}${amt}).`];
@@ -4743,7 +4935,9 @@ async function handleMerit(interaction) {
 
   if (sub === 'set') {
     const amt = interaction.options.getInteger('amount');
+    const before = getMerits(gid, target.id);
     upsertChar(gid, target.id, { merits: amt });
+    logHistory(gid, { kind: 'merit', userId: target.id, amount: amt - before, reason: `set to ${amt} by GM`, actorId: uid });
     const { current, next } = rankProgress(gid, amt);
     const lines = [`🎖️ **${name}** merits set to **${amt}**.`];
     if (current) lines.push(`✅ Eligible for **${current.name}**.`);
@@ -4950,6 +5144,20 @@ async function handleQuest(interaction) {
     return interaction.reply({ content: res.ok, ephemeral: true });
   }
 
+  if (sub === 'log') {
+    const target = interaction.options.getUser('user') ?? interaction.user;
+    const done = getPlayerCompletedQuests(gid, target.id);
+    const nm = await getDisplayName(interaction.guild, target.id);
+    if (!done.length) return interaction.reply({ content: `📋 **${nm}** hasn't completed any quests yet.`, ephemeral: true });
+    const totalMerits = done.reduce((a, q) => a + (q.merit_reward ?? 0), 0);
+    const lines = [`📜 **${nm}** — ${done.length} completed quest${done.length === 1 ? '' : 's'}${totalMerits ? ` · 🎖️ ${totalMerits} earned from quests` : ''}`, ''];
+    for (const q of done) {
+      const merit = q.merit_reward > 0 ? ` · 🎖️${q.merit_reward}` : '';
+      lines.push(`🔵 **${questTag(q)}**${merit}`);
+    }
+    return replyLong(interaction, lines);
+  }
+
   // ── GM-only from here ──
   if (!gm) return interaction.reply({ content: '❌ Only GMs can manage quests.', ephemeral: true });
 
@@ -5052,6 +5260,9 @@ async function handleQuest(interaction) {
     const awarded = [];
     for (const id of party) {
       const after = quest.merit_reward > 0 ? addMerits(gid, id, quest.merit_reward) : getMerits(gid, id);
+      if (quest.merit_reward > 0) {
+        logHistory(gid, { kind: 'merit', userId: id, amount: quest.merit_reward, reason: questTag(quest), questNumber: quest.number, actorId: uid });
+      }
       awarded.push({ id, after });
     }
     updateQuest(gid, number, { status: 'completed' });
