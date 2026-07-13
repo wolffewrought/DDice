@@ -687,6 +687,15 @@ async function getDisplayName(guild, uid) {
   catch { return 'Unknown'; }
 }
 
+// Cache display-name lookups within a single command so a 5-person roster is 5
+// fetches, not 10+. Pass the same `cache` object (a Map) through one handler call.
+async function getDisplayNameCached(guild, uid, cache) {
+  if (cache && cache.has(uid)) return cache.get(uid);
+  const name = await getDisplayName(guild, uid);
+  if (cache) cache.set(uid, name);
+  return name;
+}
+
 async function isGm(guild, uid) {
   const cfg = getConfig(guild.id);
   if (!cfg.gm_role_id) return false;
@@ -2323,6 +2332,15 @@ async function registerSlashCommands(guildId) {
   await registerSlashCommands(null);
   client.login(process.env.DISCORD_TOKEN);
 })();
+
+// Keep the process alive if a stray promise rejects or a handler throws async.
+// Better to log and keep serving other channels than to crash the whole bot.
+process.on('unhandledRejection', (reason) => {
+  console.error('UNHANDLED REJECTION:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+});
 // ─────────────────────────────────────────────
 //  FIGHT SYSTEM
 // ─────────────────────────────────────────────
@@ -4999,6 +5017,11 @@ async function handleQuest(interaction) {
     const party = getQuestMembers(gid, number, 'party');
     if (!party.length) return interaction.reply({ content: '❌ No party members to reward. Approve applicants first.', ephemeral: true });
 
+    // This does several network round-trips (name lookups, post refresh, optional
+    // cross-channel announce) — defer so we never miss Discord's 3s ack window.
+    await interaction.deferReply();
+    const nameCache = new Map();
+
     // Auto-award merits to each party member
     const awarded = [];
     for (const id of party) {
@@ -5012,7 +5035,7 @@ async function handleQuest(interaction) {
     if (quest.merit_reward > 0) {
       lines.push(`🎖️ **+${quest.merit_reward}** merit${quest.merit_reward === 1 ? '' : 's'} awarded to:`);
       for (const a of awarded) {
-        const nm = await getDisplayName(interaction.guild, a.id);
+        const nm = await getDisplayNameCached(interaction.guild, a.id, nameCache);
         const { current } = rankProgress(gid, a.after);
         const ch = getChar(gid, a.id);
         const elig = current && current.name !== ch?.rank_name ? ` ✅ eligible for **${current.name}**` : '';
@@ -5022,17 +5045,19 @@ async function handleQuest(interaction) {
       lines.push('_No merit reward set for this quest._');
     }
     if (quest.rewards) {
+      const partyNames = [];
+      for (const id of party) partyNames.push(await getDisplayNameCached(interaction.guild, id, nameCache));
       lines.push('', `🎁 **GM to distribute:** ${quest.rewards}`);
-      lines.push(`Party: ${(await Promise.all(party.map(id => getDisplayName(interaction.guild, id)))).join(', ')}`);
+      lines.push(`Party: ${partyNames.join(', ')}`);
     }
 
     // Announce in the designated run channel if set and different from here
     const announce = lines.join('\n');
     if (quest.run_channel_id && quest.run_channel_id !== interaction.channel.id) {
       try { const rc = await interaction.client.channels.fetch(quest.run_channel_id); await rc.send(announce); } catch {}
-      return interaction.reply({ content: `${announce}\n\n_(Also posted in <#${quest.run_channel_id}>.)_` });
+      return interaction.editReply({ content: `${announce}\n\n_(Also posted in <#${quest.run_channel_id}>.)_` });
     }
-    return interaction.reply({ content: announce });
+    return interaction.editReply({ content: announce });
   }
 
   if (sub === 'delete') {
