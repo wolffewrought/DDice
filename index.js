@@ -3677,24 +3677,37 @@ async function handleFight(interaction) {
 
     const mode = interaction.options.getString('roll') ?? 'normal';
 
-    const statVal = char?.[stat] ?? 0;
-    const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
+    // Preserve whatever modifier the ORIGINAL roll used: a nat-1 fumble made the
+    // defence a flat d20 (mod 0), a nat-20 riposte gave the attack +2. Those effects
+    // were consumed when the first roll was made, so reconstruct the modifier from it.
+    const rawStat = char?.[stat] ?? 0;
+    const origTotal = isAttacker ? fight.atk_roll : fight.def_roll;
+    const origNat = isAttacker ? fight.atk_nat : fight.def_nat;
+    const effMod = (origTotal != null && origNat != null) ? (origTotal - origNat) : rawStat;
+    // A flat-d20 defence has mod 0 while the fighter's stat is non-zero — keep it flat
+    // (no stat, no advantage/disadvantage) on the reroll too.
+    const isFlat = !isAttacker && effMod === 0 && rawStat !== 0;
+    const bonus = isAttacker ? Math.max(0, effMod - rawStat) : 0; // riposte carried into the reroll
+    const effMode = isFlat ? 'normal' : mode;
+    const modStr = isFlat ? '' : (effMod > 0 ? ` +${effMod}` : effMod < 0 ? ` ${effMod}` : '');
+    const bonusTag = bonus ? ` +${bonus} riposte` : '';
     let nat, total, rollLine;
     const icon = isAttacker ? '⚔️' : '🛡️';
 
-    if (mode === 'adv') {
+    if (effMode === 'adv') {
       const r1 = rollDie(20), r2 = rollDie(20);
       nat = Math.max(r1, r2); const dropped = Math.min(r1, r2);
-      total = nat + statVal;
-      rollLine = `${icon}  1d20+${STAT_LABELS[stat]} (advantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
-    } else if (mode === 'dis') {
+      total = nat + effMod;
+      rollLine = `${icon}  1d20+${STAT_LABELS[stat]}${bonusTag} (advantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+    } else if (effMode === 'dis') {
       const r1 = rollDie(20), r2 = rollDie(20);
       nat = Math.min(r1, r2); const dropped = Math.max(r1, r2);
-      total = nat + statVal;
-      rollLine = `${icon}  1d20+${STAT_LABELS[stat]} (disadvantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+      total = nat + effMod;
+      rollLine = `${icon}  1d20+${STAT_LABELS[stat]}${bonusTag} (disadvantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     } else {
-      nat = rollDie(20); total = nat + statVal;
-      rollLine = `${icon}  1d20+${STAT_LABELS[stat]} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+      nat = rollDie(20); total = nat + effMod;
+      const label = isFlat ? `${icon}  1d20 (flat — fumbled last attack)` : `${icon}  1d20+${STAT_LABELS[stat]}${bonusTag}`;
+      rollLine = `${label} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
 
     const member = await interaction.guild.members.fetch(uid).catch(()=>null);
@@ -3871,6 +3884,7 @@ async function handleFight(interaction) {
     const turnOrder = JSON.parse(fight.turn_order);
     const hpState = JSON.parse(fight.hp_state);
     const rrState = JSON.parse(fight.rr_state || '{}');
+    const fxState = JSON.parse(fight.effect_state || '{}');
     const currentId = turnOrder[fight.turn_index];
 
     const lines = ['⚔️ **Fight Status**', ''];
@@ -3881,7 +3895,12 @@ async function handleFight(interaction) {
       const arrow = fid === currentId ? ' ◀ current' : '';
       const hpMax = f.maxHp || '?';
       const rrNote = f.isNpc && fight.auto_npc ? ` · 🔁 ${rrState[fid] ?? 0}` : '';
-      lines.push(`${i+1}. **${f.name}${f.isNpc ? ' 🎭' : ''}** — ❤️ ${hp} / ${hpMax}${rrNote}${arrow}`);
+      const fx = fxState[fid] || {};
+      const fxBits = [];
+      if (fx.atkBonus) fxBits.push(`✨ +${fx.atkBonus} next attack`);
+      if (fx.flatDef) fxBits.push('🎲 flat-d20 next defence');
+      const fxNote = fxBits.length ? ` · ${fxBits.join(' · ')}` : '';
+      lines.push(`${i+1}. **${f.name}${f.isNpc ? ' 🎭' : ''}** — ❤️ ${hp} / ${hpMax}${rrNote}${fxNote}${arrow}`);
     }
     lines.push('');
     lines.push(`Phase: **${fight.phase === 'attack' ? 'Waiting for attack' : 'Waiting for defence'}**`);
