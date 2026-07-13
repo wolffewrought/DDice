@@ -696,6 +696,32 @@ async function getDisplayNameCached(guild, uid, cache) {
   return name;
 }
 
+// Reply with content that may exceed Discord's 2000-char hard limit. Splits on
+// line boundaries so long lists (quest board, npc list, recaps) never fail
+// silently. First chunk is the reply; the rest are follow-ups. Pass an array of
+// lines OR a pre-joined string.
+async function replyLong(interaction, content, opts = {}) {
+  const LIMIT = 1900; // headroom under 2000 for safety
+  const text = Array.isArray(content) ? content.join('\n') : String(content);
+  if (text.length <= LIMIT) {
+    return interaction.reply({ content: text, ...opts });
+  }
+  // Chunk by lines, never mid-line unless a single line is itself too long.
+  const src = Array.isArray(content) ? content : text.split('\n');
+  const chunks = [];
+  let buf = '';
+  for (const line of src) {
+    const piece = line.length > LIMIT ? line.slice(0, LIMIT) : line;
+    if (buf.length + piece.length + 1 > LIMIT) { chunks.push(buf); buf = piece; }
+    else { buf = buf ? buf + '\n' + piece : piece; }
+  }
+  if (buf) chunks.push(buf);
+  await interaction.reply({ content: chunks[0], ...opts });
+  for (let i = 1; i < chunks.length; i++) {
+    await interaction.followUp({ content: chunks[i], ...opts }).catch(() => {});
+  }
+}
+
 async function isGm(guild, uid) {
   const cfg = getConfig(guild.id);
   if (!cfg.gm_role_id) return false;
@@ -4141,7 +4167,7 @@ async function handleNpc(interaction) {
       const img = n.image_url ? ' 🖼️' : '';
       lines.push(`• **${n.name}**${order}${img} — STR ${n.str} CON ${n.con} DEX ${n.dex} WIS ${n.wis} LCK ${n.lck} | ❤️ ${n.hp_current}/${n.con+2}`);
     });
-    return interaction.reply({ content: lines.join('\n') });
+    return replyLong(interaction, lines);
   }
 
   if (sub === 'categorycreate') {
@@ -4736,7 +4762,7 @@ async function handleRank(interaction) {
     if (!ranks.length) return interaction.reply({ content: '📋 No ranks defined. A GM can add them with `/rank add`.', ephemeral: true });
     const lines = ['🏅 **Ranks** (junior → senior)', ''];
     ranks.forEach((r, i) => lines.push(`**${i+1}. ${r.name}** — ${r.threshold} merit${r.threshold === 1 ? '' : 's'}`));
-    return interaction.reply({ content: lines.join('\n') });
+    return replyLong(interaction, lines);
   }
 
   // everything else GM-only
@@ -4785,7 +4811,7 @@ async function handleRank(interaction) {
       }
     }
     if (!out.length) return interaction.reply({ content: '✅ No one is awaiting a promotion right now.', ephemeral: true });
-    return interaction.reply({ content: ['📋 **Awaiting promotion:**', '', ...out].join('\n') });
+    return replyLong(interaction, ['📋 **Awaiting promotion:**', '', ...out]);
   }
 }
 
@@ -4891,7 +4917,7 @@ async function handleQuest(interaction) {
       lines.push(`${questStatusBadge(q.status)} **${questTag(q)}** — 👥 ${cap}${merit}`);
     }
     lines.push('', '_Use_ `/quest show number:N` _for full details._');
-    return interaction.reply({ content: lines.join('\n') });
+    return replyLong(interaction, lines);
   }
 
   if (sub === 'show' || sub === 'roster') {
