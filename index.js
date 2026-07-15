@@ -48,6 +48,7 @@ try { db.exec('ALTER TABLE fights ADD COLUMN auto_npc INTEGER DEFAULT 0'); } cat
 try { db.exec("ALTER TABLE fights ADD COLUMN rr_state TEXT DEFAULT '{}'"); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_rr_threshold INTEGER DEFAULT 8'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN fight_ping INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN roll_audit_channel_id TEXT'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN log_state TEXT DEFAULT '{}'"); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN effect_state TEXT DEFAULT '{}'"); } catch {}
 try {
@@ -1062,6 +1063,9 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('threshold').setDescription('1–19, or 0 to disable (default 8); omit to show current').setRequired(false).setMinValue(0).setMaxValue(19)))
     .addSubcommand(s=>s.setName('fightping').setDescription('@-mention players when it becomes their turn in a fight')
       .addBooleanOption(o=>o.setName('enabled').setDescription('true = ping, false = silent (default); omit to show current').setRequired(false)))
+    .addSubcommand(s=>s.setName('rollaudit').setDescription('Mirror every player roll to a GM-only channel')
+      .addChannelOption(o=>o.setName('channel').setDescription('Channel to mirror rolls into').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = turn the mirror off').setRequired(false)))
     .addSubcommand(s=>s.setName('cleanwebhooks').setDescription('Remove orphaned NPC webhooks to free up Discord limits')),
 
   new SlashCommandBuilder()
@@ -1404,6 +1408,23 @@ async function handleConfig(interaction) {
     setConfig(gid, { fight_ping: v ? 1 : 0 });
     return interaction.reply({ content: v ? '🔔 Turn pings **on** — players get an @mention when it\'s their turn.' : '🔕 Turn pings **off**.' });
   }
+  if (sub === 'rollaudit') {
+    const channel = interaction.options.getChannel('channel');
+    const disable = interaction.options.getBoolean('disable');
+    if (disable) {
+      setConfig(gid, { roll_audit_channel_id: null });
+      return interaction.reply({ content: '🔇 Roll mirroring **disabled**.' });
+    }
+    if (!channel) {
+      const cur = getConfig(gid)?.roll_audit_channel_id;
+      return interaction.reply({ content: cur
+        ? `🎲 Player rolls are mirrored to <#${cur}>. Change with \`/config rollaudit channel:#x\` or turn off with \`disable:true\`.`
+        : '🔇 Roll mirroring is **off**. Set a channel with `/config rollaudit channel:#x`.', ephemeral: true });
+    }
+    if (!channel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
+    setConfig(gid, { roll_audit_channel_id: channel.id });
+    return interaction.reply({ content: `🎲 Player rolls will be mirrored to <#${channel.id}> — raw input, result, and a jump link.\n⚠️ Make sure that channel's permissions only let GMs view it; the bot can't set that for you.` });
+  }
   if (sub === 'npcreroll') {
     const v = interaction.options.getInteger('threshold');
     if (v === null) {
@@ -1734,6 +1755,8 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
   const sides = result.sides ?? (mode === 'normal' ? result.sides : result.sides);
   const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides ?? result.sides) : null;
   const rollLine = buildRollLine(result, mode, critType, successResult);
+  mirrorRoll(gid, { userId: uid, channelId: cid, messageId: message.id, input: message.content,
+    rollLine, context: isReroll ? 'reroll' : (successCheck ? 'success check' : null) });
   await sendRollEmbed(message, rollLine, label, false, uid, flavour, result.total, critType);
 }
 
@@ -1767,6 +1790,7 @@ async function handleHeal(message, rest) {
   const dn = await getDisplayName(message.guild, uid);
   const modStr = char.wis > 0 ? ` +${char.wis}` : '';
   const rollLine = `🎲  1d20+${char.wis} → [${nat}]${modStr} = **${total}**`;
+  mirrorRoll(gid, { userId: uid, channelId: cid, messageId: message.id, input: message.content, rollLine, context: 'heal' });
   let content;
   if (char.profile_enabled === 1) {
     content = buildRollEmbed({ rollLine, label:'heal', isReroll:false, char:{...upd,displayName:dn}, healCharges:newCharges, maxCharges:mc, flavour:null, total, critType:null });
@@ -2639,6 +2663,23 @@ function getNpcRrThreshold(gid) {
 function turnPing(gid, f) {
   if (!f || f.isNpc || !getConfig(gid)?.fight_ping) return '';
   return ` <@${f.id}>`;
+}
+// Mirror a player's roll to the GM audit channel (set with /config rollaudit).
+// Fire-and-forget: an unset, deleted, or unreadable channel must never break
+// the roll itself. GM rolls (gmr/gmrs) and NPC auto-rolls are never mirrored.
+function mirrorRoll(gid, { userId, channelId, messageId = null, input, rollLine, context = null }) {
+  const chId = getConfig(gid)?.roll_audit_channel_id;
+  if (!chId || chId === channelId) return; // no audit channel, or rolling inside it
+  (async () => {
+    const ch = await client.channels.fetch(chId);
+    const clean = String(input ?? '').replace(/`/g, "'").slice(0, 120);
+    const link = messageId ? `\nhttps://discord.com/channels/${gid}/${channelId}/${messageId}` : '';
+    const ctx = context ? ` · ${context}` : '';
+    await ch.send({
+      content: `🎲 <@${userId}> in <#${channelId}>${ctx} — \`${clean}\`\n${rollLine}${link}`,
+      allowedMentions: { parse: [] }, // identity without pinging anyone
+    });
+  })().catch(() => {});
 }
 
 // Split a fighter id list into those able to fight (HP > 0) and those downed.
@@ -3689,6 +3730,8 @@ async function handleFight(interaction) {
       nat = rollDie(20); total = nat + effTotal;
       rollLine = `⚔️  1d20+${STAT_LABELS[stat]}${bonusTag} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
+    if (!isNpcFighter(actorId)) mirrorRoll(gid, { userId: uid, channelId: cid,
+      input: `/fight atk stat:${stat}`, rollLine, context: `fight · attacks ${targetF.name}` });
 
     const targetName = targetF.name + (targetF.isNpc ? ' 🎭' : '');
     const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
@@ -3782,6 +3825,8 @@ async function handleFight(interaction) {
       const label = flat ? `🛡️  1d20${flatTag}` : `🛡️  1d20+${STAT_LABELS[stat]}`;
       rollLine = `${label} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
+    if (!isNpcFighter(defenderId)) mirrorRoll(gid, { userId: uid, channelId: cid,
+      input: `/fight def stat:${stat}`, rollLine, context: 'fight · defends' });
 
     const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
     const defCard = await fighterCharCard(interaction.guild, gid, defenderId);
@@ -3856,6 +3901,8 @@ async function handleFight(interaction) {
       const label = isFlat ? `${icon}  1d20 (flat — fumbled last attack)` : `${icon}  1d20+${STAT_LABELS[stat]}${bonusTag}`;
       rollLine = `${label} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
+    mirrorRoll(gid, { userId: uid, channelId: cid,
+      input: `/fight rr${mode !== 'normal' ? ` roll:${mode}` : ''}`, rollLine, context: 'fight · reroll' });
 
     const member = await interaction.guild.members.fetch(uid).catch(()=>null);
     const name = member?.nickname || member?.user.username || uid;
@@ -4695,6 +4742,7 @@ const HELP_CATEGORIES = {
       '`/config heal charges:N` — set default heal charges',
       '`/config npcreroll threshold:N` — NPC auto-reroll on nat ≤ N · 0 disables · omit to show',
       '`/config fightping enabled:true` — @-mention players on their turn · off by default (Admin)',
+      '`/config rollaudit channel:#x` — mirror all player rolls to a GM-only channel (Admin)',
       '`/config npcchannel #channel` — set the NPC avatar channel',
       '`/config rest type:Short Rest hp:50% rerolls:0%` — tune what a rest restores (use % of max or a flat number)',
       '`/config cleanwebhooks` — remove orphaned NPC webhooks',
