@@ -4211,7 +4211,7 @@ async function handleFight(interaction) {
     const targetUser = interaction.options.getUser('target');
     const targetNpc = interaction.options.getString('target_npc');
     const flavour = interaction.options.getString('flavour') ?? null;
-    const mode = interaction.options.getString('roll') ?? 'normal';
+    let mode = interaction.options.getString('roll') ?? 'normal';
 
     if (!targetUser && !targetNpc) return interaction.reply({ content: '❌ Pick a `target` (player) or `target_npc` (NPC) to attack.', ephemeral: true });
     if (targetUser && targetNpc) return interaction.reply({ content: '❌ Choose either a player target or an NPC target, not both.', ephemeral: true });
@@ -4321,7 +4321,7 @@ async function handleFight(interaction) {
 
     const stat = interaction.options.getString('stat');
     const flavour = interaction.options.getString('flavour') ?? null;
-    const mode = interaction.options.getString('roll') ?? 'normal';
+    let mode = interaction.options.getString('roll') ?? 'normal';
 
     const defender = await resolveFighter(interaction.guild, gid, defenderId);
     const statVal = defender.stats[stat] ?? 0;
@@ -4375,7 +4375,7 @@ async function handleFight(interaction) {
 
   // ── REROLLS ────────────────────────────────────────────────────────────────
   if (sub === 'rr') {
-    const fight = getFight(gid, cid);
+    let fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
 
     const turnOrder = JSON.parse(fight.turn_order);
