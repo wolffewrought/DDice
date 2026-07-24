@@ -53,6 +53,9 @@ try { db.exec('ALTER TABLE characters ADD COLUMN signature_stat TEXT'); } catch 
 try { db.exec('ALTER TABLE npcs ADD COLUMN class TEXT'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN signature_stat TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_role_ids TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN approval_channel_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN approval_state TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN approval_msg_id TEXT'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN log_state TEXT DEFAULT '{}'"); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN effect_state TEXT DEFAULT '{}'"); } catch {}
 try {
@@ -1049,6 +1052,8 @@ async function handleCharExport(interaction) {
     `  ${char.order_name || 'No Order'}`,
   ];
   if (char.class) textLines.push(`  ${char.class}`);
+  if (approvalEnabled(gid) && char.approval_state === 'pending') textLines.push('  ⏳ Awaiting GM approval');
+  if (approvalEnabled(gid) && char.approval_state === 'rejected') textLines.push('  🚫 Rejected by a GM');
   textLines.push(
     '',
     `  HP       ${char.hp_current} / ${hm}`,
@@ -1106,6 +1111,9 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('threshold').setDescription('1–19, or 0 to disable (default 8); omit to show current').setRequired(false).setMinValue(0).setMaxValue(19)))
     .addSubcommand(s=>s.setName('fightping').setDescription('@-mention players when it becomes their turn in a fight')
       .addBooleanOption(o=>o.setName('enabled').setDescription('true = ping, false = silent (default); omit to show current').setRequired(false)))
+    .addSubcommand(s=>s.setName('approvals').setDescription('Channel where new character sheets await GM approval')
+      .addChannelOption(o=>o.setName('channel').setDescription('Approval channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = turn sheet approval off').setRequired(false)))
     .addSubcommand(s=>s.setName('rollaudit').setDescription('Mirror every player roll to a GM-only channel')
       .addChannelOption(o=>o.setName('channel').setDescription('Channel to mirror rolls into').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = turn the mirror off').setRequired(false)))
@@ -1534,6 +1542,23 @@ async function handleConfig(interaction) {
     setConfig(gid, { fight_ping: v ? 1 : 0 });
     return interaction.reply({ content: v ? '🔔 Turn pings **on** — players get an @mention when it\'s their turn.' : '🔕 Turn pings **off**.' });
   }
+  if (sub === 'approvals') {
+    const channel = interaction.options.getChannel('channel');
+    const disable = interaction.options.getBoolean('disable');
+    if (disable) {
+      setConfig(gid, { approval_channel_id: null });
+      return interaction.reply({ content: '✅ Sheet approval **disabled** — new sheets work immediately.' });
+    }
+    if (!channel) {
+      const cur = getConfig(gid)?.approval_channel_id;
+      return interaction.reply({ content: cur
+        ? `📋 New sheets await approval in <#${cur}>. Turn off with \`/config approvals disable:true\`.`
+        : '📋 Sheet approval is **off**. Set a channel with `/config approvals channel:#x`.', ephemeral: true });
+    }
+    if (!channel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
+    setConfig(gid, { approval_channel_id: channel.id });
+    return interaction.reply({ content: `📋 New character sheets will await GM approval in <#${channel.id}>.\n⚠️ Players can't roll or fight until approved, and stats become GM-only once a sheet exists.` });
+  }
   if (sub === 'rollaudit') {
     const channel = interaction.options.getChannel('channel');
     const disable = interaction.options.getBoolean('disable');
@@ -1674,6 +1699,7 @@ async function handleChar(interaction) {
     const wis = interaction.options.getInteger('wis'); if (wis !== null) updates.wis = wis;
     const lck = interaction.options.getInteger('lck'); if (lck !== null) { updates.lck = lck; updates.rerolls_current = lck; }
     const order = interaction.options.getString('order'); if (order) updates.order_name = order;
+    const existingSheet = getChar(gid, targetId);
     const charClass = interaction.options.getString('class');
     if (charClass && String(charClass).toLowerCase() === 'hero' && !isGmUser) {
       return interaction.reply({ content: '❌ **Hero** is granted by a GM, not chosen. Pick Vanguard, Defender or Siege Knight.', ephemeral: true });
@@ -1694,11 +1720,32 @@ async function handleChar(interaction) {
       updates.weapon2emoji = c2;
     }
     if (Object.keys(updates).length === 0) return interaction.reply({ content: '❌ No fields provided.', ephemeral: true });
+
+    // Approval flow: a player creating/updating their OWN sheet while approval is
+    // enabled must have it signed off. Sheets a GM builds are approved outright.
+    const needsApproval = approvalEnabled(gid) && !isGmUser && targetId === callerId;
+    if (needsApproval) {
+      const prev = existingSheet?.approval_state;
+      if (prev === 'approved') {
+        return interaction.reply({ content: '🔒 Your sheet is already approved — stats can only be changed by a GM now.', ephemeral: true });
+      }
+      updates.approval_state = 'pending';
+    } else if (approvalEnabled(gid) && isGmUser) {
+      updates.approval_state = 'approved'; // GM-built sheets skip the queue
+    }
+
     upsertChar(gid, targetId, updates);
     const mention = targetUser ? `<@${targetId}>` : 'Your';
     const summary = Object.entries(updates)
-      .filter(([k]) => !['hp_current','rerolls_current'].includes(k))
+      .filter(([k]) => !['hp_current','rerolls_current','approval_state','approval_msg_id'].includes(k))
       .map(([k,v]) => `**${k.toUpperCase()}**: ${v}`).join(', ');
+
+    if (needsApproval) {
+      const posted = await requestSheetApproval(interaction, gid, targetId);
+      return interaction.reply({ content: posted
+        ? `✅ Sheet submitted — ${summary}\n\n⏳ **Awaiting GM approval** in <#${posted}>. You can't roll or fight until it's approved.`
+        : `✅ Sheet saved — ${summary}\n\n⚠️ Couldn't reach the approval channel; ask a GM to check \`/config approvals\`.` });
+    }
     return interaction.reply({ content: `✅ ${mention} character updated — ${summary}` });
   }
 
@@ -1754,6 +1801,17 @@ async function handleChar(interaction) {
       if (!isWhiteKnight(upd)) setHealCharges(gid, targetId, 0);
       else { const cfg = getConfig(gid); setHealCharges(gid, targetId, cfg.heal_charges??3); }
       return interaction.reply({ content: `${KNIGHT_EMOJIS[knight]??'⚪'} Order set to **${knight}**${targetId!==callerId?` for <@${targetId}>`:''}.` });
+    }
+    // Once approval is in force, players can't alter their own stats — GMs only.
+    if (approvalEnabled(gid) && targetId === callerId && !(await isGm(interaction.guild, callerId))
+        && (STATS.includes(field) || field === 'order' || field === 'class')) {
+      const own = getChar(gid, callerId);
+      if (own?.approval_state === 'approved') {
+        return interaction.reply({ content: '🔒 Your sheet is approved — only a GM can change stats, order or class now.', ephemeral: true });
+      }
+      if (own?.approval_state === 'pending') {
+        return interaction.reply({ content: '⏳ Your sheet is awaiting GM approval — wait for it to be reviewed before editing.', ephemeral: true });
+      }
     }
     if (STATS.includes(field)) {
       const num = parseInt(value);
@@ -1875,6 +1933,8 @@ async function handleProfile(interaction) {
 
 async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
   const gid = message.guild.id, cid = message.channel.id, uid = message.author.id;
+  const gateMsg = sheetGate(gid, uid);
+  if (gateMsg) return message.reply(gateMsg);
   let notation, label, flavour;
 
   if (isReroll) {
@@ -1919,6 +1979,8 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
 
 async function handleHeal(message, rest) {
   const gid = message.guild.id, uid = message.author.id;
+  const gateMsg = sheetGate(gid, uid);
+  if (gateMsg) return message.reply(gateMsg);
   // Accept the mention anywhere in the argument, not just flush at the start —
   // "!heal @user", "!heal  @user" and "!heal please @user" all work.
   const mentionMatch = rest.match(/<@!?(\d+)>/);
@@ -2430,6 +2492,9 @@ client.on('interactionCreate', async interaction => {
     if (interaction.customId.startsWith('questapply:') || interaction.customId.startsWith('questwithdraw:')) {
       return handleQuestButton(interaction);
     }
+    if (interaction.customId.startsWith('sheetok:') || interaction.customId.startsWith('sheetno:')) {
+      return handleSheetApprovalButton(interaction);
+    }
     return;
   }
 
@@ -2844,6 +2909,64 @@ function getNpcRrThreshold(gid) {
   const v = getConfig(gid)?.npc_rr_threshold;
   return (v === null || v === undefined) ? NPC_RR_NAT_MAX : v;
 }
+// ── Character sheet approval ──────────────────────────────────────────────────
+// approval_state: null = legacy sheet (pre-feature, treated as approved),
+// 'pending' = awaiting a GM, 'approved' = usable, 'rejected' = blocked.
+// Approval is only enforced once a GM has set an approval channel; without one
+// the whole feature stays dormant so existing servers are unaffected.
+function approvalEnabled(gid) {
+  return !!getConfig(gid)?.approval_channel_id;
+}
+function sheetApproved(gid, ch) {
+  if (!ch) return false;
+  if (!approvalEnabled(gid)) return true;          // feature off → everything works
+  if (!ch.approval_state) return true;             // sheet predates the feature
+  return ch.approval_state === 'approved';
+}
+// Guard for player actions that need a usable sheet. Returns an error string, or null.
+function sheetGate(gid, uid) {
+  if (!approvalEnabled(gid)) return null;
+  const ch = getChar(gid, uid);
+  if (!ch) return null;                            // "no sheet" handled by callers
+  if (!ch.approval_state || ch.approval_state === 'approved') return null;
+  if (ch.approval_state === 'pending') return '⏳ Your character sheet is **awaiting GM approval** — you can\'t roll or fight until it\'s approved.';
+  return '🚫 Your character sheet was **rejected** by a GM. Speak to them before rolling.';
+}
+function approvalButtons(uid) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`sheetok:${uid}`).setLabel('Approve').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`sheetno:${uid}`).setLabel('Reject').setStyle(ButtonStyle.Danger),
+  );
+}
+// Post an approval request to the configured channel, pinging every GM role.
+async function requestSheetApproval(interaction, gid, uid) {
+  const chId = getConfig(gid)?.approval_channel_id;
+  if (!chId) return null;
+  const ch = getChar(gid, uid);
+  const nm = await getDisplayName(interaction.guild, uid);
+  const roles = getGmRoleIds(gid);
+  const ping = roles.length ? roles.map(r => `<@&${r}>`).join(' ') + ' ' : '';
+  const lines = [
+    `${ping}📋 **Sheet approval requested**`,
+    `👤 <@${uid}> (**${nm}**)`,
+    '─────────────────────────────',
+    `💪 STR ${ch.str}   🛡️ CON ${ch.con}   ⚡ DEX ${ch.dex}`,
+    `🦉 WIS ${ch.wis}   🍀 LCK ${ch.lck}`,
+    `❤️ HP ${ch.hp_current} / ${maxHp(ch)}   🔄 Rerolls ${ch.rerolls_current} / ${maxRerolls(ch)}`,
+    ch.order_name ? `${KNIGHT_EMOJIS[ch.order_name] ?? '⚪'} ${ch.order_name}` : null,
+    ch.class ? `🎖️ ${ch.class}` : null,
+    (ch.weapon1 || ch.weapon2) ? `⚔️ ${[ch.weapon1, ch.weapon2].filter(Boolean).join(' · ')}` : null,
+  ].filter(Boolean);
+  try {
+    const channel = await interaction.client.channels.fetch(chId);
+    const msg = await channel.send({ content: lines.join('\n'), components: [approvalButtons(uid)],
+      allowedMentions: { roles } });
+    upsertChar(gid, uid, { approval_msg_id: msg.id });
+    return channel.id;
+  } catch { return null; }
+}
+
 // ── Hero signature stat ───────────────────────────────────────────────────────
 // A Hero (GM-assigned class) may have one designated stat with 5+ points. Rolls
 // using that stat are made with advantage. The 5-point floor is checked live, so
@@ -3311,6 +3434,11 @@ async function handleFight(interaction) {
   const gid = interaction.guild.id;
   const cid = interactionChannelId(interaction);
   const uid = interaction.user.id;
+  // Unapproved sheets can't take fight actions. Read-only and GM subcommands pass.
+  if (['atk','def','rr','forfeit','start'].includes(sub)) {
+    const gateMsg = sheetGate(gid, uid);
+    if (gateMsg && !(await isGm(interaction.guild, uid))) return interaction.reply({ content: gateMsg, ephemeral: true });
+  }
   // interaction.channel can be null (thread / uncached); fetch it lazily so the
   // fight flow can still post its cards and prompts.
   const chan = await interactionChannel(interaction);
@@ -5003,6 +5131,7 @@ const HELP_CATEGORIES = {
       '`/config npcreroll threshold:N` — NPC auto-reroll on nat ≤ N · 0 disables · omit to show',
       '`/config fightping enabled:true` — @-mention players on their turn · off by default (Admin)',
       '`/config rollaudit channel:#x` — mirror all player rolls to a GM-only channel (Admin)',
+      '`/config approvals channel:#x` — new sheets need GM approval before use (Admin)',
       '`/config npcchannel #channel` — set the NPC avatar channel',
       '`/config rest type:Short Rest hp:50% rerolls:0%` — tune what a rest restores (use % of max or a flat number)',
       '`/config cleanwebhooks` — remove orphaned NPC webhooks',
@@ -5254,6 +5383,9 @@ async function handleRollSlash(interaction) {
 
   if (stat && dice) return interaction.reply({ content: '❌ Pick either a **stat** or custom **dice**, not both.', ephemeral: true });
   if (!stat && !dice) return interaction.reply({ content: '❌ Choose a **stat** or enter **dice** (e.g. `2d6+3`).', ephemeral: true });
+
+  const gateMsg = sheetGate(gid, uid);
+  if (gateMsg) return interaction.reply({ content: gateMsg, ephemeral: true });
 
   const char = getChar(gid, uid);
   let notation;
@@ -5773,6 +5905,33 @@ async function requestConfirm(interaction, promptText, action) {
   // Auto-expire after 60s
   setTimeout(() => pendingConfirms.delete(token), 60000);
   await interaction.reply({ content: `⚠️ ${promptText}`, components: [makeConfirmButtons(token)], ephemeral: true });
+}
+
+async function handleSheetApprovalButton(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can approve sheets.', ephemeral: true });
+  const [action, uid] = interaction.customId.split(':');
+  const ch = getChar(gid, uid);
+  if (!ch) return interaction.reply({ content: '❌ That character sheet no longer exists.', ephemeral: true });
+  const nm = await getDisplayName(interaction.guild, uid);
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+  const approved = action === 'sheetok';
+  upsertChar(gid, uid, { approval_state: approved ? 'approved' : 'rejected' });
+
+  // Update the request post so the queue reflects the decision
+  try {
+    await interaction.message.edit({
+      content: `${interaction.message.content}\n\n${approved ? '✅' : '🚫'} **${approved ? 'Approved' : 'Rejected'}** by ${gmName}`,
+      components: [],
+    });
+  } catch {}
+
+  // Tell the player in the channel they created the sheet in? Simpler: reply here.
+  return interaction.reply({ content: approved
+    ? `✅ <@${uid}> (**${nm}**) approved — they can roll and fight now.`
+    : `🚫 <@${uid}> (**${nm}**) rejected — they'll need a GM to adjust the sheet.`,
+    allowedMentions: { parse: [] } });
 }
 
 async function handleQuestButton(interaction) {
