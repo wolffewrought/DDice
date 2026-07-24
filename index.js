@@ -1607,9 +1607,13 @@ async function handleConfig(interaction) {
     }
     if (!channel) {
       const cur = getConfig(gid)?.roll_audit_channel_id;
-      return interaction.reply({ content: cur
-        ? `🎲 Player rolls are mirrored to <#${cur}> (id \`${cur}\`).\nCheck it works with \`/config rollaudit test:true\`, change with \`channel:#x\`, or turn off with \`disable:true\`.`
-        : '🔇 Roll mirroring is **off**. Set a channel with `/config rollaudit channel:#x`.', ephemeral: true });
+      if (!cur) return interaction.reply({ content: '🔇 Roll mirroring is **off**. Set a channel with `/config rollaudit channel:#x`.', ephemeral: true });
+      let reach = '❓ unknown';
+      try {
+        const t = await interaction.client.channels.fetch(cur);
+        reach = t ? `✅ reachable (**#${t.name ?? '?'}**)` : '❌ fetch returned nothing';
+      } catch (e) { reach = `❌ cannot access — ${e?.message || e}`; }
+      return interaction.reply({ content: `🎲 Audit channel: <#${cur}>\nStored id: \`${cur}\`\nBot access: ${reach}\n\nSend a live test with \`/config rollaudit test:true\`.`, ephemeral: true });
     }
     if (!channel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
     setConfig(gid, { roll_audit_channel_id: channel.id });
@@ -3089,9 +3093,14 @@ function turnPing(gid, f) {
 // GMs are accountable to each other). NPC auto-rolls are not mirrored.
 function mirrorRoll(gid, { userId, channelId, messageId = null, input, rollLine, context = null }) {
   const chId = getConfig(gid)?.roll_audit_channel_id;
-  if (!chId || chId === channelId) return; // no audit channel, or rolling inside it
+  // Verbose tracing: a silent mirror is impossible to diagnose otherwise.
+  // These lines appear in the Railway logs and pinpoint where it stops.
+  if (!chId) { console.log('[rollaudit] skip — no audit channel configured'); return; }
+  if (chId === channelId) { console.log('[rollaudit] skip — roll was made inside the audit channel'); return; }
+  console.log(`[rollaudit] attempting mirror → channel ${chId} (roll from ${channelId})`);
   (async () => {
     const ch = await client.channels.fetch(chId);
+    if (!ch) { console.error(`[rollaudit] fetch returned null for ${chId}`); return; }
     const clean = String(input ?? '').replace(/`/g, "'").slice(0, 120);
     const link = messageId ? `\nhttps://discord.com/channels/${gid}/${channelId}/${messageId}` : '';
     const ctx = context ? ` · ${context}` : '';
@@ -3099,10 +3108,11 @@ function mirrorRoll(gid, { userId, channelId, messageId = null, input, rollLine,
       content: `🎲 <@${userId}> in <#${channelId}>${ctx} — \`${clean}\`\n${rollLine}${link}`,
       allowedMentions: { parse: [] }, // identity without pinging anyone
     });
+    console.log('[rollaudit] mirror sent OK');
   })().catch(err => {
     // Never break the roll itself, but do leave a trace — a silent mirror is
     // impossible to diagnose. Surfaced to the GM by /config rollaudit test.
-    console.error(`[rollaudit] mirror to ${chId} failed:`, err?.message || err);
+    console.error(`[rollaudit] mirror to ${chId} FAILED:`, err?.message || err, err?.code ? `(code ${err.code})` : '');
   });
 }
 
