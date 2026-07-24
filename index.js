@@ -49,6 +49,9 @@ try { db.exec("ALTER TABLE fights ADD COLUMN rr_state TEXT DEFAULT '{}'"); } cat
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_rr_threshold INTEGER DEFAULT 8'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN fight_ping INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN roll_audit_channel_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN signature_stat TEXT'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN class TEXT'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN signature_stat TEXT'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN log_state TEXT DEFAULT '{}'"); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN effect_state TEXT DEFAULT '{}'"); } catch {}
 try {
@@ -1119,6 +1122,15 @@ const slashCommands = [
       .addStringOption(o=>o.setName('custom').setDescription('Or paste a server custom emoji (overrides the dropdown)').setRequired(false))
       .addUserOption(o=>o.setName('user').setDescription('Target player (GM only)').setRequired(false)))
     .addSubcommand(s=>s.setName('show').setDescription('Display a character card').addUserOption(o=>o.setName('user').setDescription('User to show').setRequired(false)))
+    .addSubcommand(s=>s.setName('signature').setDescription('Set a Hero\'s signature stat — advantage on that stat (GM)')
+      .addUserOption(o=>o.setName('user').setDescription('The Hero').setRequired(true))
+      .addStringOption(o=>o.setName('stat').setDescription('Stat to designate (needs 5+); omit to clear').setRequired(false)
+        .addChoices(
+          {name:'💪 Strength (STR)',value:'str'},
+          {name:'🛡️ Constitution (CON)',value:'con'},
+          {name:'⚡ Dexterity (DEX)',value:'dex'},
+          {name:'🦉 Wisdom (WIS)',value:'wis'},
+          {name:'🍀 Luck (LCK)',value:'lck'})))
     .addSubcommand(s=>s.setName('export').setDescription('Export your character sheet')
       .addStringOption(o=>o.setName('format').setDescription('Export format').setRequired(false)
         .addChoices({name:'Text',value:'text'},{name:'Image',value:'image'}))
@@ -1222,6 +1234,16 @@ const slashCommands = [
       .addStringOption(o=>o.setName('new_name').setDescription('Name for the copy').setRequired(true)))
     .addSubcommand(s=>s.setName('show').setDescription('Show one NPC\'s full stat block')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('hero').setDescription('Make an NPC a Hero with a signature stat (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('stat').setDescription('Signature stat (needs 5+)').setRequired(false)
+        .addChoices(
+          {name:'💪 Strength (STR)',value:'str'},
+          {name:'🛡️ Constitution (CON)',value:'con'},
+          {name:'⚡ Dexterity (DEX)',value:'dex'},
+          {name:'🦉 Wisdom (WIS)',value:'wis'},
+          {name:'🍀 Luck (LCK)',value:'lck'}))
+      .addBooleanOption(o=>o.setName('remove').setDescription('true = strip Hero status from this NPC').setRequired(false)))
     .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server')
       .addStringOption(o=>o.setName('category').setDescription('Only show NPCs in this category').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('categorylist').setDescription('List all NPC categories'))
@@ -1581,7 +1603,11 @@ async function handleChar(interaction) {
     const wis = interaction.options.getInteger('wis'); if (wis !== null) updates.wis = wis;
     const lck = interaction.options.getInteger('lck'); if (lck !== null) { updates.lck = lck; updates.rerolls_current = lck; }
     const order = interaction.options.getString('order'); if (order) updates.order_name = order;
-    const charClass = interaction.options.getString('class'); if (charClass) updates.class = charClass;
+    const charClass = interaction.options.getString('class');
+    if (charClass && String(charClass).toLowerCase() === 'hero' && !isGmUser) {
+      return interaction.reply({ content: '❌ **Hero** is granted by a GM, not chosen. Pick Vanguard, Defender or Siege Knight.', ephemeral: true });
+    }
+    if (charClass) updates.class = charClass;
     const weapon1 = interaction.options.getString('weapon1'); if (weapon1) updates.weapon1 = weapon1;
     const weapon2 = interaction.options.getString('weapon2'); if (weapon2) updates.weapon2 = weapon2;
     const weapon1emoji = interaction.options.getString('weapon1emoji');
@@ -1623,6 +1649,25 @@ async function handleChar(interaction) {
     return interaction.reply({ content: `✅ ${slotLabel} emoji set to ${cleaned}${targetId!==callerId?` for <@${targetId}>`:''}.` });
   }
 
+  if (sub === 'signature') {
+    if (!(await isGm(interaction.guild, callerId)))
+      return interaction.reply({ content: '❌ Only GMs can set a Hero\'s signature stat.', ephemeral: true });
+    const target = interaction.options.getUser('user');
+    const stat = interaction.options.getString('stat');
+    const ch = getChar(gid, target.id);
+    if (!ch) return interaction.reply({ content: '❌ That player has no character sheet yet.', ephemeral: true });
+    const nm = await getDisplayName(interaction.guild, target.id);
+    if (!stat) {
+      upsertChar(gid, target.id, { signature_stat: null });
+      return interaction.reply({ content: `✅ Cleared **${nm}**'s signature stat.` });
+    }
+    if (!isHero(ch)) return interaction.reply({ content: `❌ **${nm}** isn't a Hero. Set their class first with \`/char set field:class value:Hero\`.`, ephemeral: true });
+    const val = ch[stat] ?? 0;
+    if (val < SIGNATURE_MIN) return interaction.reply({ content: `❌ **${nm}**'s ${STAT_LABELS[stat]} is **${val}** — a signature stat needs **${SIGNATURE_MIN}+**.`, ephemeral: true });
+    upsertChar(gid, target.id, { signature_stat: stat });
+    return interaction.reply({ content: `⭐ **${nm}**'s signature stat is **${STAT_LABELS[stat]}** (${val}) — their ${STAT_LABELS[stat]} rolls now have **advantage**.` });
+  }
+
   if (sub === 'set') {
     const field = interaction.options.getString('field');
     const value = interaction.options.getString('value');
@@ -1661,6 +1706,10 @@ async function handleChar(interaction) {
         upsertChar(gid, targetId, { [field]: cleaned });
         const lbl = field === 'weapon1emoji' ? 'Weapon 1 Emoji' : 'Weapon 2 Emoji';
         return interaction.reply({ content: `✅ **${lbl}** set to ${cleaned}${targetId!==callerId?` for <@${targetId}>`:''}.` });
+      }
+      if (field === 'class' && String(value).toLowerCase() === 'hero'
+          && !(await isGm(interaction.guild, callerId))) {
+        return interaction.reply({ content: '❌ **Hero** is granted by a GM, not chosen. Pick Vanguard, Defender or Siege Knight.', ephemeral: true });
       }
       if (['class','weapon1','weapon2'].includes(field) && value.length > 50) {
         return interaction.reply({ content: '❌ That name is too long (max 50 characters).', ephemeral: true });
@@ -1770,6 +1819,10 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
   } else {
     const ch = getChar(gid, uid);
     const parsed = parseRollInput(rest, ch);
+    // Hero signature: a stat roll on the designated stat is made with advantage.
+    if (parsed && STATS.includes(String(parsed.label || '').toLowerCase())) {
+      mode = applySignatureMode(ch, String(parsed.label).toLowerCase(), mode);
+    }
     if (!parsed) return message.reply('❌ Invalid notation. Try `r1d20+5 attack`, `r2d6`, or `r str`.');
     notation = parsed.notation;
     label = parsed.label;
@@ -2684,7 +2737,15 @@ function autoFightStat(stats) {
   return (stats.str ?? 0) >= (stats.dex ?? 0) ? 'str' : 'dex';
 }
 // Roll a d20 + modifier, returning { nat, total }.
-function autoRoll(mod) { const nat = rollDie(20); return { nat, total: nat + mod }; }
+function autoRoll(mod, adv = false) {
+  if (adv) {
+    const a = rollDie(20), b = rollDie(20);
+    const nat = Math.max(a, b);
+    return { nat, total: nat + mod, adv: true, dropped: Math.min(a, b) };
+  }
+  const nat = rollDie(20);
+  return { nat, total: nat + mod };
+}
 
 // Default: auto NPCs only spend a reroll token when the natural die was this or lower.
 const NPC_RR_NAT_MAX = 8;
@@ -2693,6 +2754,28 @@ function getNpcRrThreshold(gid) {
   const v = getConfig(gid)?.npc_rr_threshold;
   return (v === null || v === undefined) ? NPC_RR_NAT_MAX : v;
 }
+// ── Hero signature stat ───────────────────────────────────────────────────────
+// A Hero (GM-assigned class) may have one designated stat with 5+ points. Rolls
+// using that stat are made with advantage. The 5-point floor is checked live, so
+// if the stat later drops below 5 the advantage simply stops applying.
+const SIGNATURE_MIN = 5;
+function isHero(row) {
+  return String(row?.class || '').toLowerCase() === 'hero';
+}
+// Does this character/NPC row get advantage on `stat` right now?
+function hasSignatureAdvantage(row, stat) {
+  if (!row || !stat) return false;
+  if (!isHero(row)) return false;
+  if (String(row.signature_stat || '').toLowerCase() !== String(stat).toLowerCase()) return false;
+  return (row[stat] ?? 0) >= SIGNATURE_MIN;
+}
+// Upgrade a roll mode to advantage when the signature applies. An explicit
+// disadvantage from the caller still wins — the two cancel rather than stack.
+function applySignatureMode(row, stat, mode) {
+  if (mode === 'dis') return mode;
+  return hasSignatureAdvantage(row, stat) ? 'adv' : mode;
+}
+
 // Optional real @mention when announcing a player's turn (opt-in: /config fightping).
 function turnPing(gid, f) {
   if (!f || f.isNpc || !getConfig(gid)?.fight_ping) return '';
@@ -2736,7 +2819,7 @@ function downedWarning(downed) {
 
 // Build the same roll card a manual /fight atk or /fight def produces,
 // for an automatic best-stat roll (stat tracker + exact dice breakdown).
-async function autoFightCard(guild, gid, fighter, kind, stat, nat, total, targetName, isReroll = false, atkBonus = 0, flat = false) {
+async function autoFightCard(guild, gid, fighter, kind, stat, nat, total, targetName, isReroll = false, atkBonus = 0, flat = false, adv = false) {
   const statVal = fighter.stats[stat] ?? 0;
   const icon = kind === 'atk' ? '⚔️' : '🛡️';
   let rollLine;
@@ -2747,7 +2830,8 @@ async function autoFightCard(guild, gid, fighter, kind, stat, nat, total, target
     const eff = statVal + (kind === 'atk' ? atkBonus : 0);
     const modStr = eff > 0 ? ` +${eff}` : eff < 0 ? ` ${eff}` : '';
     const bonusTag = (kind === 'atk' && atkBonus) ? ` +${atkBonus} riposte` : '';
-    rollLine = `${icon}  1d20+${STAT_LABELS[stat]}${bonusTag} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+    const advTag = adv ? ' ⭐ (signature advantage)' : '';
+    rollLine = `${icon}  1d20+${STAT_LABELS[stat]}${bonusTag}${advTag} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
   }
   const who = `${fighter.name}${fighter.isNpc ? ' 🎭' : ''}`;
   const label = kind === 'atk'
@@ -2785,7 +2869,8 @@ async function applyAutoNpcRerolls(guild, gid, cid, channel) {
     const origNat = kind === 'atk' ? fight.atk_nat : fight.def_nat;
     const effMod = origTotal - origNat;
     const isFlat = kind === 'def' && effMod === 0 && (f.stats[stat] ?? 0) !== 0;
-    const roll = autoRoll(effMod);
+    const sigRow = f.isNpc ? getNpc(gid, f.name) : getChar(gid, fid);
+    const roll = autoRoll(effMod, !isFlat && hasSignatureAdvantage(sigRow, stat));
     rr[fid] = (rr[fid] ?? 0) - 1;
     if (kind === 'atk') upsertFight(gid, cid, { atk_roll: roll.total, atk_nat: roll.nat, rr_state: JSON.stringify(rr) });
     else upsertFight(gid, cid, { def_roll: roll.total, def_nat: roll.nat, rr_state: JSON.stringify(rr) });
@@ -2798,7 +2883,7 @@ async function applyAutoNpcRerolls(guild, gid, cid, channel) {
     await sleep(700);
     await channel.send(`🔁 **${f.name}** 🎭 spends a reroll token! (${rr[fid]} left)`).catch(()=>{});
     const bonus = kind === 'atk' ? Math.max(0, effMod - (f.stats[stat] ?? 0)) : 0;
-    const card = await autoFightCard(guild, gid, f, kind, stat, roll.nat, roll.total, targetName, true, bonus, isFlat);
+    const card = await autoFightCard(guild, gid, f, kind, stat, roll.nat, roll.total, targetName, true, bonus, isFlat, !!roll.adv);
     await postAsNpc(channel, gid, f.name, card);
     fight = getFight(gid, cid);
   };
@@ -2966,7 +3051,8 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
 
   const stat = autoFightStat(attacker.stats);
   const atkBonus = consumeAtkBonus(gid, cid, attackerId);
-  const a = autoRoll((attacker.stats[stat] ?? 0) + atkBonus);
+  const attRow = attacker.isNpc ? getNpc(gid, attacker.name) : getChar(gid, attackerId);
+  const a = autoRoll((attacker.stats[stat] ?? 0) + atkBonus, hasSignatureAdvantage(attRow, stat));
 
   upsertFight(gid, cid, {
     phase: 'defend', current_target: targetId,
@@ -2975,7 +3061,7 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   });
 
   // The NPC's own roll card posts AS the NPC (webhook), matching manual rolls.
-  const atkCard = await autoFightCard(guild, gid, attacker, 'atk', stat, a.nat, a.total, `${targetF.name}${targetF.isNpc ? ' 🎭' : ''}`, false, atkBonus);
+  const atkCard = await autoFightCard(guild, gid, attacker, 'atk', stat, a.nat, a.total, `${targetF.name}${targetF.isNpc ? ' 🎭' : ''}`, false, atkBonus, false, !!a.adv);
   await postAsNpc(channel, gid, attacker.name, atkCard);
   if (atkBonus) await channel.send(`✨ **${attacker.name}** presses the riposte (+${atkBonus}).`).catch(()=>{});
 
@@ -2996,11 +3082,12 @@ async function autoNpcDefend(guild, gid, cid, channel) {
   const defender = await resolveFighter(guild, gid, fight.current_target);
   const stat = autoFightStat(defender.stats);
   const flat = consumeFlatDef(gid, cid, fight.current_target);
-  const d = autoRoll(flat ? 0 : (defender.stats[stat] ?? 0));
+  const defRow = defender.isNpc ? getNpc(gid, defender.name) : getChar(gid, fight.current_target);
+  const d = autoRoll(flat ? 0 : (defender.stats[stat] ?? 0), !flat && hasSignatureAdvantage(defRow, stat));
 
   upsertFight(gid, cid, { def_roll: d.total, def_nat: d.nat, def_stat: stat, def_mode: 'normal', def_sides: 20 });
 
-  const defCard = await autoFightCard(guild, gid, defender, 'def', stat, d.nat, d.total, null, false, 0, flat);
+  const defCard = await autoFightCard(guild, gid, defender, 'def', stat, d.nat, d.total, null, false, 0, flat, !!d.adv);
   await postAsNpc(channel, gid, defender.name, defCard);
   if (flat) await channel.send(`🎲 **${defender.name}** defends on a flat d20 (fumbled last attack).`).catch(()=>{});
   return true;
@@ -3553,8 +3640,12 @@ async function handleFight(interaction) {
       const defFlat = !!fxState[defenderId]?.flatDef;
       if (fxState[attackerId]) delete fxState[attackerId].atkBonus;
       if (fxState[defenderId]) delete fxState[defenderId].flatDef;
-      let a = autoRoll((atkF.stats[aStat] ?? 0) + atkBonus);
-      let d = autoRoll(defFlat ? 0 : (defF.stats[dStat] ?? 0));
+      const atkRow = atkF.isNpc ? getNpc(gid, atkF.name) : getChar(gid, attackerId);
+      const defRow = defF.isNpc ? getNpc(gid, defF.name) : getChar(gid, defenderId);
+      const atkAdv = hasSignatureAdvantage(atkRow, aStat);
+      const defAdv = !defFlat && hasSignatureAdvantage(defRow, dStat);
+      let a = autoRoll((atkF.stats[aStat] ?? 0) + atkBonus, atkAdv);
+      let d = autoRoll(defFlat ? 0 : (defF.stats[dStat] ?? 0), defAdv);
       let { hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20);
 
       // Round header (system line)
@@ -3562,14 +3653,14 @@ async function handleFight(interaction) {
       await send(`─────────────────────────────\n**Round ${round}**`);
 
       // Attacker's roll card — posts AS the NPC if it's an NPC, else a normal card
-      const atkCard = await autoFightCard(interaction.guild, gid, atkF, 'atk', aStat, a.nat, a.total, `${defF.name}${defF.isNpc?' 🎭':''}`, false, atkBonus);
+      const atkCard = await autoFightCard(interaction.guild, gid, atkF, 'atk', aStat, a.nat, a.total, `${defF.name}${defF.isNpc?' 🎭':''}`, false, atkBonus, false, !!a.adv);
       await sleep(700);
       if (atkF.isNpc) await postAsNpc(channel, gid, atkF.name, atkCard);
       else await send(atkCard);
       if (atkBonus) await send(`✨ **${atkF.name}** presses the riposte (+${atkBonus}).`);
 
       // Defender's roll card — same treatment
-      const defCard = await autoFightCard(interaction.guild, gid, defF, 'def', dStat, d.nat, d.total, null, false, 0, defFlat);
+      const defCard = await autoFightCard(interaction.guild, gid, defF, 'def', dStat, d.nat, d.total, null, false, 0, defFlat, !!d.adv);
       await sleep(700);
       if (defF.isNpc) await postAsNpc(channel, gid, defF.name, defCard);
       else await send(defCard);
@@ -3580,20 +3671,20 @@ async function handleFight(interaction) {
       const rrMax = getNpcRrThreshold(gid);
       if (hit && d.nat <= rrMax && defF.isNpc && (rrTokens[defenderId] ?? 0) > 0) {
         rrTokens[defenderId]--;
-        d = autoRoll(defFlat ? 0 : (defF.stats[dStat] ?? 0));
+        d = autoRoll(defFlat ? 0 : (defF.stats[dStat] ?? 0), defAdv);
         await sleep(800);
         await send(`🔁 **${defF.name}** 🎭 spends a reroll token! (${rrTokens[defenderId]} left)`);
-        const rrCard = await autoFightCard(interaction.guild, gid, defF, 'def', dStat, d.nat, d.total, null, true, 0, defFlat);
+        const rrCard = await autoFightCard(interaction.guild, gid, defF, 'def', dStat, d.nat, d.total, null, true, 0, defFlat, !!d.adv);
         await postAsNpc(channel, gid, defF.name, rrCard);
         ensureLog(defenderId).rr++;
         ({ hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20));
       }
       if (!hit && a.nat <= rrMax && atkF.isNpc && (rrTokens[attackerId] ?? 0) > 0) {
         rrTokens[attackerId]--;
-        a = autoRoll((atkF.stats[aStat] ?? 0) + atkBonus);
+        a = autoRoll((atkF.stats[aStat] ?? 0) + atkBonus, atkAdv);
         await sleep(800);
         await send(`🔁 **${atkF.name}** 🎭 spends a reroll token! (${rrTokens[attackerId]} left)`);
-        const rrCard = await autoFightCard(interaction.guild, gid, atkF, 'atk', aStat, a.nat, a.total, `${defF.name}${defF.isNpc?' 🎭':''}`, true, atkBonus);
+        const rrCard = await autoFightCard(interaction.guild, gid, atkF, 'atk', aStat, a.nat, a.total, `${defF.name}${defF.isNpc?' 🎭':''}`, true, atkBonus, false, !!a.adv);
         await postAsNpc(channel, gid, atkF.name, rrCard);
         ensureLog(attackerId).rr++;
         ({ hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20));
@@ -3755,6 +3846,9 @@ async function handleFight(interaction) {
     const statVal = actor.stats[stat] ?? 0;
     // Consume a pending riposte bonus from a previous nat-20 defence.
     const atkBonus = consumeAtkBonus(gid, cid, actorId);
+    // Hero signature advantage (players and Hero NPCs alike)
+    const sigRowA = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
+    mode = applySignatureMode(sigRowA, stat, mode);
     const effTotal = statVal + atkBonus;
     let nat, total, rollLine;
     const bonusTag = atkBonus ? ` +${atkBonus} riposte` : '';
@@ -3848,6 +3942,9 @@ async function handleFight(interaction) {
     const statVal = defender.stats[stat] ?? 0;
     // A previous nat-1 attack forces this defence to be a flat d20 (no stat, no adv/dis).
     const flat = consumeFlatDef(gid, cid, defenderId);
+    // Hero signature advantage (ignored when the roll is forced flat)
+    const sigRowD = isNpcFighter(defenderId) ? getNpc(gid, npcNameFromFighter(defenderId)) : getChar(gid, defenderId);
+    if (!flat) mode = applySignatureMode(sigRowD, stat, mode);
     const effVal = flat ? 0 : statVal;
     const effMode = flat ? 'normal' : mode;
     const modStr = flat ? '' : (effVal > 0 ? ` +${effVal}` : effVal < 0 ? ` ${effVal}` : '');
@@ -4383,6 +4480,25 @@ async function handleNpc(interaction) {
     return interaction.reply({ content: `🎭 Copied **${src.name}** → **${newName}** (fresh ❤️ ${src.con + 2} / ${src.con + 2}${src.image_url ? ', avatar carried over' : ''}).` });
   }
 
+  if (sub === 'hero') {
+    const name = interaction.options.getString('name');
+    const npc = getNpc(gid, name);
+    if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found.`, ephemeral: true });
+    if (interaction.options.getBoolean('remove')) {
+      upsertNpc(gid, npc.name, { class: null, signature_stat: null });
+      return interaction.reply({ content: `✅ **${npc.name}** is no longer a Hero.` });
+    }
+    const stat = interaction.options.getString('stat');
+    if (!stat) {
+      upsertNpc(gid, npc.name, { class: 'Hero' });
+      return interaction.reply({ content: `🦸 **${npc.name}** is now a **Hero**. Give them a signature stat with \`/npc hero name:${npc.name} stat:…\`.` });
+    }
+    const val = npc[stat] ?? 0;
+    if (val < SIGNATURE_MIN) return interaction.reply({ content: `❌ **${npc.name}**'s ${STAT_LABELS[stat]} is **${val}** — a signature stat needs **${SIGNATURE_MIN}+**.`, ephemeral: true });
+    upsertNpc(gid, npc.name, { class: 'Hero', signature_stat: stat });
+    return interaction.reply({ content: `⭐ **${npc.name}** is a **Hero** with signature **${STAT_LABELS[stat]}** (${val}) — their ${STAT_LABELS[stat]} rolls now have **advantage**.` });
+  }
+
   if (sub === 'show') {
     const name = interaction.options.getString('name');
     const npc = getNpc(gid, name);
@@ -4395,6 +4511,7 @@ async function handleNpc(interaction) {
       `🦉 WIS ${npc.wis}   🍀 LCK ${npc.lck}`,
       `❤️ HP **${npc.hp_current} / ${npc.con + 2}**   🔁 ${Math.max(0, npc.lck ?? 0)} reroll token${(npc.lck ?? 0) === 1 ? '' : 's'} per fight`,
       `🖼️ Avatar: ${npc.image_url ? 'set' : '—'}${cats.length ? `   📁 ${cats.join(', ')}` : ''}`,
+      ...(isHero(npc) ? [`🦸 **Hero**${npc.signature_stat ? ` · ⭐ signature **${STAT_LABELS[npc.signature_stat]}**${hasSignatureAdvantage(npc, npc.signature_stat) ? ' (advantage active)' : ` (inactive — needs ${SIGNATURE_MIN}+)`}` : ''}`] : []),
     ];
     return interaction.reply({ content: lines.join('\n') });
   }
@@ -4720,6 +4837,7 @@ const HELP_CATEGORIES = {
       '`/char weaponemoji slot:Weapon 1 emoji:⚔️` — pick a weapon slot emoji',
       '`/char show [user]` — view a character sheet',
       '`/char export [format:Image]` — export your sheet as text or image',
+      '`/char signature user:@a stat:str` — set a Hero\'s signature stat (GM)',
       '`/profile on/off/show/save/load/saves` — manage profile display & snapshots',
       '`/weapon add/remove/list` — manage the server weapon list (GM)',
     ],
@@ -4766,6 +4884,7 @@ const HELP_CATEGORIES = {
       '`/npc heal names:all` · `/npc heal names:Goblin, Orc` — fully heal NPCs (GM)',
       '`/npc copy name:Goblin new_name:Goblin 2` — duplicate an NPC (GM)',
       '`/npc show name:Goblin` — full stat block for one NPC',
+      '`/npc hero name:X stat:str` — make an NPC a Hero with a signature stat (GM)',
       '`/npc list category:Bandits` — list only one category\'s NPCs',
       '`/npc list` · `/npc delete name:X`',
       '`/npc categorycreate/categorydelete/categorylist` — manage categories',
@@ -4972,21 +5091,24 @@ async function handleRollSlash(interaction) {
     notation = dice;
   }
 
+  // Hero signature advantage applies to stat rolls
+  const effMode = stat ? applySignatureMode(char, stat, mode) : mode;
+
   let result;
-  if (mode === 'adv') result = rollAdvantage(notation);
-  else if (mode === 'dis') result = rollDisadvantage(notation);
+  if (effMode === 'adv') result = rollAdvantage(notation);
+  else if (effMode === 'dis') result = rollDisadvantage(notation);
   else result = rollNotation(notation);
   if (!result) return interaction.reply({ content: '❌ Could not parse dice notation.', ephemeral: true });
 
   const finalLabel = label || (stat ? stat : null);
   saveRoll(gid, cid, uid, notation, finalLabel);
-  const critType = detectCrit(result, mode);
-  const naturalRoll = mode === 'normal' ? result.rolls[0] : result.chosen;
+  const critType = detectCrit(result, effMode);
+  const naturalRoll = effMode === 'normal' ? result.rolls[0] : result.chosen;
   const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides) : null;
-  const rollLine = buildRollLine(result, mode, critType, successResult);
+  const rollLine = buildRollLine(result, effMode, critType, successResult);
 
   mirrorRoll(gid, { userId: uid, channelId: cid,
-    input: `/roll ${stat ? `stat:${stat}` : `dice:${dice}`}${mode !== 'normal' ? ` mode:${mode}` : ''}${successCheck ? ' success_check:true' : ''}`,
+    input: `/roll ${stat ? `stat:${stat}` : `dice:${dice}`}${effMode !== 'normal' ? ` mode:${effMode}` : ''}${successCheck ? ' success_check:true' : ''}`,
     rollLine, context: successCheck ? 'success check' : null });
 
   if (char?.profile_enabled === 1) {
