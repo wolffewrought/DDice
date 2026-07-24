@@ -1125,6 +1125,7 @@ const slashCommands = [
       .addBooleanOption(o=>o.setName('disable').setDescription('true = turn sheet approval off').setRequired(false)))
     .addSubcommand(s=>s.setName('rollaudit').setDescription('Mirror every player roll to a GM-only channel')
       .addChannelOption(o=>o.setName('channel').setDescription('Channel to mirror rolls into').setRequired(false))
+      .addBooleanOption(o=>o.setName('test').setDescription('true = send a test mirror and report any problem').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = turn the mirror off').setRequired(false)))
     .addSubcommand(s=>s.setName('cleanwebhooks').setDescription('Remove orphaned NPC webhooks to free up Discord limits')),
 
@@ -1582,6 +1583,22 @@ async function handleConfig(interaction) {
   if (sub === 'rollaudit') {
     const channel = interaction.options.getChannel('channel');
     const disable = interaction.options.getBoolean('disable');
+    const test = interaction.options.getBoolean('test');
+
+    if (test) {
+      const chId = getConfig(gid)?.roll_audit_channel_id;
+      if (!chId) return interaction.reply({ content: '🔇 No audit channel is set. Use `/config rollaudit channel:#x` first.', ephemeral: true });
+      let target;
+      try { target = await interaction.client.channels.fetch(chId); }
+      catch (e) { return interaction.reply({ content: `❌ I can't see <#${chId}> (id \`${chId}\`).\n**${e?.message || e}**\nAdd the bot to that channel with View Channel + Send Messages.`, ephemeral: true }); }
+      if (!target) return interaction.reply({ content: `❌ Channel \`${chId}\` no longer exists. Set a new one with \`/config rollaudit channel:#x\`.`, ephemeral: true });
+      try {
+        await target.send({ content: '🎲 **Roll audit test** — mirroring is working. Player rolls will appear here.' });
+        return interaction.reply({ content: `✅ Test message sent to <#${chId}>. If you can see it there, mirroring works.\n\n_Mirrored: player rolls, heals, fight rolls, and GM rolls (including secret ones). Not mirrored: NPC auto-rolls and rolls made inside the audit channel itself._`, ephemeral: true });
+      } catch (e) {
+        return interaction.reply({ content: `❌ I can see <#${chId}> but can't post there.\n**${e?.message || e}**\nGive the bot **Send Messages** in that channel.`, ephemeral: true });
+      }
+    }
     if (disable) {
       setConfig(gid, { roll_audit_channel_id: null });
       return interaction.reply({ content: '🔇 Roll mirroring **disabled**.' });
@@ -1589,12 +1606,12 @@ async function handleConfig(interaction) {
     if (!channel) {
       const cur = getConfig(gid)?.roll_audit_channel_id;
       return interaction.reply({ content: cur
-        ? `🎲 Player rolls are mirrored to <#${cur}>. Change with \`/config rollaudit channel:#x\` or turn off with \`disable:true\`.`
+        ? `🎲 Player rolls are mirrored to <#${cur}> (id \`${cur}\`).\nCheck it works with \`/config rollaudit test:true\`, change with \`channel:#x\`, or turn off with \`disable:true\`.`
         : '🔇 Roll mirroring is **off**. Set a channel with `/config rollaudit channel:#x`.', ephemeral: true });
     }
     if (!channel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
     setConfig(gid, { roll_audit_channel_id: channel.id });
-    return interaction.reply({ content: `🎲 Player rolls will be mirrored to <#${channel.id}> — raw input, result, and a jump link.\n⚠️ Make sure that channel's permissions only let GMs view it; the bot can't set that for you.` });
+    return interaction.reply({ content: `🎲 Rolls will be mirrored to <#${channel.id}> — raw input, result, and a jump link.\nCovers player rolls **and GM rolls, including secret ones**, so GMs are accountable to each other.\n⚠️ Make sure that channel's permissions only let GMs view it; the bot can't set that for you.` });
   }
   if (sub === 'npcreroll') {
     const v = interaction.options.getInteger('threshold');
@@ -2177,6 +2194,16 @@ async function handleGmRoll(message, rest, secret) {
     lines.push(`*${parsed.flavour}*`);
   }
   const content = lines.join('\n');
+
+  // Mirror GM rolls to the audit channel too — including secret ones, so other
+  // GMs can see them. Secret rolls stay hidden from players (DM + private
+  // audit channel); only the audit copy is marked so it's clear it was secret.
+  mirrorRoll(gid, {
+    userId: uid, channelId: message.channel.id, messageId: message.id,
+    input: message.content, rollLine,
+    context: secret ? 'GM roll · 🔒 secret' : 'GM roll',
+  });
+
   if (secret) {
     try {
       await message.author.send(`🔒 **Secret GM Roll**\n${content}`);
@@ -3038,9 +3065,10 @@ function turnPing(gid, f) {
   if (!f || f.isNpc || !getConfig(gid)?.fight_ping) return '';
   return ` <@${f.id}>`;
 }
-// Mirror a player's roll to the GM audit channel (set with /config rollaudit).
+// Mirror a roll to the GM audit channel (set with /config rollaudit).
 // Fire-and-forget: an unset, deleted, or unreadable channel must never break
-// the roll itself. GM rolls (gmr/gmrs) and NPC auto-rolls are never mirrored.
+// the roll itself. Covers player rolls AND GM rolls (including secret ones, so
+// GMs are accountable to each other). NPC auto-rolls are not mirrored.
 function mirrorRoll(gid, { userId, channelId, messageId = null, input, rollLine, context = null }) {
   const chId = getConfig(gid)?.roll_audit_channel_id;
   if (!chId || chId === channelId) return; // no audit channel, or rolling inside it
@@ -3053,7 +3081,11 @@ function mirrorRoll(gid, { userId, channelId, messageId = null, input, rollLine,
       content: `🎲 <@${userId}> in <#${channelId}>${ctx} — \`${clean}\`\n${rollLine}${link}`,
       allowedMentions: { parse: [] }, // identity without pinging anyone
     });
-  })().catch(() => {});
+  })().catch(err => {
+    // Never break the roll itself, but do leave a trace — a silent mirror is
+    // impossible to diagnose. Surfaced to the GM by /config rollaudit test.
+    console.error(`[rollaudit] mirror to ${chId} failed:`, err?.message || err);
+  });
 }
 
 // Split a fighter id list into those able to fight (HP > 0) and those downed.
@@ -4138,8 +4170,9 @@ async function handleFight(interaction) {
       nat = rollDie(20); total = nat + effTotal;
       rollLine = `⚔️  1d20+${STAT_LABELS[stat]}${bonusTag} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
-    if (!isNpcFighter(actorId)) mirrorRoll(gid, { userId: uid, channelId: cid,
-      input: `/fight atk stat:${stat}`, rollLine, context: `fight · attacks ${targetF.name}` });
+    mirrorRoll(gid, { userId: uid, channelId: cid,
+      input: `/fight atk stat:${stat}${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine,
+      context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 attacks ${targetF.name}` : `fight · attacks ${targetF.name}` });
 
     const targetName = targetF.name + (targetF.isNpc ? ' 🎭' : '');
     const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
@@ -4236,8 +4269,9 @@ async function handleFight(interaction) {
       const label = flat ? `🛡️  1d20${flatTag}` : `🛡️  1d20+${STAT_LABELS[stat]}`;
       rollLine = `${label} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
-    if (!isNpcFighter(defenderId)) mirrorRoll(gid, { userId: uid, channelId: cid,
-      input: `/fight def stat:${stat}`, rollLine, context: 'fight · defends' });
+    mirrorRoll(gid, { userId: uid, channelId: cid,
+      input: `/fight def stat:${stat}${isNpcFighter(defenderId) ? ` npc:${defender.name}` : ''}`, rollLine,
+      context: isNpcFighter(defenderId) ? `fight · GM as ${defender.name} 🎭 defends` : 'fight · defends' });
 
     const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
     const defCard = await fighterCharCard(interaction.guild, gid, defenderId);
@@ -5185,7 +5219,8 @@ const HELP_CATEGORIES = {
       '`/config heal charges:N` — set default heal charges',
       '`/config npcreroll threshold:N` — NPC auto-reroll on nat ≤ N · 0 disables · omit to show',
       '`/config fightping enabled:true` — @-mention players on their turn · off by default (Admin)',
-      '`/config rollaudit channel:#x` — mirror all player rolls to a GM-only channel (Admin)',
+      '`/config rollaudit channel:#x` — mirror all rolls (players + GMs) to a GM-only channel (Admin)',
+      '`/config rollaudit test:true` — send a test mirror and report any problem (Admin)',
       '`/config approvals channel:#x` — new sheets need GM approval before use (Admin)',
       '`/config npcstats enabled:true` — reveal NPC stat blocks on roll cards · hidden by default (Admin)',
       '`/config npcchannel #channel` — set the NPC avatar channel',
