@@ -1354,14 +1354,11 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('pr').setDescription('Roll or manage NPCs as a GM persona (GM only)')
-    .addSubcommand(s=>s.setName('say').setDescription('Speak or act as an NPC — no dice rolled')
+    .addSubcommand(s=>s.setName('say').setDescription('Speak or act as an NPC — leave both blank for a writing box')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
-      .addStringOption(o=>o.setName('message').setDescription('What the NPC says or does — *italic* and **bold** work').setRequired(true))
-      .addStringOption(o=>o.setName('style').setDescription('How to present it').setRequired(false)
-        .addChoices(
-          {name:'💬 Speech — plain text',value:'plain'},
-          {name:'🎭 Action — italic emote',value:'action'},
-          {name:'❝ Quote — block quote',value:'quote'})))
+      .addStringOption(o=>o.setName('action').setDescription('What the NPC does — posted in italics').setRequired(false))
+      .addStringOption(o=>o.setName('speech').setDescription('What the NPC says — wrapped in quote marks').setRequired(false))
+      .addStringOption(o=>o.setName('raw').setDescription('Post exactly as typed — overrides action/speech').setRequired(false)))
     .addSubcommand(s=>s.setName('roll').setDescription('Roll as an NPC via webhook')
       .addStringOption(o=>o.setName('category').setDescription('Filter NPCs by category').setRequired(true)
         .addChoices({name:'All',value:'all'}))
@@ -2614,6 +2611,11 @@ client.on('interactionCreate', async interaction => {
   }
 
   // Handle confirmation buttons
+  if (interaction.isModalSubmit?.()) {
+    if (interaction.customId.startsWith('npcsay:')) return handleNpcSayModal(interaction);
+    return;
+  }
+
   if (interaction.isButton()) {
     if (interaction.customId.startsWith('confirm:') || interaction.customId.startsWith('cancel:')) {
       return handleConfirmButton(interaction);
@@ -5174,15 +5176,38 @@ async function handlePr(interaction) {
 
   if (sub === 'say') {
     const name = interaction.options.getString('name');
-    const text = interaction.options.getString('message');
-    const style = interaction.options.getString('style') || 'plain';
+    const action = interaction.options.getString('action');
+    const speech = interaction.options.getString('speech');
+    const raw = interaction.options.getString('raw');
     const npc = getNpc(gid, name);
     if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found. Create one with \`/npc create\`.`, ephemeral: true });
+
+    // Nothing supplied → open a proper writing box with multi-line fields.
+    if (!action && !speech && !raw) {
+      const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+      const modal = new ModalBuilder()
+        .setCustomId(`npcsay:${npc.name}`.slice(0, 100))
+        .setTitle(`Speak as ${npc.name}`.slice(0, 45));
+      const actionInput = new TextInputBuilder()
+        .setCustomId('action').setLabel('Action (optional)')
+        .setPlaceholder('draws his blade').setStyle(TextInputStyle.Paragraph)
+        .setRequired(false).setMaxLength(900);
+      const speechInput = new TextInputBuilder()
+        .setCustomId('speech').setLabel('Speech (optional)')
+        .setPlaceholder('Halt! Who goes there?').setStyle(TextInputStyle.Paragraph)
+        .setRequired(false).setMaxLength(900);
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(actionInput),
+        new ActionRowBuilder().addComponents(speechInput),
+      );
+      return interaction.showModal(modal);
+    }
+
+    const text = composeNpcSay({ action, speech, raw });
+    if (!text) return interaction.reply({ content: '❌ Nothing to post.', ephemeral: true });
     if (text.length > 1800) return interaction.reply({ content: '❌ Message too long (max 1800 characters).', ephemeral: true });
 
-    const body = style === 'action' ? `*${text}*`
-               : style === 'quote'  ? text.split('\n').map(l => `> ${l}`).join('\n')
-               : text;
+    const body = text;
 
     const chan = await interactionChannel(interaction);
     if (!chan) return interaction.reply({ content: '❌ I can\'t access this channel.', ephemeral: true });
@@ -5930,6 +5955,22 @@ async function handleRank(interaction) {
 }
 
 
+// Compose an NPC's post from an optional action and an optional speech line.
+// Action is italicised, speech is wrapped in quote marks (unless the writer
+// already quoted it), and both together stack on separate lines.
+function composeNpcSay({ action, speech, raw }) {
+  if (raw && raw.trim()) return raw.trim();
+  const parts = [];
+  const act = (action || '').trim();
+  const say = (speech || '').trim();
+  if (act) parts.push(`*${act}*`);
+  if (say) {
+    const alreadyQuoted = /^["\u201c][\s\S]*["\u201d]$/.test(say);
+    parts.push(alreadyQuoted ? say : `"${say}"`);
+  }
+  return parts.join('\n');
+}
+
 // ── QUEST helpers (rendering + routing) ───────────────────────────────────────
 function questStatusBadge(status) {
   return status === 'open' ? '🟢 Open' : status === 'active' ? '🟡 In progress' : status === 'completed' ? '🔵 Completed' : status;
@@ -6291,6 +6332,27 @@ async function handleSheetApprovalButton(interaction) {
     ? `✅ <@${uid}> (**${nm}**) approved — they can roll and fight now.`
     : `🚫 <@${uid}> (**${nm}**) rejected — they'll need a GM to adjust the sheet.`) + delivery,
     allowedMentions: { parse: [] } });
+}
+
+// Submission from the /pr say writing box.
+async function handleNpcSayModal(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can post as NPCs.', ephemeral: true });
+  const npcName = interaction.customId.slice('npcsay:'.length);
+  const npc = getNpc(gid, npcName);
+  if (!npc) return interaction.reply({ content: `❌ NPC **${npcName}** no longer exists.`, ephemeral: true });
+
+  const action = interaction.fields.getTextInputValue('action');
+  const speech = interaction.fields.getTextInputValue('speech');
+  const body = composeNpcSay({ action, speech });
+  if (!body) return interaction.reply({ content: '❌ Both boxes were empty — nothing posted.', ephemeral: true });
+  if (body.length > 1800) return interaction.reply({ content: '❌ Too long (max 1800 characters).', ephemeral: true });
+
+  const chan = await interactionChannel(interaction);
+  if (!chan) return interaction.reply({ content: '❌ I can\'t access this channel.', ephemeral: true });
+  await postAsNpc(chan, gid, npc.name, body);
+  return interaction.reply({ content: `🎭 Posted as **${npc.name}**.`, ephemeral: true });
 }
 
 async function handleQuestButton(interaction) {
