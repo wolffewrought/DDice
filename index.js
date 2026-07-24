@@ -56,6 +56,7 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_role_ids TEXT'); } catch {
 try { db.exec('ALTER TABLE guild_config ADD COLUMN approval_channel_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN approval_state TEXT'); } catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN approval_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_stats_visible INTEGER DEFAULT 0'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN log_state TEXT DEFAULT '{}'"); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN effect_state TEXT DEFAULT '{}'"); } catch {}
 try {
@@ -694,15 +695,21 @@ function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharg
   }
   if (char.order_name) lines.push(`${KNIGHT_EMOJIS[char.order_name]??'⚪'}  ${char.order_name}`);
   if (char.class) lines.push(`🏅  ${char.class}`);
-  lines.push(`❤️  HP${pad(char.hp_current)} / ${maxHp(char)}`);
-  lines.push(`🔄  Rerolls${pad(char.rerolls_current)} / ${maxRerolls(char)}`);
+  // NPC stat blocks are hidden from players by default so their capabilities stay
+  // a mystery. A GM can reveal them with /config npcstats enabled:true.
+  const hideNpcStats = char._isNpc && !(gid && getConfig(gid)?.npc_stats_visible);
+  if (hideNpcStats) lines.push(`❤️  ${hpCondition(char.hp_current, maxHp(char))}`);
+  else lines.push(`❤️  HP${pad(char.hp_current)} / ${maxHp(char)}`);
+  if (!char._isNpc) lines.push(`🔄  Rerolls${pad(char.rerolls_current)} / ${maxRerolls(char)}`);
   if (isWhiteKnight(char)) lines.push(`🛡️  Heal${pad(healCharges)} / ${maxCharges}`);
-  lines.push('');
-  lines.push(`💪  STR${pad(char.str)}`);
-  lines.push(`🫀  CON${pad(char.con)}`);
-  lines.push(`⚡  DEX${pad(char.dex)}`);
-  lines.push(`🧠  WIS${pad(char.wis)}`);
-  lines.push(`🍀  LCK${pad(char.lck)}`);
+  if (!hideNpcStats) {
+    lines.push('');
+    lines.push(`💪  STR${pad(char.str)}`);
+    lines.push(`🫀  CON${pad(char.con)}`);
+    lines.push(`⚡  DEX${pad(char.dex)}`);
+    lines.push(`🧠  WIS${pad(char.wis)}`);
+    lines.push(`🍀  LCK${pad(char.lck)}`);
+  }
   if (char.weapon1 || char.weapon2) {
     lines.push('');
     if (char.weapon1) lines.push(`${char.weapon1emoji??'⚔️'}  ${char.weapon1}`);
@@ -1111,6 +1118,8 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('threshold').setDescription('1–19, or 0 to disable (default 8); omit to show current').setRequired(false).setMinValue(0).setMaxValue(19)))
     .addSubcommand(s=>s.setName('fightping').setDescription('@-mention players when it becomes their turn in a fight')
       .addBooleanOption(o=>o.setName('enabled').setDescription('true = ping, false = silent (default); omit to show current').setRequired(false)))
+    .addSubcommand(s=>s.setName('npcstats').setDescription('Show NPC stat blocks on their roll cards (default: hidden)')
+      .addBooleanOption(o=>o.setName('enabled').setDescription('true = players see NPC stats; false = hidden (default)').setRequired(false)))
     .addSubcommand(s=>s.setName('approvals').setDescription('Channel where new character sheets await GM approval')
       .addChannelOption(o=>o.setName('channel').setDescription('Approval channel').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = turn sheet approval off').setRequired(false)))
@@ -1541,6 +1550,17 @@ async function handleConfig(interaction) {
     }
     setConfig(gid, { fight_ping: v ? 1 : 0 });
     return interaction.reply({ content: v ? '🔔 Turn pings **on** — players get an @mention when it\'s their turn.' : '🔕 Turn pings **off**.' });
+  }
+  if (sub === 'npcstats') {
+    const v = interaction.options.getBoolean('enabled');
+    if (v === null) {
+      const cur = !!getConfig(gid)?.npc_stats_visible;
+      return interaction.reply({ content: `🎭 NPC stat blocks are **${cur ? 'visible' : 'hidden'}**${cur ? '' : ' (default)'} on roll cards. Change with \`/config npcstats enabled:true\`.`, ephemeral: true });
+    }
+    setConfig(gid, { npc_stats_visible: v ? 1 : 0 });
+    return interaction.reply({ content: v
+      ? '🎭 NPC stat blocks are now **visible** to everyone on roll cards.'
+      : '🎭 NPC stat blocks are now **hidden** — players see the name, order and HP, but not STR/CON/DEX/WIS/LCK.' });
   }
   if (sub === 'approvals') {
     const channel = interaction.options.getChannel('channel');
@@ -2909,6 +2929,30 @@ function getNpcRrThreshold(gid) {
   const v = getConfig(gid)?.npc_rr_threshold;
   return (v === null || v === undefined) ? NPC_RR_NAT_MAX : v;
 }
+// ── NPC HP visibility ─────────────────────────────────────────────────────────
+// Players shouldn't know an NPC's HP pool, but damage dealt should still be
+// obvious. When hidden we report the damage and a coarse condition instead of
+// exact numbers. GMs see real figures via /npc show, /npc list and /fight hp.
+function npcStatsVisible(gid) {
+  return !!getConfig(gid)?.npc_stats_visible;
+}
+// Coarse health descriptor from a ratio — enough to follow a fight's momentum.
+function hpCondition(cur, max) {
+  if (cur <= 0) return '💀 down';
+  const pct = max > 0 ? cur / max : 1;
+  if (pct >= 0.85) return '💚 unhurt';
+  if (pct >= 0.55) return '💛 wounded';
+  if (pct >= 0.25) return '🧡 badly hurt';
+  return '❤️‍🩹 near death';
+}
+// The "X → Y" line after damage. For hidden NPCs: damage plus condition only.
+function hpChangeLine(gid, isNpc, name, prevHp, newHp, maxHpVal) {
+  if (isNpc && !npcStatsVisible(gid)) {
+    return `❤️ ${name}: ${hpCondition(newHp, maxHpVal)}`;
+  }
+  return `❤️ ${name} HP: **${prevHp} → ${newHp}**`;
+}
+
 // ── Character sheet approval ──────────────────────────────────────────────────
 // approval_state: null = legacy sheet (pre-feature, treated as approved),
 // 'pending' = awaiting a GM, 'approved' = usable, 'rejected' = blocked.
@@ -3024,9 +3068,11 @@ async function partitionDowned(guild, gid, fighters) {
 }
 
 // Warning line listing fighters left out for being at 0 HP or less.
-function downedWarning(downed) {
+function downedWarning(downed, gid) {
   if (!downed.length) return null;
-  const names = downed.map(d => `**${d.name}**${d.isNpc ? ' 🎭' : ''} (❤️ ${d.hp})`).join(', ');
+  // Don't print an NPC's exact (negative) HP when NPC stats are hidden.
+  const hide = gid ? !npcStatsVisible(gid) : false;
+  const names = downed.map(d => `**${d.name}**${d.isNpc ? ' 🎭' : ''}${(d.isNpc && hide) ? '' : ` (❤️ ${d.hp})`}`).join(', ');
   return `⚠️ Left out — knocked down: ${names}. Restore NPCs with \`/npc hp\`, players with \`hpfull @user\` or a rest.`;
 }
 
@@ -3041,10 +3087,14 @@ async function autoFightCard(guild, gid, fighter, kind, stat, nat, total, target
     rollLine = `${icon}  1d20 (flat — fumbled last attack) → [${nat}] = ${fightTotalStr(total, nat, 20)}`;
   } else {
     const eff = statVal + (kind === 'atk' ? atkBonus : 0);
-    const modStr = eff > 0 ? ` +${eff}` : eff < 0 ? ` ${eff}` : '';
     const bonusTag = (kind === 'atk' && atkBonus) ? ` +${atkBonus} riposte` : '';
     const advTag = adv ? ' ⭐ (signature advantage)' : '';
-    rollLine = `${icon}  1d20+${STAT_LABELS[stat]}${bonusTag}${advTag} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+    // When NPC stats are hidden, don't print the modifier — it would give the
+    // exact stat away. The natural die and final total still show.
+    const hideMods = fighter.isNpc && !getConfig(gid)?.npc_stats_visible;
+    const modStr = hideMods ? '' : (eff > 0 ? ` +${eff}` : eff < 0 ? ` ${eff}` : '');
+    const statName = hideMods ? '' : `+${STAT_LABELS[stat]}`;
+    rollLine = `${icon}  1d20${statName}${bonusTag}${advTag} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
   }
   const who = `${fighter.name}${fighter.isNpc ? ' 🎭' : ''}`;
   const label = kind === 'atk'
@@ -3349,7 +3399,7 @@ async function autoResolveExchange(guild, gid, cid, channel) {
     hpState[defenderId] = newHp;
     setFighterHp(gid, defenderId, newHp);
     lines.push(`💥 **${atkName}** hits **${defName}** for **${dmg}** damage!`);
-    lines.push(`❤️ ${defName} HP: **${prevHp} → ${newHp}**`);
+    lines.push(hpChangeLine(gid, defF.isNpc, defName, prevHp, newHp, defF.maxHp));
     for (const l of effectNoteLines(effNotes, atkName, defName)) lines.push(l);
 
     if (newHp <= 0) {
@@ -3476,7 +3526,7 @@ async function handleFight(interaction) {
 
     // Leave out anyone already knocked down (they'd silently never act)
     const { active: startActive, downed: startDowned } = await partitionDowned(interaction.guild, gid, fighters);
-    const startWarn = downedWarning(startDowned);
+    const startWarn = downedWarning(startDowned, gid);
     if (startActive.length < 2) {
       return interaction.reply({ content: `❌ Need at least 2 fighters with HP above 0.${startWarn ? `\n${startWarn}` : ''}`, ephemeral: true });
     }
@@ -3766,7 +3816,7 @@ async function handleFight(interaction) {
 
     // Leave out anyone already knocked down (they'd silently never act)
     const { active: autoActive, downed: autoDowned } = await partitionDowned(interaction.guild, gid, fighters);
-    const autoWarn = downedWarning(autoDowned);
+    const autoWarn = downedWarning(autoDowned, gid);
     if (autoActive.length < 2) {
       return interaction.reply({ content: `❌ Need at least 2 fighters with HP above 0.${autoWarn ? `\n${autoWarn}` : ''}`, ephemeral: true });
     }
@@ -3920,7 +3970,9 @@ async function handleFight(interaction) {
       if (hit) {
         hp[defenderId] -= dmg;
         setFighterHp(gid, defenderId, hp[defenderId]); // keep sheets live so the next card is accurate
-        outcome = `💥 Hit for **${dmg}**! ${defF.name} HP: **${hp[defenderId] + dmg} → ${Math.max(hp[defenderId],0)}**`;
+        outcome = `💥 Hit for **${dmg}**! ` + (defF.isNpc && !npcStatsVisible(gid)
+          ? `${defF.name}: ${hpCondition(hp[defenderId], defF.maxHp)}`
+          : `${defF.name} HP: **${hp[defenderId] + dmg} → ${Math.max(hp[defenderId],0)}**`);
         if (hp[defenderId] <= 0) outcome += `\n💀 **${defF.name}** is knocked down!`;
       } else {
         outcome = `🛡️ **${defF.name}** blocks — no damage.`;
@@ -4323,7 +4375,7 @@ async function handleFight(interaction) {
       // Persist to the right table (character or NPC)
       setFighterHp(gid, defenderId, newHp);
       lines.push(`💥 **${atkName}** hits **${defName}** for **${dmg}** damage!`);
-      lines.push(`❤️ ${defName} HP: **${prevHp} → ${newHp}**`);
+      lines.push(hpChangeLine(gid, defF.isNpc, defName, prevHp, newHp, defF.maxHp));
       for (const l of effectNoteLines(effNotes, atkName, defName)) lines.push(l);
 
       if (newHp <= 0) {
@@ -4447,6 +4499,8 @@ async function handleFight(interaction) {
     for (let i = 0; i < turnOrder.length; i++) {
       const fid = turnOrder[i];
       const f = await resolveFighter(interaction.guild, gid, fid);
+      const rawHp = hpState[fid] ?? 0;
+      const hideHp = f.isNpc && !npcStatsVisible(gid);
       const hp = hpState[fid] ?? '?';
       const arrow = fid === currentId ? ' ◀ current' : '';
       const hpMax = f.maxHp || '?';
@@ -4456,7 +4510,8 @@ async function handleFight(interaction) {
       if (fx.atkBonus) fxBits.push(`✨ +${fx.atkBonus} next attack`);
       if (fx.flatDef) fxBits.push('🎲 flat-d20 next defence');
       const fxNote = fxBits.length ? ` · ${fxBits.join(' · ')}` : '';
-      lines.push(`${i+1}. **${f.name}${f.isNpc ? ' 🎭' : ''}** — ❤️ ${hp} / ${hpMax}${rrNote}${fxNote}${arrow}`);
+      const hpText = hideHp ? hpCondition(rawHp, f.maxHp) : `❤️ ${hp} / ${hpMax}`;
+      lines.push(`${i+1}. **${f.name}${f.isNpc ? ' 🎭' : ''}** — ${hpText}${rrNote}${fxNote}${arrow}`);
     }
     lines.push('');
     lines.push(`Phase: **${fight.phase === 'attack' ? 'Waiting for attack' : 'Waiting for defence'}**`);
@@ -5132,6 +5187,7 @@ const HELP_CATEGORIES = {
       '`/config fightping enabled:true` — @-mention players on their turn · off by default (Admin)',
       '`/config rollaudit channel:#x` — mirror all player rolls to a GM-only channel (Admin)',
       '`/config approvals channel:#x` — new sheets need GM approval before use (Admin)',
+      '`/config npcstats enabled:true` — reveal NPC stat blocks on roll cards · hidden by default (Admin)',
       '`/config npcchannel #channel` — set the NPC avatar channel',
       '`/config rest type:Short Rest hp:50% rerolls:0%` — tune what a rest restores (use % of max or a flat number)',
       '`/config cleanwebhooks` — remove orphaned NPC webhooks',
