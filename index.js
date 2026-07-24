@@ -1327,6 +1327,25 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('saves').setDescription('List all your saved snapshots')),
 
   new SlashCommandBuilder()
+    .setName('roll').setDescription('Roll dice with optional stat, advantage and RP flavour')
+    .addStringOption(o=>o.setName('stat').setDescription('Roll 1d20 + this stat from your sheet').setRequired(false)
+      .addChoices(
+        {name:'💪 Strength (STR)',value:'str'},
+        {name:'🛡️ Constitution (CON)',value:'con'},
+        {name:'⚡ Dexterity (DEX)',value:'dex'},
+        {name:'🦉 Wisdom (WIS)',value:'wis'},
+        {name:'🍀 Luck (LCK)',value:'lck'}))
+    .addStringOption(o=>o.setName('dice').setDescription('Custom notation instead of a stat, e.g. 2d6+3').setRequired(false))
+    .addStringOption(o=>o.setName('mode').setDescription('Advantage or disadvantage').setRequired(false)
+      .addChoices(
+        {name:'Normal',value:'normal'},
+        {name:'🔼 Advantage (roll twice, keep higher)',value:'adv'},
+        {name:'🔽 Disadvantage (roll twice, keep lower)',value:'dis'}))
+    .addBooleanOption(o=>o.setName('success_check').setDescription('Show a success/partial/fail outcome').setRequired(false))
+    .addStringOption(o=>o.setName('label').setDescription('What the roll is for, e.g. perception').setRequired(false))
+    .addStringOption(o=>o.setName('flavour').setDescription('RP text posted with the roll — *italic* and **bold** work').setRequired(false)),
+
+  new SlashCommandBuilder()
     .setName('merit').setDescription('Track player merit / experience (GM only)')
     .addSubcommand(s=>s.setName('add').setDescription('Award merits to a player (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Player').setRequired(true))
@@ -2292,6 +2311,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'help') return await handleHelp(interaction);
     if (interaction.commandName === 'lastroll') return await handleLastRoll(interaction);
     if (interaction.commandName === 'backup') return await handleBackup(interaction);
+    if (interaction.commandName === 'roll') return await handleRollSlash(interaction);
     if (interaction.commandName === 'merit') return await handleMerit(interaction);
     if (interaction.commandName === 'rank') return await handleRank(interaction);
     if (interaction.commandName === 'quest') return await handleQuest(interaction);
@@ -4684,6 +4704,7 @@ const HELP_CATEGORIES = {
       '`ra1d20+5` — roll with **advantage** (drops lowest)',
       '`rd1d20+5` — roll with **disadvantage** (drops highest)',
       '`rr` / `rra` / `rrd` — reroll (costs a token)',
+      '`/roll` — guided roll: pick a stat, advantage, success check, label and RP flavour',
       '`str` / `con` / `dex` / `wis` / `lck` — quick stat roll (the `r` prefix is optional)',
       '`wisa` / `dexd` — quick stat roll with **advantage** / **disadvantage**',
       '`strrr` / `dexrra` / `conrrd` — reroll using a stat set · add a label like `strrr atk`',
@@ -4922,6 +4943,64 @@ function makeConfirmButtons(token) {
   return row;
 }
 
+
+// ── /roll (slash) ─────────────────────────────────────────────────────────────
+// Same roll engine and card format as the prefix commands, but every part is a
+// dropdown or field so nothing has to be memorised. `stat` and `dice` are
+// alternatives; a stat resolves to 1d20+STAT from the caller's sheet.
+async function handleRollSlash(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const cid = interactionChannelId(interaction);
+  const stat = interaction.options.getString('stat');
+  const dice = (interaction.options.getString('dice') || '').trim();
+  const mode = interaction.options.getString('mode') || 'normal';
+  const successCheck = interaction.options.getBoolean('success_check') ?? false;
+  const label = (interaction.options.getString('label') || '').trim() || null;
+  const flavour = (interaction.options.getString('flavour') || '').trim() || null;
+
+  if (stat && dice) return interaction.reply({ content: '❌ Pick either a **stat** or custom **dice**, not both.', ephemeral: true });
+  if (!stat && !dice) return interaction.reply({ content: '❌ Choose a **stat** or enter **dice** (e.g. `2d6+3`).', ephemeral: true });
+
+  const char = getChar(gid, uid);
+  let notation;
+  if (stat) {
+    if (!char) return interaction.reply({ content: '❌ No character sheet found. Use `/char create` first, or roll custom `dice`.', ephemeral: true });
+    notation = `1d20+${char[stat] ?? 0}`;
+  } else {
+    const m = dice.match(/^\d+d\d+(?:[+-]\d+)?$/i);
+    if (!m) return interaction.reply({ content: '❌ Invalid notation. Try `1d20`, `1d20+5` or `2d6+3`.', ephemeral: true });
+    notation = dice;
+  }
+
+  let result;
+  if (mode === 'adv') result = rollAdvantage(notation);
+  else if (mode === 'dis') result = rollDisadvantage(notation);
+  else result = rollNotation(notation);
+  if (!result) return interaction.reply({ content: '❌ Could not parse dice notation.', ephemeral: true });
+
+  const finalLabel = label || (stat ? stat : null);
+  saveRoll(gid, cid, uid, notation, finalLabel);
+  const critType = detectCrit(result, mode);
+  const naturalRoll = mode === 'normal' ? result.rolls[0] : result.chosen;
+  const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides) : null;
+  const rollLine = buildRollLine(result, mode, critType, successResult);
+
+  mirrorRoll(gid, { userId: uid, channelId: cid,
+    input: `/roll ${stat ? `stat:${stat}` : `dice:${dice}`}${mode !== 'normal' ? ` mode:${mode}` : ''}${successCheck ? ' success_check:true' : ''}`,
+    rollLine, context: successCheck ? 'success check' : null });
+
+  if (char?.profile_enabled === 1) {
+    const cfg = getConfig(gid);
+    const maxCharges = cfg.heal_charges ?? 3;
+    const healRow = getHealCharges(gid, uid, maxCharges);
+    const displayName = await getDisplayName(interaction.guild, uid);
+    const tags = getPlayerTags(gid, uid);
+    return interaction.reply({ content: buildRollEmbed({ rollLine, label: finalLabel, isReroll: false,
+      char: { ...char, displayName }, healCharges: healRow.current, maxCharges, flavour,
+      total: result.total, critType, tags, gid }) });
+  }
+  return interaction.reply({ content: buildPlainRoll({ rollLine, label: finalLabel, isReroll: false, flavour, total: result.total, critType }) });
+}
 
 // ── MERIT ─────────────────────────────────────────────────────────────────────
 async function handleMerit(interaction) {
