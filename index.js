@@ -1306,6 +1306,14 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('pr').setDescription('Roll or manage NPCs as a GM persona (GM only)')
+    .addSubcommand(s=>s.setName('say').setDescription('Speak or act as an NPC — no dice rolled')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('message').setDescription('What the NPC says or does — *italic* and **bold** work').setRequired(true))
+      .addStringOption(o=>o.setName('style').setDescription('How to present it').setRequired(false)
+        .addChoices(
+          {name:'💬 Speech — plain text',value:'plain'},
+          {name:'🎭 Action — italic emote',value:'action'},
+          {name:'❝ Quote — block quote',value:'quote'})))
     .addSubcommand(s=>s.setName('roll').setDescription('Roll as an NPC via webhook')
       .addStringOption(o=>o.setName('category').setDescription('Filter NPCs by category').setRequired(true)
         .addChoices({name:'All',value:'all'}))
@@ -5046,6 +5054,24 @@ async function handlePr(interaction) {
     }
   }
 
+  if (sub === 'say') {
+    const name = interaction.options.getString('name');
+    const text = interaction.options.getString('message');
+    const style = interaction.options.getString('style') || 'plain';
+    const npc = getNpc(gid, name);
+    if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found. Create one with \`/npc create\`.`, ephemeral: true });
+    if (text.length > 1800) return interaction.reply({ content: '❌ Message too long (max 1800 characters).', ephemeral: true });
+
+    const body = style === 'action' ? `*${text}*`
+               : style === 'quote'  ? text.split('\n').map(l => `> ${l}`).join('\n')
+               : text;
+
+    const chan = await interactionChannel(interaction);
+    if (!chan) return interaction.reply({ content: '❌ I can\'t access this channel.', ephemeral: true });
+    await postAsNpc(chan, gid, npc.name, body);
+    return interaction.reply({ content: `🎭 Spoke as **${npc.name}**.`, ephemeral: true });
+  }
+
   if (sub === 'roll') {
     const category = interaction.options.getString('category') ?? 'all';
     const name     = interaction.options.getString('name');
@@ -5267,6 +5293,7 @@ const HELP_CATEGORIES = {
       '`/npc copy name:Goblin new_name:Goblin 2` — duplicate an NPC (GM)',
       '`/npc show name:Goblin` — full stat block for one NPC',
       '`/npc hero name:X stat:str` — make an NPC a Hero with a signature stat (GM)',
+      '`/pr say name:X message:...` — speak or act as an NPC, no dice (GM)',
       '`/npc list category:Bandits` — list only one category\'s NPCs',
       '`/npc list` · `/npc delete name:X`',
       '`/npc categorycreate/categorydelete/categorylist` — manage categories',
