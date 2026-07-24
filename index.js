@@ -2723,6 +2723,44 @@ client.on('interactionCreate', async interaction => {
   }
 });
 
+// ── Bare stat shorthand ───────────────────────────────────────────────────────
+// Type a stat name to quick-roll 1d20+stat with no prefix. Optional ? prefix for
+// a success check, optional suffix:
+//   a / d          → fresh roll with advantage / disadvantage   (wisa, dexd)
+//   rr / rra / rrd → reroll your last roll (1 token)            (strrr, conrra)
+// followed by an optional label / flavour after a space or newline.
+//
+// The catch: str / con / dex / wis / lck are ordinary words in TTRPG chat, so a
+// message that merely *started* with one got rolled — "Dex or strength can both
+// be used to throw things" came back as a DEX check labelled with the rest of
+// the sentence. A plain stat with no prefix and no suffix must therefore be the
+// entire message and nothing else.
+//
+// Everything unambiguous keeps its label, because no ordinary word looks like
+// it: "strrr atk", "dexd guard", "wisa sneak", "?dex atk". For a label on a
+// plain stat, use a prefix — `r str atk` or `?str atk`.
+//
+// Returns null when the message is just conversation.
+function parseStatShorthand(content) {
+  const m = content.match(/^(\?)?(str|con|dex|wis|lck)(rra|rrd|rr|a|d)?(?:([ \t][\s\S]*)|(\n[\s\S]*))?$/i);
+  if (!m) return null;
+  const sc = m[1] === '?';
+  const stat = m[2].toLowerCase();
+  const suffix = (m[3] || '').toLowerCase(); // '', 'a', 'd', 'rr', 'rra', 'rrd'
+  const trailing = (m[4] ?? m[5] ?? '').replace(/^[ \t]+/, '');
+  // The ambiguous form — bare stat word, no prefix, no suffix — only fires on an
+  // exact match. Anything trailing means this is a sentence, not a roll.
+  if (!sc && !suffix && trailing.trim()) return null;
+  const isReroll = suffix.startsWith('rr');
+  const mode = (suffix === 'a' || suffix === 'rra') ? 'adv'
+             : (suffix === 'd' || suffix === 'rrd') ? 'dis'
+             : 'normal';
+  // Fresh roll: hand handleRoll the stat name so it resolves to 1d20+stat.
+  // Reroll: the label/flavour ride along; the suffix only selects adv/dis.
+  const payload = isReroll ? trailing : (stat + (trailing ? ' ' + trailing : ''));
+  return { sc, stat, suffix, mode, isReroll, payload };
+}
+
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
   const content = message.content.trim();
@@ -2782,33 +2820,10 @@ client.on('messageCreate', async message => {
     catch (err) { console.error(err); return message.reply('\u274c Something went wrong.'); }
   }
 
-  // Bare stat shorthand — type a stat name to quick-roll 1d20+stat with no prefix.
-  // Optional ? prefix for a success check. Optional suffix:
-  //   a / d        → fresh roll with advantage / disadvantage   (wisa, dexd)
-  //   rr / rra / rrd → reroll your last roll (1 token)          (strrr, conrra)
-  // Then an optional label/flavour after a space or newline. Examples:
-  //   str            → roll 1d20+STR
-  //   wisa           → roll 1d20+WIS with advantage
-  //   dexd guard     → roll 1d20+DEX with disadvantage, labelled "guard"
-  //   ?dex atk       → success-check 1d20+DEX, labelled "atk"
-  //   strrr          → reroll your last roll (1 token), STR set
-  //   conrra sneak   → reroll with advantage, labelled "sneak"
-  // Suffix alternation is longest-first so "rra" wins over a bare "a", and a
-  // trailing word like "atk" is never mistaken for a suffix.
-  const statShort = content.match(/^(\?)?(str|con|dex|wis|lck)(rra|rrd|rr|a|d)?(?:([ \t][\s\S]*)|(\n[\s\S]*))?$/i);
+  // Bare stat shorthand — see parseStatShorthand for the matching rules.
+  const statShort = parseStatShorthand(content);
   if (statShort) {
-    const sc = statShort[1] === '?';
-    const stat = statShort[2].toLowerCase();
-    const suffix = (statShort[3] || '').toLowerCase(); // '', 'a', 'd', 'rr', 'rra', 'rrd'
-    const trailing = (statShort[4] ?? statShort[5] ?? '').replace(/^[ \t]+/, '');
-    const isReroll = suffix.startsWith('rr');
-    const mode = (suffix === 'a' || suffix === 'rra') ? 'adv'
-               : (suffix === 'd' || suffix === 'rrd') ? 'dis'
-               : 'normal';
-    // Fresh roll: hand handleRoll the stat name so it resolves to 1d20+stat.
-    // Reroll: the label/flavour ride along; the suffix only selects adv/dis.
-    const payload = isReroll ? trailing : (stat + (trailing ? ' ' + trailing : ''));
-    try { return await handleRoll(message, payload, mode, isReroll, sc); }
+    try { return await handleRoll(message, statShort.payload, statShort.mode, statShort.isReroll, statShort.sc); }
     catch (err) { console.error(err); return message.reply('❌ Something went wrong.'); }
   }
 
@@ -2840,14 +2855,6 @@ client.on('messageCreate', async message => {
     if (raw==='hphalf') return handleRest(message, rest, 'hphalf');
     if (raw==='gmr') return handleGmRoll(message, rest, false);
     if (raw==='gmrs') return handleGmRoll(message, rest, true);
-    // Bare dice notation fallback e.g. 1d20+5
-    const bareMatch = content.match(/^(\d+d\d+(?:[+-]\d+)?)([ \t].*)?(\n[\s\S]*)?$/i);
-    if (bareMatch) {
-      const sameLineRest = (bareMatch[2] ?? '').trim();
-      const flavourRest = bareMatch[3] ?? '';
-      const bareRest = bareMatch[1] + (sameLineRest ? ' ' + sameLineRest : '') + flavourRest;
-      return handleRoll(message, bareRest, 'normal', false);
-    }
   } catch (err) {
     console.error(err);
     message.reply('❌ Something went wrong.');
@@ -5670,8 +5677,9 @@ const HELP_CATEGORIES = {
       '`rd1d20+5` — roll with **disadvantage** (drops highest)',
       '`rr` / `rra` / `rrd` — reroll (costs a token)',
       '`/roll` — guided roll: pick a stat, advantage, success check, label and RP flavour',
-      '`str` / `con` / `dex` / `wis` / `lck` — quick stat roll (the `r` prefix is optional)',
-      '`wisa` / `dexd` — quick stat roll with **advantage** / **disadvantage**',
+      '`str` / `con` / `dex` / `wis` / `lck` — quick stat roll. On its own with nothing else, so ordinary chat that starts with a stat name isn\'t rolled',
+      '`r str atk` or `?str atk` — a plain stat roll **with a label**',
+      '`wisa` / `dexd` — quick stat roll with **advantage** / **disadvantage** (a label may follow: `dexd guard`)',
       '`strrr` / `dexrra` / `conrrd` — reroll using a stat set · add a label like `strrr atk`',
       '`?1d20+5` — success check (crit/success/fail tiers)',
       '`/dr` — slash version with dropdowns for roll type & success',
