@@ -68,8 +68,10 @@ try {
     npc_name TEXT NOT NULL,
     webhook_id TEXT NOT NULL,
     webhook_token TEXT NOT NULL,
+    avatar_url TEXT,
     PRIMARY KEY (guild_id, channel_id, npc_name)
   )`);
+  try { db.exec('ALTER TABLE npc_webhooks ADD COLUMN avatar_url TEXT'); } catch {}
 } catch (e) { console.error('npc_webhooks schema', e); }
 try { db.exec("ALTER TABLE fights ADD COLUMN log_state TEXT DEFAULT '{}'"); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN effect_state TEXT DEFAULT '{}'"); } catch {}
@@ -487,15 +489,15 @@ function setNpcImage(gid, name, url) {
 // Per-channel webhook lookup. Falls back to nothing if the NPC has never
 // posted in this channel before, so a fresh one gets made here.
 function getNpcWebhookFor(gid, channelId, name) {
-  return db.prepare('SELECT webhook_id, webhook_token FROM npc_webhooks WHERE guild_id=? AND channel_id=? AND npc_name=?')
+  return db.prepare('SELECT webhook_id, webhook_token, avatar_url FROM npc_webhooks WHERE guild_id=? AND channel_id=? AND npc_name=?')
     .get(gid, channelId, name);
 }
-function setNpcWebhookFor(gid, channelId, name, webhookId, webhookToken) {
-  db.prepare(`INSERT INTO npc_webhooks (guild_id, channel_id, npc_name, webhook_id, webhook_token)
-              VALUES (?,?,?,?,?)
+function setNpcWebhookFor(gid, channelId, name, webhookId, webhookToken, avatarUrl = null) {
+  db.prepare(`INSERT INTO npc_webhooks (guild_id, channel_id, npc_name, webhook_id, webhook_token, avatar_url)
+              VALUES (?,?,?,?,?,?)
               ON CONFLICT(guild_id, channel_id, npc_name)
-              DO UPDATE SET webhook_id=excluded.webhook_id, webhook_token=excluded.webhook_token`)
-    .run(gid, channelId, name, webhookId, webhookToken);
+              DO UPDATE SET webhook_id=excluded.webhook_id, webhook_token=excluded.webhook_token, avatar_url=excluded.avatar_url`)
+    .run(gid, channelId, name, webhookId, webhookToken, avatarUrl);
 }
 function clearNpcWebhooks(gid, name) {
   db.prepare('DELETE FROM npc_webhooks WHERE guild_id=? AND npc_name=?').run(gid, name);
@@ -506,14 +508,23 @@ async function npcWebhookIn(channel, gid, npcName, imageUrl) {
   const { WebhookClient } = require('discord.js');
   const row = getNpcWebhookFor(gid, channel.id, npcName);
   if (row?.webhook_id && row?.webhook_token) {
-    return new WebhookClient({ id: row.webhook_id, token: row.webhook_token });
+    const client = new WebhookClient({ id: row.webhook_id, token: row.webhook_token });
+    // The avatar may have been set (or changed) after this webhook was created.
+    // Discord caches the webhook's own avatar, so push the new one through.
+    if ((row.avatar_url ?? null) !== (imageUrl ?? null)) {
+      try {
+        await client.edit({ avatar: imageUrl ?? BLANK_AVATAR, name: npcName });
+        setNpcWebhookFor(gid, channel.id, npcName, row.webhook_id, row.webhook_token, imageUrl ?? null);
+      } catch (e) { console.error('[npcwebhook] avatar refresh failed:', e?.message || e); }
+    }
+    return client;
   }
   const webhook = await channel.createWebhook({
     name: npcName,
     avatar: imageUrl ?? BLANK_AVATAR,
     reason: `NPC webhook for ${npcName}`,
   });
-  setNpcWebhookFor(gid, channel.id, npcName, webhook.id, webhook.token);
+  setNpcWebhookFor(gid, channel.id, npcName, webhook.id, webhook.token, imageUrl ?? null);
   return new WebhookClient({ id: webhook.id, token: webhook.token });
 }
 
