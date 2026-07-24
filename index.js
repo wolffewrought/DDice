@@ -459,11 +459,11 @@ function upsertNpc(gid, name, fields) {
     const sets = Object.entries(fields).map(([k])=>`${k}=?`).join(',');
     db.prepare(`UPDATE npcs SET ${sets} WHERE guild_id=? AND name=?`).run(...Object.values(fields), gid, name);
   }
-  return getNpc(gid, name);
   if ('hp_current' in fields) {
     const canonical = getNpc(gid, name)?.name ?? name;
     syncFightHp(gid, npcFighterId(canonical), fields.hp_current);
   }
+  return getNpc(gid, name);
 }
 function deleteNpc(gid, name) {
   db.prepare('DELETE FROM npcs WHERE guild_id=? AND name=?').run(gid, name);
@@ -4796,9 +4796,33 @@ async function handleNpc(interaction) {
       if (v !== null && (v < 0 || v > 99)) return interaction.reply({ content: `❌ ${n} must be between 0 and 99.`, ephemeral: true });
     }
     const order = interaction.options.getString('order') ?? null;
-    upsertNpc(gid, name, { str, con, dex, wis, lck, order_name: order });
+    const existed = !!getNpc(gid, name);
+
+    // Only write what was actually supplied — omitting a stat leaves it as-is
+    // (so an NPC can be registered by name now and statted up later).
+    const fields = {};
+    for (const [k, v] of [['str',str],['con',con],['dex',dex],['wis',wis],['lck',lck]]) {
+      if (v !== null) fields[k] = v;
+    }
+    if (order) fields.order_name = order;
+    upsertNpc(gid, name, fields);
+
+    // A brand-new NPC with no CON has 0 max HP, which would exclude them from
+    // fights — start them at full so they're usable straight away.
+    if (!existed) {
+      const made = getNpc(gid, name);
+      upsertNpc(gid, name, { hp_current: (made?.con ?? 0) + 2 });
+    }
+
+    const npcNow = getNpc(gid, name);
     const orderLine = order ? ` | ${KNIGHT_EMOJIS[order]??'⚪'} ${order}` : '';
-    await interaction.reply({ content: `✅ NPC **${name}** created.${orderLine}\n💡 Upload an image to the NPC channel with \`${name}\` as the message text to set their avatar.` });
+    const statsSet = Object.keys(fields).filter(k => k !== 'order_name').length;
+    const statNote = statsSet === 0
+      ? '\n📋 No stats set yet — add them any time with `/npc create name:' + name + ' str:… con:…`.'
+      : statsSet < 5
+        ? '\n📋 Some stats still unset (showing as 0) — fill them in later with `/npc create`.'
+        : '';
+    await interaction.reply({ content: `✅ NPC **${name}** ${existed ? 'updated' : 'created'}.${orderLine}${statNote}\n💡 Upload an image to the NPC channel with \`${name}\` as the message text to set their avatar.` });
     registerSlashCommands(gid).catch(console.error);
   }
 
