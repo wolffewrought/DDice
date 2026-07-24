@@ -1784,10 +1784,18 @@ async function handleChar(interaction) {
       .map(([k,v]) => `**${k.toUpperCase()}**: ${v}`).join(', ');
 
     if (needsApproval) {
-      const posted = await requestSheetApproval(interaction, gid, targetId);
-      return interaction.reply({ content: posted
-        ? `✅ Sheet submitted — ${summary}\n\n⏳ **Awaiting GM approval** in <#${posted}>. You can't roll or fight until it's approved.`
-        : `✅ Sheet saved — ${summary}\n\n⚠️ Couldn't reach the approval channel; ask a GM to check \`/config approvals\`.` });
+      // Reply first so the approval post can link back to a real message.
+      const chId = getConfig(gid)?.approval_channel_id;
+      await interaction.reply({ content: chId
+        ? `✅ Sheet submitted — ${summary}\n\n⏳ **Awaiting GM approval** in <#${chId}>. You can't roll or fight until it's approved.`
+        : `✅ Sheet saved — ${summary}\n\n⚠️ No approval channel set; ask a GM to check \`/config approvals\`.` });
+      let submitId = null;
+      try { const rep = await interaction.fetchReply(); submitId = rep?.id ?? null; } catch {}
+      const posted = await requestSheetApproval(interaction, gid, targetId, submitId);
+      if (!posted) {
+        await interaction.followUp({ content: '⚠️ Couldn\'t reach the approval channel — ask a GM to check `/config approvals`.', ephemeral: true }).catch(()=>{});
+      }
+      return;
     }
     return interaction.reply({ content: `✅ ${mention} character updated — ${summary}` });
   }
@@ -3033,7 +3041,7 @@ function approvalButtons(uid) {
   );
 }
 // Post an approval request to the configured channel, pinging every GM role.
-async function requestSheetApproval(interaction, gid, uid) {
+async function requestSheetApproval(interaction, gid, uid, submitMessageId = null) {
   const chId = getConfig(gid)?.approval_channel_id;
   if (!chId) return null;
   const ch = getChar(gid, uid);
@@ -3051,6 +3059,11 @@ async function requestSheetApproval(interaction, gid, uid) {
     ch.class ? `🎖️ ${ch.class}` : null,
     (ch.weapon1 || ch.weapon2) ? `⚔️ ${[ch.weapon1, ch.weapon2].filter(Boolean).join(' · ')}` : null,
   ].filter(Boolean);
+  // Jump link back to where the sheet was submitted, so a GM can see the context.
+  const srcCh = interactionChannelId(interaction);
+  let jumpId = submitMessageId;
+  if (!jumpId) { try { const rep = await interaction.fetchReply(); jumpId = rep?.id ?? null; } catch {} }
+  if (srcCh && jumpId) lines.push(`\n[↗ Jump to submission](https://discord.com/channels/${gid}/${srcCh}/${jumpId})`);
   try {
     const channel = await interaction.client.channels.fetch(chId);
     const msg = await channel.send({ content: lines.join('\n'), components: [approvalButtons(uid)],
@@ -3091,7 +3104,9 @@ function turnPing(gid, f) {
 // Fire-and-forget: an unset, deleted, or unreadable channel must never break
 // the roll itself. Covers player rolls AND GM rolls (including secret ones, so
 // GMs are accountable to each other). NPC auto-rolls are not mirrored.
-function mirrorRoll(gid, { userId, channelId, messageId = null, input, rollLine, context = null }) {
+// `messageId` links straight to the roll. For slash commands there's no user
+// message, so callers pass the interaction and we resolve its reply instead.
+function mirrorRoll(gid, { userId, channelId, messageId = null, input, rollLine, context = null, interaction = null }) {
   const chId = getConfig(gid)?.roll_audit_channel_id;
   // Verbose tracing: a silent mirror is impossible to diagnose otherwise.
   // These lines appear in the Railway logs and pinpoint where it stops.
@@ -3101,8 +3116,12 @@ function mirrorRoll(gid, { userId, channelId, messageId = null, input, rollLine,
   (async () => {
     const ch = await client.channels.fetch(chId);
     if (!ch) { console.error(`[rollaudit] fetch returned null for ${chId}`); return; }
+    // Slash commands: resolve the bot's reply so the audit entry can still link.
+    if (!messageId && interaction) {
+      try { const rep = await interaction.fetchReply(); messageId = rep?.id ?? null; } catch {}
+    }
     const clean = String(input ?? '').replace(/`/g, "'").slice(0, 120);
-    const link = messageId ? `\nhttps://discord.com/channels/${gid}/${channelId}/${messageId}` : '';
+    const link = messageId ? `\n[↗ Jump to roll](https://discord.com/channels/${gid}/${channelId}/${messageId})` : '';
     const ctx = context ? ` · ${context}` : '';
     await ch.send({
       content: `🎲 <@${userId}> in <#${channelId}>${ctx} — \`${clean}\`\n${rollLine}${link}`,
@@ -4198,7 +4217,7 @@ async function handleFight(interaction) {
       nat = rollDie(20); total = nat + effTotal;
       rollLine = `⚔️  1d20+${STAT_LABELS[stat]}${bonusTag} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
-    mirrorRoll(gid, { userId: uid, channelId: cid,
+    mirrorRoll(gid, { userId: uid, channelId: cid, interaction,
       input: `/fight atk stat:${stat}${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine,
       context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 attacks ${targetF.name}` : `fight · attacks ${targetF.name}` });
 
@@ -4297,7 +4316,7 @@ async function handleFight(interaction) {
       const label = flat ? `🛡️  1d20${flatTag}` : `🛡️  1d20+${STAT_LABELS[stat]}`;
       rollLine = `${label} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
-    mirrorRoll(gid, { userId: uid, channelId: cid,
+    mirrorRoll(gid, { userId: uid, channelId: cid, interaction,
       input: `/fight def stat:${stat}${isNpcFighter(defenderId) ? ` npc:${defender.name}` : ''}`, rollLine,
       context: isNpcFighter(defenderId) ? `fight · GM as ${defender.name} 🎭 defends` : 'fight · defends' });
 
@@ -4374,7 +4393,7 @@ async function handleFight(interaction) {
       const label = isFlat ? `${icon}  1d20 (flat — fumbled last attack)` : `${icon}  1d20+${STAT_LABELS[stat]}${bonusTag}`;
       rollLine = `${label} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
-    mirrorRoll(gid, { userId: uid, channelId: cid,
+    mirrorRoll(gid, { userId: uid, channelId: cid, interaction,
       input: `/fight rr${mode !== 'normal' ? ` roll:${mode}` : ''}`, rollLine, context: 'fight · reroll' });
 
     const member = await interaction.guild.members.fetch(uid).catch(()=>null);
@@ -5533,7 +5552,7 @@ async function handleRollSlash(interaction) {
   const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides) : null;
   const rollLine = buildRollLine(result, effMode, critType, successResult);
 
-  mirrorRoll(gid, { userId: uid, channelId: cid,
+  mirrorRoll(gid, { userId: uid, channelId: cid, interaction,
     input: `/roll ${stat ? `stat:${stat}` : `dice:${dice}`}${effMode !== 'normal' ? ` mode:${effMode}` : ''}${successCheck ? ' success_check:true' : ''}`,
     rollLine, context: successCheck ? 'success check' : null });
 
