@@ -507,18 +507,31 @@ function clearNpcWebhooks(gid, name) {
 async function npcWebhookIn(channel, gid, npcName, imageUrl) {
   const { WebhookClient } = require('discord.js');
   const row = getNpcWebhookFor(gid, channel.id, npcName);
+
   if (row?.webhook_id && row?.webhook_token) {
-    const client = new WebhookClient({ id: row.webhook_id, token: row.webhook_token });
-    // The avatar may have been set (or changed) after this webhook was created.
-    // Discord caches the webhook's own avatar, so push the new one through.
+    // The NPC's avatar may have been set (or changed) after this webhook was
+    // created. A token-only WebhookClient can't edit the avatar, so recreate
+    // the webhook instead — cheap, and guaranteed to carry the right image.
     if ((row.avatar_url ?? null) !== (imageUrl ?? null)) {
       try {
-        await client.edit({ avatar: imageUrl ?? BLANK_AVATAR, name: npcName });
-        setNpcWebhookFor(gid, channel.id, npcName, row.webhook_id, row.webhook_token, imageUrl ?? null);
-      } catch (e) { console.error('[npcwebhook] avatar refresh failed:', e?.message || e); }
+        const fresh = await channel.createWebhook({
+          name: npcName,
+          avatar: imageUrl ?? BLANK_AVATAR,
+          reason: `NPC avatar refresh for ${npcName}`,
+        });
+        // Bin the stale one — a channel is capped at 15 webhooks.
+        try { await new WebhookClient({ id: row.webhook_id, token: row.webhook_token }).delete(); } catch {}
+        setNpcWebhookFor(gid, channel.id, npcName, fresh.id, fresh.token, imageUrl ?? null);
+        return new WebhookClient({ id: fresh.id, token: fresh.token });
+      } catch (e) {
+        // Couldn't recreate (permissions, or the 15-webhook channel cap) —
+        // keep using the existing one rather than dropping to a plain post.
+        console.error('[npcwebhook] avatar refresh failed, reusing existing:', e?.message || e);
+      }
     }
-    return client;
+    return new WebhookClient({ id: row.webhook_id, token: row.webhook_token });
   }
+
   const webhook = await channel.createWebhook({
     name: npcName,
     avatar: imageUrl ?? BLANK_AVATAR,
