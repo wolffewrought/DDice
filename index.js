@@ -1796,7 +1796,7 @@ async function handleChar(interaction) {
       // Reply first so the approval post can link back to a real message.
       const chId = getConfig(gid)?.approval_channel_id;
       await interaction.reply({ content: chId
-        ? `✅ Sheet submitted — ${summary}\n\n⏳ **Awaiting GM approval** in <#${chId}>. You can't roll or fight until it's approved.`
+        ? `✅ Sheet submitted — ${summary}\n\n⏳ **Awaiting GM approval.** You can't roll or fight until it's approved.\n📬 **You'll get a DM as soon as a GM decides** — if your DMs are closed, the notice will be posted here instead.\n🔒 Once approved, only a GM can change your sheet, so check it over now with \`/char show\`.`
         : `✅ Sheet saved — ${summary}\n\n⚠️ No approval channel set; ask a GM to check \`/config approvals\`.` });
       let submitId = null;
       try { const rep = await interaction.fetchReply(); submitId = rep?.id ?? null; } catch {}
