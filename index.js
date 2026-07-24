@@ -764,6 +764,20 @@ async function getDisplayNameCached(guild, uid, cache) {
   return name;
 }
 
+// interaction.channel is null when Discord omits the channel object from the
+// payload (common in threads or uncached channels). interaction.channelId is
+// always present, so derive the id from it and lazily fetch the channel only
+// when we actually need to send something.
+function interactionChannelId(interaction) {
+  return interaction.channelId || interaction.channel?.id || null;
+}
+async function interactionChannel(interaction) {
+  if (interaction.channel) return interaction.channel;
+  const id = interaction.channelId;
+  if (!id) return null;
+  return await interaction.client.channels.fetch(id).catch(() => null);
+}
+
 // Reply with content that may exceed Discord's 2000-char hard limit. Splits on
 // line boundaries so long lists (quest board, npc list, recaps) never fail
 // silently. First chunk is the reply; the rest are follow-ups. Pass an array of
@@ -3095,8 +3109,12 @@ async function runAutoNpcChain(guild, gid, cid, channel) {
 async function handleFight(interaction) {
   const sub = interaction.options.getSubcommand();
   const gid = interaction.guild.id;
-  const cid = interaction.channel.id;
+  const cid = interactionChannelId(interaction);
   const uid = interaction.user.id;
+  // interaction.channel can be null (thread / uncached); fetch it lazily so the
+  // fight flow can still post its cards and prompts.
+  const chan = await interactionChannel(interaction);
+  if (!chan) return interaction.reply({ content: '❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.', ephemeral: true });
 
   // ── START ──────────────────────────────────────────────────────────────────
   if (sub === 'start') {
@@ -3135,7 +3153,7 @@ async function handleFight(interaction) {
       return interaction.reply({ content: `❌ Need at least 2 fighters with HP above 0.${startWarn ? `\n${startWarn}` : ''}`, ephemeral: true });
     }
     fighters.length = 0; fighters.push(...startActive.map(a => a.fid));
-    if (startWarn) await interaction.channel.send(startWarn).catch(()=>{});
+    if (startWarn) await chan.send(startWarn).catch(()=>{});
 
     const manual = interaction.options.getBoolean('manual') ?? false;
 
@@ -3337,7 +3355,7 @@ async function handleFight(interaction) {
     if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can use /fight auto.', ephemeral: true });
     const mode = interaction.options.getString('mode');
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-    const channel = interaction.channel;
+    const channel = chan;
     const send = async (txt) => { await channel.send(txt).catch(()=>{}); };
 
     // ---- DEMO: throwaway example fighters, nothing persisted ----
@@ -3429,7 +3447,7 @@ async function handleFight(interaction) {
       const t1 = fighters.some(fid => sideOf[fid] === 1), t2 = fighters.some(fid => sideOf[fid] === 2);
       if (!t1 || !t2) return interaction.reply({ content: `❌ Team ${t1 ? 2 : 1} has no able fighters.${autoWarn ? `\n${autoWarn}` : ''}`, ephemeral: true });
     }
-    if (autoWarn) await interaction.channel.send(autoWarn).catch(()=>{});
+    if (autoWarn) await chan.send(autoWarn).catch(()=>{});
 
     // Resolve everyone up front
     const F = {}; // fid -> resolved fighter (+ live hp)
@@ -3594,7 +3612,7 @@ async function handleFight(interaction) {
     } else {
       winLine = `\n⚖️ The fight ended without a clear winner. Final HP saved to all combatants' sheets.`;
     }
-    archiveFight(gid, interaction.channel.id, autoLog, order);
+    archiveFight(gid, interactionChannelId(interaction), autoLog, order);
     const recapLines = await buildFightRecap(interaction.guild, gid, autoLog);
     await send(winLine + (recapLines.length ? '\n' + recapLines.join('\n') : ''));
     return;
@@ -3756,8 +3774,8 @@ async function handleFight(interaction) {
     if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, `atk ${STAT_LABELS[stat]}`);
     if (actor.isNpc) {
       // Post the NPC's card through its webhook, ack the GM privately
-      await postAsNpc(interaction.channel, gid, actor.name, card);
-      await interaction.channel.send(defHint).catch(()=>{});
+      await postAsNpc(chan, gid, actor.name, card);
+      await chan.send(defHint).catch(()=>{});
       await interaction.reply({ content: `✅ Attacked as **${actor.name}**.`, ephemeral: true });
     } else {
       await interaction.reply({ content: `${card}\n\n${defHint}` });
@@ -3765,7 +3783,7 @@ async function handleFight(interaction) {
     // NPCs-only mode: the bot rolls the targeted NPC's defence and resolves.
     if (autoOn && targetF.isNpc) {
       await new Promise(r=>setTimeout(r,1200));
-      await runAutoNpcChain(interaction.guild, gid, cid, interaction.channel);
+      await runAutoNpcChain(interaction.guild, gid, cid, chan);
     }
     return;
   }
@@ -3839,8 +3857,8 @@ async function handleFight(interaction) {
     upsertFight(gid, cid, { def_roll: total, def_nat: nat, def_stat: stat, def_mode: mode, def_sides: 20 });
     if (!defender.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, `def ${STAT_LABELS[stat]}`);
     if (defender.isNpc) {
-      await postAsNpc(interaction.channel, gid, defender.name, card);
-      await interaction.channel.send('⚡ Use `/fight resolve` to resolve this exchange.').catch(()=>{});
+      await postAsNpc(chan, gid, defender.name, card);
+      await chan.send('⚡ Use `/fight resolve` to resolve this exchange.').catch(()=>{});
       return interaction.reply({ content: `✅ Defended as **${defender.name}**.`, ephemeral: true });
     }
     return interaction.reply({ content: `${card}\n\n⚡ Use \`/fight resolve\` to resolve this exchange.` });
@@ -3927,7 +3945,7 @@ async function handleFight(interaction) {
 
     // NPC reroll window in auto mode: defender may answer an incoming hit, attacker a block
     if (fight.auto_npc) {
-      fight = await applyAutoNpcRerolls(interaction.guild, gid, cid, interaction.channel);
+      fight = await applyAutoNpcRerolls(interaction.guild, gid, cid, chan);
       if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ The fight is no longer active.', ephemeral: true });
     }
 
@@ -3996,7 +4014,7 @@ async function handleFight(interaction) {
           hp_state: JSON.stringify(hpState),
         });
         await interaction.reply({ content: lines.join('\n') });
-        if (autoOn && nextF.isNpc) { await new Promise(r=>setTimeout(r,1200)); await runAutoNpcChain(interaction.guild, gid, cid, interaction.channel); }
+        if (autoOn && nextF.isNpc) { await new Promise(r=>setTimeout(r,1200)); await runAutoNpcChain(interaction.guild, gid, cid, chan); }
         return;
       }
     } else {
@@ -4027,7 +4045,7 @@ async function handleFight(interaction) {
     });
 
     await interaction.reply({ content: lines.join('\n') });
-    if (autoOn && nextF.isNpc) { await new Promise(r=>setTimeout(r,1200)); await runAutoNpcChain(interaction.guild, gid, cid, interaction.channel); }
+    if (autoOn && nextF.isNpc) { await new Promise(r=>setTimeout(r,1200)); await runAutoNpcChain(interaction.guild, gid, cid, chan); }
     return;
   }
 
@@ -4184,7 +4202,7 @@ async function handleSlashRoll(interaction) {
   let finalFlavour = flavour;
 
   if (isReroll) {
-    const last = getLastRoll(gid, interaction.channel.id, uid);
+    const last = getLastRoll(gid, interactionChannelId(interaction), uid);
     if (!last) return interaction.reply({ content: '❌ No previous roll found in this channel.', ephemeral: true });
     const char = getChar(gid, uid);
     if (!char || char.rerolls_current <= 0) return interaction.reply({ content: '❌ No rerolls remaining.', ephemeral: true });
@@ -4210,7 +4228,7 @@ async function handleSlashRoll(interaction) {
 
   if (!result) return interaction.reply({ content: '❌ Could not parse dice notation.', ephemeral: true });
 
-  saveRoll(gid, interaction.channel.id, uid, finalNotation, finalLabel);
+  saveRoll(gid, interactionChannelId(interaction), uid, finalNotation, finalLabel);
   const critType = detectCrit(result, mode);
   const naturalRoll = mode === 'normal' ? result.rolls?.[0] : result.chosen;
   const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides ?? 20) : null;
@@ -4446,7 +4464,7 @@ async function handlePr(interaction) {
     if (npc.lck <= 0) return interaction.reply({ content: `❌ **${name}** has no reroll tokens (LCK is 0).`, ephemeral: true });
 
     // Get last roll for this NPC in this channel
-    const last = getLastRoll(gid, interaction.channel.id, `npc_${name}`);
+    const last = getLastRoll(gid, interactionChannelId(interaction), `npc_${name}`);
     if (!last) return interaction.reply({ content: `❌ No previous roll found for **${name}** in this channel.`, ephemeral: true });
 
     // Deduct reroll — track via hp_current field repurposed as reroll tracker
@@ -4461,7 +4479,7 @@ async function handlePr(interaction) {
     if (!result) return interaction.reply({ content: '❌ Could not reroll.', ephemeral: true });
 
     const updatedNpc = getNpc(gid, name);
-    saveRoll(gid, interaction.channel.id, `npc_${name}`, last.notation, last.label);
+    saveRoll(gid, interactionChannelId(interaction), `npc_${name}`, last.notation, last.label);
 
     const critType = detectCrit(result, mode);
     const rollLine = buildRollLine(result, mode, critType, null);
@@ -4490,7 +4508,9 @@ async function handlePr(interaction) {
       if (npc.webhook_id && npc.webhook_token) {
         webhookClient = new WebhookClient({ id: npc.webhook_id, token: npc.webhook_token });
       } else {
-        const webhook = await interaction.channel.createWebhook({ name: npc.name, avatar: npc.image_url ?? BLANK_AVATAR, reason: `NPC webhook for ${npc.name}` });
+        const prChan = await interactionChannel(interaction);
+        if (!prChan) return interaction.editReply({ content: '❌ I can\'t access this channel.' }).catch(()=>{});
+        const webhook = await prChan.createWebhook({ name: npc.name, avatar: npc.image_url ?? BLANK_AVATAR, reason: `NPC webhook for ${npc.name}` });
         setNpcWebhook(gid, npc.name, webhook.id, webhook.token);
         webhookClient = new WebhookClient({ id: webhook.id, token: webhook.token });
       }
@@ -4573,7 +4593,7 @@ async function handlePr(interaction) {
     const content = lines.join('\n');
 
     // Save roll history for NPC reroll
-    saveRoll(gid, interaction.channel.id, `npc_${npc.name}`, notation, label);
+    saveRoll(gid, interactionChannelId(interaction), `npc_${npc.name}`, notation, label);
 
     // Get or create webhook for this NPC
     let webhookClient;
@@ -4583,7 +4603,9 @@ async function handlePr(interaction) {
         webhookClient = new WebhookClient({ id: npc.webhook_id, token: npc.webhook_token });
       } else {
         // Create a new webhook in this channel
-        const webhook = await interaction.channel.createWebhook({
+        const prChan2 = await interactionChannel(interaction);
+        if (!prChan2) return interaction.editReply({ content: '❌ I can\'t access this channel.' }).catch(()=>{});
+        const webhook = await prChan2.createWebhook({
           name: npc.name,
           avatar: npc.image_url ?? BLANK_AVATAR,
           reason: `NPC webhook for ${npc.name}`,
@@ -4809,7 +4831,7 @@ async function handleHelp(interaction) {
 async function handleLastRoll(interaction) {
   const gid = interaction.guild.id;
   const uid = interaction.user.id;
-  const last = getLastRoll(gid, interaction.channel.id, uid);
+  const last = getLastRoll(gid, interactionChannelId(interaction), uid);
   if (!last) return interaction.reply({ content: '❌ You haven\'t rolled anything in this channel yet.', ephemeral: true });
   const label = last.label ? ` *(${last.label})*` : '';
   return interaction.reply({ content: `🎲 Your last roll here: \`${last.notation}\`${label}\n_Rolled at ${last.saved_at} UTC._\nUse \`rr\` to reroll it (costs a token).`, ephemeral: true });
@@ -5231,7 +5253,8 @@ async function handleQuest(interaction) {
     const number = interaction.options.getInteger('number');
     const quest = getQuest(gid, number);
     if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
-    const channel = interaction.options.getChannel('channel') ?? interaction.channel;
+    const channel = interaction.options.getChannel('channel') ?? await interactionChannel(interaction);
+    if (!channel) return interaction.reply({ content: '❌ I can\'t access that channel. Pick one explicitly with `channel:`.', ephemeral: true });
     if (!channel.isTextBased?.() && !channel.isThread?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
     const components = quest.status === 'open' ? [questApplyButton(number)] : [];
     const msg = await channel.send({ content: await renderQuest(interaction.guild, quest), components });
@@ -5243,7 +5266,8 @@ async function handleQuest(interaction) {
     const number = interaction.options.getInteger('number');
     const quest = getQuest(gid, number);
     if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
-    const channel = interaction.options.getChannel('channel') ?? interaction.channel;
+    const channel = interaction.options.getChannel('channel') ?? await interactionChannel(interaction);
+    if (!channel) return interaction.reply({ content: '❌ I can\'t access that channel. Pick one explicitly with `channel:`.', ephemeral: true });
     updateQuest(gid, number, { run_channel_id: channel.id });
     await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, number));
     return interaction.reply({ content: `📍 **${questTag(quest)}** will be run and rewarded in <#${channel.id}>.` });
@@ -5338,7 +5362,7 @@ async function handleQuest(interaction) {
 
     // Announce in the designated run channel if set and different from here
     const announce = lines.join('\n');
-    if (quest.run_channel_id && quest.run_channel_id !== interaction.channel.id) {
+    if (quest.run_channel_id && quest.run_channel_id !== interactionChannelId(interaction)) {
       try { const rc = await interaction.client.channels.fetch(quest.run_channel_id); await rc.send(announce); } catch {}
       return interaction.editReply({ content: `${announce}\n\n_(Also posted in <#${quest.run_channel_id}>.)_` });
     }
