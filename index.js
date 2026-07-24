@@ -1808,6 +1808,10 @@ async function handleChar(interaction) {
     const targetId = targetUser ? targetUser.id : callerId;
     if (targetId !== callerId && !(await isGm(interaction.guild, callerId)))
       return interaction.reply({ content: '❌ Only GMs can modify other players\' characters.', ephemeral: true });
+    {
+      const lock = sheetEditLock(gid, callerId, targetId, await isGm(interaction.guild, callerId));
+      if (lock) return interaction.reply({ content: lock, ephemeral: true });
+    }
     // Custom (pasted) emoji takes priority over the dropdown
     const chosen = (custom && custom.trim()) ? custom.trim() : emoji;
     if (!chosen) return interaction.reply({ content: `❌ Pick a standard emoji from the dropdown, or paste a server custom emoji in the **custom** field.`, ephemeral: true });
@@ -1853,16 +1857,10 @@ async function handleChar(interaction) {
       else { const cfg = getConfig(gid); setHealCharges(gid, targetId, cfg.heal_charges??3); }
       return interaction.reply({ content: `${KNIGHT_EMOJIS[knight]??'⚪'} Order set to **${knight}**${targetId!==callerId?` for <@${targetId}>`:''}.` });
     }
-    // Once approval is in force, players can't alter their own stats — GMs only.
-    if (approvalEnabled(gid) && targetId === callerId && !(await isGm(interaction.guild, callerId))
-        && (STATS.includes(field) || field === 'order' || field === 'class')) {
-      const own = getChar(gid, callerId);
-      if (own?.approval_state === 'approved') {
-        return interaction.reply({ content: '🔒 Your sheet is approved — only a GM can change stats, order or class now.', ephemeral: true });
-      }
-      if (own?.approval_state === 'pending') {
-        return interaction.reply({ content: '⏳ Your sheet is awaiting GM approval — wait for it to be reviewed before editing.', ephemeral: true });
-      }
+    // Approved sheets are frozen to their owner — every field needs a GM.
+    {
+      const lock = sheetEditLock(gid, callerId, targetId, await isGm(interaction.guild, callerId));
+      if (lock) return interaction.reply({ content: lock, ephemeral: true });
     }
     if (STATS.includes(field)) {
       const num = parseInt(value);
@@ -1966,6 +1964,12 @@ async function handleProfile(interaction) {
   }
   if (sub === 'load') {
     const slot = interaction.options.getString('slotname');
+    // A snapshot restore rewrites stats — it must obey the approval lock too,
+    // otherwise it'd be a way around it.
+    {
+      const lock = sheetEditLock(gid, uid, uid, await isGm(interaction.guild, uid));
+      if (lock) return interaction.reply({ content: lock, ephemeral: true });
+    }
     const snap = loadProfile(gid, uid, slot);
     if (!snap) return interaction.reply({ content: `❌ No save found with name **${slot}**.`, ephemeral: true });
     upsertChar(gid, uid, { hp_current:snap.hp_current, rerolls_current:snap.rerolls_current, str:snap.str, con:snap.con, dex:snap.dex, wis:snap.wis, lck:snap.lck, order_name:snap.order_name, profile_enabled:snap.profile_enabled });
@@ -2274,6 +2278,13 @@ async function handleSheetImport(message, parsed) {
   if (mentionMatch && mentionMatch[1] !== uid) {
     if (!(await isGm(message.guild, uid))) return message.reply('\u274c Only GMs can import sheets for other players.');
     targetId = mentionMatch[1];
+  }
+
+  // Pasting a sheet rewrites everything — respect the approval lock so it can't
+  // be used to sidestep a GM.
+  {
+    const lock = sheetEditLock(gid, uid, targetId, await isGm(message.guild, uid));
+    if (lock) return message.reply(lock);
   }
 
   const KNIGHTS = ['White Knight','Black Knight','Gold Knight','Grey Knight','Blue Knight','Purple Knight','Green Knight','Red Knight'];
@@ -3008,6 +3019,22 @@ function hpChangeLine(gid, isNpc, name, prevHp, newHp, maxHpVal) {
     return `❤️ ${name}: ${hpCondition(newHp, maxHpVal)}`;
   }
   return `❤️ ${name} HP: **${prevHp} → ${newHp}**`;
+}
+
+// Once a sheet is approved, EVERY sheet field is GM-only — stats, order, class,
+// weapons and weapon emojis alike. Returns an error string, or null if allowed.
+function sheetEditLock(gid, callerId, targetId, isGmCaller) {
+  if (!approvalEnabled(gid)) return null;      // feature off
+  if (targetId !== callerId) return null;      // GM editing someone else (already gated)
+  if (isGmCaller) return null;                 // GMs may always edit
+  const own = getChar(gid, callerId);
+  if (own?.approval_state === 'approved') {
+    return '🔒 Your sheet is approved — only a GM can change it now. Ask a GM for any edits.';
+  }
+  if (own?.approval_state === 'pending') {
+    return '⏳ Your sheet is awaiting GM approval — wait for it to be reviewed before editing.';
+  }
+  return null;
 }
 
 // ── Character sheet approval ──────────────────────────────────────────────────
