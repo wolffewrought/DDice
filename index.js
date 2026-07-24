@@ -233,6 +233,18 @@ db.exec(`
   );
 `);
 
+// Columns added to `fights` after it first shipped. These sit AFTER the CREATE
+// above (not with the migrations at the top of the file) because on a brand-new
+// database the top-of-file ALTERs run before the table exists and are swallowed,
+// leaving a fresh install without auto_npc / rr_state / log_state.
+try { db.exec('ALTER TABLE fights ADD COLUMN auto_npc INTEGER DEFAULT 0'); } catch {}
+try { db.exec("ALTER TABLE fights ADD COLUMN rr_state TEXT NOT NULL DEFAULT '{}'"); } catch {}
+try { db.exec("ALTER TABLE fights ADD COLUMN log_state TEXT NOT NULL DEFAULT '{}'"); } catch {}
+try { db.exec("ALTER TABLE fights ADD COLUMN effect_state TEXT NOT NULL DEFAULT '{}'"); } catch {}
+// Practice bouts: HP at or below which a fighter bows out. 0 = a real fight.
+try { db.exec('ALTER TABLE fights ADD COLUMN floor_hp INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE fight_archive ADD COLUMN floor_hp INTEGER DEFAULT 0'); } catch {}
+
 function getChar(gid, uid) {
   return db.prepare('SELECT * FROM characters WHERE guild_id=? AND user_id=?').get(gid, uid);
 }
@@ -267,11 +279,11 @@ function getRecentMeritHistory(gid, limit = 20) {
 }
 
 // ── Fight archive (last finished fight per channel, for /fight log) ────────────
-function archiveFight(gid, cid, logState, roster) {
-  db.prepare(`INSERT INTO fight_archive (guild_id, channel_id, log_state, roster, ended_at)
-              VALUES (?,?,?,?,?)
-              ON CONFLICT(guild_id, channel_id) DO UPDATE SET log_state=excluded.log_state, roster=excluded.roster, ended_at=excluded.ended_at`)
-    .run(gid, cid, JSON.stringify(logState || {}), JSON.stringify(roster || []), Date.now());
+function archiveFight(gid, cid, logState, roster, floor = 0) {
+  db.prepare(`INSERT INTO fight_archive (guild_id, channel_id, log_state, roster, ended_at, floor_hp)
+              VALUES (?,?,?,?,?,?)
+              ON CONFLICT(guild_id, channel_id) DO UPDATE SET log_state=excluded.log_state, roster=excluded.roster, ended_at=excluded.ended_at, floor_hp=excluded.floor_hp`)
+    .run(gid, cid, JSON.stringify(logState || {}), JSON.stringify(roster || []), Date.now(), floor || 0);
 }
 function getArchivedFight(gid, cid) {
   return db.prepare('SELECT * FROM fight_archive WHERE guild_id=? AND channel_id=?').get(gid, cid);
@@ -614,16 +626,18 @@ function getUncategorisedNpcs(gid) {
 function getFight(gid, cid) {
   return db.prepare('SELECT * FROM fights WHERE guild_id=? AND channel_id=?').get(gid, cid);
 }
+// Insert a bare row then apply the caller's fields. Every non-key column has a
+// default, so the bare INSERT is safe. The previous version listed columns
+// explicitly and silently dropped anything added later (auto_npc, rr_state,
+// floor_hp) whenever a channel's very first fight was created.
 function upsertFight(gid, cid, fields) {
-  const ex = getFight(gid, cid);
-  if (!ex) {
-    db.prepare('INSERT INTO fights (guild_id, channel_id, state, turn_order, turn_index, phase, current_target, atk_roll, atk_nat, atk_stat, def_roll, def_nat, def_stat, hp_state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-      .run(gid, cid, fields.state??'idle', fields.turn_order??'[]', fields.turn_index??0, fields.phase??'attack',
-        fields.current_target??null, fields.atk_roll??null, fields.atk_nat??null, fields.atk_stat??null,
-        fields.def_roll??null, fields.def_nat??null, fields.def_stat??null, fields.hp_state??'{}');
-  } else {
-    const sets = Object.entries(fields).map(([k])=>`${k}=?`).join(',');
-    db.prepare(`UPDATE fights SET ${sets} WHERE guild_id=? AND channel_id=?`).run(...Object.values(fields), gid, cid);
+  if (!getFight(gid, cid)) {
+    db.prepare('INSERT INTO fights (guild_id, channel_id) VALUES (?,?)').run(gid, cid);
+  }
+  const keys = Object.keys(fields || {});
+  if (keys.length) {
+    const sets = keys.map(k => `${k}=?`).join(',');
+    db.prepare(`UPDATE fights SET ${sets} WHERE guild_id=? AND channel_id=?`).run(...keys.map(k => fields[k]), gid, cid);
   }
   return getFight(gid, cid);
 }
@@ -1411,7 +1425,8 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('start').setDescription('Start a fight')
       .addStringOption(o=>o.setName('players').setDescription('Players to include — @mention them, space-separated').setRequired(false))
       .addStringOption(o=>o.setName('npcs').setDescription('GM NPCs to include — names, comma-separated').setRequired(false))
-      .addBooleanOption(o=>o.setName('manual').setDescription('Skip initiative roll and use the order you listed fighters in').setRequired(false)))
+      .addBooleanOption(o=>o.setName('manual').setDescription('Skip initiative roll and use the order you listed fighters in').setRequired(false))
+      .addBooleanOption(o=>o.setName('practice').setDescription('Friendly bout — fighters yield at 2 HP and are never driven below it').setRequired(false)))
     .addSubcommand(s=>s.setName('addnpc').setDescription('Add GM NPCs to the current fight (GM only)')
       .addStringOption(o=>o.setName('npc').setDescription('NPC(s) to add — names, comma-separated').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('auto').setDescription('Auto-run a fight (GM only)')
@@ -1423,7 +1438,8 @@ const slashCommands = [
         ))
       .addStringOption(o=>o.setName('players').setDescription('Players to include — @mention them, space-separated (full mode)').setRequired(false))
       .addStringOption(o=>o.setName('npcs').setDescription('GM NPCs to include — names, comma-separated').setRequired(false))
-      .addStringOption(o=>o.setName('teams').setDescription('Full mode sides: "@a @b vs Goblin, Orc" — overrides players/npcs').setRequired(false)))
+      .addStringOption(o=>o.setName('teams').setDescription('Full mode sides: "@a @b vs Goblin, Orc" — overrides players/npcs').setRequired(false))
+      .addBooleanOption(o=>o.setName('practice').setDescription('Friendly bout — fighters yield at 2 HP and are never driven below it').setRequired(false)))
     .addSubcommand(s=>s.setName('order').setDescription('Set the turn order (GM) — list fighters in the order you want')
       .addStringOption(o=>o.setName('players').setDescription('Players in order — @mention them, space-separated').setRequired(false))
       .addStringOption(o=>o.setName('sequence').setDescription('Full order incl. NPCs — e.g. @Alice, Goblin, @Bob, Orc').setRequired(false)))
@@ -3123,9 +3139,40 @@ function signatureLine(row, pad = false) {
 function npcStatsVisible(gid) {
   return !!getConfig(gid)?.npc_stats_visible;
 }
+// ── Practice bouts ────────────────────────────────────────────────────────────
+// A friendly spar stops short of real harm: a fighter bows out the moment they
+// reach the floor instead of being driven to 0 and beyond, and damage never
+// carries anyone below it. The floor lives on the fight row, so a channel can
+// run a real fight before and after a bout without any global switch. Every
+// downstream check compares against the floor rather than a literal 0 — in a
+// real fight the floor is 0 and behaviour is exactly as it always was.
+const PRACTICE_FLOOR = 2;
+function fightFloor(fight) {
+  const v = Number(fight?.floor_hp ?? 0);
+  return Number.isFinite(v) && v > 0 ? v : 0;
+}
+// Apply damage without pushing a sparring partner below the floor.
+function applyFightDamage(prevHp, dmg, floor) {
+  const raw = prevHp - dmg;
+  return floor > 0 ? Math.max(floor, raw) : raw;
+}
+// Vocabulary swap so a bout doesn't read like a killing.
+function fightWords(floor) {
+  return floor > 0
+    ? { icon: '🏳️', out: 'yields the bout', win: 'takes the bout', noun: 'bout',  started: 'Practice bout started!' }
+    : { icon: '💀', out: 'has been knocked down', win: 'wins the fight', noun: 'fight', started: 'Fight started!' };
+}
+// Banner so nobody mistakes a spar for the real thing.
+function practiceBanner(floor) {
+  return floor > 0
+    ? `🏳️ **Practice bout** — friendly sparring. Fighters bow out at **${floor} HP** and are never driven below it.`
+    : null;
+}
+
 // Coarse health descriptor from a ratio — enough to follow a fight's momentum.
-function hpCondition(cur, max) {
-  if (cur <= 0) return '💀 down';
+// `floor` is the bout cut-off (0 in a real fight).
+function hpCondition(cur, max, floor = 0) {
+  if (cur <= floor) return floor > 0 ? '🏳️ yielded' : '💀 down';
   const pct = max > 0 ? cur / max : 1;
   if (pct >= 0.85) return '💚 unhurt';
   if (pct >= 0.55) return '💛 wounded';
@@ -3133,9 +3180,9 @@ function hpCondition(cur, max) {
   return '❤️‍🩹 near death';
 }
 // The "X → Y" line after damage. For hidden NPCs: damage plus condition only.
-function hpChangeLine(gid, isNpc, name, prevHp, newHp, maxHpVal) {
+function hpChangeLine(gid, isNpc, name, prevHp, newHp, maxHpVal, floor = 0) {
   if (isNpc && !npcStatsVisible(gid)) {
-    return `❤️ ${name}: ${hpCondition(newHp, maxHpVal)}`;
+    return `❤️ ${name}: ${hpCondition(newHp, maxHpVal, floor)}`;
   }
   return `❤️ ${name} HP: **${prevHp} → ${newHp}**`;
 }
@@ -3282,24 +3329,26 @@ function mirrorRoll(gid, { userId, channelId, messageId = null, input, rollLine,
   });
 }
 
-// Split a fighter id list into those able to fight (HP > 0) and those downed.
-async function partitionDowned(guild, gid, fighters) {
+// Split a fighter id list into those able to fight (HP above the floor) and
+// those who aren't. `floor` is 0 for a real fight, PRACTICE_FLOOR for a bout.
+async function partitionDowned(guild, gid, fighters, floor = 0) {
   const active = [], downed = [];
   for (const fid of fighters) {
     const f = await resolveFighter(guild, gid, fid);
     const cur = f.isNpc ? (getNpc(gid, f.name)?.hp_current ?? 0) : (getChar(gid, fid)?.hp_current ?? 0);
-    (cur > 0 ? active : downed).push({ fid, name: f.name, isNpc: f.isNpc, hp: cur });
+    (cur > floor ? active : downed).push({ fid, name: f.name, isNpc: f.isNpc, hp: cur });
   }
   return { active, downed };
 }
 
-// Warning line listing fighters left out for being at 0 HP or less.
-function downedWarning(downed, gid) {
+// Warning line listing fighters left out for sitting at or below the floor.
+function downedWarning(downed, gid, floor = 0) {
   if (!downed.length) return null;
   // Don't print an NPC's exact (negative) HP when NPC stats are hidden.
   const hide = gid ? !npcStatsVisible(gid) : false;
   const names = downed.map(d => `**${d.name}**${d.isNpc ? ' 🎭' : ''}${(d.isNpc && hide) ? '' : ` (❤️ ${d.hp})`}`).join(', ');
-  return `⚠️ Left out — knocked down: ${names}. Restore NPCs with \`/npc hp\`, players with \`hpfull @user\` or a rest.`;
+  const why = floor > 0 ? `not fit to spar (at or below the ${floor} HP bout floor)` : 'knocked down';
+  return `⚠️ Left out — ${why}: ${names}. Restore NPCs with \`/npc hp\`, players with \`hpfull @user\` or a rest.`;
 }
 
 // Build the same roll card a manual /fight atk or /fight def produces,
@@ -3529,8 +3578,9 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   if (!isNpcFighter(attackerId)) return false; // current fighter is a player — wait for them
 
   const attacker = await resolveFighter(guild, gid, attackerId);
-  // pick a random living opponent
-  const opponents = order.filter(fid => fid !== attackerId && (hpState[fid] ?? 0) > 0);
+  // pick a random opponent still standing (above the bout floor / 0)
+  const npcFloor = fightFloor(fight);
+  const opponents = order.filter(fid => fid !== attackerId && (hpState[fid] ?? 0) > npcFloor);
   if (!opponents.length) return false;
   const targetId = opponents[Math.floor(Math.random() * opponents.length)];
   const targetF = await resolveFighter(guild, gid, targetId);
@@ -3595,6 +3645,8 @@ async function autoResolveExchange(guild, gid, cid, channel) {
   const attackerId = turnOrder[fight.turn_index];
   const defenderId = fight.current_target;
   const hpState = JSON.parse(fight.hp_state);
+  const floor = fightFloor(fight);
+  const W = fightWords(floor);
 
   const { hit, dmg } = resolveDamage(
     fight.atk_roll, fight.atk_nat, 20,
@@ -3618,22 +3670,22 @@ async function autoResolveExchange(guild, gid, cid, channel) {
 
   if (hit) {
     const prevHp = hpState[defenderId] ?? 0;
-    const newHp = prevHp - dmg;
+    const newHp = applyFightDamage(prevHp, dmg, floor);
     hpState[defenderId] = newHp;
     setFighterHp(gid, defenderId, newHp);
     lines.push(`💥 **${atkName}** hits **${defName}** for **${dmg}** damage!`);
-    lines.push(hpChangeLine(gid, defF.isNpc, defName, prevHp, newHp, defF.maxHp));
+    lines.push(hpChangeLine(gid, defF.isNpc, defName, prevHp, newHp, defF.maxHp, floor));
     for (const l of effectNoteLines(effNotes, atkName, defName)) lines.push(l);
 
-    if (newHp <= 0) {
-      lines.push('', `💀 **${defName}** has been knocked down! HP: **${newHp}**`);
+    if (newHp <= floor) {
+      lines.push('', `${W.icon} **${defName}** ${W.out}! HP: **${newHp}**`);
       const newOrder = turnOrder.filter(id => id !== defenderId);
       if (newOrder.length <= 1) {
         const winF = await resolveFighter(guild, gid, newOrder[0]);
-        lines.push(`\n🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** wins the fight!`);
+        lines.push(`\n🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** ${W.win}!`);
         const endLog = JSON.parse(getFight(gid, cid)?.log_state || '{}');
         lines.push(...await buildFightRecap(guild, gid, endLog));
-        archiveFight(gid, cid, endLog, turnOrder);
+        archiveFight(gid, cid, endLog, turnOrder, floor);
         upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState) });
         await channel.send(lines.join('\n')).catch(()=>{});
         return false;
@@ -3659,7 +3711,7 @@ async function autoResolveExchange(guild, gid, cid, channel) {
   // Advance turn to next active fighter
   let nextIndex = (fight.turn_index + 1) % turnOrder.length;
   let safety = 0;
-  while (hpState[turnOrder[nextIndex]] !== undefined && hpState[turnOrder[nextIndex]] <= 0 && safety < turnOrder.length) {
+  while (hpState[turnOrder[nextIndex]] !== undefined && hpState[turnOrder[nextIndex]] <= floor && safety < turnOrder.length) {
     nextIndex = (nextIndex + 1) % turnOrder.length;
     safety++;
   }
@@ -3747,11 +3799,16 @@ async function handleFight(interaction) {
 
     if (fighters.length < 2) return interaction.reply({ content: '❌ Need at least 2 fighters. Add players via `players:` (@mention them) and/or NPCs via `npcs:` (comma-separated names).', ephemeral: true });
 
-    // Leave out anyone already knocked down (they'd silently never act)
-    const { active: startActive, downed: startDowned } = await partitionDowned(interaction.guild, gid, fighters);
-    const startWarn = downedWarning(startDowned, gid);
+    // A practice bout stops at the floor instead of 0 — nobody gets hurt.
+    const floor = (interaction.options.getBoolean('practice') ?? false) ? PRACTICE_FLOOR : 0;
+    const W = fightWords(floor);
+    const banner = practiceBanner(floor);
+
+    // Leave out anyone who can't take the field (below the floor / already down)
+    const { active: startActive, downed: startDowned } = await partitionDowned(interaction.guild, gid, fighters, floor);
+    const startWarn = downedWarning(startDowned, gid, floor);
     if (startActive.length < 2) {
-      return interaction.reply({ content: `❌ Need at least 2 fighters with HP above 0.${startWarn ? `\n${startWarn}` : ''}`, ephemeral: true });
+      return interaction.reply({ content: `❌ Need at least 2 fighters with HP above ${floor}.${startWarn ? `\n${startWarn}` : ''}`, ephemeral: true });
     }
     fighters.length = 0; fighters.push(...startActive.map(a => a.fid));
     if (startWarn) await chan.send(startWarn).catch(()=>{});
@@ -3770,7 +3827,8 @@ async function handleFight(interaction) {
         ordered.push({ id: fid, name: f.name, isNpc: f.isNpc });
       }
       const turnOrder = ordered.map(o => o.id);
-      const lines = ['⚔️ **Fight started! Turn order (manual):**', ''];
+      const lines = [`⚔️ **${W.started} Turn order (manual):**`, ''];
+      if (banner) { lines.splice(1, 0, banner); }
       ordered.forEach((f,i) => lines.push(`${i+1}. **${f.name}**${f.isNpc ? ' 🎭' : ''}`));
       lines.push('', `🎯 **${ordered[0].name}** goes first!${ordered[0].isNpc ? ' (GM acts with `npc:`)' : ' Use `/fight atk` to attack.'}${turnPing(gid, ordered[0])}`);
       upsertFight(gid, cid, {
@@ -3779,6 +3837,7 @@ async function handleFight(interaction) {
         atk_roll: null, atk_nat: null, atk_stat: null,
         def_roll: null, def_nat: null, def_stat: null,
         hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState),
+        floor_hp: floor,
       });
       return interaction.reply({ content: lines.join('\n') });
     }
@@ -3803,7 +3862,8 @@ async function handleFight(interaction) {
     const turnOrder = initiatives.map(i => i.id);
     const npcCount = initiatives.filter(i => i.isNpc).length;
     const playerCount = initiatives.length - npcCount;
-    const lines = [`⚔️ **Fight started!** ${playerCount} player${playerCount===1?'':'s'} + ${npcCount} NPC${npcCount===1?'':'s'} — initiative order:`, ''];
+    const lines = [`⚔️ **${W.started}** ${playerCount} player${playerCount===1?'':'s'} + ${npcCount} NPC${npcCount===1?'':'s'} — initiative order:`, ''];
+    if (banner) lines.splice(1, 0, banner);
     initiatives.forEach((f,i) => {
       lines.push(`${i+1}. **${f.name}**${f.isNpc ? ' 🎭' : ''} — 🎲 [${f.roll}] + ⚡ ${f.dex} DEX = **${f.total} initiative**`);
     });
@@ -3820,6 +3880,7 @@ async function handleFight(interaction) {
       atk_roll: null, atk_nat: null, atk_stat: null,
       def_roll: null, def_nat: null, def_stat: null,
       hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState),
+      floor_hp: floor,
     });
 
     return interaction.reply({ content: lines.join('\n') });
@@ -3841,7 +3902,8 @@ async function handleFight(interaction) {
     for (const npcName of names) {
       const npc = getNpc(gid, npcName);
       if (!npc) return interaction.reply({ content: `❌ NPC **${npcName}** not found.`, ephemeral: true });
-      if ((npc.hp_current ?? 0) <= 0) return interaction.reply({ content: `❌ **${npc.name}** is knocked down (❤️ ${npc.hp_current}). Restore with \`/npc hp name:${npc.name}\` first.`, ephemeral: true });
+      const addFloor = fightFloor(fight);
+      if ((npc.hp_current ?? 0) <= addFloor) return interaction.reply({ content: `❌ **${npc.name}** ${addFloor > 0 ? `isn't fit to spar (❤️ ${npc.hp_current}, bout floor is ${addFloor})` : `is knocked down (❤️ ${npc.hp_current})`}. Restore with \`/npc hp name:${npc.name}\` first.`, ephemeral: true });
       const fid = npcFighterId(npc.name); // canonical stored name
       if (turnOrder.includes(fid)) return interaction.reply({ content: `❌ **${npc.name}** is already in this fight.`, ephemeral: true });
       const roll = rollDie(20);
@@ -3869,7 +3931,11 @@ async function handleFight(interaction) {
     const prev = JSON.parse(fight.hp_state)[fid] ?? '?';
     setFighterHp(gid, fid, newHp); // sheet write → syncFightHp mirrors into hp_state
     const note = value > (f.maxHp || value) ? ' (capped at max)' : '';
-    const down = newHp <= 0 ? ` 💀 **${f.name}** is at 0 or less and will be skipped.` : '';
+    const hpFloor = fightFloor(fight);
+    const down = newHp <= hpFloor
+      ? (hpFloor > 0 ? ` 🏳️ **${f.name}** is at or below the ${hpFloor} HP bout floor and will be skipped.`
+                     : ` 💀 **${f.name}** is at 0 or less and will be skipped.`)
+      : '';
     return interaction.reply({ content: `❤️ **${f.name}${f.isNpc ? ' 🎭' : ''}** HP: **${prev} → ${newHp}**${note}.${down}` });
   }
 
@@ -3899,7 +3965,7 @@ async function handleFight(interaction) {
       }
       const kickLog = JSON.parse(fight.log_state || '{}');
       lines.push(...await buildFightRecap(interaction.guild, gid, kickLog));
-      archiveFight(gid, cid, kickLog, turnOrder);
+      archiveFight(gid, cid, kickLog, turnOrder, fightFloor(fight));
       upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState) });
       return interaction.reply({ content: lines.join('\n') });
     }
@@ -3958,20 +4024,24 @@ async function handleFight(interaction) {
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     const channel = chan;
     const send = async (txt) => { await channel.send(txt).catch(()=>{}); };
+    // A practice bout stops at the floor instead of 0, in every auto mode.
+    const floor = (interaction.options.getBoolean('practice') ?? false) ? PRACTICE_FLOOR : 0;
+    const W = fightWords(floor);
+    const banner = practiceBanner(floor);
 
     // ---- DEMO: throwaway example fighters, nothing persisted ----
     if (mode === 'demo') {
       const existing = getFight(gid, cid);
       if (existing && existing.state !== 'idle') return interaction.reply({ content: '❌ Finish or `/fight end` the current fight first.', ephemeral: true });
-      await interaction.reply({ content: '🎬 **Running a demo fight with two example combatants...**' });
+      await interaction.reply({ content: `🎬 **Running a demo ${W.noun} with two example combatants...**` });
       const A = { name: 'Sir Aldric (demo)', dex: 4, str: 5, hp: 7 };
       const B = { name: 'Cave Troll (demo)', dex: 2, str: 6, hp: 8 };
       const aInit = rollDie(20) + A.dex, bInit = rollDie(20) + B.dex;
       const order = aInit >= bInit ? [A, B] : [B, A];
       await sleep(900);
-      await send(['⚔️ **Demo fight — initiative:**', '', `1. **${order[0].name}**`, `2. **${order[1].name}**`, '', `🎯 **${order[0].name}** goes first!`].join('\n'));
+      await send([`⚔️ **Demo ${W.noun} — initiative:**`, ...(banner ? [banner] : []), '', `1. **${order[0].name}**`, `2. **${order[1].name}**`, '', `🎯 **${order[0].name}** goes first!`].join('\n'));
       let turn = 0, round = 1, safety = 0;
-      while (A.hp > 0 && B.hp > 0 && safety < 12) {
+      while (A.hp > floor && B.hp > floor && safety < 12) {
         safety++;
         const atk = order[turn % 2], def = order[(turn + 1) % 2];
         await sleep(1100);
@@ -3981,14 +4051,14 @@ async function handleFight(interaction) {
         const lines = ['─────────────────────────────', `**Round ${round}** — ${atk.name} attacks ${def.name}`,
           `⚔️ ${STAT_LABELS[aStat]} → [${a.nat}] +${atk[aStat]} = ${fightTotalStr(a.total, a.nat, 20)}`,
           `🛡️ ${STAT_LABELS[dStat]} → [${d.nat}] +${def[dStat]} = ${fightTotalStr(d.total, d.nat, 20)}`];
-        if (hit) { def.hp -= dmg; lines.push('', `💥 Hit for **${dmg}**! ${def.name} HP: **${def.hp + dmg} → ${Math.max(def.hp,0)}**`); if (def.hp <= 0) lines.push('', `💀 **${def.name}** is knocked down!`); }
+        if (hit) { const was = def.hp; def.hp = applyFightDamage(def.hp, dmg, floor); lines.push('', `💥 Hit for **${dmg}**! ${def.name} HP: **${was} → ${def.hp}**`); if (def.hp <= floor) lines.push('', `${W.icon} **${def.name}** ${W.out}!`); }
         else lines.push('', `🛡️ **${def.name}** blocks — no damage.`);
         await send(lines.join('\n'));
         turn++; if (turn % 2 === 0) round++;
       }
       await sleep(900);
-      const winner = A.hp > 0 ? A : B;
-      await send(`\n🏆 **${winner.name}** wins the demo fight!\n\n*That's the basic flow: initiative → attack vs defend → damage on a hit. In a real fight, players use \`/fight atk\` and \`/fight def\`, and a GM acts for NPCs with the \`npc:\` option (or runs \`/fight auto\` in full / NPCs-only mode).*`);
+      const winner = A.hp > floor ? A : B;
+      await send(`\n🏆 **${winner.name}** wins the demo ${W.noun}!\n\n*That's the basic flow: initiative → attack vs defend → damage on a hit. In a real fight, players use \`/fight atk\` and \`/fight def\`, and a GM acts for NPCs with the \`npc:\` option (or runs \`/fight auto\` in full / NPCs-only mode).*`);
       return;
     }
 
@@ -4037,11 +4107,11 @@ async function handleFight(interaction) {
 
     if (fighters.length < 2) return interaction.reply({ content: '❌ Need at least 2 fighters. Use `players:` (@mention) and/or `npcs:` (comma-separated).', ephemeral: true });
 
-    // Leave out anyone already knocked down (they'd silently never act)
-    const { active: autoActive, downed: autoDowned } = await partitionDowned(interaction.guild, gid, fighters);
-    const autoWarn = downedWarning(autoDowned, gid);
+    // Leave out anyone who can't take the field (below the floor / already down)
+    const { active: autoActive, downed: autoDowned } = await partitionDowned(interaction.guild, gid, fighters, floor);
+    const autoWarn = downedWarning(autoDowned, gid, floor);
     if (autoActive.length < 2) {
-      return interaction.reply({ content: `❌ Need at least 2 fighters with HP above 0.${autoWarn ? `\n${autoWarn}` : ''}`, ephemeral: true });
+      return interaction.reply({ content: `❌ Need at least 2 fighters with HP above ${floor}.${autoWarn ? `\n${autoWarn}` : ''}`, ephemeral: true });
     }
     fighters.length = 0; fighters.push(...autoActive.map(a => a.fid));
     if (useTeams) {
@@ -4084,8 +4154,9 @@ async function handleFight(interaction) {
         atk_roll: null, atk_nat: null, atk_stat: null,
         def_roll: null, def_nat: null, def_stat: null,
         hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState), auto_npc: 1,
+        floor_hp: floor,
       });
-      const lines = ['⚔️ **Fight started! (NPCs auto-piloted)**', '', '**Initiative:**'];
+      const lines = [`⚔️ **${W.started} (NPCs auto-piloted)**`, ...(banner ? [banner] : []), '', '**Initiative:**'];
       inits.forEach((it,i)=>{ const f=F[it.fid]; lines.push(`${i+1}. **${f.name}${f.isNpc?' 🎭':''}** — 🎲 [${it.roll}] + ⚡ ${f.stats.dex} DEX = **${it.total}**`); });
       const firstF = F[order[0]];
       lines.push('', firstF.isNpc ? `🤖 **${firstF.name}** is an NPC — the bot will take its turn automatically.` : `🎯 **${firstF.name}** goes first! Use \`/fight atk\` to attack.${turnPing(gid, firstF)}`);
@@ -4096,13 +4167,13 @@ async function handleFight(interaction) {
     }
 
     // ---- FULL: bot rolls everything to a winner, persists final HP, stores nothing ongoing ----
-    await interaction.reply({ content: '🎬 **Auto-resolving the fight...**' });
-    const lines0 = ['⚔️ **Initiative:**'];
+    await interaction.reply({ content: `🎬 **Auto-resolving the ${W.noun}...**` });
+    const lines0 = ['⚔️ **Initiative:**', ...(banner ? [banner] : [])];
     inits.forEach((it,i)=>{ const f=F[it.fid]; lines0.push(`${i+1}. **${f.name}${f.isNpc?' 🎭':''}** — 🎲 [${it.roll}] + ⚡ ${f.stats.dex} DEX = **${it.total}**`); });
     await sleep(800); await send(lines0.join('\n'));
 
-    const alive = () => order.filter(fid => hp[fid] > 0);
-    const sideAlive = (t) => order.some(fid => sideOf[fid] === t && hp[fid] > 0);
+    const alive = () => order.filter(fid => hp[fid] > floor);
+    const sideAlive = (t) => order.some(fid => sideOf[fid] === t && hp[fid] > floor);
     const fightOn = () => useTeams ? (sideAlive(1) && sideAlive(2)) : alive().length > 1;
     const autoLog = { exchanges: 0, f: {} };
     const ensureLog = (fid) => (autoLog.f[fid] = autoLog.f[fid] || { dealt: 0, taken: 0, crit: 0, fumble: 0, rr: 0 });
@@ -4111,12 +4182,12 @@ async function handleFight(interaction) {
       safety++;
       // find next living attacker starting at idx
       let guard = 0;
-      while (hp[order[idx]] <= 0 && guard < order.length) { idx = (idx + 1) % order.length; guard++; }
+      while (hp[order[idx]] <= floor && guard < order.length) { idx = (idx + 1) % order.length; guard++; }
       const attackerId = order[idx];
       // One round = every living fighter has taken one attack. Count completed
       // exchanges against the current number of living fighters rather than
       // watching the index wrap, which mislabelled the second half of a round.
-      const livingCount = Math.max(1, order.filter(fid => hp[fid] > 0).length);
+      const livingCount = Math.max(1, order.filter(fid => hp[fid] > floor).length);
       round = Math.floor(exchanges / livingCount) + 1;
       exchanges++;
       // pick a random living opponent
@@ -4191,12 +4262,13 @@ async function handleFight(interaction) {
       // Outcome (system line)
       let outcome;
       if (hit) {
-        hp[defenderId] -= dmg;
+        const wasHp = hp[defenderId];
+        hp[defenderId] = applyFightDamage(hp[defenderId], dmg, floor);
         setFighterHp(gid, defenderId, hp[defenderId]); // keep sheets live so the next card is accurate
         outcome = `💥 Hit for **${dmg}**! ` + (defF.isNpc && !npcStatsVisible(gid)
-          ? `${defF.name}: ${hpCondition(hp[defenderId], defF.maxHp)}`
-          : `${defF.name} HP: **${hp[defenderId] + dmg} → ${Math.max(hp[defenderId],0)}**`);
-        if (hp[defenderId] <= 0) outcome += `\n💀 **${defF.name}** is knocked down!`;
+          ? `${defF.name}: ${hpCondition(hp[defenderId], defF.maxHp, floor)}`
+          : `${defF.name} HP: **${wasHp} → ${hp[defenderId]}**`);
+        if (hp[defenderId] <= floor) outcome += `\n${W.icon} **${defF.name}** ${W.out}!`;
       } else {
         outcome = `🛡️ **${defF.name}** blocks — no damage.`;
       }
@@ -4215,14 +4287,14 @@ async function handleFight(interaction) {
     if (useTeams && (sideAlive(1) !== sideAlive(2))) {
       const winner = sideAlive(1) ? 1 : 2;
       const names = survivors.filter(fid => sideOf[fid] === winner).map(fid => `**${F[fid].name}${F[fid].isNpc?' 🎭':''}**`).join(', ');
-      winLine = `\n🏆 **Team ${winner}** wins the fight! Survivors: ${names}. Final HP has been saved to all combatants' sheets.`;
+      winLine = `\n🏆 **Team ${winner}** ${W.win}! Survivors: ${names}. Final HP has been saved to all combatants' sheets.`;
     } else if (!useTeams && survivors.length === 1) {
       const w = F[survivors[0]];
-      winLine = `\n🏆 **${w.name}${w.isNpc?' 🎭':''}** wins the fight! Final HP has been saved to all combatants' sheets.`;
+      winLine = `\n🏆 **${w.name}${w.isNpc?' 🎭':''}** ${W.win}! Final HP has been saved to all combatants' sheets.`;
     } else {
-      winLine = `\n⚖️ The fight ended without a clear winner. Final HP saved to all combatants' sheets.`;
+      winLine = `\n⚖️ The ${W.noun} ended without a clear winner. Final HP saved to all combatants' sheets.`;
     }
-    archiveFight(gid, interactionChannelId(interaction), autoLog, order);
+    archiveFight(gid, interactionChannelId(interaction), autoLog, order, floor);
     const recapLines = await buildFightRecap(interaction.guild, gid, autoLog);
     await send(winLine + (recapLines.length ? '\n' + recapLines.join('\n') : ''));
     return;
@@ -4330,8 +4402,9 @@ async function handleFight(interaction) {
     if (targetId === actorId) return interaction.reply({ content: '❌ You cannot target yourself.', ephemeral: true });
 
     const hpState = JSON.parse(fight.hp_state);
-    if (hpState[targetId] !== undefined && hpState[targetId] <= 0) {
-      return interaction.reply({ content: '❌ That target is already down.', ephemeral: true });
+    const atkFloor = fightFloor(fight);
+    if (hpState[targetId] !== undefined && hpState[targetId] <= atkFloor) {
+      return interaction.reply({ content: atkFloor > 0 ? '❌ That fighter has already yielded the bout.' : '❌ That target is already down.', ephemeral: true });
     }
 
     const actor = await resolveFighter(interaction.guild, gid, actorId);
@@ -4571,6 +4644,8 @@ async function handleFight(interaction) {
     const attackerId = turnOrder[fight.turn_index];
     const defenderId = fight.current_target;
     const hpState = JSON.parse(fight.hp_state);
+    const floor = fightFloor(fight);
+    const W = fightWords(floor);
 
     const { hit, dmg } = resolveDamage(
       fight.atk_roll, fight.atk_nat, 20,
@@ -4595,24 +4670,24 @@ async function handleFight(interaction) {
 
     if (hit) {
       const prevHp = hpState[defenderId] ?? 0;
-      const newHp = prevHp - dmg;
+      const newHp = applyFightDamage(prevHp, dmg, floor);
       hpState[defenderId] = newHp;
       // Persist to the right table (character or NPC)
       setFighterHp(gid, defenderId, newHp);
       lines.push(`💥 **${atkName}** hits **${defName}** for **${dmg}** damage!`);
-      lines.push(hpChangeLine(gid, defF.isNpc, defName, prevHp, newHp, defF.maxHp));
+      lines.push(hpChangeLine(gid, defF.isNpc, defName, prevHp, newHp, defF.maxHp, floor));
       for (const l of effectNoteLines(effNotes, atkName, defName)) lines.push(l);
 
-      if (newHp <= 0) {
-        lines.push('', `💀 **${defName}** has been knocked down! HP: **${newHp}**`);
+      if (newHp <= floor) {
+        lines.push('', `${W.icon} **${defName}** ${W.out}! HP: **${newHp}**`);
         // Remove from turn order
         const newOrder = turnOrder.filter(id => id !== defenderId);
         if (newOrder.length <= 1) {
           const winF = await resolveFighter(interaction.guild, gid, newOrder[0]);
-          lines.push(`\n🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** wins the fight!`);
+          lines.push(`\n🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** ${W.win}!`);
           const endLog = JSON.parse(getFight(gid, cid)?.log_state || '{}');
           lines.push(...await buildFightRecap(interaction.guild, gid, endLog));
-          archiveFight(gid, cid, endLog, turnOrder);
+          archiveFight(gid, cid, endLog, turnOrder, floor);
           upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState) });
           return interaction.reply({ content: lines.join('\n') });
         }
@@ -4642,9 +4717,9 @@ async function handleFight(interaction) {
 
     // Advance turn to next active fighter
     let nextIndex = (fight.turn_index + 1) % turnOrder.length;
-    // Skip downed fighters
+    // Skip anyone at or below the floor
     let safety = 0;
-    while (hpState[turnOrder[nextIndex]] !== undefined && hpState[turnOrder[nextIndex]] <= 0 && safety < turnOrder.length) {
+    while (hpState[turnOrder[nextIndex]] !== undefined && hpState[turnOrder[nextIndex]] <= floor && safety < turnOrder.length) {
       nextIndex = (nextIndex + 1) % turnOrder.length;
       safety++;
     }
@@ -4690,7 +4765,7 @@ async function handleFight(interaction) {
       }
       const ffLog = JSON.parse(fight.log_state || '{}');
       lines.push(...await buildFightRecap(interaction.guild, gid, ffLog));
-      archiveFight(gid, cid, ffLog, turnOrder);
+      archiveFight(gid, cid, ffLog, turnOrder, fightFloor(fight));
       upsertFight(gid, cid, { state: 'idle', turn_order: '[]' });
     } else {
       let newIndex = fight.turn_index % newOrder.length;
@@ -4719,8 +4794,10 @@ async function handleFight(interaction) {
     const rrState = JSON.parse(fight.rr_state || '{}');
     const fxState = JSON.parse(fight.effect_state || '{}');
     const currentId = turnOrder[fight.turn_index];
+    const floor = fightFloor(fight);
+    const stBanner = practiceBanner(floor);
 
-    const lines = ['⚔️ **Fight Status**', ''];
+    const lines = [floor > 0 ? '🏳️ **Practice Bout Status**' : '⚔️ **Fight Status**', ...(stBanner ? [stBanner] : []), ''];
     for (let i = 0; i < turnOrder.length; i++) {
       const fid = turnOrder[i];
       const f = await resolveFighter(interaction.guild, gid, fid);
@@ -4735,7 +4812,7 @@ async function handleFight(interaction) {
       if (fx.atkBonus) fxBits.push(`✨ +${fx.atkBonus} next attack`);
       if (fx.flatDef) fxBits.push('🎲 flat-d20 next defence');
       const fxNote = fxBits.length ? ` · ${fxBits.join(' · ')}` : '';
-      const hpText = hideHp ? hpCondition(rawHp, f.maxHp) : `❤️ ${hp} / ${hpMax}`;
+      const hpText = hideHp ? hpCondition(rawHp, f.maxHp, floor) : `❤️ ${hp} / ${hpMax}${floor > 0 && rawHp <= floor ? ' 🏳️ yielded' : ''}`;
       lines.push(`${i+1}. **${f.name}${f.isNpc ? ' 🎭' : ''}** — ${hpText}${rrNote}${fxNote}${arrow}`);
     }
     lines.push('');
@@ -4753,7 +4830,10 @@ async function handleFight(interaction) {
     const log = JSON.parse(arch.log_state || '{}');
     const recap = await buildFightRecap(interaction.guild, gid, log);
     if (!recap.length) return interaction.reply({ content: '📋 The last fight here ended before any exchanges were resolved.', ephemeral: true });
-    const lines = [`📜 **Last fight in this channel** — ended ${formatHistDate(arch.ended_at)}`, ...recap.slice(1)];
+    const archFloor = Number(arch.floor_hp ?? 0) > 0 ? Number(arch.floor_hp) : 0;
+    const lines = [`📜 **Last ${archFloor > 0 ? 'practice bout' : 'fight'} in this channel** — ended ${formatHistDate(arch.ended_at)}`,
+                   ...(archFloor > 0 ? [`🏳️ Friendly sparring — fighters bowed out at ${archFloor} HP.`] : []),
+                   ...recap.slice(1)];
     return replyLong(interaction, lines);
   }
 
@@ -4775,10 +4855,11 @@ async function handleFight(interaction) {
         atk_roll: null, atk_nat: null, atk_stat: null, def_roll: null, def_nat: null, def_stat: null });
       lines.push('↩️ The pending exchange was reset.');
     }
-    // Advance past the current attacker, skipping anyone knocked down
+    // Advance past the current attacker, skipping anyone at or below the floor
+    const skipFloor = fightFloor(fight);
     let nextIndex = (fight.turn_index + 1) % turnOrder.length;
     let safety = 0;
-    while ((hpState[turnOrder[nextIndex]] ?? 0) <= 0 && safety < turnOrder.length) {
+    while ((hpState[turnOrder[nextIndex]] ?? 0) <= skipFloor && safety < turnOrder.length) {
       nextIndex = (nextIndex + 1) % turnOrder.length; safety++;
     }
     patch.turn_index = nextIndex;
@@ -4797,7 +4878,7 @@ async function handleFight(interaction) {
       const endRow = getFight(gid, cid);
       const endLog = JSON.parse(endRow?.log_state || '{}');
       const recap = await buildFightRecap(interaction.guild, gid, endLog);
-      archiveFight(gid, cid, endLog, JSON.parse(endRow?.turn_order || '[]'));
+      archiveFight(gid, cid, endLog, JSON.parse(endRow?.turn_order || '[]'), fightFloor(endRow));
       upsertFight(gid, cid, { state: 'idle', turn_order: '[]' });
       return ['🛑 Fight ended by GM. HP states preserved.', ...recap].join('\n');
     });
@@ -5446,6 +5527,8 @@ const HELP_CATEGORIES = {
     body: [
       '`/fight start players:@a @b npcs:Goblin, Orc` — begin a fight with any number of players and GM NPCs (auto-rolls DEX initiative)',
       '`/fight start ... manual:true` — keep the order you listed fighters in (no roll)',
+      '`/fight start ... practice:true` — friendly bout: fighters yield at 2 HP and are never driven below it',
+      '`/fight auto ... practice:true` — the same floor in any auto mode',
       '`/fight addnpc npc:Goblin, Orc` — add one or more NPCs mid-fight',
       '`/fight order sequence:@a, Goblin, @b` — set the turn order, players and NPCs (GM)',
       '`/fight atk stat:str target:@user` — attack a player · add `target_npc:Name` to hit an NPC',

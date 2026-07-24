@@ -290,6 +290,7 @@ CONTENT = [
 ('h2', 'Commands'),
 ('code', [('/fight start players:@a @b npcs:Goblin, Orc', 'any number of each', 'player'),
           ('/fight start ... manual:true', 'skip roll, keep listed order', 'player'),
+          ('/fight start ... practice:true', 'friendly bout — fighters yield at 2 HP', 'player'),
           ('/fight addnpc npc:Goblin, Orc', 'add NPC(s) mid-fight, ' + GM, 'gm'),
           ('/fight order sequence:@a, Goblin, @b', 'reorder players + NPCs, ' + GM, 'gm'),
           ('/fight atk stat:str target:@user', 'attack a player', 'player'),
@@ -309,6 +310,7 @@ CONTENT = [
           ('/fight auto mode:Full\n  teams:@a @b vs Goblin, Orc', 'party-vs-monsters sides, ' + GM, 'gm'),
           ('/fight auto mode:NPCs only ...', 'bot plays NPCs, ' + GM, 'gm'),
           ('/fight auto mode:Demo', 'example showcase, ' + GM, 'gm'),
+          ('/fight auto ... practice:true', 'a bout in any auto mode, ' + GM, 'gm'),
           ('/fight forfeit', 'concede — HP preserved', 'player'),
           ('/fight end', GM + ' only', 'gm')]),
 ('pbreak',),
@@ -319,6 +321,14 @@ CONTENT = [
 ('p', '<b>Knocked-down fighters:</b> anyone at 0 HP or less is left out when a fight starts or when NPCs '
       'are added, with a warning naming them. Restore NPCs with <b>/npc heal</b> or <b>/npc hp</b>, '
       'players with rests or <b>hpfull @user</b>.'),
+('p', '<b>Practice bouts:</b> add <b>practice:true</b> to <b>/fight start</b> or <b>/fight auto</b> and the '
+      'fight becomes a friendly spar. Everything runs exactly as normal \u2014 initiative, rolls, damage, '
+      'crits, carry-over effects, rerolls, recap \u2014 but the cut-off moves from 0 HP to <b>2 HP</b>. '
+      'A fighter bows out the moment they reach 2, and damage never carries anyone below it, so nobody '
+      'leaves the yard worse than winded. Sparring partners already at 2 HP or less are left out at the '
+      'start, the same way knocked-down fighters are. The bout is announced on start, marked on '
+      '<b>/fight status</b>, and noted again in <b>/fight log</b>, so a spar can never be mistaken for '
+      'the real thing.'),
 ('p', '<b>HP stays in sync:</b> any mid-fight HP change — <b>!hp</b>, <b>!heal</b>, rests, <b>/npc hp</b> or '
       'the <b>/fight hp</b> command — is mirrored straight into the fight, so a heal is never overwritten '
       'by the next exchange. Anywhere a command takes NPC names, <b>category:Name</b> adds a whole '
