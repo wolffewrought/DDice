@@ -56,6 +56,7 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_role_ids TEXT'); } catch {
 try { db.exec('ALTER TABLE guild_config ADD COLUMN approval_channel_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN approval_state TEXT'); } catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN approval_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN approval_src_channel TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_stats_visible INTEGER DEFAULT 0'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN log_state TEXT DEFAULT '{}'"); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN effect_state TEXT DEFAULT '{}'"); } catch {}
@@ -3096,6 +3097,7 @@ async function requestSheetApproval(interaction, gid, uid, submitMessageId = nul
   ].filter(Boolean);
   // Jump link back to where the sheet was submitted, so a GM can see the context.
   const srcCh = interactionChannelId(interaction);
+  if (srcCh) upsertChar(gid, uid, { approval_src_channel: srcCh }); // for the decision notice
   let jumpId = submitMessageId;
   if (!jumpId) { try { const rep = await interaction.fetchReply(); jumpId = rep?.id ?? null; } catch {} }
   if (srcCh && jumpId) lines.push(`\n[↗ Jump to submission](https://discord.com/channels/${gid}/${srcCh}/${jumpId})`);
@@ -6129,10 +6131,33 @@ async function handleSheetApprovalButton(interaction) {
     });
   } catch {}
 
-  // Tell the player in the channel they created the sheet in? Simpler: reply here.
-  return interaction.reply({ content: approved
+  // Let the player know — the GM's reply lands in a channel they can't see.
+  // Try a DM first, then fall back to the channel they submitted from.
+  const notice = approved
+    ? `✅ **Your character sheet was approved** by ${gmName} in **${interaction.guild.name}** — you can roll and fight now.`
+    : `🚫 **Your character sheet was rejected** by ${gmName} in **${interaction.guild.name}**. Speak to a GM; they'll need to adjust it for you.`;
+  let told = 'DM';
+  try {
+    const user = await interaction.client.users.fetch(uid);
+    await user.send(notice);
+  } catch {
+    told = null;
+    const srcId = getChar(gid, uid)?.approval_src_channel;
+    if (srcId) {
+      try {
+        const srcChan = await interaction.client.channels.fetch(srcId);
+        await srcChan.send({ content: `<@${uid}> ${notice}`, allowedMentions: { users: [uid] } });
+        told = 'channel';
+      } catch {}
+    }
+  }
+
+  const delivery = told === 'DM' ? ' _(player notified by DM)_'
+                 : told === 'channel' ? ' _(DM blocked — notified in their submission channel)_'
+                 : ' ⚠️ _couldn\'t reach the player — tell them directly._';
+  return interaction.reply({ content: (approved
     ? `✅ <@${uid}> (**${nm}**) approved — they can roll and fight now.`
-    : `🚫 <@${uid}> (**${nm}**) rejected — they'll need a GM to adjust the sheet.`,
+    : `🚫 <@${uid}> (**${nm}**) rejected — they'll need a GM to adjust the sheet.`) + delivery,
     allowedMentions: { parse: [] } });
 }
 
