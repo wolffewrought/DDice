@@ -5313,15 +5313,25 @@ const HELP_CATEGORIES = {
   },
 };
 
+// Help categories that document GM-only tooling. Players shouldn't be able to
+// browse them — both the listing and the detail view are gated.
+const GM_HELP_CATEGORIES = ['gm', 'npc'];
+
 async function handleHelp(interaction) {
   const cat = interaction.options.getString('category');
+  const gm = await isGm(interaction.guild, interaction.user.id);
+
   if (cat && HELP_CATEGORIES[cat]) {
+    if (GM_HELP_CATEGORIES.includes(cat) && !gm) {
+      return interaction.reply({ content: '❌ That help section covers GM-only commands.', ephemeral: true });
+    }
     const c = HELP_CATEGORIES[cat];
     return interaction.reply({ content: `**${c.title}**\n${c.body.join('\n')}`, ephemeral: true });
   }
-  // Overview of all categories
+  // Overview — hide GM sections from players entirely
   const lines = ['**🎲 DDice — Command Help**', '', 'Use `/help category:X` for details on each group.', ''];
   for (const key of Object.keys(HELP_CATEGORIES)) {
+    if (GM_HELP_CATEGORIES.includes(key) && !gm) continue;
     const c = HELP_CATEGORIES[key];
     lines.push(`${c.title} — \`/help category:${key}\``);
   }
