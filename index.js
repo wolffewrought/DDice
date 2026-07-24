@@ -2818,9 +2818,23 @@ async function registerSlashCommands(guildId) {
   } catch (err) { console.error('Failed to register slash commands:', err); }
 }
 
+// Commands are registered per-guild (see the ready handler) so that NPC name
+// choices stay server-specific. Any previously-registered GLOBAL commands would
+// show up as duplicates alongside them, so clear the global set on boot.
+async function clearGlobalCommands() {
+  try {
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+    const existing = await rest.get(Routes.applicationCommands(process.env.CLIENT_ID));
+    if (Array.isArray(existing) && existing.length) {
+      await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: [] });
+      console.log(`🧹 Cleared ${existing.length} global command(s) — guild commands are authoritative.`);
+    }
+  } catch (err) { console.error('Could not clear global commands:', err?.message || err); }
+}
+
 (async () => {
-  console.log('Registering slash commands...');
-  await registerSlashCommands(null);
+  console.log('Starting up...');
+  await clearGlobalCommands();
   client.login(process.env.DISCORD_TOKEN);
 })();
 
