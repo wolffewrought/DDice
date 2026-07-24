@@ -52,6 +52,7 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN roll_audit_channel_id TEXT');
 try { db.exec('ALTER TABLE characters ADD COLUMN signature_stat TEXT'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN class TEXT'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN signature_stat TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_role_ids TEXT'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN log_state TEXT DEFAULT '{}'"); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN effect_state TEXT DEFAULT '{}'"); } catch {}
 try {
@@ -807,11 +808,33 @@ async function replyLong(interaction, content, opts = {}) {
   }
 }
 
+// Every configured GM role. gm_role_ids (JSON list) is the modern store; the
+// legacy single gm_role_id is folded in so older setups keep working.
+function getGmRoleIds(gid) {
+  const cfg = getConfig(gid);
+  let ids = [];
+  try { ids = JSON.parse(cfg.gm_role_ids || '[]'); } catch { ids = []; }
+  if (!Array.isArray(ids)) ids = [];
+  if (cfg.gm_role_id && !ids.includes(cfg.gm_role_id)) ids = [cfg.gm_role_id, ...ids];
+  return ids;
+}
+function setGmRoleIds(gid, ids) {
+  const uniq = [...new Set(ids.filter(Boolean))];
+  // Keep the legacy column pointing at the first role so nothing else breaks.
+  setConfig(gid, { gm_role_ids: JSON.stringify(uniq), gm_role_id: uniq[0] ?? null });
+  return uniq;
+}
+
 async function isGm(guild, uid) {
-  const cfg = getConfig(guild.id);
-  if (!cfg.gm_role_id) return false;
-  try { const mb = await guild.members.fetch(uid); return mb.roles.cache.has(cfg.gm_role_id); }
+  let mb;
+  try { mb = await guild.members.fetch(uid); }
   catch { return false; }
+  // Server admins are always GMs — this prevents ever locking yourself out of
+  // the bot by mis-setting the role.
+  if (mb.permissions?.has?.(PermissionFlagsBits.ManageGuild)) return true;
+  const ids = getGmRoleIds(guild.id);
+  if (!ids.length) return false;
+  return ids.some(id => mb.roles.cache.has(id));
 }
 
 async function sendRollEmbed(message, rollLine, label, isReroll, uid, flavour, total, critType) {
@@ -1067,7 +1090,10 @@ const slashCommands = [
   new SlashCommandBuilder()
     .setName('config').setDescription('Server configuration (Admin only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addSubcommand(s=>s.setName('gmrole').setDescription('Set the GM role').addRoleOption(o=>o.setName('role').setDescription('The GM role').setRequired(true)))
+    .addSubcommand(s=>s.setName('gmrole').setDescription('Add, remove or list GM roles — several can be set')
+      .addRoleOption(o=>o.setName('role').setDescription('Role to add (or remove, with remove:true)').setRequired(false))
+      .addBooleanOption(o=>o.setName('remove').setDescription('true = remove this role instead of adding it').setRequired(false))
+      .addBooleanOption(o=>o.setName('replace').setDescription('true = make this the ONLY GM role').setRequired(false)))
     .addSubcommand(s=>s.setName('heal').setDescription('Set max Heal charges for White Knights').addIntegerOption(o=>o.setName('charges').setDescription('Number of charges').setRequired(true).setMinValue(1).setMaxValue(10)))
     .addSubcommand(s=>s.setName('npcchannel').setDescription('Set the NPC image bank channel').addStringOption(o=>o.setName('channel').setDescription('Channel ID or #channel mention').setRequired(true)))
     .addSubcommand(s=>s.setName('rest').setDescription('Set how much a rest restores (e.g. 50% or a flat number like 3)')
@@ -1470,8 +1496,34 @@ async function handleConfig(interaction) {
   const sub = interaction.options.getSubcommand(), gid = interaction.guild.id;
   if (sub === 'gmrole') {
     const role = interaction.options.getRole('role');
-    setConfig(gid, { gm_role_id: role.id });
-    return interaction.reply({ content: `✅ GM role set to **${role.name}**.`, ephemeral: true });
+    const remove = interaction.options.getBoolean('remove') ?? false;
+    const replace = interaction.options.getBoolean('replace') ?? false;
+    const current = getGmRoleIds(gid);
+
+    // No role given → list what's configured
+    if (!role) {
+      if (!current.length) return interaction.reply({ content: '📋 No GM roles set. Add one with `/config gmrole role:@Role`.\n_Server admins (Manage Server) always count as GMs._', ephemeral: true });
+      const names = current.map(id => `<@&${id}>`).join(', ');
+      return interaction.reply({ content: `📋 GM roles: ${names}\n_Server admins (Manage Server) always count as GMs._`, ephemeral: true, allowedMentions: { parse: [] } });
+    }
+
+    if (remove) {
+      if (!current.includes(role.id)) return interaction.reply({ content: `❌ **${role.name}** isn't a GM role.`, ephemeral: true });
+      const next = setGmRoleIds(gid, current.filter(id => id !== role.id));
+      return interaction.reply({ content: next.length
+        ? `✅ Removed **${role.name}**. GM roles: ${next.map(id => `<@&${id}>`).join(', ')}`
+        : `✅ Removed **${role.name}**. No GM roles remain — only server admins can use GM commands now.`,
+        ephemeral: true, allowedMentions: { parse: [] } });
+    }
+
+    if (replace) {
+      setGmRoleIds(gid, [role.id]);
+      return interaction.reply({ content: `✅ **${role.name}** is now the only GM role.`, ephemeral: true });
+    }
+
+    if (current.includes(role.id)) return interaction.reply({ content: `**${role.name}** is already a GM role.`, ephemeral: true });
+    const next = setGmRoleIds(gid, [...current, role.id]);
+    return interaction.reply({ content: `✅ Added **${role.name}** as a GM role. GM roles: ${next.map(id => `<@&${id}>`).join(', ')}`, ephemeral: true, allowedMentions: { parse: [] } });
   }
   if (sub === 'fightping') {
     const v = interaction.options.getBoolean('enabled');
@@ -4945,7 +4997,8 @@ const HELP_CATEGORIES = {
   gm: {
     title: '🛠️ GM & Config',
     body: [
-      '`/config gmrole @role` — set the GM role',
+      '`/config gmrole role:@Role` — add a GM role · `remove:true` · `replace:true` · omit to list',
+      '_Server admins (Manage Server) always count as GMs._',
       '`/config heal charges:N` — set default heal charges',
       '`/config npcreroll threshold:N` — NPC auto-reroll on nat ≤ N · 0 disables · omit to show',
       '`/config fightping enabled:true` — @-mention players on their turn · off by default (Admin)',
