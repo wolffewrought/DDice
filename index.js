@@ -58,6 +58,19 @@ try { db.exec('ALTER TABLE characters ADD COLUMN approval_state TEXT'); } catch 
 try { db.exec('ALTER TABLE characters ADD COLUMN approval_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN approval_src_channel TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_stats_visible INTEGER DEFAULT 0'); } catch {}
+try {
+  // Webhooks are bound to the channel they were created in. Storing one per NPC
+  // meant every later roll posted back to the ORIGINAL channel, wherever the
+  // command was actually run. Key them by channel instead.
+  db.exec(`CREATE TABLE IF NOT EXISTS npc_webhooks (
+    guild_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    npc_name TEXT NOT NULL,
+    webhook_id TEXT NOT NULL,
+    webhook_token TEXT NOT NULL,
+    PRIMARY KEY (guild_id, channel_id, npc_name)
+  )`);
+} catch (e) { console.error('npc_webhooks schema', e); }
 try { db.exec("ALTER TABLE fights ADD COLUMN log_state TEXT DEFAULT '{}'"); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN effect_state TEXT DEFAULT '{}'"); } catch {}
 try {
@@ -471,6 +484,39 @@ function deleteNpc(gid, name) {
 function setNpcImage(gid, name, url) {
   db.prepare('UPDATE npcs SET image_url=? WHERE guild_id=? AND name=?').run(url, gid, name);
 }
+// Per-channel webhook lookup. Falls back to nothing if the NPC has never
+// posted in this channel before, so a fresh one gets made here.
+function getNpcWebhookFor(gid, channelId, name) {
+  return db.prepare('SELECT webhook_id, webhook_token FROM npc_webhooks WHERE guild_id=? AND channel_id=? AND npc_name=?')
+    .get(gid, channelId, name);
+}
+function setNpcWebhookFor(gid, channelId, name, webhookId, webhookToken) {
+  db.prepare(`INSERT INTO npc_webhooks (guild_id, channel_id, npc_name, webhook_id, webhook_token)
+              VALUES (?,?,?,?,?)
+              ON CONFLICT(guild_id, channel_id, npc_name)
+              DO UPDATE SET webhook_id=excluded.webhook_id, webhook_token=excluded.webhook_token`)
+    .run(gid, channelId, name, webhookId, webhookToken);
+}
+function clearNpcWebhooks(gid, name) {
+  db.prepare('DELETE FROM npc_webhooks WHERE guild_id=? AND npc_name=?').run(gid, name);
+}
+
+// Resolve (or create) the webhook this NPC should use in THIS channel.
+async function npcWebhookIn(channel, gid, npcName, imageUrl) {
+  const { WebhookClient } = require('discord.js');
+  const row = getNpcWebhookFor(gid, channel.id, npcName);
+  if (row?.webhook_id && row?.webhook_token) {
+    return new WebhookClient({ id: row.webhook_id, token: row.webhook_token });
+  }
+  const webhook = await channel.createWebhook({
+    name: npcName,
+    avatar: imageUrl ?? BLANK_AVATAR,
+    reason: `NPC webhook for ${npcName}`,
+  });
+  setNpcWebhookFor(gid, channel.id, npcName, webhook.id, webhook.token);
+  return new WebhookClient({ id: webhook.id, token: webhook.token });
+}
+
 function setNpcWebhook(gid, name, webhookId, webhookToken) {
   db.prepare('UPDATE npcs SET webhook_id=?, webhook_token=? WHERE guild_id=? AND name=?').run(webhookId, webhookToken, gid, name);
 }
@@ -2647,7 +2693,8 @@ client.on('messageCreate', async message => {
       }
       const imageUrl = message.attachments.first().url;
       setNpcImage(message.guild.id, npcName, imageUrl);
-      setNpcWebhook(message.guild.id, npcName, null, null); // recreate with new avatar
+      setNpcWebhook(message.guild.id, npcName, null, null);
+      clearNpcWebhooks(message.guild.id, npc.name); // recreate everywhere with the new avatar
       console.log(`[npcimg] avatar set for "${npc.name}"`);
       message.react('✅').catch(()=>{});
       await message.reply(`✅ Avatar set for **${npc.name}**.`).catch(()=>{});
@@ -3423,25 +3470,22 @@ async function fighterCharCard(guild, gid, fid) {
 async function postAsNpc(channel, gid, npcName, content) {
   const npc = getNpc(gid, npcName);
   try {
-    const { WebhookClient } = require('discord.js');
-    let webhookClient;
-    if (npc && npc.webhook_id && npc.webhook_token) {
-      webhookClient = new WebhookClient({ id: npc.webhook_id, token: npc.webhook_token });
-    } else {
-      const webhook = await channel.createWebhook({
-        name: npcName,
-        avatar: npc?.image_url ?? BLANK_AVATAR,
-        reason: `NPC webhook for ${npcName}`,
-      });
-      if (npc) setNpcWebhook(gid, npcName, webhook.id, webhook.token);
-      webhookClient = new WebhookClient({ id: webhook.id, token: webhook.token });
-    }
+    const webhookClient = await npcWebhookIn(channel, gid, npcName, npc?.image_url);
     await webhookClient.send({ content, username: npcName, avatarURL: npc?.image_url ?? BLANK_AVATAR });
     return true;
   } catch (err) {
+    // A stored webhook can be deleted server-side; drop it and retry once.
     console.error('postAsNpc webhook error:', err.message);
-    await channel.send(content).catch(()=>{});
-    return false;
+    try {
+      db.prepare('DELETE FROM npc_webhooks WHERE guild_id=? AND channel_id=? AND npc_name=?').run(gid, channel.id, npcName);
+      const fresh = await npcWebhookIn(channel, gid, npcName, npc?.image_url);
+      await fresh.send({ content, username: npcName, avatarURL: npc?.image_url ?? BLANK_AVATAR });
+      return true;
+    } catch (err2) {
+      console.error('postAsNpc retry failed:', err2.message);
+      await channel.send(content).catch(()=>{});
+      return false;
+    }
   }
 }
 
@@ -5214,23 +5258,12 @@ async function handlePr(interaction) {
     saveRoll(gid, interactionChannelId(interaction), `npc_${npc.name}`, notation, label);
 
     // Get or create webhook for this NPC
-    let webhookClient;
     try {
-      const { WebhookClient } = require('discord.js');
-      if (npc.webhook_id && npc.webhook_token) {
-        webhookClient = new WebhookClient({ id: npc.webhook_id, token: npc.webhook_token });
-      } else {
-        // Create a new webhook in this channel
-        const prChan2 = await interactionChannel(interaction);
-        if (!prChan2) return interaction.editReply({ content: '❌ I can\'t access this channel.' }).catch(()=>{});
-        const webhook = await prChan2.createWebhook({
-          name: npc.name,
-          avatar: npc.image_url ?? BLANK_AVATAR,
-          reason: `NPC webhook for ${npc.name}`,
-        });
-        setNpcWebhook(gid, npc.name, webhook.id, webhook.token);
-        webhookClient = new WebhookClient({ id: webhook.id, token: webhook.token });
-      }
+      const prChan2 = await interactionChannel(interaction);
+      if (!prChan2) return interaction.editReply({ content: '❌ I can\'t access this channel.' }).catch(()=>{});
+      // Webhook for THIS channel — otherwise the post lands wherever the NPC
+      // first spoke, which looked like "nothing happened".
+      const webhookClient = await npcWebhookIn(prChan2, gid, npc.name, npc.image_url);
 
       await webhookClient.send({
         content,
@@ -5240,10 +5273,20 @@ async function handlePr(interaction) {
       return interaction.editReply({ content: `✅ Posted as **${npc.name}**.` });
     } catch (err) {
       console.error('Webhook error:', err);
-      // Fallback: post the card normally (we've already deferred)
-      await interaction.editReply({ content: '⚠️ Webhook failed — posting normally.' }).catch(()=>{});
+      // A stored webhook may have been deleted server-side — drop it and retry.
       const fallbackChan = await interactionChannel(interaction);
-      if (fallbackChan) await fallbackChan.send({ content }).catch(()=>{});
+      if (fallbackChan) {
+        try {
+          db.prepare('DELETE FROM npc_webhooks WHERE guild_id=? AND channel_id=? AND npc_name=?').run(gid, fallbackChan.id, npc.name);
+          const fresh = await npcWebhookIn(fallbackChan, gid, npc.name, npc.image_url);
+          await fresh.send({ content, username: npc.name, avatarURL: npc.image_url ?? BLANK_AVATAR });
+          return interaction.editReply({ content: `✅ Posted as **${npc.name}**.` }).catch(()=>{});
+        } catch (err2) {
+          console.error('Webhook retry failed:', err2.message);
+          await interaction.editReply({ content: '⚠️ Webhook failed — posting normally.' }).catch(()=>{});
+          await fallbackChan.send({ content }).catch(()=>{});
+        }
+      }
     }
   }
 }
