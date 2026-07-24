@@ -2729,7 +2729,10 @@ async function autoFightCard(guild, gid, fighter, kind, stat, nat, total, target
     const bonusTag = (kind === 'atk' && atkBonus) ? ` +${atkBonus} riposte` : '';
     rollLine = `${icon}  1d20+${STAT_LABELS[stat]}${bonusTag} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
   }
-  const label = kind === 'atk' ? `⚔️ Attacks ${targetName} with ${STAT_LABELS[stat]}` : `🛡️ Defends with ${STAT_LABELS[stat]}`;
+  const who = `${fighter.name}${fighter.isNpc ? ' 🎭' : ''}`;
+  const label = kind === 'atk'
+    ? `⚔️ ${who} attacks ${targetName} with ${STAT_LABELS[stat]}`
+    : `🛡️ ${who} defends with ${STAT_LABELS[stat]}`;
   const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
   const charCard = await fighterCharCard(guild, gid, fighter.id);
   return buildRollEmbed({
@@ -3505,16 +3508,19 @@ async function handleFight(interaction) {
     const fightOn = () => useTeams ? (sideAlive(1) && sideAlive(2)) : alive().length > 1;
     const autoLog = { exchanges: 0, f: {} };
     const ensureLog = (fid) => (autoLog.f[fid] = autoLog.f[fid] || { dealt: 0, taken: 0, crit: 0, fumble: 0, rr: 0 });
-    let idx = 0, round = 1, safety = 0, lastPos = -1;
+    let idx = 0, round = 1, safety = 0, exchanges = 0;
     while (fightOn() && safety < 200) {
       safety++;
       // find next living attacker starting at idx
       let guard = 0;
       while (hp[order[idx]] <= 0 && guard < order.length) { idx = (idx + 1) % order.length; guard++; }
       const attackerId = order[idx];
-      // a new round starts whenever the turn pointer wraps past the top of the order
-      if (idx <= lastPos) round++;
-      lastPos = idx;
+      // One round = every living fighter has taken one attack. Count completed
+      // exchanges against the current number of living fighters rather than
+      // watching the index wrap, which mislabelled the second half of a round.
+      const livingCount = Math.max(1, order.filter(fid => hp[fid] > 0).length);
+      round = Math.floor(exchanges / livingCount) + 1;
+      exchanges++;
       // pick a random living opponent
       const opponents = alive().filter(fid => useTeams ? sideOf[fid] !== sideOf[attackerId] : fid !== attackerId);
       if (!opponents.length) break;
