@@ -1848,15 +1848,18 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
 
 async function handleHeal(message, rest) {
   const gid = message.guild.id, uid = message.author.id;
-  const mentionMatch = rest.match(/^<@!?(\d+)>/);
+  // Accept the mention anywhere in the argument, not just flush at the start —
+  // "!heal @user", "!heal  @user" and "!heal please @user" all work.
+  const mentionMatch = rest.match(/<@!?(\d+)>/);
   if (!mentionMatch) return message.reply('❌ You must target a player. Usage: `!heal @user`');
   const targetId = mentionMatch[1];
   if (targetId === uid) return message.reply('❌ You cannot heal yourself.');
   const char = getChar(gid, uid);
-  if (!char) return message.reply('❌ No character found. Use `/char set` first.');
-  if (!isWhiteKnight(char)) return message.reply('❌ Only White Knights with WIS 5 can use Heal.');
+  // This checks the HEALER's sheet — be explicit so it isn't mistaken for the target's.
+  if (!char) return message.reply('❌ **You** have no character sheet yet — the healer needs one to roll WIS. Use `/char create` first.');
+  if (!isWhiteKnight(char)) return message.reply('❌ Only **White Knights** with **WIS 5+** can use Heal. Your order and WIS are set with `/char set`.');
   const targetChar = getChar(gid, targetId);
-  if (!targetChar) return message.reply('❌ Target has no character set up.');
+  if (!targetChar) return message.reply(`❌ <@${targetId}> has no character sheet yet.`);
   const cfg = getConfig(gid); const mc = cfg.heal_charges??3;
   const hr = getHealCharges(gid, uid, mc);
   if (hr.current <= 0) return message.reply('❌ No Heal charges remaining.');
@@ -1889,6 +1892,7 @@ async function handleHeal(message, rest) {
 
 async function handleHp(message, rest) {
   const gid = message.guild.id, uid = message.author.id;
+  rest = String(rest || '').trim();
   const mm  = rest.match(/^<@!?(\d+)>\s*([+-]\d+)$/);
   const mm2 = rest.match(/^([+-]\d+)\s*<@!?(\d+)>$/);
   const sm  = rest.match(/^([+-]\d+)$/);
@@ -1912,6 +1916,7 @@ async function handleHp(message, rest) {
 
 async function handleRerolls(message, rest) {
   const gid = message.guild.id, uid = message.author.id;
+  rest = String(rest || '').trim();
   const mm  = rest.match(/^<@!?(\d+)>\s*([+-]\d+)$/);
   const mm2 = rest.match(/^([+-]\d+)\s*<@!?(\d+)>$/);
   const sm  = rest.match(/^([+-]\d+)$/);
@@ -1953,7 +1958,7 @@ function resolveRestToken(token, max, fallback) {
 
 async function handleRest(message, rest, type) {
   const gid = message.guild.id, uid = message.author.id;
-  const mm = rest.match(/^<@!?(\d+)>/);
+  const mm = String(rest || '').match(/<@!?(\d+)>/);
   let targetId = uid;
   if (mm) {
     if (!(await isGm(message.guild, uid))) return message.reply('❌ Only GMs can apply rests to other players.');
@@ -2458,7 +2463,12 @@ client.on('messageCreate', async message => {
     catch (err) { console.error(err); return message.reply('❌ Something went wrong.'); }
   }
 
-  const match = content.match(/^(!?|\?)(gmrs?|lrest|srest|hpfull|hphalf|rerolls|roll|rra|rrd|rr|ra|rd|r|heal|hp|h)([\s\S]*)/i);
+  // Bare (unprefixed) commands must not swallow ordinary chat: without a ! or ?
+  // prefix, a command word can't be followed immediately by another letter.
+  // "Hmm" / "hey" / "rest" / "right" are conversation; "!h @user", "r1d20",
+  // "heal @user" and "hp +5" are commands.
+  const match = content.match(/^(!|\?)(gmrs?|lrest|srest|hpfull|hphalf|rerolls|roll|rra|rrd|rr|ra|rd|r|heal|hp|h)([\s\S]*)/i)
+    || content.match(/^()(gmrs?|lrest|srest|hpfull|hphalf|rerolls|roll|rra|rrd|rr|ra|rd|r|heal|hp|h)(?![A-Za-z])([\s\S]*)/i);
   if (!match) return;
   const prefix = match[1];
   const successCheck = prefix === '?';
