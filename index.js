@@ -2621,21 +2621,26 @@ client.on('messageCreate', async message => {
   const content = message.content.trim();
 
 
-  // NPC image bank — detect image uploads in npc channel
-  if (message.attachments.size > 0) {
+  // NPC image bank — detect image uploads in the configured NPC channel
+  if (message.guild && message.attachments.size > 0) {
     const cfg = getConfig(message.guild.id);
     if (cfg.npc_channel_id && message.channel.id === cfg.npc_channel_id) {
       const npcName = message.content.trim();
-      if (npcName) {
-        const npc = getNpc(message.guild.id, npcName);
-        if (npc) {
-          const imageUrl = message.attachments.first().url;
-          setNpcImage(message.guild.id, npcName, imageUrl);
-          // Reset webhook so it gets recreated with new avatar
-          setNpcWebhook(message.guild.id, npcName, null, null);
-          message.react('✅').catch(()=>{});
-        }
+      if (!npcName) {
+        await message.reply('⚠️ Add the NPC\'s name as the message text so I know who this image belongs to.').catch(()=>{});
+        return;
       }
+      const npc = getNpc(message.guild.id, npcName);
+      if (!npc) {
+        // Say so rather than failing silently — a typo used to look identical
+        // to "the bot isn't working".
+        await message.reply(`⚠️ No NPC named **${npcName}** on this server. Create them first with \`/npc create name:${npcName}\`, then re-upload.`).catch(()=>{});
+        return;
+      }
+      const imageUrl = message.attachments.first().url;
+      setNpcImage(message.guild.id, npcName, imageUrl);
+      setNpcWebhook(message.guild.id, npcName, null, null); // recreate with new avatar
+      message.react('✅').catch(()=>{});
       return; // Don't process as commands
     }
   }
@@ -2790,7 +2795,15 @@ async function registerSlashCommands(guildId) {
       }
 
     }
-    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands.map(c => c.toJSON()) });
+    if (guildId) {
+      // Guild-scoped: NPC name choices are per-server, so they must not be
+      // pushed globally or one server's NPCs appear in every other server.
+      // Guild updates also appear instantly instead of taking up to an hour.
+      await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, guildId), { body: commands.map(c => c.toJSON()) });
+    } else {
+      // Boot-time global registration uses the generic command set (no NPC choices).
+      await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands.map(c => c.toJSON()) });
+    }
     console.log('✅ Slash commands registered.');
   } catch (err) { console.error('Failed to register slash commands:', err); }
 }
