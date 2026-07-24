@@ -695,6 +695,7 @@ function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharg
   }
   if (char.order_name) lines.push(`${KNIGHT_EMOJIS[char.order_name]??'⚪'}  ${char.order_name}`);
   if (char.class) lines.push(`🏅  ${char.class}`);
+  { const sig = signatureLine(char); if (sig && !char._isNpc) lines.push(sig); }
   // NPC stat blocks are hidden from players by default so their capabilities stay
   // a mystery. A GM can reveal them with /config npcstats enabled:true.
   const hideNpcStats = char._isNpc && !(gid && getConfig(gid)?.npc_stats_visible);
@@ -1059,6 +1060,7 @@ async function handleCharExport(interaction) {
     `  ${char.order_name || 'No Order'}`,
   ];
   if (char.class) textLines.push(`  ${char.class}`);
+  { const sig = signatureLine(char, true); if (sig) textLines.push(sig); }
   if (approvalEnabled(gid) && char.approval_state === 'pending') textLines.push('  ⏳ Awaiting GM approval');
   if (approvalEnabled(gid) && char.approval_state === 'rejected') textLines.push('  🚫 Rejected by a GM');
   textLines.push(
@@ -1896,6 +1898,7 @@ async function handleChar(interaction) {
     const kn = char.order_name ? `${KNIGHT_EMOJIS[char.order_name]??'⚪'}  ${char.order_name}` : 'No order set';
     const lines = [`⚔️  **${dn}**`, kn];
     if (char.class) lines.push(`🏅  ${char.class}`);
+    { const sig = signatureLine(char); if (sig) lines.push(sig); }
     lines.push(`❤️  HP          ${char.hp_current} / ${maxHp(char)}`, `🔄  Rerolls      ${char.rerolls_current} / ${maxRerolls(char)}`);
     if (isWhiteKnight(char)) lines.push(`🛡️  Heal         ${hr.current} / ${mc}`);
     lines.push('', `💪  STR         ${char.str}`, `🫀  CON         ${char.con}`, `⚡  DEX         ${char.dex}`, `🧠  WIS         ${char.wis}`, `🍀  LCK         ${char.lck}`);
@@ -2779,6 +2782,8 @@ process.on('uncaughtException', (err) => {
 // ─────────────────────────────────────────────
 
 const STAT_LABELS = { str:'STR', con:'CON', dex:'DEX', wis:'WIS', lck:'LCK' };
+const STAT_EMOJIS = { str:'💪', con:'🫀', dex:'⚡', wis:'🧠', lck:'🍀' };
+const STAT_NAMES  = { str:'Strength', con:'Constitution', dex:'Dexterity', wis:'Wisdom', lck:'Luck' };
 
 function fightTotalStr(total, nat, sides) {
   const isCrit = nat === sides;
@@ -2956,6 +2961,19 @@ function getNpcRrThreshold(gid) {
   const v = getConfig(gid)?.npc_rr_threshold;
   return (v === null || v === undefined) ? NPC_RR_NAT_MAX : v;
 }
+// One-line summary of a Hero's signature stat, e.g. "⭐  Signature  STR (advantage)".
+// Returns null when the row isn't a Hero or has no signature set.
+function signatureLine(row, pad = false) {
+  if (!isHero(row) || !row?.signature_stat) return null;
+  const stat = String(row.signature_stat).toLowerCase();
+  const emoji = STAT_EMOJIS[stat] ?? '⭐';
+  const name = STAT_NAMES[stat] ?? (STAT_LABELS[stat] ?? stat.toUpperCase());
+  const active = hasSignatureAdvantage(row, stat);
+  const suffix = active ? 'advantage' : `advantage *(inactive — needs ${SIGNATURE_MIN}+)*`;
+  return pad ? `  ${emoji}: ${name} ${active ? 'advantage' : `advantage (inactive — needs ${SIGNATURE_MIN}+)`}`
+             : `${emoji}:  ${name} ${suffix}`;
+}
+
 // ── NPC HP visibility ─────────────────────────────────────────────────────────
 // Players shouldn't know an NPC's HP pool, but damage dealt should still be
 // obvious. When hidden we report the damage and a coarse condition instead of
