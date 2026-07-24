@@ -1110,7 +1110,8 @@ const slashCommands = [
       .addBooleanOption(o=>o.setName('remove').setDescription('true = remove this role instead of adding it').setRequired(false))
       .addBooleanOption(o=>o.setName('replace').setDescription('true = make this the ONLY GM role').setRequired(false)))
     .addSubcommand(s=>s.setName('heal').setDescription('Set max Heal charges for White Knights').addIntegerOption(o=>o.setName('charges').setDescription('Number of charges').setRequired(true).setMinValue(1).setMaxValue(10)))
-    .addSubcommand(s=>s.setName('npcchannel').setDescription('Set the NPC image bank channel').addStringOption(o=>o.setName('channel').setDescription('Channel ID or #channel mention').setRequired(true)))
+    .addSubcommand(s=>s.setName('npcchannel').setDescription('Set the NPC image bank channel')
+      .addChannelOption(o=>o.setName('channel').setDescription('Channel to watch for NPC avatar uploads').setRequired(true)))
     .addSubcommand(s=>s.setName('rest').setDescription('Set how much a rest restores (e.g. 50% or a flat number like 3)')
       .addStringOption(o=>o.setName('type').setDescription('Which rest to configure').setRequired(true)
         .addChoices({name:'Long Rest',value:'lrest'},{name:'Short Rest',value:'srest'}))
@@ -1644,10 +1645,10 @@ async function handleConfig(interaction) {
     return interaction.reply({ content: `✅ White Knight Heal charges set to **${charges}**.`, ephemeral: true });
   }
   if (sub === 'npcchannel') {
-    const raw = interaction.options.getString('channel');
-    const channelId = raw.replace(/[<#>]/g, '').trim();
-    setConfig(gid, { npc_channel_id: channelId });
-    return interaction.reply({ content: `✅ NPC image channel set to <#${channelId}>. Upload images there with the NPC name as the message text to set avatars.`, ephemeral: true });
+    const chan = interaction.options.getChannel('channel');
+    if (!chan?.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel.', ephemeral: true });
+    setConfig(gid, { npc_channel_id: chan.id });
+    return interaction.reply({ content: `✅ NPC image channel set to <#${chan.id}> (id \`${chan.id}\`).\nUpload an image there with the NPC's name as the message text to set their avatar.\n⚠️ I need **View Channel**, **Send Messages** and **Read Message History** there.`, ephemeral: true });
   }
 
   if (sub === 'rest') {
@@ -2624,23 +2625,32 @@ client.on('messageCreate', async message => {
   // NPC image bank — detect image uploads in the configured NPC channel
   if (message.guild && message.attachments.size > 0) {
     const cfg = getConfig(message.guild.id);
-    if (cfg.npc_channel_id && message.channel.id === cfg.npc_channel_id) {
+    // Tracing: an avatar upload that does nothing is impossible to diagnose
+    // otherwise. These lines show in the Railway logs.
+    console.log(`[npcimg] attachment in ${message.channel.id}; configured=${cfg.npc_channel_id || 'NONE'}; text="${message.content}"`);
+    if (!cfg.npc_channel_id) {
+      await message.reply('⚠️ No NPC image channel is set. An admin needs to run `/config npcchannel`.').catch(()=>{});
+      return;
+    }
+    if (message.channel.id === cfg.npc_channel_id) {
       const npcName = message.content.trim();
       if (!npcName) {
-        await message.reply('⚠️ Add the NPC\'s name as the message text so I know who this image belongs to.').catch(()=>{});
+        console.error('[npcimg] message.content is EMPTY — if you did type a name, the Message Content Intent is disabled in the Developer Portal.');
+        await message.reply('⚠️ I can\'t read the message text. Either add the NPC\'s name as the caption, or — if you did — a bot admin needs to enable **Message Content Intent** in the Discord Developer Portal.').catch(()=>{});
         return;
       }
       const npc = getNpc(message.guild.id, npcName);
       if (!npc) {
-        // Say so rather than failing silently — a typo used to look identical
-        // to "the bot isn't working".
+        console.error(`[npcimg] no NPC named "${npcName}" in guild ${message.guild.id}`);
         await message.reply(`⚠️ No NPC named **${npcName}** on this server. Create them first with \`/npc create name:${npcName}\`, then re-upload.`).catch(()=>{});
         return;
       }
       const imageUrl = message.attachments.first().url;
       setNpcImage(message.guild.id, npcName, imageUrl);
       setNpcWebhook(message.guild.id, npcName, null, null); // recreate with new avatar
+      console.log(`[npcimg] avatar set for "${npc.name}"`);
       message.react('✅').catch(()=>{});
+      await message.reply(`✅ Avatar set for **${npc.name}**.`).catch(()=>{});
       return; // Don't process as commands
     }
   }
