@@ -5121,7 +5121,14 @@ async function handlePr(interaction) {
     saveRoll(gid, interactionChannelId(interaction), `npc_${name}`, last.notation, last.label);
 
     const critType = detectCrit(result, mode);
-    const rollLine = buildRollLine(result, mode, critType, null);
+    let rollLine = buildRollLine(result, mode, critType, null);
+    // "1d20+3 → [3] +3 = 6" gives the stat away — strip the modifier when NPC
+    // stats are hidden, leaving the natural die and the final total.
+    if (!npcStatsVisible(gid)) {
+      rollLine = rollLine
+        .replace(/(\d+d\d+)[+-]\d+/g, '$1')
+        .replace(/\]\s*[+-]\d+\s*=/g, '] =');
+    }
     const lines = [];
     if (last.label) lines.push(`${critPrefix(critType)}**${last.label}** *(reroll)*`);
     else lines.push('*(reroll)*');
@@ -5129,14 +5136,18 @@ async function handlePr(interaction) {
     lines.push('─────────────────────────────');
     lines.push(`⚔️  ${npc.name}`);
     if (npc.order_name) lines.push(`${KNIGHT_EMOJIS[npc.order_name]??'⚪'}  ${npc.order_name}`);
-    lines.push(`❤️  HP${pad(npc.hp_current)} / ${npc.con + 2}`);
-    lines.push(`🔄  Rerolls${pad(updatedNpc.lck)} / ${npc.lck}`);
-    lines.push('');
-    lines.push(`💪  STR${pad(npc.str)}`);
-    lines.push(`🫀  CON${pad(npc.con)}`);
-    lines.push(`⚡  DEX${pad(npc.dex)}`);
-    lines.push(`🧠  WIS${pad(npc.wis)}`);
-    lines.push(`🍀  LCK${pad(updatedNpc.lck)}`);
+    if (!npcStatsVisible(gid)) {
+      lines.push(`❤️  ${hpCondition(npc.hp_current, npc.con + 2)}`);
+    } else {
+      lines.push(`❤️  HP${pad(npc.hp_current)} / ${npc.con + 2}`);
+      lines.push(`🔄  Rerolls${pad(updatedNpc.lck)} / ${npc.lck}`);
+      lines.push('');
+      lines.push(`💪  STR${pad(npc.str)}`);
+      lines.push(`🫀  CON${pad(npc.con)}`);
+      lines.push(`⚡  DEX${pad(npc.dex)}`);
+      lines.push(`🧠  WIS${pad(npc.wis)}`);
+      lines.push(`🍀  LCK${pad(updatedNpc.lck)}`);
+    }
 
     const content2 = lines.join('\n');
 
@@ -5228,7 +5239,14 @@ async function handlePr(interaction) {
     if (!result) return interaction.editReply({ content: '❌ Invalid dice notation.' });
 
     const critType = detectCrit(result, mode);
-    const rollLine = buildRollLine(result, mode, critType, null);
+    let rollLine = buildRollLine(result, mode, critType, null);
+    // "1d20+3 → [3] +3 = 6" gives the stat away — strip the modifier when NPC
+    // stats are hidden, leaving the natural die and the final total.
+    if (!npcStatsVisible(gid)) {
+      rollLine = rollLine
+        .replace(/(\d+d\d+)[+-]\d+/g, '$1')
+        .replace(/\]\s*[+-]\d+\s*=/g, '] =');
+    }
 
     // Build embed text
     const lines = [];
@@ -5238,14 +5256,18 @@ async function handlePr(interaction) {
     lines.push('─────────────────────────────');
     lines.push(`⚔️  ${npc.name}`);
     if (npc.order_name) lines.push(`${KNIGHT_EMOJIS[npc.order_name]??'⚪'}  ${npc.order_name}`);
-    lines.push(`❤️  HP${pad(npc.hp_current)} / ${npc.con + 2}`);
-    lines.push(`🔄  Rerolls${pad(npc.lck)} / ${npc.lck}`);
-    lines.push('');
-    lines.push(`💪  STR${pad(npc.str)}`);
-    lines.push(`🫀  CON${pad(npc.con)}`);
-    lines.push(`⚡  DEX${pad(npc.dex)}`);
-    lines.push(`🧠  WIS${pad(npc.wis)}`);
-    lines.push(`🍀  LCK${pad(npc.lck)}`);
+    if (!npcStatsVisible(gid)) {
+      lines.push(`❤️  ${hpCondition(npc.hp_current, npc.con + 2)}`);
+    } else {
+      lines.push(`❤️  HP${pad(npc.hp_current)} / ${npc.con + 2}`);
+      lines.push(`🔄  Rerolls${pad(npc.lck)} / ${npc.lck}`);
+      lines.push('');
+      lines.push(`💪  STR${pad(npc.str)}`);
+      lines.push(`🫀  CON${pad(npc.con)}`);
+      lines.push(`⚡  DEX${pad(npc.dex)}`);
+      lines.push(`🧠  WIS${pad(npc.wis)}`);
+      lines.push(`🍀  LCK${pad(npc.lck)}`);
+    }
     if (flavour) {
       lines.push('');
       lines.push('─────────────────────────────');
