@@ -332,8 +332,22 @@ CONTENT = [
 ('p', '<b>HP stays in sync:</b> any mid-fight HP change — <b>!hp</b>, <b>!heal</b>, rests, <b>/npc hp</b> or '
       'the <b>/fight hp</b> command — is mirrored straight into the fight, so a heal is never overwritten '
       'by the next exchange. Anywhere a command takes NPC names, <b>category:Name</b> adds a whole '
-      'category at once. When a fight ends — by victory, forfeit, kick or <b>/fight end</b> — a recap '
-      'posts each fighter\u2019s damage dealt and taken, natural 20s and 1s, and rerolls spent.'),
+      'category at once.'),
+('h2', 'When a Fight Ends'),
+('p', 'However a fight finishes — a knockout, a forfeit, a kick, <b>/fight end</b> or an auto-resolve — '
+      'a single public <b>result post</b> goes to the channel where everyone can read it. Nothing important '
+      'is left in a private reply: the ' + GM + '\u2019s confirmation for <b>/fight end</b> stays private, but '
+      'the result itself is posted for the whole table.'),
+('p', 'The post names the <b>victor</b>, then lists every combatant\u2019s <b>final standing</b> — exact HP for '
+      'players, a condition band for NPCs while their stats are hidden — followed by the recap.'),
+('p', 'The <b>recap</b> covers players and NPCs alike, in three parts. <b>Rolls</b>: how many attacks and '
+      'defences each fighter made, their average total, and their best and worst natural dice. '
+      '<b>Damage</b>: dealt and taken, natural 20s and 1s, and rerolls spent. <b>Blow by blow</b>: every '
+      'exchange in order — both rolls, the natural die and the final total for each side, and whether it '
+      'landed or was blocked, with natural 20s and 1s marked. Very long fights show the most recent '
+      'exchanges and say how many earlier ones were trimmed; the roll and damage figures still cover the '
+      'whole fight. Long recaps are split across messages so nothing is lost to Discord\u2019s length limit.'),
+('p', '<b>/fight log</b> re-posts the last finished fight\u2019s recap in that channel at any time, blow-by-blow included.'),
 ('aud','gm'),
 ('p', '<b>NPCs as combatants:</b> a ' + GM + ' lists NPCs in <b>npcs:</b> (comma-separated) on start '
       'or <b>/fight addnpc</b> later. On an NPC\u2019s turn the ' + GM + ' adds <b>npc:Name</b> to '

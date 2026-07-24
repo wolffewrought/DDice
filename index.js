@@ -878,6 +878,24 @@ async function interactionChannel(interaction) {
   return await interaction.client.channels.fetch(id).catch(() => null);
 }
 
+// Post content to a channel that may exceed Discord's 2000-char hard limit.
+// Same line-boundary chunking as replyLong, for paths that aren't replying to
+// an interaction (auto fights, end-of-fight announcements).
+async function sendLong(channel, content) {
+  if (!channel) return;
+  const LIMIT = 1900;
+  const src = Array.isArray(content) ? content : String(content).split('\n');
+  const chunks = [];
+  let buf = '';
+  for (const line of src) {
+    const piece = line.length > LIMIT ? line.slice(0, LIMIT) : line;
+    if (buf.length + piece.length + 1 > LIMIT) { chunks.push(buf); buf = piece; }
+    else { buf = buf ? buf + '\n' + piece : piece; }
+  }
+  if (buf) chunks.push(buf);
+  for (const c of chunks) await channel.send(c).catch(()=>{});
+}
+
 // Reply with content that may exceed Discord's 2000-char hard limit. Splits on
 // line boundaries so long lists (quest board, npc list, recaps) never fail
 // silently. First chunk is the reply; the rest are follow-ups. Pass an array of
@@ -3454,18 +3472,32 @@ function resolveFightTarget(interaction, gid, fight) {
 }
 
 // ── Fight log & recap ────────────────────────────────────────────────────────
-// log_state: { exchanges: n, f: { fid: { dealt, taken, crit, fumble, rr } } }
+// log_state: {
+//   exchanges: n,
+//   f: { fid: { dealt, taken, crit, fumble, rr, atk: TALLY, def: TALLY } },
+//   r: [ { n, a, d, an, at, as, dn, dt, ds, h, dm } ]   // blow-by-blow
+// }
+// TALLY = { n, totSum, natHi, natLo } — enough for counts, averages and extremes.
+const ROLL_TALLY = () => ({ n: 0, totSum: 0, natHi: 0, natLo: 99 });
+const FIGHTER_LOG = () => ({ dealt: 0, taken: 0, crit: 0, fumble: 0, rr: 0, atk: ROLL_TALLY(), def: ROLL_TALLY() });
+// Stored exchanges are capped so log_state can't grow without bound on a very
+// long auto fight; the summary tallies still cover every exchange.
+const ROLL_LOG_MAX = 150;
+const ROLL_LOG_SHOW = 40;
+
 function bumpFightLog(gid, cid, mutate) {
   const fight = getFight(gid, cid);
   if (!fight) return;
   const log = JSON.parse(fight.log_state || '{}');
   log.f = log.f || {};
-  mutate(log, (fid) => (log.f[fid] = log.f[fid] || { dealt: 0, taken: 0, crit: 0, fumble: 0, rr: 0 }));
+  mutate(log, (fid) => (log.f[fid] = log.f[fid] || FIGHTER_LOG()));
   upsertFight(gid, cid, { log_state: JSON.stringify(log) });
 }
 
-// Record one resolved exchange into a log object (shared by DB fights and full-auto's in-memory log).
-function recordExchange(log, ensure, attackerId, defenderId, atkNat, defNat, hit, dmg) {
+// Record one resolved exchange into a log object (shared by DB fights and
+// full-auto's in-memory log). `meta` carries the roll detail the recap needs:
+// { atkTotal, defTotal, atkStat, defStat }.
+function recordExchange(log, ensure, attackerId, defenderId, atkNat, defNat, hit, dmg, meta = {}) {
   log.exchanges = (log.exchanges || 0) + 1;
   const a = ensure(attackerId), d = ensure(defenderId);
   if (atkNat === 20) a.crit++;
@@ -3473,23 +3505,137 @@ function recordExchange(log, ensure, attackerId, defenderId, atkNat, defNat, hit
   if (defNat === 20) d.crit++;
   if (defNat === 1) d.fumble++;
   if (hit) { a.dealt += dmg; d.taken += dmg; }
+
+  // Roll tallies, attack and defence kept apart. Seeded defensively so a fight
+  // already in progress when this shipped doesn't blow up mid-exchange.
+  const tally = (t, nat, total) => {
+    t.n++;
+    t.totSum += (typeof total === 'number' ? total : (nat || 0));
+    if (typeof nat === 'number') {
+      if (nat > (t.natHi ?? 0)) t.natHi = nat;
+      if (nat < (t.natLo ?? 99)) t.natLo = nat;
+    }
+  };
+  a.atk = a.atk || ROLL_TALLY();
+  d.def = d.def || ROLL_TALLY();
+  tally(a.atk, atkNat, meta.atkTotal);
+  tally(d.def, defNat, meta.defTotal);
+
+  // Blow-by-blow entry.
+  log.r = Array.isArray(log.r) ? log.r : [];
+  if (log.r.length < ROLL_LOG_MAX) {
+    log.r.push({
+      n: log.exchanges, a: attackerId, d: defenderId,
+      an: atkNat, at: meta.atkTotal ?? null, as: meta.atkStat ?? null,
+      dn: defNat, dt: meta.defTotal ?? null, ds: meta.defStat ?? null,
+      h: hit ? 1 : 0, dm: hit ? dmg : 0,
+    });
+  } else {
+    log.rTrim = (log.rTrim || 0) + 1;
+  }
 }
 
-// Render the recap lines for a finished fight.
-async function buildFightRecap(guild, gid, log) {
+// Render the recap lines for a finished fight: how the dice fell for each
+// fighter, the damage ledger, and the full blow-by-blow of every exchange.
+// Pass { rolls: false } to omit the blow-by-blow.
+async function buildFightRecap(guild, gid, log, opts = {}) {
   const entries = Object.entries(log?.f ?? {});
   if (!entries.length) return [];
-  const lines = ['', `📜 **Fight Recap** — ${log.exchanges ?? 0} exchange${(log.exchanges ?? 0) === 1 ? '' : 's'}`];
-  entries.sort((x, y) => (y[1].dealt ?? 0) - (x[1].dealt ?? 0));
-  for (const [fid, st] of entries) {
+  const ex = log.exchanges ?? 0;
+  const lines = ['', `📜 **Fight Recap** — ${ex} exchange${ex === 1 ? '' : 's'}`];
+
+  // Resolve every name once — used by all three sections.
+  const rolls = Array.isArray(log.r) ? log.r : [];
+  const ids = [...new Set([...entries.map(e => e[0]), ...rolls.flatMap(r => [r.a, r.d])])];
+  const nameOf = {}, isNpcOf = {};
+  for (const fid of ids) {
     const f = await resolveFighter(guild, gid, fid);
+    nameOf[fid] = `${f.name}${f.isNpc ? ' 🎭' : ''}`;
+    isNpcOf[fid] = f.isNpc;
+  }
+  const hideNpc = !npcStatsVisible(gid);
+  // NPC stat names stay hidden here exactly as they are on the roll cards.
+  const statTag = (fid, st) => (!st || (isNpcOf[fid] && hideNpc)) ? '' : ` ${STAT_LABELS[st] ?? ''}`;
+
+  entries.sort((x, y) => (y[1].dealt ?? 0) - (x[1].dealt ?? 0));
+
+  // ── Rolls: how the dice treated each fighter ──
+  const tallyBits = (t) => {
+    if (!t || !t.n) return null;
+    const out = [`avg **${(t.totSum / t.n).toFixed(1)}**`];
+    if (t.natHi) out.push(`best nat ${t.natHi}`);
+    // Only worth printing when it differs — a single roll isn't a range.
+    if (t.natLo != null && t.natLo < 99 && t.natLo !== t.natHi) out.push(`worst nat ${t.natLo}`);
+    return out.join(' · ');
+  };
+  const rollLines = [];
+  for (const [fid, st] of entries) {
+    const bits = [];
+    const a = tallyBits(st.atk), d = tallyBits(st.def);
+    if (a) bits.push(`⚔️ ${st.atk.n} atk · ${a}`);
+    if (d) bits.push(`🛡️ ${st.def.n} def · ${d}`);
+    if (bits.length) rollLines.push(`**${nameOf[fid] ?? fid}** — ${bits.join('   ')}`);
+  }
+  if (rollLines.length) lines.push('', '**🎲 Rolls**', ...rollLines);
+
+  // ── Damage ledger ──
+  lines.push('', '**💥 Damage**');
+  for (const [fid, st] of entries) {
     const bits = [`dealt **${st.dealt ?? 0}**`, `taken **${st.taken ?? 0}**`];
     if (st.crit) bits.push(`💥 ${st.crit} nat-20${st.crit > 1 ? 's' : ''}`);
     if (st.fumble) bits.push(`🔻 ${st.fumble} nat-1${st.fumble > 1 ? 's' : ''}`);
     if (st.rr) bits.push(`🔁 ${st.rr} reroll${st.rr > 1 ? 's' : ''}`);
-    lines.push(`**${f.name}${f.isNpc ? ' 🎭' : ''}** — ${bits.join(' · ')}`);
+    lines.push(`**${nameOf[fid] ?? fid}** — ${bits.join(' · ')}`);
+  }
+
+  // ── Blow by blow: every roll both sides made, in order ──
+  if (opts.rolls !== false && rolls.length) {
+    const shown = rolls.slice(-ROLL_LOG_SHOW);
+    const trimmed = (rolls.length - shown.length) + (log.rTrim ?? 0);
+    lines.push('', '**⚔️ Blow by blow**');
+    if (trimmed > 0) lines.push(`*(earliest ${trimmed} exchange${trimmed === 1 ? '' : 's'} trimmed)*`);
+    const nat = (v) => v === 20 ? `[**20**]💥` : v === 1 ? `[**1**]🔻` : `[${v}]`;
+    for (const r of shown) {
+      const res = r.h ? `💥 **${r.dm}**` : `🛡️ blocked`;
+      lines.push(`\`${String(r.n).padStart(2, ' ')}\` ${nameOf[r.a] ?? '?'} ⚔️${statTag(r.a, r.as)} ${nat(r.an)}→**${r.at ?? '?'}**  ·  ${nameOf[r.d] ?? '?'} 🛡️${statTag(r.d, r.ds)} ${nat(r.dn)}→**${r.dt ?? '?'}**  ·  ${res}`);
+    }
   }
   return lines;
+}
+
+// ── End-of-fight announcement ────────────────────────────────────────────────
+// Every way a fight can finish — knockout, forfeit, kick, GM end, full auto —
+// funnels through here, so the result is always posted publicly in the channel
+// where everyone can read it, never buried in an ephemeral reply only the GM
+// sees. Carries the victor, everyone's final standing, and the full recap.
+async function announceFightEnd(guild, gid, cid, channel, opts = {}) {
+  const { headline = null, log = {}, roster = [], hpState = {}, floor = 0 } = opts;
+  const W = fightWords(floor);
+  const lines = ['═════════════════════════════', floor > 0 ? '🏁 **Bout Over**' : '🏁 **Fight Over**'];
+  if (headline) lines.push('', headline);
+
+  // Everyone who took part: the roster passed in, plus anyone recorded in the
+  // log or HP state — fighters knocked out earlier already left the turn order.
+  const ids = [];
+  for (const fid of [...(roster || []), ...Object.keys(log?.f ?? {}), ...Object.keys(hpState || {})]) {
+    if (fid && !ids.includes(fid)) ids.push(fid);
+  }
+  if (ids.length) {
+    lines.push('', '**Final standing**');
+    for (const fid of ids) {
+      const f = await resolveFighter(guild, gid, fid);
+      const known = hpState && Object.prototype.hasOwnProperty.call(hpState, fid);
+      const live = known ? hpState[fid]
+        : (f.isNpc ? (getNpc(gid, f.name)?.hp_current ?? 0) : (getChar(gid, fid)?.hp_current ?? 0));
+      const text = (f.isNpc && !npcStatsVisible(gid))
+        ? hpCondition(live, f.maxHp, floor)
+        : `❤️ ${live} / ${f.maxHp || '?'}${live <= floor ? ` ${W.icon}` : ''}`;
+      lines.push(`**${f.name}${f.isNpc ? ' 🎭' : ''}** — ${text}`);
+    }
+  }
+
+  lines.push(...await buildFightRecap(guild, gid, log));
+  await sendLong(channel, lines);
 }
 
 // Expand category tokens in an NPC list, keeping unknown tokens as-is so the
@@ -3659,7 +3805,8 @@ async function autoResolveExchange(guild, gid, cid, channel) {
   const defName = defF.name + (defF.isNpc ? ' 🎭' : '');
 
   bumpFightLog(gid, cid, (log, ensure) =>
-    recordExchange(log, ensure, attackerId, defenderId, fight.atk_nat, fight.def_nat, hit, dmg));
+    recordExchange(log, ensure, attackerId, defenderId, fight.atk_nat, fight.def_nat, hit, dmg,
+      { atkTotal: fight.atk_roll, defTotal: fight.def_roll, atkStat: fight.atk_stat, defStat: fight.def_stat }));
 
   const effNotes = applyExchangeEffects(gid, cid, attackerId, defenderId, fight.atk_nat, fight.def_nat);
 
@@ -3682,12 +3829,14 @@ async function autoResolveExchange(guild, gid, cid, channel) {
       const newOrder = turnOrder.filter(id => id !== defenderId);
       if (newOrder.length <= 1) {
         const winF = await resolveFighter(guild, gid, newOrder[0]);
-        lines.push(`\n🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** ${W.win}!`);
         const endLog = JSON.parse(getFight(gid, cid)?.log_state || '{}');
-        lines.push(...await buildFightRecap(guild, gid, endLog));
         archiveFight(gid, cid, endLog, turnOrder, floor);
         upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState) });
-        await channel.send(lines.join('\n')).catch(()=>{});
+        await sendLong(channel, lines);
+        await announceFightEnd(guild, gid, cid, channel, {
+          headline: `🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** ${W.win}!`,
+          log: endLog, roster: turnOrder, hpState, floor,
+        });
         return false;
       }
       const newIndex = fight.turn_index % newOrder.length;
@@ -3959,15 +4108,21 @@ async function handleFight(interaction) {
     const lines = [`👢 **${f.name}${f.isNpc ? ' 🎭' : ''}** has been removed from the fight.`];
 
     if (newOrder.length <= 1) {
+      const kickFloor = fightFloor(fight);
+      const kickW = fightWords(kickFloor);
+      let headline = `👢 **${f.name}${f.isNpc ? ' 🎭' : ''}** was removed by the GM.`;
       if (newOrder.length === 1) {
         const winF = await resolveFighter(interaction.guild, gid, newOrder[0]);
-        lines.push(`🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** wins!`);
+        headline = `🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** ${kickW.win} — last one standing after the GM removed **${f.name}**.`;
       }
       const kickLog = JSON.parse(fight.log_state || '{}');
-      lines.push(...await buildFightRecap(interaction.guild, gid, kickLog));
-      archiveFight(gid, cid, kickLog, turnOrder, fightFloor(fight));
+      archiveFight(gid, cid, kickLog, turnOrder, kickFloor);
       upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState) });
-      return interaction.reply({ content: lines.join('\n') });
+      await interaction.reply({ content: lines.join('\n') });
+      await announceFightEnd(interaction.guild, gid, cid, chan, {
+        headline, log: kickLog, roster: turnOrder, hpState: JSON.parse(fight.hp_state), floor: kickFloor,
+      });
+      return;
     }
 
     let newIndex = (removedPos < fight.turn_index ? fight.turn_index - 1 : fight.turn_index) % newOrder.length;
@@ -4176,7 +4331,7 @@ async function handleFight(interaction) {
     const sideAlive = (t) => order.some(fid => sideOf[fid] === t && hp[fid] > floor);
     const fightOn = () => useTeams ? (sideAlive(1) && sideAlive(2)) : alive().length > 1;
     const autoLog = { exchanges: 0, f: {} };
-    const ensureLog = (fid) => (autoLog.f[fid] = autoLog.f[fid] || { dealt: 0, taken: 0, crit: 0, fumble: 0, rr: 0 });
+    const ensureLog = (fid) => (autoLog.f[fid] = autoLog.f[fid] || FIGHTER_LOG());
     let idx = 0, round = 1, safety = 0, exchanges = 0;
     while (fightOn() && safety < 200) {
       safety++;
@@ -4252,7 +4407,8 @@ async function handleFight(interaction) {
         ({ hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20));
       }
 
-      recordExchange(autoLog, ensureLog, attackerId, defenderId, a.nat, d.nat, hit, dmg);
+      recordExchange(autoLog, ensureLog, attackerId, defenderId, a.nat, d.nat, hit, dmg,
+        { atkTotal: a.total, defTotal: d.total, atkStat: aStat, defStat: dStat });
 
       // Set carry-over effects from this exchange (in-memory mirror of applyExchangeEffects)
       const fxNotes = [];
@@ -4287,16 +4443,17 @@ async function handleFight(interaction) {
     if (useTeams && (sideAlive(1) !== sideAlive(2))) {
       const winner = sideAlive(1) ? 1 : 2;
       const names = survivors.filter(fid => sideOf[fid] === winner).map(fid => `**${F[fid].name}${F[fid].isNpc?' 🎭':''}**`).join(', ');
-      winLine = `\n🏆 **Team ${winner}** ${W.win}! Survivors: ${names}. Final HP has been saved to all combatants' sheets.`;
+      winLine = `🏆 **Team ${winner}** ${W.win}! Survivors: ${names}. Final HP has been saved to all combatants' sheets.`;
     } else if (!useTeams && survivors.length === 1) {
       const w = F[survivors[0]];
-      winLine = `\n🏆 **${w.name}${w.isNpc?' 🎭':''}** ${W.win}! Final HP has been saved to all combatants' sheets.`;
+      winLine = `🏆 **${w.name}${w.isNpc?' 🎭':''}** ${W.win}! Final HP has been saved to all combatants' sheets.`;
     } else {
-      winLine = `\n⚖️ The ${W.noun} ended without a clear winner. Final HP saved to all combatants' sheets.`;
+      winLine = `⚖️ The ${W.noun} ended without a clear winner. Final HP saved to all combatants' sheets.`;
     }
     archiveFight(gid, interactionChannelId(interaction), autoLog, order, floor);
-    const recapLines = await buildFightRecap(interaction.guild, gid, autoLog);
-    await send(winLine + (recapLines.length ? '\n' + recapLines.join('\n') : ''));
+    await announceFightEnd(interaction.guild, gid, interactionChannelId(interaction), channel, {
+      headline: winLine, log: autoLog, roster: order, hpState: hp, floor,
+    });
     return;
   }
 
@@ -4656,7 +4813,8 @@ async function handleFight(interaction) {
     const effNotes = applyExchangeEffects(gid, cid, attackerId, defenderId, fight.atk_nat, fight.def_nat);
 
     bumpFightLog(gid, cid, (log, ensure) =>
-      recordExchange(log, ensure, attackerId, defenderId, fight.atk_nat, fight.def_nat, hit, dmg));
+      recordExchange(log, ensure, attackerId, defenderId, fight.atk_nat, fight.def_nat, hit, dmg,
+        { atkTotal: fight.atk_roll, defTotal: fight.def_roll, atkStat: fight.atk_stat, defStat: fight.def_stat }));
 
     const atkF = await resolveFighter(interaction.guild, gid, attackerId);
     const defF = await resolveFighter(interaction.guild, gid, defenderId);
@@ -4684,12 +4842,15 @@ async function handleFight(interaction) {
         const newOrder = turnOrder.filter(id => id !== defenderId);
         if (newOrder.length <= 1) {
           const winF = await resolveFighter(interaction.guild, gid, newOrder[0]);
-          lines.push(`\n🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** ${W.win}!`);
           const endLog = JSON.parse(getFight(gid, cid)?.log_state || '{}');
-          lines.push(...await buildFightRecap(interaction.guild, gid, endLog));
           archiveFight(gid, cid, endLog, turnOrder, floor);
           upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState) });
-          return interaction.reply({ content: lines.join('\n') });
+          await replyLong(interaction, lines);
+          await announceFightEnd(interaction.guild, gid, cid, chan, {
+            headline: `🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** ${W.win}!`,
+            log: endLog, roster: turnOrder, hpState, floor,
+          });
+          return;
         }
         // Advance turn
         const newIndex = fight.turn_index % newOrder.length;
@@ -4758,15 +4919,19 @@ async function handleFight(interaction) {
     const newOrder = turnOrder.filter(id => id !== uid);
     const lines = [`🏳️ **${name}** forfeits the fight! Their HP remains at **${hpState[uid] ?? 0}**.`];
 
+    let ffAnnounce = null;
     if (newOrder.length <= 1) {
+      const ffFloor = fightFloor(fight);
+      const ffW = fightWords(ffFloor);
+      let headline = `🏳️ **${name}** conceded — the ${ffW.noun} is over.`;
       if (newOrder.length === 1) {
         const winF = await resolveFighter(interaction.guild, gid, newOrder[0]);
-        lines.push(`🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** wins!`);
+        headline = `🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** ${ffW.win} — **${name}** conceded.`;
       }
       const ffLog = JSON.parse(fight.log_state || '{}');
-      lines.push(...await buildFightRecap(interaction.guild, gid, ffLog));
-      archiveFight(gid, cid, ffLog, turnOrder, fightFloor(fight));
+      archiveFight(gid, cid, ffLog, turnOrder, ffFloor);
       upsertFight(gid, cid, { state: 'idle', turn_order: '[]' });
+      ffAnnounce = { headline, log: ffLog, roster: turnOrder, hpState, floor: ffFloor };
     } else {
       let newIndex = fight.turn_index % newOrder.length;
       const nextF = await resolveFighter(interaction.guild, gid, newOrder[newIndex]);
@@ -4781,7 +4946,9 @@ async function handleFight(interaction) {
       });
     }
 
-    return interaction.reply({ content: lines.join('\n') });
+    await interaction.reply({ content: lines.join('\n') });
+    if (ffAnnounce) await announceFightEnd(interaction.guild, gid, cid, chan, ffAnnounce);
+    return;
   }
 
   // ── STATUS ─────────────────────────────────────────────────────────────────
@@ -4831,6 +4998,7 @@ async function handleFight(interaction) {
     const recap = await buildFightRecap(interaction.guild, gid, log);
     if (!recap.length) return interaction.reply({ content: '📋 The last fight here ended before any exchanges were resolved.', ephemeral: true });
     const archFloor = Number(arch.floor_hp ?? 0) > 0 ? Number(arch.floor_hp) : 0;
+    // (recap already includes the roll tables and blow-by-blow)
     const lines = [`📜 **Last ${archFloor > 0 ? 'practice bout' : 'fight'} in this channel** — ended ${formatHistDate(arch.ended_at)}`,
                    ...(archFloor > 0 ? [`🏳️ Friendly sparring — fighters bowed out at ${archFloor} HP.`] : []),
                    ...recap.slice(1)];
@@ -4877,10 +5045,19 @@ async function handleFight(interaction) {
     return requestConfirm(interaction, 'End the current fight? Turn order clears but HP states are preserved.', async () => {
       const endRow = getFight(gid, cid);
       const endLog = JSON.parse(endRow?.log_state || '{}');
-      const recap = await buildFightRecap(interaction.guild, gid, endLog);
-      archiveFight(gid, cid, endLog, JSON.parse(endRow?.turn_order || '[]'), fightFloor(endRow));
+      const endFloor = fightFloor(endRow);
+      const endRoster = JSON.parse(endRow?.turn_order || '[]');
+      const endHp = JSON.parse(endRow?.hp_state || '{}');
+      archiveFight(gid, cid, endLog, endRoster, endFloor);
       upsertFight(gid, cid, { state: 'idle', turn_order: '[]' });
-      return ['🛑 Fight ended by GM. HP states preserved.', ...recap].join('\n');
+      // The confirm reply is ephemeral — only the GM who pressed the button can
+      // see it. Post the real result to the channel so the table sees it too.
+      const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+      await announceFightEnd(interaction.guild, gid, cid, chan, {
+        headline: `🛑 Called by **${gmName}** — no victor. HP states are preserved.`,
+        log: endLog, roster: endRoster, hpState: endHp, floor: endFloor,
+      });
+      return '✅ Fight ended — the result and recap have been posted in the channel.';
     });
   }
 }
@@ -5542,7 +5719,8 @@ const HELP_CATEGORIES = {
       '`/fight kick target:@a` / `target_npc:Orc` — remove a fighter, fight continues (GM)',
       '`/fight auto mode:Full teams:@a @b vs Goblin, Orc` — party-vs-monsters sides (GM)',
       'NPC lists accept `category:Name` to add a whole category at once',
-      'A 📜 recap (damage, crits, rerolls) posts whenever a fight ends',
+      'When a fight ends a public 🏁 result posts in the channel — victor, everyone\'s final HP, and a 📜 recap',
+      'The recap covers both players and NPCs: roll averages, best/worst naturals, damage dealt and taken, and a blow-by-blow of every exchange',
       '`/fight log` — re-post the last finished fight\'s recap in this channel',
       '`/fight skip` — skip the current turn; the fighter stays in the fight (GM)',
       '`/fight auto mode:NPCs only ...` — bot plays NPC turns, players play manually (GM)',
