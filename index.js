@@ -5138,6 +5138,8 @@ async function handlePr(interaction) {
   if (sub === 'roll') {
     const category = interaction.options.getString('category') ?? 'all';
     const name     = interaction.options.getString('name');
+    // Creating an NPC's webhook is slow; defer so we never miss the 3s ack.
+    let prDeferred = false;
     const notationRaw = interaction.options.getString('notation') ?? '1d20';
     const stat     = interaction.options.getString('stat') ?? null;
 
@@ -5150,6 +5152,9 @@ async function handlePr(interaction) {
       const inCategory = category === 'Uncategorised' ? npcCats.length === 0 : npcCats.includes(category);
       if (!inCategory) return interaction.reply({ content: `❌ **${name}** is not in the **${category}** category.`, ephemeral: true });
     }
+    await interaction.deferReply({ ephemeral: true }).catch(()=>{});
+    prDeferred = true;
+
     const labelRaw = interaction.options.getString('label') ?? null;
     const flavour  = interaction.options.getString('flavour') ?? null;
     const rollType = interaction.options.getString('roll') ?? 'normal';
@@ -5176,7 +5181,7 @@ async function handlePr(interaction) {
     if (mode === 'adv') result = rollAdvantage(notation);
     else if (mode === 'dis') result = rollDisadvantage(notation);
     else result = rollNotation(notation);
-    if (!result) return interaction.reply({ content: '❌ Invalid dice notation.', ephemeral: true });
+    if (!result) return interaction.editReply({ content: '❌ Invalid dice notation.' });
 
     const critType = detectCrit(result, mode);
     const rollLine = buildRollLine(result, mode, critType, null);
@@ -5227,7 +5232,6 @@ async function handlePr(interaction) {
         webhookClient = new WebhookClient({ id: webhook.id, token: webhook.token });
       }
 
-      await interaction.deferReply({ ephemeral: true });
       await webhookClient.send({
         content,
         username: npc.name,
@@ -5236,8 +5240,10 @@ async function handlePr(interaction) {
       return interaction.editReply({ content: `✅ Posted as **${npc.name}**.` });
     } catch (err) {
       console.error('Webhook error:', err);
-      // Fallback to regular reply if webhook fails
-      await interaction.reply({ content });
+      // Fallback: post the card normally (we've already deferred)
+      await interaction.editReply({ content: '⚠️ Webhook failed — posting normally.' }).catch(()=>{});
+      const fallbackChan = await interactionChannel(interaction);
+      if (fallbackChan) await fallbackChan.send({ content }).catch(()=>{});
     }
   }
 }
