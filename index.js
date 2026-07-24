@@ -1349,6 +1349,25 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('saves').setDescription('List all your saved snapshots')),
 
   new SlashCommandBuilder()
+    .setName('gmheal').setDescription('Restore HP, rerolls or heal charges — players or NPCs (GM)')
+    .addUserOption(o=>o.setName('user').setDescription('Player to restore').setRequired(false))
+    .addStringOption(o=>o.setName('npc').setDescription('NPC to restore — or "all" for every NPC').setRequired(false).setAutocomplete(true))
+    .addStringOption(o=>o.setName('amount').setDescription('How much to restore (default: full)').setRequired(false)
+      .addChoices(
+        {name:'❤️ Full — restore to maximum',value:'full'},
+        {name:'🩹 Half — restore half of maximum',value:'half'},
+        {name:'➕ Add — add the value below',value:'add'},
+        {name:'➖ Subtract — remove the value below',value:'sub'},
+        {name:'🎯 Exact — set to the value below',value:'exact'}))
+    .addIntegerOption(o=>o.setName('value').setDescription('Number used by Add / Subtract / Exact').setRequired(false).setMinValue(-99).setMaxValue(99))
+    .addStringOption(o=>o.setName('restore').setDescription('What to restore (default: HP only)').setRequired(false)
+      .addChoices(
+        {name:'❤️ HP only',value:'hp'},
+        {name:'🔄 Rerolls only',value:'rerolls'},
+        {name:'🛡️ Heal charges only',value:'charges'},
+        {name:'✨ Everything — HP, rerolls and charges',value:'all'})),
+
+  new SlashCommandBuilder()
     .setName('roll').setDescription('Roll dice with optional stat, advantage and RP flavour')
     .addStringOption(o=>o.setName('stat').setDescription('Roll 1d20 + this stat from your sheet').setRequired(false)
       .addChoices(
@@ -2280,6 +2299,14 @@ client.on('interactionCreate', async interaction => {
         return await interaction.respond(choices);
       }
 
+      if (interaction.commandName === 'gmheal' && focusedOption.name === 'npc') {
+        const v = String(focusedOption.value).toLowerCase();
+        const choices = [{ name: 'all', value: 'all' },
+          ...getAllNpcs(interaction.guild.id).map(n => ({ name: n.name.slice(0,100), value: n.name }))]
+          .filter(c => c.name.toLowerCase().includes(v)).slice(0, 25);
+        return await interaction.respond(choices);
+      }
+
       if (interaction.commandName === 'npc' && focusedOption.name === 'category') {
         const v = String(focusedOption.value).toLowerCase();
         const choices = getCategories(interaction.guild.id)
@@ -2369,6 +2396,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'help') return await handleHelp(interaction);
     if (interaction.commandName === 'lastroll') return await handleLastRoll(interaction);
     if (interaction.commandName === 'backup') return await handleBackup(interaction);
+    if (interaction.commandName === 'gmheal') return await handleGmHeal(interaction);
     if (interaction.commandName === 'roll') return await handleRollSlash(interaction);
     if (interaction.commandName === 'merit') return await handleMerit(interaction);
     if (interaction.commandName === 'rank') return await handleRank(interaction);
@@ -4892,6 +4920,7 @@ const HELP_CATEGORIES = {
       '`/npc create name:X str:N ...` — create an NPC (GM)',
       '`/npc hp name:X value:N` — set an NPC\'s HP · omit value for a full heal (GM)',
       '`/npc heal names:all` · `/npc heal names:Goblin, Orc` — fully heal NPCs (GM)',
+      '`/gmheal user:@a` / `npc:all` — restore HP, rerolls or charges, any amount (GM)',
       '`/npc copy name:Goblin new_name:Goblin 2` — duplicate an NPC (GM)',
       '`/npc show name:Goblin` — full stat block for one NPC',
       '`/npc hero name:X stat:str` — make an NPC a Hero with a signature stat (GM)',
@@ -5072,6 +5101,89 @@ function makeConfirmButtons(token) {
   return row;
 }
 
+
+// ── /gmheal ───────────────────────────────────────────────────────────────────
+// One GM command for restoring resources, on a player or an NPC (or every NPC).
+// HP changes go through setFighterHp so any active fight stays in sync.
+async function handleGmHeal(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  if (!(await isGm(interaction.guild, uid)))
+    return interaction.reply({ content: '❌ Only GMs can use `/gmheal`.', ephemeral: true });
+
+  const targetUser = interaction.options.getUser('user');
+  const npcArg = (interaction.options.getString('npc') || '').trim();
+  if (!!targetUser === !!npcArg)
+    return interaction.reply({ content: '❌ Pick exactly one of `user` or `npc`.', ephemeral: true });
+
+  const amount = interaction.options.getString('amount') || 'full';
+  const restore = interaction.options.getString('restore') || 'hp';
+  const value = interaction.options.getInteger('value');
+  if (['add','sub','exact'].includes(amount) && value === null)
+    return interaction.reply({ content: `❌ \`amount:${amount}\` needs a \`value\`.`, ephemeral: true });
+
+  // Work out a new figure from the chosen mode.
+  const compute = (cur, max) => {
+    if (amount === 'full') return max;
+    if (amount === 'half') return Math.ceil(max / 2);
+    if (amount === 'add') return Math.min(max, cur + value);
+    if (amount === 'sub') return cur - value;           // may go negative — GM's call
+    return Math.min(max, value);                        // exact
+  };
+
+  // ── NPC(s) ──
+  if (npcArg) {
+    const targets = npcArg.toLowerCase() === 'all'
+      ? getAllNpcs(gid)
+      : expandNpcList(gid, npcArg).map(n => getNpc(gid, n)).filter(Boolean);
+    if (!targets.length) return interaction.reply({ content: `❌ No NPC matched **${npcArg}**.`, ephemeral: true });
+    if (restore !== 'hp' && restore !== 'all')
+      return interaction.reply({ content: '❌ NPCs only have HP — use `restore:HP only`.', ephemeral: true });
+
+    const lines = [];
+    for (const npc of targets) {
+      const max = (npc.con ?? 0) + 2;
+      const before = npc.hp_current ?? 0;
+      const after = compute(before, max);
+      setFighterHp(gid, npcFighterId(npc.name), after); // keeps any live fight in sync
+      lines.push(`🎭 **${npc.name}** — ❤️ ${before} → **${after}** / ${max}`);
+    }
+    return replyLong(interaction, [`✨ Restored ${targets.length} NPC${targets.length === 1 ? '' : 's'}:`, '', ...lines]);
+  }
+
+  // ── Player ──
+  const ch = getChar(gid, targetUser.id);
+  if (!ch) return interaction.reply({ content: `❌ <@${targetUser.id}> has no character sheet yet.`, ephemeral: true });
+  const nm = await getDisplayName(interaction.guild, targetUser.id);
+  const cfg = getConfig(gid);
+  const maxCharges = cfg.heal_charges ?? 3;
+  const lines = [];
+
+  if (restore === 'hp' || restore === 'all') {
+    const max = maxHp(ch), before = ch.hp_current ?? 0;
+    const after = compute(before, max);
+    setFighterHp(gid, targetUser.id, after);
+    lines.push(`❤️ HP: **${before} → ${after}** / ${max}`);
+  }
+  if (restore === 'rerolls' || restore === 'all') {
+    const max = maxRerolls(ch), before = ch.rerolls_current ?? 0;
+    const after = Math.max(0, compute(before, max));
+    upsertChar(gid, targetUser.id, { rerolls_current: after });
+    lines.push(`🔄 Rerolls: **${before} → ${after}** / ${max}`);
+  }
+  if (restore === 'charges' || restore === 'all') {
+    if (!isWhiteKnight(ch)) {
+      lines.push('🛡️ Heal charges: _skipped — not a White Knight with WIS 5+_');
+    } else {
+      const before = getHealCharges(gid, targetUser.id, maxCharges).current;
+      const after = Math.max(0, compute(before, maxCharges));
+      setHealCharges(gid, targetUser.id, after);
+      lines.push(`🛡️ Heal charges: **${before} → ${after}** / ${maxCharges}`);
+    }
+  }
+  const downed = (getChar(gid, targetUser.id)?.hp_current ?? 0) <= 0;
+  if (downed) lines.push('💀 _Still at 0 or less — they\'ll be left out of new fights._');
+  return interaction.reply({ content: [`✨ **${nm}** restored:`, '', ...lines].join('\n') });
+}
 
 // ── /roll (slash) ─────────────────────────────────────────────────────────────
 // Same roll engine and card format as the prefix commands, but every part is a
