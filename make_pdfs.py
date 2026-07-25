@@ -148,6 +148,29 @@ CONTENT = [
          'single change and buries the GMs in them. It matters again afterwards, because once your sheet is '
          'approved every field is locked and only a GM can change it \u2014 so /char create is your one clean '
          'run at the character you want.'),
+('h2', 'The Point Budget'),
+('p', 'A player building their own character spends <b>exactly 15 points</b> across the five stats, and every '
+      'stat needs <b>at least 1</b>. Not 14, not 16 \u2014 the full allowance, all of it placed. A ' + GM + ' can '
+      'change both numbers for the server with <b>/config statallowance</b>.'),
+('code', [('/char create str:5 con:4 dex:3 wis:2 lck:1', '15 exactly, nothing on zero \u2014 fine'),
+          ('/char create str:4 con:4 dex:3 wis:2 lck:1', '14 \u2014 refused, 1 still to place'),
+          ('/char create str:6 con:5 dex:3 wis:2 lck:1', '17 \u2014 refused, take 2 back off'),
+          ('/char create str:9 con:5 dex:1 wis:0 lck:0', 'over AND stats on 0 \u2014 both reported')]),
+('p', 'The refusal is posted <b>in the channel you are working in</b>, not as a private note only you can '
+      'see \u2014 so it sits alongside what you typed, and a ' + GM + ' watching the workshop channel can see '
+      'who is stuck and step in.'),
+('p', 'Break a rule and the sheet is refused on the spot with a note saying exactly what is wrong \u2014 both '
+      'problems at once if you managed both \u2014 along with your current spread and running total, so you can '
+      'see what to move. Nothing is saved and nothing goes to the GMs until it is legal. The same check runs '
+      'on <b>/char set</b>, on a pasted sheet, on <b>/profile load</b> and on <b>/char submit</b>, so there is '
+      'no way in around the back.'),
+('p', 'Adjusting one stat at a time with <b>/char set</b> only checks the ceiling, so you can shuffle points '
+      'between stats freely \u2014 lowering one before raising another would be impossible otherwise. The sheet '
+      'is saved either way, but it is held back from the ' + GM + 's until the full allowance is placed, and it '
+      'tells you how many points are still loose.'),
+('note', GM + 's are not limited by any of this \u2014 building a character for a player, adjusting one, or '
+         'making their own. A ' + GM + ' can hand out whatever spread a story calls for, and NPCs are '
+         'unaffected entirely.'),
 ('h2', 'Changing One Field Later'),
 ('p', 'Use <b>/char set</b> to adjust a single thing after the fact \u2014 a stat that went up, a weapon you '
       'swapped. It is a touch-up tool, not the way to build a character from nothing.'),
@@ -169,10 +192,15 @@ CONTENT = [
           ('/char weaponemoji slot:Weapon 1 custom::sword:', 'paste a server emoji')]),
 ('note', 'Pick a standard emoji from the dropdown, or paste a server custom emoji in the \u201ccustom\u201d '
          'field (it overrides the dropdown). The image export falls back to a sword glyph for custom emojis.'),
+('p', 'If a GM <b>rejects</b> your sheet you can fix it and try again yourself \u2014 change whatever they '
+      'objected to with <b>/char set</b> or <b>/char create</b> and it goes straight back to them. If you think '
+      'it was right as it stood, <b>/char submit</b> sends it again unchanged. There is no limit on how many '
+      'times a sheet can go back and forth.'),
 ('h2', 'Reading & Sharing Your Sheet'),
 ('code', [('/char create ...', 'see \u201cStart Here\u201d \u2014 builds the whole sheet'),
           ('/char show          /char show user:@player', ''),
-          ('/char export        /char export format:Image', '')]),
+          ('/char export        /char export format:Image', ''),
+          ('/char submit', 'resend your sheet after a rejection')]),
 ('p', '<b>With sheet approval switched on, an export goes to the GMs first.</b> Running <b>/char export</b> '
       'posts the sheet block into the approval channel with <b>Release to player</b> / <b>Decline</b> buttons; '
       'the player sees only a private note that it has been sent. When a GM releases it, the block arrives by '
@@ -200,6 +228,7 @@ CONTENT = [
           ('/config gmrole role:@Role replace:true', 'make it the only GM role'),
           ('/config gmrole', 'list current GM roles'),
           ('/config heal charges 3', ''),
+          ('/config statallowance points:15 minimum:1', 'player build points (omit both to view)'),
           ('/config npcchannel #channel', 'set the NPC image bank channel'),
           ('/config npcreroll threshold:8', 'NPC auto-reroll on nat ≤ N — 0 disables'),
           ('/config fightping enabled:true', '@-mention players on their turn — off by default'),
@@ -207,6 +236,7 @@ CONTENT = [
           ('/config rollaudit test:true', 'send a test mirror, report problems'),
           ('/config npcstats enabled:true', 'reveal NPC stat blocks — hidden by default'),
           ('/config approvals channel:#sheet-approvals', 'new sheets need GM sign-off'),
+          ('/config approvals list:true', 'every sheet still waiting \u2014 from the database'),
           ('/config approvals disable:true', 'turn approval off'),
           ('/config rest type:Short Rest hp:50% rerolls:0%', '% of max'),
           ('/config rest type:Short Rest hp:3 rerolls:1', 'flat numbers'),
@@ -216,6 +246,9 @@ CONTENT = [
          '(\u2764\ufe0f unhurt / wounded / badly hurt / near death / down) instead of numbers \u2014 so the fight '
          'reads clearly without revealing what an NPC can take. Reveal everything with '
          '<b>/config npcstats enabled:true</b>. NPC management commands are ' + GM + '-only regardless.'),
+('note', 'A sheet that is <b>still waiting</b> can be edited by its owner \u2014 spot a mistake before a '
+         + GM + ' gets to it and you can fix it, which retires the old request and posts a fresh one. Only an '
+         '<b>approved</b> sheet is frozen to its owner.'),
 ('note', 'With an approval channel set, a player\u2019s new sheet is posted there for sign-off, pinging '
          'every GM role, with Approve / Reject buttons. Until approved they can\u2019t roll, heal or take '
          'fight actions \u2014 and once approved, their whole sheet can only be changed by a GM. Sheets a GM '
@@ -228,11 +261,35 @@ CONTENT = [
          'posts a fresh one, so the channel holds one live entry per player rather than a pile of stale ones. '
          'A rejected sheet can still be edited by its owner \u2014 that is how they fix it \u2014 and each edit '
          'sends it straight back for another look.'),
-('note', 'The roll-audit mirror covers prefix rolls, stat shorthand, success checks, rerolls, heals and '
-         'fight rolls \u2014 and <b>' + GM + ' rolls too, including secret <b>gmrs</b> ones</b>, so ' + GM + 's are '
-         'accountable to one another. A ' + GM + ' rolling as an NPC is logged under their own name. Only NPC '
-         'auto-rolls and rolls made inside the audit channel are skipped. Use <b>/config rollaudit test:true</b> '
-         'to check it works. Set the channel\u2019s Discord permissions so only ' + GM + 's can view it.'),
+('note', 'Pressing <b>Reject</b> opens a box asking <b>why</b>. The note is optional, but it travels with the '
+         'decision \u2014 it is written onto the request in the approval channel, sent to the player with the '
+         'rejection, and shown again if they try to roll before fixing it, so nobody is left guessing at what '
+         'to change. Declining an <b>export</b> asks the same way.'),
+('note', 'A <b>rejection is never the end of it.</b> A rejected sheet stays editable by its owner, so the player '
+         'fixes whatever the GM objected to with <b>/char set</b> or <b>/char create</b> and rejoins the queue on '
+         'their own. If they believe it was right as it stood, <b>/char submit</b> sends it again unchanged. There '
+         'is no limit \u2014 a sheet can go back and forth as many times as it takes, and each resubmission retires '
+         'the previous request so the channel still holds one live entry per player. The rejection notice spells '
+         'out both routes, so nobody is left waiting on a GM to do it for them.'),
+('note', 'A declined <b>export</b> works the same way \u2014 running <b>/char export</b> again puts a fresh request '
+         'in front of the GMs.'),
+
+('note', 'Sheets are accepted from <b>any channel the bot can read</b> \u2014 an ordinary text channel, a thread, a forum post, an announcement channel, or the text chat inside a <b>voice or stage channel</b>. Wherever it came from is recorded with the request, so the decision notice can find its way back there if the player\u2019s DMs are closed.'),
+('note', 'The queue lives in the database, not in a Discord message. <b>/config approvals list:true</b> shows every sheet still waiting \u2014 who, how long ago, and which channel it came from \u2014 even if the request was never posted, was deleted, or landed somewhere nobody reads. If the bot cannot post to the approval channel it says so on that list and pings the GM roles in the channel the sheet was submitted from, so a player is never left locked out in silence.'),
+('note', '<b>The roll-audit mirror records every roll, in every channel, with nothing skipped.</b> Prefix '
+         'rolls, stat shorthand, success checks, rerolls, heals, <b>/roll</b>, <b>/dr</b> and every fight '
+         'roll \u2014 plus ' + GM + ' rolls, including secret <b>gmrs</b> ones, so ' + GM + 's are accountable to '
+         'one another.'),
+('note', 'A ' + GM + ' rolling as an NPC with <b>/pr roll</b> is logged under their own name, tagged with the '
+         'NPC they spoke as \u2014 the roll itself goes out through the NPC\u2019s webhook, so the audit is the only '
+         'place it ties back to a person.'),
+('note', 'Rolls the bot makes for itself are recorded too, attributed to the fighter and tagged <b>auto</b>: '
+         'auto-pilot attacks, defences and reroll answers, initiative at the start of every fight and whenever '
+         'an NPC joins mid-fight, every roll of a full <b>/fight auto</b>, and demo bouts. Rolls typed inside '
+         'the audit channel itself are mirrored as well \u2014 a secret <b>gmrs</b> there goes to the '
+         + GM + '\u2019s DMs, so without the mirror it would leave no record at all.'),
+('note', 'Use <b>/config rollaudit test:true</b> to check it works. Set the channel\u2019s Discord permissions '
+         'so only ' + GM + 's can view it.'),
 ('note', 'Several GM roles can be set at once \u2014 holding any of them grants GM access. Anyone with '
          'the Discord <b>Manage Server</b> permission always counts as a GM, so you can never lock '
          'yourself out by mis-setting a role.'),
