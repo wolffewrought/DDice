@@ -61,6 +61,11 @@ try { db.exec('ALTER TABLE characters ADD COLUMN approval_src_channel TEXT'); } 
 // land somewhere nobody reads. These two make the database the record of truth.
 try { db.exec('ALTER TABLE characters ADD COLUMN approval_requested_at INTEGER'); } catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN approval_post_ok INTEGER DEFAULT 0'); } catch {}
+// Why a GM turned a sheet down, so the player knows what to change.
+try { db.exec('ALTER TABLE characters ADD COLUMN approval_reason TEXT'); } catch {}
+// Character creation budget, per guild. Defaults match the shipped rules.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN stat_budget INTEGER DEFAULT 15'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN stat_min INTEGER DEFAULT 1'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_stats_visible INTEGER DEFAULT 0'); } catch {}
 try {
   // Webhooks are bound to the channel they were created in. Storing one per NPC
@@ -834,6 +839,66 @@ function buildPlainRoll({ rollLine, label, isReroll, flavour, total, critType })
 
 const STATS = ['str','con','dex','wis','lck'];
 
+// ── Character creation budget ─────────────────────────────────────────────────
+// A player building their own sheet spends exactly the guild's allowance across
+// the five stats, with a minimum in each. GMs are exempt entirely — building for
+// a player, adjusting one, or making their own sheet. Both numbers are set per
+// guild with /config statallowance; these are the defaults.
+const STAT_BUDGET_DEFAULT = 15;
+const STAT_MIN_DEFAULT = 1;
+function statRules(gid) {
+  const cfg = getConfig(gid) || {};
+  const budget = Number(cfg.stat_budget);
+  const min = Number(cfg.stat_min);
+  return {
+    budget: Number.isFinite(budget) && budget > 0 ? budget : STAT_BUDGET_DEFAULT,
+    min: Number.isFinite(min) && min >= 0 ? min : STAT_MIN_DEFAULT,
+  };
+}
+const statTotal = (stats) => STATS.reduce((t, k) => t + (Number(stats?.[k]) || 0), 0);
+
+// Every rule the given stat block breaks, as ready-to-print lines; empty means
+// it's legal. Both problems are reported together so a player fixing one isn't
+// sent straight back for the other.
+//
+// `exact` is the difference between a finished sheet and one being edited: a
+// complete character must spend the allowance exactly, but mid-edit only the
+// ceiling applies — otherwise lowering one stat to raise another is impossible,
+// since every single step would leave the total short.
+function statBudgetProblems(gid, stats, { requireAll = true, exact = true } = {}) {
+  const { budget, min } = statRules(gid);
+  const out = [];
+  const total = statTotal(stats);
+  if (total > budget) {
+    out.push(`📊 That's **${total} points** — you have **${budget}** to spend. Take **${total - budget}** back off somewhere.`);
+  } else if (exact && total < budget) {
+    out.push(`📊 That's only **${total} points** — you have **${budget}** to spend. **${budget - total}** still to place.`);
+  }
+  if (requireAll && min > 0) {
+    const short = STATS.filter(k => (Number(stats?.[k]) || 0) < min);
+    if (short.length) {
+      out.push(`0️⃣ Every stat needs at least **${min}** point${min === 1 ? '' : 's'} — ${short.map(k => `**${k.toUpperCase()}**`).join(', ')} ${short.length === 1 ? 'is' : 'are'} below that.`);
+    }
+  }
+  return out;
+}
+
+// One refusal covering everything that's wrong, with the spend so far.
+function statBudgetReply(gid, problems, stats) {
+  const { budget } = statRules(gid);
+  const spread = STATS.map(k => `${k.toUpperCase()} ${Number(stats?.[k]) || 0}`).join(' · ');
+  return [`❌ **That sheet can't be submitted yet.**`, '', ...problems, '',
+          `Your spread: ${spread}  →  **${statTotal(stats)}/${budget}**`,
+          `Set them all in one go with \`/char create str:… con:… dex:… wis:… lck:…\`.`].join('\n');
+}
+
+// The stat block a sheet would have after applying `updates`.
+function statsAfter(existing, updates = {}) {
+  const out = {};
+  for (const k of STATS) out[k] = updates[k] !== undefined ? updates[k] : (existing?.[k] ?? 0);
+  return out;
+}
+
 function parseRollInput(input, char) {
   const [rollPart, ...fp] = input.split('\n');
   const flavour = fp.join('\n').trim() || null;
@@ -1226,7 +1291,11 @@ async function handleExportRequestButton(interaction) {
     await interaction.message.edit({ components: [] }).catch(()=>{});
     return interaction.reply({ content: '⏰ That export request is no longer pending — it was already handled or superseded.', ephemeral: true });
   }
-  const released = action === 'exportok';
+  if (action === 'exportno') {
+    return showRejectReasonModal(interaction, `exportreject:${uid}`,
+      'Decline sheet export', 'e.g. not while the campaign is running.');
+  }
+  const released = true;
   clearExportRequest(gid, uid);
 
   // Mark the request as decided so the queue reads cleanly.
@@ -1304,6 +1373,9 @@ const slashCommands = [
       .addStringOption(o=>o.setName('hp').setDescription('HP restored — "50%" of max, or a flat number like "3"').setRequired(false))
       .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored — "50%" of max, or a flat number like "1"').setRequired(false))
       .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored — "50%" of max, or a flat number like "2"').setRequired(false)))
+    .addSubcommand(s=>s.setName('statallowance').setDescription('Points a player spends building a sheet, and the minimum per stat')
+      .addIntegerOption(o=>o.setName('points').setDescription('Total points to spend across the 5 stats (default 15)').setRequired(false).setMinValue(5).setMaxValue(200))
+      .addIntegerOption(o=>o.setName('minimum').setDescription('Minimum in every stat (default 1, 0 allows empty stats)').setRequired(false).setMinValue(0).setMaxValue(20)))
     .addSubcommand(s=>s.setName('npcreroll').setDescription('NPC auto-reroll threshold: natural die ≤ N (0 disables)')
       .addIntegerOption(o=>o.setName('threshold').setDescription('1–19, or 0 to disable (default 8); omit to show current').setRequired(false).setMinValue(0).setMaxValue(19)))
     .addSubcommand(s=>s.setName('fightping').setDescription('@-mention players when it becomes their turn in a fight')
@@ -1836,6 +1908,27 @@ async function handleConfig(interaction) {
     setConfig(gid, { roll_audit_channel_id: channel.id });
     return interaction.reply({ content: `🎲 Rolls will be mirrored to <#${channel.id}> — raw input, result, and a jump link.\nCovers player rolls **and GM rolls, including secret ones**, so GMs are accountable to each other.\n⚠️ Make sure that channel's permissions only let GMs view it; the bot can't set that for you.` });
   }
+  if (sub === 'statallowance') {
+    const points = interaction.options.getInteger('points');
+    const minimum = interaction.options.getInteger('minimum');
+    const cur = statRules(gid);
+    if (points === null && minimum === null) {
+      return interaction.reply({ content:
+        `📊 Players spend exactly **${cur.budget} points** across the 5 stats, minimum **${cur.min}** in each.\n`
+        + `Change it with \`/config statallowance points:20 minimum:2\`. GMs are never limited.`, ephemeral: true });
+    }
+    const budget = points ?? cur.budget;
+    const min = minimum ?? cur.min;
+    // A floor that can't fit inside the budget would make every sheet illegal.
+    if (min * STATS.length > budget) {
+      return interaction.reply({ content: `❌ A minimum of **${min}** across ${STATS.length} stats needs **${min * STATS.length}** points, more than the **${budget}** allowance. Raise the points or lower the minimum.`, ephemeral: true });
+    }
+    setConfig(gid, { stat_budget: budget, stat_min: min });
+    return interaction.reply({ content:
+      `📊 Players now spend exactly **${budget} points** across the 5 stats, minimum **${min}** in each.\n`
+      + `Existing sheets are untouched — this applies the next time one is built or submitted. GMs are never limited.` });
+  }
+
   if (sub === 'npcreroll') {
     const v = interaction.options.getInteger('threshold');
     if (v === null) {
@@ -1959,7 +2052,17 @@ async function handleChar(interaction) {
     const wis = interaction.options.getInteger('wis'); if (wis !== null) updates.wis = wis;
     const lck = interaction.options.getInteger('lck'); if (lck !== null) { updates.lck = lck; updates.rerolls_current = lck; }
     const order = interaction.options.getString('order'); if (order) updates.order_name = order;
+    // Budget check, for players only. Runs against the sheet as it would stand
+    // after this command, so filling the last stat in a second /char create is
+    // still measured against the whole spread rather than just what was typed.
     const existingSheet = getChar(gid, targetId);
+    if (!isGmUser) {
+      const after = statsAfter(existingSheet, updates);
+      const anyStatGiven = STATS.some(k => updates[k] !== undefined);
+      const complete = STATS.every(k => (after[k] ?? 0) > 0) || anyStatGiven;
+      const problems = statBudgetProblems(gid, after, { requireAll: complete, exact: complete });
+      if (problems.length) return interaction.reply({ content: statBudgetReply(gid, problems, after), ephemeral: true });
+    }
     const charClass = interaction.options.getString('class');
     if (charClass && String(charClass).toLowerCase() === 'hero' && !isGmUser) {
       return interaction.reply({ content: '❌ **Hero** is granted by a GM, not chosen. Pick Vanguard, Defender or Siege Knight.', ephemeral: true });
@@ -2100,6 +2203,19 @@ async function handleChar(interaction) {
       return done(`${KNIGHT_EMOJIS[knight]??'⚪'} Order set to **${knight}**${targetId!==callerId?` for <@${targetId}>`:''}.`);
     }
     if (STATS.includes(field)) {
+      // Same rules on a touch-up. The zero check applies to the stat being
+      // written, so a half-built sheet isn't blocked by its unset stats.
+      if (!isGmUser) {
+        const num0 = parseInt(value);
+        if (Number.isFinite(num0)) {
+          const after = statsAfter(getChar(gid, targetId), { [field]: num0 });
+          // Ceiling only while editing — see statBudgetProblems for why.
+          const problems = statBudgetProblems(gid, after, { requireAll: false, exact: false });
+          const { min: statFloor } = statRules(gid);
+          if (num0 < statFloor) problems.push(`0️⃣ Every stat needs at least **${statFloor}** point${statFloor === 1 ? '' : 's'} — **${field.toUpperCase()}** can't be ${num0}.`);
+          if (problems.length) return interaction.reply({ content: statBudgetReply(gid, problems, after), ephemeral: true });
+        }
+      }
       const num = parseInt(value);
       if (isNaN(num)||num<0) return interaction.reply({ content: '❌ Value must be a positive number.', ephemeral: true });
       if (num > 99) return interaction.reply({ content: '❌ Stat values are capped at 99.', ephemeral: true });
@@ -2145,6 +2261,8 @@ async function handleChar(interaction) {
       return interaction.reply({ content: `⏳ Your sheet is already waiting${chId ? ` in <#${chId}>` : ''}. A GM will get to it.`, ephemeral: true });
     }
     if (ch.approval_state === 'approved') return interaction.reply({ content: '✅ Your sheet is already approved. Ask a GM if you need a change.', ephemeral: true });
+    const problems = statBudgetProblems(gid, ch);
+    if (problems.length) return interaction.reply({ content: statBudgetReply(gid, problems, ch), ephemeral: true });
     return finishSheetEdit({
       src: interaction, gid, callerId, targetId: callerId, isGmCaller: false,
       content: '📤 **Sheet sent back to the GMs.**',
@@ -2231,6 +2349,12 @@ async function handleProfile(interaction) {
     }
     const snap = loadProfile(gid, uid, slot);
     if (!snap) return interaction.reply({ content: `❌ No save found with name **${slot}**.`, ephemeral: true });
+    // Snapshots predate the budget, so an old save could smuggle an illegal
+    // spread back in. Players get checked; GMs restore whatever they like.
+    if (!isGmUser) {
+      const problems = statBudgetProblems(gid, snap);
+      if (problems.length) return interaction.reply({ content: statBudgetReply(gid, problems, snap), ephemeral: true });
+    }
     upsertChar(gid, uid, { hp_current:snap.hp_current, rerolls_current:snap.rerolls_current, str:snap.str, con:snap.con, dex:snap.dex, wis:snap.wis, lck:snap.lck, order_name:snap.order_name, profile_enabled:snap.profile_enabled });
     setHealCharges(gid, uid, snap.heal_current??0);
     return finishSheetEdit({
@@ -2549,6 +2673,11 @@ async function handleSheetImport(message, parsed) {
   // Pasting a sheet rewrites everything — respect the approval lock, and send it
   // back to the queue afterwards, so it can't be used to sidestep a GM.
   const isGmImporter = await isGm(message.guild, uid);
+  // A pasted sheet is a whole character, so both rules apply in full.
+  if (!isGmImporter) {
+    const problems = statBudgetProblems(gid, parsed);
+    if (problems.length) return message.reply(statBudgetReply(gid, problems, parsed)).catch(()=>{});
+  }
   {
     const lock = sheetEditLock(gid, uid, targetId, isGmImporter);
     if (lock) return message.reply(lock);
@@ -2831,6 +2960,8 @@ client.on('interactionCreate', async interaction => {
   // Handle confirmation buttons
   if (interaction.isModalSubmit?.()) {
     if (interaction.customId.startsWith('npcsay:')) return handleNpcSayModal(interaction);
+    if (interaction.customId.startsWith('sheetreject:')) return handleSheetRejectModal(interaction);
+    if (interaction.customId.startsWith('exportreject:')) return handleExportRejectModal(interaction);
     return;
   }
 
@@ -3438,7 +3569,9 @@ function sheetGate(gid, uid) {
   if (!ch) return null;                            // "no sheet" handled by callers
   if (sheetApproved(gid, ch)) return null;         // single source of truth
   if (ch.approval_state === 'pending') return '⏳ Your character sheet is **awaiting GM approval** — you can\'t roll or fight until it\'s approved.';
-  return '🚫 Your character sheet was **rejected** by a GM. Fix it with `/char set` or `/char create` and it goes straight back for another look — or `/char submit` to send it again unchanged.';
+  return '🚫 Your character sheet was **rejected** by a GM.'
+    + (ch.approval_reason ? `\n💬 **Reason:** ${ch.approval_reason}` : '')
+    + '\nFix it with `/char set` or `/char create` and it goes straight back for another look — or `/char submit` to send it again unchanged.';
 }
 // ── Character sheet exports ───────────────────────────────────────────────────
 // With approvals on, /char export doesn't hand the sheet straight back. The
@@ -3602,7 +3735,14 @@ async function finishSheetEdit({ src, gid, callerId, targetId, isGmCaller, conte
     }
     return reply(content);
   }
-  upsertChar(gid, targetId, { approval_state: 'pending' });
+  // /char set writes freely within the ceiling, so a sheet can sit part-spent.
+  // It just can't reach the GMs that way — hold it back and say what's missing.
+  const short = statBudgetProblems(gid, getChar(gid, targetId));
+  if (short.length) {
+    return reply(content + '\n\n' + statBudgetReply(gid, short, getChar(gid, targetId))
+      + '\n_Saved, but not sent to the GMs yet._');
+  }
+  upsertChar(gid, targetId, { approval_state: 'pending', approval_reason: null });
   const chId = getConfig(gid)?.approval_channel_id;
   const sent = await reply(content + (chId
     ? `\n\n⏳ **Sent to <#${chId}> for GM approval.** You can't roll or fight until it's signed off, and you can keep editing until a GM decides.\n📬 You'll get a DM as soon as they do.`
@@ -5973,6 +6113,7 @@ const HELP_CATEGORIES = {
       '`/char set field:STR value:14` — set one field at a time (with approvals on, any change to your own sheet goes back to the GMs)',
       '`/char weaponemoji slot:Weapon 1 emoji:⚔️` — pick a weapon slot emoji',
       '`/char show [user]` — view a character sheet',
+      'Players spend an exact stat allowance across STR/CON/DEX/WIS/LCK with a minimum in each — GMs aren\'t limited. Run `/config statallowance` to see or change this server\'s numbers',
       '`/char submit` — send your sheet back to the GMs after a rejection, unchanged',
       '`/char export [format:Image]` — export your sheet as text or image. With approvals on it goes to the GMs first and reaches you when one releases it',
       '`/char signature user:@a stat:str` — set a Hero\'s signature stat (GM)',
@@ -6860,6 +7001,28 @@ async function requestConfirm(interaction, promptText, action) {
   await interaction.reply({ content: `⚠️ ${promptText}`, components: [makeConfirmButtons(token)], ephemeral: true });
 }
 
+// Ask the GM why before turning something down. The reason is optional — a GM
+// in a hurry can submit it blank — but asking is the point: "rejected" with no
+// note leaves the player guessing at what to change before they resubmit.
+// showModal must be the first reply to the button, so nothing may be deferred
+// or replied to before this runs.
+function showRejectReasonModal(interaction, customId, title, placeholder) {
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+  const modal = new ModalBuilder().setCustomId(customId.slice(0, 100)).setTitle(title.slice(0, 45));
+  const reason = new TextInputBuilder()
+    .setCustomId('reason').setLabel('Reason (optional)')
+    .setPlaceholder(placeholder).setStyle(TextInputStyle.Paragraph)
+    .setRequired(false).setMaxLength(900);
+  modal.addComponents(new ActionRowBuilder().addComponents(reason));
+  return interaction.showModal(modal);
+}
+
+// Trim a GM's note to something that fits a Discord message comfortably.
+function cleanReason(raw) {
+  const t = String(raw ?? '').trim();
+  return t ? t.slice(0, 900) : null;
+}
+
 async function handleSheetApprovalButton(interaction) {
   const gid = interaction.guild.id;
   if (!(await isGm(interaction.guild, interaction.user.id)))
@@ -6867,10 +7030,16 @@ async function handleSheetApprovalButton(interaction) {
   const [action, uid] = interaction.customId.split(':');
   const ch = getChar(gid, uid);
   if (!ch) return interaction.reply({ content: '❌ That character sheet no longer exists.', ephemeral: true });
+  // Turning a sheet down asks for a reason first; the decision is applied when
+  // the modal comes back.
+  if (action === 'sheetno') {
+    return showRejectReasonModal(interaction, `sheetreject:${uid}`,
+      'Reject character sheet', 'e.g. STR is too high for a starting character — 5 max.');
+  }
   const nm = await getDisplayName(interaction.guild, uid);
   const gmName = await getDisplayName(interaction.guild, interaction.user.id);
-  const approved = action === 'sheetok';
-  upsertChar(gid, uid, { approval_state: approved ? 'approved' : 'rejected' });
+  const approved = true;
+  upsertChar(gid, uid, { approval_state: 'approved', approval_reason: null });
 
   // Update the request post so the queue reflects the decision
   try {
@@ -6880,35 +7049,110 @@ async function handleSheetApprovalButton(interaction) {
     });
   } catch {}
 
-  // Let the player know — the GM's reply lands in a channel they can't see.
-  // Try a DM first, then fall back to the channel they submitted from.
-  const notice = approved
-    ? `✅ **Your character sheet was approved** by ${gmName} in **${interaction.guild.name}** — you can roll and fight now.`
-    : `🚫 **Your character sheet was rejected** by ${gmName} in **${interaction.guild.name}**.\n`
-      + `You can fix it and try again yourself — change whatever needs changing with \`/char set\` or \`/char create\` and it goes straight back to the GMs.\n`
-      + `If you think it was fine as it stands, \`/char submit\` sends it again unchanged.`;
+  const notice = `✅ **Your character sheet was approved** by ${gmName} in **${interaction.guild.name}** — you can roll and fight now.`;
+  const told = await notifyPlayer(interaction, gid, uid, notice);
+  return interaction.reply({
+    content: `✅ <@${uid}> (**${nm}**) approved — they can roll and fight now.` + deliveryNote(told),
+    allowedMentions: { parse: [] } });
+}
+
+// A GM's decision lands in a channel the player can't see, so tell them: DM
+// first, then the channel they submitted from. Returns how it got through.
+async function notifyPlayer(interaction, gid, uid, notice) {
+  try {
+    const user = await interaction.client.users.fetch(uid);
+    await user.send(notice);
+    return 'DM';
+  } catch {
+    const srcId = getChar(gid, uid)?.approval_src_channel;
+    if (srcId) {
+      try {
+        const srcChan = await interaction.client.channels.fetch(srcId);
+        await srcChan.send({ content: `<@${uid}> ${notice}`, allowedMentions: { users: [uid] } });
+        return 'channel';
+      } catch {}
+    }
+    return null;
+  }
+}
+function deliveryNote(told) {
+  return told === 'DM' ? ' _(player notified by DM)_'
+       : told === 'channel' ? ' _(DM blocked — notified in their submission channel)_'
+       : ' ⚠️ _couldn\'t reach the player — tell them directly._';
+}
+
+// The reason modal came back — apply the rejection and pass the note on.
+async function handleSheetRejectModal(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can reject sheets.', ephemeral: true });
+  const uid = interaction.customId.split(':')[1];
+  const ch = getChar(gid, uid);
+  if (!ch) return interaction.reply({ content: '❌ That character sheet no longer exists.', ephemeral: true });
+  const reason = cleanReason(interaction.fields.getTextInputValue('reason'));
+  const nm = await getDisplayName(interaction.guild, uid);
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+  upsertChar(gid, uid, { approval_state: 'rejected', approval_reason: reason });
+
+  // Stamp the queue post. Opened from a button, so the message is available —
+  // but don't assume it, and never let a failed edit block the decision.
+  try {
+    await interaction.message?.edit({
+      content: `${interaction.message.content}\n\n🚫 **Rejected** by ${gmName}${reason ? `\n💬 ${reason}` : ''}`,
+      components: [],
+    });
+  } catch {}
+
+  const notice = `🚫 **Your character sheet was rejected** by ${gmName} in **${interaction.guild.name}**.\n`
+    + (reason ? `💬 **Reason:** ${reason}\n` : '')
+    + `You can fix it and try again yourself — change whatever needs changing with \`/char set\` or \`/char create\` and it goes straight back to the GMs.\n`
+    + `If you think it was fine as it stands, \`/char submit\` sends it again unchanged.`;
+  const told = await notifyPlayer(interaction, gid, uid, notice);
+  return interaction.reply({
+    content: `🚫 <@${uid}> (**${nm}**) rejected${reason ? ` — “${reason}”` : ' with no reason given'}.` + deliveryNote(told),
+    allowedMentions: { parse: [] } });
+}
+
+// Same again for a declined export. Nothing is stored — the request is simply
+// dropped — so the reason only has to reach the player and the queue post.
+async function handleExportRejectModal(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can decline exports.', ephemeral: true });
+  const uid = interaction.customId.split(':')[1];
+  const req = getExportRequest(gid, uid);
+  const nm = await getDisplayName(interaction.guild, uid);
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+  const reason = cleanReason(interaction.fields.getTextInputValue('reason'));
+  if (!req) return interaction.reply({ content: '⏰ That export request is no longer pending.', ephemeral: true });
+  clearExportRequest(gid, uid);
+
+  try {
+    await interaction.message?.edit({
+      content: `${interaction.message.content}\n\n🚫 **Declined** by ${gmName}${reason ? `\n💬 ${reason}` : ''}`,
+      components: [],
+    });
+  } catch {}
+
+  const notice = `🚫 **Your sheet export was declined** by ${gmName} in **${interaction.guild.name}**.\n`
+    + (reason ? `💬 **Reason:** ${reason}\n` : '')
+    + `You can ask again whenever you like — run \`/char export\` and it goes back to the GMs.`;
   let told = 'DM';
   try {
     const user = await interaction.client.users.fetch(uid);
     await user.send(notice);
   } catch {
     told = null;
-    const srcId = getChar(gid, uid)?.approval_src_channel;
-    if (srcId) {
+    if (req.src_channel) {
       try {
-        const srcChan = await interaction.client.channels.fetch(srcId);
+        const srcChan = await interaction.client.channels.fetch(req.src_channel);
         await srcChan.send({ content: `<@${uid}> ${notice}`, allowedMentions: { users: [uid] } });
         told = 'channel';
       } catch {}
     }
   }
-
-  const delivery = told === 'DM' ? ' _(player notified by DM)_'
-                 : told === 'channel' ? ' _(DM blocked — notified in their submission channel)_'
-                 : ' ⚠️ _couldn\'t reach the player — tell them directly._';
-  return interaction.reply({ content: (approved
-    ? `✅ <@${uid}> (**${nm}**) approved — they can roll and fight now.`
-    : `🚫 <@${uid}> (**${nm}**) rejected — they'll need a GM to adjust the sheet.`) + delivery,
+  return interaction.reply({
+    content: `🚫 Export declined for <@${uid}> (**${nm}**)${reason ? ` — “${reason}”` : ''}.` + deliveryNote(told),
     allowedMentions: { parse: [] } });
 }
 
