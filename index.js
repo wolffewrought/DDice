@@ -2061,7 +2061,7 @@ async function handleChar(interaction) {
       const anyStatGiven = STATS.some(k => updates[k] !== undefined);
       const complete = STATS.every(k => (after[k] ?? 0) > 0) || anyStatGiven;
       const problems = statBudgetProblems(gid, after, { requireAll: complete, exact: complete });
-      if (problems.length) return interaction.reply({ content: statBudgetReply(gid, problems, after), ephemeral: true });
+      if (problems.length) return interaction.reply({ content: statBudgetReply(gid, problems, after) });
     }
     const charClass = interaction.options.getString('class');
     if (charClass && String(charClass).toLowerCase() === 'hero' && !isGmUser) {
@@ -2213,7 +2213,7 @@ async function handleChar(interaction) {
           const problems = statBudgetProblems(gid, after, { requireAll: false, exact: false });
           const { min: statFloor } = statRules(gid);
           if (num0 < statFloor) problems.push(`0️⃣ Every stat needs at least **${statFloor}** point${statFloor === 1 ? '' : 's'} — **${field.toUpperCase()}** can't be ${num0}.`);
-          if (problems.length) return interaction.reply({ content: statBudgetReply(gid, problems, after), ephemeral: true });
+          if (problems.length) return interaction.reply({ content: statBudgetReply(gid, problems, after) });
         }
       }
       const num = parseInt(value);
@@ -2262,7 +2262,7 @@ async function handleChar(interaction) {
     }
     if (ch.approval_state === 'approved') return interaction.reply({ content: '✅ Your sheet is already approved. Ask a GM if you need a change.', ephemeral: true });
     const problems = statBudgetProblems(gid, ch);
-    if (problems.length) return interaction.reply({ content: statBudgetReply(gid, problems, ch), ephemeral: true });
+    if (problems.length) return interaction.reply({ content: statBudgetReply(gid, problems, ch) });
     return finishSheetEdit({
       src: interaction, gid, callerId, targetId: callerId, isGmCaller: false,
       content: '📤 **Sheet sent back to the GMs.**',
@@ -2353,7 +2353,7 @@ async function handleProfile(interaction) {
     // spread back in. Players get checked; GMs restore whatever they like.
     if (!isGmUser) {
       const problems = statBudgetProblems(gid, snap);
-      if (problems.length) return interaction.reply({ content: statBudgetReply(gid, problems, snap), ephemeral: true });
+      if (problems.length) return interaction.reply({ content: statBudgetReply(gid, problems, snap) });
     }
     upsertChar(gid, uid, { hp_current:snap.hp_current, rerolls_current:snap.rerolls_current, str:snap.str, con:snap.con, dex:snap.dex, wis:snap.wis, lck:snap.lck, order_name:snap.order_name, profile_enabled:snap.profile_enabled });
     setHealCharges(gid, uid, snap.heal_current??0);
@@ -3739,8 +3739,17 @@ async function finishSheetEdit({ src, gid, callerId, targetId, isGmCaller, conte
   // It just can't reach the GMs that way — hold it back and say what's missing.
   const short = statBudgetProblems(gid, getChar(gid, targetId));
   if (short.length) {
-    return reply(content + '\n\n' + statBudgetReply(gid, short, getChar(gid, targetId))
-      + '\n_Saved, but not sent to the GMs yet._');
+    const note = statBudgetReply(gid, short, getChar(gid, targetId)) + '\n_Saved, but not sent to the GMs yet._';
+    const out = await reply(content + '\n\n' + note);
+    // `link: false` marks a caller whose reply is ephemeral (/profile load).
+    // The refusal belongs where they're working, so post it there as well.
+    if (!link) {
+      try {
+        const ch = src.channel ?? await src.client.channels.fetch(interactionChannelId(src));
+        if (ch?.send) await ch.send({ content: `<@${targetId}> ${note}`, allowedMentions: { users: [targetId] } });
+      } catch {}
+    }
+    return out;
   }
   upsertChar(gid, targetId, { approval_state: 'pending', approval_reason: null });
   const chId = getConfig(gid)?.approval_channel_id;
