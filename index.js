@@ -2038,8 +2038,16 @@ async function handleChar(interaction) {
   if (sub === 'create') {
     const targetUser = interaction.options.getUser('user');
     const isGmUser = await isGm(interaction.guild, callerId);
-    if (targetUser && !isGmUser) return interaction.reply({ content: '❌ Only GMs can set stats for other players.', ephemeral: true });
     const targetId = targetUser?.id ?? callerId;
+    if (targetId !== callerId && !isGmUser) return interaction.reply({ content: '❌ Only GMs can set stats for other players.', ephemeral: true });
+    // BUG 2: /char create skipped the approval lock entirely, so an approved
+    // player could rewrite their whole sheet with it — the one door left open
+    // after /char set, /char weaponemoji, /profile load and sheet import were
+    // all shut.
+    {
+      const lock = sheetEditLock(gid, callerId, targetId, isGmUser);
+      if (lock) return interaction.reply({ content: lock, ephemeral: true });
+    }
     const updates = {};
     // Validate stat ranges (0-99)
     for (const stat of ['str','con','dex','wis','lck']) {
@@ -3543,9 +3551,10 @@ function sheetEditLock(gid, callerId, targetId, isGmCaller) {
   if (own?.approval_state === 'approved') {
     return '🔒 Your sheet is approved — only a GM can change it now. Ask a GM for any edits.';
   }
-  if (own?.approval_state === 'pending') {
-    return '⏳ Your sheet is awaiting GM approval — wait for it to be reviewed before editing.';
-  }
+  // 'pending' is deliberately editable: a player who spots a mistake while
+  // waiting can fix it, and the edit retires the old request and queues a fresh
+  // one. A pending sheet can't be rolled with either way, so nothing is gained
+  // by freezing it — and freezing it stranded anyone who mis-typed a stat.
   return null;
 }
 
@@ -3754,7 +3763,7 @@ async function finishSheetEdit({ src, gid, callerId, targetId, isGmCaller, conte
   upsertChar(gid, targetId, { approval_state: 'pending', approval_reason: null });
   const chId = getConfig(gid)?.approval_channel_id;
   const sent = await reply(content + (chId
-    ? `\n\n⏳ **Sent to <#${chId}> for GM approval.** You can't roll or fight until it's signed off, and you can keep editing until a GM decides.\n📬 You'll get a DM as soon as they do.`
+    ? `\n\n⏳ **Sent to <#${chId}> for GM approval.** You can't roll or fight until it's signed off. Spotted a mistake? Edit it and it goes back to the front of the queue.\n📬 You'll get a DM as soon as they do.`
     : '\n\n⚠️ No approval channel set — ask a GM to check `/config approvals`.'));
   const posted = await requestSheetApproval(src, gid, targetId, link ? (sent?.id ?? null) : null);
   if (!posted) await warnApprovalUnreachable(src, gid, targetId);
