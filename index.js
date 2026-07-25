@@ -153,6 +153,12 @@ db.exec(`
     hp_current INTEGER DEFAULT 0, rerolls_current INTEGER DEFAULT 0, profile_enabled INTEGER DEFAULT 1,
     PRIMARY KEY (guild_id, user_id)
   );
+  CREATE TABLE IF NOT EXISTS export_requests (
+    guild_id TEXT NOT NULL, user_id TEXT NOT NULL,
+    payload TEXT NOT NULL, fmt TEXT NOT NULL DEFAULT 'text',
+    src_channel TEXT, msg_id TEXT, requested_at INTEGER,
+    PRIMARY KEY (guild_id, user_id)
+  );
   CREATE TABLE IF NOT EXISTS profile_saves (
     guild_id TEXT NOT NULL, user_id TEXT NOT NULL, slot_name TEXT NOT NULL,
     snapshot TEXT NOT NULL, saved_at TEXT NOT NULL,
@@ -1181,6 +1187,24 @@ async function handleCharExport(interaction) {
   textLines.push('```');
   const textContent = textLines.join('\n');
 
+  // With approvals on, a player's own export goes to the GMs first — they only
+  // get the block once a GM releases it. GMs export straight away (they're the
+  // ones doing the releasing), and so does anyone exporting on a server that
+  // isn't using approvals at all.
+  const isGmUser = await isGm(interaction.guild, uid);
+  if (approvalEnabled(gid) && !isGmUser && tid === uid) {
+    const chId = getConfig(gid)?.approval_channel_id;
+    await interaction.reply({ ephemeral: true, content:
+      `📤 **Export sent to <#${chId}> for a GM to look over.**\n`
+      + `You'll get your sheet as soon as one releases it — by DM, or back here if your DMs are closed.\n`
+      + `_This doesn't change your sheet or stop you rolling._` });
+    const posted = await requestSheetExport(interaction, gid, uid, textContent, mode);
+    if (!posted) {
+      await interaction.followUp({ ephemeral: true, content: '⚠️ Couldn\'t reach the approval channel — ask a GM to check `/config approvals`.' }).catch(()=>{});
+    }
+    return;
+  }
+
   if (mode === 'text') {
     return interaction.reply({ content: textContent });
   }
@@ -1195,6 +1219,75 @@ async function handleCharExport(interaction) {
   const { AttachmentBuilder } = require('discord.js');
   const attachment = new AttachmentBuilder(imgBuffer, { name: `${dn.replace(/\s+/g,'-')}-sheet.png` });
   return interaction.editReply({ content: textContent, files: [attachment] });
+}
+
+// Release or decline a queued export. Delivery mirrors sheet decisions: DM
+// first, then the channel they ran /char export in, so a closed DM doesn't
+// swallow the sheet silently.
+async function handleExportRequestButton(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can release sheet exports.', ephemeral: true });
+  const [action, uid] = interaction.customId.split(':');
+  const req = getExportRequest(gid, uid);
+  const nm = await getDisplayName(interaction.guild, uid);
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+  if (!req) {
+    await interaction.message.edit({ components: [] }).catch(()=>{});
+    return interaction.reply({ content: '⏰ That export request is no longer pending — it was already handled or superseded.', ephemeral: true });
+  }
+  const released = action === 'exportok';
+  clearExportRequest(gid, uid);
+
+  // Mark the request as decided so the queue reads cleanly.
+  try {
+    await interaction.message.edit({
+      content: `${interaction.message.content}\n\n${released ? '✅' : '🚫'} **${released ? 'Released' : 'Declined'}** by ${gmName}`,
+      components: [],
+    });
+  } catch {}
+
+  let files = [];
+  if (released && req.fmt && req.fmt !== 'text') {
+    // The image is drawn fresh at release time; the text block is exactly what
+    // the GM read in the queue.
+    const ch = getChar(gid, uid);
+    if (ch) {
+      const cfg = getConfig(gid); const mc = cfg.heal_charges ?? 3;
+      const hr = getHealCharges(gid, uid, mc);
+      const buf = await generateCharImage(ch, nm, hr.current, mc).catch(()=>null);
+      if (buf) {
+        const { AttachmentBuilder } = require('discord.js');
+        files = [new AttachmentBuilder(buf, { name: `${nm.replace(/\s+/g,'-')}-sheet.png` })];
+      }
+    }
+  }
+
+  const notice = released
+    ? `📤 **Your sheet export was released** by ${gmName} in **${interaction.guild.name}**:\n${req.payload}`
+    : `🚫 **Your sheet export was declined** by ${gmName} in **${interaction.guild.name}**. Speak to a GM if you need it.`;
+
+  let told = 'DM';
+  try {
+    const user = await interaction.client.users.fetch(uid);
+    await user.send({ content: notice, files });
+  } catch {
+    told = null;
+    if (req.src_channel) {
+      try {
+        const srcChan = await interaction.client.channels.fetch(req.src_channel);
+        await srcChan.send({ content: `<@${uid}> ${notice}`, files, allowedMentions: { users: [uid] } });
+        told = 'channel';
+      } catch {}
+    }
+  }
+  const delivery = told === 'DM' ? ' _(sent by DM)_'
+                 : told === 'channel' ? ' _(DM blocked — posted in the channel they exported from)_'
+                 : ' ⚠️ _couldn\'t reach the player — send it to them directly._';
+  return interaction.reply({ content: (released
+    ? `✅ Export released to <@${uid}> (**${nm}**).`
+    : `🚫 Export declined for <@${uid}> (**${nm}**).`) + delivery,
+    allowedMentions: { parse: [] } });
 }
 
 // ─────────────────────────────────────────────
@@ -2714,6 +2807,9 @@ client.on('interactionCreate', async interaction => {
     if (interaction.customId.startsWith('sheetok:') || interaction.customId.startsWith('sheetno:')) {
       return handleSheetApprovalButton(interaction);
     }
+    if (interaction.customId.startsWith('exportok:') || interaction.customId.startsWith('exportno:')) {
+      return handleExportRequestButton(interaction);
+    }
     return;
   }
 
@@ -3281,6 +3377,73 @@ function sheetGate(gid, uid) {
   if (ch.approval_state === 'pending') return '⏳ Your character sheet is **awaiting GM approval** — you can\'t roll or fight until it\'s approved.';
   return '🚫 Your character sheet was **rejected** by a GM. Speak to them before rolling.';
 }
+// ── Character sheet exports ───────────────────────────────────────────────────
+// With approvals on, /char export doesn't hand the sheet straight back. The
+// export block goes to the approval channel for a GM to read, and the player
+// only receives it once a GM presses Release. This is deliberately separate from
+// sheet approval: exporting is not a sheet edit, so it never touches
+// approval_state and never stops anyone rolling. One live request per player —
+// a new export supersedes the last, the same way a re-submitted sheet does.
+function setExportRequest(gid, uid, payload, fmt, srcChannel) {
+  db.prepare(`INSERT INTO export_requests (guild_id, user_id, payload, fmt, src_channel, msg_id, requested_at)
+              VALUES (?,?,?,?,?,NULL,?)
+              ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                payload=excluded.payload, fmt=excluded.fmt, src_channel=excluded.src_channel,
+                msg_id=NULL, requested_at=excluded.requested_at`)
+    .run(gid, uid, payload, fmt || 'text', srcChannel || null, Date.now());
+}
+function getExportRequest(gid, uid) {
+  return db.prepare('SELECT * FROM export_requests WHERE guild_id=? AND user_id=?').get(gid, uid);
+}
+function setExportRequestMsg(gid, uid, msgId) {
+  db.prepare('UPDATE export_requests SET msg_id=? WHERE guild_id=? AND user_id=?').run(msgId, gid, uid);
+}
+function clearExportRequest(gid, uid) {
+  db.prepare('DELETE FROM export_requests WHERE guild_id=? AND user_id=?').run(gid, uid);
+}
+function exportButtons(uid) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`exportok:${uid}`).setLabel('Release to player').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`exportno:${uid}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
+  );
+}
+
+// Post an export request to the approval channel. Returns the channel id, or
+// null if it couldn't be delivered.
+async function requestSheetExport(interaction, gid, uid, payload, fmt) {
+  const chId = getConfig(gid)?.approval_channel_id;
+  if (!chId) return null;
+  const nm = await getDisplayName(interaction.guild, uid);
+  const roles = getGmRoleIds(gid);
+  const ping = roles.length ? roles.map(r => `<@&${r}>`).join(' ') + ' ' : '';
+  const prev = getExportRequest(gid, uid);
+  setExportRequest(gid, uid, payload, fmt, interactionChannelId(interaction));
+  const head = [
+    `${ping}📤 **Sheet export requested**`,
+    `👤 <@${uid}> (**${nm}**)${fmt !== 'text' ? '  ·  🖼️ image requested' : ''}`,
+    '─────────────────────────────',
+    'Release sends this to the player; decline and they get nothing.',
+  ].join('\n');
+  try {
+    const channel = await interaction.client.channels.fetch(chId);
+    // Retire the player's previous request so only one is live at a time.
+    if (prev?.msg_id) {
+      try {
+        const old = await channel.messages.fetch(prev.msg_id);
+        await old.edit({ content: `~~📤 Export request from <@${uid}>~~\n↩️ *Superseded — they exported again; see the newer request below.*`, components: [] });
+      } catch {}
+    }
+    // The block can be long, so the request header and the sheet go separately
+    // and the buttons ride on the last message.
+    await channel.send({ content: head, allowedMentions: { roles } });
+    const msg = await channel.send({ content: payload.length > 1900 ? payload.slice(0, 1900) : payload,
+      components: [exportButtons(uid)], allowedMentions: { parse: [] } });
+    setExportRequestMsg(gid, uid, msg.id);
+    return channel.id;
+  } catch { clearExportRequest(gid, uid); return null; }
+}
+
 function approvalButtons(uid) {
   const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
   return new ActionRowBuilder().addComponents(
@@ -5769,7 +5932,7 @@ const HELP_CATEGORIES = {
       '`/char set field:STR value:14` — set one field at a time (with approvals on, any change to your own sheet goes back to the GMs)',
       '`/char weaponemoji slot:Weapon 1 emoji:⚔️` — pick a weapon slot emoji',
       '`/char show [user]` — view a character sheet',
-      '`/char export [format:Image]` — export your sheet as text or image',
+      '`/char export [format:Image]` — export your sheet as text or image. With approvals on it goes to the GMs first and reaches you when one releases it',
       '`/char signature user:@a stat:str` — set a Hero\'s signature stat (GM)',
       '`/profile on/off/show/save/load/saves` — manage profile display & snapshots',
       '`/weapon add/remove/list` — manage the server weapon list (GM)',
