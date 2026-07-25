@@ -1917,10 +1917,11 @@ async function handleChar(interaction) {
     const custom = interaction.options.getString('custom');   // pasted server emoji
     const targetUser = interaction.options.getUser('user');
     const targetId = targetUser ? targetUser.id : callerId;
-    if (targetId !== callerId && !(await isGm(interaction.guild, callerId)))
+    const isGmUser = await isGm(interaction.guild, callerId);
+    if (targetId !== callerId && !isGmUser)
       return interaction.reply({ content: '❌ Only GMs can modify other players\' characters.', ephemeral: true });
     {
-      const lock = sheetEditLock(gid, callerId, targetId, await isGm(interaction.guild, callerId));
+      const lock = sheetEditLock(gid, callerId, targetId, isGmUser);
       if (lock) return interaction.reply({ content: lock, ephemeral: true });
     }
     // Custom (pasted) emoji takes priority over the dropdown
@@ -1930,7 +1931,14 @@ async function handleChar(interaction) {
     if (!cleaned) return interaction.reply({ content: `❌ That isn't a valid emoji. Use a standard emoji (${STANDARD_WEAPON_EMOJIS.join(' ')}) or one of this server's own custom emojis.`, ephemeral: true });
     upsertChar(gid, targetId, { [slot]: cleaned });
     const slotLabel = slot === 'weapon1emoji' ? 'Weapon 1' : 'Weapon 2';
-    return interaction.reply({ content: `✅ ${slotLabel} emoji set to ${cleaned}${targetId!==callerId?` for <@${targetId}>`:''}.` });
+    return finishSheetEdit({
+      src: interaction, gid, callerId, targetId, isGmCaller: isGmUser,
+      content: `✅ ${slotLabel} emoji set to ${cleaned}${targetId!==callerId?` for <@${targetId}>`:''}.`,
+      reply: async (c) => {
+        await interaction.reply({ content: c });
+        try { return await interaction.fetchReply(); } catch { return null; }
+      },
+    });
   }
 
   if (sub === 'signature') {
@@ -1957,8 +1965,25 @@ async function handleChar(interaction) {
     const value = interaction.options.getString('value');
     const targetUser = interaction.options.getUser('user');
     const targetId = targetUser ? targetUser.id : callerId;
-    if (targetId !== callerId && !(await isGm(interaction.guild, callerId)))
+    const isGmUser = await isGm(interaction.guild, callerId);
+    if (targetId !== callerId && !isGmUser)
       return interaction.reply({ content: '❌ Only GMs can modify other players\' stats.', ephemeral: true });
+    // Approved sheets are frozen to their owner — every field needs a GM. This
+    // has to come before the order branch, which used to write and return above
+    // the check and so let an approved player re-pick their Knight Order.
+    {
+      const lock = sheetEditLock(gid, callerId, targetId, isGmUser);
+      if (lock) return interaction.reply({ content: lock, ephemeral: true });
+    }
+    // Every edit below is a player-writable field, so route the reply through
+    // finishSheetEdit — it re-queues the sheet for approval when it needs to be.
+    const done = (content) => finishSheetEdit({
+      src: interaction, gid, callerId, targetId, isGmCaller: isGmUser, content,
+      reply: async (c) => {
+        await interaction.reply({ content: c });
+        try { return await interaction.fetchReply(); } catch { return null; }
+      },
+    });
     if (field === 'order') {
       const knight = KNIGHTS.find(k=>k.toLowerCase()===value.toLowerCase());
       if (!knight) return interaction.reply({ content: `❌ Choose from: ${KNIGHTS.join(', ')}`, ephemeral: true });
@@ -1966,12 +1991,7 @@ async function handleChar(interaction) {
       const upd = getChar(gid, targetId);
       if (!isWhiteKnight(upd)) setHealCharges(gid, targetId, 0);
       else { const cfg = getConfig(gid); setHealCharges(gid, targetId, cfg.heal_charges??3); }
-      return interaction.reply({ content: `${KNIGHT_EMOJIS[knight]??'⚪'} Order set to **${knight}**${targetId!==callerId?` for <@${targetId}>`:''}.` });
-    }
-    // Approved sheets are frozen to their owner — every field needs a GM.
-    {
-      const lock = sheetEditLock(gid, callerId, targetId, await isGm(interaction.guild, callerId));
-      if (lock) return interaction.reply({ content: lock, ephemeral: true });
+      return done(`${KNIGHT_EMOJIS[knight]??'⚪'} Order set to **${knight}**${targetId!==callerId?` for <@${targetId}>`:''}.`);
     }
     if (STATS.includes(field)) {
       const num = parseInt(value);
@@ -1985,7 +2005,7 @@ async function handleChar(interaction) {
       let extra = '';
       if (field==='con') extra=` HP maxed to **${upd.hp_current} / ${maxHp(upd)}**`;
       if (field==='lck') extra=` Rerolls maxed to **${upd.rerolls_current} / ${maxRerolls(upd)}**`;
-      return interaction.reply({ content: `✅ ${field.toUpperCase()} set to **${num}**${targetId!==callerId?` for <@${targetId}>`:''}.${extra}` });
+      return done(`✅ ${field.toUpperCase()} set to **${num}**${targetId!==callerId?` for <@${targetId}>`:''}.${extra}`);
     }
     // Handle class, weapon and weapon emoji fields
     if (['class','weapon1','weapon2','weapon1emoji','weapon2emoji'].includes(field)) {
@@ -1994,10 +2014,9 @@ async function handleChar(interaction) {
         if (!cleaned) return interaction.reply({ content: `❌ Use a standard emoji (${STANDARD_WEAPON_EMOJIS.join(' ')}) or one of this server's custom emojis.`, ephemeral: true });
         upsertChar(gid, targetId, { [field]: cleaned });
         const lbl = field === 'weapon1emoji' ? 'Weapon 1 Emoji' : 'Weapon 2 Emoji';
-        return interaction.reply({ content: `✅ **${lbl}** set to ${cleaned}${targetId!==callerId?` for <@${targetId}>`:''}.` });
+        return done(`✅ **${lbl}** set to ${cleaned}${targetId!==callerId?` for <@${targetId}>`:''}.`);
       }
-      if (field === 'class' && String(value).toLowerCase() === 'hero'
-          && !(await isGm(interaction.guild, callerId))) {
+      if (field === 'class' && String(value).toLowerCase() === 'hero' && !isGmUser) {
         return interaction.reply({ content: '❌ **Hero** is granted by a GM, not chosen. Pick Vanguard, Defender or Siege Knight.', ephemeral: true });
       }
       if (['class','weapon1','weapon2'].includes(field) && value.length > 50) {
@@ -2005,7 +2024,7 @@ async function handleChar(interaction) {
       }
       upsertChar(gid, targetId, { [field]: value });
       const label = { class:'Class', weapon1:'Weapon 1', weapon2:'Weapon 2' }[field];
-      return interaction.reply({ content: `✅ **${label}** set to **${value}**${targetId!==callerId?` for <@${targetId}>`:''}.` });
+      return done(`✅ **${label}** set to **${value}**${targetId!==callerId?` for <@${targetId}>`:''}.`);
     }
   }
   if (sub === 'export') return handleCharExport(interaction);
@@ -2075,17 +2094,23 @@ async function handleProfile(interaction) {
   }
   if (sub === 'load') {
     const slot = interaction.options.getString('slotname');
-    // A snapshot restore rewrites stats — it must obey the approval lock too,
-    // otherwise it'd be a way around it.
+    // A snapshot restore rewrites stats — it must obey the approval lock, and
+    // put the sheet back in the queue, or it'd be a way around both.
+    const isGmUser = await isGm(interaction.guild, uid);
     {
-      const lock = sheetEditLock(gid, uid, uid, await isGm(interaction.guild, uid));
+      const lock = sheetEditLock(gid, uid, uid, isGmUser);
       if (lock) return interaction.reply({ content: lock, ephemeral: true });
     }
     const snap = loadProfile(gid, uid, slot);
     if (!snap) return interaction.reply({ content: `❌ No save found with name **${slot}**.`, ephemeral: true });
     upsertChar(gid, uid, { hp_current:snap.hp_current, rerolls_current:snap.rerolls_current, str:snap.str, con:snap.con, dex:snap.dex, wis:snap.wis, lck:snap.lck, order_name:snap.order_name, profile_enabled:snap.profile_enabled });
     setHealCharges(gid, uid, snap.heal_current??0);
-    return interaction.reply({ content: `📂 Profile **${slot}** loaded.`, ephemeral: true });
+    return finishSheetEdit({
+      src: interaction, gid, callerId: uid, targetId: uid, isGmCaller: isGmUser,
+      content: `📂 Profile **${slot}** loaded.`,
+      link: false, // the reply is ephemeral, so a jump link would be dead for the GM
+      reply: async (c) => { await interaction.reply({ content: c, ephemeral: true }); return null; },
+    });
   }
   if (sub === 'saves') {
     const saves = listProfiles(gid, uid);
@@ -2391,10 +2416,11 @@ async function handleSheetImport(message, parsed) {
     targetId = mentionMatch[1];
   }
 
-  // Pasting a sheet rewrites everything — respect the approval lock so it can't
-  // be used to sidestep a GM.
+  // Pasting a sheet rewrites everything — respect the approval lock, and send it
+  // back to the queue afterwards, so it can't be used to sidestep a GM.
+  const isGmImporter = await isGm(message.guild, uid);
   {
-    const lock = sheetEditLock(gid, uid, targetId, await isGm(message.guild, uid));
+    const lock = sheetEditLock(gid, uid, targetId, isGmImporter);
     if (lock) return message.reply(lock);
   }
 
@@ -2445,7 +2471,11 @@ async function handleSheetImport(message, parsed) {
     '',
     `\U0001f4aa STR ${parsed.str}  \U0001fac0 CON ${parsed.con}  \u26a1 DEX ${parsed.dex}  \U0001f9e0 WIS ${parsed.wis}  \U0001f340 LCK ${parsed.lck}`,
   ];
-  await message.reply(lines.join('\n'));
+  await finishSheetEdit({
+    src: message, gid, callerId: uid, targetId, isGmCaller: isGmImporter,
+    content: lines.join('\n'),
+    reply: async (c) => message.reply(c).catch(() => null),
+  });
 }
 
 async function handleTag(interaction) {
@@ -3259,37 +3289,84 @@ function approvalButtons(uid) {
   );
 }
 // Post an approval request to the configured channel, pinging every GM role.
-async function requestSheetApproval(interaction, gid, uid, submitMessageId = null) {
+// `src` is anything with .client / .guild / .channelId — a ChatInputInteraction
+// or a plain Message, since sheets arrive by slash command and by paste.
+async function requestSheetApproval(src, gid, uid, submitMessageId = null) {
   const chId = getConfig(gid)?.approval_channel_id;
   if (!chId) return null;
   const ch = getChar(gid, uid);
-  const nm = await getDisplayName(interaction.guild, uid);
+  if (!ch) return null;
+  const nm = await getDisplayName(src.guild, uid);
   const roles = getGmRoleIds(gid);
   const ping = roles.length ? roles.map(r => `<@&${r}>`).join(' ') + ' ' : '';
   const lines = [
     `${ping}📋 **Sheet approval requested**`,
     `👤 <@${uid}> (**${nm}**)`,
     '─────────────────────────────',
-    `💪 STR ${ch.str}   🛡️ CON ${ch.con}   ⚡ DEX ${ch.dex}`,
-    `🦉 WIS ${ch.wis}   🍀 LCK ${ch.lck}`,
-    `❤️ HP ${ch.hp_current} / ${maxHp(ch)}   🔄 Rerolls ${ch.rerolls_current} / ${maxRerolls(ch)}`,
+    `💪 STR ${ch.str ?? 0}   🛡️ CON ${ch.con ?? 0}   ⚡ DEX ${ch.dex ?? 0}`,
+    `🦉 WIS ${ch.wis ?? 0}   🍀 LCK ${ch.lck ?? 0}`,
+    `❤️ HP ${ch.hp_current ?? 0} / ${maxHp(ch)}   🔄 Rerolls ${ch.rerolls_current ?? 0} / ${maxRerolls(ch)}`,
     ch.order_name ? `${KNIGHT_EMOJIS[ch.order_name] ?? '⚪'} ${ch.order_name}` : null,
     ch.class ? `🎖️ ${ch.class}` : null,
     (ch.weapon1 || ch.weapon2) ? `⚔️ ${[ch.weapon1, ch.weapon2].filter(Boolean).join(' · ')}` : null,
   ].filter(Boolean);
   // Jump link back to where the sheet was submitted, so a GM can see the context.
-  const srcCh = interactionChannelId(interaction);
+  const srcCh = interactionChannelId(src);
   if (srcCh) upsertChar(gid, uid, { approval_src_channel: srcCh }); // for the decision notice
   let jumpId = submitMessageId;
-  if (!jumpId) { try { const rep = await interaction.fetchReply(); jumpId = rep?.id ?? null; } catch {} }
+  if (!jumpId && typeof src.fetchReply === 'function') {
+    try { const rep = await src.fetchReply(); jumpId = rep?.id ?? null; } catch {}
+  }
   if (srcCh && jumpId) lines.push(`\n[↗ Jump to submission](https://discord.com/channels/${gid}/${srcCh}/${jumpId})`);
   try {
-    const channel = await interaction.client.channels.fetch(chId);
+    const channel = await src.client.channels.fetch(chId);
+    // Editing a pending sheet re-queues it. Retire the previous request so the
+    // channel holds one live entry per player instead of a pile of stale ones
+    // with working buttons.
+    const oldId = ch.approval_msg_id;
+    if (oldId) {
+      try {
+        const old = await channel.messages.fetch(oldId);
+        await old.edit({ content: `~~📋 Sheet approval request for <@${uid}>~~\n↩️ *Superseded — they edited the sheet again; see the newer request below.*`, components: [] });
+      } catch {}
+    }
     const msg = await channel.send({ content: lines.join('\n'), components: [approvalButtons(uid)],
       allowedMentions: { roles } });
     upsertChar(gid, uid, { approval_msg_id: msg.id });
     return channel.id;
   } catch { return null; }
+}
+
+// Does this edit put the sheet (back) in the approval queue? Any change a player
+// makes to their OWN sheet does, while approvals are on. Without this, /char set,
+// /profile load and a pasted sheet were each a way to build a character the GMs
+// never saw: they only checked the edit *lock*, which lets a sheet with no
+// approval_state through, and nothing ever moved it to 'pending'.
+function sheetNeedsResubmit(gid, callerId, targetId, isGmCaller) {
+  if (!approvalEnabled(gid)) return false;   // feature off
+  if (isGmCaller) return false;              // GM edits are sign-off in themselves
+  return targetId === callerId;              // players editing someone else is already blocked
+}
+
+// Shared tail for every player-writable sheet edit. `reply` posts the message and
+// returns it (or null) so the approval post can link back. Set link:false when
+// the reply is ephemeral — a jump link to it would be dead for the GM.
+async function finishSheetEdit({ src, gid, callerId, targetId, isGmCaller, content, reply, link = true }) {
+  if (!sheetNeedsResubmit(gid, callerId, targetId, isGmCaller)) {
+    // A GM building a sheet from nothing shouldn't leave it looking like a
+    // pre-feature legacy sheet — approve it outright, as /char create does.
+    if (approvalEnabled(gid) && isGmCaller && !getChar(gid, targetId)?.approval_state) {
+      upsertChar(gid, targetId, { approval_state: 'approved' });
+    }
+    return reply(content);
+  }
+  upsertChar(gid, targetId, { approval_state: 'pending' });
+  const chId = getConfig(gid)?.approval_channel_id;
+  const sent = await reply(content + (chId
+    ? `\n\n⏳ **Sent to <#${chId}> for GM approval.** You can't roll or fight until it's signed off, and you can keep editing until a GM decides.\n📬 You'll get a DM as soon as they do.`
+    : '\n\n⚠️ No approval channel set — ask a GM to check `/config approvals`.'));
+  await requestSheetApproval(src, gid, targetId, link ? (sent?.id ?? null) : null);
+  return sent;
 }
 
 // ── Hero signature stat ───────────────────────────────────────────────────────
@@ -5689,7 +5766,7 @@ const HELP_CATEGORIES = {
     title: '📜 Character Sheet',
     body: [
       '`/char create` — set up a full character at once (stats, order, class, weapons, weapon emojis)',
-      '`/char set field:STR value:14` — set one field at a time',
+      '`/char set field:STR value:14` — set one field at a time (with approvals on, any change to your own sheet goes back to the GMs)',
       '`/char weaponemoji slot:Weapon 1 emoji:⚔️` — pick a weapon slot emoji',
       '`/char show [user]` — view a character sheet',
       '`/char export [format:Image]` — export your sheet as text or image',
