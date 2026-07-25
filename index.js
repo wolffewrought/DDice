@@ -1255,7 +1255,8 @@ async function handleExportRequestButton(interaction) {
 
   const notice = released
     ? `📤 **Your sheet export was released** by ${gmName} in **${interaction.guild.name}**:\n${req.payload}`
-    : `🚫 **Your sheet export was declined** by ${gmName} in **${interaction.guild.name}**. Speak to a GM if you need it.`;
+    : `🚫 **Your sheet export was declined** by ${gmName} in **${interaction.guild.name}**.\n`
+      + `You can ask again whenever you like — run \`/char export\` and it goes back to the GMs.`;
 
   let told = 'DM';
   try {
@@ -1365,6 +1366,7 @@ const slashCommands = [
           {name:'⚡ Dexterity (DEX)',value:'dex'},
           {name:'🦉 Wisdom (WIS)',value:'wis'},
           {name:'🍀 Luck (LCK)',value:'lck'})))
+    .addSubcommand(s=>s.setName('submit').setDescription('Send your sheet to the GMs for approval again'))
     .addSubcommand(s=>s.setName('export').setDescription('Export your character sheet')
       .addStringOption(o=>o.setName('format').setDescription('Export format').setRequired(false)
         .addChoices({name:'Text',value:'text'},{name:'Image',value:'image'}))
@@ -2131,6 +2133,28 @@ async function handleChar(interaction) {
       return done(`✅ **${label}** set to **${value}**${targetId!==callerId?` for <@${targetId}>`:''}.`);
     }
   }
+  // Resubmit for approval. A rejected sheet is editable by its owner and any
+  // edit re-queues it, but a player who disagrees with the call — or whose GM
+  // hit the wrong button — shouldn't have to invent a change to be seen again.
+  if (sub === 'submit') {
+    const ch = getChar(gid, callerId);
+    if (!ch) return interaction.reply({ content: '❌ You don\'t have a character sheet yet — make one with `/char create`.', ephemeral: true });
+    if (!approvalEnabled(gid)) return interaction.reply({ content: '✅ This server doesn\'t use sheet approval — your sheet is already usable.', ephemeral: true });
+    if (ch.approval_state === 'pending') {
+      const chId = getConfig(gid)?.approval_channel_id;
+      return interaction.reply({ content: `⏳ Your sheet is already waiting${chId ? ` in <#${chId}>` : ''}. A GM will get to it.`, ephemeral: true });
+    }
+    if (ch.approval_state === 'approved') return interaction.reply({ content: '✅ Your sheet is already approved. Ask a GM if you need a change.', ephemeral: true });
+    return finishSheetEdit({
+      src: interaction, gid, callerId, targetId: callerId, isGmCaller: false,
+      content: '📤 **Sheet sent back to the GMs.**',
+      reply: async (c) => {
+        await interaction.reply({ content: c });
+        try { return await interaction.fetchReply(); } catch { return null; }
+      },
+    });
+  }
+
   if (sub === 'export') return handleCharExport(interaction);
   if (sub === 'show') {
     const tu = interaction.options.getUser('user') || interaction.user, tid = tu.id;
@@ -3414,7 +3438,7 @@ function sheetGate(gid, uid) {
   if (!ch) return null;                            // "no sheet" handled by callers
   if (sheetApproved(gid, ch)) return null;         // single source of truth
   if (ch.approval_state === 'pending') return '⏳ Your character sheet is **awaiting GM approval** — you can\'t roll or fight until it\'s approved.';
-  return '🚫 Your character sheet was **rejected** by a GM. Speak to them before rolling.';
+  return '🚫 Your character sheet was **rejected** by a GM. Fix it with `/char set` or `/char create` and it goes straight back for another look — or `/char submit` to send it again unchanged.';
 }
 // ── Character sheet exports ───────────────────────────────────────────────────
 // With approvals on, /char export doesn't hand the sheet straight back. The
@@ -5949,6 +5973,7 @@ const HELP_CATEGORIES = {
       '`/char set field:STR value:14` — set one field at a time (with approvals on, any change to your own sheet goes back to the GMs)',
       '`/char weaponemoji slot:Weapon 1 emoji:⚔️` — pick a weapon slot emoji',
       '`/char show [user]` — view a character sheet',
+      '`/char submit` — send your sheet back to the GMs after a rejection, unchanged',
       '`/char export [format:Image]` — export your sheet as text or image. With approvals on it goes to the GMs first and reaches you when one releases it',
       '`/char signature user:@a stat:str` — set a Hero\'s signature stat (GM)',
       '`/profile on/off/show/save/load/saves` — manage profile display & snapshots',
@@ -6859,7 +6884,9 @@ async function handleSheetApprovalButton(interaction) {
   // Try a DM first, then fall back to the channel they submitted from.
   const notice = approved
     ? `✅ **Your character sheet was approved** by ${gmName} in **${interaction.guild.name}** — you can roll and fight now.`
-    : `🚫 **Your character sheet was rejected** by ${gmName} in **${interaction.guild.name}**. Speak to a GM; they'll need to adjust it for you.`;
+    : `🚫 **Your character sheet was rejected** by ${gmName} in **${interaction.guild.name}**.\n`
+      + `You can fix it and try again yourself — change whatever needs changing with \`/char set\` or \`/char create\` and it goes straight back to the GMs.\n`
+      + `If you think it was fine as it stands, \`/char submit\` sends it again unchanged.`;
   let told = 'DM';
   try {
     const user = await interaction.client.users.fetch(uid);
