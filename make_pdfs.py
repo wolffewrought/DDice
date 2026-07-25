@@ -157,8 +157,9 @@ CONTENT = [
           ('/char create str:6 con:5 dex:3 wis:2 lck:1', '17 \u2014 refused, take 2 back off'),
           ('/char create str:9 con:5 dex:1 wis:0 lck:0', 'over AND stats on 0 \u2014 both reported')]),
 ('p', 'The refusal is posted <b>in the channel you are working in</b>, not as a private note only you can '
-      'see \u2014 so it sits alongside what you typed, and a ' + GM + ' watching the workshop channel can see '
-      'who is stuck and step in.'),
+      'see \u2014 so it sits alongside what you typed. A copy also goes to the <b>approval channel</b> with a '
+      'jump link back to the attempt, so the ' + GM + 's can see who is wrestling with the budget and step in '
+      'without having to be in that channel. Nothing is submitted either way.'),
 ('p', 'Break a rule and the sheet is refused on the spot with a note saying exactly what is wrong \u2014 both '
       'problems at once if you managed both \u2014 along with your current spread and running total, so you can '
       'see what to move. Nothing is saved and nothing goes to the GMs until it is legal. The same check runs '

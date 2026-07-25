@@ -892,6 +892,45 @@ function statBudgetReply(gid, problems, stats) {
           `Set them all in one go with \`/char create str:… con:… dex:… wis:… lck:…\`.`].join('\n');
 }
 
+// Post a reply and hand back the message it produced, so an audit or approval
+// entry can link straight to it. Four call sites needed the same three lines.
+const replyThenFetch = (interaction) => async (c) => {
+  await interaction.reply({ content: c });
+  try { return await interaction.fetchReply(); } catch { return null; }
+};
+
+// Refuse an illegal spread in the channel the player is working in, then copy
+// the same note to the approval channel with a jump link, so the GMs can see
+// who is wrestling with the budget without being in that channel. `reply` posts
+// the refusal and returns the sent message (or null) so the link can point at
+// it. Silent when no approval channel is configured.
+async function refuseStatBudget({ src, gid, uid, problems, stats, reply, jumpId = null }) {
+  const sent = await reply(statBudgetReply(gid, problems, stats));
+  const chId = getConfig(gid)?.approval_channel_id;
+  if (!chId) return sent;
+  const srcCh = interactionChannelId(src);
+  const msgId = jumpId ?? sent?.id ?? null;
+  try {
+    const nm = await getDisplayName(src.guild, uid);
+    const { budget } = statRules(gid);
+    const spread = STATS.map(k => `${k.toUpperCase()} ${Number(stats?.[k]) || 0}`).join(' · ');
+    const link = (srcCh && msgId) ? `\n[↗ Jump to the attempt](https://discord.com/channels/${gid}/${srcCh}/${msgId})` : '';
+    const ch = await src.client.channels.fetch(chId);
+    await ch.send({
+      content: [`📊 **Sheet turned back — point allowance**`,
+                `👤 <@${uid}> (**${nm}**)${srcCh ? ` in <#${srcCh}>` : ''}`,
+                '─────────────────────────────',
+                ...problems,
+                `Their spread: ${spread}  →  **${statTotal(stats)}/${budget}**`,
+                `_Nothing was submitted. They can fix it and try again._${link}`].join('\n'),
+      allowedMentions: { parse: [] },
+    });
+  } catch (err) {
+    console.error('[statbudget] could not mirror refusal:', err?.message || err);
+  }
+  return sent;
+}
+
 // The stat block a sheet would have after applying `updates`.
 function statsAfter(existing, updates = {}) {
   const out = {};
@@ -2069,7 +2108,8 @@ async function handleChar(interaction) {
       const anyStatGiven = STATS.some(k => updates[k] !== undefined);
       const complete = STATS.every(k => (after[k] ?? 0) > 0) || anyStatGiven;
       const problems = statBudgetProblems(gid, after, { requireAll: complete, exact: complete });
-      if (problems.length) return interaction.reply({ content: statBudgetReply(gid, problems, after) });
+      if (problems.length) return refuseStatBudget({ src: interaction, gid, uid: callerId, problems, stats: after,
+        reply: replyThenFetch(interaction) });
     }
     const charClass = interaction.options.getString('class');
     if (charClass && String(charClass).toLowerCase() === 'hero' && !isGmUser) {
@@ -2151,10 +2191,7 @@ async function handleChar(interaction) {
     return finishSheetEdit({
       src: interaction, gid, callerId, targetId, isGmCaller: isGmUser,
       content: `✅ ${slotLabel} emoji set to ${cleaned}${targetId!==callerId?` for <@${targetId}>`:''}.`,
-      reply: async (c) => {
-        await interaction.reply({ content: c });
-        try { return await interaction.fetchReply(); } catch { return null; }
-      },
+      reply: replyThenFetch(interaction),
     });
   }
 
@@ -2196,10 +2233,7 @@ async function handleChar(interaction) {
     // finishSheetEdit — it re-queues the sheet for approval when it needs to be.
     const done = (content) => finishSheetEdit({
       src: interaction, gid, callerId, targetId, isGmCaller: isGmUser, content,
-      reply: async (c) => {
-        await interaction.reply({ content: c });
-        try { return await interaction.fetchReply(); } catch { return null; }
-      },
+      reply: replyThenFetch(interaction),
     });
     if (field === 'order') {
       const knight = KNIGHTS.find(k=>k.toLowerCase()===value.toLowerCase());
@@ -2221,7 +2255,8 @@ async function handleChar(interaction) {
           const problems = statBudgetProblems(gid, after, { requireAll: false, exact: false });
           const { min: statFloor } = statRules(gid);
           if (num0 < statFloor) problems.push(`0️⃣ Every stat needs at least **${statFloor}** point${statFloor === 1 ? '' : 's'} — **${field.toUpperCase()}** can't be ${num0}.`);
-          if (problems.length) return interaction.reply({ content: statBudgetReply(gid, problems, after) });
+          if (problems.length) return refuseStatBudget({ src: interaction, gid, uid: callerId, problems, stats: after,
+            reply: replyThenFetch(interaction) });
         }
       }
       const num = parseInt(value);
@@ -2270,14 +2305,12 @@ async function handleChar(interaction) {
     }
     if (ch.approval_state === 'approved') return interaction.reply({ content: '✅ Your sheet is already approved. Ask a GM if you need a change.', ephemeral: true });
     const problems = statBudgetProblems(gid, ch);
-    if (problems.length) return interaction.reply({ content: statBudgetReply(gid, problems, ch) });
+    if (problems.length) return refuseStatBudget({ src: interaction, gid, uid: callerId, problems, stats: ch,
+      reply: replyThenFetch(interaction) });
     return finishSheetEdit({
       src: interaction, gid, callerId, targetId: callerId, isGmCaller: false,
       content: '📤 **Sheet sent back to the GMs.**',
-      reply: async (c) => {
-        await interaction.reply({ content: c });
-        try { return await interaction.fetchReply(); } catch { return null; }
-      },
+      reply: replyThenFetch(interaction),
     });
   }
 
@@ -2361,7 +2394,8 @@ async function handleProfile(interaction) {
     // spread back in. Players get checked; GMs restore whatever they like.
     if (!isGmUser) {
       const problems = statBudgetProblems(gid, snap);
-      if (problems.length) return interaction.reply({ content: statBudgetReply(gid, problems, snap) });
+      if (problems.length) return refuseStatBudget({ src: interaction, gid, uid, problems, stats: snap,
+        reply: replyThenFetch(interaction) });
     }
     upsertChar(gid, uid, { hp_current:snap.hp_current, rerolls_current:snap.rerolls_current, str:snap.str, con:snap.con, dex:snap.dex, wis:snap.wis, lck:snap.lck, order_name:snap.order_name, profile_enabled:snap.profile_enabled });
     setHealCharges(gid, uid, snap.heal_current??0);
@@ -2684,7 +2718,8 @@ async function handleSheetImport(message, parsed) {
   // A pasted sheet is a whole character, so both rules apply in full.
   if (!isGmImporter) {
     const problems = statBudgetProblems(gid, parsed);
-    if (problems.length) return message.reply(statBudgetReply(gid, problems, parsed)).catch(()=>{});
+    if (problems.length) return refuseStatBudget({ src: message, gid, uid, problems, stats: parsed,
+      jumpId: message.id, reply: async (c) => message.reply(c).catch(() => null) });
   }
   {
     const lock = sheetEditLock(gid, uid, targetId, isGmImporter);
@@ -3752,12 +3787,16 @@ async function finishSheetEdit({ src, gid, callerId, targetId, isGmCaller, conte
     const out = await reply(content + '\n\n' + note);
     // `link: false` marks a caller whose reply is ephemeral (/profile load).
     // The refusal belongs where they're working, so post it there as well.
+    let inChannel = out;
     if (!link) {
       try {
         const ch = src.channel ?? await src.client.channels.fetch(interactionChannelId(src));
-        if (ch?.send) await ch.send({ content: `<@${targetId}> ${note}`, allowedMentions: { users: [targetId] } });
+        if (ch?.send) inChannel = await ch.send({ content: `<@${targetId}> ${note}`, allowedMentions: { users: [targetId] } });
       } catch {}
     }
+    // Same event as an outright refusal — copy it to the GMs with a jump link.
+    await refuseStatBudget({ src, gid, uid: targetId, problems: short, stats: getChar(gid, targetId),
+      jumpId: inChannel?.id ?? null, reply: async () => inChannel });
     return out;
   }
   upsertChar(gid, targetId, { approval_state: 'pending', approval_reason: null });
