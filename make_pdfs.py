@@ -66,11 +66,18 @@ CONTENT = [
       'RP flavour \u2014 so nothing has to be memorised. Choose either a <b>stat</b> (rolls 1d20 + that stat '
       'from your sheet) or custom <b>dice</b>. The result uses the same card as a typed roll.'),
 ('h2', 'Stat Quick Rolls'),
-('code', [('str   con   dex   wis   lck', 'r prefix optional · add a label e.g. str atk'),
-          ('wisa   dexd', 'stat roll with advantage / disadvantage')]),
-('p', 'Rolls 1d20 + that stat from your saved character. Type the stat on its own (no prefix) '
-      'or keep the <b>r</b> prefix. Add <b>a</b> for advantage or <b>d</b> for disadvantage — '
-      '<b>wisa</b>, <b>dexd</b>.'),
+('code', [('str   con   dex   wis   lck', 'on their own — nothing else in the message'),
+          ('wisa   dexd', 'advantage / disadvantage · a label may follow'),
+          ('r str atk', 'a plain stat roll with a label'),
+          ('?str atk', 'the same, as a success check')]),
+('p', 'Rolls 1d20 + that stat from your saved character. Add <b>a</b> for advantage or <b>d</b> for '
+      'disadvantage — <b>wisa</b>, <b>dexd</b>.'),
+('p', '<b>A plain stat name must be the whole message.</b> <b>str</b>, <b>con</b>, <b>dex</b>, <b>wis</b> and '
+      '<b>lck</b> are ordinary words in conversation, so anything typed after one means it is treated as '
+      'chat and left alone — “Dex or strength can both be used to throw things” is a sentence, not a '
+      'roll. To label a plain stat roll, put a prefix on it: <b>r str atk</b> or <b>?str atk</b>.'),
+('p', 'Forms that cannot be mistaken for words keep their labels as they always did — <b>wisa sneak</b>, '
+      '<b>dexd guard</b>, <b>strrr atk</b>, <b>conrra hold the line</b>.'),
 ('h2', '? Success Check Rolls'),
 ('p', 'Prefix <b>?</b> instead of <b>r</b> to get a success outcome:'),
 ('code', [('?1d20+5   ?ra1d20+5   ?rd1d20+5   ?rr   ?str   ?wisa', '')]),
@@ -129,14 +136,30 @@ CONTENT = [
 
 ('aud','player'),
 ('sec', 'Character & Profile'),
+('h2', 'Start Here \u2014 Make Your Character'),
+('p', '<b>Build your character with /char create.</b> One command sets the whole sheet at once \u2014 every '
+      'stat, your order, your class and both weapons \u2014 so it arrives complete instead of in pieces.'),
+('code', [('/char create str:14 con:12 dex:10 wis:5 lck:3 \\\n  order:White Knight class:Hero \\\n'
+           '  weapon1:Longsword weapon2:Tower Shield', 'the whole character, one command')]),
+('p', 'Every option is optional \u2014 fill in what you have decided and run it again later to add the rest. '
+      'The values for <b>order</b>, <b>class</b> and the weapon fields are listed further down this chapter.'),
+('note', 'This matters most where a GM has switched sheet approval on. /char create sends one request for '
+         'the whole character; building the same sheet a field at a time sends a fresh request on every '
+         'single change and buries the GMs in them. It matters again afterwards, because once your sheet is '
+         'approved every field is locked and only a GM can change it \u2014 so /char create is your one clean '
+         'run at the character you want.'),
+('h2', 'Changing One Field Later'),
+('p', 'Use <b>/char set</b> to adjust a single thing after the fact \u2014 a stat that went up, a weapon you '
+      'swapped. It is a touch-up tool, not the way to build a character from nothing.'),
 ('aud','all'),
-('h2', 'Stats'),
-('code', [('/char set field:str value:14', '', 'player'),
+('code', [('/char set field:str value:14', 'one field at a time', 'player'),
           ('/char set field:con value:12', 'HP auto-maxes to CON + 2', 'player'),
           ('/char set field:lck value:3', 'rerolls auto-max to LCK', 'player'),
           ('/char set field:str value:14 user:@player', GM + ' only', 'gm')]),
 ('aud','player'),
 ('h2', 'Knight Orders'),
+('p', 'These are the values to pass to <b>order:</b> on /char create \u2014 or to /char set if this is the '
+      'only thing you are changing.'),
 ('code', [('/char set field:order value:White Knight', 'also: Black, Gold, Grey, Blue,'),
           ('/char set field:order value:Red Knight', 'Purple, Green, Red')]),
 ('h2', 'Class, Weapons & Emojis'),
@@ -146,11 +169,17 @@ CONTENT = [
           ('/char weaponemoji slot:Weapon 1 custom::sword:', 'paste a server emoji')]),
 ('note', 'Pick a standard emoji from the dropdown, or paste a server custom emoji in the \u201ccustom\u201d '
          'field (it overrides the dropdown). The image export falls back to a sword glyph for custom emojis.'),
-('h2', 'Bulk Setup & Export'),
-('code', [('/char create str:14 con:12 dex:10 wis:5 lck:3 \\\n  order:White Knight class:Hero \\\n'
-           '  weapon1:Longsword weapon2:Tower Shield', 'everything at once'),
+('h2', 'Reading & Sharing Your Sheet'),
+('code', [('/char create ...', 'see \u201cStart Here\u201d \u2014 builds the whole sheet'),
           ('/char show          /char show user:@player', ''),
           ('/char export        /char export format:Image', '')]),
+('p', '<b>With sheet approval switched on, an export goes to the GMs first.</b> Running <b>/char export</b> '
+      'posts the sheet block into the approval channel with <b>Release to player</b> / <b>Decline</b> buttons; '
+      'the player sees only a private note that it has been sent. When a GM releases it, the block arrives by '
+      'DM \u2014 or back in the channel they exported from, if their DMs are closed. Exporting is not an edit: it '
+      'never changes a sheet\u2019s approval state and never stops anyone rolling. Exporting again replaces the '
+      'previous request, so the channel holds one live entry per player. GMs export straight away, for '
+      'themselves and for anyone else, and on servers not using approvals nothing changes.'),
 ('h2', 'Profile'),
 ('code', [('/profile on    /p on', 'enable embed, max HP + rerolls'),
           ('/profile off   /p off', 'disable embed, plain text rolls'),
@@ -189,8 +218,16 @@ CONTENT = [
          '<b>/config npcstats enabled:true</b>. NPC management commands are ' + GM + '-only regardless.'),
 ('note', 'With an approval channel set, a player\u2019s new sheet is posted there for sign-off, pinging '
          'every GM role, with Approve / Reject buttons. Until approved they can\u2019t roll, heal or take '
-         'fight actions \u2014 and once approved, their stats, order and class can only be changed by a GM. '
-         'Sheets a GM creates skip the queue, and sheets made before approval was enabled keep working.'),
+         'fight actions \u2014 and once approved, their whole sheet can only be changed by a GM. Sheets a GM '
+         'creates or edits skip the queue, and sheets made before approval was enabled keep working until '
+         'someone edits them.'),
+('note', 'Every way a player can write to their own sheet goes to the queue: <b>/char create</b>, '
+         '<b>/char set</b> (any field \u2014 stats, order, class and weapons alike), <b>/char weaponemoji</b>, '
+         '<b>/profile load</b> and pasting an exported sheet. Building a character one <b>/char set</b> at a '
+         'time is not a way past a GM. Editing a sheet that is still pending retires the old request and '
+         'posts a fresh one, so the channel holds one live entry per player rather than a pile of stale ones. '
+         'A rejected sheet can still be edited by its owner \u2014 that is how they fix it \u2014 and each edit '
+         'sends it straight back for another look.'),
 ('note', 'The roll-audit mirror covers prefix rolls, stat shorthand, success checks, rerolls, heals and '
          'fight rolls \u2014 and <b>' + GM + ' rolls too, including secret <b>gmrs</b> ones</b>, so ' + GM + 's are '
          'accountable to one another. A ' + GM + ' rolling as an NPC is logged under their own name. Only NPC '
