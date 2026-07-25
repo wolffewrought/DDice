@@ -66,6 +66,8 @@ try { db.exec('ALTER TABLE characters ADD COLUMN approval_reason TEXT'); } catch
 // Character creation budget, per guild. Defaults match the shipped rules.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN stat_budget INTEGER DEFAULT 15'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN stat_min INTEGER DEFAULT 1'); } catch {}
+// The flat part of the max-HP formula: max HP = CON + hp_base.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN hp_base INTEGER DEFAULT 2'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_stats_visible INTEGER DEFAULT 0'); } catch {}
 try {
   // Webhooks are bound to the channel they were created in. Storing one per NPC
@@ -671,7 +673,17 @@ function loadProfile(gid, uid, slot) {
 function listProfiles(gid, uid) {
   return db.prepare('SELECT slot_name,saved_at FROM profile_saves WHERE guild_id=? AND user_id=? ORDER BY saved_at DESC').all(gid, uid);
 }
-function maxHp(ch) { return (ch?.con ?? 0) + 2; }
+// ── Max HP ────────────────────────────────────────────────────────────────────
+// max HP = CON + a flat base, set per guild with /config hpbase. The base used
+// to be a hard-coded 2 written out at fourteen separate sites; it lives here now
+// so a server can run CON+3 (or CON+0) without any of them drifting apart.
+const HP_BASE_DEFAULT = 2;
+function hpBase(gid) {
+  const v = Number(getConfig(gid)?.hp_base);
+  return Number.isFinite(v) && v >= 0 ? v : HP_BASE_DEFAULT;
+}
+function maxHpFromCon(gid, con) { return (Number(con) || 0) + hpBase(gid); }
+function maxHp(ch, gid) { return maxHpFromCon(gid, ch?.con ?? 0); }
 function maxRerolls(ch) { return ch?.lck ?? 0; }
 function isWhiteKnight(ch) { return ch?.order_name === 'White Knight' && ch?.wis >= 5; }
 
@@ -802,8 +814,8 @@ function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharg
   // NPC stat blocks are hidden from players by default so their capabilities stay
   // a mystery. A GM can reveal them with /config npcstats enabled:true.
   const hideNpcStats = char._isNpc && !(gid && getConfig(gid)?.npc_stats_visible);
-  if (hideNpcStats) lines.push(`❤️  ${hpCondition(char.hp_current, maxHp(char))}`);
-  else lines.push(`❤️  HP${pad(char.hp_current)} / ${maxHp(char)}`);
+  if (hideNpcStats) lines.push(`❤️  ${hpCondition(char.hp_current, maxHp(char, gid))}`);
+  else lines.push(`❤️  HP${pad(char.hp_current)} / ${maxHp(char, gid)}`);
   if (!char._isNpc) lines.push(`🔄  Rerolls${pad(char.rerolls_current)} / ${maxRerolls(char)}`);
   if (isWhiteKnight(char)) lines.push(`🛡️  Heal${pad(healCharges)} / ${maxCharges}`);
   if (!hideNpcStats) {
@@ -1084,7 +1096,7 @@ const ORDER_PALETTE = {
 const DEFAULT_PALETTE = { bg: '#f5f0e8', accent: '#8b7355', text: '#2a2a2a', border: '#8b7355', crest: '⚔️' };
 
 
-async function generateCharImage(char, displayName, healCharges, maxCharges) {
+async function generateCharImage(char, displayName, healCharges, maxCharges, gid) {
   let createCanvas;
   try {
     ({ createCanvas } = require('@napi-rs/canvas'));
@@ -1159,7 +1171,7 @@ async function generateCharImage(char, displayName, healCharges, maxCharges) {
 
   // ── Tracker rows ─────────────────────────────────────────────────────────────
   const trackers = [
-    { label: '❤️  HP', value: `${char.hp_current} / ${maxHp(char)}` },
+    { label: '❤️  HP', value: `${char.hp_current} / ${maxHp(char, gid)}` },
     { label: '🔄  Rerolls', value: `${char.rerolls_current} / ${maxRerolls(char)}` },
   ];
   if (isWhiteKnight(char)) trackers.push({ label: '🛡️  Heal', value: `${healCharges} / ${maxCharges}` });
@@ -1238,7 +1250,7 @@ async function handleCharExport(interaction) {
   const dn = await getDisplayName(interaction.guild, tid);
   const cfg = getConfig(gid); const mc = cfg.heal_charges ?? 3;
   const hr = getHealCharges(gid, tid, mc);
-  const hm = maxHp(char), rm = maxRerolls(char);
+  const hm = maxHp(char, gid), rm = maxRerolls(char);
 
   // ── Text export ──────────────────────────────────────────────────────────────
   const textLines = [
@@ -1305,7 +1317,7 @@ async function handleCharExport(interaction) {
 
   // ── Image export ─────────────────────────────────────────────────────────────
   await interaction.deferReply();
-  const imgBuffer = await generateCharImage(char, dn, hr.current, mc);
+  const imgBuffer = await generateCharImage(char, dn, hr.current, mc, gid);
   if (!imgBuffer) {
     return interaction.editReply({ content: textContent + '\n*Image generation unavailable — install `@napi-rs/canvas` to enable.*' });
   }
@@ -1353,7 +1365,7 @@ async function handleExportRequestButton(interaction) {
     if (ch) {
       const cfg = getConfig(gid); const mc = cfg.heal_charges ?? 3;
       const hr = getHealCharges(gid, uid, mc);
-      const buf = await generateCharImage(ch, nm, hr.current, mc).catch(()=>null);
+      const buf = await generateCharImage(ch, nm, hr.current, mc, gid).catch(()=>null);
       if (buf) {
         const { AttachmentBuilder } = require('discord.js');
         files = [new AttachmentBuilder(buf, { name: `${nm.replace(/\s+/g,'-')}-sheet.png` })];
@@ -1412,6 +1424,8 @@ const slashCommands = [
       .addStringOption(o=>o.setName('hp').setDescription('HP restored — "50%" of max, or a flat number like "3"').setRequired(false))
       .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored — "50%" of max, or a flat number like "1"').setRequired(false))
       .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored — "50%" of max, or a flat number like "2"').setRequired(false)))
+    .addSubcommand(s=>s.setName('hpbase').setDescription('Flat points added to CON for max HP (default 2, so CON+2)')
+      .addIntegerOption(o=>o.setName('base').setDescription('Max HP = CON + this. 3 gives CON+3, 0 gives plain CON').setRequired(false).setMinValue(0).setMaxValue(50)))
     .addSubcommand(s=>s.setName('statallowance').setDescription('Points a player spends building a sheet, and the minimum per stat')
       .addIntegerOption(o=>o.setName('points').setDescription('Total points to spend across the 5 stats (default 15)').setRequired(false).setMinValue(5).setMaxValue(200))
       .addIntegerOption(o=>o.setName('minimum').setDescription('Minimum in every stat (default 1, 0 allows empty stats)').setRequired(false).setMinValue(0).setMaxValue(20)))
@@ -1947,6 +1961,20 @@ async function handleConfig(interaction) {
     setConfig(gid, { roll_audit_channel_id: channel.id });
     return interaction.reply({ content: `🎲 Rolls will be mirrored to <#${channel.id}> — raw input, result, and a jump link.\nCovers player rolls **and GM rolls, including secret ones**, so GMs are accountable to each other.\n⚠️ Make sure that channel's permissions only let GMs view it; the bot can't set that for you.` });
   }
+  if (sub === 'hpbase') {
+    const base = interaction.options.getInteger('base');
+    const cur = hpBase(gid);
+    if (base === null) {
+      return interaction.reply({ content:
+        `❤️ Max HP is **CON + ${cur}**. Change it with \`/config hpbase base:3\`.`, ephemeral: true });
+    }
+    setConfig(gid, { hp_base: base });
+    return interaction.reply({ content:
+      `❤️ Max HP is now **CON + ${base}**.\n`
+      + `Everyone's ceiling moves immediately; current HP is left alone, so run a rest or \`hpfull @user\` to top people up`
+      + `${base < cur ? ' — anyone now above their new maximum is trimmed on their next heal or rest' : ''}.` });
+  }
+
   if (sub === 'statallowance') {
     const points = interaction.options.getInteger('points');
     const minimum = interaction.options.getInteger('minimum');
@@ -2094,7 +2122,7 @@ async function handleChar(interaction) {
       if (v !== null && (v < 0 || v > 99)) return interaction.reply({ content: `❌ ${stat.toUpperCase()} must be between 0 and 99.`, ephemeral: true });
     }
     const str = interaction.options.getInteger('str'); if (str !== null) updates.str = str;
-    const con = interaction.options.getInteger('con'); if (con !== null) { updates.con = con; updates.hp_current = con + 2; }
+    const con = interaction.options.getInteger('con'); if (con !== null) { updates.con = con; updates.hp_current = maxHpFromCon(gid, con); }
     const dex = interaction.options.getInteger('dex'); if (dex !== null) updates.dex = dex;
     const wis = interaction.options.getInteger('wis'); if (wis !== null) updates.wis = wis;
     const lck = interaction.options.getInteger('lck'); if (lck !== null) { updates.lck = lck; updates.rerolls_current = lck; }
@@ -2268,7 +2296,7 @@ async function handleChar(interaction) {
         else setHealCharges(gid,targetId,0);
       }
       let extra = '';
-      if (field==='con') extra=` HP maxed to **${upd.hp_current} / ${maxHp(upd)}**`;
+      if (field==='con') extra=` HP maxed to **${upd.hp_current} / ${maxHp(upd, gid)}**`;
       if (field==='lck') extra=` Rerolls maxed to **${upd.rerolls_current} / ${maxRerolls(upd)}**`;
       return done(`✅ ${field.toUpperCase()} set to **${num}**${targetId!==callerId?` for <@${targetId}>`:''}.${extra}`);
     }
@@ -2326,7 +2354,7 @@ async function handleChar(interaction) {
     const lines = [`⚔️  **${dn}**`, kn];
     if (char.class) lines.push(`🏅  ${char.class}`);
     { const sig = signatureLine(char); if (sig) lines.push(sig); }
-    lines.push(`❤️  HP          ${char.hp_current} / ${maxHp(char)}`, `🔄  Rerolls      ${char.rerolls_current} / ${maxRerolls(char)}`);
+    lines.push(`❤️  HP          ${char.hp_current} / ${maxHp(char, gid)}`, `🔄  Rerolls      ${char.rerolls_current} / ${maxRerolls(char)}`);
     if (isWhiteKnight(char)) lines.push(`🛡️  Heal         ${hr.current} / ${mc}`);
     lines.push('', `💪  STR         ${char.str}`, `🫀  CON         ${char.con}`, `⚡  DEX         ${char.dex}`, `🧠  WIS         ${char.wis}`, `🍀  LCK         ${char.lck}`);
     if (char.weapon1 || char.weapon2) {
@@ -2343,7 +2371,7 @@ async function handleProfile(interaction) {
   if (sub === 'on') {
     let ch = getChar(gid, uid);
     if (!ch) { upsertChar(gid, uid, {}); ch = getChar(gid, uid); }
-    upsertChar(gid, uid, { profile_enabled:1, hp_current:maxHp(ch), rerolls_current:maxRerolls(ch) });
+    upsertChar(gid, uid, { profile_enabled:1, hp_current:maxHp(ch, gid), rerolls_current:maxRerolls(ch) });
     if (isWhiteKnight(ch)) { const cfg=getConfig(gid); setHealCharges(gid,uid,cfg.heal_charges??3); }
     return interaction.reply({ content: '✅ Profile enabled. HP and rerolls maxed out.', ephemeral: true });
   }
@@ -2360,7 +2388,7 @@ async function handleProfile(interaction) {
     const kn = ch.order_name ? `${KNIGHT_EMOJIS[ch.order_name]??'⚪'}  ${ch.order_name}` : 'No order set';
     const lines = [`⚔️  **${dn}**`, kn];
     if (ch.class) lines.push(`🏅  ${ch.class}`);
-    lines.push(`❤️  HP          ${ch.hp_current} / ${maxHp(ch)}`, `🔄  Rerolls      ${ch.rerolls_current} / ${maxRerolls(ch)}`);
+    lines.push(`❤️  HP          ${ch.hp_current} / ${maxHp(ch, gid)}`, `🔄  Rerolls      ${ch.rerolls_current} / ${maxRerolls(ch)}`);
     if (isWhiteKnight(ch)) lines.push(`🛡️  Heal         ${hr.current} / ${mc}`);
     lines.push('', `💪  STR         ${ch.str}`, `🫀  CON         ${ch.con}`, `⚡  DEX         ${ch.dex}`, `🧠  WIS         ${ch.wis}`, `🍀  LCK         ${ch.lck}`);
     if (ch.weapon1 || ch.weapon2) {
@@ -2490,7 +2518,7 @@ async function handleHeal(message, rest) {
   else if (total >= 20) { healAmount=2; chargesUsed=1; resultText=`*2 HP restored to ${tn}. 1 charge consumed.*`; }
   else if (nat === 1) { chargesUsed=Math.min(2,hr.current); resultText=`*Natural 1! No heal. ${chargesUsed} charges consumed.*`; }
   else { chargesUsed=1; resultText=`*No heal. 1 charge consumed.*`; }
-  const newTHp = Math.min(targetChar.hp_current + healAmount, maxHp(targetChar));
+  const newTHp = Math.min(targetChar.hp_current + healAmount, maxHp(targetChar, gid));
   const newCharges = Math.max(0, hr.current - chargesUsed);
   upsertChar(gid, targetId, { hp_current: newTHp });
   setHealCharges(gid, uid, newCharges);
@@ -2535,7 +2563,7 @@ async function handleHp(message, rest) {
   const { targetId, amount } = t;
   const ch = getChar(gid, targetId);
   if (!ch) return message.reply('❌ No character found for that user.');
-  const hm = maxHp(ch);
+  const hm = maxHp(ch, gid);
   const newHp = Math.max(0, Math.min(ch.hp_current + amount, hm));
   upsertChar(gid, targetId, { hp_current: newHp });
   const dir = amount > 0 ? '💚 Healed' : '🩸 Damaged';
@@ -2585,7 +2613,7 @@ async function handleRest(message, rest, type) {
   const ch = getChar(gid, targetId);
   if (!ch) return message.reply('❌ No character found.');
   const cfg = getConfig(gid); const mc = cfg.heal_charges??3;
-  const hm = maxHp(ch), rm = maxRerolls(ch);
+  const hm = maxHp(ch, gid), rm = maxRerolls(ch);
   const tn = targetId === uid ? 'Your' : `<@${targetId}>'s`;
 
   let label, hpTok, rTok, healTok;
@@ -2734,7 +2762,7 @@ async function handleSheetImport(message, parsed) {
   }
 
   // Apply stats — derive HP max and reroll max from CON and LCK
-  const hpMax = parsed.con + 2;
+  const hpMax = maxHpFromCon(gid, parsed.con);
   const rerollMax = parsed.lck;
 
   // Use imported current values if valid, otherwise max out
@@ -3408,7 +3436,7 @@ async function resolveFighter(guild, gid, fid) {
     return {
       id: fid, name, isNpc: true,
       stats: npc ? { str:npc.str, con:npc.con, dex:npc.dex, wis:npc.wis, lck:npc.lck } : { str:0,con:0,dex:0,wis:0,lck:0 },
-      maxHp: npc ? npc.con + 2 : 0,
+      maxHp: npc ? maxHpFromCon(gid, npc.con) : 0,
     };
   }
   const member = await guild.members.fetch(fid).catch(()=>null);
@@ -3417,7 +3445,7 @@ async function resolveFighter(guild, gid, fid) {
   return {
     id: fid, name, isNpc: false,
     stats: char ? { str:char.str, con:char.con, dex:char.dex, wis:char.wis, lck:char.lck } : { str:0,con:0,dex:0,wis:0,lck:0 },
-    maxHp: char ? maxHp(char) : 0,
+    maxHp: char ? maxHp(char, gid) : 0,
   };
 }
 
@@ -3555,9 +3583,9 @@ function npcCardFooter(gid, npc, cur = npc) {
   const lines = ['─────────────────────────────', `⚔️  ${npc.name}`];
   if (npc.order_name) lines.push(`${KNIGHT_EMOJIS[npc.order_name]??'⚪'}  ${npc.order_name}`);
   if (!npcStatsVisible(gid)) {
-    lines.push(`❤️  ${hpCondition(npc.hp_current, npc.con + 2)}`);
+    lines.push(`❤️  ${hpCondition(npc.hp_current, maxHpFromCon(gid, npc.con))}`);
   } else {
-    lines.push(`❤️  HP${pad(npc.hp_current)} / ${npc.con + 2}`);
+    lines.push(`❤️  HP${pad(npc.hp_current)} / ${maxHpFromCon(gid, npc.con)}`);
     lines.push(`🔄  Rerolls${pad(cur.lck)} / ${npc.lck}`);
     lines.push('');
     lines.push(`💪  STR${pad(npc.str)}`);
@@ -3708,7 +3736,7 @@ async function requestSheetApproval(src, gid, uid, submitMessageId = null) {
     '─────────────────────────────',
     `💪 STR ${ch.str ?? 0}   🛡️ CON ${ch.con ?? 0}   ⚡ DEX ${ch.dex ?? 0}`,
     `🦉 WIS ${ch.wis ?? 0}   🍀 LCK ${ch.lck ?? 0}`,
-    `❤️ HP ${ch.hp_current ?? 0} / ${maxHp(ch)}   🔄 Rerolls ${ch.rerolls_current ?? 0} / ${maxRerolls(ch)}`,
+    `❤️ HP ${ch.hp_current ?? 0} / ${maxHp(ch, gid)}   🔄 Rerolls ${ch.rerolls_current ?? 0} / ${maxRerolls(ch)}`,
     ch.order_name ? `${KNIGHT_EMOJIS[ch.order_name] ?? '⚪'} ${ch.order_name}` : null,
     ch.class ? `🎖️ ${ch.class}` : null,
     (ch.weapon1 || ch.weapon2) ? `⚔️ ${[ch.weapon1, ch.weapon2].filter(Boolean).join(' · ')}` : null,
@@ -5694,7 +5722,7 @@ async function handleNpc(interaction) {
     // fights — start them at full so they're usable straight away.
     if (!existed) {
       const made = getNpc(gid, name);
-      upsertNpc(gid, name, { hp_current: (made?.con ?? 0) + 2 });
+      upsertNpc(gid, name, { hp_current: maxHpFromCon(gid, made?.con) });
     }
 
     const orderLine = order ? ` | ${KNIGHT_EMOJIS[order]??'⚪'} ${order}` : '';
@@ -5731,7 +5759,7 @@ async function handleNpc(interaction) {
     const name = interaction.options.getString('name');
     const npc = getNpc(gid, name);
     if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found.`, ephemeral: true });
-    const max = npc.con + 2;
+    const max = maxHpFromCon(gid, npc.con);
     const raw = interaction.options.getInteger('value');
     const newHp = raw === null ? max : Math.min(raw, max);
     upsertNpc(gid, npc.name, { hp_current: newHp });
@@ -5755,7 +5783,7 @@ async function handleNpc(interaction) {
       if (!targets.length) return interaction.reply({ content: '❌ Name at least one NPC, or use `names:all`.', ephemeral: true });
     }
     const lines = targets.map(npc => {
-      const max = npc.con + 2;
+      const max = maxHpFromCon(gid, npc.con);
       upsertNpc(gid, npc.name, { hp_current: max });
       return `❤️ **${npc.name}** — **${max} / ${max}**`;
     });
@@ -5772,9 +5800,9 @@ async function handleNpc(interaction) {
     if (getNpc(gid, newName)) return interaction.reply({ content: `❌ An NPC named **${getNpc(gid, newName).name}** already exists.`, ephemeral: true });
     upsertNpc(gid, newName, {
       order_name: src.order_name, str: src.str, con: src.con, dex: src.dex, wis: src.wis, lck: src.lck,
-      hp_current: src.con + 2, image_url: src.image_url ?? null,
+      hp_current: maxHpFromCon(gid, src.con), image_url: src.image_url ?? null,
     });
-    return interaction.reply({ content: `🎭 Copied **${src.name}** → **${newName}** (fresh ❤️ ${src.con + 2} / ${src.con + 2}${src.image_url ? ', avatar carried over' : ''}).` });
+    return interaction.reply({ content: `🎭 Copied **${src.name}** → **${newName}** (fresh ❤️ ${maxHpFromCon(gid, src.con)} / ${maxHpFromCon(gid, src.con)}${src.image_url ? ', avatar carried over' : ''}).` });
   }
 
   if (sub === 'hero') {
@@ -5806,7 +5834,7 @@ async function handleNpc(interaction) {
       '─────────────────────────────',
       `💪 STR ${npc.str}   🛡️ CON ${npc.con}   ⚡ DEX ${npc.dex}`,
       `🦉 WIS ${npc.wis}   🍀 LCK ${npc.lck}`,
-      `❤️ HP **${npc.hp_current} / ${npc.con + 2}**   🔁 ${Math.max(0, npc.lck ?? 0)} reroll token${(npc.lck ?? 0) === 1 ? '' : 's'} per fight`,
+      `❤️ HP **${npc.hp_current} / ${maxHpFromCon(gid, npc.con)}**   🔁 ${Math.max(0, npc.lck ?? 0)} reroll token${(npc.lck ?? 0) === 1 ? '' : 's'} per fight`,
       `🖼️ Avatar: ${npc.image_url ? 'set' : '—'}${cats.length ? `   📁 ${cats.join(', ')}` : ''}`,
       ...(isHero(npc) ? [`🦸 **Hero**${npc.signature_stat ? ` · ⭐ signature **${STAT_LABELS[npc.signature_stat]}**${hasSignatureAdvantage(npc, npc.signature_stat) ? ' (advantage active)' : ` (inactive — needs ${SIGNATURE_MIN}+)`}` : ''}`] : []),
     ];
@@ -5830,7 +5858,7 @@ async function handleNpc(interaction) {
     npcs.forEach(n => {
       const order = n.order_name ? ` ${KNIGHT_EMOJIS[n.order_name]??'⚪'} ${n.order_name}` : '';
       const img = n.image_url ? ' 🖼️' : '';
-      lines.push(`• **${n.name}**${order}${img} — STR ${n.str} CON ${n.con} DEX ${n.dex} WIS ${n.wis} LCK ${n.lck} | ❤️ ${n.hp_current}/${n.con+2}`);
+      lines.push(`• **${n.name}**${order}${img} — STR ${n.str} CON ${n.con} DEX ${n.dex} WIS ${n.wis} LCK ${n.lck} | ❤️ ${n.hp_current}/${maxHpFromCon(gid, n.con)}`);
     });
     return replyLong(interaction, lines);
   }
@@ -6250,6 +6278,7 @@ const HELP_CATEGORIES = {
       '`/config gmrole role:@Role` — add a GM role · `remove:true` · `replace:true` · omit to list',
       '_Server admins (Manage Server) always count as GMs._',
       '`/config heal charges:N` — set default heal charges',
+      '`/config hpbase base:3` — max HP formula: CON + this (default 2)',
       '`/config npcreroll threshold:N` — NPC auto-reroll on nat ≤ N · 0 disables · omit to show',
       '`/config fightping enabled:true` — @-mention players on their turn · off by default (Admin)',
       '`/config rollaudit channel:#x` — mirror all rolls (players + GMs) to a GM-only channel (Admin)',
@@ -6458,7 +6487,7 @@ async function handleGmHeal(interaction) {
 
     const lines = [];
     for (const npc of targets) {
-      const max = (npc.con ?? 0) + 2;
+      const max = maxHpFromCon(gid, npc.con);
       const before = npc.hp_current ?? 0;
       const after = compute(before, max);
       setFighterHp(gid, npcFighterId(npc.name), after); // keeps any live fight in sync
@@ -6476,7 +6505,7 @@ async function handleGmHeal(interaction) {
   const lines = [];
 
   if (restore === 'hp' || restore === 'all') {
-    const max = maxHp(ch), before = ch.hp_current ?? 0;
+    const max = maxHp(ch, gid), before = ch.hp_current ?? 0;
     const after = compute(before, max);
     setFighterHp(gid, targetUser.id, after);
     lines.push(`❤️ HP: **${before} → ${after}** / ${max}`);
