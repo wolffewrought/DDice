@@ -57,6 +57,10 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN approval_channel_id TEXT'); }
 try { db.exec('ALTER TABLE characters ADD COLUMN approval_state TEXT'); } catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN approval_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN approval_src_channel TEXT'); } catch {}
+// The queue must survive the Discord message: a post can fail, be deleted, or
+// land somewhere nobody reads. These two make the database the record of truth.
+try { db.exec('ALTER TABLE characters ADD COLUMN approval_requested_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN approval_post_ok INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_stats_visible INTEGER DEFAULT 0'); } catch {}
 try {
   // Webhooks are bound to the channel they were created in. Storing one per NPC
@@ -1307,6 +1311,7 @@ const slashCommands = [
       .addBooleanOption(o=>o.setName('enabled').setDescription('true = players see NPC stats; false = hidden (default)').setRequired(false)))
     .addSubcommand(s=>s.setName('approvals').setDescription('Channel where new character sheets await GM approval')
       .addChannelOption(o=>o.setName('channel').setDescription('Approval channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('list').setDescription('true = list every sheet still waiting, wherever it was posted').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = turn sheet approval off').setRequired(false)))
     .addSubcommand(s=>s.setName('rollaudit').setDescription('Mirror every player roll to a GM-only channel')
       .addChannelOption(o=>o.setName('channel').setDescription('Channel to mirror rolls into').setRequired(false))
@@ -1758,6 +1763,26 @@ async function handleConfig(interaction) {
   if (sub === 'approvals') {
     const channel = interaction.options.getChannel('channel');
     const disable = interaction.options.getBoolean('disable');
+
+    // The authoritative queue: read from the database, not from whatever
+    // messages happen to still exist. A request that failed to post, was
+    // deleted, or landed in a channel nobody watches still shows up here.
+    if (interaction.options.getBoolean('list')) {
+      const rows = listPendingSheets(gid);
+      if (!rows.length) return interaction.reply({ content: '✅ No sheets are waiting for approval.', ephemeral: true });
+      const lines = [`📋 **${rows.length} sheet${rows.length === 1 ? '' : 's'} awaiting approval**`, ''];
+      for (const r of rows) {
+        const nm = await getDisplayName(interaction.guild, r.user_id);
+        const when = r.approval_requested_at ? `<t:${Math.floor(r.approval_requested_at / 1000)}:R>` : 'unknown time';
+        const where = r.approval_src_channel ? `<#${r.approval_src_channel}>` : 'unknown channel';
+        const flag = r.approval_post_ok ? '' : '  ⚠️ **never reached the approval channel**';
+        lines.push(`• <@${r.user_id}> (**${nm}**) — submitted ${when} from ${where}${flag}`);
+      }
+      const broken = rows.filter(r => !r.approval_post_ok).length;
+      if (broken) lines.push('', `⚠️ ${broken} request${broken === 1 ? '' : 's'} never posted — check I can **View Channel** and **Send Messages** in the approval channel, then ask them to edit their sheet to resubmit.`);
+      return replyLong(interaction, lines, { ephemeral: true, allowedMentions: { parse: [] } });
+    }
+
     if (disable) {
       setConfig(gid, { approval_channel_id: null });
       return interaction.reply({ content: '✅ Sheet approval **disabled** — new sheets work immediately.' });
@@ -2484,6 +2509,9 @@ function parseSheetImport(text) {
 }
 
 async function handleSheetImport(message, parsed) {
+  // Sheets arrive from any channel the bot can read — text, thread, forum post,
+  // or the text chat inside a voice or stage channel. Only a DM has no guild.
+  if (!message.guild) return message.reply('❌ Import a sheet in a server channel, not a DM — I need to know which server it belongs to.').catch(()=>{});
   const gid = message.guild.id, uid = message.author.id;
 
   // Check if GM is importing for someone else via mention
@@ -3486,7 +3514,9 @@ async function requestSheetApproval(src, gid, uid, submitMessageId = null) {
   ].filter(Boolean);
   // Jump link back to where the sheet was submitted, so a GM can see the context.
   const srcCh = interactionChannelId(src);
-  if (srcCh) upsertChar(gid, uid, { approval_src_channel: srcCh }); // for the decision notice
+  // Works for any channel a sheet can be posted in — text, thread, forum post,
+  // announcement, or the text chat inside a voice or stage channel.
+  upsertChar(gid, uid, { approval_src_channel: srcCh || null, approval_requested_at: Date.now() });
   let jumpId = submitMessageId;
   if (!jumpId && typeof src.fetchReply === 'function') {
     try { const rep = await src.fetchReply(); jumpId = rep?.id ?? null; } catch {}
@@ -3506,9 +3536,15 @@ async function requestSheetApproval(src, gid, uid, submitMessageId = null) {
     }
     const msg = await channel.send({ content: lines.join('\n'), components: [approvalButtons(uid)],
       allowedMentions: { roles } });
-    upsertChar(gid, uid, { approval_msg_id: msg.id });
+    upsertChar(gid, uid, { approval_msg_id: msg.id, approval_post_ok: 1 });
     return channel.id;
-  } catch { return null; }
+  } catch (err) {
+    // The sheet stays pending either way — the player is locked out, so a
+    // failure here must never be silent. Flagged for /config approvals list.
+    console.error('[approvals] could not post request for', uid, '-', err?.message || err);
+    upsertChar(gid, uid, { approval_post_ok: 0 });
+    return null;
+  }
 }
 
 // Does this edit put the sheet (back) in the approval queue? Any change a player
@@ -3516,6 +3552,14 @@ async function requestSheetApproval(src, gid, uid, submitMessageId = null) {
 // /profile load and a pasted sheet were each a way to build a character the GMs
 // never saw: they only checked the edit *lock*, which lets a sheet with no
 // approval_state through, and nothing ever moved it to 'pending'.
+// Every sheet still waiting on a GM, oldest first — the record of truth behind
+// /config approvals list:true.
+function listPendingSheets(gid) {
+  return db.prepare(`SELECT user_id, approval_requested_at, approval_src_channel, approval_post_ok
+                     FROM characters WHERE guild_id=? AND approval_state='pending'
+                     ORDER BY COALESCE(approval_requested_at, 0) ASC`).all(gid);
+}
+
 function sheetNeedsResubmit(gid, callerId, targetId, isGmCaller) {
   if (!approvalEnabled(gid)) return false;   // feature off
   if (isGmCaller) return false;              // GM edits are sign-off in themselves
@@ -3539,8 +3583,25 @@ async function finishSheetEdit({ src, gid, callerId, targetId, isGmCaller, conte
   const sent = await reply(content + (chId
     ? `\n\n⏳ **Sent to <#${chId}> for GM approval.** You can't roll or fight until it's signed off, and you can keep editing until a GM decides.\n📬 You'll get a DM as soon as they do.`
     : '\n\n⚠️ No approval channel set — ask a GM to check `/config approvals`.'));
-  await requestSheetApproval(src, gid, targetId, link ? (sent?.id ?? null) : null);
+  const posted = await requestSheetApproval(src, gid, targetId, link ? (sent?.id ?? null) : null);
+  if (!posted) await warnApprovalUnreachable(src, gid, targetId);
   return sent;
+}
+
+// The queue post didn't land — the sheet is pending, so the player can't roll and
+// no GM has been told. Ping the GM roles where the sheet was actually submitted
+// so it's tracked somewhere, whatever kind of channel that is.
+async function warnApprovalUnreachable(src, gid, uid) {
+  const roles = getGmRoleIds(gid);
+  const ping = roles.length ? roles.map(r => `<@&${r}>` ).join(' ') + ' ' : '';
+  const chId = getConfig(gid)?.approval_channel_id;
+  const text = `${ping}⚠️ **A sheet is waiting for approval but I couldn't post it to ${chId ? `<#${chId}>` : 'the approval channel'}.**\n`
+    + `👤 <@${uid}> is locked out until a GM decides.\n`
+    + `Check I can **View Channel** and **Send Messages** there, then see \`/config approvals list:true\`.`;
+  try {
+    const ch = src.channel ?? await src.client.channels.fetch(interactionChannelId(src));
+    if (ch?.send) await ch.send({ content: text, allowedMentions: { roles } });
+  } catch (err) { console.error('[approvals] fallback warning failed:', err?.message || err); }
 }
 
 // ── Hero signature stat ───────────────────────────────────────────────────────
@@ -5971,6 +6032,7 @@ const HELP_CATEGORIES = {
       '`/config rollaudit channel:#x` — mirror all rolls (players + GMs) to a GM-only channel (Admin)',
       '`/config rollaudit test:true` — send a test mirror and report any problem (Admin)',
       '`/config approvals channel:#x` — new sheets need GM approval before use (Admin)',
+      '`/config approvals list:true` — every sheet still waiting, read from the database so nothing is lost if a post failed',
       '`/config npcstats enabled:true` — reveal NPC stat blocks on roll cards · hidden by default (Admin)',
       '`/config npcchannel #channel` — set the NPC avatar channel',
       '`/config rest type:Short Rest hp:50% rerolls:0%` — tune what a rest restores (use % of max or a flat number)',
