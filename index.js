@@ -851,6 +851,21 @@ function buildPlainRoll({ rollLine, label, isReroll, flavour, total, critType })
 
 const STATS = ['str','con','dex','wis','lck'];
 
+// Roll by the long name as readily as the short one: "strength" is the same
+// roll as "str". Written out rather than derived so the matching alternation
+// stays longest-first — "con" must not win against "constitution".
+const STAT_ALIASES = {
+  strength: 'str', str: 'str',
+  constitution: 'con', con: 'con',
+  dexterity: 'dex', dex: 'dex',
+  wisdom: 'wis', wis: 'wis',
+  luck: 'lck', lck: 'lck',
+};
+// Longest first so the regex can't stop early on a prefix.
+const STAT_WORDS = Object.keys(STAT_ALIASES).sort((a, b) => b.length - a.length);
+const STAT_WORD_RE = STAT_WORDS.join('|');
+const resolveStatWord = (w) => STAT_ALIASES[String(w || '').toLowerCase()] ?? null;
+
 // ── Character creation budget ─────────────────────────────────────────────────
 // A player building their own sheet spends exactly the guild's allowance across
 // the five stats, with a minimum in each. GMs are exempt entirely — building for
@@ -954,12 +969,14 @@ function parseRollInput(input, char) {
   const [rollPart, ...fp] = input.split('\n');
   const flavour = fp.join('\n').trim() || null;
   const trimmed = rollPart.trim();
-  // Stat quick roll — "str" alone, or "str <label>" (e.g. "str heavy swing")
-  const statMatch = trimmed.match(/^(str|con|dex|wis|lck)(?:\s+(.*))?$/i);
+  // Stat quick roll — "str" or "strength" alone, or with a label after it.
+  // `stat` comes back on the result so the card can be forced to show the
+  // roller's stat block: a stat roll is only readable next to the numbers.
+  const statMatch = trimmed.match(new RegExp(`^(${STAT_WORD_RE})(?:\\s+(.*))?$`, 'i'));
   if (statMatch) {
-    const stat = statMatch[1].toLowerCase();
+    const stat = resolveStatWord(statMatch[1]);
     const val = char?.[stat] ?? 0;
-    return { notation: `1d20+${val}`, label: statMatch[2]?.trim() || stat, flavour };
+    return { notation: `1d20+${val}`, label: statMatch[2]?.trim() || statMatch[1].toLowerCase(), flavour, stat };
   }
   const m = rollPart.trim().match(/^(\d+d\d+(?:[+-]\d+)?)\s*(.*)?$/i);
   if (!m) return null;
@@ -1064,10 +1081,13 @@ async function isGm(guild, uid) {
   return ids.some(id => mb.roles.cache.has(id));
 }
 
-async function sendRollEmbed(message, rollLine, label, isReroll, uid, flavour, total, critType) {
+// `forceCard` is set for stat rolls. A 1d20+4 means nothing on its own — the
+// reader has to know it was DEX and that DEX is 4 — so a stat roll always shows
+// the roller's sheet, even with the profile embed switched off.
+async function sendRollEmbed(message, rollLine, label, isReroll, uid, flavour, total, critType, forceCard = false) {
   const gid = message.guild.id;
   const char = getChar(gid, uid);
-  if (char?.profile_enabled === 1) {
+  if (char && (char.profile_enabled === 1 || forceCard)) {
     const cfg = getConfig(gid);
     const maxCharges = cfg.heal_charges ?? 3;
     const healRow = getHealCharges(gid, uid, maxCharges);
@@ -2449,7 +2469,7 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
   const gid = message.guild.id, cid = message.channel.id, uid = message.author.id;
   const gateMsg = sheetGate(gid, uid);
   if (gateMsg) return message.reply(gateMsg);
-  let notation, label, flavour;
+  let notation, label, flavour, statRolled = null;
 
   if (isReroll) {
     const last = getLastRoll(gid, cid, uid);
@@ -2460,13 +2480,18 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
     const [rl, ...fp] = rest.split('\n');
     label = rl.trim() || last.label;
     flavour = fp.join('\n').trim() || null;
+    statRolled = resolveStatWord(label);   // a reroll of a stat roll still shows the sheet
     upsertChar(gid, uid, { rerolls_current: ch.rerolls_current - 1 });
   } else {
     const ch = getChar(gid, uid);
     const parsed = parseRollInput(rest, ch);
     // Hero signature: a stat roll on the designated stat is made with advantage.
-    if (parsed && STATS.includes(String(parsed.label || '').toLowerCase())) {
-      mode = applySignatureMode(ch, String(parsed.label).toLowerCase(), mode);
+    // This used to test parsed.label, which only equals the stat when no label
+    // was given — so "str atk" silently lost the Hero's advantage. parsed.stat
+    // is the stat actually rolled, whichever spelling was typed.
+    if (parsed?.stat) {
+      mode = applySignatureMode(ch, parsed.stat, mode);
+      statRolled = parsed.stat;
     }
     if (!parsed) return message.reply('❌ Invalid notation. Try `r1d20+5 attack`, `r2d6`, or `r str`.');
     notation = parsed.notation;
@@ -2488,7 +2513,7 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
   const rollLine = buildRollLine(result, mode, critType, successResult);
   mirrorRoll(gid, { userId: uid, channelId: cid, messageId: message.id, input: message.content,
     rollLine, context: isReroll ? 'reroll' : (successCheck ? 'success check' : null) });
-  await sendRollEmbed(message, rollLine, label, false, uid, flavour, result.total, critType);
+  await sendRollEmbed(message, rollLine, label, isReroll, uid, flavour, result.total, critType, !!statRolled);
 }
 
 async function handleHeal(message, rest) {
@@ -3107,10 +3132,10 @@ client.on('interactionCreate', async interaction => {
 //
 // Returns null when the message is just conversation.
 function parseStatShorthand(content) {
-  const m = content.match(/^(\?)?(str|con|dex|wis|lck)(rra|rrd|rr|a|d)?(?:([ \t][\s\S]*)|(\n[\s\S]*))?$/i);
+  const m = content.match(new RegExp(`^(\\?)?(${STAT_WORD_RE})(rra|rrd|rr|a|d)?(?:([ \\t][\\s\\S]*)|(\\n[\\s\\S]*))?$`, 'i'));
   if (!m) return null;
   const sc = m[1] === '?';
-  const stat = m[2].toLowerCase();
+  const stat = resolveStatWord(m[2]);
   const suffix = (m[3] || '').toLowerCase(); // '', 'a', 'd', 'rr', 'rra', 'rrd'
   const trailing = (m[4] ?? m[5] ?? '').replace(/^[ \t]+/, '');
   // The ambiguous form — bare stat word, no prefix, no suffix — only fires on an
