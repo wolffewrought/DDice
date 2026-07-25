@@ -3576,12 +3576,19 @@ function turnPing(gid, f) {
 // GMs are accountable to each other). NPC auto-rolls are not mirrored.
 // `messageId` links straight to the roll. For slash commands there's no user
 // message, so callers pass the interaction and we resolve its reply instead.
-function mirrorRoll(gid, { userId, channelId, messageId = null, input, rollLine, context = null, interaction = null }) {
+// Mirror one roll into the audit channel. Every roll goes through here — typed,
+// slash, fight, GM, GM-as-NPC and bot-driven auto rolls alike.
+//
+// `userId` names a human roller; `actor` is used instead for rolls nobody made
+// by hand (the NPC auto-pilot). Rolls made inside the audit channel are mirrored
+// too: the previous self-skip meant a secret `gmrs` typed in that channel went
+// to the GM's DMs and was never recorded anywhere, which is precisely the hole
+// the audit exists to close.
+function mirrorRoll(gid, { userId = null, actor = null, channelId, messageId = null, input, rollLine, context = null, interaction = null }) {
   const chId = getConfig(gid)?.roll_audit_channel_id;
   // Verbose tracing: a silent mirror is impossible to diagnose otherwise.
   // These lines appear in the Railway logs and pinpoint where it stops.
   if (!chId) { console.log('[rollaudit] skip — no audit channel configured'); return; }
-  if (chId === channelId) { console.log('[rollaudit] skip — roll was made inside the audit channel'); return; }
   console.log(`[rollaudit] attempting mirror → channel ${chId} (roll from ${channelId})`);
   (async () => {
     const ch = await client.channels.fetch(chId);
@@ -3593,8 +3600,11 @@ function mirrorRoll(gid, { userId, channelId, messageId = null, input, rollLine,
     const clean = String(input ?? '').replace(/`/g, "'").slice(0, 120);
     const link = messageId ? `\n[↗ Jump to roll](https://discord.com/channels/${gid}/${channelId}/${messageId})` : '';
     const ctx = context ? ` · ${context}` : '';
+    const who = userId ? `<@${userId}>` : (actor || '🤖 bot');
+    const where = channelId ? ` in <#${channelId}>` : '';
+    const cmd = clean ? ` — \`${clean}\`` : '';
     await ch.send({
-      content: `🎲 <@${userId}> in <#${channelId}>${ctx} — \`${clean}\`\n${rollLine}${link}`,
+      content: `🎲 ${who}${where}${ctx}${cmd}\n${rollLine}${link}`,
       allowedMentions: { parse: [] }, // identity without pinging anyone
     });
     console.log('[rollaudit] mirror sent OK');
@@ -3602,6 +3612,19 @@ function mirrorRoll(gid, { userId, channelId, messageId = null, input, rollLine,
     // Never break the roll itself, but do leave a trace — a silent mirror is
     // impossible to diagnose. Surfaced to the GM by /config rollaudit test.
     console.error(`[rollaudit] mirror to ${chId} FAILED:`, err?.message || err, err?.code ? `(code ${err.code})` : '');
+  });
+}
+
+// Audit entry for a roll the bot made itself — auto-pilot fighters, initiative,
+// demo bouts. There's no human to attribute it to, so the fighter is named
+// instead and the entry is tagged so a GM can tell it from a hand-rolled one.
+function mirrorAutoRoll(gid, cid, name, notation, nat, total, context) {
+  const mod = total - nat;
+  const modStr = mod > 0 ? ` +${mod}` : (mod < 0 ? ` ${mod}` : '');
+  mirrorRoll(gid, {
+    actor: `🤖 **${name}**`, channelId: cid, input: notation,
+    rollLine: `🎲  ${notation} → [${nat}]${modStr} = **${total}**`,
+    context: context ? `auto · ${context}` : 'auto',
   });
 }
 
@@ -3685,6 +3708,8 @@ async function applyAutoNpcRerolls(guild, gid, cid, channel) {
     const isFlat = kind === 'def' && effMod === 0 && (f.stats[stat] ?? 0) !== 0;
     const sigRow = f.isNpc ? getNpc(gid, f.name) : getChar(gid, fid);
     const roll = autoRoll(effMod, !isFlat && hasSignatureAdvantage(sigRow, stat));
+    mirrorAutoRoll(gid, cid, f.name, `1d20${roll.adv ? ' (adv)' : ''}`, roll.nat, roll.total,
+      `fight ${kind === 'atk' ? 'attack' : 'defence'} reroll`);
     rr[fid] = (rr[fid] ?? 0) - 1;
     if (kind === 'atk') upsertFight(gid, cid, { atk_roll: roll.total, atk_nat: roll.nat, rr_state: JSON.stringify(rr) });
     else upsertFight(gid, cid, { def_roll: roll.total, def_nat: roll.nat, rr_state: JSON.stringify(rr) });
@@ -3993,6 +4018,7 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   const atkBonus = consumeAtkBonus(gid, cid, attackerId);
   const attRow = attacker.isNpc ? getNpc(gid, attacker.name) : getChar(gid, attackerId);
   const a = autoRoll((attacker.stats[stat] ?? 0) + atkBonus, hasSignatureAdvantage(attRow, stat));
+  mirrorAutoRoll(gid, cid, attacker.name, `1d20${a.adv ? ' (adv)' : ''}`, a.nat, a.total, `fight attack (${STAT_LABELS[stat]})`);
 
   upsertFight(gid, cid, {
     phase: 'defend', current_target: targetId,
@@ -4024,6 +4050,8 @@ async function autoNpcDefend(guild, gid, cid, channel) {
   const flat = consumeFlatDef(gid, cid, fight.current_target);
   const defRow = defender.isNpc ? getNpc(gid, defender.name) : getChar(gid, fight.current_target);
   const d = autoRoll(flat ? 0 : (defender.stats[stat] ?? 0), !flat && hasSignatureAdvantage(defRow, stat));
+  mirrorAutoRoll(gid, cid, defender.name, `1d20${d.adv ? ' (adv)' : ''}`, d.nat, d.total,
+    flat ? 'fight defence (flat d20 — fumbled)' : `fight defence (${STAT_LABELS[stat]})`);
 
   upsertFight(gid, cid, { def_roll: d.total, def_nat: d.nat, def_stat: stat, def_mode: 'normal', def_sides: 20 });
 
@@ -4282,6 +4310,7 @@ async function handleFight(interaction) {
       const dex = f.stats.dex ?? 0;
       const roll = rollDie(20);
       const total = roll + dex;
+      mirrorAutoRoll(gid, cid, f.name, '1d20', roll, total, 'initiative');
       hpState[fid] = f.isNpc ? (getNpc(gid, f.name)?.hp_current ?? 0) : (getChar(gid, fid)?.hp_current ?? 0);
       if (f.isNpc) rrState[fid] = Math.max(0, f.stats.lck ?? 0);
       initiatives.push({ id: fid, name: f.name, roll, dex, total, isNpc: f.isNpc });
@@ -4339,6 +4368,7 @@ async function handleFight(interaction) {
       if (turnOrder.includes(fid)) return interaction.reply({ content: `❌ **${npc.name}** is already in this fight.`, ephemeral: true });
       const roll = rollDie(20);
       const total = roll + (npc.dex ?? 0);
+      mirrorAutoRoll(gid, cid, npc.name, '1d20', roll, total, 'initiative (joined mid-fight)');
       hpState[fid] = npc.hp_current;
       rrState[fid] = Math.max(0, npc.lck ?? 0);
       turnOrder.push(fid);
@@ -4473,7 +4503,10 @@ async function handleFight(interaction) {
       await interaction.reply({ content: `🎬 **Running a demo ${W.noun} with two example combatants...**` });
       const A = { name: 'Sir Aldric (demo)', dex: 4, str: 5, hp: 7 };
       const B = { name: 'Cave Troll (demo)', dex: 2, str: 6, hp: 8 };
-      const aInit = rollDie(20) + A.dex, bInit = rollDie(20) + B.dex;
+      const aInitRoll = rollDie(20), bInitRoll = rollDie(20);
+      const aInit = aInitRoll + A.dex, bInit = bInitRoll + B.dex;
+      mirrorAutoRoll(gid, cid, A.name, '1d20', aInitRoll, aInit, 'demo initiative');
+      mirrorAutoRoll(gid, cid, B.name, '1d20', bInitRoll, bInit, 'demo initiative');
       const order = aInit >= bInit ? [A, B] : [B, A];
       await sleep(900);
       await send([`⚔️ **Demo ${W.noun} — initiative:**`, ...(banner ? [banner] : []), '', `1. **${order[0].name}**`, `2. **${order[1].name}**`, '', `🎯 **${order[0].name}** goes first!`].join('\n'));
@@ -4484,6 +4517,8 @@ async function handleFight(interaction) {
         await sleep(1100);
         const aStat = autoFightStat(atk), dStat = autoFightStat(def);
         const a = autoRoll(atk[aStat]), d = autoRoll(def[dStat]);
+        mirrorAutoRoll(gid, cid, atk.name, '1d20', a.nat, a.total, `demo attack (${STAT_LABELS[aStat]})`);
+        mirrorAutoRoll(gid, cid, def.name, '1d20', d.nat, d.total, `demo defence (${STAT_LABELS[dStat]})`);
         const { hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20);
         const lines = ['─────────────────────────────', `**Round ${round}** — ${atk.name} attacks ${def.name}`,
           `⚔️ ${STAT_LABELS[aStat]} → [${a.nat}] +${atk[aStat]} = ${fightTotalStr(a.total, a.nat, 20)}`,
@@ -4566,7 +4601,10 @@ async function handleFight(interaction) {
 
     // Initiative for all
     const inits = fighters.map(fid => ({ fid, roll: 0, total: 0 }));
-    for (const it of inits) { const r = rollDie(20); it.roll = r; it.total = r + (F[it.fid].stats.dex ?? 0); }
+    for (const it of inits) {
+      const r = rollDie(20); it.roll = r; it.total = r + (F[it.fid].stats.dex ?? 0);
+      mirrorAutoRoll(gid, cid, F[it.fid].name, '1d20', r, it.total, 'initiative (auto fight)');
+    }
     inits.sort((a,b) => b.total - a.total || b.roll - a.roll);
     const order = inits.map(i => i.fid);
 
@@ -4645,6 +4683,9 @@ async function handleFight(interaction) {
       const defAdv = !defFlat && hasSignatureAdvantage(defRow, dStat);
       let a = autoRoll((atkF.stats[aStat] ?? 0) + atkBonus, atkAdv);
       let d = autoRoll(defFlat ? 0 : (defF.stats[dStat] ?? 0), defAdv);
+      mirrorAutoRoll(gid, cid, atkF.name, `1d20${a.adv ? ' (adv)' : ''}`, a.nat, a.total, `auto fight attack (${STAT_LABELS[aStat]})`);
+      mirrorAutoRoll(gid, cid, defF.name, `1d20${d.adv ? ' (adv)' : ''}`, d.nat, d.total,
+        defFlat ? 'auto fight defence (flat d20 — fumbled)' : `auto fight defence (${STAT_LABELS[dStat]})`);
       let { hit, dmg } = resolveDamage(a.total, a.nat, 20, d.total, d.nat, 20);
 
       // Round header (system line)
@@ -4671,6 +4712,7 @@ async function handleFight(interaction) {
       if (hit && d.nat <= rrMax && defF.isNpc && (rrTokens[defenderId] ?? 0) > 0) {
         rrTokens[defenderId]--;
         d = autoRoll(defFlat ? 0 : (defF.stats[dStat] ?? 0), defAdv);
+        mirrorAutoRoll(gid, cid, defF.name, `1d20${d.adv ? ' (adv)' : ''}`, d.nat, d.total, 'auto fight defence reroll');
         await sleep(800);
         await send(`🔁 **${defF.name}** 🎭 spends a reroll token! (${rrTokens[defenderId]} left)`);
         const rrCard = await autoFightCard(interaction.guild, gid, defF, 'def', dStat, d.nat, d.total, null, true, 0, defFlat, !!d.adv);
@@ -4681,6 +4723,7 @@ async function handleFight(interaction) {
       if (!hit && a.nat <= rrMax && atkF.isNpc && (rrTokens[attackerId] ?? 0) > 0) {
         rrTokens[attackerId]--;
         a = autoRoll((atkF.stats[aStat] ?? 0) + atkBonus, atkAdv);
+        mirrorAutoRoll(gid, cid, atkF.name, `1d20${a.adv ? ' (adv)' : ''}`, a.nat, a.total, 'auto fight attack reroll');
         await sleep(800);
         await send(`🔁 **${atkF.name}** 🎭 spends a reroll token! (${rrTokens[attackerId]} left)`);
         const rrCard = await autoFightCard(interaction.guild, gid, atkF, 'atk', aStat, a.nat, a.total, `${defF.name}${defF.isNpc?' 🎭':''}`, true, atkBonus, false, !!a.adv);
@@ -5302,6 +5345,9 @@ async function handleSlashRoll(interaction) {
   const naturalRoll = mode === 'normal' ? result.rolls?.[0] : result.chosen;
   const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides ?? 20) : null;
   const rollLine = buildRollLine(result, mode, critType, successResult);
+  mirrorRoll(gid, { userId: uid, channelId: interactionChannelId(interaction), interaction,
+    input: `/dr ${finalNotation}${finalLabel ? ' ' + finalLabel : ''}`, rollLine,
+    context: successCheck ? 'success check' : null });
 
   // Build flavour lines
   let cleanFlavour = null;
@@ -5595,6 +5641,10 @@ async function handlePr(interaction) {
 
     const critType = detectCrit(result, mode);
     const rollLine = maskNpcRollLine(gid, buildRollLine(result, mode, critType, null));
+    mirrorRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction,
+      input: `/pr reroll ${last.notation}${last.label ? ' ' + last.label : ''}`,
+      rollLine: buildRollLine(result, mode, critType, null),
+      context: `as NPC **${npc.name}** · reroll` });
     const lines = [];
     if (last.label) lines.push(`${critPrefix(critType)}**${last.label}** *(reroll)*`);
     else lines.push('*(reroll)*');
@@ -5715,6 +5765,12 @@ async function handlePr(interaction) {
 
     const critType = detectCrit(result, mode);
     const rollLine = maskNpcRollLine(gid, buildRollLine(result, mode, critType, null));
+    // Posted through the NPC's webhook, so the audit is the only place this ties
+    // back to the GM who actually rolled it.
+    mirrorRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction,
+      input: `/pr roll ${notation}${label ? ' ' + label : ''}`,
+      rollLine: buildRollLine(result, mode, critType, null),
+      context: `as NPC **${npc.name}**` });
 
     // Build embed text
     const lines = [];
