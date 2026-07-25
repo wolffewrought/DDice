@@ -647,10 +647,6 @@ function upsertFight(gid, cid, fields) {
   }
   return getFight(gid, cid);
 }
-function deleteFight(gid, cid) {
-  db.prepare('DELETE FROM fights WHERE guild_id=? AND channel_id=?').run(gid, cid);
-}
-
 function getAllAvailableTags(gid) {
   const customs = getCustomTags(gid).map(t => t.tag_name);
   return [...Object.keys(PRESET_TAGS), ...customs];
@@ -772,6 +768,13 @@ function buildRollLine(result, mode, critType, successResult) {
   return `🎲  ${result.notation} ${ml} → [${result.chosen}, ~~${result.dropped}~~]${modStr} = ${ts}${suffix}`;
 }
 
+// Trailing RP flavour: collapse the lines, then restate the result above it.
+// Used by both the embed card and the plain-text card.
+function flavourBlock(flavour, label, total, critType) {
+  const clean = flavour.split(/\n/).map(l => l.trim()).filter(l => l.length > 0).join('\n\n');
+  return ['', '─────────────────────────────', `**${label??'roll'}** — ${totalStr(total, critType)}`, '', clean];
+}
+
 function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharges, flavour, total, critType, tags, gid }) {
   const lines = [];
   const lc = critPrefix(critType);
@@ -807,14 +810,7 @@ function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharg
     if (char.weapon1) lines.push(`${char.weapon1emoji??'⚔️'}  ${char.weapon1}`);
     if (char.weapon2) lines.push(`${char.weapon2emoji??'🗡️'}  ${char.weapon2}`);
   }
-  if (flavour) {
-    // Collapse multiline flavour into single block, strip trailing asterisks from markdown collisions
-    const cleanFlavour = flavour.split(/\n/).map(l => l.trim()).filter(l => l.length > 0).join('\n\n');
-    lines.push('', '─────────────────────────────');
-    lines.push(`**${label??'roll'}** — ${totalStr(total, critType)}`);
-    lines.push('');
-    lines.push(cleanFlavour);
-  }
+  if (flavour) lines.push(...flavourBlock(flavour, label, total, critType));
   return lines.join('\n');
 }
 
@@ -824,13 +820,7 @@ function buildPlainRoll({ rollLine, label, isReroll, flavour, total, critType })
   if (label) lines.push(`${lc}**${label}**${isReroll ? ' *(reroll)*' : ''}`);
   else if (isReroll) lines.push('*(reroll)*');
   lines.push(rollLine);
-  if (flavour) {
-    const cleanFlavour = flavour.split(/\n/).map(l => l.trim()).filter(l => l.length > 0).join('\n\n');
-    lines.push('', '─────────────────────────────');
-    lines.push(`**${label??'roll'}** — ${totalStr(total, critType)}`);
-    lines.push('');
-    lines.push(cleanFlavour);
-  }
+  if (flavour) lines.push(...flavourBlock(flavour, label, total, critType));
   return lines.join('\n');
 }
 
@@ -887,19 +877,24 @@ async function interactionChannel(interaction) {
 // Post content to a channel that may exceed Discord's 2000-char hard limit.
 // Same line-boundary chunking as replyLong, for paths that aren't replying to
 // an interaction (auto fights, end-of-fight announcements).
-async function sendLong(channel, content) {
-  if (!channel) return;
-  const LIMIT = 1900;
+// Split content on line boundaries into pieces that fit Discord's 2000-char
+// hard limit. Shared by sendLong and replyLong so the two can't drift.
+function chunkLines(content, limit = 1900) {
   const src = Array.isArray(content) ? content : String(content).split('\n');
   const chunks = [];
   let buf = '';
   for (const line of src) {
-    const piece = line.length > LIMIT ? line.slice(0, LIMIT) : line;
-    if (buf.length + piece.length + 1 > LIMIT) { chunks.push(buf); buf = piece; }
+    const piece = line.length > limit ? line.slice(0, limit) : line;
+    if (buf.length + piece.length + 1 > limit) { chunks.push(buf); buf = piece; }
     else { buf = buf ? buf + '\n' + piece : piece; }
   }
   if (buf) chunks.push(buf);
-  for (const c of chunks) await channel.send(c).catch(()=>{});
+  return chunks;
+}
+
+async function sendLong(channel, content) {
+  if (!channel) return;
+  for (const c of chunkLines(content)) await channel.send(c).catch(()=>{});
 }
 
 // Reply with content that may exceed Discord's 2000-char hard limit. Splits on
@@ -913,15 +908,7 @@ async function replyLong(interaction, content, opts = {}) {
     return interaction.reply({ content: text, ...opts });
   }
   // Chunk by lines, never mid-line unless a single line is itself too long.
-  const src = Array.isArray(content) ? content : text.split('\n');
-  const chunks = [];
-  let buf = '';
-  for (const line of src) {
-    const piece = line.length > LIMIT ? line.slice(0, LIMIT) : line;
-    if (buf.length + piece.length + 1 > LIMIT) { chunks.push(buf); buf = piece; }
-    else { buf = buf ? buf + '\n' + piece : piece; }
-  }
-  if (buf) chunks.push(buf);
+  const chunks = chunkLines(Array.isArray(content) ? content : text, LIMIT);
   await interaction.reply({ content: chunks[0], ...opts });
   for (let i = 1; i < chunks.length; i++) {
     await interaction.followUp({ content: chunks[i], ...opts }).catch(() => {});
@@ -990,7 +977,7 @@ const DEFAULT_PALETTE = { bg: '#f5f0e8', accent: '#8b7355', text: '#2a2a2a', bor
 
 
 async function generateCharImage(char, displayName, healCharges, maxCharges) {
-  let createCanvas, loadImage;
+  let createCanvas;
   try {
     ({ createCanvas } = require('@napi-rs/canvas'));
   } catch {
@@ -1143,7 +1130,6 @@ async function handleCharExport(interaction) {
   const dn = await getDisplayName(interaction.guild, tid);
   const cfg = getConfig(gid); const mc = cfg.heal_charges ?? 3;
   const hr = getHealCharges(gid, tid, mc);
-  const kn = char.order_name ? `${KNIGHT_EMOJIS[char.order_name]??'⚪'}  ${char.order_name}` : 'No order set';
   const hm = maxHp(char), rm = maxRerolls(char);
 
   // ── Text export ──────────────────────────────────────────────────────────────
@@ -2263,7 +2249,7 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
 }
 
 async function handleHeal(message, rest) {
-  const gid = message.guild.id, uid = message.author.id;
+  const gid = message.guild.id, uid = message.author.id, cid = message.channel.id;
   const gateMsg = sheetGate(gid, uid);
   if (gateMsg) return message.reply(gateMsg);
   // Accept the mention anywhere in the argument, not just flush at the start —
@@ -2308,21 +2294,30 @@ async function handleHeal(message, rest) {
   await message.reply(content);
 }
 
+// Shared by !hp and !rerolls: "+5", "@user -3" and "-3 @user" all parse, and
+// targeting anyone else needs the GM role. Returns { targetId, amount } or
+// { error } for the caller to reply with.
+async function parseTargetAmount(message, rest, resourceLabel, usage) {
+  const uid = message.author.id;
+  rest = String(rest || '').trim();
+  const mm  = rest.match(/^<@!?(\d+)>\s*([+-]\d+)$/);   // @user +5
+  const mm2 = rest.match(/^([+-]\d+)\s*<@!?(\d+)>$/);   // +5 @user
+  const sm  = rest.match(/^([+-]\d+)$/);                 // +5  (self)
+  if (mm || mm2) {
+    if (!(await isGm(message.guild, uid)))
+      return { error: `❌ Only GMs can modify other players' ${resourceLabel}.` };
+    return mm ? { targetId: mm[1], amount: parseInt(mm[2]) }
+              : { targetId: mm2[2], amount: parseInt(mm2[1]) };
+  }
+  if (sm) return { targetId: uid, amount: parseInt(sm[1]) };
+  return { error: `❌ Usage: ${usage}` };
+}
+
 async function handleHp(message, rest) {
   const gid = message.guild.id, uid = message.author.id;
-  rest = String(rest || '').trim();
-  const mm  = rest.match(/^<@!?(\d+)>\s*([+-]\d+)$/);
-  const mm2 = rest.match(/^([+-]\d+)\s*<@!?(\d+)>$/);
-  const sm  = rest.match(/^([+-]\d+)$/);
-  let targetId, amount;
-  if (mm) {
-    if (!(await isGm(message.guild, uid))) return message.reply('❌ Only GMs can modify other players\' HP.');
-    targetId=mm[1]; amount=parseInt(mm[2]);
-  } else if (mm2) {
-    if (!(await isGm(message.guild, uid))) return message.reply('❌ Only GMs can modify other players\' HP.');
-    targetId=mm2[2]; amount=parseInt(mm2[1]);
-  } else if (sm) { targetId=uid; amount=parseInt(sm[1]); }
-  else return message.reply('❌ Usage: `!hp +5` or `!hp @user -3`');
+  const t = await parseTargetAmount(message, rest, 'HP', '`!hp +5` or `!hp @user -3`');
+  if (t.error) return message.reply(t.error);
+  const { targetId, amount } = t;
   const ch = getChar(gid, targetId);
   if (!ch) return message.reply('❌ No character found for that user.');
   const hm = maxHp(ch);
@@ -2334,19 +2329,9 @@ async function handleHp(message, rest) {
 
 async function handleRerolls(message, rest) {
   const gid = message.guild.id, uid = message.author.id;
-  rest = String(rest || '').trim();
-  const mm  = rest.match(/^<@!?(\d+)>\s*([+-]\d+)$/);
-  const mm2 = rest.match(/^([+-]\d+)\s*<@!?(\d+)>$/);
-  const sm  = rest.match(/^([+-]\d+)$/);
-  let targetId, amount;
-  if (mm) {
-    if (!(await isGm(message.guild, uid))) return message.reply('❌ Only GMs can modify other players\' rerolls.');
-    targetId=mm[1]; amount=parseInt(mm[2]);
-  } else if (mm2) {
-    if (!(await isGm(message.guild, uid))) return message.reply('❌ Only GMs can modify other players\' rerolls.');
-    targetId=mm2[2]; amount=parseInt(mm2[1]);
-  } else if (sm) { targetId=uid; amount=parseInt(sm[1]); }
-  else return message.reply('❌ Usage: `!rerolls +1` or `!rerolls @user -1`');
+  const t = await parseTargetAmount(message, rest, 'rerolls', '`!rerolls +1` or `!rerolls @user -1`');
+  if (t.error) return message.reply(t.error);
+  const { targetId, amount } = t;
   const ch = getChar(gid, targetId);
   if (!ch) return message.reply('❌ No character found for that user.');
   const rm = maxRerolls(ch);
@@ -3122,10 +3107,6 @@ function resolveDamage(atkRoll, atkNat, atkSides, defRoll, defNat, defSides) {
 //   nat-1 attack  → attacker's NEXT defence is a flat d20 (no stat)   { flatDef:true }
 //   nat-20 defence (that blocks) → defender's NEXT attack gets +2,    { atkBonus:2 }
 //     UNLESS the incoming attack was itself a nat 20.
-function getEffects(fight, fid) {
-  const all = JSON.parse(fight.effect_state || '{}');
-  return all[fid] || {};
-}
 // Pull and clear an attacker's pending +N bonus. Returns the bonus (0 if none).
 function consumeAtkBonus(gid, cid, fid) {
   const fight = getFight(gid, cid);
@@ -3298,6 +3279,7 @@ function npcStatsVisible(gid) {
 // downstream check compares against the floor rather than a literal 0 — in a
 // real fight the floor is 0 and behaviour is exactly as it always was.
 const PRACTICE_FLOOR = 2;
+const NO_ACTIVE_FIGHT = '❌ No active fight in this channel.';
 function fightFloor(fight) {
   const v = Number(fight?.floor_hp ?? 0);
   return Number.isFinite(v) && v > 0 ? v : 0;
@@ -3331,6 +3313,36 @@ function hpCondition(cur, max, floor = 0) {
   return '❤️‍🩹 near death';
 }
 // The "X → Y" line after damage. For hidden NPCs: damage plus condition only.
+// "1d20+3 → [3] +3 = 6" gives an NPC's stat away — strip the modifier while NPC
+// stats are hidden, leaving the natural die and the final total. One copy, so a
+// second roll path can't quietly leak what the first hides.
+function maskNpcRollLine(gid, rollLine) {
+  if (npcStatsVisible(gid)) return rollLine;
+  return rollLine
+    .replace(/(\d+d\d+)[+-]\d+/g, '$1')
+    .replace(/\]\s*[+-]\d+\s*=/g, '] =');
+}
+
+// The NPC block printed under a roll card. `cur` supplies the live reroll/LCK
+// figures — the reroll path passes the refreshed row, everyone else the same one.
+function npcCardFooter(gid, npc, cur = npc) {
+  const lines = ['─────────────────────────────', `⚔️  ${npc.name}`];
+  if (npc.order_name) lines.push(`${KNIGHT_EMOJIS[npc.order_name]??'⚪'}  ${npc.order_name}`);
+  if (!npcStatsVisible(gid)) {
+    lines.push(`❤️  ${hpCondition(npc.hp_current, npc.con + 2)}`);
+  } else {
+    lines.push(`❤️  HP${pad(npc.hp_current)} / ${npc.con + 2}`);
+    lines.push(`🔄  Rerolls${pad(cur.lck)} / ${npc.lck}`);
+    lines.push('');
+    lines.push(`💪  STR${pad(npc.str)}`);
+    lines.push(`🫀  CON${pad(npc.con)}`);
+    lines.push(`⚡  DEX${pad(npc.dex)}`);
+    lines.push(`🧠  WIS${pad(npc.wis)}`);
+    lines.push(`🍀  LCK${pad(cur.lck)}`);
+  }
+  return lines;
+}
+
 function hpChangeLine(gid, isNpc, name, prevHp, newHp, maxHpVal, floor = 0) {
   if (isNpc && !npcStatsVisible(gid)) {
     return `❤️ ${name}: ${hpCondition(newHp, maxHpVal, floor)}`;
@@ -3370,10 +3382,9 @@ function sheetApproved(gid, ch) {
 }
 // Guard for player actions that need a usable sheet. Returns an error string, or null.
 function sheetGate(gid, uid) {
-  if (!approvalEnabled(gid)) return null;
   const ch = getChar(gid, uid);
   if (!ch) return null;                            // "no sheet" handled by callers
-  if (!ch.approval_state || ch.approval_state === 'approved') return null;
+  if (sheetApproved(gid, ch)) return null;         // single source of truth
   if (ch.approval_state === 'pending') return '⏳ Your character sheet is **awaiting GM approval** — you can\'t roll or fight until it\'s approved.';
   return '🚫 Your character sheet was **rejected** by a GM. Speak to them before rolling.';
 }
@@ -4026,47 +4037,69 @@ async function autoNpcDefend(guild, gid, cid, channel) {
 // Computes damage from the stored rolls, persists HP, handles knockdown /
 // win / turn advance, and posts the summary. Returns true if the fight continues.
 // Keep the rules here in lockstep with the `resolve` subcommand in handleFight.
-async function autoResolveExchange(guild, gid, cid, channel) {
-  let fight = getFight(gid, cid);
-  if (!fight || fight.state !== 'active' || fight.phase !== 'defend' || fight.def_roll === null) return false;
-
-  // NPC reroll window: defender may answer an incoming hit, attacker a block
-  fight = await applyAutoNpcRerolls(guild, gid, cid, channel);
-  if (!fight || fight.state !== 'active') return false;
-
+// ── Exchange resolution ───────────────────────────────────────────────────────
+// One implementation of the combat rules, shared by /fight resolve and the NPC
+// auto-pilot. These used to be two ~90-line copies that had to be edited in
+// lockstep for every rules change; anything that touched damage, crit carry-over,
+// the bout floor or the recap had to be applied twice and could silently drift.
+//
+// This computes the whole exchange and hands back what to say and what happened.
+// The caller owns delivery (an interaction reply vs a channel post) and whether
+// to keep the auto chain running.
+//
+// Returns { lines, ended, announce } where `announce` is the payload for
+// announceFightEnd when the fight finished, and `nextF` is the fighter whose
+// turn it now is (null when the fight ended).
+async function resolveExchange(guild, gid, cid, fight) {
   const turnOrder = JSON.parse(fight.turn_order);
   const attackerId = turnOrder[fight.turn_index];
   const defenderId = fight.current_target;
   const hpState = JSON.parse(fight.hp_state);
   const floor = fightFloor(fight);
   const W = fightWords(floor);
+  const autoOn = !!fight.auto_npc;
 
   const { hit, dmg } = resolveDamage(
     fight.atk_roll, fight.atk_nat, 20,
     fight.def_roll, fight.def_nat, 20
   );
 
-  const atkF = await resolveFighter(guild, gid, attackerId);
-  const defF = await resolveFighter(guild, gid, defenderId);
-  const atkName = atkF.name + (atkF.isNpc ? ' 🎭' : '');
-  const defName = defF.name + (defF.isNpc ? ' 🎭' : '');
-
+  // Carry-over effects from this exchange (nat-1 attack, nat-20 defence), and
+  // the running fight log. Neither depends on the other's writes.
+  const effNotes = applyExchangeEffects(gid, cid, attackerId, defenderId, fight.atk_nat, fight.def_nat);
   bumpFightLog(gid, cid, (log, ensure) =>
     recordExchange(log, ensure, attackerId, defenderId, fight.atk_nat, fight.def_nat, hit, dmg,
       { atkTotal: fight.atk_roll, defTotal: fight.def_roll, atkStat: fight.atk_stat, defStat: fight.def_stat }));
 
-  const effNotes = applyExchangeEffects(gid, cid, attackerId, defenderId, fight.atk_nat, fight.def_nat);
+  const atkF = await resolveFighter(guild, gid, attackerId);
+  const defF = await resolveFighter(guild, gid, defenderId);
+  const atkName = atkF.name + (atkF.isNpc ? ' 🎭' : '');
+  const defName = defF.name + (defF.isNpc ? ' 🎭' : '');
 
   const lines = ['─────────────────────────────', '⚔️  **Exchange Resolved**', ''];
   lines.push(`${atkName} (**${STAT_LABELS[fight.atk_stat]}**): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
   lines.push(`${defName} (**${STAT_LABELS[fight.def_stat]}**): ${fightTotalStr(fight.def_roll, fight.def_nat, 20)}`);
   lines.push('');
 
+  // Whose turn it becomes, and the reminder a GM needs when they're driving an
+  // NPC by hand. Shared by the "fighter went down" and "fight continues" paths.
+  const handOver = async (order, index) => {
+    const nextF = await resolveFighter(guild, gid, order[index]);
+    const hint = (nextF.isNpc && !autoOn) ? ` (GM acts with \`npc:${nextF.name}\`)` : '';
+    lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${hint}${turnPing(gid, nextF)}`);
+    return nextF;
+  };
+  const clearRolls = {
+    phase: 'attack', current_target: null,
+    atk_roll: null, atk_nat: null, atk_stat: null,
+    def_roll: null, def_nat: null, def_stat: null,
+  };
+
   if (hit) {
     const prevHp = hpState[defenderId] ?? 0;
     const newHp = applyFightDamage(prevHp, dmg, floor);
     hpState[defenderId] = newHp;
-    setFighterHp(gid, defenderId, newHp);
+    setFighterHp(gid, defenderId, newHp);           // persist to character or NPC
     lines.push(`💥 **${atkName}** hits **${defName}** for **${dmg}** damage!`);
     lines.push(hpChangeLine(gid, defF.isNpc, defName, prevHp, newHp, defF.maxHp, floor));
     for (const l of effectNoteLines(effNotes, atkName, defName)) lines.push(l);
@@ -4074,53 +4107,55 @@ async function autoResolveExchange(guild, gid, cid, channel) {
     if (newHp <= floor) {
       lines.push('', `${W.icon} **${defName}** ${W.out}! HP: **${newHp}**`);
       const newOrder = turnOrder.filter(id => id !== defenderId);
+
       if (newOrder.length <= 1) {
         const winF = await resolveFighter(guild, gid, newOrder[0]);
         const endLog = JSON.parse(getFight(gid, cid)?.log_state || '{}');
         archiveFight(gid, cid, endLog, turnOrder, floor);
         upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState) });
-        await sendLong(channel, lines);
-        await announceFightEnd(guild, gid, cid, channel, {
+        return { lines, ended: true, nextF: null, announce: {
           headline: `🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** ${W.win}!`,
           log: endLog, roster: turnOrder, hpState, floor,
-        });
-        return false;
+        } };
       }
+
       const newIndex = fight.turn_index % newOrder.length;
-      const nextF = await resolveFighter(guild, gid, newOrder[newIndex]);
-      lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${turnPing(gid, nextF)}`);
-      upsertFight(gid, cid, {
+      const nextF = await handOver(newOrder, newIndex);
+      upsertFight(gid, cid, { ...clearRolls,
         turn_order: JSON.stringify(newOrder), turn_index: newIndex,
-        phase: 'attack', current_target: null,
-        atk_roll: null, atk_nat: null, atk_stat: null,
-        def_roll: null, def_nat: null, def_stat: null,
         hp_state: JSON.stringify(hpState),
       });
-      await channel.send(lines.join('\n')).catch(()=>{});
-      return true;
+      return { lines, ended: false, nextF, announce: null };
     }
   } else {
     lines.push(`🛡️ **${defName}** blocks the attack! No damage.`);
     for (const l of effectNoteLines(effNotes, atkName, defName)) lines.push(l);
   }
 
-  // Advance turn to next active fighter
+  // Advance to the next fighter still standing (above the bout floor / 0).
   let nextIndex = (fight.turn_index + 1) % turnOrder.length;
   let safety = 0;
   while (hpState[turnOrder[nextIndex]] !== undefined && hpState[turnOrder[nextIndex]] <= floor && safety < turnOrder.length) {
     nextIndex = (nextIndex + 1) % turnOrder.length;
     safety++;
   }
-  const nextF = await resolveFighter(guild, gid, turnOrder[nextIndex]);
-  lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${turnPing(gid, nextF)}`);
-  upsertFight(gid, cid, {
-    turn_index: nextIndex, phase: 'attack', current_target: null,
-    atk_roll: null, atk_nat: null, atk_stat: null,
-    def_roll: null, def_nat: null, def_stat: null,
-    hp_state: JSON.stringify(hpState),
-  });
-  await channel.send(lines.join('\n')).catch(()=>{});
-  return true;
+  const nextF = await handOver(turnOrder, nextIndex);
+  upsertFight(gid, cid, { ...clearRolls, turn_index: nextIndex, hp_state: JSON.stringify(hpState) });
+  return { lines, ended: false, nextF, announce: null };
+}
+
+// Auto-pilot wrapper: posts to the channel. Returns whether the fight goes on.
+async function autoResolveExchange(guild, gid, cid, channel) {
+  let fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active' || fight.phase !== 'defend' || fight.def_roll === null) return false;
+
+  fight = await applyAutoNpcRerolls(guild, gid, cid, channel);
+  if (!fight || fight.state !== 'active') return false;
+
+  const r = await resolveExchange(guild, gid, cid, fight);
+  await sendLong(channel, r.lines);
+  if (r.ended) await announceFightEnd(guild, gid, cid, channel, r.announce);
+  return !r.ended;
 }
 
 // Drive automatic NPC actions in an NPCs-only fight: take NPC attacks,
@@ -4286,7 +4321,7 @@ async function handleFight(interaction) {
   if (sub === 'addnpc') {
     if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can add NPCs to a fight.', ephemeral: true });
     const fight = getFight(gid, cid);
-    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
 
     const names = expandNpcList(gid, interaction.options.getString('npc'));
     if (!names.length) return interaction.reply({ content: '❌ Name at least one NPC.', ephemeral: true });
@@ -4317,7 +4352,7 @@ async function handleFight(interaction) {
   if (sub === 'hp') {
     if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can adjust fight HP.', ephemeral: true });
     const fight = getFight(gid, cid);
-    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
     const t = resolveFightTarget(interaction, gid, fight);
     if (t.error) return interaction.reply({ content: t.error, ephemeral: true });
     const fid = t.fid;
@@ -4339,7 +4374,7 @@ async function handleFight(interaction) {
   if (sub === 'kick') {
     if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can kick fighters.', ephemeral: true });
     const fight = getFight(gid, cid);
-    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
     const t = resolveFightTarget(interaction, gid, fight);
     if (t.error) return interaction.reply({ content: t.error, ephemeral: true });
     const fid = t.fid;
@@ -4392,7 +4427,7 @@ async function handleFight(interaction) {
   if (sub === 'refill') {
     if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can refill NPC rerolls.', ephemeral: true });
     const fight = getFight(gid, cid);
-    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
     const turnOrder = JSON.parse(fight.turn_order);
     const rrState = JSON.parse(fight.rr_state || '{}');
     const raw = (interaction.options.getString('npcs') || '').trim();
@@ -4708,7 +4743,7 @@ async function handleFight(interaction) {
   if (sub === 'order') {
     if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can change the turn order.', ephemeral: true });
     const fight = getFight(gid, cid);
-    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
 
     const currentOrder = JSON.parse(fight.turn_order);
     const seqStr = interaction.options.getString('sequence');
@@ -4766,7 +4801,7 @@ async function handleFight(interaction) {
   // ── ATK (normal / adv / dis) ──────────────────────────────────────────────
   if (sub === 'atk') {
     const fight = getFight(gid, cid);
-    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
 
     const turnOrder = JSON.parse(fight.turn_order);
     const currentId = turnOrder[fight.turn_index];
@@ -4882,7 +4917,7 @@ async function handleFight(interaction) {
   // ── DEF (normal / adv / dis) ──────────────────────────────────────────────
   if (sub === 'def') {
     const fight = getFight(gid, cid);
-    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
     if (fight.phase !== 'defend') return interaction.reply({ content: '❌ No attack to defend against yet.', ephemeral: true });
 
     const npcActAs = interaction.options.getString('npc'); // GM defending as an NPC
@@ -4962,7 +4997,7 @@ async function handleFight(interaction) {
   // ── REROLLS ────────────────────────────────────────────────────────────────
   if (sub === 'rr') {
     let fight = getFight(gid, cid);
-    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
 
     const turnOrder = JSON.parse(fight.turn_order);
     const isAttacker = turnOrder[fight.turn_index] === uid;
@@ -5035,7 +5070,7 @@ async function handleFight(interaction) {
   // Rule changes here must be mirrored in autoResolveExchange (the auto-mode twin).
   if (sub === 'resolve') {
     let fight = getFight(gid, cid);
-    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
     if (fight.phase !== 'defend' || fight.def_roll === null) return interaction.reply({ content: '❌ Both attack and defend rolls needed before resolving.', ephemeral: true });
 
     // NPC reroll window in auto mode: defender may answer an incoming hit, attacker a block
@@ -5044,116 +5079,24 @@ async function handleFight(interaction) {
       if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ The fight is no longer active.', ephemeral: true });
     }
 
-    const turnOrder = JSON.parse(fight.turn_order);
-    const attackerId = turnOrder[fight.turn_index];
-    const defenderId = fight.current_target;
-    const hpState = JSON.parse(fight.hp_state);
-    const floor = fightFloor(fight);
-    const W = fightWords(floor);
-
-    const { hit, dmg } = resolveDamage(
-      fight.atk_roll, fight.atk_nat, 20,
-      fight.def_roll, fight.def_nat, 20
-    );
-
-    // Set carry-over effects from this exchange (nat-1 attack, nat-20 defence).
-    const effNotes = applyExchangeEffects(gid, cid, attackerId, defenderId, fight.atk_nat, fight.def_nat);
-
-    bumpFightLog(gid, cid, (log, ensure) =>
-      recordExchange(log, ensure, attackerId, defenderId, fight.atk_nat, fight.def_nat, hit, dmg,
-        { atkTotal: fight.atk_roll, defTotal: fight.def_roll, atkStat: fight.atk_stat, defStat: fight.def_stat }));
-
-    const atkF = await resolveFighter(interaction.guild, gid, attackerId);
-    const defF = await resolveFighter(interaction.guild, gid, defenderId);
-    const atkName = atkF.name + (atkF.isNpc ? ' 🎭' : '');
-    const defName = defF.name + (defF.isNpc ? ' 🎭' : '');
-
-    const lines = ['─────────────────────────────', '⚔️  **Exchange Resolved**', ''];
-    lines.push(`${atkName} (**${STAT_LABELS[fight.atk_stat]}**): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
-    lines.push(`${defName} (**${STAT_LABELS[fight.def_stat]}**): ${fightTotalStr(fight.def_roll, fight.def_nat, 20)}`);
-    lines.push('');
-
-    if (hit) {
-      const prevHp = hpState[defenderId] ?? 0;
-      const newHp = applyFightDamage(prevHp, dmg, floor);
-      hpState[defenderId] = newHp;
-      // Persist to the right table (character or NPC)
-      setFighterHp(gid, defenderId, newHp);
-      lines.push(`💥 **${atkName}** hits **${defName}** for **${dmg}** damage!`);
-      lines.push(hpChangeLine(gid, defF.isNpc, defName, prevHp, newHp, defF.maxHp, floor));
-      for (const l of effectNoteLines(effNotes, atkName, defName)) lines.push(l);
-
-      if (newHp <= floor) {
-        lines.push('', `${W.icon} **${defName}** ${W.out}! HP: **${newHp}**`);
-        // Remove from turn order
-        const newOrder = turnOrder.filter(id => id !== defenderId);
-        if (newOrder.length <= 1) {
-          const winF = await resolveFighter(interaction.guild, gid, newOrder[0]);
-          const endLog = JSON.parse(getFight(gid, cid)?.log_state || '{}');
-          archiveFight(gid, cid, endLog, turnOrder, floor);
-          upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState) });
-          await replyLong(interaction, lines);
-          await announceFightEnd(interaction.guild, gid, cid, chan, {
-            headline: `🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** ${W.win}!`,
-            log: endLog, roster: turnOrder, hpState, floor,
-          });
-          return;
-        }
-        // Advance turn
-        const newIndex = fight.turn_index % newOrder.length;
-        const nextF = await resolveFighter(interaction.guild, gid, newOrder[newIndex]);
-        const autoOn = !!fight.auto_npc;
-        const nextHint = (nextF.isNpc && !autoOn) ? ` (GM acts with \`npc:${nextF.name}\`)` : '';
-        lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${nextHint}${turnPing(gid, nextF)}`);
-        upsertFight(gid, cid, {
-          turn_order: JSON.stringify(newOrder),
-          turn_index: newIndex,
-          phase: 'attack',
-          current_target: null,
-          atk_roll: null, atk_nat: null, atk_stat: null,
-          def_roll: null, def_nat: null, def_stat: null,
-          hp_state: JSON.stringify(hpState),
-        });
-        await interaction.reply({ content: lines.join('\n') });
-        if (autoOn && nextF.isNpc) { await new Promise(r=>setTimeout(r,1200)); await runAutoNpcChain(interaction.guild, gid, cid, chan); }
-        return;
-      }
-    } else {
-      lines.push(`🛡️ **${defName}** blocks the attack! No damage.`);
-      for (const l of effectNoteLines(effNotes, atkName, defName)) lines.push(l);
+    const r = await resolveExchange(interaction.guild, gid, cid, fight);
+    await replyLong(interaction, r.lines);
+    if (r.ended) {
+      await announceFightEnd(interaction.guild, gid, cid, chan, r.announce);
+      return;
     }
-
-    // Advance turn to next active fighter
-    let nextIndex = (fight.turn_index + 1) % turnOrder.length;
-    // Skip anyone at or below the floor
-    let safety = 0;
-    while (hpState[turnOrder[nextIndex]] !== undefined && hpState[turnOrder[nextIndex]] <= floor && safety < turnOrder.length) {
-      nextIndex = (nextIndex + 1) % turnOrder.length;
-      safety++;
+    // Hand straight back to the bot when the next fighter is an auto-piloted NPC.
+    if (fight.auto_npc && r.nextF?.isNpc) {
+      await new Promise(res => setTimeout(res, 1200));
+      await runAutoNpcChain(interaction.guild, gid, cid, chan);
     }
-    const nextF = await resolveFighter(interaction.guild, gid, turnOrder[nextIndex]);
-    const autoOn = !!fight.auto_npc;
-    const nextHint = (nextF.isNpc && !autoOn) ? ` (GM acts with \`npc:${nextF.name}\`)` : '';
-    lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${nextHint}${turnPing(gid, nextF)}`);
-
-    upsertFight(gid, cid, {
-      turn_index: nextIndex,
-      phase: 'attack',
-      current_target: null,
-      atk_roll: null, atk_nat: null, atk_stat: null,
-      def_roll: null, def_nat: null, def_stat: null,
-      hp_state: JSON.stringify(hpState),
-    });
-
-    await interaction.reply({ content: lines.join('\n') });
-    if (autoOn && nextF.isNpc) { await new Promise(r=>setTimeout(r,1200)); await runAutoNpcChain(interaction.guild, gid, cid, chan); }
     return;
   }
 
   // ── FORFEIT ────────────────────────────────────────────────────────────────
   if (sub === 'forfeit') {
     const fight = getFight(gid, cid);
-    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
 
     const turnOrder = JSON.parse(fight.turn_order);
     if (!turnOrder.includes(uid)) return interaction.reply({ content: '❌ You are not in this fight.', ephemeral: true });
@@ -5201,7 +5144,7 @@ async function handleFight(interaction) {
   // ── STATUS ─────────────────────────────────────────────────────────────────
   if (sub === 'status') {
     const fight = getFight(gid, cid);
-    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: false });
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: false });
 
     const turnOrder = JSON.parse(fight.turn_order);
     const hpState = JSON.parse(fight.hp_state);
@@ -5256,7 +5199,7 @@ async function handleFight(interaction) {
   if (sub === 'skip') {
     if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can skip turns.', ephemeral: true });
     const fight = getFight(gid, cid);
-    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight in this channel.', ephemeral: true });
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
     const turnOrder = JSON.parse(fight.turn_order);
     const hpState = JSON.parse(fight.hp_state || '{}');
     const attackerId = turnOrder[fight.turn_index];
@@ -5426,7 +5369,6 @@ async function handleNpc(interaction) {
       upsertNpc(gid, name, { hp_current: (made?.con ?? 0) + 2 });
     }
 
-    const npcNow = getNpc(gid, name);
     const orderLine = order ? ` | ${KNIGHT_EMOJIS[order]??'⚪'} ${order}` : '';
     const statsSet = Object.keys(fields).filter(k => k !== 'order_name').length;
     const statNote = statsSet === 0
@@ -5652,33 +5594,12 @@ async function handlePr(interaction) {
     saveRoll(gid, interactionChannelId(interaction), `npc_${name}`, last.notation, last.label);
 
     const critType = detectCrit(result, mode);
-    let rollLine = buildRollLine(result, mode, critType, null);
-    // "1d20+3 → [3] +3 = 6" gives the stat away — strip the modifier when NPC
-    // stats are hidden, leaving the natural die and the final total.
-    if (!npcStatsVisible(gid)) {
-      rollLine = rollLine
-        .replace(/(\d+d\d+)[+-]\d+/g, '$1')
-        .replace(/\]\s*[+-]\d+\s*=/g, '] =');
-    }
+    const rollLine = maskNpcRollLine(gid, buildRollLine(result, mode, critType, null));
     const lines = [];
     if (last.label) lines.push(`${critPrefix(critType)}**${last.label}** *(reroll)*`);
     else lines.push('*(reroll)*');
     lines.push(rollLine, '');
-    lines.push('─────────────────────────────');
-    lines.push(`⚔️  ${npc.name}`);
-    if (npc.order_name) lines.push(`${KNIGHT_EMOJIS[npc.order_name]??'⚪'}  ${npc.order_name}`);
-    if (!npcStatsVisible(gid)) {
-      lines.push(`❤️  ${hpCondition(npc.hp_current, npc.con + 2)}`);
-    } else {
-      lines.push(`❤️  HP${pad(npc.hp_current)} / ${npc.con + 2}`);
-      lines.push(`🔄  Rerolls${pad(updatedNpc.lck)} / ${npc.lck}`);
-      lines.push('');
-      lines.push(`💪  STR${pad(npc.str)}`);
-      lines.push(`🫀  CON${pad(npc.con)}`);
-      lines.push(`⚡  DEX${pad(npc.dex)}`);
-      lines.push(`🧠  WIS${pad(npc.wis)}`);
-      lines.push(`🍀  LCK${pad(updatedNpc.lck)}`);
-    }
+    lines.push(...npcCardFooter(gid, npc, updatedNpc));
 
     const content2 = lines.join('\n');
 
@@ -5793,35 +5714,14 @@ async function handlePr(interaction) {
     if (!result) return interaction.editReply({ content: '❌ Invalid dice notation.' });
 
     const critType = detectCrit(result, mode);
-    let rollLine = buildRollLine(result, mode, critType, null);
-    // "1d20+3 → [3] +3 = 6" gives the stat away — strip the modifier when NPC
-    // stats are hidden, leaving the natural die and the final total.
-    if (!npcStatsVisible(gid)) {
-      rollLine = rollLine
-        .replace(/(\d+d\d+)[+-]\d+/g, '$1')
-        .replace(/\]\s*[+-]\d+\s*=/g, '] =');
-    }
+    const rollLine = maskNpcRollLine(gid, buildRollLine(result, mode, critType, null));
 
     // Build embed text
     const lines = [];
     if (label) lines.push(`${critPrefix(critType)}**${label}**`);
     lines.push(rollLine);
     lines.push('');
-    lines.push('─────────────────────────────');
-    lines.push(`⚔️  ${npc.name}`);
-    if (npc.order_name) lines.push(`${KNIGHT_EMOJIS[npc.order_name]??'⚪'}  ${npc.order_name}`);
-    if (!npcStatsVisible(gid)) {
-      lines.push(`❤️  ${hpCondition(npc.hp_current, npc.con + 2)}`);
-    } else {
-      lines.push(`❤️  HP${pad(npc.hp_current)} / ${npc.con + 2}`);
-      lines.push(`🔄  Rerolls${pad(npc.lck)} / ${npc.lck}`);
-      lines.push('');
-      lines.push(`💪  STR${pad(npc.str)}`);
-      lines.push(`🫀  CON${pad(npc.con)}`);
-      lines.push(`⚡  DEX${pad(npc.dex)}`);
-      lines.push(`🧠  WIS${pad(npc.wis)}`);
-      lines.push(`🍀  LCK${pad(npc.lck)}`);
-    }
+    lines.push(...npcCardFooter(gid, npc));
     if (flavour) {
       lines.push('');
       lines.push('─────────────────────────────');
