@@ -68,6 +68,11 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN stat_budget INTEGER DEFAULT 1
 try { db.exec('ALTER TABLE guild_config ADD COLUMN stat_min INTEGER DEFAULT 1'); } catch {}
 // The flat part of the max-HP formula: max HP = CON + hp_base.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN hp_base INTEGER DEFAULT 2'); } catch {}
+// Scheduled recovery: everyone not out on a quest is restored every N hours.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN autorest_enabled INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN autorest_hours INTEGER DEFAULT 6'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN autorest_channel TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN autorest_last INTEGER'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_stats_visible INTEGER DEFAULT 0'); } catch {}
 try {
   // Webhooks are bound to the channel they were created in. Storing one per NPC
@@ -163,6 +168,15 @@ db.exec(`
     wis INTEGER DEFAULT 0, lck INTEGER DEFAULT 0,
     hp_current INTEGER DEFAULT 0, rerolls_current INTEGER DEFAULT 0, profile_enabled INTEGER DEFAULT 1,
     PRIMARY KEY (guild_id, user_id)
+  );
+  CREATE TABLE IF NOT EXISTS autorest_schedules (
+    guild_id TEXT NOT NULL, name TEXT NOT NULL,
+    hours INTEGER NOT NULL DEFAULT 6,
+    hp TEXT NOT NULL DEFAULT '100%',
+    rerolls TEXT NOT NULL DEFAULT '100%',
+    heal TEXT NOT NULL DEFAULT '100%',
+    channel TEXT, last_run INTEGER, enabled INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (guild_id, name)
   );
   CREATE TABLE IF NOT EXISTS export_requests (
     guild_id TEXT NOT NULL, user_id TEXT NOT NULL,
@@ -450,6 +464,122 @@ function getHealCharges(gid, uid, max) {
 function setHealCharges(gid, uid, cur) {
   db.prepare('INSERT OR REPLACE INTO heal_charges (guild_id,user_id,current) VALUES (?,?,?)').run(gid, uid, cur);
 }
+// ── Scheduled recovery ────────────────────────────────────────────────────────
+// A guild can run any number of named schedules, each with its own interval and
+// its own strength. "half HP every 6 hours" and "everything back every 24" can
+// sit side by side. Amounts use the same tokens as /config rest — 100%, 50%, a
+// flat number, or 0% to leave that resource alone — so they round down the same
+// way and there's one format to learn.
+const AUTOREST_HOURS_DEFAULT = 6;
+const AUTOREST_TICK_MS = 5 * 60 * 1000;   // how often we ask whether anything is due
+
+function listSchedules(gid) {
+  return db.prepare('SELECT * FROM autorest_schedules WHERE guild_id=? ORDER BY name').all(gid);
+}
+function getSchedule(gid, name) {
+  return db.prepare('SELECT * FROM autorest_schedules WHERE guild_id=? AND name=? COLLATE NOCASE').get(gid, name);
+}
+function upsertSchedule(gid, name, fields) {
+  const ex = getSchedule(gid, name);
+  if (!ex) {
+    db.prepare('INSERT INTO autorest_schedules (guild_id, name, last_run) VALUES (?,?,?)').run(gid, name, Date.now());
+  }
+  const keys = Object.keys(fields || {});
+  if (keys.length) {
+    db.prepare(`UPDATE autorest_schedules SET ${keys.map(k => `${k}=?`).join(',')} WHERE guild_id=? AND name=? COLLATE NOCASE`)
+      .run(...keys.map(k => fields[k]), gid, ex ? ex.name : name);
+  }
+  return getSchedule(gid, name);
+}
+function deleteSchedule(gid, name) {
+  return db.prepare('DELETE FROM autorest_schedules WHERE guild_id=? AND name=? COLLATE NOCASE').run(gid, name).changes > 0;
+}
+// Plain-English summary of what a schedule actually does.
+function describeSchedule(sc) {
+  const bit = (tok, what) => {
+    const t = String(tok ?? '0%');
+    if (t === '0%' || t === '0') return null;
+    if (t === '100%') return `full ${what}`;
+    if (t.endsWith('%')) return `${t} ${what} (rounded down)`;
+    return `${t} ${what}`;
+  };
+  const parts = [bit(sc.hp, 'HP'), bit(sc.rerolls, 'rerolls'), bit(sc.heal, 'heal charges')].filter(Boolean);
+  return parts.length ? parts.join(' · ') : 'nothing (every amount is 0%)';
+}
+
+// Everyone currently on the party of a quest that's underway.
+function questBusyUsers(gid) {
+  const rows = db.prepare(`SELECT DISTINCT m.user_id FROM quest_members m
+                           JOIN quests q ON q.guild_id = m.guild_id AND q.number = m.number
+                           WHERE m.guild_id = ? AND m.state = 'party' AND q.status = 'active'`).all(gid);
+  return new Set(rows.map(r => r.user_id));
+}
+
+// Apply one schedule to everyone not out on a quest.
+async function runAutoRest(guild, sc) {
+  const gid = guild.id;
+  const cfg = getConfig(gid) || {};
+  const maxCharges = cfg.heal_charges ?? 3;
+  const busy = questBusyUsers(gid);
+  const sheets = db.prepare('SELECT * FROM characters WHERE guild_id=?').all(gid);
+  const restored = [], skipped = [];
+  for (const ch of sheets) {
+    const name = await getDisplayName(guild, ch.user_id);
+    if (busy.has(ch.user_id)) { skipped.push(name); continue; }
+    const updates = {};
+    const hpR = resolveRestToken(sc.hp, maxHp(ch, gid), '0%');
+    if (hpR.changed) updates.hp_current = hpR.value;
+    const rR = resolveRestToken(sc.rerolls, maxRerolls(ch), '0%');
+    if (rR.changed) updates.rerolls_current = rR.value;
+    if (Object.keys(updates).length) upsertChar(gid, ch.user_id, updates);
+    // Heal charges only mean anything to a White Knight with WIS 5+.
+    const healR = resolveRestToken(sc.heal, maxCharges, '0%');
+    if (healR.changed && isWhiteKnight(ch)) setHealCharges(gid, ch.user_id, healR.value);
+    restored.push(name);
+  }
+  upsertSchedule(gid, sc.name, { last_run: Date.now() });
+  return { restored, skipped };
+}
+
+// Post the result where the GM asked for it, if anywhere.
+async function announceAutoRest(guild, sc, result) {
+  if (!sc.channel) return;
+  const lines = [`🌙 **${sc.name}** — every ${sc.hours}h · ${describeSchedule(sc)}`];
+  lines.push(result.restored.length
+    ? `❤️ Restored: **${result.restored.length}** — ${result.restored.join(', ')}`
+    : '❤️ Nobody to restore.');
+  if (result.skipped.length) {
+    lines.push(`🎒 Out on a quest, left as they are: **${result.skipped.length}** — ${result.skipped.join(', ')}`);
+  }
+  try {
+    const ch = await guild.client.channels.fetch(sc.channel);
+    await sendLong(ch, lines);
+  } catch (err) { console.error('[autorest] could not announce:', err?.message || err); }
+}
+
+// The scheduler. Short tick, and every schedule carries its own stored last-run,
+// so a redeploy can neither skip a cycle nor fire one early.
+function startAutoRest(client) {
+  const tick = async () => {
+    for (const guild of client.guilds.cache.values()) {
+      for (const sc of listSchedules(guild.id)) {
+        try {
+          if (!sc.enabled) continue;
+          const hours = Number(sc.hours) > 0 ? Number(sc.hours) : AUTOREST_HOURS_DEFAULT;
+          const last = Number(sc.last_run) || 0;
+          if (!last) { upsertSchedule(guild.id, sc.name, { last_run: Date.now() }); continue; }
+          if (Date.now() < last + hours * 3600 * 1000) continue;
+          const result = await runAutoRest(guild, sc);
+          await announceAutoRest(guild, sc, result);
+          console.log(`[autorest] ${guild.id}/${sc.name}: restored ${result.restored.length}, skipped ${result.skipped.length}`);
+        } catch (err) { console.error('[autorest] tick failed for', guild.id, sc?.name, '-', err?.message || err); }
+      }
+    }
+  };
+  setInterval(tick, AUTOREST_TICK_MS);
+  setTimeout(tick, 30 * 1000);   // first look shortly after boot
+}
+
 // ── Tag helpers ──────────────────────────────────────────────────────────────
 const PRESET_TAGS = {
   'Hero of Kalidale': '⚜️',
@@ -1444,6 +1574,16 @@ const slashCommands = [
       .addStringOption(o=>o.setName('hp').setDescription('HP restored — "50%" of max, or a flat number like "3"').setRequired(false))
       .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored — "50%" of max, or a flat number like "1"').setRequired(false))
       .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored — "50%" of max, or a flat number like "2"').setRequired(false)))
+    .addSubcommand(s=>s.setName('autorest').setDescription('Scheduled recovery: named schedules, each with its own timing and strength')
+      .addStringOption(o=>o.setName('action').setDescription('What to do').setRequired(false)
+        .addChoices({name:'List',value:'list'},{name:'Add or update',value:'set'},{name:'Remove',value:'remove'},
+                    {name:'Run now',value:'run'},{name:'Pause',value:'pause'},{name:'Resume',value:'resume'}))
+      .addStringOption(o=>o.setName('name').setDescription('Schedule name, e.g. Breather or Full Recovery').setRequired(false))
+      .addIntegerOption(o=>o.setName('hours').setDescription('How often, in hours (default 6)').setRequired(false).setMinValue(1).setMaxValue(720))
+      .addStringOption(o=>o.setName('hp').setDescription('HP restored: 100%, 50%, a flat number, or 0% to skip').setRequired(false))
+      .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored: 100%, 50%, a number, or 0%').setRequired(false))
+      .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored: 100%, 50%, a number, or 0%').setRequired(false))
+      .addChannelOption(o=>o.setName('channel').setDescription('Announce this schedule here (optional)').setRequired(false)))
     .addSubcommand(s=>s.setName('hpbase').setDescription('Flat points added to CON for max HP (default 2, so CON+2)')
       .addIntegerOption(o=>o.setName('base').setDescription('Max HP = CON + this. 3 gives CON+3, 0 gives plain CON').setRequired(false).setMinValue(0).setMaxValue(50)))
     .addSubcommand(s=>s.setName('statallowance').setDescription('Points a player spends building a sheet, and the minimum per stat')
@@ -1981,6 +2121,79 @@ async function handleConfig(interaction) {
     setConfig(gid, { roll_audit_channel_id: channel.id });
     return interaction.reply({ content: `🎲 Rolls will be mirrored to <#${channel.id}> — raw input, result, and a jump link.\nCovers player rolls **and GM rolls, including secret ones**, so GMs are accountable to each other.\n⚠️ Make sure that channel's permissions only let GMs view it; the bot can't set that for you.` });
   }
+  if (sub === 'autorest') {
+    const action = interaction.options.getString('action') || 'list';
+    const name = (interaction.options.getString('name') || '').trim();
+    const hours = interaction.options.getInteger('hours');
+    const hp = interaction.options.getString('hp');
+    const rerolls = interaction.options.getString('rerolls');
+    const heal = interaction.options.getString('heal');
+    const channel = interaction.options.getChannel('channel');
+    const line = (sc) => `• **${sc.name}** — every **${sc.hours}h** · ${describeSchedule(sc)}`
+      + (sc.channel ? ` · <#${sc.channel}>` : '')
+      + (sc.enabled ? '' : ' · ⏸️ **paused**')
+      + (sc.last_run ? `\n   next <t:${Math.floor((sc.last_run + sc.hours * 3600 * 1000) / 1000)}:R>` : '');
+
+    if (action === 'list') {
+      const all = listSchedules(gid);
+      if (!all.length) return interaction.reply({ ephemeral: true, content:
+        '🌙 No recovery schedules yet.\n'
+        + 'Add one with `/config autorest action:Add or update name:Breather hours:6 hp:50% rerolls:0% heal:0%`.\n'
+        + 'Amounts take `100%`, `50%`, a flat number, or `0%` to leave that resource alone. Percentages round down.' });
+      return replyLong(interaction, ['🌙 **Recovery schedules**', '', ...all.map(line), '',
+        '_Anyone on an in-progress quest is skipped by every schedule._'], { ephemeral: true });
+    }
+
+    if (!name) return interaction.reply({ content: '❌ Give the schedule a `name:` — e.g. `name:Breather`.', ephemeral: true });
+
+    if (action === 'remove') {
+      return interaction.reply({ content: deleteSchedule(gid, name)
+        ? `🗑️ Removed recovery schedule **${name}**.`
+        : `❌ No schedule called **${name}**.`, ephemeral: true });
+    }
+
+    const existing = getSchedule(gid, name);
+    if (action === 'pause' || action === 'resume') {
+      if (!existing) return interaction.reply({ content: `❌ No schedule called **${name}**.`, ephemeral: true });
+      const sc = upsertSchedule(gid, name, { enabled: action === 'resume' ? 1 : 0,
+        ...(action === 'resume' ? { last_run: Date.now() } : {}) });
+      return interaction.reply({ content: `${action === 'resume' ? '▶️ Resumed' : '⏸️ Paused'} **${sc.name}**.` });
+    }
+
+    if (action === 'run') {
+      if (!existing) return interaction.reply({ content: `❌ No schedule called **${name}**.`, ephemeral: true });
+      await interaction.reply({ content: `🌙 Running **${existing.name}** now…` });
+      const result = await runAutoRest(interaction.guild, existing);
+      await announceAutoRest(interaction.guild, existing, result);
+      return interaction.followUp({ content:
+        `✅ **${existing.name}** — restored **${result.restored.length}**`
+        + (result.skipped.length ? `, left **${result.skipped.length}** out on quests alone.` : '.') });
+    }
+
+    // Add or update. Every amount is validated up front so a typo can't sit in
+    // the table silently doing nothing at 3am.
+    const fields = {};
+    for (const [key, val] of [['hp', hp], ['rerolls', rerolls], ['heal', heal]]) {
+      if (val === null || val === undefined) continue;
+      const t = String(val).trim();
+      if (!/^\d+%?$/.test(t)) return interaction.reply({ content: `❌ **${key}** must be like \`100%\`, \`50%\`, \`0%\` or a plain number — got \`${t}\`.`, ephemeral: true });
+      fields[key] = t;
+    }
+    if (hours !== null) fields.hours = hours;
+    if (channel) {
+      if (!channel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
+      fields.channel = channel.id;
+    }
+    if (!existing && !Object.keys(fields).length) {
+      return interaction.reply({ content: '❌ New schedules need at least `hours:` or one amount. Defaults are every 6h at 100% of everything.', ephemeral: true });
+    }
+    const sc = upsertSchedule(gid, name, fields);
+    return interaction.reply({ content: [
+      `${existing ? '✏️ Updated' : '🌙 Added'} recovery schedule:`, line(sc), '',
+      'Everyone not on an in-progress quest is covered. Quest parties keep whatever they have until they finish.',
+    ].join('\n') });
+  }
+
   if (sub === 'hpbase') {
     const base = interaction.options.getInteger('base');
     const cur = hpBase(gid);
@@ -3339,6 +3552,7 @@ async function clearGlobalCommands() {
 (async () => {
   console.log('Starting up...');
   await clearGlobalCommands();
+  startAutoRest(client);
   client.login(process.env.DISCORD_TOKEN);
 })();
 
@@ -6304,6 +6518,10 @@ const HELP_CATEGORIES = {
       '_Server admins (Manage Server) always count as GMs._',
       '`/config heal charges:N` — set default heal charges',
       '`/config hpbase base:3` — max HP formula: CON + this (default 2)',
+      '`/config autorest action:List` — see every recovery schedule',
+      '`/config autorest action:Add or update name:Breather hours:6 hp:50% rerolls:0% heal:0%` — a light top-up',
+      '`/config autorest action:Add or update name:Full Recovery hours:24 hp:100% rerolls:100% heal:100%` — the works',
+      'Amounts take `100%`, `50%`, a flat number, or `0%` to skip that resource. Percentages round down. Quest parties are always skipped',
       '`/config npcreroll threshold:N` — NPC auto-reroll on nat ≤ N · 0 disables · omit to show',
       '`/config fightping enabled:true` — @-mention players on their turn · off by default (Admin)',
       '`/config rollaudit channel:#x` — mirror all rolls (players + GMs) to a GM-only channel (Admin)',

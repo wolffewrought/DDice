@@ -67,11 +67,19 @@ CONTENT = [
       'from your sheet) or custom <b>dice</b>. The result uses the same card as a typed roll.'),
 ('h2', 'Stat Quick Rolls'),
 ('code', [('str   con   dex   wis   lck', 'on their own — nothing else in the message'),
+          ('strength   constitution   dexterity', 'long names roll exactly the same'),
+          ('wisdom   luck', ''),
           ('wisa   dexd', 'advantage / disadvantage · a label may follow'),
           ('r str atk', 'a plain stat roll with a label'),
           ('?str atk', 'the same, as a success check')]),
 ('p', 'Rolls 1d20 + that stat from your saved character. Add <b>a</b> for advantage or <b>d</b> for '
-      'disadvantage — <b>wisa</b>, <b>dexd</b>.'),
+      'disadvantage — <b>wisa</b>, <b>dexd</b>. Every stat answers to its <b>full name</b> as well as its '
+      'short one, and they behave identically: <b>strength</b> is <b>str</b>, <b>wisdoma</b> is <b>wisa</b>, '
+      '<b>luckrra</b> is <b>lckrra</b>.'),
+('p', 'A stat roll <b>always shows your sheet</b> — stats, HP, rerolls and all — even with the profile '
+      'embed switched off. A bare <b>1d20+4</b> tells nobody which stat it was or where the 4 came from, so '
+      'the card is forced open where the numbers need explaining. Plain dice rolls still honour '
+      '<b>/profile off</b>.'),
 ('p', '<b>A plain stat name must be the whole message.</b> <b>str</b>, <b>con</b>, <b>dex</b>, <b>wis</b> and '
       '<b>lck</b> are ordinary words in conversation, so anything typed after one means it is treated as '
       'chat and left alone — “Dex or strength can both be used to throw things” is a sentence, not a '
@@ -230,6 +238,10 @@ CONTENT = [
           ('/config gmrole', 'list current GM roles'),
           ('/config heal charges 3', ''),
           ('/config statallowance points:15 minimum:1', 'player build points (omit both to view)'),
+          ('/config hpbase base:3', 'max HP = CON + this (default 2)'),
+          ('/config autorest action:List', 'every recovery schedule'),
+          ('/config autorest action:Add or update name:Breather \\\n  hours:6 hp:50% rerolls:0% heal:0%', 'a light top-up'),
+          ('/config autorest action:Run now name:Breather', 'fire one immediately'),
           ('/config npcchannel #channel', 'set the NPC image bank channel'),
           ('/config npcreroll threshold:8', 'NPC auto-reroll on nat ≤ N — 0 disables'),
           ('/config fightping enabled:true', '@-mention players on their turn — off by default'),
@@ -297,6 +309,30 @@ CONTENT = [
 ('note', 'Each rest value is either a percentage of that resource\u2019s max (e.g. 50%) or a flat whole number '
          'that sets it exactly (e.g. 3). 0% means leave it untouched. Only the values you provide change.'),
 ('aud','all'),
+('h2', 'Scheduled Recovery'),
+('p', 'A server can run <b>any number of named schedules</b>, each with its own timing and its own strength. '
+      'A light top-up every few hours and a full recovery overnight can sit side by side.'),
+('code', [('/config autorest action:Add or update name:Breather \\\n  hours:6 hp:50% rerolls:0% heal:0%',
+           'half HP, rounded down, every 6h'),
+          ('/config autorest action:Add or update name:Full Recovery \\\n  hours:24 hp:100% rerolls:100% heal:100%',
+           'everything back, once a day'),
+          ('/config autorest action:List', 'what is set, and when each next falls'),
+          ('/config autorest action:Run now name:Breather', 'fire one immediately'),
+          ('/config autorest action:Pause name:Breather', 'stop it without deleting it'),
+          ('/config autorest action:Remove name:Breather', 'delete it')]),
+('p', 'Amounts use the same tokens as <b>/config rest</b>: <b>100%</b> for full, <b>50%</b> for half, a plain '
+      'number for a flat amount, or <b>0%</b> to leave that resource alone entirely. Percentages <b>round '
+      'down</b>, so half of 11 HP is 5. A typo is refused when you set the schedule rather than quietly doing '
+      'nothing at three in the morning.'),
+('p', '<b>Anyone on a quest that is in progress is skipped by every schedule.</b> Their HP, rerolls and charges '
+      'stay exactly where they are until the quest is completed, so being out in the field costs something. '
+      'Applicants, and members of quests still open or already finished, are restored as normal. Heal charges '
+      'only go to White Knights with WIS 5+, as everywhere else.'),
+('p', 'Give a schedule a <b>channel:</b> and each run is announced there, naming what it did, who was restored '
+      'and who was left out in the field.'),
+('note', 'Each schedule carries its own clock in the database, so a restart or redeploy can neither skip a '
+         'cycle nor fire one early. Adding a schedule, or resuming a paused one, starts its count from that '
+         'moment.'),
 ('h2', 'Help & Maintenance'),
 ('code', [('/help', 'overview of all command groups'),
           ('/help category:dice', 'detail on a specific group'),
@@ -308,8 +344,12 @@ CONTENT = [
          'Confirm / Cancel before running.'),
 ('aud','all'),
 ('h2', 'Derived Stats'),
+('p', 'Max HP is <b>CON plus a flat base</b>, 2 by default \u2014 so CON 10 gives 12 HP. A ' + GM + ' can change '
+      'the base for the whole server with <b>/config hpbase base:3</b>, making it CON+3; set it to 0 for max HP '
+      'equal to CON alone. Everyone\u2019s ceiling moves the moment it is changed, players and NPCs alike, though '
+      'current HP is left where it is \u2014 run a rest or <b>hpfull @user</b> to top people up.'),
 ('table', ['Stat', 'Formula', 'On change'],
-          [['Max HP', 'CON + 2', 'HP always maxes'],
+          [['Max HP', 'CON + base', 'HP always maxes'],
            ['Max Rerolls', 'LCK', 'Rerolls always max'],
            ['Heal tracker', 'White Knight + WIS ≥ 5', 'Appears / disappears automatically']]),
 
