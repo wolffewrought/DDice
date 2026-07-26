@@ -188,6 +188,16 @@ CONTENT = [
           ('/char set field:con value:12', 'HP auto-maxes to CON + 2', 'player'),
           ('/char set field:lck value:3', 'rerolls auto-max to LCK', 'player'),
           ('/char set field:str value:14 user:@player', GM + ' only', 'gm')]),
+('aud','gm'),
+('h2', 'Items & Pages'),
+('code', [('/char give user:@a item:A tarnished silver key \\\n  note:Cold to the touch', GM + ' only', 'gm'),
+          ('/char take user:@a id:3', 'by the number in their inventory', 'gm'),
+          ('/char summary user:@a', 'their sheet and every page at once', 'gm'),
+          ('/char standing user:@a', 'merit and renown, and where each came from', 'gm'),
+          ('/char rollhistory user:@a', 'every natural die they have rolled', 'gm')]),
+('note', 'Items are free text \u2014 whatever a story calls for. Activities can hand them over too, and a '
+         'player reads them back with <b>/char inventory</b>. Lore submitted with <b>/char lore</b> arrives '
+         'in the sheet approval channel with Approve / Reject buttons, and a rejection asks you why.'),
 ('aud','player'),
 ('h2', 'Knight Orders'),
 ('p', 'These are the values to pass to <b>order:</b> on /char create \u2014 or to /char set if this is the '
@@ -217,6 +227,31 @@ CONTENT = [
       'never changes a sheet\u2019s approval state and never stops anyone rolling. Exporting again replaces the '
       'previous request, so the channel holds one live entry per player. GMs export straight away, for '
       'themselves and for anyone else, and on servers not using approvals nothing changes.'),
+('h2', 'Character Pages'),
+('p', 'Beyond the stat block, a character accumulates things worth keeping. Each page can be read for '
+      'yourself or for someone else with <b>user:</b>.'),
+('code', [('/char summary', 'the sheet and every page below, on one post'),
+          ('/char inventory', 'what they are carrying'),
+          ('/char standing', 'merit and renown, and where each came from'),
+          ('/char rollhistory', 'every natural die this character has rolled'),
+          ('/char rollhistory sides:6', 'the same for a different die'),
+          ('/char lore', 'write your lore and send it to the ' + GM + 's'),
+          ('/char showlore', 'read approved lore')]),
+('p', '<b>Inventory</b> holds roleplay items \u2014 things an activity handed over, or a ' + GM + ' gave out by '
+      'hand with <b>/char give user:@a item:A tarnished silver key</b>. Each carries a number, so '
+      '<b>/char take user:@a id:3</b> removes one. Giving and taking are ' + GM + '-only.'),
+('p', '<b>Standing</b> puts total merit and renown at the top, then lists every movement beneath it \u2014 the '
+      'quest, activity or ' + GM + ' award that caused it, the amount, and how long ago. Merits are a lifetime '
+      'tally that only climbs; renown is a currency that is spent again.'),
+('p', '<b>Roll history</b> counts every natural die a character has ever rolled, drawn as a bar chart with the '
+      'natural 20s and 1s marked. It follows the character, not the player, and covers every roll they make '
+      '\u2014 typed, slash, in a fight or in an activity.'),
+('p', '<b>Lore</b> opens a writing box, pre-filled with whatever you wrote last time. It goes to the same '
+      'channel character sheets do, with Approve / Reject buttons; a rejection asks the ' + GM + ' why and '
+      'passes the reason back. Only approved lore shows on <b>/char showlore</b> \u2014 before that it says it is '
+      'waiting, or why it was turned down. Rewriting retires the old request and sends a fresh one.'),
+('note', 'Nothing here is required. A character works perfectly well with an empty inventory, no lore and no '
+         'renown \u2014 these are for tables that want to track more.'),
 ('h2', 'Profile'),
 ('code', [('/profile on    /p on', 'enable embed, max HP + rerolls'),
           ('/profile off   /p off', 'disable embed, plain text rolls'),
@@ -306,8 +341,11 @@ CONTENT = [
 ('note', 'Several GM roles can be set at once \u2014 holding any of them grants GM access. Anyone with '
          'the Discord <b>Manage Server</b> permission always counts as a GM, so you can never lock '
          'yourself out by mis-setting a role.'),
-('note', 'Each rest value is either a percentage of that resource\u2019s max (e.g. 50%) or a flat whole number '
-         'that sets it exactly (e.g. 3). 0% means leave it untouched. Only the values you provide change.'),
+('note', 'Rest amounts come in two shapes, and the difference matters. A bare value <b>sets</b> the resource: '
+         '<b>50%</b> puts them on half their maximum, <b>4</b> puts them on exactly 4 \u2014 even if that is '
+         'fewer than they had. Prefix a <b>+</b> and it <b>adds</b> instead: <b>+4</b> gives four more HP, '
+         '<b>+25%</b> gives a quarter of their maximum on top of what they have. Both cap at the maximum and '
+         'both round down. <b>0%</b> leaves that resource untouched, and only the values you provide change.'),
 ('aud','all'),
 ('h2', 'Scheduled Recovery'),
 ('p', 'A server can run <b>any number of named schedules</b>, each with its own timing and its own strength. '
@@ -320,10 +358,11 @@ CONTENT = [
           ('/config autorest action:Run now name:Breather', 'fire one immediately'),
           ('/config autorest action:Pause name:Breather', 'stop it without deleting it'),
           ('/config autorest action:Remove name:Breather', 'delete it')]),
-('p', 'Amounts use the same tokens as <b>/config rest</b>: <b>100%</b> for full, <b>50%</b> for half, a plain '
-      'number for a flat amount, or <b>0%</b> to leave that resource alone entirely. Percentages <b>round '
-      'down</b>, so half of 11 HP is 5. A typo is refused when you set the schedule rather than quietly doing '
-      'nothing at three in the morning.'),
+('p', 'Amounts use the same tokens as <b>/config rest</b>. A bare value <b>sets</b> the resource \u2014 '
+      '<b>100%</b> full, <b>50%</b> half, <b>4</b> exactly four. A <b>+</b> prefix <b>adds</b> instead: '
+      '<b>+4</b> is four more HP, <b>+25%</b> a quarter of their maximum on top. <b>0%</b> leaves it alone. '
+      'Everything caps at the maximum and rounds down, so half of 11 HP is 5. A typo is refused when you set '
+      'the schedule rather than quietly doing nothing at three in the morning.'),
 ('p', '<b>Anyone on a quest that is in progress is skipped by every schedule.</b> Their HP, rerolls and charges '
       'stay exactly where they are until the quest is completed, so being out in the field costs something. '
       'Applicants, and members of quests still open or already finished, are restored as normal. Heal charges '
@@ -383,6 +422,15 @@ CONTENT = [
 ('p', 'One command for every restore. Works on a player or an NPC (or <b>all</b> NPCs), and HP changes '
       'sync straight into any active fight. NPCs only have HP; heal charges are skipped for anyone who '
       'isn\u2019t a White Knight with WIS 5+.'),
+('p', '<b>global:</b> restores everyone at once instead of naming a target \u2014 <b>Players</b>, <b>NPCs</b>, '
+      'or <b>Everyone</b> together. It takes the same <b>amount</b> and <b>restore</b> options as a single '
+      'target, so <b>/gmheal global:Everyone amount:Half</b> puts the whole server on half HP, and '
+      '<b>/gmheal global:Players restore:Everything</b> hands every character HP, rerolls and heal charges '
+      'back. Pick exactly one of <b>user</b>, <b>npc</b> or <b>global</b>.'),
+('note', 'Unlike scheduled recovery, a global heal does <b>not</b> skip players out on a quest. A '
+         + GM + ' typing this has decided to heal the room, and a silent exclusion mid-session would be a '
+         'nasty surprise. Heal charges still only reach White Knights with WIS 5+, and every change syncs '
+         'into any fight already running.'),
 ('note', 'Stats are optional \u2014 an NPC can be registered by name (and given an avatar) with no stats at '
          'all, then statted up later. Re-running <b>/npc create</b> with the same name updates only the '
          'fields you supply and leaves the rest untouched.'),
@@ -550,6 +598,99 @@ CONTENT = [
          'answers \u201cwho earned what, and when\u201d. Removing a rank doesn\u2019t change players who '
          'already hold its label.'),
 
+('aud','gm'),
+('sec', 'Activities'),
+('p', 'An activity is a minigame you write for your server: the bot narrates, asks for rolls, branches on the '
+      'results and loops until someone stops. Fishing, foraging, a gauntlet in the training yard \u2014 whatever '
+      'you script. Only a ' + GM + ' can write one; whether players can <b>start</b> one is a setting.'),
+('h2', 'Writing One'),
+('p', 'Paste a script into any channel the bot can read, starting with <b>[ACTIVITY] Name</b>. Re-pasting the '
+      'same name replaces it. The whole script is checked before anything is saved.'),
+('code', [('[ACTIVITY] Fishing', ''),
+          ('TALLY renown', 'a running total, paid out at the end'),
+          ('', ''),
+          ('SCENE find', ''),
+          ('SAY Find a spot to set up.', ''),
+          ('ROLL wis DC15', 'a difficulty to beat'),
+          ('  PASS -> cast', ''),
+          ('  FAIL ONE OF', 'picks a different line each loop'),
+          ('    This spot does not look all too lucky...', ''),
+          ('    They are not biting here today...', ''),
+          ('  FAIL -> find', 'loops back'),
+          ('', ''),
+          ('SCENE cast', ''),
+          ('ROLL str|dex|wis', 'the roller picks the stat'),
+          ('  1-5   Small fry.  -> fight_small', 'ranges on the total'),
+          ('  16+   A monster!  -> fight_extra', ''),
+          ('', ''),
+          ('SCENE fight_big', ''),
+          ('GAUNTLET str|con 14 12 10', 'three rolls, each harder to fail'),
+          ('  NAT20 It leaps aboard. -> caught', ''),
+          ('  NAT1  Your line snaps. -> restring', ''),
+          ('  PASS -> caught', ''),
+          ('  FAIL -> find', ''),
+          ('', ''),
+          ('SCENE caught', ''),
+          ('GAIN renown 3', 'banked on arrival'),
+          ('CHOICE', 'buttons, no dice'),
+          ('  Carry on      -> cast', ''),
+          ('  Call it quits -> depot', ''),
+          ('', ''),
+          ('SCENE depot', ''),
+          ('END TALLY', 'pays the tally out as renown')]),
+('h2', 'What Each Line Does'),
+('table', ['Line', 'Meaning'],
+          [['SCENE name', 'A step. The first one is where a run begins.'],
+           ['SAY ...', 'Narration. Runs over as many lines as you like.'],
+           ['AS Cave Orc', 'Speak this scene in an NPC\u2019s voice, through their webhook.'],
+           ['ROLL str', 'Ask for a roll. <b>str|dex|wis</b> lets the roller choose.'],
+           ['ROLL wis DC15', 'Beat 15 for PASS, else FAIL.'],
+           ['GAUNTLET str|con 14 12 10', 'A run of rolls, each with its own DC. All must pass.'],
+           ['GAUNTLET 14:str 12:str|con 10:dex', 'The same, but a different check at every step.'],
+           ['1-5 text -> scene', 'Branch on the roll total. <b>16+</b> is open-ended.'],
+           ['PASS / FAIL text -> scene', 'Branch on the outcome band.'],
+           ['BAND ONE OF', 'Indented lines below become random variants.'],
+           ['NAT20 / NAT1 text -> scene', 'Overrides everything else.'],
+           ['CHOICE', 'Buttons instead of dice. Options are <b>label -> scene</b>.'],
+           ['TALLY renown', 'Names a running total, declared once at the top.'],
+           ['GAIN renown 3', 'Adds to the tally when a player arrives at this scene.'],
+           ['END', 'Finishes. <b>END TALLY</b> pays out, <b>merits:2</b> awards merits,'],
+           ['', '<b>rewards:a silver key</b> is announced for you to hand out.']]),
+('p', 'Without a <b>DC</b> or ranges, outcomes fall back to the same bands a <b>?</b> check uses: <b>CRIT</b> a '
+      'natural 20, <b>PASS</b> 15+, <b>PARTIAL</b> 10\u201314, <b>FAIL</b> under 10, <b>FUMBLE</b> a natural 1. '
+      'You need not define all of them \u2014 a crit falls back to PASS, a fumble to FAIL.'),
+('note', 'Validation refuses a branch pointing at a scene that does not exist, a duplicate scene name, a scene '
+         'with no roll, choice or ending, a roll on something that is not a stat, a gauntlet longer than eight, '
+         'and a <b>GAIN</b> with no <b>TALLY</b> \u2014 each with the reason, so a run can never dead-end.'),
+('h2', 'Running One'),
+('code', [('/activity demo', 'play the built-in fishing game (' + GM + ')'),
+          ('/activity run name:Fishing', 'start it in this channel'),
+          ('/activity list      /activity show name:Fishing', 'what exists, and read it back in full'),
+          ('/activity stop', 'abandon the run here'),
+          ('/activity set name:X scene:find field:Roll value:dex', 'tweak one line (' + GM + ')'),
+          ('/activity delete name:X', 'remove it (' + GM + ', asks first)'),
+          ('/config activities players:true', 'let players start them too')]),
+('p', '<b>/activity demo</b> plays a ready-made fishing game so you can see the whole system working before '
+      'writing anything: a difficulty check that loops with a different excuse each time, four sizes of catch '
+      'chosen by the roll, a gauntlet per size, natural 20s and 1s, and buttons to keep going or head back. '
+      'It awards <b>nothing</b> \u2014 no renown, no merits, no items \u2014 so it is safe to play with.'),
+('p', 'Each scene posts with a button per stat it accepts. <b>Anyone in the channel can press one</b> \u2014 the '
+      'roll uses their own sheet, honours a Hero\u2019s signature stat, and lands in the roll audit like any '
+      'other. One run per channel at a time. Writing and deleting always need a ' + GM + '; starting one is '
+      'GM-only until <b>/config activities players:true</b>.'),
+('aud','all'),
+('h2', 'Renown'),
+('p', 'Renown is a currency \u2014 earned from quests, encounters and activities, and spent again. It is separate '
+      'from merits, which only ever climb.'),
+('code', [('/renown view        /renown view user:@player', ''),
+          ('/renown leaderboard /renown history', ''),
+          ('/renown add user:@a amount:5 reason:Fishing', GM),
+          ('/renown spend user:@a amount:3 reason:A better rod', GM),
+          ('/renown set user:@a amount:0', GM)]),
+('p', 'A spend is refused when the balance will not cover it, and every movement is logged with its reason, so '
+      '<b>/renown history</b> answers where it came from and where it went.'),
+('aud','gm'),
+('aud','all'),
 ('sec', 'Quest Board'),
 ('p', 'GMs create quests with lore, objectives, details and rewards. Quests are posted as a message '
       'with an Apply button and also appear on the board. Players apply, a ' + GM + ' approves the party, '

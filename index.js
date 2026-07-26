@@ -1843,12 +1843,17 @@ async function sendLong(channel, content) {
 async function replyLong(interaction, content, opts = {}) {
   const LIMIT = 1900; // headroom under 2000 for safety
   const text = Array.isArray(content) ? content.join('\n') : String(content);
+  // A deferred interaction has already been answered, so the first message has
+  // to be an edit — replying again throws "already acknowledged".
+  const first = (payload) => interaction.deferred || interaction.replied
+    ? interaction.editReply(payload)
+    : interaction.reply(payload);
   if (text.length <= LIMIT) {
-    return interaction.reply({ content: text, ...opts });
+    return first({ content: text, ...opts });
   }
   // Chunk by lines, never mid-line unless a single line is itself too long.
   const chunks = chunkLines(Array.isArray(content) ? content : text, LIMIT);
-  await interaction.reply({ content: chunks[0], ...opts });
+  await first({ content: chunks[0], ...opts });
   for (let i = 1; i < chunks.length; i++) {
     await interaction.followUp({ content: chunks[i], ...opts }).catch(() => {});
   }
@@ -2592,6 +2597,11 @@ const slashCommands = [
     .setName('gmheal').setDescription('Restore HP, rerolls or heal charges — players or NPCs (GM)')
     .addUserOption(o=>o.setName('user').setDescription('Player to restore').setRequired(false))
     .addStringOption(o=>o.setName('npc').setDescription('NPC to restore — or "all" for every NPC').setRequired(false).setAutocomplete(true))
+    .addStringOption(o=>o.setName('global').setDescription('Restore everyone at once instead of naming one').setRequired(false)
+      .addChoices(
+        {name:'👥 Players — every character sheet',value:'players'},
+        {name:'🎭 NPCs — every NPC',value:'npcs'},
+        {name:'🌍 Everyone — players and NPCs together',value:'all'}))
     .addStringOption(o=>o.setName('amount').setDescription('How much to restore (default: full)').setRequired(false)
       .addChoices(
         {name:'❤️ Full — restore to maximum',value:'full'},
@@ -7821,8 +7831,10 @@ async function handleGmHeal(interaction) {
 
   const targetUser = interaction.options.getUser('user');
   const npcArg = (interaction.options.getString('npc') || '').trim();
-  if (!!targetUser === !!npcArg)
-    return interaction.reply({ content: '❌ Pick exactly one of `user` or `npc`.', ephemeral: true });
+  const scope = interaction.options.getString('global');
+  const named = [targetUser, npcArg || null, scope || null].filter(Boolean).length;
+  if (named !== 1)
+    return interaction.reply({ content: '❌ Pick exactly one of `user`, `npc` or `global`.', ephemeral: true });
 
   const amount = interaction.options.getString('amount') || 'full';
   const restore = interaction.options.getString('restore') || 'hp';
@@ -7838,6 +7850,63 @@ async function handleGmHeal(interaction) {
     if (amount === 'sub') return cur - value;           // may go negative — GM's call
     return Math.min(max, value);                        // exact
   };
+
+  // ── Everyone at once ──
+  // Deliberately does not skip quest parties the way scheduled recovery does:
+  // a GM typing this has decided to heal the room, and a silent exclusion would
+  // be a nasty surprise mid-session.
+  if (scope) {
+    await interaction.deferReply();
+    const cfg0 = getConfig(gid);
+    const maxCharges0 = cfg0.heal_charges ?? 3;
+    const lines = [];
+    let players = 0, npcs = 0;
+
+    if (scope === 'players' || scope === 'all') {
+      const sheets = db.prepare('SELECT * FROM characters WHERE guild_id=?').all(gid);
+      for (const ch of sheets) {
+        const nm = await getDisplayName(interaction.guild, ch.user_id);
+        const bits = [];
+        if (restore === 'hp' || restore === 'all') {
+          const max = maxHp(ch, gid), before = ch.hp_current ?? 0, after = compute(before, max);
+          setFighterHp(gid, ch.user_id, after);
+          bits.push(`❤️ ${before}→${after}`);
+        }
+        if (restore === 'rerolls' || restore === 'all') {
+          const max = maxRerolls(ch), before = ch.rerolls_current ?? 0, after = Math.max(0, compute(before, max));
+          upsertChar(gid, ch.user_id, { rerolls_current: after });
+          bits.push(`🔄 ${before}→${after}`);
+        }
+        if ((restore === 'charges' || restore === 'all') && isWhiteKnight(ch)) {
+          const before = getHealCharges(gid, ch.user_id, maxCharges0).current;
+          const after = Math.max(0, compute(before, maxCharges0));
+          setHealCharges(gid, ch.user_id, after);
+          bits.push(`🛡️ ${before}→${after}`);
+        }
+        if (bits.length) { players++; lines.push(`**${nm}** — ${bits.join(' · ')}`); }
+      }
+    }
+
+    if (scope === 'npcs' || scope === 'all') {
+      if (restore !== 'hp' && restore !== 'all' && scope === 'npcs') {
+        return interaction.editReply({ content: '❌ NPCs only have HP — use `restore:HP only`.' });
+      }
+      for (const npc of getAllNpcs(gid)) {
+        const max = maxHpFromCon(gid, npc.con), before = npc.hp_current ?? 0, after = compute(before, max);
+        setFighterHp(gid, npcFighterId(npc.name), after);
+        npcs++;
+        lines.push(`🎭 **${npc.name}** — ❤️ ${before}→${after} / ${max}`);
+      }
+    }
+
+    if (!lines.length) return interaction.editReply({ content: '❌ Nothing to restore — no sheets or NPCs on this server.' });
+    const what = scope === 'players' ? `${players} player${players === 1 ? '' : 's'}`
+               : scope === 'npcs' ? `${npcs} NPC${npcs === 1 ? '' : 's'}`
+               : `${players} player${players === 1 ? '' : 's'} and ${npcs} NPC${npcs === 1 ? '' : 's'}`;
+    const head = `✨ **Restored ${what}** — ${amount === 'full' ? 'to full' : amount === 'half' ? 'to half' : `${amount} ${value}`}`
+      + (restore === 'all' ? ' (HP, rerolls and heal charges)' : restore === 'hp' ? ' (HP)' : ` (${restore})`);
+    return replyLong(interaction, [head, '', ...lines]);
+  }
 
   // ── NPC(s) ──
   if (npcArg) {
