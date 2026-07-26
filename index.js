@@ -118,6 +118,17 @@ try {
   )`);
 } catch (e) { console.error('history schema', e); }
 try { db.exec('ALTER TABLE characters ADD COLUMN merits INTEGER DEFAULT 0'); } catch {}
+// Renown is a currency: earned from quests, encounters and activities, and spent
+// again. Merits are a lifetime tally that only ever climbs, so the two can't
+// share a column.
+try { db.exec('ALTER TABLE characters ADD COLUMN renown INTEGER DEFAULT 0'); } catch {}
+// Writing and deleting activities is always GM-only; this decides whether
+// players may start one themselves. Locked to GMs until a server says otherwise.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN activity_players INTEGER DEFAULT 0'); } catch {}
+try { db.exec(`CREATE TABLE IF NOT EXISTS renown_log (
+  guild_id TEXT NOT NULL, user_id TEXT NOT NULL, delta INTEGER NOT NULL,
+  reason TEXT, at INTEGER NOT NULL
+)`); } catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN rank_name TEXT'); } catch {}
 try {
   db.exec(`CREATE TABLE IF NOT EXISTS ranks (
@@ -168,6 +179,33 @@ db.exec(`
     wis INTEGER DEFAULT 0, lck INTEGER DEFAULT 0,
     hp_current INTEGER DEFAULT 0, rerolls_current INTEGER DEFAULT 0, profile_enabled INTEGER DEFAULT 1,
     PRIMARY KEY (guild_id, user_id)
+  );
+  CREATE TABLE IF NOT EXISTS stories (
+    guild_id TEXT NOT NULL, name TEXT NOT NULL, author_id TEXT,
+    start_scene TEXT NOT NULL DEFAULT 'start', tally TEXT, created_at INTEGER,
+    PRIMARY KEY (guild_id, name)
+  );
+  CREATE TABLE IF NOT EXISTS story_scenes (
+    guild_id TEXT NOT NULL, story TEXT NOT NULL, scene TEXT NOT NULL,
+    say TEXT, npc TEXT, roll TEXT, dc INTEGER,
+    outcomes TEXT NOT NULL DEFAULT '{}',
+    ranges TEXT NOT NULL DEFAULT '[]',
+    choices TEXT NOT NULL DEFAULT '[]',
+    gauntlet TEXT, nat20 TEXT, nat1 TEXT,
+    gain INTEGER NOT NULL DEFAULT 0, cash_tally INTEGER NOT NULL DEFAULT 0,
+    ending INTEGER NOT NULL DEFAULT 0,
+    merits INTEGER NOT NULL DEFAULT 0, rewards TEXT,
+    ord INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (guild_id, story, scene)
+  );
+  CREATE TABLE IF NOT EXISTS story_runs (
+    guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+    story TEXT NOT NULL, scene TEXT NOT NULL,
+    started_by TEXT, started_at INTEGER,
+    took_part TEXT NOT NULL DEFAULT '[]',
+    tally_state TEXT NOT NULL DEFAULT '{}',
+    gauntlet_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (guild_id, channel_id)
   );
   CREATE TABLE IF NOT EXISTS autorest_schedules (
     guild_id TEXT NOT NULL, name TEXT NOT NULL,
@@ -347,6 +385,22 @@ function getMerits(gid, uid) {
   return getChar(gid, uid)?.merits ?? 0;
 }
 // Change a player's merit total by delta (can be negative). Ensures a character row exists.
+// Move a player's renown and record why. Returns the new balance, or null when
+// a spend is refused for want of funds.
+function addRenown(gid, uid, delta, reason = null, { allowNegative = false } = {}) {
+  const cur = getChar(gid, uid)?.renown ?? 0;
+  const next = cur + delta;
+  if (next < 0 && !allowNegative) return null;
+  upsertChar(gid, uid, { renown: Math.max(0, next) });
+  db.prepare('INSERT INTO renown_log (guild_id,user_id,delta,reason,at) VALUES (?,?,?,?,?)')
+    .run(gid, uid, delta, reason, Date.now());
+  return Math.max(0, next);
+}
+function getRenown(gid, uid) { return getChar(gid, uid)?.renown ?? 0; }
+function renownHistory(gid, uid, limit = 15) {
+  return db.prepare('SELECT * FROM renown_log WHERE guild_id=? AND user_id=? ORDER BY at DESC LIMIT ?').all(gid, uid, limit);
+}
+
 function addMerits(gid, uid, delta) {
   const ch = getChar(gid, uid);
   const cur = ch?.merits ?? 0;
@@ -464,6 +518,460 @@ function getHealCharges(gid, uid, max) {
 function setHealCharges(gid, uid, cur) {
   db.prepare('INSERT OR REPLACE INTO heal_charges (guild_id,user_id,current) VALUES (?,?,?)').run(gid, uid, cur);
 }
+// ── Story engine ──────────────────────────────────────────────────────────────
+// A scenario is a set of named scenes. A scene narrates, asks for a roll, and
+// branches on the outcome; an ending stops the run and hands out rewards.
+//
+// Branches key off the same bands as a `?` success check, so a story reads the
+// way the rest of the bot already rolls. Merits are awarded automatically to
+// everyone who took part; anything else a GM writes is announced for them to
+// hand out by hand, exactly as quest rewards work — that way an ending can give
+// "2 merits" or "a tarnished silver key" without the bot needing to model items.
+const STORY_BANDS = ['CRIT', 'PASS', 'PARTIAL', 'FAIL', 'FUMBLE'];
+const STORY_BAND_LABEL = { CRIT: '🌟 Critical Success', PASS: '✅ Success', PARTIAL: '⚡ Partial Success', FAIL: '❌ Fail', FUMBLE: '💀 Critical Fail' };
+
+// Map a rolled result onto a branch, falling back sensibly when a story doesn't
+// define every band: a crit reads as a pass, a fumble as a fail.
+function storyBandFor(outcomes, total, nat, sides) {
+  const res = getSuccessResult(total, nat, sides);
+  const order = res.crit === 'crit' ? ['CRIT', 'PASS']
+              : res.crit === 'fail' ? ['FUMBLE', 'FAIL']
+              : res.label === 'Success' ? ['PASS']
+              : res.label === 'Partial Success' ? ['PARTIAL', 'PASS']
+              : ['FAIL'];
+  for (const b of order) if (outcomes[b]) return { band: b, res };
+  return { band: null, res };
+}
+
+function getStory(gid, name) {
+  return db.prepare('SELECT * FROM stories WHERE guild_id=? AND name=? COLLATE NOCASE').get(gid, name);
+}
+function listStories(gid) {
+  return db.prepare('SELECT * FROM stories WHERE guild_id=? ORDER BY name').all(gid);
+}
+function getScene(gid, story, scene) {
+  return db.prepare('SELECT * FROM story_scenes WHERE guild_id=? AND story=? COLLATE NOCASE AND scene=? COLLATE NOCASE').get(gid, story, scene);
+}
+function listScenes(gid, story) {
+  return db.prepare('SELECT * FROM story_scenes WHERE guild_id=? AND story=? COLLATE NOCASE ORDER BY ord').all(gid, story);
+}
+function deleteStory(gid, name) {
+  db.prepare('DELETE FROM story_scenes WHERE guild_id=? AND story=? COLLATE NOCASE').run(gid, name);
+  return db.prepare('DELETE FROM stories WHERE guild_id=? AND name=? COLLATE NOCASE').run(gid, name).changes > 0;
+}
+function getRun(gid, cid) {
+  return db.prepare('SELECT * FROM story_runs WHERE guild_id=? AND channel_id=?').get(gid, cid);
+}
+function setRun(gid, cid, fields) {
+  const ex = getRun(gid, cid);
+  if (!ex) db.prepare('INSERT INTO story_runs (guild_id, channel_id, story, scene) VALUES (?,?,?,?)')
+    .run(gid, cid, fields.story ?? '', fields.scene ?? '');
+  const keys = Object.keys(fields || {});
+  if (keys.length) db.prepare(`UPDATE story_runs SET ${keys.map(k => `${k}=?`).join(',')} WHERE guild_id=? AND channel_id=?`)
+    .run(...keys.map(k => fields[k]), gid, cid);
+  return getRun(gid, cid);
+}
+function endRun(gid, cid) {
+  db.prepare('DELETE FROM story_runs WHERE guild_id=? AND channel_id=?').run(gid, cid);
+}
+
+// Parse a pasted activity script. Returns { name, start, tally, scenes[] }
+// or { error }. The format grew out of a fishing loop, so it has to express:
+// difficulty classes, ranges on the natural die, a random pick between flavour
+// lines, a run of descending rolls, natural-20/1 overrides, plain button
+// choices with no roll at all, and a tally that accumulates across a loop and
+// cashes out at the end.
+function parseStoryScript(text) {
+  const lines = String(text || '').split(/\r?\n/);
+  const head = lines.findIndex(l => /^\s*\[(STORY|ACTIVITY)\]/i.test(l));
+  if (head === -1) return { error: 'No `[ACTIVITY] Name` line found.' };
+  const name = lines[head].replace(/^\s*\[(STORY|ACTIVITY)\]\s*/i, '').trim();
+  if (!name) return { error: 'Give it a name on the `[ACTIVITY]` line.' };
+
+  const scenes = [];
+  let cur = null, tally = null, oneOfInto = null;
+  const flush = () => { if (cur) { cur.say = (cur.say || '').trim(); scenes.push(cur); } cur = null; oneOfInto = null; };
+
+  for (const raw of lines.slice(head + 1)) {
+    const line = raw.trim();
+    if (!line) { oneOfInto = null; continue; }
+    let m;
+
+    if ((m = line.match(/^TALLY\s+(\w+)/i))) { tally = m[1].toLowerCase(); continue; }
+
+    if ((m = line.match(/^SCENE\s+(\S+)/i))) {
+      flush();
+      cur = { scene: m[1], say: '', npc: null, roll: null, dc: null, gauntlet: null,
+              outcomes: {}, ranges: [], choices: [], gain: 0, nat20: null, nat1: null,
+              ending: 0, merits: 0, rewards: null, cashTally: 0 };
+      continue;
+    }
+    if (!cur) continue;
+
+    // A bare line while collecting a ONE OF block is another flavour variant.
+    // A bare line inside a ONE OF block is another variant — but a band name
+    // ends the block, so `FAIL -> find` after `FAIL ONE OF` still branches.
+    if (oneOfInto && !new RegExp(`^(SAY|AS|ROLL|GAUNTLET|CHOICE|GAIN|END|NAT20|NAT1|SCENE|TALLY|${STORY_BANDS.join('|')}|\\d)\\b`, 'i').test(line)) {
+      oneOfInto.push(line); continue;
+    }
+    oneOfInto = null;
+
+    if ((m = line.match(/^SAY\s+([\s\S]*)$/i)))  { cur.say += (cur.say ? '\n' : '') + m[1]; continue; }
+    if ((m = line.match(/^AS\s+(.+)$/i)))        { cur.npc = m[1].trim(); continue; }
+
+    // ROLL str|dex|wis DC15   — the roller picks from the offered stats.
+    if ((m = line.match(/^ROLL\s+([a-z|]+)(?:\s+DC\s*(\d+))?\s*$/i))) {
+      cur.roll = m[1].toLowerCase();
+      if (m[2]) cur.dc = parseInt(m[2]);
+      continue;
+    }
+    // A run of rolls, each with its own DC. Two forms:
+    //   GAUNTLET str|con 14 12 10           same stats every step
+    //   GAUNTLET 14:str 12:str|con 10:dex   a different check each step
+    if ((m = line.match(/^GAUNTLET\s+([a-z|]+)\s+([\d\s]+)$/i))) {
+      cur.roll = m[1].toLowerCase();
+      cur.gauntlet = m[2].trim().split(/\s+/).map(Number).filter(Number.isFinite)
+        .map(dc => ({ dc, stats: cur.roll }));
+      continue;
+    }
+    if ((m = line.match(/^GAUNTLET\s+((?:\d+:[a-z|]+\s*)+)$/i))) {
+      cur.gauntlet = m[1].trim().split(/\s+/).map(tok => {
+        const [dc, stats] = tok.split(':');
+        return { dc: parseInt(dc), stats: String(stats || '').toLowerCase() };
+      });
+      // The scene's roll line becomes the union, so validation and `show` have
+      // something to work from even when every step differs.
+      cur.roll = [...new Set(cur.gauntlet.flatMap(g => g.stats.split('|')))].join('|');
+      continue;
+    }
+    if ((m = line.match(/^GAIN\s+(\w+)\s+(-?\d+)/i))) {
+      if (tally && m[1].toLowerCase() !== tally) return { error: `\`GAIN ${m[1]}\` but the tally is called \`${tally}\`.` };
+      cur.gain = parseInt(m[2]); continue;
+    }
+    if (/^CHOICE\s*$/i.test(line)) { cur.isChoice = true; continue; }
+    if (cur.isChoice && (m = line.match(/^(.+?)\s*->\s*(\S+)\s*$/))) {
+      cur.choices.push({ label: m[1].trim(), next: m[2] }); continue;
+    }
+    if ((m = line.match(/^NAT20\s+(.*?)\s*->\s*(\S+)\s*$/i))) { cur.nat20 = { text: m[1].trim(), next: m[2] }; continue; }
+    if ((m = line.match(/^NAT1\s+(.*?)\s*->\s*(\S+)\s*$/i)))  { cur.nat1  = { text: m[1].trim(), next: m[2] }; continue; }
+
+    if ((m = line.match(/^END\b\s*(.*)$/i))) {
+      cur.ending = 1;
+      let rest = m[1] || '';
+      if (/TALLY/i.test(rest)) { cur.cashTally = 1; rest = rest.replace(/TALLY\s*\w*/i, ''); }
+      const mm = rest.match(/merits:\s*(\d+)/i);
+      if (mm) cur.merits = parseInt(mm[1]);
+      const rw = rest.replace(/merits:\s*\d+/i, '').replace(/^\s*rewards:\s*/i, '').trim();
+      if (rw) cur.rewards = rw;
+      continue;
+    }
+
+    // Numeric range on the natural die: "1-5 Small fry. -> fight_small"
+    if ((m = line.match(/^(\d+)\s*(?:-|–|to)\s*(\d+|\+)?\s*(.*?)\s*->\s*(\S+)\s*$/i))
+        || (m = line.match(/^(\d+)\s*(\+)\s*(.*?)\s*->\s*(\S+)\s*$/))) {
+      const lo = parseInt(m[1]);
+      // 9999 rather than Infinity: this is stored as JSON, and JSON has no way
+      // to represent Infinity — it serialises to null and the range dies.
+      const hi = (!m[2] || m[2] === '+') ? 9999 : parseInt(m[2]);
+      cur.ranges.push({ lo, hi, text: (m[3] || '').trim(), next: m[4] });
+      continue;
+    }
+
+    // Band outcome, optionally opening a ONE OF block of flavour variants.
+    if ((m = line.match(new RegExp(`^(${STORY_BANDS.join('|')})\\s+ONE OF\\s*$`, 'i')))) {
+      const band = m[1].toUpperCase();
+      cur.outcomes[band] = cur.outcomes[band] || { text: '', variants: [], next: null };
+      oneOfInto = (cur.outcomes[band].variants = cur.outcomes[band].variants || []);
+      continue;
+    }
+    if ((m = line.match(new RegExp(`^(${STORY_BANDS.join('|')})\\s*->\\s*(\\S+)\\s*$`, 'i')))) {
+      const band = m[1].toUpperCase();
+      cur.outcomes[band] = Object.assign(cur.outcomes[band] || { text: '', variants: [] }, { next: m[2] });
+      continue;
+    }
+    if ((m = line.match(new RegExp(`^(${STORY_BANDS.join('|')})\\s+([\\s\\S]*?)\\s*->\\s*(\\S+)\\s*$`, 'i')))) {
+      const band = m[1].toUpperCase();
+      cur.outcomes[band] = Object.assign(cur.outcomes[band] || { variants: [] },
+        { text: m[2].trim(), next: m[3] });
+      continue;
+    }
+    cur.say += (cur.say ? '\n' : '') + line;
+  }
+  flush();
+
+  if (!scenes.length) return { error: 'No `SCENE` blocks found.' };
+  const names = scenes.map(sc => sc.scene.toLowerCase());
+  const dupe = names.find((v, i) => names.indexOf(v) !== i);
+  if (dupe) return { error: `Two scenes are both called \`${dupe}\`.` };
+
+  const targets = (sc) => [
+    ...Object.values(sc.outcomes).map(o => o.next),
+    ...sc.ranges.map(r => r.next), ...sc.choices.map(c => c.next),
+    sc.nat20?.next, sc.nat1?.next,
+  ].filter(Boolean);
+
+  for (const sc of scenes) {
+    for (const t of targets(sc)) {
+      if (!names.includes(String(t).toLowerCase())) {
+        return { error: `Scene \`${sc.scene}\` points at \`${t}\`, which doesn't exist.` };
+      }
+    }
+    const asks = sc.roll || sc.choices.length;
+    if (!sc.ending && !asks) return { error: `Scene \`${sc.scene}\` has no \`ROLL\`, \`CHOICE\` or \`END\` — a run would stop there.` };
+    if (sc.roll && !targets(sc).length) return { error: `Scene \`${sc.scene}\` asks for a roll but nothing follows it.` };
+    if (sc.isChoice && !sc.choices.length) return { error: `Scene \`${sc.scene}\` has a \`CHOICE\` with no options.` };
+    if (sc.gauntlet && sc.gauntlet.length > 8) return { error: `Scene \`${sc.scene}\` has a gauntlet of ${sc.gauntlet.length} rolls — 8 is the most.` };
+    for (const g of (sc.gauntlet || [])) {
+      if (!Number.isFinite(g.dc)) return { error: `Scene \`${sc.scene}\` has a gauntlet step with no DC.` };
+      for (const st of String(g.stats || '').split('|').filter(Boolean)) {
+        if (!resolveStatWord(st)) return { error: `Scene \`${sc.scene}\` rolls \`${st}\` in its gauntlet, which isn't a stat.` };
+      }
+    }
+    for (const st of String(sc.roll || '').split('|').filter(Boolean)) {
+      if (!resolveStatWord(st) && !/^\d+d\d+/.test(st)) return { error: `Scene \`${sc.scene}\` rolls \`${st}\`, which isn't a stat.` };
+    }
+  }
+  if (scenes.some(sc => sc.cashTally || sc.gain) && !tally) {
+    return { error: 'Add a `TALLY renown` line at the top — a scene gains or cashes out a tally that has no name.' };
+  }
+  return { name, start: scenes[0].scene, tally, scenes };
+}
+
+function saveStory(gid, uid, parsed) {
+  db.prepare('DELETE FROM story_scenes WHERE guild_id=? AND story=? COLLATE NOCASE').run(gid, parsed.name);
+  db.prepare(`INSERT INTO stories (guild_id, name, author_id, start_scene, tally, created_at) VALUES (?,?,?,?,?,?)
+              ON CONFLICT(guild_id, name) DO UPDATE SET author_id=excluded.author_id, start_scene=excluded.start_scene, tally=excluded.tally`)
+    .run(gid, parsed.name, uid, parsed.start, parsed.tally ?? null, Date.now());
+  const ins = db.prepare(`INSERT INTO story_scenes
+    (guild_id, story, scene, say, npc, roll, dc, outcomes, ranges, choices, gauntlet, nat20, nat1, gain, cash_tally, ending, merits, rewards, ord)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  parsed.scenes.forEach((sc, i) => ins.run(gid, parsed.name, sc.scene, sc.say || null, sc.npc, sc.roll, sc.dc ?? null,
+    JSON.stringify(sc.outcomes), JSON.stringify(sc.ranges || []), JSON.stringify(sc.choices || []),
+    sc.gauntlet ? JSON.stringify(sc.gauntlet) : null,
+    sc.nat20 ? JSON.stringify(sc.nat20) : null, sc.nat1 ? JSON.stringify(sc.nat1) : null,
+    sc.gain || 0, sc.cashTally || 0, sc.ending, sc.merits, sc.rewards, i));
+  return listScenes(gid, parsed.name).length;
+}
+
+// Render one scene: narration, then whatever it asks for — a roll (with the
+// stats it accepts), a plain choice of buttons, or an ending.
+async function postScene(guild, cid, run, sc) {
+  const gid = guild.id;
+  const channel = await guild.client.channels.fetch(cid);
+  const lines = [];
+  if (sc.say) lines.push(sc.say);
+
+  if (sc.npc && sc.say) {
+    // Speak in the NPC's voice where the script asked for one; if that NPC has
+    // no webhook the narration just stays in the bot's own voice.
+    try {
+      const npc = getNpc(gid, sc.npc);
+      const hook = await npcWebhookIn(channel, gid, sc.npc, npc?.image_url ?? null);
+      if (hook) { await hook.send({ content: sc.say }); lines.length = 0; }
+    } catch (err) { console.error('[activity] npc voice failed:', err?.message || err); }
+  }
+
+  const story = getStory(gid, run.story);
+  const tallyName = story?.tally || null;
+  const tallyState = JSON.parse(run.tally_state || '{}');
+
+  if (sc.ending) {
+    const took = JSON.parse(run.took_part || '[]');
+    lines.push('', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    if (sc.merits > 0 && took.length) {
+      for (const uid of took) addMerits(gid, uid, sc.merits);
+      lines.push(`🏅 **${sc.merits} merit${sc.merits === 1 ? '' : 's'}** to ${took.map(u => `<@${u}>`).join(', ')}.`);
+    }
+    // Cash the tally out to whoever earned it.
+    if (sc.cash_tally && tallyName) {
+      const paid = [];
+      for (const [uid, amt] of Object.entries(tallyState)) {
+        if (!amt) continue;
+        const bal = addRenown(gid, uid, amt, `${run.story}`);
+        paid.push(`<@${uid}> **+${amt}**${bal !== null ? ` (now ${bal})` : ''}`);
+      }
+      lines.push(paid.length ? `💠 **${tallyName}** earned — ${paid.join(', ')}` : `💠 No ${tallyName} earned this time.`);
+    }
+    if (sc.rewards) lines.push(`🎁 **For the GM to hand out:** ${sc.rewards}`);
+    endRun(gid, cid);
+    await sendLong(channel, lines);
+    return;
+  }
+
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  const choices = JSON.parse(sc.choices || '[]');
+  if (choices.length) {
+    const row = new ActionRowBuilder().addComponents(...choices.slice(0, 5).map((c, k) =>
+      new ButtonBuilder().setCustomId(`storypick:${sc.scene}:${k}`).setLabel(c.label.slice(0, 78)).setStyle(ButtonStyle.Secondary)));
+    await postWithButtons(channel, lines, row);
+    return;
+  }
+
+  // A roll. Offer one button per stat the scene accepts, and say what's needed.
+  const gauntlet = sc.gauntlet ? JSON.parse(sc.gauntlet) : null;
+  let stepStats = String(sc.roll || '');
+  if (gauntlet) {
+    const step = Number(run.gauntlet_at) || 0;
+    const g = gauntlet[step] || {};
+    lines.push('', `🎣 **Keep at it** — roll ${step + 1} of ${gauntlet.length}, **DC ${g.dc}**.`);
+    stepStats = String(g.stats || sc.roll || '');
+  } else if (sc.dc) {
+    lines.push('', `🎲 Roll **DC ${sc.dc}**.`);
+  } else {
+    lines.push('', '🎲 Roll.');
+  }
+  const stats = stepStats.split('|').filter(Boolean);
+  lines.push(`_Anyone here can answer${stats.length > 1 ? ` — pick ${stats.map(x => (resolveStatWord(x) || x).toUpperCase()).join(', ')}` : ''}._`);
+  const row = new ActionRowBuilder().addComponents(...stats.slice(0, 5).map(st =>
+    new ButtonBuilder().setCustomId(`storyroll:${sc.scene}:${st}`)
+      .setLabel(`Roll ${(resolveStatWord(st) || st).toUpperCase()}`).setStyle(ButtonStyle.Primary)));
+  await postWithButtons(channel, lines, row);
+}
+
+// Send the narration, hanging the buttons off the final chunk.
+async function postWithButtons(channel, lines, row) {
+  const chunks = chunkLines(lines.length ? lines : ['…']);
+  for (const c of chunks.slice(0, -1)) await channel.send(c).catch(()=>{});
+  await channel.send({ content: chunks[chunks.length - 1], components: [row] }).catch(()=>{});
+}
+
+// Shared guard: is there a live run here, still on the scene this button came
+// from, and may this person take part?
+function activeSceneFor(interaction, sceneName) {
+  const gid = interaction.guild.id, cid = interactionChannelId(interaction), uid = interaction.user.id;
+  const run = getRun(gid, cid);
+  if (!run) return { error: '❌ Nothing is running here.' };
+  if (String(run.scene).toLowerCase() !== String(sceneName).toLowerCase()) {
+    return { error: '⏰ That moment has already passed.' };
+  }
+  const gate = sheetGate(gid, uid);
+  if (gate) return { error: gate };
+  const ch = getChar(gid, uid);
+  if (!ch) return { error: '❌ You need a character sheet to take part — `/char create`.' };
+  const sc = getScene(gid, run.story, run.scene);
+  if (!sc) { endRun(gid, cid); return { error: '❌ That scene has gone missing; the run has stopped.' }; }
+  return { gid, cid, uid, run, ch, sc };
+}
+
+async function advance(interaction, ctx, nextName, took, tallyState, gauntletAt = 0) {
+  const { gid, cid, uid, run } = ctx;
+  const next = getScene(gid, run.story, nextName);
+  if (!next) { endRun(gid, cid); return; }
+  // Credit the arriving scene's GAIN to whoever got them there.
+  if (next.gain) tallyState[uid] = (tallyState[uid] || 0) + next.gain;
+  if (uid && !took.includes(uid)) took.push(uid);
+  const updated = setRun(gid, cid, { scene: next.scene, took_part: JSON.stringify(took),
+    tally_state: JSON.stringify(tallyState), gauntlet_at: gauntletAt });
+  await new Promise(r => setTimeout(r, 900));
+  await postScene(interaction.guild, cid, updated, next);
+}
+
+// A plain choice — no dice, just a fork.
+async function handleStoryPickButton(interaction) {
+  const [, sceneName, idx] = interaction.customId.split(':');
+  const ctx = activeSceneFor(interaction, sceneName);
+  if (ctx.error) return interaction.reply({ content: ctx.error, ephemeral: true });
+  const choices = JSON.parse(ctx.sc.choices || '[]');
+  const pick = choices[Number(idx)];
+  if (!pick) return interaction.reply({ content: '❌ That option has gone.', ephemeral: true });
+  const name = await getDisplayName(interaction.guild, ctx.uid);
+  await interaction.reply({ content: `➡️ **${name}** — ${pick.label}` });
+  try { await interaction.message.edit({ components: [] }); } catch {}
+  const took = JSON.parse(ctx.run.took_part || '[]');
+  await advance(interaction, ctx, pick.next, took, JSON.parse(ctx.run.tally_state || '{}'), 0);
+}
+
+// A roll. Anyone in the channel may answer; the only gate is that the run is
+// still on this scene.
+async function handleStoryRollButton(interaction) {
+  const [, sceneName, statWord] = interaction.customId.split(':');
+  const ctx = activeSceneFor(interaction, sceneName);
+  if (ctx.error) return interaction.reply({ content: ctx.error, ephemeral: true });
+  const { gid, cid, uid, run, ch, sc } = ctx;
+
+  const stat = resolveStatWord(statWord);
+  const mod = stat ? (ch[stat] ?? 0) : 0;
+  const mode = stat ? applySignatureMode(ch, stat, 'normal') : 'normal';
+  const result = mode === 'adv' ? rollAdvantage(`1d20+${mod}`)
+               : mode === 'dis' ? rollDisadvantage(`1d20+${mod}`)
+               : rollNotation(`1d20+${mod}`);
+  if (!result) return interaction.reply({ content: `❌ \`${statWord}\` isn't a stat.`, ephemeral: true });
+  const nat = mode === 'normal' ? result.rolls?.[0] : result.chosen;
+  const sides = result.sides ?? 20;
+  const name = await getDisplayName(interaction.guild, uid);
+  const label = (stat || statWord).toUpperCase();
+
+  mirrorRoll(gid, { userId: uid, channelId: cid, interaction,
+    input: `${run.story} · ${run.scene}`, rollLine: buildRollLine(result, mode, detectCrit(result, mode), null),
+    context: `activity roll (${label})` });
+
+  const took = JSON.parse(run.took_part || '[]');
+  if (!took.includes(uid)) took.push(uid);
+  // GAIN is credited on arrival by advance(), not here, or a scene reached by a
+  // choice would never pay and a scene with a roll would pay twice.
+  const tallyState = JSON.parse(run.tally_state || '{}');
+
+  const gauntlet = sc.gauntlet ? JSON.parse(sc.gauntlet) : null;
+  const ranges = JSON.parse(sc.ranges || '[]');
+  const outcomes = JSON.parse(sc.outcomes || '{}');
+  const nat20 = sc.nat20 ? JSON.parse(sc.nat20) : null;
+  const nat1 = sc.nat1 ? JSON.parse(sc.nat1) : null;
+  const lines = [`🎲 **${name}** rolls **${label}** — ${fightTotalStr(result.total, nat, sides)}`];
+
+  const finish = async (text, next, gaAt = 0) => {
+    if (text) lines.push('', text);
+    await interaction.reply({ content: lines.join('\n') });
+    try { await interaction.message.edit({ components: [] }); } catch {}
+    if (next) await advance(interaction, ctx, next, took, tallyState, gaAt);
+    else setRun(gid, cid, { took_part: JSON.stringify(took), tally_state: JSON.stringify(tallyState) });
+  };
+  // A ONE OF block picks a different line each time, so a loop doesn't repeat.
+  const flavour = (o) => (o?.variants?.length ? o.variants[Math.floor(Math.random() * o.variants.length)] : (o?.text || ''));
+
+  // Natural 20 / 1 override everything else where the script defines them.
+  if (nat === sides && nat20) return finish(nat20.text, nat20.next, 0);
+  if (nat === 1 && nat1) return finish(nat1.text, nat1.next, 0);
+
+  if (gauntlet) {
+    const step = Number(run.gauntlet_at) || 0;
+    const need = gauntlet[step]?.dc ?? 0;
+    if (result.total >= need) {
+      const last = step + 1 >= gauntlet.length;
+      if (!last) {
+        lines.push('', `✅ **${result.total}** beats DC ${need} — it's still fighting. ${gauntlet.length - step - 1} to go.`);
+        await interaction.reply({ content: lines.join('\n') });
+        try { await interaction.message.edit({ components: [] }); } catch {}
+        const updated = setRun(gid, cid, { took_part: JSON.stringify(took),
+          tally_state: JSON.stringify(tallyState), gauntlet_at: step + 1 });
+        await new Promise(r => setTimeout(r, 700));
+        return postScene(interaction.guild, cid, updated, sc);
+      }
+      const o = outcomes.PASS;
+      return finish(`✅ **${result.total}** beats DC ${need}. ${flavour(o)}`, o?.next, 0);
+    }
+    const o = outcomes.FAIL;
+    return finish(`❌ **${result.total}** misses DC ${need}. ${flavour(o)}`, o?.next, 0);
+  }
+
+  if (ranges.length) {
+    const hit = ranges.find(r => result.total >= r.lo && result.total <= r.hi);
+    if (hit) return finish(hit.text, hit.next, 0);
+    return finish('*Nothing in the script covers that total.*', null);
+  }
+
+  if (sc.dc) {
+    const band = result.total >= sc.dc ? 'PASS' : 'FAIL';
+    const o = outcomes[band];
+    if (!o) return finish('*That branch is missing from the script.*', null);
+    return finish(`${band === 'PASS' ? '✅' : '❌'} **${result.total}** vs DC ${sc.dc}. ${flavour(o)}`, o.next, 0);
+  }
+
+  const { band, res } = storyBandFor(outcomes, result.total, nat, sides);
+  lines[0] += `  ${res.emoji} **${res.label}**`;
+  if (!band) return finish('*Nothing in the script answers to that.*', null);
+  return finish(flavour(outcomes[band]), outcomes[band].next, 0);
+}
+
 // ── Scheduled recovery ────────────────────────────────────────────────────────
 // A guild can run any number of named schedules, each with its own interval and
 // its own strength. "half HP every 6 hours" and "everything back every 24" can
@@ -1559,6 +2067,24 @@ const KNIGHTS = ['White Knight','Black Knight','Gold Knight','Grey Knight','Blue
 
 const slashCommands = [
   new SlashCommandBuilder()
+    .setName('activity').setDescription('Run a minigame written for this server')
+    .addSubcommand(s=>s.setName('list').setDescription('Every activity on this server'))
+    .addSubcommand(s=>s.setName('show').setDescription('Read an activity scene by scene')
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true)))
+    .addSubcommand(s=>s.setName('run').setDescription('Start an activity in this channel')
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true)))
+    .addSubcommand(s=>s.setName('stop').setDescription('Stop the activity running in this channel'))
+    .addSubcommand(s=>s.setName('delete').setDescription('Delete an activity (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true)))
+    .addSubcommand(s=>s.setName('set').setDescription('Tweak one line of one scene without re-pasting (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true))
+      .addStringOption(o=>o.setName('scene').setDescription('Scene name').setRequired(true))
+      .addStringOption(o=>o.setName('field').setDescription('What to change').setRequired(true)
+        .addChoices({name:'Narration (SAY)',value:'say'},{name:'Speak as NPC',value:'npc'},{name:'Roll',value:'roll'},
+                    {name:'Merits on ending',value:'merits'},{name:'Rewards text',value:'rewards'}))
+      .addStringOption(o=>o.setName('value').setDescription('New value').setRequired(true))),
+
+  new SlashCommandBuilder()
     .setName('config').setDescription('Server configuration (Admin only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand(s=>s.setName('gmrole').setDescription('Add, remove or list GM roles — several can be set')
@@ -1584,6 +2110,8 @@ const slashCommands = [
       .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored: 100%, 50%, a number, or 0%').setRequired(false))
       .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored: 100%, 50%, a number, or 0%').setRequired(false))
       .addChannelOption(o=>o.setName('channel').setDescription('Announce this schedule here (optional)').setRequired(false)))
+    .addSubcommand(s=>s.setName('activities').setDescription('Who may start an activity — GMs only, or anyone')
+      .addBooleanOption(o=>o.setName('players').setDescription('true = players can start them too (writing stays GM-only)').setRequired(false)))
     .addSubcommand(s=>s.setName('hpbase').setDescription('Flat points added to CON for max HP (default 2, so CON+2)')
       .addIntegerOption(o=>o.setName('base').setDescription('Max HP = CON + this. 3 gives CON+3, 0 gives plain CON').setRequired(false).setMinValue(0).setMaxValue(50)))
     .addSubcommand(s=>s.setName('statallowance').setDescription('Points a player spends building a sheet, and the minimum per stat')
@@ -1915,6 +2443,25 @@ const slashCommands = [
     .addStringOption(o=>o.setName('flavour').setDescription('RP text posted with the roll — *italic* and **bold** work').setRequired(false)),
 
   new SlashCommandBuilder()
+    .setName('renown').setDescription('Renown — the currency earned and spent on quests, encounters and activities')
+    .addSubcommand(s=>s.setName('view').setDescription('Your renown, or another player\'s')
+      .addUserOption(o=>o.setName('user').setDescription('Whose renown').setRequired(false)))
+    .addSubcommand(s=>s.setName('leaderboard').setDescription('Who holds the most renown'))
+    .addSubcommand(s=>s.setName('history').setDescription('Where a player\'s renown came from and went')
+      .addUserOption(o=>o.setName('user').setDescription('Whose history').setRequired(false)))
+    .addSubcommand(s=>s.setName('add').setDescription('Award renown (GM)')
+      .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+      .addIntegerOption(o=>o.setName('amount').setDescription('How much').setRequired(true).setMinValue(1))
+      .addStringOption(o=>o.setName('reason').setDescription('What for').setRequired(false)))
+    .addSubcommand(s=>s.setName('spend').setDescription('Spend renown (GM)')
+      .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+      .addIntegerOption(o=>o.setName('amount').setDescription('How much').setRequired(true).setMinValue(1))
+      .addStringOption(o=>o.setName('reason').setDescription('On what').setRequired(false)))
+    .addSubcommand(s=>s.setName('set').setDescription('Set an exact balance (GM)')
+      .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+      .addIntegerOption(o=>o.setName('amount').setDescription('New balance').setRequired(true).setMinValue(0))),
+
+  new SlashCommandBuilder()
     .setName('merit').setDescription('Track player merit / experience (GM only)')
     .addSubcommand(s=>s.setName('add').setDescription('Award merits to a player (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Player').setRequired(true))
@@ -1993,6 +2540,167 @@ const slashCommands = [
 // ─────────────────────────────────────────────
 //  SLASH HANDLERS
 // ─────────────────────────────────────────────
+
+async function handleRenown(interaction) {
+  const gid = interaction.guild.id;
+  const sub = interaction.options.getSubcommand();
+  const isGmUser = await isGm(interaction.guild, interaction.user.id);
+  const target = interaction.options.getUser('user');
+  const amount = interaction.options.getInteger('amount');
+  const reason = interaction.options.getString('reason') || null;
+
+  if (sub === 'view' || sub === 'history') {
+    const uid = target?.id ?? interaction.user.id;
+    const nm = await getDisplayName(interaction.guild, uid);
+    if (!getChar(gid, uid)) return interaction.reply({ content: `❌ **${nm}** has no character sheet.`, ephemeral: true });
+    if (sub === 'view') return interaction.reply({ content: `💠 **${nm}** — **${getRenown(gid, uid)}** renown.` });
+    const rows = renownHistory(gid, uid);
+    if (!rows.length) return interaction.reply({ content: `💠 **${nm}** has no renown history yet.`, ephemeral: true });
+    return replyLong(interaction, [`💠 **${nm}** — renown history (now **${getRenown(gid, uid)}**)`, '',
+      ...rows.map(r => `${r.delta > 0 ? '➕' : '➖'} **${Math.abs(r.delta)}** · ${r.reason || 'no reason given'} · <t:${Math.floor(r.at/1000)}:R>`)],
+      { ephemeral: true });
+  }
+
+  if (sub === 'leaderboard') {
+    const rows = db.prepare('SELECT user_id, renown FROM characters WHERE guild_id=? AND renown > 0 ORDER BY renown DESC LIMIT 15').all(gid);
+    if (!rows.length) return interaction.reply({ content: '💠 Nobody has any renown yet.', ephemeral: true });
+    const lines = ['💠 **Renown**', ''];
+    for (const [i, r] of rows.entries()) {
+      lines.push(`${['🥇','🥈','🥉'][i] ?? `${i+1}.`} **${await getDisplayName(interaction.guild, r.user_id)}** — ${r.renown}`);
+    }
+    return replyLong(interaction, lines);
+  }
+
+  if (!isGmUser) return interaction.reply({ content: '❌ Only GMs can move renown around.', ephemeral: true });
+  const nm = await getDisplayName(interaction.guild, target.id);
+  if (!getChar(gid, target.id)) return interaction.reply({ content: `❌ **${nm}** has no character sheet.`, ephemeral: true });
+
+  if (sub === 'add') {
+    const now = addRenown(gid, target.id, amount, reason ?? 'awarded by GM');
+    return interaction.reply({ content: `💠 **${nm}** gains **${amount}** renown${reason ? ` — ${reason}` : ''}. Balance: **${now}**.` });
+  }
+  if (sub === 'spend') {
+    const now = addRenown(gid, target.id, -amount, reason ?? 'spent');
+    if (now === null) return interaction.reply({ content: `❌ **${nm}** only has **${getRenown(gid, target.id)}** renown — not enough to spend ${amount}.`, ephemeral: true });
+    return interaction.reply({ content: `💠 **${nm}** spends **${amount}** renown${reason ? ` on ${reason}` : ''}. Balance: **${now}**.` });
+  }
+  if (sub === 'set') {
+    const cur = getRenown(gid, target.id);
+    addRenown(gid, target.id, amount - cur, 'set by GM', { allowNegative: true });
+    return interaction.reply({ content: `💠 **${nm}**'s renown set to **${amount}**.` });
+  }
+}
+
+async function handleStory(interaction) {
+  const gid = interaction.guild.id, cid = interactionChannelId(interaction);
+  const sub = interaction.options.getSubcommand();
+  const isGmUser = await isGm(interaction.guild, interaction.user.id);
+  // Writing, tweaking and deleting always need a GM. Running one is a separate
+  // question, and stays GM-only until a server opens it up.
+  const AUTHORING = ['delete', 'set'];
+  if (AUTHORING.includes(sub) && !isGmUser)
+    return interaction.reply({ content: '❌ Only GMs can write or change activities.', ephemeral: true });
+  if (!isGmUser && !(getConfig(gid)?.activity_players))
+    return interaction.reply({ content: '❌ Activities are GM-led on this server for now. Ask a GM to start one.', ephemeral: true });
+
+  if (sub === 'list') {
+    const all = listStories(gid);
+    if (!all.length) return interaction.reply({ ephemeral: true, content:
+      '🎮 No activities yet. Write one and paste it into any channel I can read — start the message with `[ACTIVITY] Name`.' });
+    return replyLong(interaction, ['🎮 **Activities**', '',
+      ...all.map(st => `• **${st.name}** — ${listScenes(gid, st.name).length} scenes, starts at \`${st.start_scene}\``)], { ephemeral: true });
+  }
+
+  const name = interaction.options.getString('name');
+
+  if (sub === 'stop') {
+    const run = getRun(gid, cid);
+    if (!run) return interaction.reply({ content: '❌ Nothing is running here.', ephemeral: true });
+    endRun(gid, cid);
+    return interaction.reply({ content: `🛑 Stopped **${run.story}**.` });
+  }
+
+  const story = getStory(gid, name);
+  if (!story) return interaction.reply({ content: `❌ No activity called **${name}**.`, ephemeral: true });
+
+  if (sub === 'delete') {
+    return requestConfirm(interaction, `Delete the activity **${story.name}** and all its scenes?`, async () => {
+      deleteStory(gid, story.name);
+      return `🗑️ Deleted **${story.name}**.`;
+    });
+  }
+
+  if (sub === 'show') {
+    const statList = (r) => String(r || '').split('|').filter(Boolean)
+      .map(x => (resolveStatWord(x) || x).toUpperCase()).join(' / ');
+    const lines = [`🎮 **${story.name}** — starts at \`${story.start_scene}\``
+      + (story.tally ? ` · tally: **${story.tally}**` : ''), ''];
+    for (const sc of listScenes(gid, story.name)) {
+      lines.push(`**\`${sc.scene}\`**${sc.npc ? ` · spoken by *${sc.npc}*` : ''}${sc.gain ? ` · 💠 +${sc.gain}` : ''}`);
+      if (sc.say) lines.push(sc.say.split('\n').map(l => `> ${l}`).join('\n'));
+
+      const gauntlet = sc.gauntlet ? JSON.parse(sc.gauntlet) : null;
+      const ranges = JSON.parse(sc.ranges || '[]');
+      const choices = JSON.parse(sc.choices || '[]');
+      const outcomes = JSON.parse(sc.outcomes || '{}');
+
+      if (gauntlet) {
+        const same = gauntlet.every(g => g.stats === gauntlet[0].stats);
+        lines.push(same
+          ? `🎣 gauntlet **${statList(gauntlet[0].stats)}** — DC ${gauntlet.map(g => g.dc).join(' → ')}`
+          : `🎣 gauntlet — ${gauntlet.map(g => `DC ${g.dc} **${statList(g.stats)}**`).join(' → ')}`);
+      }
+      else if (sc.roll) lines.push(`🎲 roll **${statList(sc.roll)}**${sc.dc ? ` · DC ${sc.dc}` : ''}`);
+
+      if (sc.nat20) { const o = JSON.parse(sc.nat20); lines.push(`   🌟 nat 20 → \`${o.next}\`${o.text ? ` — ${o.text}` : ''}`); }
+      if (sc.nat1)  { const o = JSON.parse(sc.nat1);  lines.push(`   💀 nat 1 → \`${o.next}\`${o.text ? ` — ${o.text}` : ''}`); }
+      for (const r of ranges) {
+        lines.push(`   🔢 ${r.lo}${r.hi >= 9999 ? '+' : `–${r.hi}`} → \`${r.next}\`${r.text ? ` — ${r.text}` : ''}`);
+      }
+      for (const [band, o] of Object.entries(outcomes)) {
+        const label = sc.dc || gauntlet ? (band === 'PASS' ? '✅ pass' : band === 'FAIL' ? '❌ fail' : STORY_BAND_LABEL[band] ?? band)
+                                        : (STORY_BAND_LABEL[band] ?? band);
+        lines.push(`   ${label} → \`${o.next}\`${o.text ? ` — ${o.text}` : ''}`);
+        for (const v of (o.variants || [])) lines.push(`      • ${v}`);
+      }
+      for (const c of choices) lines.push(`   🔘 ${c.label} → \`${c.next}\``);
+
+      if (sc.ending) {
+        const bits = [];
+        if (sc.merits) bits.push(`🏅 ${sc.merits} merits`);
+        if (sc.cash_tally) bits.push(`💠 pays out the ${story.tally || 'tally'}`);
+        if (sc.rewards) bits.push(`🎁 ${sc.rewards}`);
+        lines.push(`🏁 ending${bits.length ? ` · ${bits.join(' · ')}` : ''}`);
+      }
+      lines.push('');
+    }
+    return replyLong(interaction, lines, { ephemeral: true });
+  }
+
+  if (sub === 'set') {
+    const sceneName = interaction.options.getString('scene');
+    const field = interaction.options.getString('field');
+    const value = interaction.options.getString('value');
+    const sc = getScene(gid, story.name, sceneName);
+    if (!sc) return interaction.reply({ content: `❌ **${story.name}** has no scene called \`${sceneName}\`.`, ephemeral: true });
+    if (field === 'merits' && !/^\d+$/.test(value.trim()))
+      return interaction.reply({ content: '❌ Merits must be a whole number.', ephemeral: true });
+    const val = field === 'merits' ? parseInt(value) : value;
+    db.prepare(`UPDATE story_scenes SET ${field}=? WHERE guild_id=? AND story=? COLLATE NOCASE AND scene=? COLLATE NOCASE`)
+      .run(val, gid, story.name, sc.scene);
+    return interaction.reply({ content: `✏️ **${story.name}** · \`${sc.scene}\` — ${field} updated.` });
+  }
+
+  if (sub === 'run') {
+    if (getRun(gid, cid)) return interaction.reply({ content: '❌ An activity is already running here. `/activity stop` first.', ephemeral: true });
+    const first = getScene(gid, story.name, story.start_scene);
+    if (!first) return interaction.reply({ content: `❌ **${story.name}** has no starting scene.`, ephemeral: true });
+    const run = setRun(gid, cid, { story: story.name, scene: first.scene, started_by: interaction.user.id,
+      started_at: Date.now(), took_part: '[]' });
+    await interaction.reply({ content: `🎮 **${story.name}** begins…` });
+    return postScene(interaction.guild, cid, run, first);
+  }
+}
 
 async function handleConfig(interaction) {
   const sub = interaction.options.getSubcommand(), gid = interaction.guild.id;
@@ -2194,6 +2902,19 @@ async function handleConfig(interaction) {
     ].join('\n') });
   }
 
+  if (sub === 'activities') {
+    const players = interaction.options.getBoolean('players');
+    if (players === null) {
+      return interaction.reply({ ephemeral: true, content: getConfig(gid)?.activity_players
+        ? '🎮 Anyone can start an activity. Writing and deleting them is still GM-only.'
+        : '🎮 Activities are **GM-led** — only a GM can start one. Open it up with `/config activities players:true`.' });
+    }
+    setConfig(gid, { activity_players: players ? 1 : 0 });
+    return interaction.reply({ content: players
+      ? '🎮 Players can now start activities themselves. Writing and deleting them is still GM-only.'
+      : '🎮 Activities are now **GM-led** — only a GM can start one.' });
+  }
+
   if (sub === 'hpbase') {
     const base = interaction.options.getInteger('base');
     const cur = hpBase(gid);
@@ -2355,10 +3076,10 @@ async function handleChar(interaction) {
       if (v !== null && (v < 0 || v > 99)) return interaction.reply({ content: `❌ ${stat.toUpperCase()} must be between 0 and 99.`, ephemeral: true });
     }
     const str = interaction.options.getInteger('str'); if (str !== null) updates.str = str;
-    const con = interaction.options.getInteger('con'); if (con !== null) { updates.con = con; updates.hp_current = maxHpFromCon(gid, con); }
+    const con = interaction.options.getInteger('con'); if (con !== null) updates.con = con;
     const dex = interaction.options.getInteger('dex'); if (dex !== null) updates.dex = dex;
     const wis = interaction.options.getInteger('wis'); if (wis !== null) updates.wis = wis;
-    const lck = interaction.options.getInteger('lck'); if (lck !== null) { updates.lck = lck; updates.rerolls_current = lck; }
+    const lck = interaction.options.getInteger('lck'); if (lck !== null) updates.lck = lck;
     const order = interaction.options.getString('order'); if (order) updates.order_name = order;
     // Budget check, for players only. Runs against the sheet as it would stand
     // after this command, so filling the last stat in a second /char create is
@@ -2371,6 +3092,14 @@ async function handleChar(interaction) {
       const problems = statBudgetProblems(gid, after, { requireAll: complete, exact: complete });
       if (problems.length) return refuseStatBudget({ src: interaction, gid, uid: callerId, problems, stats: after,
         reply: replyThenFetch(interaction) });
+    }
+    // Max HP and rerolls off the finished sheet rather than off this one call.
+    // Setting them only when con/lck happened to be typed meant a character
+    // built over two commands could end up short of full.
+    {
+      const after = statsAfter(existingSheet, updates);
+      updates.hp_current = maxHpFromCon(gid, after.con);
+      updates.rerolls_current = after.lck ?? 0;
     }
     const charClass = interaction.options.getString('class');
     if (charClass && String(charClass).toLowerCase() === 'hero' && !isGmUser) {
@@ -3004,8 +3733,14 @@ async function handleSheetImport(message, parsed) {
   const rerollMax = parsed.lck;
 
   // Use imported current values if valid, otherwise max out
-  const hpCurrent = (parsed.hp_current !== null && parsed.hp_current <= hpMax) ? parsed.hp_current : hpMax;
-  const rerollsCurrent = (parsed.rerolls_current !== null && parsed.rerolls_current <= rerollMax) ? parsed.rerolls_current : rerollMax;
+  // A brand-new character always starts at full. Only a re-import over an
+  // existing sheet keeps the pasted figures — that's a restore, not a creation,
+  // and an exported block carries whatever HP the character happened to be on.
+  const isNewSheet = !getChar(gid, targetId);
+  const hpCurrent = (!isNewSheet && parsed.hp_current !== null && parsed.hp_current <= hpMax)
+    ? parsed.hp_current : hpMax;
+  const rerollsCurrent = (!isNewSheet && parsed.rerolls_current !== null && parsed.rerolls_current <= rerollMax)
+    ? parsed.rerolls_current : rerollMax;
 
   upsertChar(gid, targetId, {
     order_name: parsed.order_name,
@@ -3278,6 +4013,8 @@ client.on('interactionCreate', async interaction => {
     if (interaction.customId.startsWith('confirm:') || interaction.customId.startsWith('cancel:')) {
       return handleConfirmButton(interaction);
     }
+    if (interaction.customId.startsWith('storyroll:')) return handleStoryRollButton(interaction);
+    if (interaction.customId.startsWith('storypick:')) return handleStoryPickButton(interaction);
     if (interaction.customId.startsWith('questapply:') || interaction.customId.startsWith('questwithdraw:')) {
       return handleQuestButton(interaction);
     }
@@ -3292,6 +4029,8 @@ client.on('interactionCreate', async interaction => {
 
   if (!interaction.isChatInputCommand()) return;
   try {
+    if (interaction.commandName === 'renown') return await handleRenown(interaction);
+    if (interaction.commandName === 'activity') return await handleStory(interaction);
     if (interaction.commandName === 'config') return await handleConfig(interaction);
     if (interaction.commandName === 'char') return await handleChar(interaction);
     if (interaction.commandName === 'profile' || interaction.commandName === 'p') return await handleProfile(interaction);
@@ -3404,6 +4143,16 @@ client.on('messageCreate', async message => {
   }
 
   // Sheet import detection — check before prefix matching
+  // Pasted scenario script — GM only, and validated before anything is stored.
+  if (/^\s*\[STORY\]/im.test(content)) {
+    if (!(await isGm(message.guild, message.author.id))) return message.reply('❌ Only GMs can add activities.');
+    const parsed = parseStoryScript(content);
+    if (parsed.error) return message.reply(`❌ **Couldn't read that activity.** ${parsed.error}`);
+    const count = saveStory(message.guild.id, message.author.id, parsed);
+    return message.reply([`🎮 **${parsed.name}** saved — **${count}** scene${count === 1 ? '' : 's'}, starting at \`${parsed.start}\`.`,
+      `Run it with \`/activity run name:${parsed.name}\`, or read it back with \`/activity show name:${parsed.name}\`.`].join('\n'));
+  }
+
   if (content.includes('[TTRPG SHEET]')) {
     const parsed = parseSheetImport(content);
     if (parsed) {
@@ -6518,6 +7267,7 @@ const HELP_CATEGORIES = {
       '_Server admins (Manage Server) always count as GMs._',
       '`/config heal charges:N` — set default heal charges',
       '`/config hpbase base:3` — max HP formula: CON + this (default 2)',
+      '`/config activities players:true` — let players start activities themselves (writing stays GM-only)',
       '`/config autorest action:List` — see every recovery schedule',
       '`/config autorest action:Add or update name:Breather hours:6 hp:50% rerolls:0% heal:0%` — a light top-up',
       '`/config autorest action:Add or update name:Full Recovery hours:24 hp:100% rerolls:100% heal:100%` — the works',
