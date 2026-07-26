@@ -125,6 +125,18 @@ try { db.exec('ALTER TABLE characters ADD COLUMN renown INTEGER DEFAULT 0'); } c
 // Writing and deleting activities is always GM-only; this decides whether
 // players may start one themselves. Locked to GMs until a server says otherwise.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN activity_players INTEGER DEFAULT 0'); } catch {}
+// Runs used to be one-per-channel. They are now one per player per channel so
+// several people can play alongside each other and one leaving doesn't disturb
+// the rest. SQLite can't alter a primary key, so an old table is dropped —
+// anything mid-run at deploy time is lost, which is the right trade for a
+// throwaway activity.
+try {
+  const cols = db.prepare('PRAGMA table_info(story_runs)').all().map(c => c.name);
+  if (cols.length && !cols.includes('user_id')) {
+    db.exec('DROP TABLE story_runs');
+    console.log('[activity] story_runs rebuilt for per-player runs');
+  }
+} catch {}
 try { db.exec(`CREATE TABLE IF NOT EXISTS renown_log (
   guild_id TEXT NOT NULL, user_id TEXT NOT NULL, delta INTEGER NOT NULL,
   reason TEXT, at INTEGER NOT NULL
@@ -216,13 +228,12 @@ db.exec(`
     PRIMARY KEY (guild_id, story, scene)
   );
   CREATE TABLE IF NOT EXISTS story_runs (
-    guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+    guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, user_id TEXT NOT NULL,
     story TEXT NOT NULL, scene TEXT NOT NULL,
-    started_by TEXT, started_at INTEGER,
-    took_part TEXT NOT NULL DEFAULT '[]',
+    started_at INTEGER,
     tally_state TEXT NOT NULL DEFAULT '{}',
     gauntlet_at INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (guild_id, channel_id)
+    PRIMARY KEY (guild_id, channel_id, user_id)
   );
   CREATE TABLE IF NOT EXISTS autorest_schedules (
     guild_id TEXT NOT NULL, name TEXT NOT NULL,
@@ -614,7 +625,7 @@ function loreButtons(uid) {
 const DEMO_FISHING = [
 '[ACTIVITY] Fishing (demo)',
 'SCENE find',
-'SAY 🎣 You walk the bank looking for somewhere the fish might be holding.',
+'SAY 🎣 You survey the area for a good spot to try your luck at feeling out where fish may be hiding...',
 'ROLL wis DC12',
 '  PASS -> cast',
 '  FAIL ONE OF',
@@ -624,7 +635,7 @@ const DEMO_FISHING = [
 '  FAIL -> find',
 '',
 'SCENE cast',
-'SAY Now we are talking! Cast out and try your luck.',
+'SAY Now we\'re talking! Cast out and try your luck.',
 'ROLL str|dex|wis',
 '  1-5   Something small brushes the line.     -> fight_small',
 '  6-10  A decent weight takes the bait.       -> fight_medium',
@@ -635,44 +646,44 @@ const DEMO_FISHING = [
 'SAY A gentle tug. Bring it in.',
 'GAUNTLET str|con 6',
 '  NAT20 It practically leaps into your hands. -> caught',
-'  NAT1  The line snaps and it is gone. -> restring',
+'  NAT1  The line snaps. Along with your potential prize... -> restring',
 '  PASS -> caught',
 '  FAIL -> find',
 '',
 'SCENE fight_medium',
 'SAY It runs. Hold on.',
 'GAUNTLET str|con 10 8',
-'  NAT1 The line snaps and it is gone. -> restring',
+'  NAT1 The line snaps. Along with your potential prize... -> restring',
 '  PASS -> caught',
 '  FAIL -> find',
 '',
 'SCENE fight_big',
 'SAY The water boils. This will take some work.',
-'GAUNTLET 14:str 12:str|con 10:con',
+'GAUNTLET 14:str|con 12:str|con 10:str|con',
 '  NAT20 One clean heave and it is aboard. -> caught',
-'  NAT1  The line snaps and it is gone. -> restring',
+'  NAT1  The line snaps. Along with your potential prize... -> restring',
 '  PASS -> caught',
 '  FAIL -> find',
 '',
 'SCENE fight_extra',
 'SAY Whatever this is, it does not want to be caught.',
-'GAUNTLET 16:str 14:str|con 12:con 10:str|dex',
+'GAUNTLET 16:str|con 14:str|con 12:str|con 10:str|con',
 '  NAT20 Somehow, it is yours. -> caught',
-'  NAT1  The line snaps and it is gone. -> restring',
+'  NAT1  The line snaps. Along with your potential prize... -> restring',
 '  PASS -> caught',
 '  FAIL -> find',
 '',
 'SCENE restring',
-'SAY You restring the rod, muttering.',
+'SAY Undeterred you restring your rod; muttering curses under your breath...',
 'CHOICE',
 '  Cast again -> cast',
-'  Head back  -> depot',
+'  Heads back... -> depot',
 '',
 'SCENE caught',
 'SAY 🐟 A fine catch! (Nothing is awarded — this is a demo.)',
 'CHOICE',
 '  Keep fishing  -> cast',
-'  Call it a day -> depot',
+'  Calls it a day... -> depot',
 '',
 'SCENE depot',
 'SAY You head back with your haul. The quartermaster nods approvingly.',
@@ -720,20 +731,26 @@ function deleteStory(gid, name) {
   db.prepare('DELETE FROM story_scenes WHERE guild_id=? AND story=? COLLATE NOCASE').run(gid, name);
   return db.prepare('DELETE FROM stories WHERE guild_id=? AND name=? COLLATE NOCASE').run(gid, name).changes > 0;
 }
-function getRun(gid, cid) {
-  return db.prepare('SELECT * FROM story_runs WHERE guild_id=? AND channel_id=?').get(gid, cid);
+function getRun(gid, cid, uid) {
+  return db.prepare('SELECT * FROM story_runs WHERE guild_id=? AND channel_id=? AND user_id=?').get(gid, cid, uid);
 }
-function setRun(gid, cid, fields) {
-  const ex = getRun(gid, cid);
-  if (!ex) db.prepare('INSERT INTO story_runs (guild_id, channel_id, story, scene) VALUES (?,?,?,?)')
-    .run(gid, cid, fields.story ?? '', fields.scene ?? '');
+function setRun(gid, cid, uid, fields) {
+  if (!getRun(gid, cid, uid)) {
+    db.prepare('INSERT INTO story_runs (guild_id, channel_id, user_id, story, scene) VALUES (?,?,?,?,?)')
+      .run(gid, cid, uid, fields.story ?? '', fields.scene ?? '');
+  }
   const keys = Object.keys(fields || {});
-  if (keys.length) db.prepare(`UPDATE story_runs SET ${keys.map(k => `${k}=?`).join(',')} WHERE guild_id=? AND channel_id=?`)
-    .run(...keys.map(k => fields[k]), gid, cid);
-  return getRun(gid, cid);
+  if (keys.length) db.prepare(`UPDATE story_runs SET ${keys.map(k => `${k}=?`).join(',')} WHERE guild_id=? AND channel_id=? AND user_id=?`)
+    .run(...keys.map(k => fields[k]), gid, cid, uid);
+  return getRun(gid, cid, uid);
 }
-function endRun(gid, cid) {
-  db.prepare('DELETE FROM story_runs WHERE guild_id=? AND channel_id=?').run(gid, cid);
+function endRun(gid, cid, uid) {
+  db.prepare('DELETE FROM story_runs WHERE guild_id=? AND channel_id=? AND user_id=?').run(gid, cid, uid);
+}
+// Everyone currently playing in this channel — used by /activity stop and to
+// tell a GM what is in flight.
+function runsIn(gid, cid) {
+  return db.prepare('SELECT * FROM story_runs WHERE guild_id=? AND channel_id=?').all(gid, cid);
 }
 
 // Parse a pasted activity script. Returns { name, start, tally, scenes[] }
@@ -918,6 +935,8 @@ function saveStory(gid, uid, parsed) {
 // stats it accepts), a plain choice of buttons, or an ending.
 async function postScene(guild, cid, run, sc) {
   const gid = guild.id;
+  const owner = run.user_id;
+  const ownerName = await getDisplayName(guild, owner);
   const channel = await guild.client.channels.fetch(cid);
   const lines = [];
   if (sc.say) lines.push(sc.say);
@@ -937,25 +956,30 @@ async function postScene(guild, cid, run, sc) {
   const tallyState = JSON.parse(run.tally_state || '{}');
 
   if (sc.ending) {
-    const took = JSON.parse(run.took_part || '[]');
     lines.push('', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    if (sc.merits > 0 && took.length) {
-      for (const uid of took) addMerits(gid, uid, sc.merits);
-      lines.push(`🏅 **${sc.merits} merit${sc.merits === 1 ? '' : 's'}** to ${took.map(u => `<@${u}>`).join(', ')}.`);
+    // The tally belongs to whoever played this run.
+    const cashing = !!(sc.cash_tally && tallyName);
+    const banked = cashing ? (tallyState[owner] || 0) : 0;
+    // Coming home empty-handed from a trip that pays out earns nothing at all —
+    // not the rewards, and not the merits for turning up. An ending that has no
+    // tally to cash still awards its merits, since there was nothing to catch.
+    const emptyHanded = cashing && banked === 0;
+
+    if (sc.merits > 0 && !emptyHanded) {
+      addMerits(gid, owner, sc.merits);
+      lines.push(`🏅 **${sc.merits} merit${sc.merits === 1 ? '' : 's'}** to <@${owner}>.`);
     }
-    // Cash the tally out to whoever earned it.
-    if (sc.cash_tally && tallyName) {
-      const paid = [];
-      for (const [uid, amt] of Object.entries(tallyState)) {
-        if (!amt) continue;
-        const bal = addRenown(gid, uid, amt, `${run.story}`);
-        paid.push(`<@${uid}> **+${amt}**${bal !== null ? ` (now ${bal})` : ''}`);
+    if (cashing) {
+      if (banked) {
+        const bal = addRenown(gid, owner, banked, `${run.story}`);
+        lines.push(`💠 **${tallyName}** earned — <@${owner}> **+${banked}**${bal !== null ? ` (now ${bal})` : ''}`);
+      } else {
+        lines.push(`💠 Nothing to show for it — no ${tallyName}${sc.merits > 0 ? ' and no merits' : ''} this time.`);
       }
-      lines.push(paid.length ? `💠 **${tallyName}** earned — ${paid.join(', ')}` : `💠 No ${tallyName} earned this time.`);
     }
-    if (sc.rewards) lines.push(`🎁 **For the GM to hand out:** ${sc.rewards}`);
-    endRun(gid, cid);
-    await sendLong(channel, lines);
+    if (sc.rewards && !emptyHanded) lines.push(`🎁 **For the GM to hand out:** ${sc.rewards}`);
+    endRun(gid, cid, owner);
+    await sendLong(channel, [`🎮 **${ownerName}**`, ...lines]);
     return;
   }
 
@@ -963,8 +987,8 @@ async function postScene(guild, cid, run, sc) {
   const choices = JSON.parse(sc.choices || '[]');
   if (choices.length) {
     const row = new ActionRowBuilder().addComponents(...choices.slice(0, 5).map((c, k) =>
-      new ButtonBuilder().setCustomId(`storypick:${sc.scene}:${k}`).setLabel(c.label.slice(0, 78)).setStyle(ButtonStyle.Secondary)));
-    await postWithButtons(channel, lines, row);
+      new ButtonBuilder().setCustomId(`storypick:${owner}:${sc.scene}:${k}`).setLabel(c.label.slice(0, 78)).setStyle(ButtonStyle.Secondary)));
+    await postWithButtons(channel, [`🎮 **${ownerName}**`, ...lines], row);
     return;
   }
 
@@ -982,11 +1006,14 @@ async function postScene(guild, cid, run, sc) {
     lines.push('', '🎲 Roll.');
   }
   const stats = stepStats.split('|').filter(Boolean);
-  lines.push(`_Anyone here can answer${stats.length > 1 ? ` — pick ${stats.map(x => (resolveStatWord(x) || x).toUpperCase()).join(', ')}` : ''}._`);
+  const names = stats.map(x => (resolveStatWord(x) || x).toUpperCase());
+  lines.push(`_<@${owner}> — press a button, or type **${names[0].toLowerCase()}** and add your own flavour `
+    + `after it: \`${names[0].toLowerCase()} I cast into the deep pools\`._`
+    + (names.length > 1 ? `\n_This step takes ${names.join(', ')}._` : ''));
   const row = new ActionRowBuilder().addComponents(...stats.slice(0, 5).map(st =>
-    new ButtonBuilder().setCustomId(`storyroll:${sc.scene}:${st}`)
+    new ButtonBuilder().setCustomId(`storyroll:${owner}:${sc.scene}:${st}`)
       .setLabel(`Roll ${(resolveStatWord(st) || st).toUpperCase()}`).setStyle(ButtonStyle.Primary)));
-  await postWithButtons(channel, lines, row);
+  await postWithButtons(channel, [`🎮 **${ownerName}**`, ...lines], row);
 }
 
 // Send the narration, hanging the buttons off the final chunk.
@@ -998,10 +1025,13 @@ async function postWithButtons(channel, lines, row) {
 
 // Shared guard: is there a live run here, still on the scene this button came
 // from, and may this person take part?
-function activeSceneFor(interaction, sceneName) {
+function activeSceneFor(interaction, owner, sceneName) {
   const gid = interaction.guild.id, cid = interactionChannelId(interaction), uid = interaction.user.id;
-  const run = getRun(gid, cid);
-  if (!run) return { error: '❌ Nothing is running here.' };
+  // Runs are per-player, so a button only answers for the person it belongs to.
+  // Everyone can watch; only its owner can act on it.
+  if (owner && owner !== uid) return { error: '🎮 That is someone else\'s run. Start your own with `/activity run`.' };
+  const run = getRun(gid, cid, uid);
+  if (!run) return { error: '❌ You have nothing running here. Start one with `/activity run`.' };
   if (String(run.scene).toLowerCase() !== String(sceneName).toLowerCase()) {
     return { error: '⏰ That moment has already passed.' };
   }
@@ -1010,27 +1040,26 @@ function activeSceneFor(interaction, sceneName) {
   const ch = getChar(gid, uid);
   if (!ch) return { error: '❌ You need a character sheet to take part — `/char create`.' };
   const sc = getScene(gid, run.story, run.scene);
-  if (!sc) { endRun(gid, cid); return { error: '❌ That scene has gone missing; the run has stopped.' }; }
+  if (!sc) { endRun(gid, cid, uid); return { error: '❌ That scene has gone missing; the run has stopped.' }; }
   return { gid, cid, uid, run, ch, sc };
 }
 
-async function advance(interaction, ctx, nextName, took, tallyState, gauntletAt = 0) {
+async function advance(io, ctx, nextName, tallyState, gauntletAt = 0) {
   const { gid, cid, uid, run } = ctx;
   const next = getScene(gid, run.story, nextName);
-  if (!next) { endRun(gid, cid); return; }
+  if (!next) { endRun(gid, cid, uid); return; }
   // Credit the arriving scene's GAIN to whoever got them there.
   if (next.gain) tallyState[uid] = (tallyState[uid] || 0) + next.gain;
-  if (uid && !took.includes(uid)) took.push(uid);
-  const updated = setRun(gid, cid, { scene: next.scene, took_part: JSON.stringify(took),
+  const updated = setRun(gid, cid, uid, { scene: next.scene,
     tally_state: JSON.stringify(tallyState), gauntlet_at: gauntletAt });
   await new Promise(r => setTimeout(r, 900));
-  await postScene(interaction.guild, cid, updated, next);
+  await postScene(io.guild, cid, updated, next);
 }
 
 // A plain choice — no dice, just a fork.
 async function handleStoryPickButton(interaction) {
-  const [, sceneName, idx] = interaction.customId.split(':');
-  const ctx = activeSceneFor(interaction, sceneName);
+  const [, owner, sceneName, idx] = interaction.customId.split(':');
+  const ctx = activeSceneFor(interaction, owner, sceneName);
   if (ctx.error) return interaction.reply({ content: ctx.error, ephemeral: true });
   const choices = JSON.parse(ctx.sc.choices || '[]');
   const pick = choices[Number(idx)];
@@ -1038,17 +1067,67 @@ async function handleStoryPickButton(interaction) {
   const name = await getDisplayName(interaction.guild, ctx.uid);
   await interaction.reply({ content: `➡️ **${name}** — ${pick.label}` });
   try { await interaction.message.edit({ components: [] }); } catch {}
-  const took = JSON.parse(ctx.run.took_part || '[]');
-  await advance(interaction, ctx, pick.next, took, JSON.parse(ctx.run.tally_state || '{}'), 0);
+  await advance({ guild: interaction.guild }, ctx, pick.next, JSON.parse(ctx.run.tally_state || '{}'), 0);
 }
 
 // A roll. Anyone in the channel may answer; the only gate is that the run is
 // still on this scene.
+// The stats a scene will accept right now — a gauntlet narrows to the current
+// step, everything else offers whatever the ROLL line listed.
+function sceneStats(sc, run) {
+  const g = sc.gauntlet ? JSON.parse(sc.gauntlet) : null;
+  if (g) return String(g[Number(run.gauntlet_at) || 0]?.stats || sc.roll || '').split('|').filter(Boolean);
+  return String(sc.roll || '').split('|').filter(Boolean);
+}
+
+// A compact sheet line, so a reader can see where the modifier came from
+// without the full card being reprinted on every roll of a loop.
+function statLine(ch, gid) {
+  return `💪 ${ch.str ?? 0} · 🫀 ${ch.con ?? 0} · ⚡ ${ch.dex ?? 0} · 🧠 ${ch.wis ?? 0} · 🍀 ${ch.lck ?? 0}`
+    + `  ·  ❤️ ${ch.hp_current ?? 0}/${maxHp(ch, gid)}  ·  🔄 ${ch.rerolls_current ?? 0}/${maxRerolls(ch)}`;
+}
+
 async function handleStoryRollButton(interaction) {
-  const [, sceneName, statWord] = interaction.customId.split(':');
-  const ctx = activeSceneFor(interaction, sceneName);
+  const [, owner, sceneName, statWord] = interaction.customId.split(':');
+  const ctx = activeSceneFor(interaction, owner, sceneName);
   if (ctx.error) return interaction.reply({ content: ctx.error, ephemeral: true });
+  return resolveActivityRoll(ctx, statWord, null, {
+    guild: interaction.guild,
+    reply: async (content) => { await interaction.reply({ content }); try { await interaction.message.edit({ components: [] }); } catch {} },
+    interaction,
+  });
+}
+
+// Answer the scene by typing instead of pressing: "wis I cast into the deep
+// pools" rolls WIS and prints the rest as flavour. Returns false when the
+// message isn't an answer, so the normal roll handling carries on.
+async function tryActivityTypedRoll(message, content) {
+  const gid = message.guild.id, cid = message.channel.id, uid = message.author.id;
+  const run = getRun(gid, cid, uid);
+  if (!run) return false;
+  const sc = getScene(gid, run.story, run.scene);
+  if (!sc || !sc.roll) return false;
+
+  const m = content.match(new RegExp(`^(${STAT_WORD_RE})(?:\\s+([\\s\\S]*))?$`, 'i'));
+  if (!m) return false;
+  const stat = resolveStatWord(m[1]);
+  if (!sceneStats(sc, run).map(resolveStatWord).includes(stat)) return false;   // wrong stat for this step
+
+  const gate = sheetGate(gid, uid);
+  if (gate) { await message.reply(gate).catch(()=>{}); return true; }
+  const ch = getChar(gid, uid);
+  if (!ch) { await message.reply('❌ You need a character sheet to take part — `/char create`.').catch(()=>{}); return true; }
+
+  await resolveActivityRoll({ gid, cid, uid, run, ch, sc }, stat, (m[2] || '').trim() || null, {
+    guild: message.guild,
+    reply: async (c) => { await message.reply(c).catch(()=>{}); },
+  });
+  return true;
+}
+
+async function resolveActivityRoll(ctx, statWord, flavour, io) {
   const { gid, cid, uid, run, ch, sc } = ctx;
+  const say = io.reply;
 
   const stat = resolveStatWord(statWord);
   const mod = stat ? (ch[stat] ?? 0) : 0;
@@ -1056,18 +1135,16 @@ async function handleStoryRollButton(interaction) {
   const result = mode === 'adv' ? rollAdvantage(`1d20+${mod}`)
                : mode === 'dis' ? rollDisadvantage(`1d20+${mod}`)
                : rollNotation(`1d20+${mod}`);
-  if (!result) return interaction.reply({ content: `❌ \`${statWord}\` isn't a stat.`, ephemeral: true });
+  if (!result) return say(`❌ \`${statWord}\` isn't a stat.`);
   const nat = mode === 'normal' ? result.rolls?.[0] : result.chosen;
   const sides = result.sides ?? 20;
-  const name = await getDisplayName(interaction.guild, uid);
+  const name = await getDisplayName(io.guild, uid);
   const label = (stat || statWord).toUpperCase();
 
-  recordRoll(gid, { userId: uid, channelId: cid, interaction,
+  recordRoll(gid, { userId: uid, channelId: cid, interaction: io.interaction ?? null,
     input: `${run.story} · ${run.scene}`, rollLine: buildRollLine(result, mode, detectCrit(result, mode), null),
     context: `activity roll (${label})` });
 
-  const took = JSON.parse(run.took_part || '[]');
-  if (!took.includes(uid)) took.push(uid);
   // GAIN is credited on arrival by advance(), not here, or a scene reached by a
   // choice would never pay and a scene with a roll would pay twice.
   const tallyState = JSON.parse(run.tally_state || '{}');
@@ -1077,17 +1154,19 @@ async function handleStoryRollButton(interaction) {
   const outcomes = JSON.parse(sc.outcomes || '{}');
   const nat20 = sc.nat20 ? JSON.parse(sc.nat20) : null;
   const nat1 = sc.nat1 ? JSON.parse(sc.nat1) : null;
-  const lines = [`🎲 **${name}** rolls **${label}** — ${fightTotalStr(result.total, nat, sides)}`];
+  const lines = [`🎲 **${name}** rolls **${label}** — ${fightTotalStr(result.total, nat, sides)}`,
+                 statLine(ch, gid)];
+  if (flavour) lines.push('', `*${flavour}*`);
 
   const finish = async (text, next, gaAt = 0) => {
     if (text) lines.push('', text);
-    await interaction.reply({ content: lines.join('\n') });
-    try { await interaction.message.edit({ components: [] }); } catch {}
-    if (next) await advance(interaction, ctx, next, took, tallyState, gaAt);
-    else setRun(gid, cid, { took_part: JSON.stringify(took), tally_state: JSON.stringify(tallyState) });
+    await say(lines.join('\n'));
+    if (next) await advance(io, ctx, next, tallyState, gaAt);
+    else setRun(gid, cid, uid, { tally_state: JSON.stringify(tallyState) });
   };
   // A ONE OF block picks a different line each time, so a loop doesn't repeat.
-  const flavour = (o) => (o?.variants?.length ? o.variants[Math.floor(Math.random() * o.variants.length)] : (o?.text || ''));
+  // A ONE OF block picks a different line each time, so a loop doesn't repeat.
+  const pickText = (o) => (o?.variants?.length ? o.variants[Math.floor(Math.random() * o.variants.length)] : (o?.text || ''));
 
   // Natural 20 / 1 override everything else where the script defines them.
   if (nat === sides && nat20) return finish(nat20.text, nat20.next, 0);
@@ -1100,18 +1179,17 @@ async function handleStoryRollButton(interaction) {
       const last = step + 1 >= gauntlet.length;
       if (!last) {
         lines.push('', `✅ **${result.total}** beats DC ${need} — it's still fighting. ${gauntlet.length - step - 1} to go.`);
-        await interaction.reply({ content: lines.join('\n') });
-        try { await interaction.message.edit({ components: [] }); } catch {}
-        const updated = setRun(gid, cid, { took_part: JSON.stringify(took),
+        await say(lines.join('\n'));
+        const updated = setRun(gid, cid, uid, {
           tally_state: JSON.stringify(tallyState), gauntlet_at: step + 1 });
         await new Promise(r => setTimeout(r, 700));
-        return postScene(interaction.guild, cid, updated, sc);
+        return postScene(io.guild, cid, updated, sc);
       }
       const o = outcomes.PASS;
-      return finish(`✅ **${result.total}** beats DC ${need}. ${flavour(o)}`, o?.next, 0);
+      return finish(`✅ **${result.total}** beats DC ${need}. ${pickText(o)}`, o?.next, 0);
     }
     const o = outcomes.FAIL;
-    return finish(`❌ **${result.total}** misses DC ${need}. ${flavour(o)}`, o?.next, 0);
+    return finish(`❌ **${result.total}** misses DC ${need}. ${pickText(o)}`, o?.next, 0);
   }
 
   if (ranges.length) {
@@ -1124,13 +1202,13 @@ async function handleStoryRollButton(interaction) {
     const band = result.total >= sc.dc ? 'PASS' : 'FAIL';
     const o = outcomes[band];
     if (!o) return finish('*That branch is missing from the script.*', null);
-    return finish(`${band === 'PASS' ? '✅' : '❌'} **${result.total}** vs DC ${sc.dc}. ${flavour(o)}`, o.next, 0);
+    return finish(`${band === 'PASS' ? '✅' : '❌'} **${result.total}** vs DC ${sc.dc}. ${pickText(o)}`, o.next, 0);
   }
 
   const { band, res } = storyBandFor(outcomes, result.total, nat, sides);
   lines[0] += `  ${res.emoji} **${res.label}**`;
   if (!band) return finish('*Nothing in the script answers to that.*', null);
-  return finish(flavour(outcomes[band]), outcomes[band].next, 0);
+  return finish(pickText(outcomes[band]), outcomes[band].next, 0);
 }
 
 // ── Scheduled recovery ────────────────────────────────────────────────────────
@@ -2863,14 +2941,14 @@ async function handleStory(interaction) {
   // a reserved name with every reward stripped, so a demo run can't move
   // anyone's renown, merits or items.
   if (sub === 'demo') {
-    if (getRun(gid, cid)) return interaction.reply({ content: '❌ Something is already running here. `/activity stop` first.', ephemeral: true });
+    if (getRun(gid, cid, interaction.user.id)) return interaction.reply({ content: '❌ You already have something running here. `/activity stop` first.', ephemeral: true });
     const parsed = parseStoryScript(DEMO_FISHING);
     if (parsed.error) return interaction.reply({ content: `❌ The built-in demo failed to parse: ${parsed.error}`, ephemeral: true });
     saveStory(gid, interaction.user.id, parsed);
     const first = getScene(gid, parsed.name, parsed.start);
-    const run = setRun(gid, cid, { story: parsed.name, scene: first.scene, started_by: interaction.user.id,
-      started_at: Date.now(), took_part: '[]', tally_state: '{}', gauntlet_at: 0 });
-    await interaction.reply({ content: '🎣 **Fishing (demo)** — a dry run. Nothing you catch will be awarded.\nAnyone here can press the buttons.' });
+    const run = setRun(gid, cid, interaction.user.id, { story: parsed.name, scene: first.scene,
+      started_at: Date.now(), tally_state: '{}', gauntlet_at: 0 });
+    await interaction.reply({ content: '🎣 **Fishing (demo)** — a dry run. Nothing you catch will be awarded.\nThis one is yours; others can start their own alongside it.' });
     return postScene(interaction.guild, cid, run, first);
   }
 
@@ -2885,10 +2963,18 @@ async function handleStory(interaction) {
   const name = interaction.options.getString('name');
 
   if (sub === 'stop') {
-    const run = getRun(gid, cid);
-    if (!run) return interaction.reply({ content: '❌ Nothing is running here.', ephemeral: true });
-    endRun(gid, cid);
-    return interaction.reply({ content: `🛑 Stopped **${run.story}**.` });
+    const mine = getRun(gid, cid, interaction.user.id);
+    const others = runsIn(gid, cid).filter(r => r.user_id !== interaction.user.id);
+    if (!mine && !others.length) return interaction.reply({ content: '❌ Nothing is running here.', ephemeral: true });
+    if (mine) {
+      endRun(gid, cid, interaction.user.id);
+      const note = others.length ? ` ${others.length} other run${others.length === 1 ? ' is' : 's are'} still going.` : '';
+      return interaction.reply({ content: `🛑 Stopped your run of **${mine.story}**.${note}` });
+    }
+    // Only other people's runs are live — a GM may clear them, a player may not.
+    if (!isGmUser) return interaction.reply({ content: '❌ You have nothing running here. Only a GM can stop someone else\'s.', ephemeral: true });
+    for (const r of others) endRun(gid, cid, r.user_id);
+    return interaction.reply({ content: `🛑 Stopped ${others.length} run${others.length === 1 ? '' : 's'} in this channel.` });
   }
 
   const story = getStory(gid, name);
@@ -2963,12 +3049,14 @@ async function handleStory(interaction) {
   }
 
   if (sub === 'run') {
-    if (getRun(gid, cid)) return interaction.reply({ content: '❌ An activity is already running here. `/activity stop` first.', ephemeral: true });
+    if (getRun(gid, cid, interaction.user.id)) return interaction.reply({ content: '❌ You already have an activity running here. `/activity stop` first.', ephemeral: true });
     const first = getScene(gid, story.name, story.start_scene);
     if (!first) return interaction.reply({ content: `❌ **${story.name}** has no starting scene.`, ephemeral: true });
-    const run = setRun(gid, cid, { story: story.name, scene: first.scene, started_by: interaction.user.id,
-      started_at: Date.now(), took_part: '[]' });
-    await interaction.reply({ content: `🎮 **${story.name}** begins…` });
+    const run = setRun(gid, cid, interaction.user.id, { story: story.name, scene: first.scene,
+      started_at: Date.now(), tally_state: '{}', gauntlet_at: 0 });
+    const alongside = runsIn(gid, cid).length - 1;
+    await interaction.reply({ content: `🎮 **${story.name}** begins for <@${interaction.user.id}>…`
+      + (alongside > 0 ? `\n_${alongside} other run${alongside === 1 ? ' is' : 's are'} going in here too — each is its own._` : '') });
     return postScene(interaction.guild, cid, run, first);
   }
 }
@@ -4543,6 +4631,12 @@ client.on('messageCreate', async message => {
     try { return await handleRoll(message, bareRest, 'normal', false); }
     catch (err) { console.error(err); return message.reply('\u274c Something went wrong.'); }
   }
+
+  // An activity waiting on a roll takes precedence: "wis I cast into the deep
+  // pools" answers the scene and prints the rest as flavour. Falls through when
+  // nothing is running, or the stat isn't one this step accepts.
+  try { if (await tryActivityTypedRoll(message, content)) return; }
+  catch (err) { console.error('[activity] typed roll failed:', err?.message || err); }
 
   // Bare stat shorthand — see parseStatShorthand for the matching rules.
   const statShort = parseStatShorthand(content);
