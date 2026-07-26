@@ -192,6 +192,13 @@ db.exec(`
     hp_current INTEGER DEFAULT 0, rerolls_current INTEGER DEFAULT 0, profile_enabled INTEGER DEFAULT 1,
     PRIMARY KEY (guild_id, user_id)
   );
+  CREATE TABLE IF NOT EXISTS merit_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL, from_user TEXT NOT NULL, to_user TEXT NOT NULL,
+    amount INTEGER NOT NULL, reason TEXT,
+    state TEXT NOT NULL DEFAULT 'pending', msg_id TEXT, src_channel TEXT,
+    created_at INTEGER NOT NULL, decided_by TEXT, decided_at INTEGER
+  );
   CREATE TABLE IF NOT EXISTS inventory (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id TEXT NOT NULL, user_id TEXT NOT NULL,
@@ -567,6 +574,34 @@ function buildCharCard(ch, displayName, healNow, maxCharges, gid) {
 // ── Character pages ───────────────────────────────────────────────────────────
 // Inventory, standing, lore and roll history: the things a character accumulates
 // over a lifetime that aren't on the stat block.
+
+// ── Merit trading ─────────────────────────────────────────────────────────────
+// Merit changes hands between players — payment, tribute, a debt settled — but
+// never without a GM seeing it, so a trade is a proposal until one signs it off.
+function createMeritTrade(gid, from, to, amount, reason, srcChannel) {
+  const r = db.prepare(`INSERT INTO merit_trades (guild_id,from_user,to_user,amount,reason,src_channel,created_at)
+                        VALUES (?,?,?,?,?,?,?)`).run(gid, from, to, amount, reason, srcChannel, Date.now());
+  return getMeritTrade(gid, r.lastInsertRowid);
+}
+function getMeritTrade(gid, id) {
+  return db.prepare('SELECT * FROM merit_trades WHERE guild_id=? AND id=?').get(gid, id);
+}
+function setMeritTrade(gid, id, fields) {
+  const keys = Object.keys(fields || {});
+  if (keys.length) db.prepare(`UPDATE merit_trades SET ${keys.map(k => `${k}=?`).join(',')} WHERE guild_id=? AND id=?`)
+    .run(...keys.map(k => fields[k]), gid, id);
+  return getMeritTrade(gid, id);
+}
+function pendingMeritTrades(gid) {
+  return db.prepare(`SELECT * FROM merit_trades WHERE guild_id=? AND state='pending' ORDER BY created_at`).all(gid);
+}
+function meritTradeButtons(id) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`tradeok:${id}`).setLabel('Approve trade').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`tradeno:${id}`).setLabel('Refuse').setStyle(ButtonStyle.Danger),
+  );
+}
 
 function addItem(gid, uid, item, { note = null, source = null, by = null } = {}) {
   db.prepare('INSERT INTO inventory (guild_id,user_id,item,note,source,added_by,at) VALUES (?,?,?,?,?,?,?)')
@@ -1093,6 +1128,15 @@ function sceneStats(sc, run) {
 
 // A compact sheet line, so a reader can see where the modifier came from
 // without the full card being reprinted on every roll of a loop.
+// Roll card modes. Kept on profile_enabled so nothing needed migrating:
+// 0 = off, 1 = full (the long-standing default), 2 = compressed.
+const CARD_OFF = 0, CARD_FULL = 1, CARD_COMPACT = 2;
+function cardMode(ch) {
+  const v = Number(ch?.profile_enabled);
+  return v === CARD_COMPACT ? CARD_COMPACT : v === CARD_OFF ? CARD_OFF : CARD_FULL;
+}
+const CARD_NAME = { [CARD_OFF]: 'Off', [CARD_FULL]: 'Full', [CARD_COMPACT]: 'Compressed' };
+
 function statLine(ch, gid) {
   return `💪 ${ch.str ?? 0} · 🫀 ${ch.con ?? 0} · ⚡ ${ch.dex ?? 0} · 🧠 ${ch.wis ?? 0} · 🍀 ${ch.lck ?? 0}`
     + `  ·  ❤️ ${ch.hp_current ?? 0}/${maxHp(ch, gid)}  ·  🔄 ${ch.rerolls_current ?? 0}/${maxRerolls(ch)}`;
@@ -1983,7 +2027,19 @@ async function isGm(guild, uid) {
 async function sendRollEmbed(message, rollLine, label, isReroll, uid, flavour, total, critType, forceCard = false) {
   const gid = message.guild.id;
   const char = getChar(gid, uid);
-  if (char && (char.profile_enabled === 1 || forceCard)) {
+  // A stat roll always shows something, because 1d20+4 explains nothing on its
+  // own — but it respects a compressed setting rather than overriding it, and
+  // only falls back to compressed for someone who has cards off entirely.
+  const mode = char ? (forceCard && cardMode(char) === CARD_OFF ? CARD_COMPACT : cardMode(char)) : CARD_OFF;
+
+  if (char && mode === CARD_COMPACT) {
+    const lines = [];
+    if (label) lines.push(`${critPrefix(critType)}**${label}**`);
+    lines.push(rollLine, statLine(char, gid));
+    if (flavour) lines.push(...flavourBlock(flavour, label, total, critType));
+    return message.reply(lines.join('\n'));
+  }
+  if (char && mode === CARD_FULL) {
     const cfg = getConfig(gid);
     const maxCharges = cfg.heal_charges ?? 3;
     const healRow = getHealCharges(gid, uid, maxCharges);
@@ -2465,6 +2521,11 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('profile').setDescription('Manage your roll card profile')
+    .addSubcommand(s=>s.setName('card').setDescription('How much of your sheet shows when you roll')
+      .addStringOption(o=>o.setName('style').setDescription('Full card, one compressed line, or nothing').setRequired(true)
+        .addChoices({name:'Full — the whole sheet',value:'full'},
+                    {name:'Compressed — one line of stats',value:'compact'},
+                    {name:'Off — plain text rolls',value:'off'})))
     .addSubcommand(s=>s.setName('on').setDescription('Enable profile embed, max HP and rerolls'))
     .addSubcommand(s=>s.setName('off').setDescription('Disable profile embed'))
     .addSubcommand(s=>s.setName('show').setDescription('Preview your profile without rolling'))
@@ -2675,6 +2736,11 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('p').setDescription('Shorthand for /profile')
+    .addSubcommand(s=>s.setName('card').setDescription('How much of your sheet shows when you roll')
+      .addStringOption(o=>o.setName('style').setDescription('Full card, one compressed line, or nothing').setRequired(true)
+        .addChoices({name:'Full — the whole sheet',value:'full'},
+                    {name:'Compressed — one line of stats',value:'compact'},
+                    {name:'Off — plain text rolls',value:'off'})))
     .addSubcommand(s=>s.setName('on').setDescription('Enable profile embed, max HP and rerolls'))
     .addSubcommand(s=>s.setName('off').setDescription('Disable profile embed'))
     .addSubcommand(s=>s.setName('show').setDescription('Preview your profile without rolling'))
@@ -2732,20 +2798,25 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('leaderboard').setDescription('Who holds the most renown'))
     .addSubcommand(s=>s.setName('history').setDescription('Where a player\'s renown came from and went')
       .addUserOption(o=>o.setName('user').setDescription('Whose history').setRequired(false)))
-    .addSubcommand(s=>s.setName('add').setDescription('Award renown (GM)')
+    .addSubcommand(s=>s.setName('gain').setDescription('A character\'s standing rises (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
       .addIntegerOption(o=>o.setName('amount').setDescription('How much').setRequired(true).setMinValue(1))
-      .addStringOption(o=>o.setName('reason').setDescription('What for').setRequired(false)))
-    .addSubcommand(s=>s.setName('spend').setDescription('Spend renown (GM)')
+      .addStringOption(o=>o.setName('reason').setDescription('What earned it').setRequired(false)))
+    .addSubcommand(s=>s.setName('loss').setDescription('A character\'s standing falls (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
       .addIntegerOption(o=>o.setName('amount').setDescription('How much').setRequired(true).setMinValue(1))
-      .addStringOption(o=>o.setName('reason').setDescription('On what').setRequired(false)))
+      .addStringOption(o=>o.setName('reason').setDescription('What cost them').setRequired(false)))
     .addSubcommand(s=>s.setName('set').setDescription('Set an exact balance (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
       .addIntegerOption(o=>o.setName('amount').setDescription('New balance').setRequired(true).setMinValue(0))),
 
   new SlashCommandBuilder()
     .setName('merit').setDescription('Track player merit / experience (GM only)')
+    .addSubcommand(s=>s.setName('give').setDescription('Offer some of your merit to another character — a GM signs it off')
+      .addUserOption(o=>o.setName('user').setDescription('Who receives it').setRequired(true))
+      .addIntegerOption(o=>o.setName('amount').setDescription('How much').setRequired(true).setMinValue(1))
+      .addStringOption(o=>o.setName('reason').setDescription('What it is for — payment, tribute, a debt').setRequired(false)))
+    .addSubcommand(s=>s.setName('trades').setDescription('Merit trades still waiting on a GM'))
     .addSubcommand(s=>s.setName('add').setDescription('Award merits to a player (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Player').setRequired(true))
       .addIntegerOption(o=>o.setName('amount').setDescription('How many merits (default 1)').setRequired(false).setMinValue(1).setMaxValue(999)))
@@ -2886,6 +2957,112 @@ async function handleLoreRejectModal(interaction) {
     allowedMentions: { parse: [] } });
 }
 
+// A player offers merit; nothing moves until a GM approves it.
+async function handleMeritGive(interaction) {
+  const gid = interaction.guild.id, from = interaction.user.id;
+  const to = interaction.options.getUser('user');
+  const amount = interaction.options.getInteger('amount');
+  const reason = (interaction.options.getString('reason') || '').trim() || null;
+
+  if (to.id === from) return interaction.reply({ content: '❌ You can\'t trade merit with yourself.', ephemeral: true });
+  if (to.bot) return interaction.reply({ content: '❌ Pick a character, not a bot.', ephemeral: true });
+  const mine = getChar(gid, from);
+  if (!mine) return interaction.reply({ content: '❌ You need a character sheet first — `/char create`.', ephemeral: true });
+  if (!getChar(gid, to.id)) return interaction.reply({ content: `❌ **${await getDisplayName(interaction.guild, to.id)}** has no character sheet.`, ephemeral: true });
+
+  // Checked now and again at approval — merit can be spent in between.
+  const have = mine.merits ?? 0;
+  if (have < amount) return interaction.reply({ content: `❌ You have **${have}** merit — not enough to give ${amount}.`, ephemeral: true });
+
+  const chId = getConfig(gid)?.approval_channel_id;
+  const fromName = await getDisplayName(interaction.guild, from);
+  const toName = await getDisplayName(interaction.guild, to.id);
+  const trade = createMeritTrade(gid, from, to.id, amount, reason, interactionChannelId(interaction));
+
+  await interaction.reply({ content:
+    `🤝 **${fromName}** offers **${amount} merit** to **${toName}**${reason ? ` — ${reason}` : ''}.\n`
+    + (chId ? `_Held for a GM to sign off${chId ? ` in <#${chId}>` : ''}. Nothing moves until then._`
+            : '_⚠️ No approval channel is set, so no GM has been told — ask one to run `/config approvals`._') });
+  if (!chId) return;
+
+  try {
+    const roles = getGmRoleIds(gid);
+    const ch = await interaction.client.channels.fetch(chId);
+    const msg = await ch.send({
+      content: [`${roles.map(r => `<@&${r}>`).join(' ')} 🤝 **Merit trade — trade #${trade.id}**`,
+        `From <@${from}> (**${fromName}**) — holds ${have}`,
+        `To <@${to.id}> (**${toName}**)`,
+        `Amount: **${amount} merit**`,
+        reason ? `Reason: ${reason}` : 'No reason given',
+      ].join('\n'),
+      components: [meritTradeButtons(trade.id)], allowedMentions: { roles } });
+    setMeritTrade(gid, trade.id, { msg_id: msg.id });
+  } catch (err) {
+    console.error('[merit] could not queue trade:', err?.message || err);
+    await interaction.followUp({ ephemeral: true, content: '⚠️ Couldn\'t reach the approval channel — ask a GM to check `/config approvals`.' }).catch(()=>{});
+  }
+}
+
+async function handleMeritTradeButton(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can decide on merit trades.', ephemeral: true });
+  const [action, idRaw] = interaction.customId.split(':');
+  const trade = getMeritTrade(gid, Number(idRaw));
+  if (!trade || trade.state !== 'pending') {
+    try { await interaction.message.edit({ components: [] }); } catch {}
+    return interaction.reply({ content: '⏰ That trade has already been settled.', ephemeral: true });
+  }
+  if (action === 'tradeno') {
+    return showRejectReasonModal(interaction, `traderej:${trade.id}`, 'Refuse merit trade', 'e.g. not while they owe the guild.');
+  }
+
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+  const fromName = await getDisplayName(interaction.guild, trade.from_user);
+  const toName = await getDisplayName(interaction.guild, trade.to_user);
+  // Re-check the balance: merit may have moved since the offer was made.
+  const have = getChar(gid, trade.from_user)?.merits ?? 0;
+  if (have < trade.amount) {
+    setMeritTrade(gid, trade.id, { state: 'void', decided_by: interaction.user.id, decided_at: Date.now() });
+    try { await interaction.message.edit({ content: `${interaction.message.content}\n\n⚠️ **Void** — they no longer have the merit.`, components: [] }); } catch {}
+    return interaction.reply({ content: `⚠️ **${fromName}** only has **${have}** merit now — the trade can't go through.` });
+  }
+
+  addMerits(gid, trade.from_user, -trade.amount);
+  addMerits(gid, trade.to_user, trade.amount);
+  setMeritTrade(gid, trade.id, { state: 'approved', decided_by: interaction.user.id, decided_at: Date.now() });
+  try { await interaction.message.edit({ content: `${interaction.message.content}\n\n✅ **Approved** by ${gmName}`, components: [] }); } catch {}
+
+  const notice = `🤝 **Merit trade approved** by ${gmName} in **${interaction.guild.name}** — `
+    + `**${trade.amount}** merit from **${fromName}** to **${toName}**${trade.reason ? ` (${trade.reason})` : ''}.`;
+  await notifyPlayer(interaction, gid, trade.from_user, notice);
+  await notifyPlayer(interaction, gid, trade.to_user, notice);
+  // Say it where it was offered, so the table sees the trade land.
+  if (trade.src_channel) {
+    try { const ch = await interaction.client.channels.fetch(trade.src_channel);
+      await ch.send({ content: notice, allowedMentions: { parse: [] } }); } catch {}
+  }
+  return interaction.reply({ content:
+    `✅ Trade #${trade.id} approved — **${trade.amount}** merit moved from **${fromName}** to **${toName}**.` });
+}
+
+async function handleMeritTradeRejectModal(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can decide on merit trades.', ephemeral: true });
+  const trade = getMeritTrade(gid, Number(interaction.customId.split(':')[1]));
+  if (!trade || trade.state !== 'pending') return interaction.reply({ content: '⏰ That trade has already been settled.', ephemeral: true });
+  const reason = cleanReason(interaction.fields.getTextInputValue('reason'));
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+  setMeritTrade(gid, trade.id, { state: 'refused', reason, decided_by: interaction.user.id, decided_at: Date.now() });
+  try { await interaction.message?.edit({ content: `${interaction.message.content}\n\n🚫 **Refused** by ${gmName}${reason ? `\n💬 ${reason}` : ''}`, components: [] }); } catch {}
+  const notice = `🚫 **Your merit trade was refused** by ${gmName} in **${interaction.guild.name}**.`
+    + (reason ? `\n💬 **Reason:** ${reason}` : '') + '\nNo merit changed hands.';
+  await notifyPlayer(interaction, gid, trade.from_user, notice);
+  return interaction.reply({ content: `🚫 Trade #${trade.id} refused${reason ? ` — “${reason}”` : ''}. No merit moved.`,
+    allowedMentions: { parse: [] } });
+}
+
 async function handleRenown(interaction) {
   const gid = interaction.guild.id;
   const sub = interaction.options.getSubcommand();
@@ -2920,14 +3097,17 @@ async function handleRenown(interaction) {
   const nm = await getDisplayName(interaction.guild, target.id);
   if (!getChar(gid, target.id)) return interaction.reply({ content: `❌ **${nm}** has no character sheet.`, ephemeral: true });
 
-  if (sub === 'add') {
+  if (sub === 'gain') {
     const now = addRenown(gid, target.id, amount, reason ?? 'awarded by GM');
-    return interaction.reply({ content: `💠 **${nm}** gains **${amount}** renown${reason ? ` — ${reason}` : ''}. Balance: **${now}**.` });
+    return interaction.reply({ content: `💠 **${nm}**'s standing rises by **+${amount}**${reason ? ` — ${reason}` : ''}. Renown: **${now}**.` });
   }
-  if (sub === 'spend') {
-    const now = addRenown(gid, target.id, -amount, reason ?? 'spent');
-    if (now === null) return interaction.reply({ content: `❌ **${nm}** only has **${getRenown(gid, target.id)}** renown — not enough to spend ${amount}.`, ephemeral: true });
-    return interaction.reply({ content: `💠 **${nm}** spends **${amount}** renown${reason ? ` on ${reason}` : ''}. Balance: **${now}**.` });
+  if (sub === 'loss') {
+    // Standing is a tally, not a purse — it can be knocked down to nothing but
+    // never below, so a heavy blow simply floors it.
+    const before = getRenown(gid, target.id);
+    const now = addRenown(gid, target.id, -amount, reason ?? 'standing lost', { allowNegative: true });
+    const note = amount > before ? ` _(they only had ${before})_` : '';
+    return interaction.reply({ content: `💠 **${nm}**'s standing falls by **−${amount}**${reason ? ` — ${reason}` : ''}.${note} Renown: **${now}**.` });
   }
   if (sub === 'set') {
     const cur = getRenown(gid, target.id);
@@ -3810,16 +3990,30 @@ async function handleChar(interaction) {
 
 async function handleProfile(interaction) {
   const sub = interaction.options.getSubcommand(), gid = interaction.guild.id, uid = interaction.user.id;
+  if (sub === 'card') {
+    const style = interaction.options.getString('style');
+    const want = style === 'off' ? CARD_OFF : style === 'compact' ? CARD_COMPACT : CARD_FULL;
+    let ch = getChar(gid, uid);
+    if (!ch) { upsertChar(gid, uid, {}); ch = getChar(gid, uid); }
+    upsertChar(gid, uid, { profile_enabled: want });
+    const sample = want === CARD_COMPACT ? `\n${statLine(getChar(gid, uid), gid)}`
+                 : want === CARD_FULL ? '\n_The whole sheet — order, class, HP, rerolls, stats and weapons._'
+                 : '\n_Just the dice._';
+    return interaction.reply({ ephemeral: true, content:
+      `🎴 Roll card set to **${CARD_NAME[want]}**.${sample}`
+      + (want === CARD_OFF ? '\n_Stat rolls still show the compressed line, since a bare total says nothing about which stat it was._' : '') });
+  }
+
   if (sub === 'on') {
     let ch = getChar(gid, uid);
     if (!ch) { upsertChar(gid, uid, {}); ch = getChar(gid, uid); }
     upsertChar(gid, uid, { profile_enabled:1, hp_current:maxHp(ch, gid), rerolls_current:maxRerolls(ch) });
     if (isWhiteKnight(ch)) { const cfg=getConfig(gid); setHealCharges(gid,uid,cfg.heal_charges??3); }
-    return interaction.reply({ content: '✅ Profile enabled. HP and rerolls maxed out.', ephemeral: true });
+    return interaction.reply({ content: '✅ Profile enabled (full card). HP and rerolls maxed out. `/profile card` picks a style.', ephemeral: true });
   }
   if (sub === 'off') {
     upsertChar(gid, uid, { profile_enabled: 0 });
-    return interaction.reply({ content: '⏸️ Profile disabled. Rolls will post as plain text.', ephemeral: true });
+    return interaction.reply({ content: '⏸️ Profile disabled. Rolls post as plain text. `/profile card style:Compressed` gives a one-line version instead.', ephemeral: true });
   }
   if (sub === 'show') {
     const ch = getChar(gid, uid);
@@ -3964,7 +4158,10 @@ async function handleHeal(message, rest) {
   const rollLine = `🎲  1d20+${char.wis} → [${nat}]${modStr} = **${total}**`;
   recordRoll(gid, { userId: uid, channelId: cid, messageId: message.id, input: message.content, rollLine, nat, sides: 20, context: 'heal' });
   let content;
-  if (char.profile_enabled === 1) {
+  const healMode = cardMode(char);
+  if (healMode === CARD_COMPACT) {
+    content = `**heal**\n${rollLine}\n${statLine(upd, gid)}\n${resultText}`;
+  } else if (healMode === CARD_FULL) {
     content = buildRollEmbed({ rollLine, label:'heal', isReroll:false, char:{...upd,displayName:dn}, healCharges:newCharges, maxCharges:mc, flavour:null, total, critType:null });
     content += `\n${resultText}`;
   } else {
@@ -4492,6 +4689,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.customId.startsWith('npcsay:')) return handleNpcSayModal(interaction);
     if (interaction.customId === 'loresubmit') return handleLoreSubmit(interaction);
     if (interaction.customId.startsWith('lorereject:')) return handleLoreRejectModal(interaction);
+    if (interaction.customId.startsWith('traderej:')) return handleMeritTradeRejectModal(interaction);
     if (interaction.customId.startsWith('sheetreject:')) return handleSheetRejectModal(interaction);
     if (interaction.customId.startsWith('exportreject:')) return handleExportRejectModal(interaction);
     return;
@@ -4504,6 +4702,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.customId.startsWith('storyroll:')) return handleStoryRollButton(interaction);
     if (interaction.customId.startsWith('storypick:')) return handleStoryPickButton(interaction);
     if (interaction.customId.startsWith('loreok:') || interaction.customId.startsWith('loreno:')) return handleLoreButton(interaction);
+    if (interaction.customId.startsWith('tradeok:') || interaction.customId.startsWith('tradeno:')) return handleMeritTradeButton(interaction);
     if (interaction.customId.startsWith('questapply:') || interaction.customId.startsWith('questwithdraw:')) {
       return handleQuestButton(interaction);
     }
@@ -7168,7 +7367,7 @@ async function handleSlashRoll(interaction) {
   }
 
   const char = getChar(gid, uid);
-  const profileEnabled = char?.profile_enabled === 1;
+  const profileEnabled = char ? cardMode(char) !== CARD_OFF : false;
   let content;
   if (profileEnabled && char) {
     const cfg = getConfig(gid);
@@ -8148,7 +8347,19 @@ async function handleRollSlash(interaction) {
     input: `/roll ${stat ? `stat:${stat}` : `dice:${dice}`}${effMode !== 'normal' ? ` mode:${effMode}` : ''}${successCheck ? ' success_check:true' : ''}`,
     rollLine, context: successCheck ? 'success check' : null });
 
-  if (char?.profile_enabled === 1) {
+  // Same rule as a typed stat roll: 1d20+4 says nothing about which stat it was
+  // or where the 4 came from, so a stat roll always shows at least the
+  // compressed line — even for someone who has their card switched off.
+  const slashMode = char ? (stat && cardMode(char) === CARD_OFF ? CARD_COMPACT : cardMode(char)) : CARD_OFF;
+
+  if (char && slashMode === CARD_COMPACT) {
+    const lines = [];
+    if (finalLabel) lines.push(`${critPrefix(critType)}**${finalLabel}**`);
+    lines.push(rollLine, statLine(char, gid));
+    if (flavour) lines.push(...flavourBlock(flavour, finalLabel, result.total, critType));
+    return interaction.reply({ content: lines.join('\n') });
+  }
+  if (char && slashMode === CARD_FULL) {
     const cfg = getConfig(gid);
     const maxCharges = cfg.heal_charges ?? 3;
     const healRow = getHealCharges(gid, uid, maxCharges);
@@ -8163,6 +8374,22 @@ async function handleRollSlash(interaction) {
 
 // ── MERIT ─────────────────────────────────────────────────────────────────────
 async function handleMerit(interaction) {
+  {
+    const sub0 = interaction.options.getSubcommand();
+    if (sub0 === 'give') return handleMeritGive(interaction);
+    if (sub0 === 'trades') {
+      const gid0 = interaction.guild.id;
+      const rows = pendingMeritTrades(gid0);
+      if (!rows.length) return interaction.reply({ content: '🤝 No merit trades are waiting.', ephemeral: true });
+      const lines = ['🤝 **Merit trades awaiting a GM**', ''];
+      for (const t of rows) {
+        lines.push(`\`#${t.id}\` **${await getDisplayName(interaction.guild, t.from_user)}** → `
+          + `**${await getDisplayName(interaction.guild, t.to_user)}** · **${t.amount}** merit`
+          + (t.reason ? ` · ${t.reason}` : '') + ` · <t:${Math.floor(t.created_at / 1000)}:R>`);
+      }
+      return replyLong(interaction, lines, { ephemeral: true });
+    }
+  }
   const gid = interaction.guild.id, uid = interaction.user.id;
   const sub = interaction.options.getSubcommand();
 

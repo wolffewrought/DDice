@@ -346,7 +346,7 @@ CONTENT = [
          'fewer than they had. Prefix a <b>+</b> and it <b>adds</b> instead: <b>+4</b> gives four more HP, '
          '<b>+25%</b> gives a quarter of their maximum on top of what they have. Both cap at the maximum and '
          'both round down. <b>0%</b> leaves that resource untouched, and only the values you provide change.'),
-('aud','all'),
+('aud','gm'),
 ('h2', 'Scheduled Recovery'),
 ('p', 'A server can run <b>any number of named schedules</b>, each with its own timing and its own strength. '
       'A light top-up every few hours and a full recovery overnight can sit side by side.'),
@@ -372,6 +372,7 @@ CONTENT = [
 ('note', 'Each schedule carries its own clock in the database, so a restart or redeploy can neither skip a '
          'cycle nor fire one early. Adding a schedule, or resuming a paused one, starts its count from that '
          'moment.'),
+('aud','all'),
 ('h2', 'Help & Maintenance'),
 ('code', [('/help', 'overview of all command groups'),
           ('/help category:dice', 'detail on a specific group'),
@@ -680,15 +681,35 @@ CONTENT = [
       'GM-only until <b>/config activities players:true</b>.'),
 ('aud','all'),
 ('h2', 'Renown'),
-('p', 'Renown is a currency \u2014 earned from quests, encounters and activities, and spent again. It is separate '
-      'from merits, which only ever climb.'),
+('p', '<b>Renown is not a currency.</b> It is a running tally of how a character <b>stands in the world</b> '
+      '\u2014 what they have done, who has noticed, and how far their name carries. It is earned from quests, '
+      'encounters and activities, and it is not meant to be traded away for goods. Someone with high renown '
+      'is <b>known</b>; that is the whole of it.'),
+('p', 'A ' + GM + ' can adjust it either way when the story calls for it \u2014 a reputation can be damaged as '
+      'well as built \u2014 but it is a record of standing rather than a purse.'),
 ('code', [('/renown view        /renown view user:@player', ''),
-          ('/renown leaderboard /renown history', ''),
-          ('/renown add user:@a amount:5 reason:Fishing', GM),
-          ('/renown spend user:@a amount:3 reason:A better rod', GM),
+          ('/renown leaderboard', 'who is best known'),
+          ('/renown history', 'where a standing came from'),
+          ('/renown gain user:@a amount:5 reason:Cleared the Sunken Vault', GM),
+          ('/renown loss user:@a amount:3 reason:Disgraced at court', GM),
           ('/renown set user:@a amount:0', GM)]),
-('p', 'A spend is refused when the balance will not cover it, and every movement is logged with its reason, so '
-      '<b>/renown history</b> answers where it came from and where it went.'),
+('p', 'Every change is logged with its reason, so <b>/renown history</b> answers how a reputation was built '
+      'and where it was lost.'),
+('h2', 'Merit'),
+('p', 'Merit is the earned measure of service \u2014 awarded by a ' + GM + ', accumulated across quests and '
+      'activities, and the thing rank thresholds are set against. Unlike renown, <b>merit is tradeable</b>: '
+      'it can be passed between players, and potentially to and from NPCs, as payment, tribute, a debt '
+      'settled or a favour bought.'),
+('code', [('/merit give user:@a amount:2 reason:A debt settled', 'offer some of your merit'),
+          ('/merit trades', 'what is still waiting on a ' + GM)]),
+('p', '<b>No merit moves until a ' + GM + ' signs it off.</b> An offer is held and posted to the sheet approval '
+      'channel with Approve / Refuse buttons; a refusal asks the ' + GM + ' why and passes the reason back. '
+      'Both parties are told when it lands, and it is announced in the channel where it was offered so the '
+      'table sees the trade happen.'),
+('note', 'Your balance is checked twice \u2014 when you offer, and again when a ' + GM + ' approves. If you have '
+         'spent the merit in between, the trade is voided rather than pushing anyone into the red.'),
+('note', 'Renown says who you are in the world. Merit is what you have earned and may hand on. A character '
+         'can be widely known and hold no merit at all, or quietly hold a great deal.'),
 ('aud','gm'),
 ('aud','all'),
 ('sec', 'Quest Board'),
