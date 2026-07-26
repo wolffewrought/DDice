@@ -1008,8 +1008,11 @@ function describeSchedule(sc) {
     const t = String(tok ?? '0%');
     if (t === '0%' || t === '0') return null;
     if (t === '100%') return `full ${what}`;
-    if (t.endsWith('%')) return `${t} ${what} (rounded down)`;
-    return `${t} ${what}`;
+    if (t.startsWith('+')) return t.endsWith('%')
+      ? `${t.slice(1)} of max ${what} added (rounded down)`
+      : `${t.slice(1)} ${what} added`;
+    if (t.endsWith('%')) return `set to ${t} ${what} (rounded down)`;
+    return `set to ${t} ${what}`;
   };
   const parts = [bit(sc.hp, 'HP'), bit(sc.rerolls, 'rerolls'), bit(sc.heal, 'heal charges')].filter(Boolean);
   return parts.length ? parts.join(' · ') : 'nothing (every amount is 0%)';
@@ -1035,13 +1038,13 @@ async function runAutoRest(guild, sc) {
     const name = await getDisplayName(guild, ch.user_id);
     if (busy.has(ch.user_id)) { skipped.push(name); continue; }
     const updates = {};
-    const hpR = resolveRestToken(sc.hp, maxHp(ch, gid), '0%');
+    const hpR = resolveRestToken(sc.hp, maxHp(ch, gid), '0%', ch.hp_current ?? 0);
     if (hpR.changed) updates.hp_current = hpR.value;
-    const rR = resolveRestToken(sc.rerolls, maxRerolls(ch), '0%');
+    const rR = resolveRestToken(sc.rerolls, maxRerolls(ch), '0%', ch.rerolls_current ?? 0);
     if (rR.changed) updates.rerolls_current = rR.value;
     if (Object.keys(updates).length) upsertChar(gid, ch.user_id, updates);
     // Heal charges only mean anything to a White Knight with WIS 5+.
-    const healR = resolveRestToken(sc.heal, maxCharges, '0%');
+    const healR = resolveRestToken(sc.heal, maxCharges, '0%', getHealCharges(gid, ch.user_id, maxCharges).current);
     if (healR.changed && isWhiteKnight(ch)) setHealCharges(gid, ch.user_id, healR.value);
     restored.push(name);
   }
@@ -2884,7 +2887,7 @@ async function handleConfig(interaction) {
     for (const [key, val] of [['hp', hp], ['rerolls', rerolls], ['heal', heal]]) {
       if (val === null || val === undefined) continue;
       const t = String(val).trim();
-      if (!/^\d+%?$/.test(t)) return interaction.reply({ content: `❌ **${key}** must be like \`100%\`, \`50%\`, \`0%\` or a plain number — got \`${t}\`.`, ephemeral: true });
+      if (!/^\+?\d+%?$/.test(t)) return interaction.reply({ content: `❌ **${key}** must be like \`100%\`, \`50%\`, \`+4\`, \`+25%\`, \`0%\` or a plain number — got \`${t}\`.\n_A bare number **sets** the value; a **+** adds to what they already have._`, ephemeral: true });
       fields[key] = t;
     }
     if (hours !== null) fields.hours = hours;
@@ -3554,19 +3557,36 @@ async function handleRerolls(message, rest) {
 //   "100%" / "50%" -> percentage of max (capped at max, uncapped input allowed)
 //   "3"            -> flat: set the resource to exactly 3 (capped at max)
 // Returns { value, changed } — changed=false means "don't touch this resource".
-function resolveRestToken(token, max, fallback) {
+// Work out what a rest amount means. `current` is what the character has now,
+// which only matters for the "+" forms.
+//
+//   50%   → set to half their maximum
+//   +50%  → add half their maximum to what they have
+//   4     → set to exactly 4
+//   +4    → add 4 to what they have
+//   0%    → leave it alone
+//
+// The "+" forms exist because "a short rest restores 4 HP" reads as *add 4* to
+// most people, while a bare number has always meant *set to 4* — so both are
+// spelled out rather than one silently winning.
+function resolveRestToken(token, max, fallback, current = null) {
   let raw = (token === null || token === undefined || token === '') ? fallback : String(token).trim();
   if (raw === null || raw === undefined) return { value: null, changed: false };
   raw = String(raw).trim();
+
+  const add = raw.startsWith('+');
+  if (add) raw = raw.slice(1).trim();
+  const base = (add && typeof current === 'number') ? current : 0;
+
   if (raw.endsWith('%')) {
     const p = parseInt(raw.slice(0, -1), 10);
     if (isNaN(p) || p <= 0) return { value: null, changed: false };
-    return { value: Math.min(max, Math.floor(max * p / 100)), changed: true };
+    const amount = Math.floor(max * p / 100);
+    return { value: Math.max(0, Math.min(max, add ? base + amount : amount)), changed: true };
   }
-  // Flat whole number — set the value to exactly this (clamped to max)
   const n = parseInt(raw, 10);
   if (isNaN(n) || n < 0) return { value: null, changed: false };
-  return { value: Math.min(max, n), changed: true };
+  return { value: Math.max(0, Math.min(max, add ? base + n : n)), changed: true };
 }
 
 async function handleRest(message, rest, type) {
@@ -3605,12 +3625,12 @@ async function handleRest(message, rest, type) {
   // Long / short rest: resolve each resource's token and only touch ones that change
   const lines = [`${label} applied to ${tn} character.`];
   const updates = {};
-  const hpR = resolveRestToken(hpTok, hm, '0%');
+  const hpR = resolveRestToken(hpTok, hm, '0%', ch.hp_current ?? 0);
   if (hpR.changed) { updates.hp_current = hpR.value; lines.push(`❤️ HP: **${hpR.value} / ${hm}**`); }
-  const rR = resolveRestToken(rTok, rm, '0%');
+  const rR = resolveRestToken(rTok, rm, '0%', ch.rerolls_current ?? 0);
   if (rR.changed) { updates.rerolls_current = rR.value; lines.push(`🔄 Rerolls: **${rR.value} / ${rm}**`); }
   if (Object.keys(updates).length) upsertChar(gid, targetId, updates);
-  const healR = resolveRestToken(healTok, mc, '0%');
+  const healR = resolveRestToken(healTok, mc, '0%', getHealCharges(gid, targetId, mc).current);
   if (healR.changed && isWhiteKnight(ch)) {
     setHealCharges(gid, targetId, healR.value);
     lines.push(`🛡️ Heal: **${healR.value} / ${mc}**`);
