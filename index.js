@@ -180,6 +180,23 @@ db.exec(`
     hp_current INTEGER DEFAULT 0, rerolls_current INTEGER DEFAULT 0, profile_enabled INTEGER DEFAULT 1,
     PRIMARY KEY (guild_id, user_id)
   );
+  CREATE TABLE IF NOT EXISTS inventory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL, user_id TEXT NOT NULL,
+    item TEXT NOT NULL, note TEXT, source TEXT, added_by TEXT, at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS lore (
+    guild_id TEXT NOT NULL, user_id TEXT NOT NULL,
+    body TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+    reason TEXT, submitted_at INTEGER, decided_by TEXT, decided_at INTEGER,
+    msg_id TEXT, src_channel TEXT,
+    PRIMARY KEY (guild_id, user_id)
+  );
+  CREATE TABLE IF NOT EXISTS roll_tally (
+    guild_id TEXT NOT NULL, user_id TEXT NOT NULL,
+    sides INTEGER NOT NULL, nat INTEGER NOT NULL, count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (guild_id, user_id, sides, nat)
+  );
   CREATE TABLE IF NOT EXISTS stories (
     guild_id TEXT NOT NULL, name TEXT NOT NULL, author_id TEXT,
     start_scene TEXT NOT NULL DEFAULT 'start', tally TEXT, created_at INTEGER,
@@ -518,6 +535,150 @@ function getHealCharges(gid, uid, max) {
 function setHealCharges(gid, uid, cur) {
   db.prepare('INSERT OR REPLACE INTO heal_charges (guild_id,user_id,current) VALUES (?,?,?)').run(gid, uid, cur);
 }
+// The character card, in one place so /char show and /char summary agree.
+function buildCharCard(ch, displayName, healNow, maxCharges, gid) {
+  const lines = [`⚔️  **${displayName}**`,
+    ch.order_name ? `${KNIGHT_EMOJIS[ch.order_name] ?? '⚪'}  ${ch.order_name}` : 'No order set'];
+  if (ch.class) lines.push(`🏅  ${ch.class}`);
+  lines.push(`❤️  HP          ${ch.hp_current} / ${maxHp(ch, gid)}`,
+             `🔄  Rerolls      ${ch.rerolls_current} / ${maxRerolls(ch)}`);
+  if (isWhiteKnight(ch)) lines.push(`🛡️  Heal         ${healNow} / ${maxCharges}`);
+  lines.push('', `💪  STR         ${ch.str}`, `🫀  CON         ${ch.con}`, `⚡  DEX         ${ch.dex}`,
+             `🧠  WIS         ${ch.wis}`, `🍀  LCK         ${ch.lck}`);
+  if (ch.weapon1 || ch.weapon2) {
+    lines.push('');
+    if (ch.weapon1) lines.push(`${ch.weapon1emoji ?? '⚔️'}  ${ch.weapon1}`);
+    if (ch.weapon2) lines.push(`${ch.weapon2emoji ?? '🗡️'}  ${ch.weapon2}`);
+  }
+  return lines;
+}
+
+// ── Character pages ───────────────────────────────────────────────────────────
+// Inventory, standing, lore and roll history: the things a character accumulates
+// over a lifetime that aren't on the stat block.
+
+function addItem(gid, uid, item, { note = null, source = null, by = null } = {}) {
+  db.prepare('INSERT INTO inventory (guild_id,user_id,item,note,source,added_by,at) VALUES (?,?,?,?,?,?,?)')
+    .run(gid, uid, item, note, source, by, Date.now());
+}
+function listItems(gid, uid) {
+  return db.prepare('SELECT * FROM inventory WHERE guild_id=? AND user_id=? ORDER BY at DESC').all(gid, uid);
+}
+function removeItem(gid, id, uid) {
+  return db.prepare('DELETE FROM inventory WHERE guild_id=? AND id=? AND user_id=?').run(gid, id, uid).changes > 0;
+}
+
+// Every natural die a character has ever rolled, kept per die size so a d20's
+// twenty and a d6's six don't land in the same bucket.
+function tallyRoll(gid, uid, nat, sides) {
+  if (!uid || !Number.isFinite(nat) || !Number.isFinite(sides)) return;
+  db.prepare(`INSERT INTO roll_tally (guild_id,user_id,sides,nat,count) VALUES (?,?,?,?,1)
+              ON CONFLICT(guild_id,user_id,sides,nat) DO UPDATE SET count = count + 1`)
+    .run(gid, uid, sides, nat);
+}
+function rollTally(gid, uid, sides = 20) {
+  const rows = db.prepare('SELECT nat, count FROM roll_tally WHERE guild_id=? AND user_id=? AND sides=? ORDER BY nat').all(gid, uid, sides);
+  const by = {}; let total = 0;
+  for (const r of rows) { by[r.nat] = r.count; total += r.count; }
+  return { by, total };
+}
+
+// Merit and renown movements, newest first, from the two logs they live in.
+function standingEvents(gid, uid, limit = 20) {
+  const merits = db.prepare(`SELECT amount AS delta, reason, created_at AS at, 'merit' AS kind FROM history
+                             WHERE guild_id=? AND kind='merit' AND user_id=? ORDER BY created_at DESC LIMIT ?`).all(gid, uid, limit);
+  const renown = db.prepare(`SELECT delta, reason, at, 'renown' AS kind FROM renown_log
+                             WHERE guild_id=? AND user_id=? ORDER BY at DESC LIMIT ?`).all(gid, uid, limit);
+  return [...merits, ...renown].sort((a, b) => (b.at || 0) - (a.at || 0)).slice(0, limit);
+}
+
+function getLore(gid, uid) { return db.prepare('SELECT * FROM lore WHERE guild_id=? AND user_id=?').get(gid, uid); }
+function setLore(gid, uid, fields) {
+  if (!getLore(gid, uid)) db.prepare('INSERT INTO lore (guild_id,user_id,body) VALUES (?,?,?)').run(gid, uid, fields.body ?? '');
+  const keys = Object.keys(fields || {});
+  if (keys.length) db.prepare(`UPDATE lore SET ${keys.map(k => `${k}=?`).join(',')} WHERE guild_id=? AND user_id=?`)
+    .run(...keys.map(k => fields[k]), gid, uid);
+  return getLore(gid, uid);
+}
+function loreButtons(uid) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`loreok:${uid}`).setLabel('Approve lore').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`loreno:${uid}`).setLabel('Reject').setStyle(ButtonStyle.Danger),
+  );
+}
+
+// A ready-made activity for trying the system out. Deliberately has no GAIN, no
+// TALLY, no merits and no rewards — a demo that quietly handed out renown would
+// be worse than no demo at all.
+const DEMO_FISHING = [
+'[ACTIVITY] Fishing (demo)',
+'SCENE find',
+'SAY 🎣 You walk the bank looking for somewhere the fish might be holding.',
+'ROLL wis DC12',
+'  PASS -> cast',
+'  FAIL ONE OF',
+"    This spot doesn't look all too lucky... gotta keep looking.",
+"    Doesn't look like they're biting here today... time to expand the search.",
+'    You know what they say? Try, try, try again... do not give up!',
+'  FAIL -> find',
+'',
+'SCENE cast',
+'SAY Now we are talking! Cast out and try your luck.',
+'ROLL str|dex|wis',
+'  1-5   Something small brushes the line.     -> fight_small',
+'  6-10  A decent weight takes the bait.       -> fight_medium',
+'  11-15 The rod bends hard. That is a big one! -> fight_big',
+'  16+   The reel screams. Extraordinary!      -> fight_extra',
+'',
+'SCENE fight_small',
+'SAY A gentle tug. Bring it in.',
+'GAUNTLET str|con 6',
+'  NAT20 It practically leaps into your hands. -> caught',
+'  NAT1  The line snaps and it is gone. -> restring',
+'  PASS -> caught',
+'  FAIL -> find',
+'',
+'SCENE fight_medium',
+'SAY It runs. Hold on.',
+'GAUNTLET str|con 10 8',
+'  NAT1 The line snaps and it is gone. -> restring',
+'  PASS -> caught',
+'  FAIL -> find',
+'',
+'SCENE fight_big',
+'SAY The water boils. This will take some work.',
+'GAUNTLET 14:str 12:str|con 10:con',
+'  NAT20 One clean heave and it is aboard. -> caught',
+'  NAT1  The line snaps and it is gone. -> restring',
+'  PASS -> caught',
+'  FAIL -> find',
+'',
+'SCENE fight_extra',
+'SAY Whatever this is, it does not want to be caught.',
+'GAUNTLET 16:str 14:str|con 12:con 10:str|dex',
+'  NAT20 Somehow, it is yours. -> caught',
+'  NAT1  The line snaps and it is gone. -> restring',
+'  PASS -> caught',
+'  FAIL -> find',
+'',
+'SCENE restring',
+'SAY You restring the rod, muttering.',
+'CHOICE',
+'  Cast again -> cast',
+'  Head back  -> depot',
+'',
+'SCENE caught',
+'SAY 🐟 A fine catch! (Nothing is awarded — this is a demo.)',
+'CHOICE',
+'  Keep fishing  -> cast',
+'  Call it a day -> depot',
+'',
+'SCENE depot',
+'SAY You head back with your haul. The quartermaster nods approvingly.',
+'END',
+].join('\n');
+
 // ── Story engine ──────────────────────────────────────────────────────────────
 // A scenario is a set of named scenes. A scene narrates, asks for a roll, and
 // branches on the outcome; an ending stops the run and hands out rewards.
@@ -901,7 +1062,7 @@ async function handleStoryRollButton(interaction) {
   const name = await getDisplayName(interaction.guild, uid);
   const label = (stat || statWord).toUpperCase();
 
-  mirrorRoll(gid, { userId: uid, channelId: cid, interaction,
+  recordRoll(gid, { userId: uid, channelId: cid, interaction,
     input: `${run.story} · ${run.scene}`, rollLine: buildRollLine(result, mode, detectCrit(result, mode), null),
     context: `activity roll (${label})` });
 
@@ -2076,6 +2237,7 @@ const slashCommands = [
       .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true)))
     .addSubcommand(s=>s.setName('run').setDescription('Start an activity in this channel')
       .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true)))
+    .addSubcommand(s=>s.setName('demo').setDescription('Play the built-in fishing activity — awards nothing (GM)'))
     .addSubcommand(s=>s.setName('stop').setDescription('Stop the activity running in this channel'))
     .addSubcommand(s=>s.setName('delete').setDescription('Delete an activity (GM)')
       .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true)))
@@ -2183,6 +2345,25 @@ const slashCommands = [
           {name:'🦉 Wisdom (WIS)',value:'wis'},
           {name:'🍀 Luck (LCK)',value:'lck'})))
     .addSubcommand(s=>s.setName('submit').setDescription('Send your sheet to the GMs for approval again'))
+    .addSubcommand(s=>s.setName('summary').setDescription('Everything about a character on one page')
+      .addUserOption(o=>o.setName('user').setDescription('Whose character').setRequired(false)))
+    .addSubcommand(s=>s.setName('inventory').setDescription('Items a character is carrying')
+      .addUserOption(o=>o.setName('user').setDescription('Whose inventory').setRequired(false)))
+    .addSubcommand(s=>s.setName('give').setDescription('Give a character an item (GM)')
+      .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+      .addStringOption(o=>o.setName('item').setDescription('What they receive').setRequired(true))
+      .addStringOption(o=>o.setName('note').setDescription('A detail about it').setRequired(false)))
+    .addSubcommand(s=>s.setName('take').setDescription('Remove an item from a character (GM)')
+      .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+      .addIntegerOption(o=>o.setName('id').setDescription('Item number from /char inventory').setRequired(true)))
+    .addSubcommand(s=>s.setName('standing').setDescription('Merit and renown, and where each came from')
+      .addUserOption(o=>o.setName('user').setDescription('Whose standing').setRequired(false)))
+    .addSubcommand(s=>s.setName('rollhistory').setDescription('Every natural die this character has ever rolled')
+      .addUserOption(o=>o.setName('user').setDescription('Whose rolls').setRequired(false))
+      .addIntegerOption(o=>o.setName('sides').setDescription('Die size (default 20)').setRequired(false).setMinValue(2).setMaxValue(100)))
+    .addSubcommand(s=>s.setName('lore').setDescription('Write your character\'s lore and send it to the GMs'))
+    .addSubcommand(s=>s.setName('showlore').setDescription('Read a character\'s approved lore')
+      .addUserOption(o=>o.setName('user').setDescription('Whose lore').setRequired(false)))
     .addSubcommand(s=>s.setName('export').setDescription('Export your character sheet')
       .addStringOption(o=>o.setName('format').setDescription('Export format').setRequired(false)
         .addChoices({name:'Text',value:'text'},{name:'Image',value:'image'}))
@@ -2544,6 +2725,68 @@ const slashCommands = [
 //  SLASH HANDLERS
 // ─────────────────────────────────────────────
 
+// Lore is written in a modal, then queued to the same channel sheets go to.
+async function handleLoreSubmit(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const body = String(interaction.fields.getTextInputValue('body') || '').trim();
+  if (!body) return interaction.reply({ content: '❌ Nothing to send.', ephemeral: true });
+  const chId = getConfig(gid)?.approval_channel_id;
+  setLore(gid, uid, { body, state: 'pending', reason: null, submitted_at: Date.now(),
+    src_channel: interactionChannelId(interaction) });
+  await interaction.reply({ ephemeral: true, content: chId
+    ? `📜 **Lore sent to <#${chId}> for a GM to read.** You'll hear back once they decide.`
+    : '📜 Lore saved, but no approval channel is set — ask a GM to run `/config approvals`.' });
+  if (!chId) return;
+  try {
+    const nm = await getDisplayName(interaction.guild, uid);
+    const roles = getGmRoleIds(gid);
+    const ch = await interaction.client.channels.fetch(chId);
+    const prev = getLore(gid, uid);
+    if (prev?.msg_id) {
+      try { const old = await ch.messages.fetch(prev.msg_id);
+        await old.edit({ content: `~~📜 Lore from <@${uid}>~~\n↩️ *Superseded — they rewrote it.*`, components: [] }); } catch {}
+    }
+    await ch.send({ content: `${roles.map(r => `<@&${r}>`).join(' ')} 📜 **Lore submitted** by <@${uid}> (**${nm}**)`,
+      allowedMentions: { roles } });
+    const msg = await ch.send({ content: body.length > 1900 ? body.slice(0, 1900) + '…' : body,
+      components: [loreButtons(uid)], allowedMentions: { parse: [] } });
+    setLore(gid, uid, { msg_id: msg.id });
+  } catch (err) { console.error('[lore] could not queue:', err?.message || err); }
+}
+
+async function handleLoreButton(interaction) {
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can decide on lore.', ephemeral: true });
+  const [action, uid] = interaction.customId.split(':');
+  if (action === 'loreno') {
+    return showRejectReasonModal(interaction, `lorereject:${uid}`, 'Reject lore', 'e.g. this contradicts the setting.');
+  }
+  const gid = interaction.guild.id;
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+  setLore(gid, uid, { state: 'approved', reason: null, decided_by: interaction.user.id, decided_at: Date.now() });
+  try { await interaction.message.edit({ content: `${interaction.message.content}\n\n✅ **Approved** by ${gmName}`, components: [] }); } catch {}
+  const told = await notifyPlayer(interaction, gid, uid,
+    `✅ **Your lore was approved** by ${gmName} in **${interaction.guild.name}** — it shows on \`/char showlore\` now.`);
+  return interaction.reply({ content: `✅ Lore approved for <@${uid}>.` + deliveryNote(told), allowedMentions: { parse: [] } });
+}
+
+async function handleLoreRejectModal(interaction) {
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can decide on lore.', ephemeral: true });
+  const gid = interaction.guild.id;
+  const uid = interaction.customId.split(':')[1];
+  const reason = cleanReason(interaction.fields.getTextInputValue('reason'));
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+  setLore(gid, uid, { state: 'rejected', reason, decided_by: interaction.user.id, decided_at: Date.now() });
+  try { await interaction.message?.edit({ content: `${interaction.message.content}\n\n🚫 **Rejected** by ${gmName}${reason ? `\n💬 ${reason}` : ''}`, components: [] }); } catch {}
+  const told = await notifyPlayer(interaction, gid, uid,
+    `🚫 **Your lore was turned down** by ${gmName} in **${interaction.guild.name}**.\n`
+    + (reason ? `💬 **Reason:** ${reason}\n` : '')
+    + 'Rewrite it with `/char lore` and it goes straight back to them.');
+  return interaction.reply({ content: `🚫 Lore rejected for <@${uid}>${reason ? ` — “${reason}”` : ''}.` + deliveryNote(told),
+    allowedMentions: { parse: [] } });
+}
+
 async function handleRenown(interaction) {
   const gid = interaction.guild.id;
   const sub = interaction.options.getSubcommand();
@@ -2600,11 +2843,26 @@ async function handleStory(interaction) {
   const isGmUser = await isGm(interaction.guild, interaction.user.id);
   // Writing, tweaking and deleting always need a GM. Running one is a separate
   // question, and stays GM-only until a server opens it up.
-  const AUTHORING = ['delete', 'set'];
+  const AUTHORING = ['delete', 'set', 'demo'];
   if (AUTHORING.includes(sub) && !isGmUser)
     return interaction.reply({ content: '❌ Only GMs can write or change activities.', ephemeral: true });
   if (!isGmUser && !(getConfig(gid)?.activity_players))
     return interaction.reply({ content: '❌ Activities are GM-led on this server for now. Ask a GM to start one.', ephemeral: true });
+
+  // A throwaway copy of the fishing loop for trying the system out. Saved under
+  // a reserved name with every reward stripped, so a demo run can't move
+  // anyone's renown, merits or items.
+  if (sub === 'demo') {
+    if (getRun(gid, cid)) return interaction.reply({ content: '❌ Something is already running here. `/activity stop` first.', ephemeral: true });
+    const parsed = parseStoryScript(DEMO_FISHING);
+    if (parsed.error) return interaction.reply({ content: `❌ The built-in demo failed to parse: ${parsed.error}`, ephemeral: true });
+    saveStory(gid, interaction.user.id, parsed);
+    const first = getScene(gid, parsed.name, parsed.start);
+    const run = setRun(gid, cid, { story: parsed.name, scene: first.scene, started_by: interaction.user.id,
+      started_at: Date.now(), took_part: '[]', tally_state: '{}', gauntlet_at: 0 });
+    await interaction.reply({ content: '🎣 **Fishing (demo)** — a dry run. Nothing you catch will be awarded.\nAnyone here can press the buttons.' });
+    return postScene(interaction.guild, cid, run, first);
+  }
 
   if (sub === 'list') {
     const all = listStories(gid);
@@ -3307,6 +3565,98 @@ async function handleChar(interaction) {
     });
   }
 
+  // ── Character pages ──
+  if (['summary','inventory','standing','rollhistory','showlore'].includes(sub)) {
+    const who = interaction.options.getUser('user');
+    const tid = who?.id ?? callerId;
+    const nm = await getDisplayName(interaction.guild, tid);
+    const ch = getChar(gid, tid);
+    if (!ch) return interaction.reply({ content: `❌ **${nm}** has no character sheet.`, ephemeral: true });
+
+    const inventoryLines = () => {
+      const items = listItems(gid, tid);
+      if (!items.length) return ['🎒 **Inventory** — empty.'];
+      return ['🎒 **Inventory**', ...items.map(i =>
+        `\`#${i.id}\` **${i.item}**${i.note ? ` — ${i.note}` : ''}${i.source ? `  _(${i.source})_` : ''}`)];
+    };
+    const standingLines = () => {
+      const out = [`🏅 **Standing** — **${ch.merits ?? 0}** merit${(ch.merits ?? 0) === 1 ? '' : 's'} · 💠 **${ch.renown ?? 0}** renown`];
+      const ev = standingEvents(gid, tid);
+      if (!ev.length) { out.push('_Nothing recorded yet._'); return out; }
+      out.push('');
+      for (const e of ev) {
+        out.push(`${e.kind === 'merit' ? '🏅' : '💠'} ${e.delta > 0 ? '+' : ''}${e.delta} · ${e.reason || 'no reason given'}`
+          + (e.at ? ` · <t:${Math.floor(e.at / 1000)}:R>` : ''));
+      }
+      return out;
+    };
+    const rollLines = (sides) => {
+      const { by, total } = rollTally(gid, tid, sides);
+      if (!total) return [`🎲 **Roll history (d${sides})** — nothing recorded yet.`];
+      const out = [`🎲 **Roll history (d${sides})** — **${total}** rolls`];
+      const peak = Math.max(...Object.values(by));
+      for (let f = 1; f <= sides; f++) {
+        const c = by[f] || 0;
+        const bar = '▰'.repeat(Math.round((c / peak) * 12)) || '';
+        const tag = f === sides ? ' 🌟' : f === 1 ? ' 💀' : '';
+        out.push(`\`${String(f).padStart(2)}\`${tag} ${String(c).padStart(4)}  ${bar}`);
+      }
+      return out;
+    };
+    const loreLines = () => {
+      const l = getLore(gid, tid);
+      if (!l || !l.body) return ['📜 **Lore** — none written yet.'];
+      if (l.state !== 'approved') return [`📜 **Lore** — ⏳ ${l.state === 'pending' ? 'awaiting GM approval' : 'was rejected'}${l.reason ? ` — ${l.reason}` : ''}.`];
+      return ['📜 **Lore**', l.body];
+    };
+
+    if (sub === 'inventory')   return replyLong(interaction, [`🎒 **${nm}**`, '', ...inventoryLines().slice(1)]);
+    if (sub === 'standing')    return replyLong(interaction, [`**${nm}**`, ...standingLines()]);
+    if (sub === 'rollhistory') return replyLong(interaction, [`**${nm}**`, ...rollLines(interaction.options.getInteger('sides') ?? 20)]);
+    if (sub === 'showlore')    return replyLong(interaction, [`**${nm}**`, ...loreLines()]);
+
+    // summary — the sheet, then every page under it
+    const cfg = getConfig(gid); const mc = cfg.heal_charges ?? 3;
+    const hr = getHealCharges(gid, tid, mc);
+    const card = buildCharCard(ch, nm, hr.current, mc, gid);
+    const t = rollTally(gid, tid, 20);
+    const nat20 = t.by[20] || 0, nat1 = t.by[1] || 0;
+    return replyLong(interaction, [...card, '',
+      ...standingLines(), '',
+      ...inventoryLines(), '',
+      `🎲 **Rolls** — ${t.total} lifetime · 🌟 ${nat20} nat-20${nat20 === 1 ? '' : 's'} · 💀 ${nat1} nat-1${nat1 === 1 ? '' : 's'}`, '',
+      ...loreLines()]);
+  }
+
+  if (sub === 'give' || sub === 'take') {
+    if (!(await isGm(interaction.guild, callerId)))
+      return interaction.reply({ content: '❌ Only GMs can hand out or take items.', ephemeral: true });
+    const who = interaction.options.getUser('user');
+    const nm = await getDisplayName(interaction.guild, who.id);
+    if (!getChar(gid, who.id)) return interaction.reply({ content: `❌ **${nm}** has no character sheet.`, ephemeral: true });
+    if (sub === 'give') {
+      const item = interaction.options.getString('item').trim();
+      addItem(gid, who.id, item, { note: interaction.options.getString('note'), source: 'given by a GM', by: callerId });
+      return interaction.reply({ content: `🎒 **${nm}** receives **${item}**.` });
+    }
+    const id = interaction.options.getInteger('id');
+    return interaction.reply({ content: removeItem(gid, id, who.id)
+      ? `🎒 Item \`#${id}\` taken from **${nm}**.`
+      : `❌ **${nm}** has no item \`#${id}\`.`, ephemeral: true });
+  }
+
+  if (sub === 'lore') {
+    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+    const existing = getLore(gid, callerId);
+    const modal = new ModalBuilder().setCustomId('loresubmit').setTitle('Your character\'s lore');
+    modal.addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId('body').setLabel('Lore')
+        .setPlaceholder('Where they came from, who they were, what they carry.')
+        .setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(3500)
+        .setValue(existing?.body || '')));
+    return interaction.showModal(modal);
+  }
+
   if (sub === 'export') return handleCharExport(interaction);
   if (sub === 'show') {
     const tu = interaction.options.getUser('user') || interaction.user, tid = tu.id;
@@ -3350,18 +3700,7 @@ async function handleProfile(interaction) {
     const dn = await getDisplayName(interaction.guild, uid);
     const cfg = getConfig(gid); const mc = cfg.heal_charges??3;
     const hr = getHealCharges(gid, uid, mc);
-    const kn = ch.order_name ? `${KNIGHT_EMOJIS[ch.order_name]??'⚪'}  ${ch.order_name}` : 'No order set';
-    const lines = [`⚔️  **${dn}**`, kn];
-    if (ch.class) lines.push(`🏅  ${ch.class}`);
-    lines.push(`❤️  HP          ${ch.hp_current} / ${maxHp(ch, gid)}`, `🔄  Rerolls      ${ch.rerolls_current} / ${maxRerolls(ch)}`);
-    if (isWhiteKnight(ch)) lines.push(`🛡️  Heal         ${hr.current} / ${mc}`);
-    lines.push('', `💪  STR         ${ch.str}`, `🫀  CON         ${ch.con}`, `⚡  DEX         ${ch.dex}`, `🧠  WIS         ${ch.wis}`, `🍀  LCK         ${ch.lck}`);
-    if (ch.weapon1 || ch.weapon2) {
-      lines.push('');
-      if (ch.weapon1) lines.push(`${ch.weapon1emoji??'⚔️'}  ${ch.weapon1}`);
-      if (ch.weapon2) lines.push(`${ch.weapon2emoji??'🗡️'}  ${ch.weapon2}`);
-    }
-    return interaction.reply({ content: lines.join('\n'), ephemeral: true });
+    return interaction.reply({ content: buildCharCard(ch, dn, hr.current, mc, gid).join('\n'), ephemeral: true });
   }
   if (sub === 'save') {
     const slot = interaction.options.getString('slotname');
@@ -3456,7 +3795,7 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
   const sides = result.sides ?? (mode === 'normal' ? result.sides : result.sides);
   const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides ?? result.sides) : null;
   const rollLine = buildRollLine(result, mode, critType, successResult);
-  mirrorRoll(gid, { userId: uid, channelId: cid, messageId: message.id, input: message.content,
+  recordRoll(gid, { userId: uid, channelId: cid, messageId: message.id, input: message.content,
     rollLine, context: isReroll ? 'reroll' : (successCheck ? 'success check' : null) });
   await sendRollEmbed(message, rollLine, label, isReroll, uid, flavour, result.total, critType, !!statRolled);
 }
@@ -3496,7 +3835,7 @@ async function handleHeal(message, rest) {
   const dn = await getDisplayName(message.guild, uid);
   const modStr = char.wis > 0 ? ` +${char.wis}` : '';
   const rollLine = `🎲  1d20+${char.wis} → [${nat}]${modStr} = **${total}**`;
-  mirrorRoll(gid, { userId: uid, channelId: cid, messageId: message.id, input: message.content, rollLine, context: 'heal' });
+  recordRoll(gid, { userId: uid, channelId: cid, messageId: message.id, input: message.content, rollLine, context: 'heal' });
   let content;
   if (char.profile_enabled === 1) {
     content = buildRollEmbed({ rollLine, label:'heal', isReroll:false, char:{...upd,displayName:dn}, healCharges:newCharges, maxCharges:mc, flavour:null, total, critType:null });
@@ -4024,6 +4363,8 @@ client.on('interactionCreate', async interaction => {
   // Handle confirmation buttons
   if (interaction.isModalSubmit?.()) {
     if (interaction.customId.startsWith('npcsay:')) return handleNpcSayModal(interaction);
+    if (interaction.customId === 'loresubmit') return handleLoreSubmit(interaction);
+    if (interaction.customId.startsWith('lorereject:')) return handleLoreRejectModal(interaction);
     if (interaction.customId.startsWith('sheetreject:')) return handleSheetRejectModal(interaction);
     if (interaction.customId.startsWith('exportreject:')) return handleExportRejectModal(interaction);
     return;
@@ -4035,6 +4376,7 @@ client.on('interactionCreate', async interaction => {
     }
     if (interaction.customId.startsWith('storyroll:')) return handleStoryRollButton(interaction);
     if (interaction.customId.startsWith('storypick:')) return handleStoryPickButton(interaction);
+    if (interaction.customId.startsWith('loreok:') || interaction.customId.startsWith('loreno:')) return handleLoreButton(interaction);
     if (interaction.customId.startsWith('questapply:') || interaction.customId.startsWith('questwithdraw:')) {
       return handleQuestButton(interaction);
     }
@@ -4894,6 +5236,14 @@ function turnPing(gid, f) {
 // GMs are accountable to each other). NPC auto-rolls are not mirrored.
 // `messageId` links straight to the roll. For slash commands there's no user
 // message, so callers pass the interaction and we resolve its reply instead.
+// Count a roll toward the character's lifetime tally, then mirror it. Every
+// roll path already calls mirrorRoll, so this is the one place that sees them
+// all — auto rolls have no userId and are skipped, as they belong to no sheet.
+function recordRoll(gid, opts) {
+  if (opts?.userId && Number.isFinite(opts?.nat)) tallyRoll(gid, opts.userId, opts.nat, opts.sides ?? 20);
+  mirrorRoll(gid, opts);
+}
+
 // Mirror one roll into the audit channel. Every roll goes through here — typed,
 // slash, fight, GM, GM-as-NPC and bot-driven auto rolls alike.
 //
@@ -6234,7 +6584,7 @@ async function handleFight(interaction) {
       nat = rollDie(20); total = nat + effTotal;
       rollLine = `⚔️  1d20+${STAT_LABELS[stat]}${bonusTag} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
-    mirrorRoll(gid, { userId: uid, channelId: cid, interaction,
+    recordRoll(gid, { userId: uid, channelId: cid, interaction,
       input: `/fight atk stat:${stat}${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine,
       context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 attacks ${targetF.name}` : `fight · attacks ${targetF.name}` });
 
@@ -6333,7 +6683,7 @@ async function handleFight(interaction) {
       const label = flat ? `🛡️  1d20${flatTag}` : `🛡️  1d20+${STAT_LABELS[stat]}`;
       rollLine = `${label} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
-    mirrorRoll(gid, { userId: uid, channelId: cid, interaction,
+    recordRoll(gid, { userId: uid, channelId: cid, interaction,
       input: `/fight def stat:${stat}${isNpcFighter(defenderId) ? ` npc:${defender.name}` : ''}`, rollLine,
       context: isNpcFighter(defenderId) ? `fight · GM as ${defender.name} 🎭 defends` : 'fight · defends' });
 
@@ -6410,7 +6760,7 @@ async function handleFight(interaction) {
       const label = isFlat ? `${icon}  1d20 (flat — fumbled last attack)` : `${icon}  1d20+${STAT_LABELS[stat]}${bonusTag}`;
       rollLine = `${label} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
-    mirrorRoll(gid, { userId: uid, channelId: cid, interaction,
+    recordRoll(gid, { userId: uid, channelId: cid, interaction,
       input: `/fight rr${mode !== 'normal' ? ` roll:${mode}` : ''}`, rollLine, context: 'fight · reroll' });
 
     const member = await interaction.guild.members.fetch(uid).catch(()=>null);
@@ -6663,7 +7013,7 @@ async function handleSlashRoll(interaction) {
   const naturalRoll = mode === 'normal' ? result.rolls?.[0] : result.chosen;
   const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides ?? 20) : null;
   const rollLine = buildRollLine(result, mode, critType, successResult);
-  mirrorRoll(gid, { userId: uid, channelId: interactionChannelId(interaction), interaction,
+  recordRoll(gid, { userId: uid, channelId: interactionChannelId(interaction), interaction,
     input: `/dr ${finalNotation}${finalLabel ? ' ' + finalLabel : ''}`, rollLine,
     context: successCheck ? 'success check' : null });
 
@@ -6959,7 +7309,7 @@ async function handlePr(interaction) {
 
     const critType = detectCrit(result, mode);
     const rollLine = maskNpcRollLine(gid, buildRollLine(result, mode, critType, null));
-    mirrorRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction,
+    recordRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction,
       input: `/pr reroll ${last.notation}${last.label ? ' ' + last.label : ''}`,
       rollLine: buildRollLine(result, mode, critType, null),
       context: `as NPC **${npc.name}** · reroll` });
@@ -7085,7 +7435,7 @@ async function handlePr(interaction) {
     const rollLine = maskNpcRollLine(gid, buildRollLine(result, mode, critType, null));
     // Posted through the NPC's webhook, so the audit is the only place this ties
     // back to the GM who actually rolled it.
-    mirrorRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction,
+    recordRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction,
       input: `/pr roll ${notation}${label ? ' ' + label : ''}`,
       rollLine: buildRollLine(result, mode, critType, null),
       context: `as NPC **${npc.name}**` });
@@ -7591,7 +7941,7 @@ async function handleRollSlash(interaction) {
   const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides) : null;
   const rollLine = buildRollLine(result, effMode, critType, successResult);
 
-  mirrorRoll(gid, { userId: uid, channelId: cid, interaction,
+  recordRoll(gid, { userId: uid, channelId: cid, interaction,
     input: `/roll ${stat ? `stat:${stat}` : `dice:${dice}`}${effMode !== 'normal' ? ` mode:${effMode}` : ''}${successCheck ? ' success_check:true' : ''}`,
     rollLine, context: successCheck ? 'success check' : null });
 
