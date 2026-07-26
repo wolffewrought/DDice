@@ -593,6 +593,17 @@ function rollTally(gid, uid, sides = 20) {
   for (const r of rows) { by[r.nat] = r.count; total += r.count; }
   return { by, total };
 }
+// Everything a character has ever rolled, across every die size.
+function rollTallyAll(gid, uid) {
+  const rows = db.prepare('SELECT sides, nat, count FROM roll_tally WHERE guild_id=? AND user_id=? ORDER BY sides, nat').all(gid, uid);
+  const bySize = {}; let total = 0;
+  for (const r of rows) {
+    const b = (bySize[r.sides] = bySize[r.sides] || { by: {}, total: 0, sum: 0 });
+    b.by[r.nat] = r.count; b.total += r.count; b.sum += r.nat * r.count;
+    total += r.count;
+  }
+  return { bySize, total };
+}
 
 // Merit and renown movements, newest first, from the two logs they live in.
 function standingEvents(gid, uid, limit = 20) {
@@ -1141,7 +1152,7 @@ async function resolveActivityRoll(ctx, statWord, flavour, io) {
   const name = await getDisplayName(io.guild, uid);
   const label = (stat || statWord).toUpperCase();
 
-  recordRoll(gid, { userId: uid, channelId: cid, interaction: io.interaction ?? null,
+  recordRoll(gid, { userId: uid, channelId: cid, interaction: io.interaction ?? null, result,
     input: `${run.story} · ${run.scene}`, rollLine: buildRollLine(result, mode, detectCrit(result, mode), null),
     context: `activity roll (${label})` });
 
@@ -3688,16 +3699,34 @@ async function handleChar(interaction) {
       }
       return out;
     };
+    // Faces for one die size, then a breakdown of every size rolled, then the
+    // headline figures. The face list is always printed in full, zeros and all,
+    // so the shape of someone's luck is visible at a glance.
     const rollLines = (sides) => {
-      const { by, total } = rollTally(gid, tid, sides);
-      if (!total) return [`🎲 **Roll history (d${sides})** — nothing recorded yet.`];
-      const out = [`🎲 **Roll history (d${sides})** — **${total}** rolls`];
-      const peak = Math.max(...Object.values(by));
+      const all = rollTallyAll(gid, tid);
+      if (!all.total) return ['🎲 **Roll history** — nothing recorded yet.'];
+      const face = all.bySize[sides] || { by: {}, total: 0, sum: 0 };
+      const out = [`🎲 **Roll history**`, '', `**d${sides} faces**`];
+      const times = (c) => `${c} time${c === 1 ? '' : 's'} rolled`;
       for (let f = 1; f <= sides; f++) {
-        const c = by[f] || 0;
-        const bar = '▰'.repeat(Math.round((c / peak) * 12)) || '';
-        const tag = f === sides ? ' 🌟' : f === 1 ? ' 💀' : '';
-        out.push(`\`${String(f).padStart(2)}\`${tag} ${String(c).padStart(4)}  ${bar}`);
+        const mark = f === 1 ? '🔴 ' : f === sides ? '🟡 ' : '';
+        out.push(`${mark}**${f}** — ${times(face.by[f] || 0)}`);
+      }
+
+      out.push('', '**Dice rolled**');
+      const shown = [2, 4, 6, 8, 10, 12, 20];
+      for (const sd of shown) out.push(`d${sd} — ${times(all.bySize[sd]?.total || 0)}`);
+      for (const sd of Object.keys(all.bySize).map(Number).sort((a, b) => a - b)) {
+        if (!shown.includes(sd)) out.push(`d${sd} — ${times(all.bySize[sd].total)}`);
+      }
+
+      out.push('', `**Total dice rolled** — ${all.total}`);
+      if (face.total) {
+        const avg = (face.sum / face.total).toFixed(2);
+        const peak = Math.max(...Object.values(face.by));
+        const commonest = Object.entries(face.by).filter(([, c]) => c === peak).map(([f]) => f);
+        out.push(`**Average d${sides} result** — ${avg}`);
+        out.push(`**Most rolled** — ${commonest.join(', ')} (${times(peak)})`);
       }
       return out;
     };
@@ -3894,7 +3923,7 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
   const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides ?? result.sides) : null;
   const rollLine = buildRollLine(result, mode, critType, successResult);
   recordRoll(gid, { userId: uid, channelId: cid, messageId: message.id, input: message.content,
-    rollLine, context: isReroll ? 'reroll' : (successCheck ? 'success check' : null) });
+    rollLine, result, context: isReroll ? 'reroll' : (successCheck ? 'success check' : null) });
   await sendRollEmbed(message, rollLine, label, isReroll, uid, flavour, result.total, critType, !!statRolled);
 }
 
@@ -3933,7 +3962,7 @@ async function handleHeal(message, rest) {
   const dn = await getDisplayName(message.guild, uid);
   const modStr = char.wis > 0 ? ` +${char.wis}` : '';
   const rollLine = `🎲  1d20+${char.wis} → [${nat}]${modStr} = **${total}**`;
-  recordRoll(gid, { userId: uid, channelId: cid, messageId: message.id, input: message.content, rollLine, context: 'heal' });
+  recordRoll(gid, { userId: uid, channelId: cid, messageId: message.id, input: message.content, rollLine, nat, sides: 20, context: 'heal' });
   let content;
   if (char.profile_enabled === 1) {
     content = buildRollEmbed({ rollLine, label:'heal', isReroll:false, char:{...upd,displayName:dn}, healCharges:newCharges, maxCharges:mc, flavour:null, total, critType:null });
@@ -5344,7 +5373,18 @@ function turnPing(gid, f) {
 // roll path already calls mirrorRoll, so this is the one place that sees them
 // all — auto rolls have no userId and are skipped, as they belong to no sheet.
 function recordRoll(gid, opts) {
-  if (opts?.userId && Number.isFinite(opts?.nat)) tallyRoll(gid, opts.userId, opts.nat, opts.sides ?? 20);
+  // Tally every die that was physically rolled, not just the one that counted:
+  // an advantage roll threw two d20s and both belong in a lifetime history.
+  // `result` is the object from rollNotation/rollAdvantage/rollDisadvantage;
+  // `nat`/`sides` are the fallback for paths that build a roll line by hand.
+  if (opts?.userId) {
+    const r = opts.result;
+    if (r && Array.isArray(r.rolls) && r.rolls.length) {
+      for (const face of r.rolls) tallyRoll(gid, opts.userId, face, r.sides ?? 20);
+    } else if (Number.isFinite(opts.nat)) {
+      tallyRoll(gid, opts.userId, opts.nat, opts.sides ?? 20);
+    }
+  }
   mirrorRoll(gid, opts);
 }
 
@@ -6689,7 +6729,7 @@ async function handleFight(interaction) {
       rollLine = `⚔️  1d20+${STAT_LABELS[stat]}${bonusTag} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
     recordRoll(gid, { userId: uid, channelId: cid, interaction,
-      input: `/fight atk stat:${stat}${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine,
+      input: `/fight atk stat:${stat}${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
       context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 attacks ${targetF.name}` : `fight · attacks ${targetF.name}` });
 
     const targetName = targetF.name + (targetF.isNpc ? ' 🎭' : '');
@@ -6788,7 +6828,7 @@ async function handleFight(interaction) {
       rollLine = `${label} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
     recordRoll(gid, { userId: uid, channelId: cid, interaction,
-      input: `/fight def stat:${stat}${isNpcFighter(defenderId) ? ` npc:${defender.name}` : ''}`, rollLine,
+      input: `/fight def stat:${stat}${isNpcFighter(defenderId) ? ` npc:${defender.name}` : ''}`, rollLine, nat, sides: 20,
       context: isNpcFighter(defenderId) ? `fight · GM as ${defender.name} 🎭 defends` : 'fight · defends' });
 
     const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
@@ -6865,7 +6905,7 @@ async function handleFight(interaction) {
       rollLine = `${label} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
     recordRoll(gid, { userId: uid, channelId: cid, interaction,
-      input: `/fight rr${mode !== 'normal' ? ` roll:${mode}` : ''}`, rollLine, context: 'fight · reroll' });
+      input: `/fight rr${mode !== 'normal' ? ` roll:${mode}` : ''}`, rollLine, nat, sides: 20, context: 'fight · reroll' });
 
     const member = await interaction.guild.members.fetch(uid).catch(()=>null);
     const name = member?.nickname || member?.user.username || uid;
@@ -7117,7 +7157,7 @@ async function handleSlashRoll(interaction) {
   const naturalRoll = mode === 'normal' ? result.rolls?.[0] : result.chosen;
   const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides ?? 20) : null;
   const rollLine = buildRollLine(result, mode, critType, successResult);
-  recordRoll(gid, { userId: uid, channelId: interactionChannelId(interaction), interaction,
+  recordRoll(gid, { userId: uid, channelId: interactionChannelId(interaction), interaction, result,
     input: `/dr ${finalNotation}${finalLabel ? ' ' + finalLabel : ''}`, rollLine,
     context: successCheck ? 'success check' : null });
 
@@ -7413,7 +7453,7 @@ async function handlePr(interaction) {
 
     const critType = detectCrit(result, mode);
     const rollLine = maskNpcRollLine(gid, buildRollLine(result, mode, critType, null));
-    recordRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction,
+    recordRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction, result,
       input: `/pr reroll ${last.notation}${last.label ? ' ' + last.label : ''}`,
       rollLine: buildRollLine(result, mode, critType, null),
       context: `as NPC **${npc.name}** · reroll` });
@@ -7539,7 +7579,7 @@ async function handlePr(interaction) {
     const rollLine = maskNpcRollLine(gid, buildRollLine(result, mode, critType, null));
     // Posted through the NPC's webhook, so the audit is the only place this ties
     // back to the GM who actually rolled it.
-    recordRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction,
+    recordRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction, result,
       input: `/pr roll ${notation}${label ? ' ' + label : ''}`,
       rollLine: buildRollLine(result, mode, critType, null),
       context: `as NPC **${npc.name}**` });
@@ -8104,7 +8144,7 @@ async function handleRollSlash(interaction) {
   const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides) : null;
   const rollLine = buildRollLine(result, effMode, critType, successResult);
 
-  recordRoll(gid, { userId: uid, channelId: cid, interaction,
+  recordRoll(gid, { userId: uid, channelId: cid, interaction, result,
     input: `/roll ${stat ? `stat:${stat}` : `dice:${dice}`}${effMode !== 'normal' ? ` mode:${effMode}` : ''}${successCheck ? ' success_check:true' : ''}`,
     rollLine, context: successCheck ? 'success check' : null });
 
