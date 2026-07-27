@@ -63,6 +63,11 @@ try { db.exec('ALTER TABLE characters ADD COLUMN approval_requested_at INTEGER')
 try { db.exec('ALTER TABLE characters ADD COLUMN approval_post_ok INTEGER DEFAULT 0'); } catch {}
 // Why a GM turned a sheet down, so the player knows what to change.
 try { db.exec('ALTER TABLE characters ADD COLUMN approval_reason TEXT'); } catch {}
+// The emoji columns carry a default (⚔️/🗡️), so their value can't tell us whether
+// a player actually picked one. These record that they did, per slot, so a sheet
+// can be required to be finished before a GM ever sees it.
+try { db.exec('ALTER TABLE characters ADD COLUMN weapon1emoji_set INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN weapon2emoji_set INTEGER DEFAULT 0'); } catch {}
 // Character creation budget, per guild. Defaults match the shipped rules.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN stat_budget INTEGER DEFAULT 15'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN stat_min INTEGER DEFAULT 1'); } catch {}
@@ -959,6 +964,109 @@ function parseStoryScript(text) {
     return { error: 'Add a `TALLY renown` line at the top — a scene gains or cashes out a tally that has no name.' };
   }
   return { name, start: scenes[0].scene, tally, scenes };
+}
+
+// Change one part of one scene without re-pasting the whole activity. Values
+// use the same grammar as the script itself, so a GM edits with the syntax they
+// already wrote in — and every branch target is checked before anything saves,
+// exactly as a full paste is, so an edit can't strand a run.
+function applySceneEdit(gid, story, scene, field, raw) {
+  const sc = getScene(gid, story, scene);
+  if (!sc) return { error: `**${story}** has no scene \`${scene}\`.` };
+  const value = String(raw ?? '').trim();
+  const names = listScenes(gid, story).map(x => x.scene.toLowerCase());
+  const target = (t) => names.includes(String(t).toLowerCase());
+  const clearing = /^(none|clear|off|-)$/i.test(value);
+  const upd = {};
+
+  const arrow = (v) => {
+    const m = v.match(/^([\s\S]*?)\s*->\s*(\S+)$/);
+    return m ? { text: m[1].trim(), next: m[2] } : null;
+  };
+
+  switch (field) {
+    case 'dc': {
+      if (clearing) { upd.dc = null; break; }
+      if (!/^\d+$/.test(value)) return { error: 'A DC must be a whole number, or `none` to remove it.' };
+      upd.dc = parseInt(value); break;
+    }
+    case 'gauntlet': {
+      if (clearing) { upd.gauntlet = null; break; }
+      let g = null;
+      let m = value.match(/^([a-z|]+)\s+([\d\s]+)$/i);
+      if (m) g = m[2].trim().split(/\s+/).map(Number).filter(Number.isFinite).map(dc => ({ dc, stats: m[1].toLowerCase() }));
+      else if (/^(?:\d+:[a-z|]+\s*)+$/i.test(value)) {
+        g = value.trim().split(/\s+/).map(tok => { const [dc, st] = tok.split(':'); return { dc: parseInt(dc), stats: String(st).toLowerCase() }; });
+      }
+      if (!g || !g.length) return { error: 'Write it as `str|con 14 12 10` or `14:str 12:str|con 10:con`.' };
+      if (g.length > 8) return { error: 'Eight rolls is the most a gauntlet can have.' };
+      for (const step of g) for (const st of step.stats.split('|')) {
+        if (!resolveStatWord(st)) return { error: `\`${st}\` isn't a stat.` };
+      }
+      upd.gauntlet = JSON.stringify(g);
+      upd.roll = [...new Set(g.flatMap(x => x.stats.split('|')))].join('|');
+      break;
+    }
+    case 'outcome': {
+      const m = value.match(new RegExp(`^(${STORY_BANDS.join('|')})\\s+([\\s\\S]*)$`, 'i'));
+      if (!m) return { error: `Write it as \`PASS some text -> scene\` (bands: ${STORY_BANDS.join(', ')}).` };
+      const band = m[1].toUpperCase();
+      const outcomes = JSON.parse(sc.outcomes || '{}');
+      if (/^(none|clear|off|-)$/i.test(m[2].trim())) { delete outcomes[band]; upd.outcomes = JSON.stringify(outcomes); break; }
+      const a = arrow(m[2]);
+      if (!a) return { error: 'Missing the `-> scene` part.' };
+      if (!target(a.next)) return { error: `There is no scene \`${a.next}\`.` };
+      outcomes[band] = Object.assign(outcomes[band] || { variants: [] }, { text: a.text, next: a.next });
+      upd.outcomes = JSON.stringify(outcomes); break;
+    }
+    case 'range': {
+      if (clearing) { upd.ranges = '[]'; break; }
+      const m = value.match(/^(\d+)\s*(?:-|–|to)?\s*(\d+|\+)?\s*([\s\S]*)$/);
+      if (!m) return { error: 'Write it as `1-5 some text -> scene`, or `16+ text -> scene`.' };
+      const a = arrow(m[3] || '');
+      if (!a) return { error: 'Missing the `-> scene` part.' };
+      if (!target(a.next)) return { error: `There is no scene \`${a.next}\`.` };
+      const lo = parseInt(m[1]);
+      const hi = (!m[2] || m[2] === '+') ? 9999 : parseInt(m[2]);
+      const ranges = JSON.parse(sc.ranges || '[]').filter(r => r.lo !== lo);
+      ranges.push({ lo, hi, text: a.text, next: a.next });
+      ranges.sort((x, y) => x.lo - y.lo);
+      upd.ranges = JSON.stringify(ranges); break;
+    }
+    case 'choice': {
+      if (clearing) { upd.choices = '[]'; break; }
+      const a = arrow(value);
+      if (!a || !a.text) return { error: 'Write it as `Carry on -> scene`.' };
+      if (!target(a.next)) return { error: `There is no scene \`${a.next}\`.` };
+      const choices = JSON.parse(sc.choices || '[]').filter(c => c.label.toLowerCase() !== a.text.toLowerCase());
+      choices.push({ label: a.text, next: a.next });
+      if (choices.length > 5) return { error: 'Five options is the most a choice can offer.' };
+      upd.choices = JSON.stringify(choices); break;
+    }
+    case 'nat20': case 'nat1': {
+      if (clearing) { upd[field] = null; break; }
+      const a = arrow(value);
+      if (!a) return { error: 'Write it as `some text -> scene`.' };
+      if (!target(a.next)) return { error: `There is no scene \`${a.next}\`.` };
+      upd[field] = JSON.stringify(a); break;
+    }
+    case 'gain': {
+      if (!/^-?\d+$/.test(value)) return { error: 'A gain must be a whole number.' };
+      upd.gain = parseInt(value); break;
+    }
+    case 'say': case 'npc': case 'roll': case 'rewards':
+      upd[field] = clearing ? null : value; break;
+    case 'merits': {
+      if (!/^\d+$/.test(value)) return { error: 'Merits must be a whole number.' };
+      upd.merits = parseInt(value); break;
+    }
+    default: return { error: `Don't know how to change \`${field}\`.` };
+  }
+
+  const keys = Object.keys(upd);
+  db.prepare(`UPDATE story_scenes SET ${keys.map(k => `${k}=?`).join(',')} WHERE guild_id=? AND story=? COLLATE NOCASE AND scene=? COLLATE NOCASE`)
+    .run(...keys.map(k => upd[k]), gid, story, sc.scene);
+  return { scene: sc.scene, changed: keys };
 }
 
 function saveStory(gid, uid, parsed) {
@@ -1867,13 +1975,35 @@ function statBudgetProblems(gid, stats, { requireAll = true, exact = true } = {}
   return out;
 }
 
+// A sheet isn't finished until both weapons are named and both emojis chosen.
+// Kept separate from the stat budget so a player is told about everything at
+// once rather than fixing one thing and being sent back for the next.
+function sheetKitProblems(ch) {
+  const out = [];
+  const missing = [];
+  if (!String(ch?.weapon1 || '').trim()) missing.push('**Weapon 1**');
+  if (!String(ch?.weapon2 || '').trim()) missing.push('**Weapon 2**');
+  if (missing.length) out.push(`⚔️ Name your weapons — ${missing.join(' and ')} ${missing.length === 1 ? 'is' : 'are'} empty.`);
+
+  const noEmoji = [];
+  if (!ch?.weapon1emoji_set) noEmoji.push('**Weapon 1**');
+  if (!ch?.weapon2emoji_set) noEmoji.push('**Weapon 2**');
+  if (noEmoji.length) out.push(`🎨 Pick an emoji for ${noEmoji.join(' and ')} — \`/char weaponemoji\`.`);
+  return out;
+}
+
 // One refusal covering everything that's wrong, with the spend so far.
 function statBudgetReply(gid, problems, stats) {
   const { budget } = statRules(gid);
   const spread = STATS.map(k => `${k.toUpperCase()} ${Number(stats?.[k]) || 0}`).join(' · ');
   return [`❌ **That sheet can't be submitted yet.**`, '', ...problems, '',
           `Your spread: ${spread}  →  **${statTotal(stats)}/${budget}**`,
-          `Set them all in one go with \`/char create str:… con:… dex:… wis:… lck:…\`.`].join('\n');
+          `Set them all in one go with \`/char create str:… con:… dex:… wis:… lck:… weapon1:… weapon2:…\`.`].join('\n');
+}
+
+// Everything standing between this sheet and a GM seeing it.
+function sheetSubmissionProblems(gid, ch) {
+  return [...statBudgetProblems(gid, ch), ...sheetKitProblems(ch)];
 }
 
 // Post a reply and hand back the message it produced, so an audit or approval
@@ -2417,8 +2547,20 @@ const slashCommands = [
       .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true))
       .addStringOption(o=>o.setName('scene').setDescription('Scene name').setRequired(true))
       .addStringOption(o=>o.setName('field').setDescription('What to change').setRequired(true)
-        .addChoices({name:'Narration (SAY)',value:'say'},{name:'Speak as NPC',value:'npc'},{name:'Roll',value:'roll'},
-                    {name:'Merits on ending',value:'merits'},{name:'Rewards text',value:'rewards'}))
+        .addChoices(
+          {name:'Narration (SAY)',value:'say'},
+          {name:'Speak as NPC',value:'npc'},
+          {name:'Roll — which stats',value:'roll'},
+          {name:'DC — e.g. 13, or none',value:'dc'},
+          {name:'Gauntlet — e.g. 14:str 12:str|con',value:'gauntlet'},
+          {name:'Outcome — e.g. PASS text -> scene',value:'outcome'},
+          {name:'Range — e.g. 1-5 text -> scene',value:'range'},
+          {name:'Choice — e.g. Carry on -> scene',value:'choice'},
+          {name:'Natural 20 — text -> scene',value:'nat20'},
+          {name:'Natural 1 — text -> scene',value:'nat1'},
+          {name:'Tally gain on arrival',value:'gain'},
+          {name:'Merits on ending',value:'merits'},
+          {name:'Rewards text',value:'rewards'}))
       .addStringOption(o=>o.setName('value').setDescription('New value').setRequired(true))),
 
   new SlashCommandBuilder()
@@ -2525,6 +2667,11 @@ const slashCommands = [
       .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
       .addStringOption(o=>o.setName('item').setDescription('What they receive').setRequired(true))
       .addStringOption(o=>o.setName('note').setDescription('A detail about it').setRequired(false)))
+    .addSubcommand(s=>s.setName('edit').setDescription('Reword an item a character is carrying (GM)')
+      .addUserOption(o=>o.setName('user').setDescription('Whose item').setRequired(true))
+      .addIntegerOption(o=>o.setName('id').setDescription('Item number from /char inventory').setRequired(true))
+      .addStringOption(o=>o.setName('item').setDescription('New name for it').setRequired(false))
+      .addStringOption(o=>o.setName('note').setDescription('New detail \u2014 or "none" to clear').setRequired(false)))
     .addSubcommand(s=>s.setName('take').setDescription('Remove an item from a character (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
       .addIntegerOption(o=>o.setName('id').setDescription('Item number from /char inventory').setRequired(true)))
@@ -2841,6 +2988,8 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('amount').setDescription('How much').setRequired(true).setMinValue(1))
       .addStringOption(o=>o.setName('reason').setDescription('What it is for — payment, tribute, a debt').setRequired(false)))
     .addSubcommand(s=>s.setName('trades').setDescription('Merit trades still waiting on a GM'))
+    .addSubcommand(s=>s.setName('cancel').setDescription('Withdraw a merit trade — your own, or any if you are a GM')
+      .addIntegerOption(o=>o.setName('id').setDescription('Trade number from /merit trades').setRequired(true)))
     .addSubcommand(s=>s.setName('add').setDescription('Award merits to a player (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Player').setRequired(true))
       .addIntegerOption(o=>o.setName('amount').setDescription('How many merits (default 1)').setRequired(false).setMinValue(1).setMaxValue(999)))
@@ -3253,14 +3402,11 @@ async function handleStory(interaction) {
     const sceneName = interaction.options.getString('scene');
     const field = interaction.options.getString('field');
     const value = interaction.options.getString('value');
-    const sc = getScene(gid, story.name, sceneName);
-    if (!sc) return interaction.reply({ content: `❌ **${story.name}** has no scene called \`${sceneName}\`.`, ephemeral: true });
-    if (field === 'merits' && !/^\d+$/.test(value.trim()))
-      return interaction.reply({ content: '❌ Merits must be a whole number.', ephemeral: true });
-    const val = field === 'merits' ? parseInt(value) : value;
-    db.prepare(`UPDATE story_scenes SET ${field}=? WHERE guild_id=? AND story=? COLLATE NOCASE AND scene=? COLLATE NOCASE`)
-      .run(val, gid, story.name, sc.scene);
-    return interaction.reply({ content: `✏️ **${story.name}** · \`${sc.scene}\` — ${field} updated.` });
+    const res = applySceneEdit(gid, story.name, sceneName, field, value);
+    if (res.error) return interaction.reply({ content: `❌ ${res.error}`, ephemeral: true });
+    return interaction.reply({ content:
+      `✏️ **${story.name}** · \`${res.scene}\` — **${field}** updated.\n`
+      + `_Read it back with \`/activity show name:${story.name}\`._` });
   }
 
   if (sub === 'run') {
@@ -3750,7 +3896,7 @@ async function handleChar(interaction) {
     if (!chosen) return interaction.reply({ content: `❌ Pick a standard emoji from the dropdown, or paste a server custom emoji in the **custom** field.`, ephemeral: true });
     const cleaned = validateWeaponEmoji(interaction.guild, chosen);
     if (!cleaned) return interaction.reply({ content: `❌ That isn't a valid emoji. Use a standard emoji (${STANDARD_WEAPON_EMOJIS.join(' ')}) or one of this server's own custom emojis.`, ephemeral: true });
-    upsertChar(gid, targetId, { [slot]: cleaned });
+    upsertChar(gid, targetId, { [slot]: cleaned, [`${slot}_set`]: 1 });
     const slotLabel = slot === 'weapon1emoji' ? 'Weapon 1' : 'Weapon 2';
     return finishSheetEdit({
       src: interaction, gid, callerId, targetId, isGmCaller: isGmUser,
@@ -3841,7 +3987,7 @@ async function handleChar(interaction) {
       if (field === 'weapon1emoji' || field === 'weapon2emoji') {
         const cleaned = validateWeaponEmoji(interaction.guild, value);
         if (!cleaned) return interaction.reply({ content: `❌ Use a standard emoji (${STANDARD_WEAPON_EMOJIS.join(' ')}) or one of this server's custom emojis.`, ephemeral: true });
-        upsertChar(gid, targetId, { [field]: cleaned });
+        upsertChar(gid, targetId, { [field]: cleaned, [`${field}_set`]: 1 });
         const lbl = field === 'weapon1emoji' ? 'Weapon 1 Emoji' : 'Weapon 2 Emoji';
         return done(`✅ **${lbl}** set to ${cleaned}${targetId!==callerId?` for <@${targetId}>`:''}.`);
       }
@@ -3868,7 +4014,7 @@ async function handleChar(interaction) {
       return interaction.reply({ content: `⏳ Your sheet is already waiting${chId ? ` in <#${chId}>` : ''}. A GM will get to it.`, ephemeral: true });
     }
     if (ch.approval_state === 'approved') return interaction.reply({ content: '✅ Your sheet is already approved. Ask a GM if you need a change.', ephemeral: true });
-    const problems = statBudgetProblems(gid, ch);
+    const problems = sheetSubmissionProblems(gid, ch);
     if (problems.length) return refuseStatBudget({ src: interaction, gid, uid: callerId, problems, stats: ch,
       reply: replyThenFetch(interaction) });
     return finishSheetEdit({
@@ -3957,6 +4103,29 @@ async function handleChar(interaction) {
       ...inventoryLines(), '',
       `🎲 **Rolls** — ${t.total} lifetime · 🌟 ${nat20} nat-20${nat20 === 1 ? '' : 's'} · 💀 ${nat1} nat-1${nat1 === 1 ? '' : 's'}`, '',
       ...loreLines()]);
+  }
+
+  if (sub === 'edit') {
+    if (!(await isGm(interaction.guild, callerId)))
+      return interaction.reply({ content: '❌ Only GMs can reword items.', ephemeral: true });
+    const who = interaction.options.getUser('user');
+    const id = interaction.options.getInteger('id');
+    const item = interaction.options.getString('item');
+    const note = interaction.options.getString('note');
+    if (item === null && note === null)
+      return interaction.reply({ content: '❌ Give a new `item` name, a new `note`, or both.', ephemeral: true });
+    const row = db.prepare('SELECT * FROM inventory WHERE guild_id=? AND id=? AND user_id=?').get(gid, id, who.id);
+    const nm = await getDisplayName(interaction.guild, who.id);
+    if (!row) return interaction.reply({ content: `❌ **${nm}** has no item \`#${id}\`.`, ephemeral: true });
+    const fields = {};
+    if (item !== null) fields.item = item.trim();
+    if (note !== null) fields.note = /^(none|clear|-)$/i.test(note.trim()) ? null : note.trim();
+    const keys = Object.keys(fields);
+    db.prepare(`UPDATE inventory SET ${keys.map(k => `${k}=?`).join(',')} WHERE guild_id=? AND id=?`)
+      .run(...keys.map(k => fields[k]), gid, id);
+    const after = db.prepare('SELECT * FROM inventory WHERE guild_id=? AND id=?').get(gid, id);
+    return interaction.reply({ content:
+      `🎒 **${nm}**'s item \`#${id}\` is now **${after.item}**${after.note ? ` — ${after.note}` : ''}.` });
   }
 
   if (sub === 'give' || sub === 'take') {
@@ -4070,7 +4239,7 @@ async function handleProfile(interaction) {
     // Snapshots predate the budget, so an old save could smuggle an illegal
     // spread back in. Players get checked; GMs restore whatever they like.
     if (!isGmUser) {
-      const problems = statBudgetProblems(gid, snap);
+      const problems = sheetSubmissionProblems(gid, getChar(gid, uid) ? { ...getChar(gid, uid), ...snap } : snap);
       if (problems.length) return refuseStatBudget({ src: interaction, gid, uid, problems, stats: snap,
         reply: replyThenFetch(interaction) });
     }
@@ -4419,7 +4588,7 @@ async function handleSheetImport(message, parsed) {
   const isGmImporter = await isGm(message.guild, uid);
   // A pasted sheet is a whole character, so both rules apply in full.
   if (!isGmImporter) {
-    const problems = statBudgetProblems(gid, parsed);
+    const problems = sheetSubmissionProblems(gid, { ...(getChar(gid, targetId) || {}), ...parsed });
     if (problems.length) return refuseStatBudget({ src: message, gid, uid, problems, stats: parsed,
       jumpId: message.id, reply: async (c) => message.reply(c).catch(() => null) });
   }
@@ -4460,6 +4629,10 @@ async function handleSheetImport(message, parsed) {
     weapon1emoji: validateWeaponEmoji(message.guild, parsed.weapon1emoji) || '⚔️',
     weapon2: parsed.weapon2 || null,
     weapon2emoji: validateWeaponEmoji(message.guild, parsed.weapon2emoji) || '🗡️',
+    // An exported sheet carries the emoji the character already had, so a
+    // paste counts as a choice — otherwise a re-import would un-finish a sheet.
+    ...(parsed.weapon1emoji ? { weapon1emoji_set: 1 } : {}),
+    ...(parsed.weapon2emoji ? { weapon2emoji_set: 1 } : {}),
   });
 
   // Handle heal charges for White Knight
@@ -5515,7 +5688,7 @@ async function finishSheetEdit({ src, gid, callerId, targetId, isGmCaller, conte
   }
   // /char set writes freely within the ceiling, so a sheet can sit part-spent.
   // It just can't reach the GMs that way — hold it back and say what's missing.
-  const short = statBudgetProblems(gid, getChar(gid, targetId));
+  const short = sheetSubmissionProblems(gid, getChar(gid, targetId));
   if (short.length) {
     const note = statBudgetReply(gid, short, getChar(gid, targetId)) + '\n_Saved, but not sent to the GMs yet._';
     const out = await reply(content + '\n\n' + note);
@@ -8496,6 +8669,33 @@ async function handleMerit(interaction) {
   {
     const sub0 = interaction.options.getSubcommand();
     if (sub0 === 'give') return handleMeritGive(interaction);
+    if (sub0 === 'cancel') {
+      const gid0 = interaction.guild.id, me = interaction.user.id;
+      const id = interaction.options.getInteger('id');
+      const t = getMeritTrade(gid0, id);
+      if (!t) return interaction.reply({ content: `❌ There is no trade \`#${id}\`.`, ephemeral: true });
+      if (t.state !== 'pending') return interaction.reply({ content: `❌ Trade \`#${id}\` was already ${t.state}.`, ephemeral: true });
+      // The player who offered it may withdraw; a GM may clear any of them.
+      const isGmUser0 = await isGm(interaction.guild, me);
+      if (t.from_user !== me && !isGmUser0)
+        return interaction.reply({ content: '❌ Only the player who offered it, or a GM, can withdraw a trade.', ephemeral: true });
+      setMeritTrade(gid0, id, { state: 'cancelled', decided_by: me, decided_at: Date.now() });
+      const chId0 = getConfig(gid0)?.approval_channel_id;
+      if (chId0 && t.msg_id) {
+        try {
+          const ch0 = await interaction.client.channels.fetch(chId0);
+          const old = await ch0.messages.fetch(t.msg_id);
+          await old.edit({ content: `~~🤝 Merit trade #${id}~~\n↩️ *Withdrawn${t.from_user === me ? ' by the sender' : ' by a GM'}.*`, components: [] });
+        } catch {}
+      }
+      const fromN = await getDisplayName(interaction.guild, t.from_user);
+      const toN = await getDisplayName(interaction.guild, t.to_user);
+      if (t.from_user !== me) {
+        await notifyPlayer(interaction, gid0, t.from_user,
+          `↩️ **Your merit trade was withdrawn** by a GM in **${interaction.guild.name}** — ${t.amount} merit to **${toN}**. No merit moved.`);
+      }
+      return interaction.reply({ content: `↩️ Trade \`#${id}\` withdrawn — **${t.amount}** merit from **${fromN}** to **${toN}**. Nothing moved.` });
+    }
     if (sub0 === 'trades') {
       const gid0 = interaction.guild.id;
       const rows = pendingMeritTrades(gid0);

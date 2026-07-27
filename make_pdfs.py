@@ -164,6 +164,13 @@ CONTENT = [
           ('/char create str:4 con:4 dex:3 wis:2 lck:1', '14 \u2014 refused, 1 still to place'),
           ('/char create str:6 con:5 dex:3 wis:2 lck:1', '17 \u2014 refused, take 2 back off'),
           ('/char create str:9 con:5 dex:1 wis:0 lck:0', 'over AND stats on 0 \u2014 both reported')]),
+('p', 'A sheet also has to be <b>finished</b> before it can go to a ' + GM + ': both weapons named, and an '
+      'emoji chosen for each with <b>/char weaponemoji</b>. A weapon emoji has a default, so picking one is '
+      'what counts \u2014 leaving it be is not the same as choosing it. Weapons can be set on '
+      '<b>/char create</b> in the same breath as your stats.'),
+('code', [('/char create str:5 con:4 dex:3 wis:2 lck:1 \\\n  weapon1:Gunlance weapon2:Rifle', 'stats and weapons at once'),
+          ('/char weaponemoji slot:Weapon 1 emoji:[choose]', 'then an emoji for each'),
+          ('/char weaponemoji slot:Weapon 2 emoji:[choose]', '')]),
 ('p', 'The refusal is posted <b>in the channel you are working in</b>, not as a private note only you can '
       'see \u2014 so it sits alongside what you typed. A copy also goes to the <b>approval channel</b> with a '
       'jump link back to the attempt, so the ' + GM + 's can see who is wrestling with the budget and step in '
