@@ -1468,9 +1468,31 @@ function clearNpcWebhooks(gid, name) {
 }
 
 // Resolve (or create) the webhook this NPC should use in THIS channel.
+// Webhooks live on the parent when the target is a thread or forum post.
+function webhookHost(channel) {
+  return (channel && typeof channel.isThread === 'function' && channel.isThread())
+    ? (channel.parent ?? null) : (channel ?? null);
+}
+
 async function npcWebhookIn(channel, gid, npcName, imageUrl) {
   const { WebhookClient } = require('discord.js');
-  const row = getNpcWebhookFor(gid, channel.id, npcName);
+
+  // A thread cannot own a webhook. Discord requires one on the parent channel,
+  // with posts routed in by thread id — so a /pr say inside any thread or forum
+  // post used to throw here and quietly fall back to speaking as the bot.
+  // Webhooks are therefore stored against the parent and shared by its threads.
+  const inThread = typeof channel.isThread === 'function' && channel.isThread();
+  const host = inThread ? channel.parent : channel;
+  if (!host) return null;
+  const threadId = inThread ? channel.id : null;
+
+  // Wrap the client so every send lands back in the thread it was called from.
+  const bind = (client) => threadId ? {
+    send: (payload) => client.send(
+      typeof payload === 'string' ? { content: payload, threadId } : { ...payload, threadId }),
+  } : client;
+
+  const row = getNpcWebhookFor(gid, host.id, npcName);
 
   if (row?.webhook_id && row?.webhook_token) {
     // The NPC's avatar may have been set (or changed) after this webhook was
@@ -1478,31 +1500,31 @@ async function npcWebhookIn(channel, gid, npcName, imageUrl) {
     // the webhook instead — cheap, and guaranteed to carry the right image.
     if ((row.avatar_url ?? null) !== (imageUrl ?? null)) {
       try {
-        const fresh = await channel.createWebhook({
+        const fresh = await host.createWebhook({
           name: npcName,
           avatar: imageUrl ?? BLANK_AVATAR,
           reason: `NPC avatar refresh for ${npcName}`,
         });
         // Bin the stale one — a channel is capped at 15 webhooks.
         try { await new WebhookClient({ id: row.webhook_id, token: row.webhook_token }).delete(); } catch {}
-        setNpcWebhookFor(gid, channel.id, npcName, fresh.id, fresh.token, imageUrl ?? null);
-        return new WebhookClient({ id: fresh.id, token: fresh.token });
+        setNpcWebhookFor(gid, host.id, npcName, fresh.id, fresh.token, imageUrl ?? null);
+        return bind(new WebhookClient({ id: fresh.id, token: fresh.token }));
       } catch (e) {
         // Couldn't recreate (permissions, or the 15-webhook channel cap) —
         // keep using the existing one rather than dropping to a plain post.
         console.error('[npcwebhook] avatar refresh failed, reusing existing:', e?.message || e);
       }
     }
-    return new WebhookClient({ id: row.webhook_id, token: row.webhook_token });
+    return bind(new WebhookClient({ id: row.webhook_id, token: row.webhook_token }));
   }
 
-  const webhook = await channel.createWebhook({
+  const webhook = await host.createWebhook({
     name: npcName,
     avatar: imageUrl ?? BLANK_AVATAR,
     reason: `NPC webhook for ${npcName}`,
   });
-  setNpcWebhookFor(gid, channel.id, npcName, webhook.id, webhook.token, imageUrl ?? null);
-  return new WebhookClient({ id: webhook.id, token: webhook.token });
+  setNpcWebhookFor(gid, host.id, npcName, webhook.id, webhook.token, imageUrl ?? null);
+  return bind(new WebhookClient({ id: webhook.id, token: webhook.token }));
 }
 
 function setNpcWebhook(gid, name, webhookId, webhookToken) {
@@ -2788,6 +2810,8 @@ const slashCommands = [
         {name:'🔼 Advantage (roll twice, keep higher)',value:'adv'},
         {name:'🔽 Disadvantage (roll twice, keep lower)',value:'dis'}))
     .addBooleanOption(o=>o.setName('success_check').setDescription('Show a success/partial/fail outcome').setRequired(false))
+    .addBooleanOption(o=>o.setName('fight').setDescription('Submit this roll into the fight here, in place of /fight atk or /fight def').setRequired(false))
+    .addUserOption(o=>o.setName('target').setDescription('Who you are attacking, when this roll is a fight attack').setRequired(false))
     .addStringOption(o=>o.setName('label').setDescription('What the roll is for, e.g. perception').setRequired(false))
     .addStringOption(o=>o.setName('flavour').setDescription('RP text posted with the roll — *italic* and **bold** work').setRequired(false)),
 
@@ -5765,6 +5789,37 @@ function resolveFightTarget(interaction, gid, fight) {
   return { fid };
 }
 
+// What a live fight is waiting for from this player, if anything. Lets a custom
+// /roll stand in for /fight atk or /fight def, so a GM can call for something
+// unusual — 2d6 for a trap, a flat d100 — without the fight chain breaking and
+// everyone falling back to rolling by hand.
+function fightAwaiting(gid, cid, uid) {
+  const fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active') return null;
+  const order = JSON.parse(fight.turn_order || '[]');
+  const currentId = order[fight.turn_index];
+  if (fight.phase === 'attack') return currentId === uid ? { fight, kind: 'atk' } : null;
+  if (fight.phase === 'defend' && fight.def_roll === null) {
+    return fight.current_target === uid ? { fight, kind: 'def' } : null;
+  }
+  return null;
+}
+
+// Write a custom roll into the fight in place of the usual stat roll. `label`
+// stands in for the stat name so the recap still reads sensibly.
+function submitFightRoll(gid, cid, kind, { total, nat, sides, label, targetId = null }) {
+  if (kind === 'atk') {
+    upsertFight(gid, cid, {
+      phase: 'defend', current_target: targetId,
+      atk_roll: total, atk_nat: nat, atk_stat: label, atk_mode: 'normal', atk_sides: sides,
+      def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
+    });
+  } else {
+    upsertFight(gid, cid, { def_roll: total, def_nat: nat, def_stat: label, def_mode: 'normal', def_sides: sides });
+  }
+  return getFight(gid, cid);
+}
+
 // ── Fight log & recap ────────────────────────────────────────────────────────
 // log_state: {
 //   exchanges: n,
@@ -6124,7 +6179,9 @@ async function resolveExchange(guild, gid, cid, fight) {
   // NPC by hand. Shared by the "fighter went down" and "fight continues" paths.
   const handOver = async (order, index) => {
     const nextF = await resolveFighter(guild, gid, order[index]);
-    const hint = (nextF.isNpc && !autoOn) ? ` (GM acts with \`npc:${nextF.name}\`)` : '';
+    const hint = (nextF.isNpc && !autoOn)
+      ? `\n_A GM acts for them: \`/fight atk stat:str npc:${nextF.name} target:@player\`_`
+      : (nextF.isNpc ? '' : '\n_`/fight atk stat:str target:@player` — or `/roll dice:2d6+3 fight:true target:@player` for a custom roll._');
     lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${hint}${turnPing(gid, nextF)}`);
     return nextF;
   };
@@ -6300,7 +6357,9 @@ async function handleFight(interaction) {
       const lines = [`⚔️ **${W.started} Turn order (manual):**`, ''];
       if (banner) { lines.splice(1, 0, banner); }
       ordered.forEach((f,i) => lines.push(`${i+1}. **${f.name}**${f.isNpc ? ' 🎭' : ''}`));
-      lines.push('', `🎯 **${ordered[0].name}** goes first!${ordered[0].isNpc ? ' (GM acts with `npc:`)' : ' Use `/fight atk` to attack.'}${turnPing(gid, ordered[0])}`);
+      lines.push('', `🎯 **${ordered[0].name}** goes first!${ordered[0].isNpc
+        ? ' _(a GM acts with `npc:`)_'
+        : '\n_`/fight atk stat:str target:@player` — or `/roll dice:2d6+3 fight:true target:@player` for a custom roll._'}${turnPing(gid, ordered[0])}`);
       upsertFight(gid, cid, {
         state: 'active', turn_order: JSON.stringify(turnOrder), turn_index: 0,
         phase: 'attack', current_target: null,
@@ -6944,7 +7003,7 @@ async function handleFight(interaction) {
     const autoOn = !!fight.auto_npc;
     const defHint = targetF.isNpc
       ? (autoOn ? `🤖 **${targetF.name}** defends automatically...` : `🛡️ A GM defends for **${targetF.name}** with \`/fight def npc:${targetF.name}\`.`)
-      : `🛡️ **${targetF.name}** — use \`/fight def\` to defend.`;
+      : `🛡️ <@${targetId}> — \`/fight def stat:dex\`, or \`/roll dice:2d6 fight:true\` for a custom roll.`;
 
     upsertFight(gid, cid, {
       phase: 'defend', current_target: targetId,
@@ -7820,13 +7879,20 @@ async function handlePr(interaction) {
       const fallbackChan = await interactionChannel(interaction);
       if (fallbackChan) {
         try {
-          db.prepare('DELETE FROM npc_webhooks WHERE guild_id=? AND channel_id=? AND npc_name=?').run(gid, fallbackChan.id, npc.name);
+          const hostChan = webhookHost(fallbackChan);
+          db.prepare('DELETE FROM npc_webhooks WHERE guild_id=? AND channel_id=? AND npc_name=?')
+            .run(gid, hostChan?.id ?? fallbackChan.id, npc.name);
           const fresh = await npcWebhookIn(fallbackChan, gid, npc.name, npc.image_url);
           await fresh.send({ content, username: npc.name, avatarURL: npc.image_url ?? BLANK_AVATAR });
           return interaction.editReply({ content: `✅ Posted as **${npc.name}**.` }).catch(()=>{});
         } catch (err2) {
           console.error('Webhook retry failed:', err2.message);
-          await interaction.editReply({ content: '⚠️ Webhook failed — posting normally.' }).catch(()=>{});
+          const host = webhookHost(fallbackChan);
+          const where = host && host.id !== fallbackChan.id ? ` on the parent channel <#${host.id}>` : '';
+          await interaction.editReply({ content:
+            `⚠️ Couldn't speak as **${npc.name}** — posted as me instead.\n`
+            + `_I need **Manage Webhooks**${where} for NPC voices. In a thread the webhook has to live on the parent._`
+          }).catch(()=>{});
           await fallbackChan.send({ content }).catch(()=>{});
         }
       }
@@ -8309,6 +8375,8 @@ async function handleRollSlash(interaction) {
   const successCheck = interaction.options.getBoolean('success_check') ?? false;
   const label = (interaction.options.getString('label') || '').trim() || null;
   const flavour = (interaction.options.getString('flavour') || '').trim() || null;
+  const intoFight = interaction.options.getBoolean('fight') ?? false;
+  const fightTarget = interaction.options.getUser('target');
 
   if (stat && dice) return interaction.reply({ content: '❌ Pick either a **stat** or custom **dice**, not both.', ephemeral: true });
   if (!stat && !dice) return interaction.reply({ content: '❌ Choose a **stat** or enter **dice** (e.g. `2d6+3`).', ephemeral: true });
@@ -8341,7 +8409,58 @@ async function handleRollSlash(interaction) {
   const critType = detectCrit(result, effMode);
   const naturalRoll = effMode === 'normal' ? result.rolls[0] : result.chosen;
   const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides) : null;
+
   const rollLine = buildRollLine(result, effMode, critType, successResult);
+
+  // Feed this roll into the fight instead of standing alone. Explicit rather
+  // than automatic: a player rolling casually mid-fight shouldn't accidentally
+  // commit their turn.
+  if (intoFight) {
+    const waiting = fightAwaiting(gid, cid, uid);
+    if (!waiting) {
+      const f = getFight(gid, cid);
+      const why = !f || f.state !== 'active' ? 'There is no fight running here.'
+        : f.phase === 'attack' ? 'It is not your turn to attack.'
+        : f.def_roll !== null ? 'That exchange already has both rolls — `/fight resolve` it.'
+        : 'You are not the one being attacked.';
+      return interaction.reply({ content: `❌ ${why} The roll was not submitted.`, ephemeral: true });
+    }
+    const rollLabel = label || (stat ? STAT_LABELS[stat] : dice);
+
+    if (waiting.kind === 'atk') {
+      const order = JSON.parse(waiting.fight.turn_order || '[]');
+      let targetId = fightTarget?.id ?? null;
+      if (!targetId) {
+        // With exactly one opponent left there is nothing to disambiguate.
+        const others = order.filter(x => x !== uid);
+        if (others.length === 1) targetId = others[0];
+        else return interaction.reply({ content: '❌ Say who you are attacking — add `target:@player`. (For an NPC, a GM should use `/fight atk`.)', ephemeral: true });
+      }
+      if (!order.includes(targetId)) return interaction.reply({ content: '❌ They are not in this fight.', ephemeral: true });
+      submitFightRoll(gid, cid, 'atk', { total: result.total, nat: naturalRoll, sides: result.sides, label: rollLabel, targetId });
+      const tF = await resolveFighter(interaction.guild, gid, targetId);
+      const nm = await getDisplayName(interaction.guild, uid);
+      recordRoll(gid, { userId: uid, channelId: cid, interaction, result,
+        input: `/roll ${stat ? `stat:${stat}` : `dice:${dice}`} fight:true`, rollLine,
+        context: `fight · custom attack on ${tF.name}` });
+      return interaction.reply({ content: [
+        `⚔️ **${nm}** attacks **${tF.name}${tF.isNpc ? ' 🎭' : ''}** with a custom roll — **${rollLabel}**`,
+        rollLine, '',
+        tF.isNpc ? `🛡️ A GM defends with \`/fight def stat:… npc:${tF.name}\`, or \`/roll … fight:true\`.`
+                 : `🛡️ <@${targetId}> defends — \`/fight def stat:dex\`, or \`/roll … fight:true\` for a custom roll.`,
+      ].join('\n') });
+    }
+
+    submitFightRoll(gid, cid, 'def', { total: result.total, nat: naturalRoll, sides: result.sides, label: rollLabel });
+    const nm = await getDisplayName(interaction.guild, uid);
+    recordRoll(gid, { userId: uid, channelId: cid, interaction, result,
+      input: `/roll ${stat ? `stat:${stat}` : `dice:${dice}`} fight:true`, rollLine,
+      context: 'fight · custom defence' });
+    return interaction.reply({ content: [
+      `🛡️ **${nm}** defends with a custom roll — **${rollLabel}**`,
+      rollLine, '', '⚡ Use `/fight resolve` to resolve this exchange.',
+    ].join('\n') });
+  }
 
   recordRoll(gid, { userId: uid, channelId: cid, interaction, result,
     input: `/roll ${stat ? `stat:${stat}` : `dice:${dice}`}${effMode !== 'normal' ? ` mode:${effMode}` : ''}${successCheck ? ' success_check:true' : ''}`,

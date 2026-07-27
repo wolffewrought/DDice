@@ -441,6 +441,7 @@ CONTENT = [
           ('/pr say name:Cave Orc action:raises its axe', 'action \u2014 italic emote'),
           ('/pr say name:Cave Orc action:raises its axe\n  speech:Halt!', 'both, stacked'),
           ('/pr say name:Cave Orc', 'opens a writing box')]),
+('note', '<b>Works in threads and forum posts too.</b> A thread cannot own a webhook, so the NPC\u2019s voice is created on the parent channel instead and every message is routed back into the thread it was called from \u2014 several threads under one channel share the same NPC webhook.'),
 ('p', 'Posts as the NPC through their webhook \u2014 their name and avatar, no dice rolled. Fill '
       '<b>action</b>, <b>speech</b>, or both: the action is italicised and the speech is wrapped in quote '
       'marks, stacked on separate lines. Leave both blank and a <b>writing box</b> opens with roomy '
