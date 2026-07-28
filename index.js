@@ -105,6 +105,12 @@ try { db.exec('ALTER TABLE quests ADD COLUMN instance_of INTEGER'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN merits INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN renown INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN lore TEXT'); } catch {}
+// One reroll per roll. A saved roll is marked the moment it is rerolled, so a
+// second attempt on the same result is refused rather than letting someone
+// chain rerolls until the dice agree with them.
+try { db.exec('ALTER TABLE roll_history ADD COLUMN rerolled INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE fights ADD COLUMN atk_rerolled INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE fights ADD COLUMN def_rerolled INTEGER DEFAULT 0'); } catch {}
 // Character creation budget, per guild. Defaults match the shipped rules.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN stat_budget INTEGER DEFAULT 15'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN stat_min INTEGER DEFAULT 1'); } catch {}
@@ -595,8 +601,14 @@ function setStatAndDerive(gid, uid, stat, val) {
   upsertChar(gid, uid, upd);
   return getChar(gid, uid);
 }
+// Saving a fresh roll clears the reroll mark — the new result is rerollable,
+// the old one is gone.
 function saveRoll(gid, cid, uid, notation, label) {
-  db.prepare(`INSERT OR REPLACE INTO roll_history (guild_id,channel_id,user_id,notation,label,saved_at) VALUES (?,?,?,?,?,datetime('now'))`).run(gid, cid, uid, notation, label??null);
+  db.prepare(`INSERT OR REPLACE INTO roll_history (guild_id,channel_id,user_id,notation,label,saved_at,rerolled)
+              VALUES (?,?,?,?,?,datetime('now'),0)`).run(gid, cid, uid, notation, label ?? null);
+}
+function markRerolled(gid, cid, uid) {
+  db.prepare('UPDATE roll_history SET rerolled=1 WHERE guild_id=? AND channel_id=? AND user_id=?').run(gid, cid, uid);
 }
 function getLastRoll(gid, cid, uid) {
   return db.prepare('SELECT * FROM roll_history WHERE guild_id=? AND channel_id=? AND user_id=?').get(gid, cid, uid);
@@ -1311,6 +1323,39 @@ function statLine(ch, gid) {
     + `  ·  ❤️ ${ch.hp_current ?? 0}/${maxHp(ch, gid)}  ·  🔄 ${ch.rerolls_current ?? 0}/${maxRerolls(ch)}`;
 }
 
+// Spend a reroll on the result just posted. One per roll — the reroll's own
+// result stands, so this button is never offered again for it.
+async function handleStoryRerollButton(interaction) {
+  const [, owner, scene, statWord, next, gaAt] = interaction.customId.split(':');
+  const ctx = activeSceneFor(interaction, owner, scene);
+  if (ctx.error) return interaction.reply({ content: ctx.error, ephemeral: true });
+  const { gid, cid, uid, ch } = ctx;
+  if ((ch.rerolls_current ?? 0) <= 0) return interaction.reply({ content: '❌ No rerolls remaining.', ephemeral: true });
+  upsertChar(gid, uid, { rerolls_current: ch.rerolls_current - 1 });
+  try { await interaction.message.edit({ components: [] }); } catch {}
+  const fresh = { ...ctx, ch: getChar(gid, uid) };
+  return resolveActivityRoll(fresh, statWord, null, {
+    guild: interaction.guild,
+    reply: async (content) => { await interaction.reply(typeof content === 'string' ? { content } : content); },
+    interaction,
+  }, true);
+}
+
+// Take the result as it stands and move on.
+async function handleStoryCarryOnButton(interaction) {
+  const [, owner, next, gaAt] = interaction.customId.split(':');
+  const gid = interaction.guild.id, cid = interactionChannelId(interaction), uid = interaction.user.id;
+  if (owner !== uid) return interaction.reply({ content: '🎮 That is someone else\'s run.', ephemeral: true });
+  const run = getRun(gid, cid, uid);
+  if (!run) return interaction.reply({ content: '❌ You have nothing running here.', ephemeral: true });
+  const sc = getScene(gid, run.story, run.scene);
+  if (!sc) { endRun(gid, cid, uid); return interaction.reply({ content: '❌ That scene has gone missing.', ephemeral: true }); }
+  await interaction.reply({ content: '▶️ Onward.' });
+  try { await interaction.message.edit({ components: [] }); } catch {}
+  await advance({ guild: interaction.guild }, { gid, cid, uid, run, ch: getChar(gid, uid), sc },
+    next, JSON.parse(run.tally_state || '{}'), Number(gaAt) || 0);
+}
+
 async function handleStoryRollButton(interaction) {
   const [, owner, sceneName, statWord] = interaction.customId.split(':');
   const ctx = activeSceneFor(interaction, owner, sceneName);
@@ -1349,7 +1394,7 @@ async function tryActivityTypedRoll(message, content) {
   return true;
 }
 
-async function resolveActivityRoll(ctx, statWord, flavour, io) {
+async function resolveActivityRoll(ctx, statWord, flavour, io, rerolled = false) {
   const { gid, cid, uid, run, ch, sc } = ctx;
   const say = io.reply;
 
@@ -1378,12 +1423,28 @@ async function resolveActivityRoll(ctx, statWord, flavour, io) {
   const outcomes = JSON.parse(sc.outcomes || '{}');
   const nat20 = sc.nat20 ? JSON.parse(sc.nat20) : null;
   const nat1 = sc.nat1 ? JSON.parse(sc.nat1) : null;
-  const lines = [`🎲 **${name}** rolls **${label}** — ${fightTotalStr(result.total, nat, sides)}`,
+  const lines = [`🎲 **${name}** rolls **${label}**${rerolled ? ' *(reroll)*' : ''} — ${fightTotalStr(result.total, nat, sides)}`,
                  statLine(ch, gid)];
   if (flavour) lines.push('', `*${flavour}*`);
 
+  // Offer a second chance before the tale moves on. One reroll per roll, and
+  // only if they have one to spend — otherwise it advances as before.
   const finish = async (text, next, gaAt = 0) => {
     if (text) lines.push('', text);
+    const canReroll = next && !rerolled && (ch.rerolls_current ?? 0) > 0;
+    if (canReroll) {
+      const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+      const token = `${sc.scene}:${statWord}:${next}:${gaAt}`;
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`storyrr:${uid}:${token}`)
+          .setLabel(`Reroll (${ch.rerolls_current} left)`).setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`storygo:${uid}:${next}:${gaAt}`)
+          .setLabel('Carry on').setStyle(ButtonStyle.Primary),
+      );
+      setRun(gid, cid, uid, { tally_state: JSON.stringify(tallyState) });
+      await say({ content: lines.join('\n'), components: [row] });
+      return;
+    }
     await say(lines.join('\n'));
     if (next) await advance(io, ctx, next, tallyState, gaAt);
     else setRun(gid, cid, uid, { tally_state: JSON.stringify(tallyState) });
@@ -4664,8 +4725,10 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
   if (isReroll) {
     const last = getLastRoll(gid, cid, uid);
     if (!last) return message.reply('❌ No previous roll found in this channel.');
+    if (last.rerolled) return message.reply('❌ That roll has already been rerolled — one reroll per roll. Whatever it says, it stands.');
     const ch = getChar(gid, uid);
     if (!ch || ch.rerolls_current <= 0) return message.reply('❌ No rerolls remaining.');
+    markRerolled(gid, cid, uid);
     notation = last.notation;
     const [rl, ...fp] = rest.split('\n');
     label = rl.trim() || last.label;
@@ -4703,6 +4766,8 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
   const rollLine = buildRollLine(result, mode, critType, successResult);
   recordRoll(gid, { userId: uid, channelId: cid, messageId: message.id, input: message.content,
     rollLine, result, context: isReroll ? 'reroll' : (successCheck ? 'success check' : null) });
+  // A reroll does not overwrite the saved roll, so its own result can't be
+  // rerolled in turn — the mark set above stays put.
   await sendRollEmbed(message, rollLine, label, isReroll, uid, flavour, result.total, critType, !!statRolled);
 }
 
@@ -5290,6 +5355,8 @@ client.on('interactionCreate', async interaction => {
     }
     if (interaction.customId.startsWith('storyroll:')) return handleStoryRollButton(interaction);
     if (interaction.customId.startsWith('storypick:')) return handleStoryPickButton(interaction);
+    if (interaction.customId.startsWith('storyrr:')) return handleStoryRerollButton(interaction);
+    if (interaction.customId.startsWith('storygo:')) return handleStoryCarryOnButton(interaction);
     if (interaction.customId.startsWith('loreok:') || interaction.customId.startsWith('loreno:')) return handleLoreButton(interaction);
     if (interaction.customId.startsWith('tradeok:') || interaction.customId.startsWith('tradeno:')) return handleMeritTradeButton(interaction);
     if (interaction.customId.startsWith('questapply:') || interaction.customId.startsWith('questwithdraw:')) {
@@ -6768,6 +6835,7 @@ async function resolveExchange(guild, gid, cid, fight) {
     phase: 'attack', current_target: null,
     atk_roll: null, atk_nat: null, atk_stat: null,
     def_roll: null, def_nat: null, def_stat: null,
+    atk_rerolled: 0, def_rerolled: 0,   // a new exchange, a fresh second chance
   };
 
   if (hit) {
@@ -7588,6 +7656,7 @@ async function handleFight(interaction) {
       phase: 'defend', current_target: targetId,
       atk_roll: total, atk_nat: nat, atk_stat: stat, atk_mode: mode, atk_sides: 20,
       def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
+      atk_rerolled: 0, def_rerolled: 0,
     });
     if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, `atk ${STAT_LABELS[stat]}`);
     if (actor.isNpc) {
@@ -7696,6 +7765,9 @@ async function handleFight(interaction) {
     const isDefender = fight.current_target === uid && fight.phase === 'defend';
 
     if (!isAttacker && !isDefender) return interaction.reply({ content: '❌ It is not your turn to reroll.', ephemeral: true });
+    // One reroll per roll: each side of an exchange gets a single second chance.
+    if (isAttacker && fight.atk_rerolled) return interaction.reply({ content: '❌ You have already rerolled this attack — one reroll per roll.', ephemeral: true });
+    if (isDefender && fight.def_rerolled) return interaction.reply({ content: '❌ You have already rerolled this defence — one reroll per roll.', ephemeral: true });
 
     // Make sure there's actually a roll to reroll BEFORE spending the token
     const stat = isAttacker ? fight.atk_stat : fight.def_stat;
@@ -7750,9 +7822,9 @@ async function handleFight(interaction) {
     lines.push('', '⚡ Use \`/fight resolve\` to resolve this exchange.');
 
     if (isAttacker) {
-      upsertFight(gid, cid, { atk_roll: total, atk_nat: nat, atk_mode: mode });
+      upsertFight(gid, cid, { atk_roll: total, atk_nat: nat, atk_mode: mode, atk_rerolled: 1 });
     } else {
-      upsertFight(gid, cid, { def_roll: total, def_nat: nat, def_mode: mode });
+      upsertFight(gid, cid, { def_roll: total, def_nat: nat, def_mode: mode, def_rerolled: 1 });
     }
 
     return interaction.reply({ content: lines.join('\n') });

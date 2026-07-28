@@ -64,6 +64,13 @@ CONTENT = [
 ('note', 'It has to be asked for. A player rolling casually mid-fight should not accidentally commit their '
          'turn, so nothing is submitted without <b>fight:true</b>. If it is not your moment the roll is '
          'refused with the reason, and stands alone instead.'),
+('h2', 'One Reroll Per Roll'),
+('p', 'A roll can be rerolled <b>once</b>. Whatever the second attempt says, it stands \u2014 you cannot keep '
+      'spending rerolls on the same roll until the dice agree with you. This holds everywhere: typed rerolls, '
+      '<b>/fight rr</b>, and the prompt inside an activity.'),
+('p', 'In a fight each side of an exchange gets its own second chance, so an attacker rerolling does not use '
+      'up the defender\u2019s. A fresh exchange resets both.'),
+('note', 'Rerolls are still a resource \u2014 this is a limit on top of having one to spend, not instead of it.'),
 ('h2', 'Rerolls (Player)'),
 ('code', [('rr', 'costs 1 token'),
           ('rra', 'reroll with advantage'),
@@ -737,6 +744,14 @@ CONTENT = [
 ('code', [('wis I survey the reeds where the current slows', 'rolls WIS, prints your words')]),
 ('p', 'A typed roll only answers the scene if the stat is one that step accepts; anything else falls through '
       'to an ordinary roll, untouched. Your stats are shown alongside the result either way.'),
+('h2', 'A Second Chance'),
+('p', 'After a roll the tale <b>waits</b> rather than moving straight on. If you have a reroll to spend you '
+      'are offered one, alongside a <b>Carry on</b> button:'),
+('code', [('\u1f504 Reroll (2 left)', 'spend one and roll again'),
+          ('\u25b6 Carry on', 'take the result and continue')]),
+('p', 'Only one reroll is offered per roll \u2014 the second result stands, and the tale moves on. If you have '
+      'none left, or the scene was an ending, it continues as before without stopping to ask. Your progress '
+      'is saved while it waits, so nothing is lost if you take a moment to decide.'),
 ('p', 'Each scene posts with a button per stat it accepts. <b>Anyone in the channel can press one</b> \u2014 the '
       'roll uses their own sheet, honours a Hero\u2019s signature stat, and lands in the roll audit like any '
       'other. One run per channel at a time. Writing and deleting always need a ' + GM + '; starting one is '
