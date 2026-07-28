@@ -51,6 +51,19 @@ CONTENT = [
 ('h2', 'Advantage & Disadvantage'),
 ('code', [('ra1d20+5', 'rolls twice, takes higher'),
           ('rd1d20+5', 'rolls twice, takes lower')]),
+('h2', 'A Custom Roll in a Fight'),
+('p', 'When it is your turn, <b>/roll ... fight:true</b> submits that roll in place of <b>/fight atk</b> or '
+      '<b>/fight def</b> \u2014 so a ' + GM + ' can call for something unusual without the fight chain breaking and '
+      'everyone falling back to rolling by hand.'),
+('code', [('/roll dice:2d6+3 fight:true target:@Skol', 'attack with 2d6+3'),
+          ('/roll dice:1d100 fight:true', 'defend with a d100'),
+          ('/roll stat:wis fight:true target:@Skol', 'attack with WIS instead of STR')]),
+('p', 'It writes into the same fight the normal commands use, so <b>/fight resolve</b> handles it exactly as '
+      'ever \u2014 damage, criticals, carry-over effects and the recap. The die size is remembered, so a natural '
+      '20 on a d6 is not mistaken for a critical.'),
+('note', 'It has to be asked for. A player rolling casually mid-fight should not accidentally commit their '
+         'turn, so nothing is submitted without <b>fight:true</b>. If it is not your moment the roll is '
+         'refused with the reason, and stands alone instead.'),
 ('h2', 'Rerolls (Player)'),
 ('code', [('rr', 'costs 1 token'),
           ('rra', 'reroll with advantage'),
@@ -199,6 +212,7 @@ CONTENT = [
 ('h2', 'Items & Pages'),
 ('code', [('/char give user:@a item:A tarnished silver key \\\n  note:Cold to the touch', GM + ' only', 'gm'),
           ('/char take user:@a id:3', 'by the number in their inventory', 'gm'),
+          ('/char edit user:@a id:3 item:Silver key note:Cold', 'reword an item', 'gm'),
           ('/char summary user:@a', 'their sheet and every page at once', 'gm'),
           ('/char standing user:@a', 'merit and renown, and where each came from', 'gm'),
           ('/char rollhistory user:@a', 'every natural die they have rolled', 'gm')]),
@@ -259,6 +273,24 @@ CONTENT = [
       'waiting, or why it was turned down. Rewriting retires the old request and sends a fresh one.'),
 ('note', 'Nothing here is required. A character works perfectly well with an empty inventory, no lore and no '
          'renown \u2014 these are for tables that want to track more.'),
+('h2', 'Your Roll Card'),
+('p', 'How much of your sheet appears when you roll is up to you.'),
+('code', [('/profile card style:Full        /p card style:Full', 'the whole sheet'),
+          ('/profile card style:Compressed  /p card style:Compressed', 'one line of stats'),
+          ('/profile card style:Off         /p card style:Off', 'plain text rolls')]),
+('p', 'Compressed puts everything on a single line under the roll \u2014 '
+      '<b>\u1f4aa 5 \u00b7 \u1fac0 5 \u00b7 \u26a1 4 \u00b7 \u1f9e0 4 \u00b7 \u1f340 2 \u00b7 \u2764 8/8 \u00b7 \u1f504 2/2</b> \u2014 which keeps a busy '
+      'channel readable without hiding where a modifier came from.'),
+('note', 'A <b>stat roll always shows something</b>, even with your card Off: <b>1d20+4</b> says nothing about '
+         'which stat it was or where the 4 came from, so those fall back to the compressed line. Choosing '
+         'Compressed is respected rather than overridden \u2014 the bot never upgrades you to Full. Plain dice '
+         'rolls honour Off completely.'),
+('h2', 'Saved Sheets'),
+('code', [('/profile save slot:vault    /p save slot:vault', 'keep a copy of your sheet'),
+          ('/profile load slot:vault    /p load slot:vault', 'put it back'),
+          ('/profile saves              /p saves', 'what you have saved')]),
+('note', 'Loading a save is checked like any other change \u2014 an old snapshot cannot smuggle in a spread that '
+         'breaks the current point allowance.'),
 ('h2', 'Profile'),
 ('code', [('/profile on    /p on', 'enable embed, max HP + rerolls'),
           ('/profile off   /p off', 'disable embed, plain text rolls'),
@@ -389,6 +421,15 @@ CONTENT = [
 ('aud','gm'),
 ('note', 'Destructive actions (/npc delete, /fight end, /quest delete, /weapon remove) ask for '
          'Confirm / Cancel before running.'),
+('aud','all'),
+('h2', 'What the Stats Do'),
+('code', [('/stat', 'what each stat is for, in plain words')]),
+('aud','gm'),
+('h2', 'The Server Weapon List'),
+('p', 'Weapons players can pick from are kept as a server list, so names stay consistent.'),
+('code', [('/weapon add name:Gunlance', 'add one'),
+          ('/weapon list', 'see them all'),
+          ('/weapon remove name:Gunlance', 'take one off')]),
 ('aud','all'),
 ('h2', 'Derived Stats'),
 ('p', 'Max HP is <b>CON plus a flat base</b>, 2 by default \u2014 so CON 10 gives 12 HP. A ' + GM + ' can change '
@@ -683,6 +724,19 @@ CONTENT = [
       'writing anything: a difficulty check that loops with a different excuse each time, four sizes of catch '
       'chosen by the roll, a gauntlet per size, natural 20s and 1s, and buttons to keep going or head back. '
       'It awards <b>nothing</b> \u2014 no renown, no merits, no items \u2014 so it is safe to play with.'),
+('h2', 'One Run Each'),
+('p', 'An activity run belongs to the person who started it. Several people can play in the same channel at '
+      'once, each with their own prompts, their own progress and their own rewards \u2014 and one person stopping '
+      'or wandering off does nothing to anyone else. Every post is tagged with whose run it is, and a button '
+      'only answers for its owner.'),
+('code', [('/activity run name:Fishing', 'start your own run'),
+          ('/activity stop', 'end yours \u2014 a ' + GM + ' with none running can clear the channel')]),
+('h2', 'Answering a Scene'),
+('p', 'Press the button, or <b>type the stat and add your own flavour after it</b> \u2014 both roll the same '
+      'thing, but typing lets you say what your character is doing.'),
+('code', [('wis I survey the reeds where the current slows', 'rolls WIS, prints your words')]),
+('p', 'A typed roll only answers the scene if the stat is one that step accepts; anything else falls through '
+      'to an ordinary roll, untouched. Your stats are shown alongside the result either way.'),
 ('p', 'Each scene posts with a button per stat it accepts. <b>Anyone in the channel can press one</b> \u2014 the '
       'roll uses their own sheet, honours a Hero\u2019s signature stat, and lands in the roll audit like any '
       'other. One run per channel at a time. Writing and deleting always need a ' + GM + '; starting one is '
@@ -709,7 +763,8 @@ CONTENT = [
       'it can be passed between players, and potentially to and from NPCs, as payment, tribute, a debt '
       'settled or a favour bought.'),
 ('code', [('/merit give user:@a amount:2 reason:A debt settled', 'offer some of your merit'),
-          ('/merit trades', 'what is still waiting on a ' + GM)]),
+          ('/merit trades', 'what is still waiting on a ' + GM),
+          ('/merit cancel id:3', 'withdraw one \u2014 your own, or any as a ' + GM)]),
 ('p', '<b>No merit moves until a ' + GM + ' signs it off.</b> An offer is held and posted to the sheet approval '
       'channel with Approve / Refuse buttons; a refusal asks the ' + GM + ' why and passes the reason back. '
       'Both parties are told when it lands, and it is announced in the channel where it was offered so the '
@@ -719,8 +774,102 @@ CONTENT = [
 ('note', 'Renown says who you are in the world. Merit is what you have earned and may hand on. A character '
          'can be widely known and hold no merit at all, or quietly hold a great deal.'),
 ('aud','gm'),
+('aud','gm'),
+('sec', 'NPC Records'),
+('p', 'An NPC keeps the same records a player does. <b>/npc sheet</b> shows the lot on one page \u2014 stats and '
+      'HP, standing, inventory, lifetime roll history and lore.'),
+('code', [('/npc sheet name:Cave Orc         /pr sheet name:...', 'the whole record'),
+          ('/npc give name:Cave Orc item:... /pr give name:...', 'hand them something'),
+          ('/npc take name:Cave Orc id:1     /pr take name:...', 'take it back'),
+          ('/npc npclore name:Cave Orc text:...  /pr npclore', 'write their story'),
+          ('/npc delete name:Cave Orc        /pr delete name:...', 'remove them entirely')]),
+('p', 'Their dice count too. Every roll the auto-pilot makes for an NPC \u2014 attacks, defences, reroll answers, '
+      'initiative \u2014 goes into that NPC\u2019s lifetime tally, so a long-running villain builds a record of their '
+      'own luck exactly as a player does.'),
+('p', 'Merit and renown work on an NPC the same way they do on a character, so an NPC can hold standing in '
+      'the world, be paid in merit, or carry the reward for a job.'),
+('h2', 'Categories'),
+('code', [('/npc categorycreate name:Bandits', 'make a grouping'),
+          ('/npc categoryassign name:Cave Orc category:Bandits', 'file an NPC under it'),
+          ('/npc categoryremove name:Cave Orc', 'take it out'),
+          ('/npc categorylist', 'every category and who is in it'),
+          ('/npc categorydelete name:Bandits', 'remove the grouping')]),
+('note', 'Everything above also works on <b>/pr</b>, which is the same command under a shorter name for use '
+         'mid-scene.'),
+
+('sec', 'Test Tools'),
+('p', 'Trying a feature out usually means inventing a quest or an NPC you then have to tidy out of the world. '
+      '<b>/gmtest</b> makes throwaway ones instead. Everything it creates is named <b>[test]</b> and can be '
+      'swept away in one command. It is hidden from players entirely.'),
+('code', [('/gmtest quest', 'a quest with you on the party, in this channel'),
+          ('/gmtest npc', 'an NPC with items, standing, rolls and lore already on it'),
+          ('/gmtest list', 'what it has made'),
+          ('/gmtest clean', 'delete all of it \u2014 asks first')]),
+('p', 'The test quest arrives ready to start, so the clock, the reminders, the timeline and the summary can '
+      'all be exercised in a few minutes. The test NPC arrives with a record already on it, so '
+      '<b>/npc sheet</b> has something to show.'),
+('note', 'Cleaning only ever touches rows named <b>[test]</b>, and clears their events, summaries, inventory, '
+         'roll tallies and standing log along with them.'),
+
 ('aud','all'),
 ('sec', 'Quest Board'),
+('aud','gm'),
+('h2', 'Running a Quest — the Clock'),
+('p', 'Starting a quest with <b>/quest start</b> begins a stopwatch. From then on the bot posts a public time '
+      'check in the quest\u2019s run channel <b>every 15 minutes</b>, and <b>on the hour</b> a recap of everything '
+      'that happened during it. Set the channel first with <b>/quest runchannel</b>, or there is nowhere for '
+      'them to go.'),
+('code', [('/quest start number:1', 'the clock begins'),
+          ('/quest note number:1 text:They bribed the gatekeeper kind:Roleplay', 'mark a moment'),
+          ('/quest timeline number:1', 'the whole log so far'),
+          ('/quest pause number:1', 'stop the clock, keep the time'),
+          ('/quest resume number:1', 'carry on where it left off'),
+          ('/quest complete number:1', 'stop, award, and write it up')]),
+('p', 'A timeline reads back like a ship\u2019s log:'),
+('code', [('` 0h 00m` \u2691 Quest begins \u2014 4 on the party', ''),
+          ('` 0h 15m` \u23f1 Time check \u2014 0h 15m', ''),
+          ('` 0h 17m` \u1f3ad Cave Orc speaks', ''),
+          ('` 0h 44m` \u2694 Artorius wins the fight', ''),
+          ('` 1h 00m` \u1f4fb Hourly recap \u2014 3 events', '')]),
+('p', '<b>Combat and roleplay log themselves.</b> A fight ending in the quest\u2019s run channel, or an NPC '
+      'speaking there through <b>/pr say</b>, is attached to whichever quest is running in that channel. '
+      'Anything else you want on the record goes on with <b>/quest note</b>, taggable as roleplay, combat or a '
+      'plain note.'),
+('note', '<b>Pause keeps everything.</b> The time already run is banked and the clock stops \u2014 a paused quest '
+         'gets no reminders and logs nothing. Resuming picks up at exactly the same figure. Both counters live '
+         'on the quest itself, so a restart or redeploy mid-session resumes rather than starting the count '
+         'again.'),
+('h2', 'The Quest Summary'),
+('p', 'On <b>/quest complete</b> the clock stops and the whole run is written up: who ran it, how they run a '
+      'table, how long it took, who was on the party, and the full timeline. Set where it goes with '
+      '<b>/config questlog channel:#chronicle</b>.'),
+('code', [('/config questlog channel:#chronicle', 'where finished quests are written up'),
+          ('/config questlog disable:true', 'stop posting them')]),
+('p', 'The summary is then <b>linked on every party member\u2019s standing page</b> \u2014 <b>/char standing</b> and '
+      '<b>/char summary</b> both list the quests a character has finished, each one a link straight to its '
+      'write-up, with how long it took and how long ago it was.'),
+('h2', 'Several GMs, the Same Adventure'),
+('p', 'A quest holds one party on one clock, so two ' + GM + 's cannot share a quest number. '
+      '<b>/quest instance</b> makes a separate run of the same adventure: it copies the writing \u2014 name, lore, '
+      'objectives, details, rewards, merit and party rules \u2014 and leaves everything else fresh. A new number, '
+      'an empty party, a clock at zero and its own log.'),
+('code', [('/quest instance number:1', 'your own run of quest 1'),
+          ('/quest instance number:1 gm_style:Roleplay-focused', 'and advertise how you run it')]),
+('note', 'Three ' + GM + 's can run the same adventure at once, each with their own party, channel, clock and '
+         'summary. Completing one does nothing to the others. The board marks them: <i>One of 3 separate runs '
+         'of this adventure.</i>'),
+('h2', 'GM Style'),
+('p', 'A quest can advertise how its ' + GM + ' runs a table, so a player knows what they are applying to. Set '
+      'it on <b>/quest create</b> or per instance; it shows on the quest card, the board post and the final '
+      'summary.'),
+('table', ['Tag', 'What it promises'],
+          [['\u2699 Mechanics-focused', 'rules, rolls and tactics to the fore'],
+           ['\u1f3ad Roleplay-focused', 'character and conversation to the fore'],
+           ['\u2696 Mixed elements', 'a bit of both'],
+           ['\u2694 Combat-heavy', 'expect fighting'],
+           ['\u1f9e9 Puzzle & investigation', 'problems to work out'],
+           ['\u1f5fa Sandbox', 'the players decide where it goes']]),
+('aud','all'),
 ('p', 'GMs create quests with lore, objectives, details and rewards. Quests are posted as a message '
       'with an Apply button and also appear on the board. Players apply, a ' + GM + ' approves the party, '
       'and on completion merits are auto-awarded while other rewards are listed for the ' + GM + ' to hand out.'),

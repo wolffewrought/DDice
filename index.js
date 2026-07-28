@@ -68,6 +68,43 @@ try { db.exec('ALTER TABLE characters ADD COLUMN approval_reason TEXT'); } catch
 // can be required to be finished before a GM ever sees it.
 try { db.exec('ALTER TABLE characters ADD COLUMN weapon1emoji_set INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN weapon2emoji_set INTEGER DEFAULT 0'); } catch {}
+
+// ── Quest timing ─────────────────────────────────────────────────────────────
+// A quest runs on a stopwatch: started_at is when the current stretch began,
+// elapsed_ms is everything banked before the last pause. Elapsed time is
+// therefore (elapsed_ms + now - started_at) while running, or just elapsed_ms
+// while paused — so a pause can't lose time and a restart can't invent it.
+try { db.exec('ALTER TABLE quests ADD COLUMN started_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN paused INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN last_tick_ms INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN last_recap_ms INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec(`CREATE TABLE IF NOT EXISTS quest_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL, number INTEGER NOT NULL,
+  at_ms INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT, actor TEXT,
+  wall_at INTEGER NOT NULL
+)`); } catch (e) { console.error('quest_events schema', e); }
+try { db.exec(`CREATE TABLE IF NOT EXISTS quest_summaries (
+  guild_id TEXT NOT NULL, number INTEGER NOT NULL, user_id TEXT NOT NULL,
+  quest_name TEXT NOT NULL, url TEXT, duration_ms INTEGER NOT NULL DEFAULT 0,
+  ended_at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, number, user_id)
+)`); } catch (e) { console.error('quest_summaries schema', e); }
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_log_channel TEXT'); } catch {}
+// Who is running this one, how they run a table, and — for an instance — which
+// quest it was copied from. A quest row is a single party on a single clock, so
+// two GMs running the same adventure need two rows; instance_of ties them
+// together for the board without merging them.
+try { db.exec('ALTER TABLE quests ADD COLUMN gm_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN gm_style TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN instance_of INTEGER'); } catch {}
+// An NPC keeps the same records a player does. The page tables are keyed on a
+// plain id string, so the fighter id ("npc:Cave Orc") slots straight in — only
+// the balances need somewhere to live, since those hang off `characters`.
+try { db.exec('ALTER TABLE npcs ADD COLUMN merits INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN renown INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN lore TEXT'); } catch {}
 // Character creation budget, per guild. Defaults match the shipped rules.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN stat_budget INTEGER DEFAULT 15'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN stat_min INTEGER DEFAULT 1'); } catch {}
@@ -428,25 +465,49 @@ function getMerits(gid, uid) {
 // Move a player's renown and record why. Returns the new balance, or null when
 // a spend is refused for want of funds.
 function addRenown(gid, uid, delta, reason = null, { allowNegative = false } = {}) {
-  const cur = getChar(gid, uid)?.renown ?? 0;
-  const next = cur + delta;
-  if (next < 0 && !allowNegative) return null;
-  upsertChar(gid, uid, { renown: Math.max(0, next) });
+  const now = adjustBalance(gid, uid, 'renown', delta, { allowNegative });
+  if (now === null) return null;
   db.prepare('INSERT INTO renown_log (guild_id,user_id,delta,reason,at) VALUES (?,?,?,?,?)')
     .run(gid, uid, delta, reason, Date.now());
-  return Math.max(0, next);
+  return now;
 }
-function getRenown(gid, uid) { return getChar(gid, uid)?.renown ?? 0; }
+function getRenown(gid, uid) { return pageSubject(gid, uid)?.renown ?? 0; }
 function renownHistory(gid, uid, limit = 15) {
   return db.prepare('SELECT * FROM renown_log WHERE guild_id=? AND user_id=? ORDER BY at DESC LIMIT ?').all(gid, uid, limit);
 }
 
+// A page subject: either a player's sheet or an NPC, shaped the same way so
+// standing, inventory and roll history don't need to know which they have.
+function pageSubject(gid, id) {
+  if (isNpcFighter(id)) {
+    const npc = getNpc(gid, npcNameFromFighter(id));
+    if (!npc) return null;
+    return { ...npc, isNpc: true, user_id: id, displayName: npc.name,
+      hp_current: npc.hp_current, rerolls_current: npc.lck ?? 0 };
+  }
+  const ch = getChar(gid, id);
+  return ch ? { ...ch, isNpc: false, user_id: id } : null;
+}
+// Move a balance for either kind. NPC balances live on the npcs row.
+function adjustBalance(gid, id, column, delta, { allowNegative = false } = {}) {
+  if (isNpcFighter(id)) {
+    const name = npcNameFromFighter(id);
+    const npc = getNpc(gid, name);
+    if (!npc) return null;
+    const next = (npc[column] ?? 0) + delta;
+    if (next < 0 && !allowNegative) return null;
+    db.prepare(`UPDATE npcs SET ${column}=? WHERE guild_id=? AND name=?`).run(Math.max(0, next), gid, name);
+    return Math.max(0, next);
+  }
+  const cur = getChar(gid, id)?.[column] ?? 0;
+  const next = cur + delta;
+  if (next < 0 && !allowNegative) return null;
+  upsertChar(gid, id, { [column]: Math.max(0, next) });
+  return Math.max(0, next);
+}
+
 function addMerits(gid, uid, delta) {
-  const ch = getChar(gid, uid);
-  const cur = ch?.merits ?? 0;
-  const next = Math.max(0, cur + delta);
-  upsertChar(gid, uid, { merits: next });
-  return next;
+  return adjustBalance(gid, uid, 'merits', delta, { allowNegative: true }) ?? 0;
 }
 function getRanks(gid) {
   return db.prepare('SELECT name, threshold, sort_order FROM ranks WHERE guild_id=? ORDER BY sort_order, threshold').all(gid);
@@ -1491,6 +1552,109 @@ function startAutoRest(client) {
   };
   setInterval(tick, AUTOREST_TICK_MS);
   setTimeout(tick, 30 * 1000);   // first look shortly after boot
+}
+
+// How a GM runs a table, so players applying know what they are signing up for.
+const GM_STYLES = {
+  mechanics: '⚙️ Mechanics-focused',
+  rp:        '🎭 Roleplay-focused',
+  mixed:     '⚖️ Mixed elements',
+  combat:    '⚔️ Combat-heavy',
+  puzzle:    '🧩 Puzzle & investigation',
+  sandbox:   '🗺️ Sandbox — led by the players',
+};
+const gmStyleLabel = (k) => GM_STYLES[k] ?? null;
+
+// ── Quest stopwatch & event log ──────────────────────────────────────────────
+const QUEST_REMIND_MS = 15 * 60 * 1000;   // public "how long we've been at it"
+const QUEST_RECAP_MS  = 60 * 60 * 1000;   // hourly summary of what happened
+
+function questElapsed(q) {
+  if (!q) return 0;
+  const banked = Number(q.elapsed_ms) || 0;
+  if (q.paused || !q.started_at) return banked;
+  return banked + Math.max(0, Date.now() - Number(q.started_at));
+}
+function fmtElapsed(ms) {
+  const total = Math.max(0, Math.floor(ms / 60000));
+  return `${Math.floor(total / 60)}h ${String(total % 60).padStart(2, '0')}m`;
+}
+
+function logQuestEvent(gid, number, kind, text, actor = null) {
+  const q = getQuest(gid, number);
+  if (!q) return null;
+  db.prepare('INSERT INTO quest_events (guild_id,number,at_ms,kind,text,actor,wall_at) VALUES (?,?,?,?,?,?,?)')
+    .run(gid, number, questElapsed(q), kind, text ?? null, actor, Date.now());
+  return true;
+}
+function questEvents(gid, number, sinceMs = null) {
+  return sinceMs === null
+    ? db.prepare('SELECT * FROM quest_events WHERE guild_id=? AND number=? ORDER BY at_ms, id').all(gid, number)
+    : db.prepare('SELECT * FROM quest_events WHERE guild_id=? AND number=? AND at_ms > ? ORDER BY at_ms, id').all(gid, number, sinceMs);
+}
+const QUEST_EVENT_ICON = {
+  start: '🚩', pause: '⏸️', resume: '▶️', remind: '⏱️', recap: '📻',
+  combat: '⚔️', rp: '🎭', activity: '🎮', note: '📝', end: '🏁',
+};
+function questEventLine(e) {
+  return `\`${fmtElapsed(e.at_ms).padStart(7)}\` ${QUEST_EVENT_ICON[e.kind] ?? '•'} ${e.text || e.kind}`;
+}
+
+// Every quest currently underway in this channel — used to attach combat and
+// roleplay to the right quest without a GM having to say which.
+function activeQuestsInChannel(gid, cid) {
+  return db.prepare(`SELECT * FROM quests WHERE guild_id=? AND run_channel_id=? AND status='active'`).all(gid, cid);
+}
+// Note something against whichever quest is running in this channel, if any.
+function noteQuestActivity(gid, cid, kind, text, actor = null) {
+  for (const q of activeQuestsInChannel(gid, cid)) {
+    if (q.paused) continue;               // a paused quest records nothing
+    logQuestEvent(gid, q.number, kind, text, actor);
+  }
+}
+
+// The quest clock. Ticks every minute so a 15-minute reminder lands close to
+// the mark; both counters are stored on the quest, so a redeploy mid-session
+// resumes exactly where it left off rather than restarting the count.
+const QUEST_TICK_MS = 60 * 1000;
+
+async function questTick(client) {
+  for (const guild of client.guilds.cache.values()) {
+    let running;
+    try { running = db.prepare(`SELECT * FROM quests WHERE guild_id=? AND status='active' AND paused=0`).all(guild.id); }
+    catch { continue; }
+    for (const q of running) {
+      try {
+        if (!q.run_channel_id) continue;
+        const now = questElapsed(q);
+
+        // Hourly recap first — it also satisfies the quarter-hour mark, so the
+        // two don't both fire on the hour and say the same thing twice.
+        if (now - (Number(q.last_recap_ms) || 0) >= QUEST_RECAP_MS) {
+          const since = Number(q.last_recap_ms) || 0;
+          const events = questEvents(guild.id, q.number, since)
+            .filter(e => !['remind', 'recap'].includes(e.kind));
+          const lines = [`📻 **${questTag(q)}** — **${fmtElapsed(now)}** in. The last hour:`];
+          lines.push(...(events.length ? events.map(questEventLine) : ['`      ` _Quiet hour — nothing logged._']));
+          logQuestEvent(guild.id, q.number, 'recap', `Hourly recap — ${events.length} event${events.length === 1 ? '' : 's'}`);
+          updateQuest(guild.id, q.number, { last_recap_ms: now, last_tick_ms: now });
+          const ch = await client.channels.fetch(q.run_channel_id).catch(() => null);
+          if (ch) await sendLong(ch, lines);
+          continue;
+        }
+
+        if (now - (Number(q.last_tick_ms) || 0) >= QUEST_REMIND_MS) {
+          logQuestEvent(guild.id, q.number, 'remind', `Time check — ${fmtElapsed(now)}`);
+          updateQuest(guild.id, q.number, { last_tick_ms: now });
+          const ch = await client.channels.fetch(q.run_channel_id).catch(() => null);
+          if (ch) await ch.send(`⏱️ **${questTag(q)}** — **${fmtElapsed(now)}** elapsed.`).catch(()=>{});
+        }
+      } catch (err) { console.error('[quest] tick failed for', q.number, '-', err?.message || err); }
+    }
+  }
+}
+function startQuestClock(client) {
+  setInterval(() => questTick(client).catch(e => console.error('[quest] tick:', e?.message || e)), QUEST_TICK_MS);
 }
 
 // ── Tag helpers ──────────────────────────────────────────────────────────────
@@ -2564,6 +2728,14 @@ const slashCommands = [
       .addStringOption(o=>o.setName('value').setDescription('New value').setRequired(true))),
 
   new SlashCommandBuilder()
+    .setName('gmtest').setDescription('Throwaway test data for trying features out (GM)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addSubcommand(s=>s.setName('quest').setDescription('A ready-made quest with a party, so you can test the board and timer'))
+    .addSubcommand(s=>s.setName('npc').setDescription('An NPC with stats, items, standing and a roll history already on it'))
+    .addSubcommand(s=>s.setName('list').setDescription('Everything /gmtest has created'))
+    .addSubcommand(s=>s.setName('clean').setDescription('Delete every test quest and NPC this made')),
+
+  new SlashCommandBuilder()
     .setName('config').setDescription('Server configuration (Admin only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand(s=>s.setName('gmrole').setDescription('Add, remove or list GM roles — several can be set')
@@ -2589,6 +2761,9 @@ const slashCommands = [
       .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored: 100%, 50%, a number, or 0%').setRequired(false))
       .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored: 100%, 50%, a number, or 0%').setRequired(false))
       .addChannelOption(o=>o.setName('channel').setDescription('Announce this schedule here (optional)').setRequired(false)))
+    .addSubcommand(s=>s.setName('questlog').setDescription('Where finished quest summaries are posted for everyone to read')
+      .addChannelOption(o=>o.setName('channel').setDescription('Summary channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop posting summaries').setRequired(false)))
     .addSubcommand(s=>s.setName('activities').setDescription('Who may start an activity — GMs only, or anyone')
       .addBooleanOption(o=>o.setName('players').setDescription('true = players can start them too (writing stays GM-only)').setRequired(false)))
     .addSubcommand(s=>s.setName('hpbase').setDescription('Flat points added to CON for max HP (default 2, so CON+2)')
@@ -2780,6 +2955,18 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('lck').setDescription('Luck').setRequired(false))
       .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
         .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'})))
+    .addSubcommand(s=>s.setName('sheet').setDescription('An NPC\'s full record — stats, standing, inventory, rolls, lore')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true)))
+    .addSubcommand(s=>s.setName('give').setDescription('Give an NPC an item')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addStringOption(o=>o.setName('item').setDescription('What they receive').setRequired(true))
+      .addStringOption(o=>o.setName('note').setDescription('A detail about it').setRequired(false)))
+    .addSubcommand(s=>s.setName('take').setDescription('Take an item from an NPC')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addIntegerOption(o=>o.setName('id').setDescription('Item number from /npc sheet').setRequired(true)))
+    .addSubcommand(s=>s.setName('npclore').setDescription('Write an NPC\'s lore')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addStringOption(o=>o.setName('text').setDescription('Their story \u2014 or "none" to clear').setRequired(true)))
     .addSubcommand(s=>s.setName('delete').setDescription('Delete an NPC').addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true)))
     .addSubcommand(s=>s.setName('hp').setDescription('Set or restore an NPC HP (omit value for a full heal)')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
@@ -2842,6 +3029,18 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('lck').setDescription('Luck').setRequired(true))
       .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
         .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'})))
+    .addSubcommand(s=>s.setName('sheet').setDescription('An NPC\'s full record — stats, standing, inventory, rolls, lore')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true)))
+    .addSubcommand(s=>s.setName('give').setDescription('Give an NPC an item')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addStringOption(o=>o.setName('item').setDescription('What they receive').setRequired(true))
+      .addStringOption(o=>o.setName('note').setDescription('A detail about it').setRequired(false)))
+    .addSubcommand(s=>s.setName('take').setDescription('Take an item from an NPC')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addIntegerOption(o=>o.setName('id').setDescription('Item number from /npc sheet').setRequired(true)))
+    .addSubcommand(s=>s.setName('npclore').setDescription('Write an NPC\'s lore')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addStringOption(o=>o.setName('text').setDescription('Their story \u2014 or "none" to clear').setRequired(true)))
     .addSubcommand(s=>s.setName('delete').setDescription('Delete an NPC').addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true)))
     .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server')),
 
@@ -3029,7 +3228,17 @@ const slashCommands = [
       .addStringOption(o=>o.setName('rewards').setDescription('Non-merit rewards, distributed by the GM').setRequired(false))
       .addIntegerOption(o=>o.setName('merit_reward').setDescription('Merits each member earns on completion').setRequired(false).setMinValue(0).setMaxValue(999))
       .addIntegerOption(o=>o.setName('party_size').setDescription('Party size (cap or suggestion)').setRequired(false).setMinValue(1).setMaxValue(99))
-      .addBooleanOption(o=>o.setName('hard_cap').setDescription('True = enforce party size; false = suggestion (default)').setRequired(false)))
+      .addBooleanOption(o=>o.setName('hard_cap').setDescription('True = enforce party size; false = suggestion (default)').setRequired(false))
+      .addStringOption(o=>o.setName('gm_style').setDescription('How you run a table, so players know what to expect').setRequired(false)
+        .addChoices({name:'⚙️ Mechanics-focused',value:'mechanics'},{name:'🎭 Roleplay-focused',value:'rp'},
+                    {name:'⚖️ Mixed elements',value:'mixed'},{name:'⚔️ Combat-heavy',value:'combat'},
+                    {name:'🧩 Puzzle & investigation',value:'puzzle'},{name:'🗺️ Sandbox — led by the players',value:'sandbox'})))
+    .addSubcommand(s=>s.setName('instance').setDescription('Run your own copy of a quest, separate from anyone else\'s (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest to copy').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('gm_style').setDescription('How you run a table, so players know what to expect').setRequired(false)
+        .addChoices({name:'⚙️ Mechanics-focused',value:'mechanics'},{name:'🎭 Roleplay-focused',value:'rp'},
+                    {name:'⚖️ Mixed elements',value:'mixed'},{name:'⚔️ Combat-heavy',value:'combat'},
+                    {name:'🧩 Puzzle & investigation',value:'puzzle'},{name:'🗺️ Sandbox — led by the players',value:'sandbox'})))
     .addSubcommand(s=>s.setName('post').setDescription('Post a quest to a channel/thread as an embed (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addChannelOption(o=>o.setName('channel').setDescription('Where to post (defaults to here)').setRequired(false)))
@@ -3058,6 +3267,17 @@ const slashCommands = [
       .addChannelOption(o=>o.setName('channel').setDescription('Thread or channel (defaults to here)').setRequired(false)))
     .addSubcommand(s=>s.setName('start').setDescription('Mark a quest in progress, locking the party (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('pause').setDescription('Stop the clock — the time so far is kept (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true)))
+    .addSubcommand(s=>s.setName('resume').setDescription('Start the clock again where it left off (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true)))
+    .addSubcommand(s=>s.setName('note').setDescription('Mark something on the quest log (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true))
+      .addStringOption(o=>o.setName('text').setDescription('What happened').setRequired(true))
+      .addStringOption(o=>o.setName('kind').setDescription('What sort of moment').setRequired(false)
+        .addChoices({name:'🎭 Roleplay',value:'rp'},{name:'⚔️ Combat',value:'combat'},{name:'📝 Note',value:'note'})))
+    .addSubcommand(s=>s.setName('timeline').setDescription('The full log of a quest so far')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true)))
     .addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — award merits to the party (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('delete').setDescription('Delete a quest permanently (GM)')
@@ -3234,6 +3454,155 @@ async function handleMeritTradeRejectModal(interaction) {
   await notifyPlayer(interaction, gid, trade.from_user, notice);
   return interaction.reply({ content: `🚫 Trade #${trade.id} refused${reason ? ` — “${reason}”` : ''}. No merit moved.`,
     allowedMentions: { parse: [] } });
+}
+
+// An NPC's record, built from the same tables a player's pages read.
+async function handleNpcPages(interaction, sub) {
+  const gid = interaction.guild.id;
+  const name = interaction.options.getString('name').trim();
+  const npc = getNpc(gid, name);
+  if (!npc) return interaction.reply({ content: `❌ No NPC called **${name}**.`, ephemeral: true });
+  const id = npcFighterId(npc.name);
+
+  if (sub === 'give') {
+    const item = interaction.options.getString('item').trim();
+    addItem(gid, id, item, { note: interaction.options.getString('note'), source: 'given by a GM', by: interaction.user.id });
+    return interaction.reply({ content: `🎒 **${npc.name}** 🎭 receives **${item}**.` });
+  }
+  if (sub === 'take') {
+    const itemId = interaction.options.getInteger('id');
+    return interaction.reply({ content: removeItem(gid, itemId, id)
+      ? `🎒 Item \`#${itemId}\` taken from **${npc.name}** 🎭.`
+      : `❌ **${npc.name}** has no item \`#${itemId}\`.`, ephemeral: true });
+  }
+  if (sub === 'npclore') {
+    const text = interaction.options.getString('text').trim();
+    const clearing = /^(none|clear|-)$/i.test(text);
+    db.prepare('UPDATE npcs SET lore=? WHERE guild_id=? AND name=?').run(clearing ? null : text, gid, npc.name);
+    return interaction.reply({ content: clearing
+      ? `📜 Cleared **${npc.name}**'s lore.` : `📜 Lore written for **${npc.name}** 🎭.` });
+  }
+
+  // sheet — the whole record on one page
+  const max = maxHpFromCon(gid, npc.con);
+  const lines = [`⚔️  **${npc.name}** 🎭`];
+  if (npc.order_name) lines.push(`${KNIGHT_EMOJIS[npc.order_name] ?? '⚪'}  ${npc.order_name}`);
+  lines.push(`❤️  HP          ${npc.hp_current} / ${max}`);
+  lines.push('', `💪  STR         ${npc.str ?? 0}`, `🫀  CON         ${npc.con ?? 0}`,
+             `⚡  DEX         ${npc.dex ?? 0}`, `🧠  WIS         ${npc.wis ?? 0}`, `🍀  LCK         ${npc.lck ?? 0}`);
+
+  lines.push('', `🏅 **Standing** — **${npc.merits ?? 0}** merit${(npc.merits ?? 0) === 1 ? '' : 's'} · 💠 **${npc.renown ?? 0}** renown`);
+  const ev = standingEvents(gid, id, 10);
+  for (const e of ev) {
+    lines.push(`${e.kind === 'merit' ? '🏅' : '💠'} ${e.delta > 0 ? '+' : ''}${e.delta} · ${e.reason || 'no reason given'}`
+      + (e.at ? ` · <t:${Math.floor(e.at / 1000)}:R>` : ''));
+  }
+
+  const items = listItems(gid, id);
+  lines.push('', items.length ? '🎒 **Inventory**' : '🎒 **Inventory** — empty.');
+  for (const i of items) lines.push(`\`#${i.id}\` **${i.item}**${i.note ? ` — ${i.note}` : ''}`);
+
+  const t = rollTally(gid, id, 20);
+  lines.push('', t.total
+    ? `🎲 **Rolls** — ${t.total} lifetime · 🌟 ${t.by[20] || 0} nat-20${(t.by[20] || 0) === 1 ? '' : 's'} · 💀 ${t.by[1] || 0} nat-1${(t.by[1] || 0) === 1 ? '' : 's'}`
+    : '🎲 **Rolls** — nothing recorded yet.');
+
+  if (npc.lore) lines.push('', '📜 **Lore**', npc.lore);
+  return replyLong(interaction, lines);
+}
+
+// Everything here is prefixed and disposable. It exists so a GM can exercise
+// the board, the timer, the pages and the summary without inventing a real
+// quest or an NPC they will then have to tidy out of the world.
+const GMTEST_PREFIX = '[test] ';
+
+async function handleGmTest(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  if (!(await isGm(interaction.guild, uid)))
+    return interaction.reply({ content: '❌ Only GMs can use the test tools.', ephemeral: true });
+  const sub = interaction.options.getSubcommand();
+
+  if (sub === 'quest') {
+    const number = createQuest(gid, {
+      name: `${GMTEST_PREFIX}Trial of the Sunken Vault`,
+      lore: 'A test quest. Nothing here is canon.',
+      objectives: 'Try the board, the clock and the summary.',
+      details: 'Made by /gmtest — delete it with /gmtest clean.',
+      rewards: 'A tarnished silver key (test)',
+      merit_reward: 1, party_size: 4, party_hard: false, created_by: uid,
+    });
+    updateQuest(gid, number, { gm_id: uid, gm_style: 'mixed', run_channel_id: interactionChannelId(interaction) });
+    setQuestMember(gid, number, uid, 'party');   // so it can be started immediately
+    const quest = getQuest(gid, number);
+    return interaction.reply({ ephemeral: true, content: [
+      `🧪 Created **${questTag(quest)}** with you on the party, running in this channel.`,
+      '',
+      `Try: \`/quest start number:${number}\` → \`/quest note number:${number} text:Something happened\``,
+      `→ \`/quest timeline number:${number}\` → \`/quest pause\` / \`/quest resume\` → \`/quest complete number:${number}\``,
+      '',
+      '_Reminders land every 15 minutes and a recap on the hour. `/gmtest clean` removes it._',
+    ].join('\n') });
+  }
+
+  if (sub === 'npc') {
+    const name = `${GMTEST_PREFIX}Vault Warden`;
+    upsertNpc(gid, name, { str: 6, con: 5, dex: 3, wis: 4, lck: 2, order_name: 'Black Knight',
+      hp_current: maxHpFromCon(gid, 5) });
+    const id = npcFighterId(name);
+    // Give it a record worth looking at, rather than an empty page.
+    db.prepare('DELETE FROM inventory WHERE guild_id=? AND user_id=?').run(gid, id);
+    addItem(gid, id, 'Rusted vault key', { note: 'Warm to the touch', source: 'test data' });
+    addItem(gid, id, 'Ledger of names', { source: 'test data' });
+    addMerits(gid, id, 3);
+    addRenown(gid, id, 5, 'test data');
+    db.prepare('DELETE FROM roll_tally WHERE guild_id=? AND user_id=?').run(gid, id);
+    for (const [face, times] of [[20, 2], [13, 4], [7, 3], [1, 1]]) {
+      for (let i = 0; i < times; i++) tallyRoll(gid, id, face, 20);
+    }
+    db.prepare('UPDATE npcs SET lore=? WHERE guild_id=? AND name=?')
+      .run('Kept the vault long after the last of the order had gone.', gid, name);
+    return interaction.reply({ ephemeral: true, content: [
+      `🧪 Created **${name}** 🎭 with items, standing, a roll history and lore.`,
+      '',
+      `Try: \`/npc sheet name:${name}\` → \`/npc give name:${name} item:…\` → \`/fight start npcs:${name}\``,
+      '',
+      '_`/gmtest clean` removes it._',
+    ].join('\n') });
+  }
+
+  if (sub === 'list') {
+    const quests = db.prepare(`SELECT number, name, status FROM quests WHERE guild_id=? AND name LIKE ? ORDER BY number`)
+      .all(gid, GMTEST_PREFIX + '%');
+    const npcs = db.prepare('SELECT name FROM npcs WHERE guild_id=? AND name LIKE ? ORDER BY name')
+      .all(gid, GMTEST_PREFIX + '%');
+    if (!quests.length && !npcs.length) return interaction.reply({ content: '🧪 Nothing has been made by `/gmtest`.', ephemeral: true });
+    const lines = ['🧪 **Test data**', ''];
+    for (const q of quests) lines.push(`📜 #${String(q.number).padStart(3, '0')} ${q.name} — ${q.status}`);
+    for (const npcRow of npcs) lines.push(`🎭 ${npcRow.name}`);
+    return replyLong(interaction, lines, { ephemeral: true });
+  }
+
+  // clean
+  const quests = db.prepare('SELECT number FROM quests WHERE guild_id=? AND name LIKE ?').all(gid, GMTEST_PREFIX + '%');
+  const npcs = db.prepare('SELECT name FROM npcs WHERE guild_id=? AND name LIKE ?').all(gid, GMTEST_PREFIX + '%');
+  if (!quests.length && !npcs.length) return interaction.reply({ content: '🧪 Nothing to clean.', ephemeral: true });
+  return requestConfirm(interaction,
+    `Delete ${quests.length} test quest${quests.length === 1 ? '' : 's'} and ${npcs.length} test NPC${npcs.length === 1 ? '' : 's'}?`,
+    async () => {
+      for (const q of quests) {
+        for (const t of ['quests', 'quest_members', 'quest_events', 'quest_summaries']) {
+          db.prepare(`DELETE FROM ${t} WHERE guild_id=? AND number=?`).run(gid, q.number);
+        }
+      }
+      for (const npcRow of npcs) {
+        const id = npcFighterId(npcRow.name);
+        db.prepare('DELETE FROM inventory WHERE guild_id=? AND user_id=?').run(gid, id);
+        db.prepare('DELETE FROM roll_tally WHERE guild_id=? AND user_id=?').run(gid, id);
+        db.prepare('DELETE FROM renown_log WHERE guild_id=? AND user_id=?').run(gid, id);
+        db.prepare('DELETE FROM npcs WHERE guild_id=? AND name=?').run(gid, npcRow.name);
+      }
+      return `🧪 Cleaned up ${quests.length} quest${quests.length === 1 ? '' : 's'} and ${npcs.length} NPC${npcs.length === 1 ? '' : 's'}.`;
+    });
 }
 
 async function handleRenown(interaction) {
@@ -3620,6 +3989,21 @@ async function handleConfig(interaction) {
       `${existing ? '✏️ Updated' : '🌙 Added'} recovery schedule:`, line(sc), '',
       'Everyone not on an in-progress quest is covered. Quest parties keep whatever they have until they finish.',
     ].join('\n') });
+  }
+
+  if (sub === 'questlog') {
+    const channel = interaction.options.getChannel('channel');
+    const disable = interaction.options.getBoolean('disable');
+    if (disable) { setConfig(gid, { quest_log_channel: null }); return interaction.reply({ content: '📜 Quest summaries will no longer be posted.' }); }
+    if (!channel) {
+      const cur = getConfig(gid)?.quest_log_channel;
+      return interaction.reply({ ephemeral: true, content: cur
+        ? `📜 Quest summaries are posted in <#${cur}>.`
+        : '📜 No quest log channel set. `/config questlog channel:#chronicle`' });
+    }
+    if (!channel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
+    setConfig(gid, { quest_log_channel: channel.id });
+    return interaction.reply({ content: `📜 Finished quests will be written up in <#${channel.id}>, and linked on each player's \`/char standing\`.` });
   }
 
   if (sub === 'activities') {
@@ -4038,6 +4422,14 @@ async function handleChar(interaction) {
       return ['🎒 **Inventory**', ...items.map(i =>
         `\`#${i.id}\` **${i.item}**${i.note ? ` — ${i.note}` : ''}${i.source ? `  _(${i.source})_` : ''}`)];
     };
+    const questSummaryLines = () => {
+      const rows = db.prepare(`SELECT * FROM quest_summaries WHERE guild_id=? AND user_id=?
+                               ORDER BY ended_at DESC LIMIT 10`).all(gid, tid);
+      if (!rows.length) return [];
+      return ['', '📜 **Quests completed**',
+        ...rows.map(r => `${r.url ? `[${r.quest_name}](${r.url})` : `**${r.quest_name}**`}`
+          + ` — ${fmtElapsed(r.duration_ms)} · <t:${Math.floor(r.ended_at / 1000)}:R>`)];
+    };
     const standingLines = () => {
       const out = [`🏅 **Standing** — **${ch.merits ?? 0}** merit${(ch.merits ?? 0) === 1 ? '' : 's'} · 💠 **${ch.renown ?? 0}** renown`];
       const ev = standingEvents(gid, tid);
@@ -4088,7 +4480,7 @@ async function handleChar(interaction) {
     };
 
     if (sub === 'inventory')   return replyLong(interaction, [`🎒 **${nm}**`, '', ...inventoryLines().slice(1)]);
-    if (sub === 'standing')    return replyLong(interaction, [`**${nm}**`, ...standingLines()]);
+    if (sub === 'standing')    return replyLong(interaction, [`**${nm}**`, ...standingLines(), ...questSummaryLines()]);
     if (sub === 'rollhistory') return replyLong(interaction, [`**${nm}**`, ...rollLines(interaction.options.getInteger('sides') ?? 20)]);
     if (sub === 'showlore')    return replyLong(interaction, [`**${nm}**`, ...loreLines()]);
 
@@ -4099,7 +4491,7 @@ async function handleChar(interaction) {
     const t = rollTally(gid, tid, 20);
     const nat20 = t.by[20] || 0, nat1 = t.by[1] || 0;
     return replyLong(interaction, [...card, '',
-      ...standingLines(), '',
+      ...standingLines(), ...questSummaryLines(), '',
       ...inventoryLines(), '',
       `🎲 **Rolls** — ${t.total} lifetime · 🌟 ${nat20} nat-20${nat20 === 1 ? '' : 's'} · 💀 ${nat1} nat-1${nat1 === 1 ? '' : 's'}`, '',
       ...loreLines()]);
@@ -4914,6 +5306,7 @@ client.on('interactionCreate', async interaction => {
 
   if (!interaction.isChatInputCommand()) return;
   try {
+    if (interaction.commandName === 'gmtest') return await handleGmTest(interaction);
     if (interaction.commandName === 'renown') return await handleRenown(interaction);
     if (interaction.commandName === 'activity') return await handleStory(interaction);
     if (interaction.commandName === 'config') return await handleConfig(interaction);
@@ -5193,6 +5586,7 @@ async function clearGlobalCommands() {
   console.log('Starting up...');
   await clearGlobalCommands();
   startAutoRest(client);
+  startQuestClock(client);
   client.login(process.env.DISCORD_TOKEN);
 })();
 
@@ -5827,6 +6221,8 @@ function mirrorRoll(gid, { userId = null, actor = null, channelId, messageId = n
 // demo bouts. There's no human to attribute it to, so the fighter is named
 // instead and the entry is tagged so a GM can tell it from a hand-rolled one.
 function mirrorAutoRoll(gid, cid, name, notation, nat, total, context) {
+  // An NPC's dice belong in its own lifetime record, the same as a player's.
+  try { if (getNpc(gid, name)) tallyRoll(gid, npcFighterId(name), nat, 20); } catch {}
   const mod = total - nat;
   const modStr = mod > 0 ? ` +${mod}` : (mod < 0 ? ` ${mod}` : '');
   mirrorRoll(gid, {
@@ -6131,6 +6527,10 @@ async function buildFightRecap(guild, gid, log, opts = {}) {
 // where everyone can read it, never buried in an ephemeral reply only the GM
 // sees. Carries the victor, everyone's final standing, and the full recap.
 async function announceFightEnd(guild, gid, cid, channel, opts = {}) {
+  // A fight in a quest's channel is part of that quest's story.
+  try { noteQuestActivity(gid, cid, 'combat', opts?.headline
+    ? String(opts.headline).replace(/\*\*/g, '').replace(/[🏆🛑🏳️]/g, '').trim()
+    : 'A fight ended'); } catch {}
   const { headline = null, log = {}, roster = [], hpState = {}, floor = 0 } = opts;
   const W = fightWords(floor);
   const lines = ['═════════════════════════════', floor > 0 ? '🏁 **Bout Over**' : '🏁 **Fight Over**'];
@@ -6210,7 +6610,13 @@ async function fighterCharCard(guild, gid, fid) {
 
 // Post a message into a channel AS an NPC (via its webhook, with name + avatar),
 // matching how /pr posts. Falls back to a plain channel.send if the webhook fails.
+// Speaking as an NPC in a quest's channel is a roleplay beat worth logging.
+function noteNpcSpeech(gid, channel, npcName) {
+  try { noteQuestActivity(gid, channel?.id, 'rp', `${npcName} speaks`); } catch {}
+}
+
 async function postAsNpc(channel, gid, npcName, content) {
+  noteNpcSpeech(gid, channel, npcName);
   const npc = getNpc(gid, npcName);
   try {
     const webhookClient = await npcWebhookIn(channel, gid, npcName, npc?.image_url);
@@ -7621,6 +8027,10 @@ async function handleSlashRoll(interaction) {
 // ─────────────────────────────────────────────
 
 async function handleNpc(interaction) {
+  {
+    const sub0 = interaction.options.getSubcommand();
+    if (['sheet', 'give', 'take', 'npclore'].includes(sub0)) return handleNpcPages(interaction, sub0);
+  }
   const sub = interaction.options.getSubcommand();
   const gid = interaction.guild.id;
   const uid = interaction.user.id;
@@ -8899,6 +9309,18 @@ async function renderQuest(guild, quest) {
   const lines = [];
   lines.push(`📜 **${questTag(quest)}**`);
   lines.push(`${questStatusBadge(quest.status)}`);
+  // Who is running it and how they run a table — the two things a player wants
+  // before applying, especially when several GMs are running the same adventure.
+  const gmBits = [];
+  if (quest.gm_id) gmBits.push(`🎲 GM: **${await getDisplayName(guild, quest.gm_id)}**`);
+  const style = gmStyleLabel(quest.gm_style);
+  if (style) gmBits.push(style);
+  if (gmBits.length) lines.push(gmBits.join('  ·  '));
+  if (quest.instance_of) {
+    const runs = db.prepare('SELECT COUNT(*) AS c FROM quests WHERE guild_id=? AND (number=? OR instance_of=?)')
+      .get(gid, quest.instance_of, quest.instance_of).c;
+    lines.push(`_One of ${runs} separate runs of this adventure._`);
+  }
   lines.push('─────────────────────────────');
   if (quest.lore) lines.push(`📖 *${quest.lore}*\n`);
   if (quest.objectives) lines.push(`🎯 **Objectives**\n${quest.objectives}\n`);
@@ -9051,6 +9473,7 @@ async function handleQuest(interaction) {
       party_hard: interaction.options.getBoolean('hard_cap') ?? false,
       created_by: uid,
     });
+    updateQuest(gid, number, { gm_id: uid, gm_style: interaction.options.getString('gm_style') ?? null });
     const quest = getQuest(gid, number);
     return interaction.reply({ content: `✅ Created **${questTag(quest)}**.\n\n${await renderQuest(interaction.guild, quest)}\n\n_Post it with_ \`/quest post number:${number}\`_._` });
   }
@@ -9116,9 +9539,84 @@ async function handleQuest(interaction) {
     if (quest.status === 'completed') return interaction.reply({ content: '❌ That quest is already completed.', ephemeral: true });
     const party = getQuestMembers(gid, number, 'party');
     if (!party.length) return interaction.reply({ content: '❌ No party members yet — approve applicants first.', ephemeral: true });
-    updateQuest(gid, number, { status: 'active' });
+    // Start the stopwatch fresh, and clear any log from a previous run.
+    db.prepare('DELETE FROM quest_events WHERE guild_id=? AND number=?').run(gid, number);
+    updateQuest(gid, number, { status: 'active', started_at: Date.now(), elapsed_ms: 0,
+      paused: 0, last_tick_ms: 0, last_recap_ms: 0,
+      // Whoever starts it is running it, unless one was already recorded.
+      gm_id: quest.gm_id ?? uid });
+    logQuestEvent(gid, number, 'start', `Quest begins — ${party.length} on the party`, uid);
     await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, number));
-    return interaction.reply({ content: `🟡 **${questTag(quest)}** is now in progress with ${party.length} member${party.length === 1 ? '' : 's'}. Applications are closed.` });
+    return interaction.reply({ content:
+      `🟡 **${questTag(quest)}** is now in progress with ${party.length} member${party.length === 1 ? '' : 's'}. Applications are closed.\n`
+      + `⏱️ The clock is running${quest.run_channel_id ? ` in <#${quest.run_channel_id}>` : ' — set a channel with `/quest runchannel` for reminders'}.` });
+  }
+
+  // A quest row carries one party, one clock and one status, so two GMs running
+  // the same adventure need two rows. This copies the writing and leaves
+  // everything else fresh — new number, empty party, clock at zero.
+  if (sub === 'instance') {
+    const from = interaction.options.getInteger('number');
+    const src = getQuest(gid, from);
+    if (!src) return interaction.reply({ content: `❌ No quest #${String(from).padStart(3,'0')}.`, ephemeral: true });
+    const number = createQuest(gid, {
+      name: src.name, objectives: src.objectives, lore: src.lore, details: src.details,
+      rewards: src.rewards, merit_reward: src.merit_reward,
+      party_size: src.party_size, party_hard: src.party_hard, created_by: uid,
+    });
+    updateQuest(gid, number, {
+      gm_id: uid,
+      gm_style: interaction.options.getString('gm_style') ?? src.gm_style ?? null,
+      instance_of: src.instance_of ?? from,
+    });
+    const quest = getQuest(gid, number);
+    const siblings = db.prepare('SELECT COUNT(*) AS c FROM quests WHERE guild_id=? AND (number=? OR instance_of=?)')
+      .get(gid, quest.instance_of, quest.instance_of).c;
+    return interaction.reply({ content:
+      `✅ **${questTag(quest)}** — your own run of **${src.name}**, separate from any other.\n`
+      + `_${siblings} run${siblings === 1 ? '' : 's'} of this adventure exist. Yours has its own party, clock and log._\n\n`
+      + `${await renderQuest(interaction.guild, quest)}\n\n_Post it with_ \`/quest post number:${number}\`_._` });
+  }
+
+  if (sub === 'pause' || sub === 'resume') {
+    const number = interaction.options.getInteger('number');
+    const quest = getQuest(gid, number);
+    if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
+    if (quest.status !== 'active') return interaction.reply({ content: '❌ That quest is not running.', ephemeral: true });
+    const paused = !!quest.paused;
+    if (sub === 'pause') {
+      if (paused) return interaction.reply({ content: '❌ It is already paused.', ephemeral: true });
+      // Bank the running stretch, then stop the clock.
+      updateQuest(gid, number, { elapsed_ms: questElapsed(quest), paused: 1, started_at: null });
+      logQuestEvent(gid, number, 'pause', 'Paused', uid);
+      return interaction.reply({ content: `⏸️ **${questTag(quest)}** paused at **${fmtElapsed(questElapsed(getQuest(gid, number)))}**. The clock and the log are kept.` });
+    }
+    if (!paused) return interaction.reply({ content: '❌ It is already running.', ephemeral: true });
+    updateQuest(gid, number, { paused: 0, started_at: Date.now() });
+    logQuestEvent(gid, number, 'resume', 'Resumed', uid);
+    return interaction.reply({ content: `▶️ **${questTag(quest)}** resumed at **${fmtElapsed(questElapsed(getQuest(gid, number)))}**.` });
+  }
+
+  if (sub === 'note') {
+    const number = interaction.options.getInteger('number');
+    const quest = getQuest(gid, number);
+    if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
+    if (quest.status !== 'active') return interaction.reply({ content: '❌ That quest is not running.', ephemeral: true });
+    const text = interaction.options.getString('text');
+    const kind = interaction.options.getString('kind') || 'note';
+    logQuestEvent(gid, number, kind, text, uid);
+    return interaction.reply({ content: `${QUEST_EVENT_ICON[kind] ?? '📝'} \`${fmtElapsed(questElapsed(quest))}\` — ${text}` });
+  }
+
+  if (sub === 'timeline') {
+    const number = interaction.options.getInteger('number');
+    const quest = getQuest(gid, number);
+    if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
+    const events = questEvents(gid, number);
+    if (!events.length) return interaction.reply({ content: `📜 **${questTag(quest)}** has nothing logged yet.`, ephemeral: true });
+    return replyLong(interaction, [
+      `📜 **${questTag(quest)}** — ${quest.paused ? '⏸️ paused at' : 'running,'} **${fmtElapsed(questElapsed(quest))}**`, '',
+      ...events.map(questEventLine)], { ephemeral: true });
   }
 
   if (sub === 'complete') {
@@ -9143,10 +9641,14 @@ async function handleQuest(interaction) {
       }
       awarded.push({ id, after });
     }
-    updateQuest(gid, number, { status: 'completed' });
+    // Stop the stopwatch before anything else, so the summary reports the run
+    // rather than however long the paperwork took.
+    const runMs = questElapsed(quest);
+    logQuestEvent(gid, number, 'end', 'Quest complete', uid);
+    updateQuest(gid, number, { status: 'completed', elapsed_ms: runMs, paused: 1, started_at: null });
     await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, number));
 
-    const lines = [`🎉 **${questTag(quest)}** complete!`, ''];
+    const lines = [`🎉 **${questTag(quest)}** complete!`, `⏱️ Ran for **${fmtElapsed(runMs)}**.`, ''];
     if (quest.merit_reward > 0) {
       lines.push(`🎖️ **+${quest.merit_reward}** merit${quest.merit_reward === 1 ? '' : 's'} awarded to:`);
       for (const a of awarded) {
@@ -9165,6 +9667,49 @@ async function handleQuest(interaction) {
       lines.push('', `🎁 **GM to distribute:** ${quest.rewards}`);
       lines.push(`Party: ${partyNames.join(', ')}`);
     }
+
+    // The summary: the whole timeline, the party, and how long it took.
+    const partyNames = [];
+    for (const id of party) partyNames.push(await getDisplayNameCached(interaction.guild, id, nameCache));
+    const events = questEvents(gid, number);
+    const runner = getQuest(gid, number)?.gm_id ?? uid;
+    const runnerName = await getDisplayNameCached(interaction.guild, runner, nameCache);
+    const styleLabel = gmStyleLabel(quest.gm_style);
+    const summary = [
+      `📜 **${questTag(quest)}** — quest summary`,
+      `🎲 Run by **${runnerName}**${styleLabel ? ` · ${styleLabel}` : ''}`,
+      `⏱️ **${fmtElapsed(runMs)}** · 👥 ${partyNames.join(', ')}`,
+      '─────────────────────────────',
+      ...(events.length ? events.map(questEventLine) : ['_Nothing was logged._']),
+    ];
+    if (quest.merit_reward > 0) summary.push('', `🎖️ +${quest.merit_reward} merit each.`);
+    if (quest.rewards) summary.push(`🎁 ${quest.rewards}`);
+
+    // Post it where a GM asked for it, and keep the link so it can hang off
+    // each player's standing page.
+    let summaryUrl = null;
+    const logChId = getConfig(gid)?.quest_log_channel;
+    if (logChId) {
+      try {
+        const logCh = await interaction.client.channels.fetch(logChId);
+        const chunks = chunkLines(summary);
+        let first = null;
+        for (const [i, c] of chunks.entries()) {
+          const m = await logCh.send({ content: c, allowedMentions: { parse: [] } });
+          if (i === 0) first = m;
+        }
+        if (first) summaryUrl = `https://discord.com/channels/${gid}/${logCh.id}/${first.id}`;
+      } catch (err) { console.error('[quest] could not post summary:', err?.message || err); }
+    }
+    const ins = db.prepare(`INSERT INTO quest_summaries (guild_id,number,user_id,quest_name,url,duration_ms,ended_at)
+                            VALUES (?,?,?,?,?,?,?)
+                            ON CONFLICT(guild_id,number,user_id) DO UPDATE SET url=excluded.url, duration_ms=excluded.duration_ms`);
+    for (const id of party) ins.run(gid, number, id, questTag(quest), summaryUrl, runMs, Date.now());
+
+    lines.push('', ...(summaryUrl
+      ? [`📜 [Read the full summary](${summaryUrl}) — it is on everyone's \`/char standing\` too.`]
+      : ['_No quest log channel set, so the summary was not posted — a GM can set one with `/config questlog`._']));
+    if (!logChId) lines.push(...summary.slice(2, 14));
 
     // Announce in the designated run channel if set and different from here
     const announce = lines.join('\n');
