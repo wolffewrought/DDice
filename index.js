@@ -133,6 +133,11 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_sha TEXT'); } catch {}
 // console meant a misconfigured repo failed silently for anyone not reading
 // Railway's output.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_error TEXT'); } catch {}
+// When it last looked and what it concluded. Without this there is no way to
+// tell "hasn't tried yet" from "tried and found nothing new" from "tried and
+// failed" — which leaves a manual push as the only way to learn anything.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_checked_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_result TEXT'); } catch {}
 // A second home for the player book alone, posted quietly — no ping, no
 // notification — so a reference channel stays current without nagging anyone.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_player_channel TEXT'); } catch {}
@@ -2029,6 +2034,8 @@ function startDocsWatch(client) {
       if (!st.channel || !st.repo) continue;
       try {
         const out = await publishDocs(client, guild);
+        setConfig(guild.id, { docs_checked_at: Date.now(),
+          docs_result: out.posted ? 'published a new build' : (out.skipped === 'unchanged' ? 'nothing new' : String(out.skipped)) });
         if (out.posted) console.log(`[docs] ${guild.id}: published a new build`);
         // Recovered — say so if we had complained.
         if (getConfig(guild.id)?.docs_error) {
@@ -2040,6 +2047,7 @@ function startDocsWatch(client) {
         }
       } catch (err) {
         const msg = err?.message || String(err);
+        setConfig(guild.id, { docs_checked_at: Date.now(), docs_result: `failed — ${msg}` });
         console.error('[docs] check failed for', guild.id, '-', msg);
         // Tell the channel once per distinct problem, not every 15 minutes.
         if (getConfig(guild.id)?.docs_error === msg) continue;
@@ -2057,7 +2065,7 @@ function startDocsWatch(client) {
     }
   };
   setInterval(tick, DOCS_POLL_MS);
-  setTimeout(tick, 90 * 1000);   // settle after boot, then look once
+  setTimeout(tick, 30 * 1000);   // look soon after boot, not a minute and a half later
 }
 
 // ── Quest stopwatch & event log ──────────────────────────────────────────────
@@ -4807,11 +4815,14 @@ async function handleConfig(interaction) {
         : '📚 Not set up. `/config docs channel:#gm-books repo:owner/name`\n_The three PDFs are fetched from that repository and kept as a single, current post._' });
     }
 
+    const cfg0 = getConfig(gid) || {};
     if (!push && !Object.keys(fields).length) {
       return interaction.reply({ ephemeral: true, content:
         `📚 Watching \`${st.repo}\` (${st.branch}${st.path ? `, /${st.path}` : ''}) → <#${st.channel}>, checked every 15 minutes.\n`
         + (st.playerChannel ? `📘 Player book also posted quietly in <#${st.playerChannel}>.\n` : '')
-        + (getConfig(gid)?.docs_error ? `⚠️ Last check failed: \`${getConfig(gid).docs_error}\`\n` : '')
+        + (cfg0.docs_checked_at
+            ? `🕘 Last looked <t:${Math.floor(cfg0.docs_checked_at / 1000)}:R> — ${cfg0.docs_result || 'no result recorded'}.\n`
+            : '🕘 _Not checked yet — the first look is about 30 seconds after the bot starts._\n')
         + (st.msgId ? `Current post: https://discord.com/channels/${gid}/${st.channel}/${st.msgId}` : '_Nothing posted yet._') });
     }
 
@@ -4820,11 +4831,12 @@ async function handleConfig(interaction) {
       const out = await publishDocs(interaction.client, interaction.guild,
         { reason: push ? 'pushed by a GM' : 'settings changed', force: !!push });
       if (out.skipped === 'unchanged') {
+        setConfig(gid, { docs_error: null, docs_checked_at: Date.now(), docs_result: 'nothing new' });
         return interaction.editReply({ content: `📚 Already up to date. Watching \`${st.repo}\` → <#${st.channel}>.` });
       }
       const extra = out.playerUrl ? `\n📘 Player book posted quietly in <#${st.playerChannel}>.`
                   : out.playerError ? `\n⚠️ Player copy failed: ${out.playerError}` : '';
-      setConfig(gid, { docs_error: null });
+      setConfig(gid, { docs_error: null, docs_checked_at: Date.now(), docs_result: 'published by a GM' });
       return interaction.editReply({ content: `📚 Published to <#${st.channel}> and the GMs pinged.\n${out.url}${extra}` });
     } catch (err) {
       return interaction.editReply({ content:
@@ -6052,6 +6064,29 @@ client.on('ready', async () => {
   console.log('✅ Backup scheduler started');
 });
 
+async function routeButton(interaction) {
+    if (interaction.customId.startsWith('confirm:') || interaction.customId.startsWith('cancel:')) {
+      return handleConfirmButton(interaction);
+    }
+    if (interaction.customId.startsWith('storyroll:')) return handleStoryRollButton(interaction);
+    if (interaction.customId.startsWith('storypick:')) return handleStoryPickButton(interaction);
+    if (interaction.customId.startsWith('storyrr:')) return handleStoryRerollButton(interaction);
+    if (interaction.customId.startsWith('storygo:')) return handleStoryCarryOnButton(interaction);
+    if (interaction.customId.startsWith('loreok:') || interaction.customId.startsWith('loreno:')) return handleLoreButton(interaction);
+    if (interaction.customId.startsWith('tradeok:') || interaction.customId.startsWith('tradeno:')) return handleMeritTradeButton(interaction);
+    if (interaction.customId.startsWith('revive:')) return handleReviveButton(interaction);
+    if (interaction.customId.startsWith('questapply:') || interaction.customId.startsWith('questwithdraw:')) {
+      return handleQuestButton(interaction);
+    }
+    if (interaction.customId.startsWith('sheetok:') || interaction.customId.startsWith('sheetno:')) {
+      return handleSheetApprovalButton(interaction);
+    }
+    if (interaction.customId.startsWith('exportok:') || interaction.customId.startsWith('exportno:')) {
+      return handleExportRequestButton(interaction);
+    }
+    return;
+}
+
 client.on('interactionCreate', async interaction => {
   // Handle autocomplete for NPC name fields
   if (interaction.isAutocomplete()) {
@@ -6182,26 +6217,21 @@ client.on('interactionCreate', async interaction => {
   }
 
   if (interaction.isButton()) {
-    if (interaction.customId.startsWith('confirm:') || interaction.customId.startsWith('cancel:')) {
-      return handleConfirmButton(interaction);
+    // Every button dispatch was outside a try, so anything they threw became an
+    // unhandled rejection: Discord showed "This interaction failed" and nothing
+    // was logged anywhere. A silent button is undebuggable.
+    try {
+      return await routeButton(interaction);
+    } catch (err) {
+      const msg = err?.message || String(err);
+      console.error('[button]', interaction.customId, '→', msg, '\n', err?.stack || '');
+      const tell = { content: `⚠️ That button hit an error:\n\`${msg}\``, ephemeral: true };
+      try {
+        if (interaction.replied || interaction.deferred) await interaction.followUp(tell);
+        else await interaction.reply(tell);
+      } catch {}
+      return;
     }
-    if (interaction.customId.startsWith('storyroll:')) return handleStoryRollButton(interaction);
-    if (interaction.customId.startsWith('storypick:')) return handleStoryPickButton(interaction);
-    if (interaction.customId.startsWith('storyrr:')) return handleStoryRerollButton(interaction);
-    if (interaction.customId.startsWith('storygo:')) return handleStoryCarryOnButton(interaction);
-    if (interaction.customId.startsWith('loreok:') || interaction.customId.startsWith('loreno:')) return handleLoreButton(interaction);
-    if (interaction.customId.startsWith('tradeok:') || interaction.customId.startsWith('tradeno:')) return handleMeritTradeButton(interaction);
-    if (interaction.customId.startsWith('revive:')) return handleReviveButton(interaction);
-    if (interaction.customId.startsWith('questapply:') || interaction.customId.startsWith('questwithdraw:')) {
-      return handleQuestButton(interaction);
-    }
-    if (interaction.customId.startsWith('sheetok:') || interaction.customId.startsWith('sheetno:')) {
-      return handleSheetApprovalButton(interaction);
-    }
-    if (interaction.customId.startsWith('exportok:') || interaction.customId.startsWith('exportno:')) {
-      return handleExportRequestButton(interaction);
-    }
-    return;
   }
 
   if (!interaction.isChatInputCommand()) return;
