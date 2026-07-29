@@ -680,7 +680,7 @@ function turnPrompt(f) {
 const fightOrder = (fight) => JSON.parse(fight?.turn_order || '[]');
 const fightHp = (fight) => JSON.parse(fight?.hp_state || '{}');
 // Where sheets, lore, exports and merit trades all queue for a GM.
-const approvalChannelId = (gid) => approvalChannelId(gid) || null;
+const approvalChannelId = (gid) => getConfig(gid)?.approval_channel_id || null;
 
 // Resolve the `number:` option to a quest, or answer the refusal. Twelve
 // subcommands opened with the same four lines; this is those four lines.
