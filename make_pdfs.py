@@ -424,7 +424,8 @@ CONTENT = [
           ('/help category:dice', 'detail on a specific group'),
           ('/lastroll', 'recall your last roll in this channel'),
           ('/backup now', 'take one immediately \u2014 ' + GM, 'gm'),
-          ('/backup auto channel:#backups', 'daily automatic backups \u2014 ' + GM, 'gm'),
+          ('/backup auto channel:#backups', 'automatic backups \u2014 ' + GM, 'gm'),
+          ('/backup auto channel:#backups hours:12', 'or a different interval \u2014 ' + GM, 'gm'),
           ('/backup auto channel:off', 'stop them \u2014 ' + GM, 'gm')]),
 ('aud','gm'),
 ('h2', 'Backups'),
@@ -432,6 +433,10 @@ CONTENT = [
       '<b>deletes and replaces the last</b>, so the channel holds exactly one file: the newest. '
       '<b>/backup now</b> takes one on demand and replaces the standing post the same way; with no channel '
       'set it comes back to you privately as a one-off copy instead.'),
+('note', 'The cycle is measured from the <b>last backup taken</b>, not from when the bot last started. A '
+         'redeploy mid-cycle resumes where it left off, and one that happens while a backup is overdue takes '
+         'it shortly after boot \u2014 so a server that redeploys several times a day still gets its daily file. '
+         'Switching backups on takes one immediately rather than waiting out the first cycle.'),
 ('note', 'The file is a <b>settled snapshot</b>, not the live database \u2014 taken with SQLite\u2019s own '
          '<b>VACUUM INTO</b>, so a write landing mid-upload cannot produce a torn file, and unused pages are '
          'dropped so the attachment is as small as it can be. The new backup is posted <b>before</b> the old '
@@ -444,9 +449,21 @@ CONTENT = [
 ('aud','gm'),
 ('h2', 'The Server Weapon List'),
 ('p', 'Weapons players can pick from are kept as a server list, so names stay consistent.'),
-('code', [('/weapon add name:Gunlance', 'add one'),
-          ('/weapon list', 'see them all'),
+('code', [('/weapon add name:Gunlance atk:wis def:dex|con', 'add one, with its rules'),
+          ('/weapon stats name:Gunlance atk:wis', 'set or change them later'),
+          ('/weapon stats name:Gunlance atk:any', 'lift a restriction'),
+          ('/weapon list', 'see them all and what they allow'),
           ('/weapon remove name:Gunlance', 'take one off')]),
+('p', 'A weapon can dictate <b>which stats it fights with</b>, separately for attack and defence. A gunlance '
+      'is fired rather than swung, so it might attack with <b>WIS</b> and defend with <b>DEX</b> or '
+      '<b>CON</b>. Give several with <b>|</b> \u2014 <b>atk:str|dex</b> \u2014 and use <b>any</b> to lift a '
+      'restriction.'),
+('p', 'A player carrying that weapon is then held to it: attacking with a stat it does not allow is refused, '
+      'and the refusal names what they <i>can</i> use. <b>The auto-pilot obeys the same rules</b> \u2014 an NPC '
+      'fighting on automatic picks the best stat its weapons permit rather than always reaching for STR.'),
+('note', 'A weapon with nothing set restricts nothing, so a list that predates this carries on unchanged. '
+         'Carrying <b>one</b> unrestricted weapon frees the hand entirely; carrying two restricted ones lets '
+         'you use either weapon\u2019s stats.'),
 ('aud','all'),
 ('h2', 'Derived Stats'),
 ('p', 'Max HP is <b>CON plus a flat base</b>, 2 by default \u2014 so CON 10 gives 12 HP. A ' + GM + ' can change '

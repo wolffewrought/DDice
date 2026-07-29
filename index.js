@@ -27,6 +27,12 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_channel_id TEXT DEFAUL
 // The backup channel holds one file: the newest. This remembers which post that
 // is, so each backup can replace the last rather than piling up.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_msg_id TEXT'); } catch {}
+// setInterval starts counting from process start, so on a server that deploys
+// often the 24-hour timer never reached zero and no automatic backup ever ran.
+// The last run is stored instead, and checked shortly after boot — so the cycle
+// is a real day rather than a day of uninterrupted uptime.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_last INTEGER'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_hours INTEGER DEFAULT 24'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
 // Rest restore amounts. Stored as text tokens so GMs can use either form:
 //   "100%" = percentage of that resource's max   |   "3" = flat, set the value to exactly 3
@@ -43,6 +49,12 @@ try { db.exec("ALTER TABLE characters ADD COLUMN weapon2 TEXT DEFAULT NULL"); } 
 try { db.exec("ALTER TABLE characters ADD COLUMN weapon1emoji TEXT DEFAULT '⚔️'"); } catch {}
 try { db.exec("ALTER TABLE characters ADD COLUMN weapon2emoji TEXT DEFAULT '🗡️'"); } catch {}
 try { db.exec("CREATE TABLE IF NOT EXISTS weapons (guild_id TEXT NOT NULL, name TEXT NOT NULL, PRIMARY KEY (guild_id, name))"); } catch {}
+// What a weapon lets you fight with. Stored as pipe-separated stat keys, the
+// same shape activities use — empty means no restriction, which is what every
+// weapon on an existing server already is.
+try { db.exec('ALTER TABLE weapons ADD COLUMN atk_stats TEXT'); } catch {}
+try { db.exec('ALTER TABLE weapons ADD COLUMN def_stats TEXT'); } catch {}
+try { db.exec('ALTER TABLE weapons ADD COLUMN note TEXT'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN atk_mode TEXT DEFAULT 'normal'"); } catch {}
 try { db.exec('ALTER TABLE fights ADD COLUMN atk_sides INTEGER DEFAULT 20'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN def_mode TEXT DEFAULT 'normal'"); } catch {}
@@ -3348,12 +3360,21 @@ const slashCommands = [
     .setName('backup').setDescription('Database backup (GM only)')
     .addSubcommand(s=>s.setName('now').setDescription('Export the database to this channel'))
     .addSubcommand(s=>s.setName('auto').setDescription('Toggle daily automatic backups')
-      .addStringOption(o=>o.setName('channel').setDescription('Channel for backups (or type off to disable)').setRequired(true))),
+      .addStringOption(o=>o.setName('channel').setDescription('Channel for backups (or type off to disable)').setRequired(true))
+      .addIntegerOption(o=>o.setName('hours').setDescription('How often, in hours (default 24)').setRequired(false).setMinValue(1).setMaxValue(720))),
 
   new SlashCommandBuilder()
     .setName('weapon').setDescription('Manage the server weapon list (GM only)')
     .addSubcommand(s=>s.setName('add').setDescription('Add a weapon to the server list')
-      .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true)))
+      .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true))
+      .addStringOption(o=>o.setName('atk').setDescription('Stats it can attack with — e.g. wis, or str|dex. Blank = any').setRequired(false))
+      .addStringOption(o=>o.setName('def').setDescription('Stats it can defend with. Blank = any').setRequired(false))
+      .addStringOption(o=>o.setName('note').setDescription('How it handles, for the list').setRequired(false)))
+    .addSubcommand(s=>s.setName('stats').setDescription('Set or clear what a weapon can fight with (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true))
+      .addStringOption(o=>o.setName('atk').setDescription('Attack stats — e.g. wis, or str|dex. "any" clears it').setRequired(false))
+      .addStringOption(o=>o.setName('def').setDescription('Defence stats. "any" clears it').setRequired(false))
+      .addStringOption(o=>o.setName('note').setDescription('How it handles').setRequired(false)))
     .addSubcommand(s=>s.setName('remove').setDescription('Remove a weapon from the server list')
       .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true)))
     .addSubcommand(s=>s.setName('list').setDescription('List all server weapons')),
@@ -6473,8 +6494,47 @@ function parseNpcNames(str) {
 
 // Pick the stat an auto fighter rolls with — always the highest of STR/DEX,
 // for both attack and defence (ties go to STR).
-function autoFightStat(stats) {
-  return (stats.str ?? 0) >= (stats.dex ?? 0) ? 'str' : 'dex';
+// ── Weapon stat restrictions ─────────────────────────────────────────────────
+// A gunlance is fired, not swung: it may attack with WIS and defend with DEX.
+// A weapon with nothing set restricts nothing, so servers that never touch this
+// carry on exactly as before.
+function getWeaponRow(gid, name) {
+  if (!name) return null;
+  return db.prepare('SELECT * FROM weapons WHERE guild_id=? AND name=? COLLATE NOCASE').get(gid, String(name).trim());
+}
+const parseStatList = (v) => String(v || '').split('|').map(x => resolveStatWord(x)).filter(Boolean);
+
+// Which stats this fighter may use, given what they are carrying. Returns null
+// when nothing restricts them — a different answer from "an empty list", which
+// would mean they can do nothing at all.
+function allowedFightStats(gid, subject, kind) {
+  if (!subject) return null;
+  const col = kind === 'def' ? 'def_stats' : 'atk_stats';
+  const carried = [subject.weapon1, subject.weapon2].filter(Boolean);
+  if (!carried.length) return null;
+  const rows = carried.map(w => getWeaponRow(gid, w)).filter(Boolean);
+  if (!rows.length) return null;
+  // A weapon with no restriction set frees the hand holding it.
+  if (rows.some(r => !String(r[col] || '').trim())) return null;
+  const allowed = [...new Set(rows.flatMap(r => parseStatList(r[col])))];
+  return allowed.length ? allowed : null;
+}
+
+// The refusal, naming what they can use instead.
+function weaponStatRefusal(gid, subject, kind, stat) {
+  const allowed = allowedFightStats(gid, subject, kind);
+  if (!allowed || allowed.includes(stat)) return null;
+  const what = kind === 'def' ? 'defend' : 'attack';
+  const carried = [subject.weapon1, subject.weapon2].filter(Boolean).map(w => `**${w}**`).join(' and ');
+  return `❌ You can't ${what} with **${STAT_LABELS[stat] ?? stat.toUpperCase()}** carrying ${carried}.\n`
+    + `_Allowed: ${allowed.map(x => `**${STAT_LABELS[x]}**`).join(', ')}._`;
+}
+
+// The auto-pilot picks the best stat it is actually allowed to use, rather than
+// always reaching for STR or DEX.
+function autoFightStat(stats, allowed = null) {
+  const pool = (allowed && allowed.length) ? allowed : ['str', 'dex'];
+  return pool.reduce((best, k) => ((stats?.[k] ?? 0) > (stats?.[best] ?? 0) ? k : best), pool[0]);
 }
 // Roll a d20 + modifier, returning { nat, total }.
 function autoRoll(mod, adv = false) {
@@ -7400,7 +7460,8 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   const targetId = opponents[Math.floor(Math.random() * opponents.length)];
   const targetF = await resolveFighter(guild, gid, targetId);
 
-  const stat = autoFightStat(attacker.stats);
+  // The bot fights within the same rules a player does.
+  const stat = autoFightStat(attacker.stats, allowedFightStats(gid, pageSubject(gid, attackerId), 'atk'));
   const atkBonus = consumeAtkBonus(gid, cid, attackerId);
   const attRow = attacker.isNpc ? getNpc(gid, attacker.name) : getChar(gid, attackerId);
   const a = autoRoll((attacker.stats[stat] ?? 0) + atkBonus, hasSignatureAdvantage(attRow, stat));
@@ -7432,7 +7493,7 @@ async function autoNpcDefend(guild, gid, cid, channel) {
   if (fight.phase !== 'defend' || !isNpcFighter(fight.current_target)) return false;
 
   const defender = await resolveFighter(guild, gid, fight.current_target);
-  const stat = autoFightStat(defender.stats);
+  const stat = autoFightStat(defender.stats, allowedFightStats(gid, pageSubject(gid, fight.current_target), 'def'));
   const flat = consumeFlatDef(gid, cid, fight.current_target);
   const defRow = defender.isNpc ? getNpc(gid, defender.name) : getChar(gid, fight.current_target);
   const d = autoRoll(flat ? 0 : (defender.stats[stat] ?? 0), !flat && hasSignatureAdvantage(defRow, stat));
@@ -8062,7 +8123,8 @@ async function handleFight(interaction) {
       const defenderId = opponents[Math.floor(Math.random() * opponents.length)];
 
       const atkF = F[attackerId], defF = F[defenderId];
-      const aStat = autoFightStat(atkF.stats), dStat = autoFightStat(defF.stats);
+      const aStat = autoFightStat(atkF.stats, allowedFightStats(gid, pageSubject(gid, atkF.id), 'atk'));
+      const dStat = autoFightStat(defF.stats, allowedFightStats(gid, pageSubject(gid, defF.id), 'def'));
       // Consume carry-over effects: attacker's riposte bonus, defender's flat-d20.
       const atkBonus = fxState[attackerId]?.atkBonus ?? 0;
       const defFlat = !!fxState[defenderId]?.flatDef;
@@ -8268,6 +8330,11 @@ async function handleFight(interaction) {
     let mode = interaction.options.getString('roll') ?? 'normal';
 
     if (!targetUser && !targetNpc) return interaction.reply({ content: '❌ Pick a `target` (player) or `target_npc` (NPC) to attack.', ephemeral: true });
+    {
+      // What you are carrying decides what you can swing, shoot or brace with.
+      const refusal = weaponStatRefusal(gid, pageSubject(gid, actorId), 'atk', stat);
+      if (refusal) return interaction.reply({ content: refusal, ephemeral: true });
+    }
     if (targetUser && targetNpc) return interaction.reply({ content: '❌ Choose either a player target or an NPC target, not both.', ephemeral: true });
     const targetId = targetNpc ? npcFighterId(targetNpc) : targetUser.id;
 
@@ -8380,6 +8447,10 @@ async function handleFight(interaction) {
     let mode = interaction.options.getString('roll') ?? 'normal';
 
     const defender = await resolveFighter(interaction.guild, gid, defenderId);
+    {
+      const refusal = weaponStatRefusal(gid, pageSubject(gid, defenderId), 'def', stat);
+      if (refusal) return interaction.reply({ content: refusal, ephemeral: true });
+    }
     const statVal = defender.stats[stat] ?? 0;
     // A previous nat-1 attack forces this defence to be a flat d20 (no stat, no adv/dis).
     const flat = consumeFlatDef(gid, cid, defenderId);
@@ -9247,11 +9318,43 @@ async function handleWeapon(interaction) {
   if (!(await isGm(interaction.guild, uid)))
     return interaction.reply({ content: '❌ Only GMs can manage the weapon list.', ephemeral: true });
 
-  if (sub === 'add') {
-    const name = interaction.options.getString('name');
-    addWeapon(gid, name);
-    await interaction.reply({ content: `✅ **${name}** added to the weapon list. Menus updating...` });
-    registerSlashCommands(gid).catch(console.error);
+  if (sub === 'add' || sub === 'stats') {
+    const name = interaction.options.getString('name').trim();
+    if (sub === 'stats' && !getWeaponRow(gid, name))
+      return interaction.reply({ content: `❌ **${name}** isn't in the weapon list.`, ephemeral: true });
+    if (sub === 'add') addWeapon(gid, name);
+
+    // "any" (or an empty string) removes a restriction rather than setting one.
+    const fields = {};
+    for (const [opt, col] of [['atk', 'atk_stats'], ['def', 'def_stats']]) {
+      const raw = interaction.options.getString(opt);
+      if (raw === null) continue;
+      const t = raw.trim();
+      if (!t || /^(any|all|none|-)$/i.test(t)) { fields[col] = null; continue; }
+      const parsed = parseStatList(t);
+      const given = t.split('|').map(x => x.trim()).filter(Boolean);
+      if (parsed.length !== given.length) {
+        return interaction.reply({ ephemeral: true, content:
+          `❌ \`${t}\` isn't a stat list. Use one or more of str, con, dex, wis, lck separated by \`|\` — or \`any\` for no restriction.` });
+      }
+      fields[col] = parsed.join('|');
+    }
+    const note = interaction.options.getString('note');
+    if (note !== null) fields.note = note.trim() || null;
+    const keys = Object.keys(fields);
+    if (keys.length) {
+      db.prepare(`UPDATE weapons SET ${keys.map(k => `${k}=?`).join(',')} WHERE guild_id=? AND name=? COLLATE NOCASE`)
+        .run(...keys.map(k => fields[k]), gid, name);
+    }
+    const row = getWeaponRow(gid, name);
+    const say = (v, what) => v ? parseStatList(v).map(x => `**${STAT_LABELS[x]}**`).join(' / ') : `any (${what} unrestricted)`;
+    await interaction.reply({ content:
+      `✅ **${name}** ${sub === 'add' ? 'added to the weapon list' : 'updated'}.\n`
+      + `⚔️ Attacks with ${say(row?.atk_stats, 'attack')}\n`
+      + `🛡️ Defends with ${say(row?.def_stats, 'defence')}`
+      + (row?.note ? `\n_${row.note}_` : '')
+      + (sub === 'add' ? '\n_Menus updating…_' : '') });
+    if (sub === 'add') registerSlashCommands(gid).catch(console.error);
     return;
   }
   if (sub === 'remove') {
@@ -9264,9 +9367,16 @@ async function handleWeapon(interaction) {
     });
   }
   if (sub === 'list') {
-    const weapons = getWeapons(gid);
-    if (!weapons.length) return interaction.reply({ content: '❌ No weapons added yet. Use `/weapon add` to add one.', ephemeral: true });
-    return interaction.reply({ content: `**⚔️ Server Weapons:**\n${weapons.map(w=>`• ${w}`).join('\n')}` });
+    const rows = db.prepare('SELECT * FROM weapons WHERE guild_id=? ORDER BY name').all(gid);
+    if (!rows.length) return interaction.reply({ content: '❌ No weapons added yet. Use `/weapon add` to add one.', ephemeral: true });
+    const short = (v) => parseStatList(v).map(x => x.toUpperCase()).join('/');
+    const lines = ['**⚔️ Server weapons**', ''];
+    for (const w of rows) {
+      lines.push(`• **${w.name}** — ⚔️ ${w.atk_stats ? short(w.atk_stats) : 'any'} · 🛡️ ${w.def_stats ? short(w.def_stats) : 'any'}`
+        + (w.note ? `\n  _${w.note}_` : ''));
+    }
+    lines.push('', '_A GM sets these with `/weapon stats`. "any" means the weapon restricts nothing._');
+    return replyLong(interaction, lines);
   }
 }
 
@@ -9537,6 +9647,8 @@ async function handleBackup(interaction) {
       // there too — otherwise it comes back privately as a one-off copy.
       if (channelId) {
         const out = await publishBackup(interaction.client, gid, channelId, { reason: 'taken by a GM' });
+        // A fresh backup restarts the cycle — no point taking another an hour later.
+        setConfig(gid, { backup_last: Date.now() });
         return interaction.editReply({ content:
           `✅ Backup posted to <#${channelId}> (${(out.size / 1024).toFixed(1)} KB), replacing the previous one.\n${out.url}` });
       }
@@ -9558,34 +9670,71 @@ async function handleBackup(interaction) {
   if (sub === 'auto') {
     const raw = interaction.options.getString('channel');
     if (raw.toLowerCase() === 'off') {
-      setConfig(gid, { backup_channel_id: null });
-      return interaction.reply({ content: '✅ Daily automatic backups disabled.', ephemeral: true });
+      setConfig(gid, { backup_channel_id: null, backup_last: null });
+      return interaction.reply({ content: '✅ Automatic backups disabled. The last file is left where it is.', ephemeral: true });
     }
     const channelId = raw.replace(/[<#>]/g, '').trim();
+    const hours = interaction.options.getInteger('hours');
     // A new home means a new standing post — don't try to delete a message
     // that lives in a channel we're no longer watching.
-    setConfig(gid, { backup_channel_id: channelId, backup_msg_id: null });
-    return interaction.reply({ ephemeral: true, content:
-      `✅ Automatic backups enabled — posted to <#${channelId}> every 24 hours.\n`
-      + '_Each one deletes and replaces the last, so the channel holds only the newest._' });
+    setConfig(gid, { backup_channel_id: channelId, backup_msg_id: null,
+      ...(hours ? { backup_hours: hours } : {}) });
+    const every = backupInterval(getConfig(gid)) / 3600000;
+    await interaction.deferReply({ ephemeral: true });
+    // Post one now, so the channel has a backup from the moment it is set up
+    // rather than after the first full cycle.
+    try {
+      const out = await publishBackup(interaction.client, gid, channelId, { reason: 'backups switched on' });
+      setConfig(gid, { backup_last: Date.now() });
+      return interaction.editReply({ content:
+        `✅ Automatic backups enabled — <#${channelId}>, every **${every}h**.\n`
+        + `_Each one deletes and replaces the last, so the channel holds only the newest._\n`
+        + `First backup posted (${(out.size / 1024).toFixed(1)} KB): ${out.url}` });
+    } catch (err) {
+      setConfig(gid, { backup_last: Date.now() });
+      return interaction.editReply({ content:
+        `⚠️ Set to <#${channelId}> every **${every}h**, but the first backup failed: ${err.message}\n`
+        + '_Check I can see that channel and attach files there._' });
+    }
   }
 }
 
-// Daily automatic backup. Each run replaces the standing post rather than
-// adding to it, so the channel holds the newest file and nothing else.
+// Automatic backups. Each run replaces the standing post rather than adding to
+// it, so the channel holds the newest file and nothing else.
+//
+// The tick is short and the decision is made from a stored timestamp: a deploy
+// mid-cycle resumes where it left off instead of starting the count again, and
+// a server that redeploys hourly still gets its daily backup.
+const BACKUP_TICK_MS = 10 * 60 * 1000;
+const BACKUP_HOURS_DEFAULT = 24;
+
+function backupInterval(cfg) {
+  const h = Number(cfg?.backup_hours);
+  return (Number.isFinite(h) && h > 0 ? h : BACKUP_HOURS_DEFAULT) * 3600 * 1000;
+}
+
+async function backupTick() {
+  try {
+    if (!fs.existsSync(DB_PATH)) return;
+    const rows = db.prepare('SELECT * FROM guild_config WHERE backup_channel_id IS NOT NULL').all();
+    for (const row of rows) {
+      try {
+        const last = Number(row.backup_last) || 0;
+        // First run after enabling: start the clock rather than firing at once,
+        // since /backup auto already posts one immediately.
+        if (!last) { setConfig(row.guild_id, { backup_last: Date.now() }); continue; }
+        if (Date.now() - last < backupInterval(row)) continue;
+        await publishBackup(client, row.guild_id, row.backup_channel_id, { reason: 'scheduled backup' });
+        setConfig(row.guild_id, { backup_last: Date.now() });
+        console.log(`[backup] ${row.guild_id}: posted, previous removed`);
+      } catch (e) { console.error('Auto-backup failed for guild', row.guild_id, e.message); }
+    }
+  } catch (err) { console.error('Backup scheduler error:', err.message); }
+}
+
 function startBackupScheduler() {
-  setInterval(async () => {
-    try {
-      if (!fs.existsSync(DB_PATH)) return;
-      const rows = db.prepare('SELECT guild_id, backup_channel_id FROM guild_config WHERE backup_channel_id IS NOT NULL').all();
-      for (const row of rows) {
-        try {
-          await publishBackup(client, row.guild_id, row.backup_channel_id, { reason: 'daily automatic backup' });
-          console.log(`[backup] ${row.guild_id}: posted, previous removed`);
-        } catch (e) { console.error('Auto-backup failed for guild', row.guild_id, e.message); }
-      }
-    } catch (err) { console.error('Backup scheduler error:', err.message); }
-  }, 24 * 60 * 60 * 1000); // every 24 hours
+  setInterval(() => backupTick().catch(e => console.error('[backup] tick:', e?.message || e)), BACKUP_TICK_MS);
+  setTimeout(() => backupTick().catch(()=>{}), 2 * 60 * 1000);   // catch up on anything missed while down
 }
 
 // ─────────────────────────────────────────────
