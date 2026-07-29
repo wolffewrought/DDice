@@ -1957,7 +1957,10 @@ async function fetchDocsFingerprint(st) {
 // A token is optional and only needed for a private repository. With one, the
 // raw host will serve files it otherwise refuses.
 function docsHeaders() {
-  const h = { 'User-Agent': 'DDice-bot' };
+  // The raw host sits behind a CDN that will happily serve a few-minute-old
+  // copy. Asking it not to means a commit is seen when it lands rather than
+  // whenever the edge decides to expire.
+  const h = { 'User-Agent': 'DDice-bot', 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' };
   if (process.env.GITHUB_TOKEN) h.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
   return h;
 }
@@ -4832,7 +4835,11 @@ async function handleConfig(interaction) {
         { reason: push ? 'pushed by a GM' : 'settings changed', force: !!push });
       if (out.skipped === 'unchanged') {
         setConfig(gid, { docs_error: null, docs_checked_at: Date.now(), docs_result: 'nothing new' });
-        return interaction.editReply({ content: `📚 Already up to date. Watching \`${st.repo}\` → <#${st.channel}>.` });
+        return interaction.editReply({ content:
+          `📚 Already up to date — the files in \`${st.repo}\` are the same ones already posted in <#${st.channel}>.\n`
+          + '_If you have just committed new books, give the CDN a minute and try again. '
+          + 'If it keeps saying this, check the commit actually landed on '
+          + `\`${st.branch}\`${st.path ? ` under \`${st.path}/\`` : ' at the repository root'}._` });
       }
       const extra = out.playerUrl ? `\n📘 Player book posted quietly in <#${st.playerChannel}>.`
                   : out.playerError ? `\n⚠️ Player copy failed: ${out.playerError}` : '';
