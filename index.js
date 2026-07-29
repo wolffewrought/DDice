@@ -24,6 +24,9 @@ db.pragma('journal_mode = WAL');
 // ── Schema migrations ─────────────────────────────────────────────────────────
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_channel_id TEXT DEFAULT NULL'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_channel_id TEXT DEFAULT NULL'); } catch {}
+// The backup channel holds one file: the newest. This remembers which post that
+// is, so each backup can replace the last rather than piling up.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
 // Rest restore amounts. Stored as text tokens so GMs can use either form:
 //   "100%" = percentage of that resource's max   |   "3" = flat, set the value to exactly 3
@@ -105,6 +108,25 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_sha TEXT'); } catch {}
 // notification — so a reference channel stays current without nagging anyone.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_player_channel TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_player_msg_id TEXT'); } catch {}
+// Where the fallen are remembered, and the fact of a death itself. A dead
+// character keeps its whole record — the sheet, the deeds, the standing — so
+// the memorial can be rebuilt and a resurrection loses nothing.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN memorial_channel TEXT'); } catch {}
+// The GM copy carries the full account and the revive button; the public one is
+// the story without the bookkeeping. Both message ids are kept so a revival can
+// clear the pair.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN memorial_public_channel TEXT'); } catch {}
+try { db.exec('ALTER TABLE deaths ADD COLUMN public_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE deaths ADD COLUMN revived_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN died_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN died_at INTEGER'); } catch {}
+try { db.exec(`CREATE TABLE IF NOT EXISTS deaths (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL, subject_id TEXT NOT NULL, name TEXT NOT NULL,
+  order_name TEXT, rank_name TEXT, cause TEXT, quote TEXT, flavour TEXT,
+  deeds TEXT, merits INTEGER DEFAULT 0, renown INTEGER DEFAULT 0,
+  killed_by TEXT, at INTEGER NOT NULL, msg_id TEXT
+)`); } catch (e) { console.error('deaths schema', e); }
 // Who is running this one, how they run a table, and — for an instance — which
 // quest it was copied from. A quest row is a single party on a single clock, so
 // two GMs running the same adventure need two rows; instance_of ties them
@@ -1664,6 +1686,9 @@ async function runAutoRest(guild, sc) {
   const restored = [], skipped = [];
   for (const ch of sheets) {
     const name = await getDisplayName(guild, ch.user_id);
+    // The fallen do not recover. Healing them to full while still dead leaves a
+    // character in a state the rest of the bot can't read.
+    if (ch.died_at) continue;
     if (busy.has(ch.user_id)) { skipped.push(name); continue; }
     const updates = {};
     const hpR = resolveRestToken(sc.hp, maxHp(ch, gid), '0%', ch.hp_current ?? 0);
@@ -1729,6 +1754,94 @@ const GM_STYLES = {
   sandbox:   '🗺️ Sandbox — led by the players',
 };
 const gmStyleLabel = (k) => GM_STYLES[k] ?? null;
+
+// ── Death & memorial ─────────────────────────────────────────────────────────
+// A character's deeds are not written by hand — they are what the bot already
+// watched them do. Quests finished, merit earned and why, standing won, and the
+// dice they were remembered for.
+// Each deed is kept as { icon, text, detail, ledger }: `text` is what happened,
+// `detail` the figures behind it, and `ledger` marks the bookkeeping entries a
+// public memorial leaves out. Storing them apart is what lets the same record
+// be told plainly to a hall and in full to the GMs.
+function compileDeeds(gid, id) {
+  const out = [];
+  const quests = db.prepare(`SELECT quest_name, duration_ms FROM quest_summaries
+                             WHERE guild_id=? AND user_id=? ORDER BY ended_at`).all(gid, id);
+  for (const q of quests) {
+    out.push({ icon: '📜', text: `Saw **${q.quest_name}** through`, detail: fmtElapsed(q.duration_ms) });
+  }
+  const merits = db.prepare(`SELECT amount, reason FROM history
+                             WHERE guild_id=? AND kind='merit' AND user_id=? AND amount > 0
+                             ORDER BY amount DESC LIMIT 5`).all(gid, id);
+  for (const m of merits) if (m.reason) out.push({ icon: '🎖️', text: m.reason, detail: `**+${m.amount}** merit` });
+
+  const renown = db.prepare(`SELECT delta, reason FROM renown_log
+                             WHERE guild_id=? AND user_id=? AND delta > 0
+                             ORDER BY delta DESC LIMIT 3`).all(gid, id);
+  for (const r of renown) if (r.reason) out.push({ icon: '💠', text: r.reason, detail: `**+${r.delta}** renown` });
+
+  const t = rollTally(gid, id, 20);
+  if (t.total) {
+    out.push({ ledger: true, icon: '🎲', text: `Rolled **${t.total}** times`,
+      detail: `🌟 ${t.by[20] || 0} perfect, 💀 ${t.by[1] || 0} disastrous` });
+  }
+  const items = listItems(gid, id);
+  if (items.length) {
+    out.push({ ledger: true, icon: '🎒', text: `Carried ${items.map(i => `**${i.item}**`).join(', ')}` });
+  }
+  return out;
+}
+
+// How many times this character has been laid to rest and walked back.
+function deathCount(gid, id) {
+  const r = db.prepare(`SELECT COUNT(*) AS deaths, SUM(revived_at IS NOT NULL) AS revivals
+                        FROM deaths WHERE guild_id=? AND subject_id=?`).get(gid, id);
+  return { deaths: r?.deaths ?? 0, revivals: r?.revivals ?? 0 };
+}
+
+// One card for the fallen, whoever they were.
+// `publicView` tells the same life without the ledger: no merit or renown
+// totals, no dice, no inventory, and no figures or dates hanging off the deeds.
+// A hall should hear what someone did, not what they were worth.
+async function buildMemorial(guild, gid, id, rec, { publicView = false } = {}) {
+  const lines = [
+    '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+    `🕯️  **${rec.name}**${id.startsWith(NPC_PREFIX) ? ' 🎭' : ''}`,
+  ];
+  if (rec.order_name) lines.push(`${KNIGHT_EMOJIS[rec.order_name] ?? '⚪'}  ${rec.order_name}`);
+  if (rec.rank_name) lines.push(`🏅  ${rec.rank_name}`);
+  if (!publicView) lines.push(`🎖️ ${rec.merits ?? 0} merit${(rec.merits ?? 0) === 1 ? '' : 's'}  ·  💠 ${rec.renown ?? 0} renown`);
+  lines.push('─────────────────────────────');
+  if (rec.cause) lines.push(`⚰️ **Cause of death**`, rec.cause, '');
+
+  // Older records stored deeds as plain strings; read both shapes.
+  const raw = JSON.parse(rec.deeds || '[]');
+  const deeds = raw.map(d => typeof d === 'string' ? { icon: '•', text: d } : d)
+                   .filter(d => !(publicView && d.ledger));
+  lines.push(deeds.length ? '📖 **Deeds**' : '📖 **Deeds** — _none recorded._');
+  for (const d of deeds) {
+    lines.push(`${d.icon ?? '•'} ${d.text}${!publicView && d.detail ? ` — ${d.detail}` : ''}`);
+  }
+
+  if (rec.quote) lines.push('', `> *“${rec.quote}”*`);
+  if (rec.flavour) lines.push('', rec.flavour);
+  if (!publicView) lines.push('', `_Fell <t:${Math.floor(rec.at / 1000)}:D>._`);
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  return lines;
+}
+
+// The revive button, with the tally of how often this one has come back.
+function memorialButtons(gid, id, deathId) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  const { deaths, revivals } = deathCount(gid, id);
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`revive:${deathId}`).setLabel('Revive').setStyle(ButtonStyle.Success));
+  if (deaths > 1 || revivals > 0) {
+    row.addComponents(new ButtonBuilder().setCustomId('revivecount').setDisabled(true)
+      .setLabel(`Fallen ${deaths}× · revived ${revivals}×`).setStyle(ButtonStyle.Secondary));
+  }
+  return row;
+}
 
 // ── Command PDFs from GitHub ─────────────────────────────────────────────────
 // The three books are built outside the bot and committed to a repository. This
@@ -2010,6 +2123,7 @@ function upsertNpc(gid, name, fields) {
   return getNpc(gid, name);
 }
 function deleteNpc(gid, name) {
+  purgeSubjectRecords(gid, npcFighterId(name));
   db.prepare('DELETE FROM npcs WHERE guild_id=? AND name=?').run(gid, name);
 }
 function setNpcImage(gid, name, url) {
@@ -3021,6 +3135,17 @@ const slashCommands = [
       .addStringOption(o=>o.setName('value').setDescription('New value').setRequired(true))),
 
   new SlashCommandBuilder()
+    .setName('gmkill').setDescription('Mark a character as fallen and post their memorial (GM)')
+    .addUserOption(o=>o.setName('user').setDescription('The player whose character has fallen').setRequired(false))
+    .addStringOption(o=>o.setName('npc').setDescription('Or the NPC').setRequired(false))
+    .addBooleanOption(o=>o.setName('anyway').setDescription('true = kill even though they are still standing').setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName('gmrevive').setDescription('Bring a fallen character back (GM)')
+    .addUserOption(o=>o.setName('user').setDescription('The player').setRequired(false))
+    .addStringOption(o=>o.setName('npc').setDescription('Or the NPC').setRequired(false)),
+
+  new SlashCommandBuilder()
     .setName('gmtest').setDescription('Throwaway test data for trying features out (GM)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand(s=>s.setName('quest').setDescription('A ready-made quest with a party, so you can test the board and timer'))
@@ -3054,6 +3179,10 @@ const slashCommands = [
       .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored: 100%, 50%, a number, or 0%').setRequired(false))
       .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored: 100%, 50%, a number, or 0%').setRequired(false))
       .addChannelOption(o=>o.setName('channel').setDescription('Announce this schedule here (optional)').setRequired(false)))
+    .addSubcommand(s=>s.setName('memorial').setDescription('Where fallen characters are recorded and remembered')
+      .addChannelOption(o=>o.setName('channel').setDescription('GM record — the full account, with a Revive button').setRequired(false))
+      .addChannelOption(o=>o.setName('public').setDescription('Public hall — the story alone, no figures').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop posting memorials').setRequired(false)))
     .addSubcommand(s=>s.setName('docs').setDescription('Publish the command PDFs from GitHub into a GM channel')
       .addChannelOption(o=>o.setName('channel').setDescription('Where all three books live (GMs are pinged here)').setRequired(false))
       .addChannelOption(o=>o.setName('player_channel').setDescription('Where the player book alone goes — posted silently, no ping').setRequired(false))
@@ -3662,6 +3791,9 @@ async function handleMeritGive(interaction) {
   if (to.bot) return interaction.reply({ content: '❌ Pick a character, not a bot.', ephemeral: true });
   const mine = getChar(gid, from);
   if (!mine) return interaction.reply({ content: '❌ You need a character sheet first — `/char create`.', ephemeral: true });
+  // The fallen settle no debts. Receiving is allowed — an estate can still be
+  // paid into — but a dead character cannot hand their merit away.
+  if (mine.died_at) return interaction.reply({ content: '🕯️ Your character has fallen and can no longer trade. A GM can bring them back with `/gmrevive`.', ephemeral: true });
   if (!getChar(gid, to.id)) return interaction.reply({ content: `❌ **${await getDisplayName(interaction.guild, to.id)}** has no character sheet.`, ephemeral: true });
 
   // Checked now and again at approval — merit can be spent in between.
@@ -3715,7 +3847,14 @@ async function handleMeritTradeButton(interaction) {
   const fromName = await getDisplayName(interaction.guild, trade.from_user);
   const toName = await getDisplayName(interaction.guild, trade.to_user);
   // Re-check the balance: merit may have moved since the offer was made.
-  const have = getChar(gid, trade.from_user)?.merits ?? 0;
+  const sender = getChar(gid, trade.from_user);
+  if (sender?.died_at) {
+    db.prepare(`UPDATE merit_trades SET state='void', decided_by=?, decided_at=? WHERE guild_id=? AND id=? AND state='pending'`)
+      .run(interaction.user.id, Date.now(), gid, trade.id);
+    try { await interaction.message.edit({ content: `${interaction.message.content}\n\n⚠️ **Void** — ${fromName} has fallen.`, components: [] }); } catch {}
+    return interaction.reply({ content: `⚠️ **${fromName}** has fallen since offering this. The trade is void.` });
+  }
+  const have = sender?.merits ?? 0;
   if (have < trade.amount) {
     setMeritTrade(gid, trade.id, { state: 'void', decided_by: interaction.user.id, decided_at: Date.now() });
     try { await interaction.message.edit({ content: `${interaction.message.content}\n\n⚠️ **Void** — they no longer have the merit.`, components: [] }); } catch {}
@@ -3825,6 +3964,172 @@ async function handleNpcPages(interaction, sub) {
 // quest or an NPC they will then have to tidy out of the world.
 const GMTEST_PREFIX = '[test] ';
 
+// Resolve the target of a death or revival to a page subject.
+async function resolveMortal(interaction) {
+  const gid = interaction.guild.id;
+  const user = interaction.options.getUser('user');
+  const npcName = (interaction.options.getString('npc') || '').trim();
+  if (!!user === !!npcName) return { error: '❌ Name exactly one of `user` or `npc`.' };
+  if (user) {
+    const ch = getChar(gid, user.id);
+    if (!ch) return { error: `❌ <@${user.id}> has no character sheet.` };
+    return { id: user.id, subject: ch, name: await getDisplayName(interaction.guild, user.id) };
+  }
+  const npc = getNpc(gid, npcName);
+  if (!npc) return { error: `❌ No NPC called **${npcName}**.` };
+  return { id: npcFighterId(npc.name), subject: npc, name: npc.name };
+}
+
+async function handleGmKill(interaction) {
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can call a death.', ephemeral: true });
+  const t = await resolveMortal(interaction);
+  if (t.error) return interaction.reply({ content: t.error, ephemeral: true });
+  if (t.subject.died_at) return interaction.reply({ content: `❌ **${t.name}** has already fallen.`, ephemeral: true });
+
+  // A death normally follows being brought down. `anyway` covers the rest —
+  // execution, a story beat, a character written out while still standing.
+  const hp = t.subject.hp_current ?? 0;
+  if (hp > 0 && !interaction.options.getBoolean('anyway')) {
+    return interaction.reply({ ephemeral: true, content:
+      `❌ **${t.name}** is still on **${hp}** HP. Use \`anyway:true\` if they are to die regardless.` });
+  }
+
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+  const modal = new ModalBuilder().setCustomId(`gmkill:${t.id}`).setTitle(`The fall of ${t.name}`.slice(0, 45));
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('cause')
+      .setLabel('Cause of death').setPlaceholder('Cut down holding the north gate.')
+      .setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(500)),
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('quote')
+      .setLabel('Last words (optional)').setPlaceholder('Hold the line.')
+      .setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(200)),
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('flavour')
+      .setLabel('Epitaph (optional)').setPlaceholder('They never did learn to duck.')
+      .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000)),
+  );
+  return interaction.showModal(modal);
+}
+
+async function handleGmKillModal(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can call a death.', ephemeral: true });
+  const id = interaction.customId.split(':').slice(1).join(':');
+  const subject = pageSubject(gid, id);
+  if (!subject) return interaction.reply({ content: '❌ That character no longer exists.', ephemeral: true });
+  if (subject.died_at) return interaction.reply({ content: `❌ **${subject.displayName ?? subject.name}** has already fallen.`, ephemeral: true });
+
+  const isNpc = isNpcFighter(id);
+  const name = isNpc ? subject.name : await getDisplayName(interaction.guild, id);
+  const cause = cleanReason(interaction.fields.getTextInputValue('cause'));
+  const quote = cleanReason(interaction.fields.getTextInputValue('quote'));
+  const flavour = cleanReason(interaction.fields.getTextInputValue('flavour'));
+  const rank = rankProgress(gid, subject.merits ?? 0)?.current?.name ?? null;
+  const deeds = compileDeeds(gid, id);
+  const at = Date.now();
+
+  const info = db.prepare(`INSERT INTO deaths (guild_id,subject_id,name,order_name,rank_name,cause,quote,flavour,
+                            deeds,merits,renown,killed_by,at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(gid, id, name, subject.order_name ?? null, rank, cause, quote, flavour,
+         JSON.stringify(deeds), subject.merits ?? 0, subject.renown ?? 0, interaction.user.id, at);
+
+  // Mark them fallen. Nothing is deleted — the sheet, deeds and standing all
+  // remain, so a revival costs nothing and the memorial can be rebuilt.
+  if (isNpc) db.prepare('UPDATE npcs SET died_at=?, hp_current=0 WHERE guild_id=? AND name=?').run(at, gid, subject.name);
+  else upsertChar(gid, id, { died_at: at, hp_current: 0 });
+
+  const rec = db.prepare('SELECT * FROM deaths WHERE guild_id=? AND id=?').get(gid, info.lastInsertRowid);
+  const cfg = getConfig(gid) || {};
+  const gmChId = cfg.memorial_channel, pubChId = cfg.memorial_public_channel;
+
+  const gmLines = await buildMemorial(interaction.guild, gid, id, rec);
+  await interaction.reply({ content: `🕯️ **${name}** has fallen.`
+    + (gmChId ? ` Recorded in <#${gmChId}>.` : '') + (pubChId ? ` Remembered in <#${pubChId}>.` : '') });
+  if (!gmChId && !pubChId) {
+    return interaction.followUp({ ephemeral: true,
+      content: '⚠️ No memorial channel is set, so nothing was posted — `/config memorial channel:#gm-records public:#the-fallen`.\n\n'
+        + gmLines.join('\n') });
+  }
+
+  // The GM copy carries the full account and the means to undo it.
+  if (gmChId) {
+    try {
+      const ch = await interaction.client.channels.fetch(gmChId);
+      const chunks = chunkLines(gmLines);
+      let first = null;
+      for (const [i, c] of chunks.entries()) {
+        const last = i === chunks.length - 1;
+        const m = await ch.send({ content: c, allowedMentions: { parse: [] },
+          ...(last ? { components: [memorialButtons(gid, id, rec.id)] } : {}) });
+        if (i === 0) first = m;
+      }
+      if (first) db.prepare('UPDATE deaths SET msg_id=? WHERE guild_id=? AND id=?').run(first.id, gid, rec.id);
+    } catch (err) { console.error('[memorial] GM copy failed:', err?.message || err); }
+  }
+
+  // The public one is the story alone.
+  if (pubChId) {
+    try {
+      const ch = await interaction.client.channels.fetch(pubChId);
+      const pubLines = await buildMemorial(interaction.guild, gid, id, rec, { publicView: true });
+      const chunks = chunkLines(pubLines);
+      let first = null;
+      for (const [i, c] of chunks.entries()) {
+        const m = await ch.send({ content: c, allowedMentions: { parse: [] } });
+        if (i === 0) first = m;
+      }
+      if (first) db.prepare('UPDATE deaths SET public_msg_id=? WHERE guild_id=? AND id=?').run(first.id, gid, rec.id);
+    } catch (err) { console.error('[memorial] public copy failed:', err?.message || err); }
+  }
+}
+
+// Revive from the memorial itself: brings them back and clears both posts, so
+// the record of a death that was undone doesn't linger in the hall.
+async function handleReviveButton(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can bring someone back.', ephemeral: true });
+  const deathId = Number(interaction.customId.split(':')[1]);
+  const rec = db.prepare('SELECT * FROM deaths WHERE guild_id=? AND id=?').get(gid, deathId);
+  if (!rec) return interaction.reply({ content: '❌ That record has gone.', ephemeral: true });
+  if (rec.revived_at) return interaction.reply({ content: `❌ **${rec.name}** has already been brought back.`, ephemeral: true });
+
+  const subject = pageSubject(gid, rec.subject_id);
+  if (!subject) return interaction.reply({ content: '❌ That character no longer exists.', ephemeral: true });
+  const isNpc = isNpcFighter(rec.subject_id);
+  const max = isNpc ? maxHpFromCon(gid, subject.con) : maxHp(subject, gid);
+  if (isNpc) db.prepare('UPDATE npcs SET died_at=NULL, hp_current=? WHERE guild_id=? AND name=?').run(max, gid, subject.name);
+  else upsertChar(gid, rec.subject_id, { died_at: null, hp_current: max });
+  db.prepare('UPDATE deaths SET revived_at=? WHERE guild_id=? AND id=?').run(Date.now(), gid, deathId);
+
+  await interaction.reply({ content: `✨ **${rec.name}** walks again — back on **${max}** HP. Both memorials cleared.` });
+
+  const cfg = getConfig(gid) || {};
+  for (const [chId, msgId] of [[cfg.memorial_channel, rec.msg_id], [cfg.memorial_public_channel, rec.public_msg_id]]) {
+    if (!chId || !msgId) continue;
+    try {
+      const ch = await interaction.client.channels.fetch(chId);
+      const m = await ch.messages.fetch(msgId);
+      await m.delete();
+    } catch {}
+  }
+}
+
+async function handleGmRevive(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can bring someone back.', ephemeral: true });
+  const t = await resolveMortal(interaction);
+  if (t.error) return interaction.reply({ content: t.error, ephemeral: true });
+  if (!t.subject.died_at) return interaction.reply({ content: `❌ **${t.name}** is not dead.`, ephemeral: true });
+  const isNpc = isNpcFighter(t.id);
+  const max = isNpc ? maxHpFromCon(gid, t.subject.con) : maxHp(t.subject, gid);
+  if (isNpc) db.prepare('UPDATE npcs SET died_at=NULL, hp_current=? WHERE guild_id=? AND name=?').run(max, gid, t.subject.name);
+  else upsertChar(gid, t.id, { died_at: null, hp_current: max });
+  return interaction.reply({ content: `✨ **${t.name}** walks again — back on **${max}** HP. The memorial stands.` });
+}
+
 async function handleGmTest(interaction) {
   const gid = interaction.guild.id, uid = interaction.user.id;
   if (!(await isGm(interaction.guild, uid)))
@@ -3904,10 +4209,7 @@ async function handleGmTest(interaction) {
         }
       }
       for (const npcRow of npcs) {
-        const id = npcFighterId(npcRow.name);
-        db.prepare('DELETE FROM inventory WHERE guild_id=? AND user_id=?').run(gid, id);
-        db.prepare('DELETE FROM roll_tally WHERE guild_id=? AND user_id=?').run(gid, id);
-        db.prepare('DELETE FROM renown_log WHERE guild_id=? AND user_id=?').run(gid, id);
+        purgeSubjectRecords(gid, npcFighterId(npcRow.name));
         db.prepare('DELETE FROM npcs WHERE guild_id=? AND name=?').run(gid, npcRow.name);
       }
       return `🧪 Cleaned up ${quests.length} quest${quests.length === 1 ? '' : 's'} and ${npcs.length} NPC${npcs.length === 1 ? '' : 's'}.`;
@@ -4298,6 +4600,34 @@ async function handleConfig(interaction) {
       `${existing ? '✏️ Updated' : '🌙 Added'} recovery schedule:`, line(sc), '',
       'Everyone not on an in-progress quest is covered. Quest parties keep whatever they have until they finish.',
     ].join('\n') });
+  }
+
+  if (sub === 'memorial') {
+    const channel = interaction.options.getChannel('channel');
+    const pub = interaction.options.getChannel('public');
+    if (interaction.options.getBoolean('disable')) {
+      setConfig(gid, { memorial_channel: null, memorial_public_channel: null });
+      return interaction.reply({ content: '🕯️ Memorials will no longer be posted.' });
+    }
+    if (!channel && !pub) {
+      const cfg = getConfig(gid) || {};
+      const bits = [];
+      if (cfg.memorial_channel) bits.push(`📋 GM record in <#${cfg.memorial_channel}> — full account, with a Revive button.`);
+      if (cfg.memorial_public_channel) bits.push(`🕯️ Public hall in <#${cfg.memorial_public_channel}> — the story alone.`);
+      return interaction.reply({ ephemeral: true, content: bits.length ? bits.join('\n')
+        : '🕯️ No memorial channels set. `/config memorial channel:#gm-records public:#the-fallen`' });
+    }
+    const fields = {};
+    for (const [opt, key, what] of [[channel, 'memorial_channel', 'GM record'], [pub, 'memorial_public_channel', 'public hall']]) {
+      if (!opt) continue;
+      if (!opt.isTextBased?.()) return interaction.reply({ content: `❌ Pick a text channel or thread for the ${what}.`, ephemeral: true });
+      fields[key] = opt.id;
+    }
+    setConfig(gid, fields);
+    const out = [];
+    if (channel) out.push(`📋 The full account goes to <#${channel.id}>, with a Revive button.`);
+    if (pub) out.push(`🕯️ The fallen are remembered in <#${pub.id}> — no figures, no dice, no ledger.`);
+    return interaction.reply({ content: out.join('\n') });
   }
 
   if (sub === 'docs') {
@@ -5656,6 +5986,7 @@ client.on('interactionCreate', async interaction => {
   if (interaction.isModalSubmit?.()) {
     if (interaction.customId.startsWith('npcsay:')) return handleNpcSayModal(interaction);
     if (interaction.customId === 'loresubmit') return handleLoreSubmit(interaction);
+    if (interaction.customId.startsWith('gmkill:')) return handleGmKillModal(interaction);
     if (interaction.customId.startsWith('lorereject:')) return handleLoreRejectModal(interaction);
     if (interaction.customId.startsWith('traderej:')) return handleMeritTradeRejectModal(interaction);
     if (interaction.customId.startsWith('sheetreject:')) return handleSheetRejectModal(interaction);
@@ -5673,6 +6004,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.customId.startsWith('storygo:')) return handleStoryCarryOnButton(interaction);
     if (interaction.customId.startsWith('loreok:') || interaction.customId.startsWith('loreno:')) return handleLoreButton(interaction);
     if (interaction.customId.startsWith('tradeok:') || interaction.customId.startsWith('tradeno:')) return handleMeritTradeButton(interaction);
+    if (interaction.customId.startsWith('revive:')) return handleReviveButton(interaction);
     if (interaction.customId.startsWith('questapply:') || interaction.customId.startsWith('questwithdraw:')) {
       return handleQuestButton(interaction);
     }
@@ -5687,6 +6019,8 @@ client.on('interactionCreate', async interaction => {
 
   if (!interaction.isChatInputCommand()) return;
   try {
+    if (interaction.commandName === 'gmkill') return await handleGmKill(interaction);
+    if (interaction.commandName === 'gmrevive') return await handleGmRevive(interaction);
     if (interaction.commandName === 'gmtest') return await handleGmTest(interaction);
     if (interaction.commandName === 'renown') return await handleRenown(interaction);
     if (interaction.commandName === 'activity') return await handleStory(interaction);
@@ -6291,9 +6625,34 @@ function sheetApproved(gid, ch) {
   return ch.approval_state === 'approved';
 }
 // Guard for player actions that need a usable sheet. Returns an error string, or null.
+// Is this character out of the story? Asked by everything that would otherwise
+// let the fallen keep playing — rolls, quests, and scheduled recovery.
+// Everything that hangs off a character id. An NPC's id is derived from its
+// name, so without this a deleted "Cave Orc" would hand its inventory, dice,
+// standing and death count to the next NPC of the same name.
+function purgeSubjectRecords(gid, id) {
+  const counts = {};
+  for (const [table, col] of [['inventory', 'user_id'], ['roll_tally', 'user_id'],
+                              ['renown_log', 'user_id'], ['lore', 'user_id'],
+                              ['deaths', 'subject_id'], ['quest_members', 'user_id'],
+                              ['quest_summaries', 'user_id']]) {
+    try { counts[table] = db.prepare(`DELETE FROM ${table} WHERE guild_id=? AND ${col}=?`).run(gid, id).changes; }
+    catch { counts[table] = 0; }
+  }
+  try { counts.history = db.prepare('DELETE FROM history WHERE guild_id=? AND user_id=?').run(gid, id).changes; }
+  catch { counts.history = 0; }
+  return counts;
+}
+
+function isFallen(gid, id) {
+  return !!pageSubject(gid, id)?.died_at;
+}
+
 function sheetGate(gid, uid) {
   const ch = getChar(gid, uid);
   if (!ch) return null;                            // "no sheet" handled by callers
+  // The fallen take no more actions until a GM says otherwise.
+  if (ch.died_at) return '🕯️ Your character has fallen. A GM can bring them back with `/gmrevive`.';
   if (sheetApproved(gid, ch)) return null;         // single source of truth
   if (ch.approval_state === 'pending') return '⏳ Your character sheet is **awaiting GM approval** — you can\'t roll or fight until it\'s approved.';
   return '🚫 Your character sheet was **rejected** by a GM.'
@@ -8332,6 +8691,11 @@ async function handleFight(interaction) {
 }
 
 async function handleSlashRoll(interaction) {
+  {
+    // Every other roll path already refuses the fallen; this one was missed.
+    const gate0 = sheetGate(interaction.guild.id, interaction.user.id);
+    if (gate0) return interaction.reply({ content: gate0, ephemeral: true });
+  }
   const gid = interaction.guild.id;
   const uid = interaction.user.id;
   const rollType = interaction.options.getString('roll') ?? 'normal';
@@ -9114,6 +9478,48 @@ async function handleLastRoll(interaction) {
 //  BACKUP SYSTEM
 // ─────────────────────────────────────────────
 
+// Take a consistent snapshot. Attaching the live database risks a torn file if
+// a write lands mid-upload; VACUUM INTO writes a settled copy, and also drops
+// free pages so the attachment is as small as it can be. Falls back to a plain
+// copy on an older SQLite that lacks it.
+function snapshotDb() {
+  const out = path.join(require('os').tmpdir(), `ddice-snapshot-${Date.now()}.db`);
+  try {
+    db.exec(`VACUUM INTO '${out.replace(/'/g, "''")}'`);
+  } catch (err) {
+    console.error('[backup] VACUUM INTO unavailable, copying instead:', err?.message || err);
+    fs.copyFileSync(DB_PATH, out);
+  }
+  return out;
+}
+
+// Post the newest backup and remove the one before it, so the channel always
+// holds exactly one file. New goes up first — a failure part-way leaves the
+// previous backup in place rather than none at all.
+async function publishBackup(client, gid, channelId, { reason = 'automatic backup' } = {}) {
+  const { AttachmentBuilder } = require('discord.js');
+  const snap = snapshotDb();
+  try {
+    const size = fs.statSync(snap).size;
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    const ch = await client.channels.fetch(channelId);
+    const msg = await ch.send({
+      content: `🗄️ **Database backup** — ${reason}\n`
+        + `_${new Date().toUTCString()} · ${(size / 1024).toFixed(1)} KB. This replaces the previous backup._`,
+      files: [new AttachmentBuilder(snap, { name: `ddice-backup-${stamp}.db` })],
+      allowedMentions: { parse: [] },
+    });
+    const prev = getConfig(gid)?.backup_msg_id;
+    if (prev) {
+      try { const old = await ch.messages.fetch(prev); await old.delete(); } catch {}
+    }
+    setConfig(gid, { backup_msg_id: msg.id });
+    return { size, url: `https://discord.com/channels/${gid}/${ch.id}/${msg.id}` };
+  } finally {
+    try { fs.unlinkSync(snap); } catch {}
+  }
+}
+
 async function handleBackup(interaction) {
   const sub = interaction.options.getSubcommand();
   const gid = interaction.guild.id;
@@ -9124,19 +9530,29 @@ async function handleBackup(interaction) {
 
   if (sub === 'now') {
     await interaction.deferReply({ ephemeral: true });
+    if (!fs.existsSync(DB_PATH)) return interaction.editReply({ content: '❌ Database file not found.' });
+    const channelId = getConfig(gid)?.backup_channel_id;
     try {
+      // With a backup channel set, a manual backup replaces the standing one
+      // there too — otherwise it comes back privately as a one-off copy.
+      if (channelId) {
+        const out = await publishBackup(interaction.client, gid, channelId, { reason: 'taken by a GM' });
+        return interaction.editReply({ content:
+          `✅ Backup posted to <#${channelId}> (${(out.size / 1024).toFixed(1)} KB), replacing the previous one.\n${out.url}` });
+      }
       const { AttachmentBuilder } = require('discord.js');
-      const dbPath = DB_PATH;
-      const fs = require('fs');
-      if (!fs.existsSync(dbPath)) return interaction.editReply({ content: '❌ Database file not found.' });
-      const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
-      const attachment = new AttachmentBuilder(dbPath, { name: `ddice-backup-${stamp}.db` });
-      await interaction.editReply({ content: `✅ Database backup (${(fs.statSync(dbPath).size/1024).toFixed(1)} KB). Save this file somewhere safe.`, files: [attachment] });
+      const snap = snapshotDb();
+      try {
+        const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+        return await interaction.editReply({
+          content: `✅ Database backup (${(fs.statSync(snap).size / 1024).toFixed(1)} KB). Save this somewhere safe.\n`
+            + '_Set a channel with `/backup auto` and each backup will replace the last there._',
+          files: [new AttachmentBuilder(snap, { name: `ddice-backup-${stamp}.db` })] });
+      } finally { try { fs.unlinkSync(snap); } catch {} }
     } catch (err) {
       console.error('Backup error:', err);
       return interaction.editReply({ content: `❌ Backup failed: ${err.message}` });
     }
-    return;
   }
 
   if (sub === 'auto') {
@@ -9146,27 +9562,26 @@ async function handleBackup(interaction) {
       return interaction.reply({ content: '✅ Daily automatic backups disabled.', ephemeral: true });
     }
     const channelId = raw.replace(/[<#>]/g, '').trim();
-    setConfig(gid, { backup_channel_id: channelId });
-    return interaction.reply({ content: `✅ Daily automatic backups enabled — will post to <#${channelId}> every 24 hours.`, ephemeral: true });
+    // A new home means a new standing post — don't try to delete a message
+    // that lives in a channel we're no longer watching.
+    setConfig(gid, { backup_channel_id: channelId, backup_msg_id: null });
+    return interaction.reply({ ephemeral: true, content:
+      `✅ Automatic backups enabled — posted to <#${channelId}> every 24 hours.\n`
+      + '_Each one deletes and replaces the last, so the channel holds only the newest._' });
   }
 }
 
-// Daily automatic backup task
+// Daily automatic backup. Each run replaces the standing post rather than
+// adding to it, so the channel holds the newest file and nothing else.
 function startBackupScheduler() {
   setInterval(async () => {
     try {
-      const fs = require('fs');
-      const { AttachmentBuilder } = require('discord.js');
-      const dbPath = DB_PATH;
-      if (!fs.existsSync(dbPath)) return;
+      if (!fs.existsSync(DB_PATH)) return;
       const rows = db.prepare('SELECT guild_id, backup_channel_id FROM guild_config WHERE backup_channel_id IS NOT NULL').all();
       for (const row of rows) {
         try {
-          const ch = await client.channels.fetch(row.backup_channel_id);
-          if (!ch) continue;
-          const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
-          const attachment = new AttachmentBuilder(dbPath, { name: `ddice-backup-${stamp}.db` });
-          await ch.send({ content: `🗄️ Daily automatic backup — ${new Date().toUTCString()}`, files: [attachment] });
+          await publishBackup(client, row.guild_id, row.backup_channel_id, { reason: 'daily automatic backup' });
+          console.log(`[backup] ${row.guild_id}: posted, previous removed`);
         } catch (e) { console.error('Auto-backup failed for guild', row.guild_id, e.message); }
       }
     } catch (err) { console.error('Backup scheduler error:', err.message); }
@@ -9233,7 +9648,10 @@ async function handleGmHeal(interaction) {
 
     if (scope === 'players' || scope === 'all') {
       const sheets = db.prepare('SELECT * FROM characters WHERE guild_id=?').all(gid);
+      let fallenSkipped = 0;
       for (const ch of sheets) {
+        // A heal is not a resurrection — that needs /gmrevive and a decision.
+        if (ch.died_at) { fallenSkipped++; continue; }
         const nm = await getDisplayName(interaction.guild, ch.user_id);
         const bits = [];
         if (restore === 'hp' || restore === 'all') {
@@ -9261,6 +9679,7 @@ async function handleGmHeal(interaction) {
         return interaction.editReply({ content: '❌ NPCs only have HP — use `restore:HP only`.' });
       }
       for (const npc of getAllNpcs(gid)) {
+        if (npc.died_at) { fallenSkipped++; continue; }
         const max = maxHpFromCon(gid, npc.con), before = npc.hp_current ?? 0, after = compute(before, max);
         setFighterHp(gid, npcFighterId(npc.name), after);
         npcs++;
@@ -9268,11 +9687,14 @@ async function handleGmHeal(interaction) {
       }
     }
 
-    if (!lines.length) return interaction.editReply({ content: '❌ Nothing to restore — no sheets or NPCs on this server.' });
+    if (!lines.length) return interaction.editReply({ content: fallenSkipped
+      ? `❌ Nothing to restore — the only characters here have fallen. \`/gmrevive\` brings one back.`
+      : '❌ Nothing to restore — no sheets or NPCs on this server.' });
     const what = scope === 'players' ? `${players} player${players === 1 ? '' : 's'}`
                : scope === 'npcs' ? `${npcs} NPC${npcs === 1 ? '' : 's'}`
                : `${players} player${players === 1 ? '' : 's'} and ${npcs} NPC${npcs === 1 ? '' : 's'}`;
     const head = `✨ **Restored ${what}** — ${amount === 'full' ? 'to full' : amount === 'half' ? 'to half' : `${amount} ${value}`}`
+      + (fallenSkipped ? ` _(${fallenSkipped} fallen left as they are)_` : '')
       + (restore === 'all' ? ' (HP, rerolls and heal charges)' : restore === 'hp' ? ' (HP)' : ` (${restore})`);
     return replyLong(interaction, [head, '', ...lines]);
   }
@@ -9823,6 +10245,10 @@ async function handleQuest(interaction) {
     const quest = await requireQuest(interaction, gid);
     if (!quest) return;
     const number = quest.number;
+    // Withdrawing is always allowed — a fallen character should still be able to
+    // come off a roster. Signing up for new work is not.
+    if (sub === 'apply' && isFallen(gid, uid))
+      return interaction.reply({ content: '🕯️ Your character has fallen and cannot take on new work. A GM can bring them back with `/gmrevive`.', ephemeral: true });
     const res = sub === 'apply' ? await questApply(interaction.guild, quest, uid) : await questWithdraw(interaction.guild, quest, uid);
     if (res.error) return interaction.reply({ content: res.error, ephemeral: true });
     await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, number));
@@ -9897,6 +10323,11 @@ async function handleQuest(interaction) {
     const force = interaction.options.getBoolean('force') ?? false;
     const party = getQuestMembers(gid, number, 'party');
     if (party.includes(target.id)) return interaction.reply({ content: 'They\'re already on the party.', ephemeral: true });
+    // A GM can still do it — but knowingly, not by forgetting.
+    if (isFallen(gid, target.id) && !force) {
+      return interaction.reply({ ephemeral: true, content:
+        `🕯️ **${await getDisplayName(interaction.guild, target.id)}** has fallen. Bring them back with \`/gmrevive\`, or re-run with \`force:true\` if they are joining as a ghost.` });
+    }
     if (quest.party_size && quest.party_hard && party.length >= quest.party_size && !force) {
       return interaction.reply({ content: `❌ Party is at the hard cap (${quest.party_size}). Re-run with \`force:true\` to override.`, ephemeral: true });
     }

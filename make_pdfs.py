@@ -423,9 +423,19 @@ CONTENT = [
 ('code', [('/help', 'overview of all command groups'),
           ('/help category:dice', 'detail on a specific group'),
           ('/lastroll', 'recall your last roll in this channel'),
-          ('/backup now', 'export the database to this channel — ' + GM, 'gm'),
-          ('/backup auto channel:#backups', 'daily automatic backups — ' + GM, 'gm')]),
+          ('/backup now', 'take one immediately \u2014 ' + GM, 'gm'),
+          ('/backup auto channel:#backups', 'daily automatic backups \u2014 ' + GM, 'gm'),
+          ('/backup auto channel:off', 'stop them \u2014 ' + GM, 'gm')]),
 ('aud','gm'),
+('h2', 'Backups'),
+('p', 'With a channel set, the database is posted there <b>every 24 hours</b> \u2014 and each backup '
+      '<b>deletes and replaces the last</b>, so the channel holds exactly one file: the newest. '
+      '<b>/backup now</b> takes one on demand and replaces the standing post the same way; with no channel '
+      'set it comes back to you privately as a one-off copy instead.'),
+('note', 'The file is a <b>settled snapshot</b>, not the live database \u2014 taken with SQLite\u2019s own '
+         '<b>VACUUM INTO</b>, so a write landing mid-upload cannot produce a torn file, and unused pages are '
+         'dropped so the attachment is as small as it can be. The new backup is posted <b>before</b> the old '
+         'one is removed, so a failure part-way leaves the previous file in place rather than none at all.'),
 ('note', 'Destructive actions (/npc delete, /fight end, /quest delete, /weapon remove) ask for '
          'Confirm / Cancel before running.'),
 ('aud','all'),
@@ -813,6 +823,31 @@ CONTENT = [
           ('/npc categorydelete name:Bandits', 'remove the grouping')]),
 ('note', 'Everything above also works on <b>/pr</b>, which is the same command under a shorter name for use '
          'mid-scene.'),
+
+('sec', 'The Fallen'),
+('p', 'When a character is brought to 0 HP they are down, not gone \u2014 whether that is the end is the '
+      + GM + '\u2019s call. <b>/gmkill</b> makes it final and writes them up.'),
+('code', [('/config memorial channel:#gm-records public:#the-fallen', 'both halves'),
+          ('/gmkill user:@player', 'call it, once they are down'),
+          ('/gmkill npc:Cave Orc', 'NPCs too'),
+          ('/gmkill user:@player anyway:true', 'even while still standing'),
+          ('/gmrevive user:@player', 'bring them back')]),
+('p', 'It asks for a <b>cause of death</b>, optional <b>last words</b> and an optional <b>epitaph</b>. '
+      'Everything else is already known: their name, order, rank at the moment they fell, merit, renown \u2014 '
+      'and their <b>deeds</b>, which are not typed out but gathered from what the bot watched them do. Quests '
+      'seen through and how long each took, the merit they earned and what for, the standing they won, the '
+      'dice of a lifetime, and what they were carrying at the end.'),
+('p', 'It is written up <b>twice</b>. The <b>GM record</b> carries the full account \u2014 merit, renown, the '
+      'dice of a lifetime, what they carried, when they fell \u2014 with a <b>Revive</b> button attached. The '
+      '<b>public hall</b> gets the same life told plainly: name, order, rank, cause, deeds, last words and '
+      'epitaph, and <b>no figures at all</b>. No merit or renown totals, no roll history, no inventory, no '
+      'dates hanging off the deeds. A hall should hear what someone did, not what they were worth.'),
+('p', 'Pressing <b>Revive</b> brings them back at full HP and <b>deletes both posts</b> \u2014 a death that was '
+      'undone does not linger in the hall. If the same character falls again, the button carries a tally '
+      'beside it: <b>Fallen 3\u00d7 \u00b7 revived 2\u00d7</b>.'),
+('note', 'Nothing is deleted from the character. A fallen one keeps their whole record, so a revival costs '
+         'nothing and the account can be rebuilt. Until they are brought back they cannot roll: the fallen '
+         'take no more actions.'),
 
 ('sec', 'Publishing These Books'),
 ('p', 'The three books are built outside the bot and committed to a repository. Point the bot at that '
