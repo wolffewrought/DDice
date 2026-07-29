@@ -128,6 +128,11 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_branch TEXT'); } catch {
 try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_path TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_sha TEXT'); } catch {}
+// The last thing that went wrong, so a repeated failure is reported once rather
+// than every quarter of an hour — and so it is reported at all. Logging to the
+// console meant a misconfigured repo failed silently for anyone not reading
+// Railway's output.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_error TEXT'); } catch {}
 // A second home for the player book alone, posted quietly — no ping, no
 // notification — so a reference channel stays current without nagging anyone.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_player_channel TEXT'); } catch {}
@@ -1915,31 +1920,48 @@ function docsSettings(gid) {
 }
 const docFileUrl = (st, file) =>
   `https://raw.githubusercontent.com/${st.repo}/${st.branch}/${st.path ? st.path + '/' : ''}${file}`;
-const docApiUrl = (st, file) =>
-  `https://api.github.com/repos/${st.repo}/contents/${st.path ? st.path + '/' : ''}${file}?ref=${encodeURIComponent(st.branch)}`;
 
 // A fingerprint of the three files as they currently stand on GitHub. Uses the
 // contents API rather than downloading, so a poll that finds nothing new costs
 // three small requests instead of half a megabyte.
+// A fingerprint of the three files as they currently stand.
+//
+// This deliberately avoids GitHub's REST API. That is rate-limited to 60 calls
+// an hour per IP unauthenticated, and a Railway container shares its outbound
+// address with other tenants — so the budget is often already spent by someone
+// else and every check comes back 403. The raw CDN has no such limit, and a
+// HEAD gives us an ETag that changes exactly when the file does.
 async function fetchDocsFingerprint(st) {
   const parts = [];
   for (const file of DOC_FILES) {
-    const res = await fetch(docApiUrl(st, file), {
-      headers: { 'Accept': 'application/vnd.github+json', 'User-Agent': 'DDice-bot' },
-    });
-    if (!res.ok) throw new Error(`${file}: GitHub returned ${res.status}`);
-    const json = await res.json();
-    if (!json?.sha) throw new Error(`${file}: no version returned`);
-    parts.push(`${file}:${json.sha}`);
+    const url = docFileUrl(st, file);
+    const res = await fetch(url, { method: 'HEAD', headers: docsHeaders() });
+    if (!res.ok) {
+      throw new Error(res.status === 404
+        ? `${file}: not found at ${st.repo}/${st.branch}${st.path ? '/' + st.path : ''} — check the branch, path and that the file is committed`
+        : `${file}: GitHub returned ${res.status}`);
+    }
+    // ETag is what we want; fall back to the length so a mirror without one
+    // still detects a change rather than never updating.
+    const tag = res.headers.get('etag') || res.headers.get('last-modified') || res.headers.get('content-length');
+    parts.push(`${file}:${tag ?? '?'}`);
   }
   return parts.join('|');
+}
+
+// A token is optional and only needed for a private repository. With one, the
+// raw host will serve files it otherwise refuses.
+function docsHeaders() {
+  const h = { 'User-Agent': 'DDice-bot' };
+  if (process.env.GITHUB_TOKEN) h.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  return h;
 }
 
 async function fetchDocFiles(st, only = DOC_FILES) {
   const { AttachmentBuilder } = require('discord.js');
   const files = [];
   for (const file of only) {
-    const res = await fetch(docFileUrl(st, file), { headers: { 'User-Agent': 'DDice-bot' } });
+    const res = await fetch(docFileUrl(st, file), { headers: docsHeaders() });
     if (!res.ok) throw new Error(`${file}: download returned ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
     if (!buf.length) throw new Error(`${file}: downloaded nothing`);
@@ -2003,12 +2025,35 @@ async function publishDocs(client, guild, { reason = 'a new build', force = fals
 function startDocsWatch(client) {
   const tick = async () => {
     for (const guild of client.guilds.cache.values()) {
+      const st = docsSettings(guild.id);
+      if (!st.channel || !st.repo) continue;
       try {
-        const st = docsSettings(guild.id);
-        if (!st.channel || !st.repo) continue;
         const out = await publishDocs(client, guild);
         if (out.posted) console.log(`[docs] ${guild.id}: published a new build`);
-      } catch (err) { console.error('[docs] check failed for', guild.id, '-', err?.message || err); }
+        // Recovered — say so if we had complained.
+        if (getConfig(guild.id)?.docs_error) {
+          setConfig(guild.id, { docs_error: null });
+          try {
+            const ch = await client.channels.fetch(st.channel);
+            await ch.send('📚 _Reading the command books again — whatever was wrong has cleared._');
+          } catch {}
+        }
+      } catch (err) {
+        const msg = err?.message || String(err);
+        console.error('[docs] check failed for', guild.id, '-', msg);
+        // Tell the channel once per distinct problem, not every 15 minutes.
+        if (getConfig(guild.id)?.docs_error === msg) continue;
+        setConfig(guild.id, { docs_error: msg });
+        try {
+          const ch = await client.channels.fetch(st.channel);
+          await ch.send({ allowedMentions: { parse: [] }, content:
+            `⚠️ **Can't fetch the command books** from \`${st.repo}\` (${st.branch}${st.path ? `, /${st.path}` : ''}).\n`
+            + `\`${msg}\`\n`
+            + '_I will keep trying every 15 minutes and say so when it works. '
+            + 'Check the repository is public, the branch and path are right, and the PDFs are committed. '
+            + 'For a private repository, set a `GITHUB_TOKEN` on the host._' });
+        } catch {}
+      }
     }
   };
   setInterval(tick, DOCS_POLL_MS);
@@ -4766,6 +4811,7 @@ async function handleConfig(interaction) {
       return interaction.reply({ ephemeral: true, content:
         `📚 Watching \`${st.repo}\` (${st.branch}${st.path ? `, /${st.path}` : ''}) → <#${st.channel}>, checked every 15 minutes.\n`
         + (st.playerChannel ? `📘 Player book also posted quietly in <#${st.playerChannel}>.\n` : '')
+        + (getConfig(gid)?.docs_error ? `⚠️ Last check failed: \`${getConfig(gid).docs_error}\`\n` : '')
         + (st.msgId ? `Current post: https://discord.com/channels/${gid}/${st.channel}/${st.msgId}` : '_Nothing posted yet._') });
     }
 
@@ -4778,6 +4824,7 @@ async function handleConfig(interaction) {
       }
       const extra = out.playerUrl ? `\n📘 Player book posted quietly in <#${st.playerChannel}>.`
                   : out.playerError ? `\n⚠️ Player copy failed: ${out.playerError}` : '';
+      setConfig(gid, { docs_error: null });
       return interaction.editReply({ content: `📚 Published to <#${st.channel}> and the GMs pinged.\n${out.url}${extra}` });
     } catch (err) {
       return interaction.editReply({ content:

@@ -461,9 +461,30 @@ CONTENT = [
 ('p', 'A player carrying that weapon is then held to it: attacking with a stat it does not allow is refused, '
       'and the refusal names what they <i>can</i> use. <b>The auto-pilot obeys the same rules</b> \u2014 an NPC '
       'fighting on automatic picks the best stat its weapons permit rather than always reaching for STR.'),
+('p', '<b>NPCs carry weapons too.</b> Give one on <b>/npc create</b> and the auto-pilot is bound by exactly '
+      'the same rules \u2014 an NPC with a gunlance fires with WIS instead of reaching for its best raw stat. '
+      'The slot only accepts weapons already on the server list, so an NPC can never hold something whose '
+      'rules are unknown; <b>none</b> clears it, and omitting it leaves whatever they carry alone.'),
+('code', [('/npc create name:Vault Warden str:6 con:5 \\\n  weapon1:Gunlance', 'an armed NPC'),
+          ('/npc create name:Vault Warden atk_stat:Dexterity', 'and how it should fight on auto'),
+          ('/npc sheet name:Vault Warden', 'shows what it carries and what that allows')]),
+('h2', 'Choosing How Auto Fights'),
+('p', 'Left alone, the auto-pilot reaches for whichever stat is <b>highest</b>. A character who fights with '
+      'finesse over force can say otherwise \u2014 and so can a ' + GM + ' setting up an NPC.'),
+('aud','all'),
+('code', [('/char prefer atk:Dexterity def:Constitution', 'your own, for when auto rolls for you'),
+          ('/char prefer', 'see what is set'),
+          ('/char prefer atk:Clear it', 'go back to using your best')]),
+('p', 'This matters to players as well as ' + GM + 's: <b>/fight auto</b> in full mode rolls for '
+      '<b>everyone</b> in the fight, so without a preference your character swings with their strongest '
+      'arm whether that suits them or not.'),
+('note', 'A preference <b>never overrides a weapon</b>. If what you asked for is not one of the stats your '
+         'weapons allow, your best allowed stat is used instead and <b>/char prefer</b> tells you so \u2014 '
+         'setting one can only ever narrow a free choice, never break a rule.'),
+('aud','gm'),
 ('note', 'A weapon with nothing set restricts nothing, so a list that predates this carries on unchanged. '
          'Carrying <b>one</b> unrestricted weapon frees the hand entirely; carrying two restricted ones lets '
-         'you use either weapon\u2019s stats.'),
+         'you use either weapon\u2019s stats. An unarmed NPC is unrestricted, exactly as before.'),
 ('aud','all'),
 ('h2', 'Derived Stats'),
 ('p', 'Max HP is <b>CON plus a flat base</b>, 2 by default \u2014 so CON 10 gives 12 HP. A ' + GM + ' can change '
