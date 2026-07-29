@@ -280,6 +280,13 @@ CONTENT = [
       'waiting, or why it was turned down. Rewriting retires the old request and sends a fresh one.'),
 ('note', 'Nothing here is required. A character works perfectly well with an empty inventory, no lore and no '
          'renown \u2014 these are for tables that want to track more.'),
+('h2', 'Is My Sheet Ready?'),
+('p', 'Rather than finding out one refusal at a time, ask.'),
+('code', [('/char check', 'the whole checklist at once')]),
+('p', 'It shows your stats against the point allowance and how far off you are, whether both weapons are '
+      'named, whether both emojis are chosen, and then whether the sheet is ready to send, already with a '
+      + GM + ', or approved.'),
+
 ('h2', 'Your Roll Card'),
 ('p', 'How much of your sheet appears when you roll is up to you.'),
 ('code', [('/profile card style:Full        /p card style:Full', 'the whole sheet'),
@@ -461,11 +468,14 @@ CONTENT = [
 ('p', 'A player carrying that weapon is then held to it: attacking with a stat it does not allow is refused, '
       'and the refusal names what they <i>can</i> use. <b>The auto-pilot obeys the same rules</b> \u2014 an NPC '
       'fighting on automatic picks the best stat its weapons permit rather than always reaching for STR.'),
+('p', 'An NPC can also take a <b>class</b> \u2014 optional, and the same four players use. A <b>Hero</b> NPC '
+      'gets a signature stat with advantage on it, which makes for a decent boss. <b>Clear it</b> removes '
+      'one, and it shows on their sheet and their fight card.'),
 ('p', '<b>NPCs carry weapons too.</b> Give one on <b>/npc create</b> and the auto-pilot is bound by exactly '
       'the same rules \u2014 an NPC with a gunlance fires with WIS instead of reaching for its best raw stat. '
       'The slot only accepts weapons already on the server list, so an NPC can never hold something whose '
       'rules are unknown; <b>none</b> clears it, and omitting it leaves whatever they carry alone.'),
-('code', [('/npc create name:Vault Warden str:6 con:5 \\\n  weapon1:Gunlance', 'an armed NPC'),
+('code', [('/npc create name:Vault Warden str:6 con:5 \\\n  weapon1:Gunlance class:Defender', 'an armed NPC with a class'),
           ('/npc create name:Vault Warden atk_stat:Dexterity', 'and how it should fight on auto'),
           ('/npc sheet name:Vault Warden', 'shows what it carries and what that allows')]),
 ('h2', 'Choosing How Auto Fights'),
@@ -908,6 +918,13 @@ CONTENT = [
          'with a copy rather than none at all. The repository must be public, and the three files must be '
          'named <b>DDice-Commands-GameMaster.pdf</b>, <b>DDice-Commands-Player.pdf</b> and '
          '<b>DDice-Commands-Parchment.pdf</b>.'),
+
+('sec', 'The Queue'),
+('p', 'Everything waiting on a decision, in one place \u2014 character sheets, lore, merit trades and quest '
+      'applicants, with jump links to each. It also surfaces any background job that is failing.'),
+('code', [('/gmqueue', 'what is waiting')]),
+('note', 'Pending lore had no listing anywhere else, so a submission whose queue post was deleted was '
+         'effectively invisible. This finds it.'),
 
 ('sec', 'Test Tools'),
 ('p', 'Trying a feature out usually means inventing a quest or an NPC you then have to tidy out of the world. '

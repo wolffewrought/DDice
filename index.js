@@ -33,6 +33,13 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_msg_id TEXT'); } catch
 // is a real day rather than a day of uninterrupted uptime.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_last INTEGER'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_hours INTEGER DEFAULT 24'); } catch {}
+// The last error each background job reported, so a repeated failure is
+// announced once rather than every cycle. A table rather than a column per job,
+// because job names carry spaces and brackets and there is one per schedule.
+try { db.exec(`CREATE TABLE IF NOT EXISTS job_failures (
+  guild_id TEXT NOT NULL, job TEXT NOT NULL, message TEXT, at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, job)
+)`); } catch (e) { console.error('job_failures schema', e); }
 try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
 // Rest restore amounts. Stored as text tokens so GMs can use either form:
 //   "100%" = percentage of that resource's max   |   "3" = flat, set the value to exactly 3
@@ -1789,8 +1796,12 @@ function startAutoRest(client) {
           if (Date.now() < last + hours * 3600 * 1000) continue;
           const result = await runAutoRest(guild, sc);
           await announceAutoRest(guild, sc, result);
+          await reportJobRecovered(client, guild.id, sc?.channel || null, `Scheduled recovery (${sc?.name ?? '?'})`);
           console.log(`[autorest] ${guild.id}/${sc.name}: restored ${result.restored.length}, skipped ${result.skipped.length}`);
-        } catch (err) { console.error('[autorest] tick failed for', guild.id, sc?.name, '-', err?.message || err); }
+        } catch (err) {
+          console.error('[autorest] tick failed for', guild.id, sc?.name, '-', err?.message || err);
+          await reportJobFailure(client, guild.id, sc?.channel || null, `Scheduled recovery (${sc?.name ?? '?'})`, err);
+        }
       }
     }
   };
@@ -3235,6 +3246,9 @@ const slashCommands = [
       .addStringOption(o=>o.setName('value').setDescription('New value').setRequired(true))),
 
   new SlashCommandBuilder()
+    .setName('gmqueue').setDescription('Everything waiting on a GM, in one place'),
+
+  new SlashCommandBuilder()
     .setName('gmkill').setDescription('Mark a character as fallen and post their memorial (GM)')
     .addUserOption(o=>o.setName('user').setDescription('The player whose character has fallen').setRequired(false))
     .addStringOption(o=>o.setName('npc').setDescription('Or the NPC').setRequired(false))
@@ -3364,6 +3378,7 @@ const slashCommands = [
           {name:'🦉 Wisdom (WIS)',value:'wis'},
           {name:'🍀 Luck (LCK)',value:'lck'})))
     .addSubcommand(s=>s.setName('submit').setDescription('Send your sheet to the GMs for approval again'))
+    .addSubcommand(s=>s.setName('check').setDescription('What is left before your sheet can go to a GM'))
     .addSubcommand(s=>s.setName('prefer').setDescription('Which stats the bot should use when it rolls for you on auto')
       .addStringOption(o=>o.setName('atk').setDescription('Attack with').setRequired(false)
         .addChoices({name:'💪 Strength',value:'str'},{name:'🫀 Constitution',value:'con'},{name:'⚡ Dexterity',value:'dex'},
@@ -3498,6 +3513,10 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('con').setDescription('Constitution').setRequired(false))
       .addIntegerOption(o=>o.setName('dex').setDescription('Dexterity').setRequired(false))
       .addIntegerOption(o=>o.setName('wis').setDescription('Wisdom').setRequired(false))
+      .addIntegerOption(o=>o.setName('lck').setDescription('Luck').setRequired(false))
+      .addStringOption(o=>o.setName('class').setDescription('Their class — optional, and Hero gives a signature stat').setRequired(false)
+        .addChoices({name:'Hero',value:'Hero'},{name:'Vanguard',value:'Vanguard'},{name:'Defender',value:'Defender'},
+                    {name:'Siege Knight',value:'Siege Knight'},{name:'✖️ Clear it',value:'none'}))
       .addStringOption(o=>o.setName('weapon1').setDescription('What they fight with — restricts their stats if the weapon does').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('weapon2').setDescription('A second weapon').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('atk_stat').setDescription('Which stat the bot should attack with on auto').setRequired(false)
@@ -3506,7 +3525,6 @@ const slashCommands = [
       .addStringOption(o=>o.setName('def_stat').setDescription('Which stat the bot should defend with on auto').setRequired(false)
         .addChoices({name:'💪 Strength',value:'str'},{name:'🫀 Constitution',value:'con'},{name:'⚡ Dexterity',value:'dex'},
                     {name:'🧠 Wisdom',value:'wis'},{name:'🍀 Luck',value:'lck'},{name:'✖️ Clear it',value:'none'}))
-      .addIntegerOption(o=>o.setName('lck').setDescription('Luck').setRequired(false))
       .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
         .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'})))
     .addSubcommand(s=>s.setName('sheet').setDescription('An NPC\'s full record — stats, standing, inventory, rolls, lore')
@@ -3581,6 +3599,9 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('dex').setDescription('Dexterity').setRequired(true))
       .addIntegerOption(o=>o.setName('wis').setDescription('Wisdom').setRequired(true))
       .addIntegerOption(o=>o.setName('lck').setDescription('Luck').setRequired(true))
+      .addStringOption(o=>o.setName('class').setDescription('Their class — optional, and Hero gives a signature stat').setRequired(false)
+        .addChoices({name:'Hero',value:'Hero'},{name:'Vanguard',value:'Vanguard'},{name:'Defender',value:'Defender'},
+                    {name:'Siege Knight',value:'Siege Knight'},{name:'✖️ Clear it',value:'none'}))
       .addStringOption(o=>o.setName('weapon1').setDescription('What they fight with — restricts their stats if the weapon does').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('weapon2').setDescription('A second weapon').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('atk_stat').setDescription('Which stat the bot should attack with on auto').setRequired(false)
@@ -4067,6 +4088,8 @@ async function handleNpcPages(interaction, sub) {
   const max = maxHpFromCon(gid, npc.con);
   const lines = [`⚔️  **${npc.name}** 🎭`];
   if (npc.order_name) lines.push(`${KNIGHT_EMOJIS[npc.order_name] ?? '⚪'}  ${npc.order_name}`);
+  if (npc.class) lines.push(`🏅  ${npc.class}`);
+  if (isHero(npc) && npc.signature_stat) lines.push(`${STAT_EMOJIS[npc.signature_stat] ?? '✨'}:  ${STAT_LABELS[npc.signature_stat]} advantage`);
   lines.push(`❤️  HP          ${npc.hp_current} / ${max}`);
   lines.push('', `💪  STR         ${npc.str ?? 0}`, `🫀  CON         ${npc.con ?? 0}`,
              `⚡  DEX         ${npc.dex ?? 0}`, `🧠  WIS         ${npc.wis ?? 0}`, `🍀  LCK         ${npc.lck ?? 0}`);
@@ -4124,6 +4147,87 @@ async function resolveMortal(interaction) {
   const npc = getNpc(gid, npcName);
   if (!npc) return { error: `❌ No NPC called **${npcName}**.` };
   return { id: npcFighterId(npc.name), subject: npc, name: npc.name };
+}
+
+// Work waiting on a decision lived in four different commands, and pending lore
+// had no listing at all — a submission whose queue post was deleted was simply
+// invisible. This is the one place to look.
+async function handleGmQueue(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can see the queue.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+
+  const jump = (chId, msgId) => (chId && msgId) ? ` · [jump](https://discord.com/channels/${gid}/${chId}/${msgId})` : '';
+  const ago = (t) => t ? ` · <t:${Math.floor(t / 1000)}:R>` : '';
+  const lines = [];
+  let total = 0;
+
+  // Character sheets
+  const sheets = listPendingSheets(gid);
+  if (sheets.length) {
+    total += sheets.length;
+    lines.push(`📋 **Character sheets** — ${sheets.length}`);
+    for (const p of sheets) {
+      lines.push(`• <@${p.user_id}>${ago(p.approval_requested_at)}`
+        + (p.approval_post_ok === 0 ? ' ⚠️ _queue post never landed_' : ''));
+    }
+    lines.push('');
+  }
+
+  // Lore
+  const lore = db.prepare(`SELECT * FROM lore WHERE guild_id=? AND state='pending' ORDER BY submitted_at`).all(gid);
+  if (lore.length) {
+    total += lore.length;
+    lines.push(`📜 **Lore** — ${lore.length}`);
+    for (const l of lore) {
+      lines.push(`• <@${l.user_id}>${ago(l.submitted_at)}${jump(getConfig(gid)?.approval_channel_id, l.msg_id)}`);
+    }
+    lines.push('');
+  }
+
+  // Merit trades
+  const trades = pendingMeritTrades(gid);
+  if (trades.length) {
+    total += trades.length;
+    lines.push(`🤝 **Merit trades** — ${trades.length}`);
+    for (const t of trades) {
+      lines.push(`• \`#${t.id}\` <@${t.from_user}> → <@${t.to_user}> · **${t.amount}**${ago(t.created_at)}`);
+    }
+    lines.push('');
+  }
+
+  // Quest applicants
+  const openQuests = db.prepare(`SELECT * FROM quests WHERE guild_id=? AND status IN ('open','posted') ORDER BY number`).all(gid);
+  const withApplicants = [];
+  for (const q of openQuests) {
+    const applied = getQuestMembers(gid, q.number, 'applied');
+    if (applied.length) withApplicants.push([q, applied]);
+  }
+  if (withApplicants.length) {
+    const count = withApplicants.reduce((a, [, ap]) => a + ap.length, 0);
+    total += count;
+    lines.push(`🧭 **Quest applicants** — ${count}`);
+    for (const [q, applied] of withApplicants) {
+      lines.push(`• **${questTag(q)}** — ${applied.map(u => `<@${u}>`).join(', ')}`);
+    }
+    lines.push('');
+  }
+
+  // Anything that has gone wrong in the background
+  const fails = db.prepare('SELECT * FROM job_failures WHERE guild_id=? ORDER BY at').all(gid);
+  if (fails.length) {
+    lines.push(`⚠️ **Background jobs failing** — ${fails.length}`);
+    for (const f of fails) lines.push(`• **${f.job}** — \`${f.message}\`${ago(f.at)}`);
+    lines.push('');
+  }
+
+  if (!total && !fails.length) {
+    return interaction.editReply({ content: '✅ **Nothing waiting.** No sheets, lore, trades or applicants outstanding.' });
+  }
+  lines.unshift(`🗂️ **${total} thing${total === 1 ? '' : 's'} waiting on a GM**`, '');
+  lines.push('_Sheets and lore are decided on their queue posts · `/merit cancel` or the trade buttons · `/quest approve`._');
+  return replyLong(interaction, lines, { ephemeral: true });
 }
 
 async function handleGmKill(interaction) {
@@ -4189,6 +4293,7 @@ async function handleGmKillModal(interaction) {
   const cfg = getConfig(gid) || {};
   const gmChId = cfg.memorial_channel, pubChId = cfg.memorial_public_channel;
 
+  const trouble = [];
   const gmLines = await buildMemorial(interaction.guild, gid, id, rec);
   await interaction.reply({ content: `🕯️ **${name}** has fallen.`
     + (gmChId ? ` Recorded in <#${gmChId}>.` : '') + (pubChId ? ` Remembered in <#${pubChId}>.` : '') });
@@ -4211,10 +4316,15 @@ async function handleGmKillModal(interaction) {
         if (i === 0) first = m;
       }
       if (first) db.prepare('UPDATE deaths SET msg_id=? WHERE guild_id=? AND id=?').run(first.id, gid, rec.id);
-    } catch (err) { console.error('[memorial] GM copy failed:', err?.message || err); }
+    } catch (err) {
+      console.error('[memorial] GM copy failed:', err?.message || err);
+      trouble.push(`the GM record in <#${gmChId}> — \`${err?.message || err}\``);
+    }
   }
 
-  // The public one is the story alone.
+  // The public one is the story alone. It only runs if a channel is set — a
+  // memorial that quietly went to one of two places was indistinguishable from
+  // one that had no public channel configured at all.
   if (pubChId) {
     try {
       const ch = await interaction.client.channels.fetch(pubChId);
@@ -4226,7 +4336,21 @@ async function handleGmKillModal(interaction) {
         if (i === 0) first = m;
       }
       if (first) db.prepare('UPDATE deaths SET public_msg_id=? WHERE guild_id=? AND id=?').run(first.id, gid, rec.id);
-    } catch (err) { console.error('[memorial] public copy failed:', err?.message || err); }
+    } catch (err) {
+      console.error('[memorial] public copy failed:', err?.message || err);
+      trouble.push(`the public hall in <#${pubChId}> — \`${err?.message || err}\``);
+    }
+  }
+
+  // Say what didn't land. A memorial that reached one channel of two used to
+  // look identical to one where no second channel was configured.
+  if (trouble.length) {
+    await interaction.followUp({ ephemeral: true, content:
+      `⚠️ **The memorial didn't reach everywhere.**\nCouldn't post to ${trouble.join('; and ')}.\n`
+      + '_Check I can **View Channel**, **Send Messages** and **Embed Links** there._' }).catch(()=>{});
+  } else if (gmChId && !pubChId) {
+    await interaction.followUp({ ephemeral: true, content:
+      '📋 _Posted to the GM record only — no public hall is set. `/config memorial public:#the-fallen` adds one._' }).catch(()=>{});
   }
 }
 
@@ -5358,6 +5482,47 @@ async function handleChar(interaction) {
       ...loreLines()]);
   }
 
+  // Everything the gates check, shown as a checklist — so a new player sees the
+  // whole list once instead of discovering it one refusal at a time.
+  if (sub === 'check') {
+    const ch = getChar(gid, callerId);
+    if (!ch) {
+      return interaction.reply({ ephemeral: true, content: [
+        '📝 **You have no character sheet yet.**', '',
+        '☐ Stats — `/char create str:5 con:4 dex:3 wis:2 lck:1`',
+        '☐ Weapons — add `weapon1:` and `weapon2:` in the same command',
+        '☐ Emojis — `/char weaponemoji` for each',
+        '', '_Then it goes to a GM automatically._',
+      ].join('\n') });
+    }
+    const { budget, min } = statRules(gid);
+    const spent = statTotal(ch);
+    const box = (ok) => ok ? '☑' : '☐';   // not `tick` — that name is a scheduler elsewhere
+    const budgetOk = spent === budget && STATS.every(k => (Number(ch[k]) || 0) >= min);
+    const w1 = !!String(ch.weapon1 || '').trim(), w2 = !!String(ch.weapon2 || '').trim();
+    const e1 = !!ch.weapon1emoji_set, e2 = !!ch.weapon2emoji_set;
+    const gm = await isGm(interaction.guild, callerId);
+
+    const out = ['📝 **Your sheet**', ''];
+    out.push(`${box(budgetOk)} **Stats** — ${STATS.map(k => `${k.toUpperCase()} ${Number(ch[k]) || 0}`).join(' · ')}`);
+    out.push(`   _${spent}/${budget} spent${gm ? ' — GMs are exempt' : ''}${!budgetOk && spent !== budget ? `, ${spent > budget ? `${spent - budget} over` : `${budget - spent} left`}` : ''}_`);
+    out.push(`${box(w1)} **Weapon 1** — ${w1 ? `**${ch.weapon1}**` : '_not set_'}`);
+    out.push(`${box(w2)} **Weapon 2** — ${w2 ? `**${ch.weapon2}**` : '_not set_'}`);
+    out.push(`${box(e1 && e2)} **Weapon emojis** — ${e1 && e2 ? 'both chosen' : `${!e1 ? 'Weapon 1' : ''}${!e1 && !e2 ? ' and ' : ''}${!e2 ? 'Weapon 2' : ''} still to choose`}`);
+
+    const problems = sheetSubmissionProblems(gid, ch);
+    out.push('');
+    if (!problems.length) {
+      const state = sheetApproved(gid, ch) ? '✅ **Approved.**'
+        : ch.approval_requested_at ? '⏳ **With a GM now.**'
+        : '✅ **Ready** — `/char submit` sends it.';
+      out.push(state);
+    } else {
+      out.push('**Still to do**', ...problems.map(x => `• ${x.replace(/^[^ ]+ /, '')}`));
+    }
+    return interaction.reply({ ephemeral: true, content: out.join('\n') });
+  }
+
   if (sub === 'prefer') {
     const ch = getChar(gid, callerId);
     if (!ch) return interaction.reply({ content: '❌ You need a character sheet first — `/char create`.', ephemeral: true });
@@ -6243,6 +6408,7 @@ client.on('interactionCreate', async interaction => {
 
   if (!interaction.isChatInputCommand()) return;
   try {
+    if (interaction.commandName === 'gmqueue') return await handleGmQueue(interaction);
     if (interaction.commandName === 'gmkill') return await handleGmKill(interaction);
     if (interaction.commandName === 'gmrevive') return await handleGmRevive(interaction);
     if (interaction.commandName === 'gmtest') return await handleGmTest(interaction);
@@ -9090,18 +9256,20 @@ async function handleNpc(interaction) {
     // Weapons behave like stats here: supply one to set it, "none" to clear it,
     // omit it entirely to leave whatever they already carry alone.
     const weap = {};
+    const unlisted = [];
     for (const slot of ['weapon1', 'weapon2']) {
       const v = interaction.options.getString(slot);
       if (v === null) continue;
       const t = v.trim();
       if (/^(none|clear|-)$/i.test(t)) { weap[slot] = null; continue; }
-      if (!getWeaponRow(gid, t)) {
-        return interaction.reply({ ephemeral: true, content:
-          `❌ **${t}** isn't on the weapon list. Add it with \`/weapon add name:${t}\` first, so its stat rules are known.` });
-      }
-      weap[slot] = getWeaponRow(gid, t).name;   // canonical casing
+      // Anything goes. A weapon on the list brings its stat rules with it;
+      // anything else is simply carried, restricting nothing — better to let a
+      // GM write "a broken chair leg" than to make them register it first.
+      const known = getWeaponRow(gid, t);
+      weap[slot] = known ? known.name : t;      // canonical casing when known
+      if (!known) unlisted.push(t);
     }
-    for (const [opt, col] of [['atk_stat', 'preferred_atk'], ['def_stat', 'preferred_def']]) {
+    for (const [opt, col] of [['atk_stat', 'preferred_atk'], ['def_stat', 'preferred_def'], ['class', 'class']]) {
       const v = interaction.options.getString(opt);
       if (v === null) continue;
       weap[col] = (v === 'none') ? null : v;
@@ -9124,14 +9292,21 @@ async function handleNpc(interaction) {
       upsertNpc(gid, name, { hp_current: maxHpFromCon(gid, made?.con) });
     }
 
-    const orderLine = order ? ` | ${KNIGHT_EMOJIS[order]??'⚪'} ${order}` : '';
-    const statsSet = Object.keys(fields).filter(k => k !== 'order_name').length;
+    const madeNpc = getNpc(gid, name);
+    const orderLine = (order ? ` | ${KNIGHT_EMOJIS[order]??'⚪'} ${order}` : '')
+      + (madeNpc?.class ? ` | 🏅 ${madeNpc.class}` : '');
+    // Only the five stats count toward "statted up" — a class or a weapon is
+    // not a stat, and counting them would suppress the hint that stats are due.
+    const statsSet = Object.keys(fields).filter(k => STATS.includes(k)).length;
     const statNote = statsSet === 0
       ? '\n📋 No stats set yet — add them any time with `/npc create name:' + name + ' str:… con:…`.'
       : statsSet < 5
         ? '\n📋 Some stats still unset (showing as 0) — fill them in later with `/npc create`.'
         : '';
-    await interaction.reply({ content: `✅ NPC **${name}** ${existed ? 'updated' : 'created'}.${orderLine}${statNote}\n💡 Upload an image to the NPC channel with \`${name}\` as the message text to set their avatar.` });
+    const unlistedNote = unlisted.length
+      ? `\n📝 ${unlisted.map(w => `**${w}**`).join(' and ')} ${unlisted.length === 1 ? 'is' : 'are'} not on the weapon list, so ${unlisted.length === 1 ? 'it restricts' : 'they restrict'} nothing. \`/weapon add\` to give ${unlisted.length === 1 ? 'it' : 'them'} stat rules.`
+      : '';
+    await interaction.reply({ content: `✅ NPC **${name}** ${existed ? 'updated' : 'created'}.${orderLine}${statNote}${unlistedNote}\n💡 Upload an image to the NPC channel with \`${name}\` as the message text to set their avatar.` });
     registerSlashCommands(gid).catch(console.error);
   }
 
@@ -9933,6 +10108,37 @@ async function handleBackup(interaction) {
   }
 }
 
+// A background job failing to the console is a job nobody knows has failed —
+// and for backups that means believing you are covered when you are not. This
+// reports to the channel the job belongs to, once per distinct problem, and
+// says when it recovers.
+function lastJobFailure(gid, job) {
+  return db.prepare('SELECT message FROM job_failures WHERE guild_id=? AND job=?').get(gid, job)?.message ?? null;
+}
+async function reportJobFailure(client, gid, channelId, job, err) {
+  const msg = err?.message || String(err);
+  if (lastJobFailure(gid, job) === msg) return;   // already said this one
+  db.prepare(`INSERT INTO job_failures (guild_id,job,message,at) VALUES (?,?,?,?)
+              ON CONFLICT(guild_id,job) DO UPDATE SET message=excluded.message, at=excluded.at`)
+    .run(gid, job, msg, Date.now());
+  if (!channelId) return;
+  try {
+    const ch = await client.channels.fetch(channelId);
+    await ch.send({ allowedMentions: { roles: getGmRoleIds(gid) },
+      content: `${getGmRoleIds(gid).map(r => `<@&${r}>`).join(' ')} ⚠️ **${job} failed.**\n\`${msg}\`\n`
+        + '_It will keep trying, and I will say so when it works again._' });
+  } catch {}
+}
+async function reportJobRecovered(client, gid, channelId, job) {
+  if (!lastJobFailure(gid, job)) return;
+  db.prepare('DELETE FROM job_failures WHERE guild_id=? AND job=?').run(gid, job);
+  if (!channelId) return;
+  try {
+    const ch = await client.channels.fetch(channelId);
+    await ch.send(`✅ _${job} is working again._`);
+  } catch {}
+}
+
 // Automatic backups. Each run replaces the standing post rather than adding to
 // it, so the channel holds the newest file and nothing else.
 //
@@ -9960,8 +10166,13 @@ async function backupTick() {
         if (Date.now() - last < backupInterval(row)) continue;
         await publishBackup(client, row.guild_id, row.backup_channel_id, { reason: 'scheduled backup' });
         setConfig(row.guild_id, { backup_last: Date.now() });
+        await reportJobRecovered(client, row.guild_id, row.backup_channel_id, 'Backup');
         console.log(`[backup] ${row.guild_id}: posted, previous removed`);
-      } catch (e) { console.error('Auto-backup failed for guild', row.guild_id, e.message); }
+      } catch (e) {
+        console.error('Auto-backup failed for guild', row.guild_id, e.message);
+        // A backup nobody knows has failed is worse than no backup at all.
+        await reportJobFailure(client, row.guild_id, row.backup_channel_id, 'Backup', e);
+      }
     }
   } catch (err) { console.error('Backup scheduler error:', err.message); }
 }
