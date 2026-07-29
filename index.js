@@ -4,7 +4,7 @@
 // ============================================================
 
 require('dotenv').config();
-const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, REST, Routes } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, MessageFlags, REST, Routes } = require('discord.js');
 const Database = require('better-sqlite3');
 const path = require('path');
 
@@ -92,6 +92,19 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS quest_summaries (
   PRIMARY KEY (guild_id, number, user_id)
 )`); } catch (e) { console.error('quest_summaries schema', e); }
 try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_log_channel TEXT'); } catch {}
+// Where the command PDFs are published, which repository they come from, the
+// message currently holding them, and the file versions last seen — so a poll
+// can tell "nothing has changed" from "there is a new build".
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_channel TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_repo TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_branch TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_path TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_sha TEXT'); } catch {}
+// A second home for the player book alone, posted quietly — no ping, no
+// notification — so a reference channel stays current without nagging anyone.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_player_channel TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_player_msg_id TEXT'); } catch {}
 // Who is running this one, how they run a table, and — for an instance — which
 // quest it was copied from. A quest row is a single party on a single clock, so
 // two GMs running the same adventure need two rows; instance_of ties them
@@ -1717,6 +1730,134 @@ const GM_STYLES = {
 };
 const gmStyleLabel = (k) => GM_STYLES[k] ?? null;
 
+// ── Command PDFs from GitHub ─────────────────────────────────────────────────
+// The three books are built outside the bot and committed to a repository. This
+// watches them and keeps a single, current post in a GM channel: when a new
+// build lands, the old post is deleted and replaced rather than the channel
+// filling up with stale copies.
+const DOC_FILES = [
+  'DDice-Commands-GameMaster.pdf',
+  'DDice-Commands-Player.pdf',
+  'DDice-Commands-Parchment.pdf',
+];
+const DOCS_POLL_MS = 15 * 60 * 1000;
+const DOC_PLAYER_FILE = 'DDice-Commands-Player.pdf';
+
+function docsSettings(gid) {
+  const cfg = getConfig(gid) || {};
+  return {
+    channel: cfg.docs_channel || null,
+    repo: cfg.docs_repo || null,
+    branch: cfg.docs_branch || 'main',
+    path: (cfg.docs_path || '').replace(/^\/+|\/+$/g, ''),
+    msgId: cfg.docs_msg_id || null,
+    sha: cfg.docs_sha || null,
+    playerChannel: cfg.docs_player_channel || null,
+    playerMsgId: cfg.docs_player_msg_id || null,
+  };
+}
+const docFileUrl = (st, file) =>
+  `https://raw.githubusercontent.com/${st.repo}/${st.branch}/${st.path ? st.path + '/' : ''}${file}`;
+const docApiUrl = (st, file) =>
+  `https://api.github.com/repos/${st.repo}/contents/${st.path ? st.path + '/' : ''}${file}?ref=${encodeURIComponent(st.branch)}`;
+
+// A fingerprint of the three files as they currently stand on GitHub. Uses the
+// contents API rather than downloading, so a poll that finds nothing new costs
+// three small requests instead of half a megabyte.
+async function fetchDocsFingerprint(st) {
+  const parts = [];
+  for (const file of DOC_FILES) {
+    const res = await fetch(docApiUrl(st, file), {
+      headers: { 'Accept': 'application/vnd.github+json', 'User-Agent': 'DDice-bot' },
+    });
+    if (!res.ok) throw new Error(`${file}: GitHub returned ${res.status}`);
+    const json = await res.json();
+    if (!json?.sha) throw new Error(`${file}: no version returned`);
+    parts.push(`${file}:${json.sha}`);
+  }
+  return parts.join('|');
+}
+
+async function fetchDocFiles(st, only = DOC_FILES) {
+  const { AttachmentBuilder } = require('discord.js');
+  const files = [];
+  for (const file of only) {
+    const res = await fetch(docFileUrl(st, file), { headers: { 'User-Agent': 'DDice-bot' } });
+    if (!res.ok) throw new Error(`${file}: download returned ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (!buf.length) throw new Error(`${file}: downloaded nothing`);
+    files.push(new AttachmentBuilder(buf, { name: file }));
+  }
+  return files;
+}
+
+// Replace the standing post with a fresh one. Returns a short outcome line.
+async function publishDocs(client, guild, { reason = 'a new build', force = false } = {}) {
+  const gid = guild.id;
+  const st = docsSettings(gid);
+  if (!st.channel || !st.repo) return { skipped: 'not configured' };
+
+  const fingerprint = await fetchDocsFingerprint(st);
+  if (!force && fingerprint === st.sha) return { skipped: 'unchanged' };
+
+  const files = await fetchDocFiles(st);
+  const channel = await client.channels.fetch(st.channel);
+  const roles = getGmRoleIds(gid);
+
+  // Post the new one first, then remove the old — that way a failure leaves the
+  // channel with a copy rather than none at all.
+  const msg = await channel.send({
+    content: `${roles.map(r => `<@&${r}>`).join(' ')} 📚 **Command reference updated** — ${reason}.\n`
+      + `_Latest build from \`${st.repo}\`. The previous post has been removed._`,
+    files, allowedMentions: { roles },
+  });
+  if (st.msgId) {
+    try { const old = await channel.messages.fetch(st.msgId); await old.delete(); } catch {}
+  }
+  setConfig(gid, { docs_msg_id: msg.id, docs_sha: fingerprint });
+  const out = { posted: true, url: `https://discord.com/channels/${gid}/${channel.id}/${msg.id}` };
+
+  // The player book on its own, somewhere players can find it. Deliberately
+  // silent: no roles pinged, no notification raised, and mentions suppressed
+  // entirely — a reference channel should stay current without nagging anyone.
+  if (st.playerChannel) {
+    try {
+      const pCh = await client.channels.fetch(st.playerChannel);
+      const [playerFile] = await fetchDocFiles(st, [DOC_PLAYER_FILE]);
+      const pMsg = await pCh.send({
+        content: '📘 **Player command reference** — latest version.',
+        files: [playerFile],
+        allowedMentions: { parse: [] },
+        flags: MessageFlags.SuppressNotifications,
+      });
+      if (st.playerMsgId) {
+        try { const old = await pCh.messages.fetch(st.playerMsgId); await old.delete(); } catch {}
+      }
+      setConfig(gid, { docs_player_msg_id: pMsg.id });
+      out.playerUrl = `https://discord.com/channels/${gid}/${pCh.id}/${pMsg.id}`;
+    } catch (err) {
+      console.error('[docs] player copy failed:', err?.message || err);
+      out.playerError = err?.message || String(err);
+    }
+  }
+  return out;
+}
+
+function startDocsWatch(client) {
+  const tick = async () => {
+    for (const guild of client.guilds.cache.values()) {
+      try {
+        const st = docsSettings(guild.id);
+        if (!st.channel || !st.repo) continue;
+        const out = await publishDocs(client, guild);
+        if (out.posted) console.log(`[docs] ${guild.id}: published a new build`);
+      } catch (err) { console.error('[docs] check failed for', guild.id, '-', err?.message || err); }
+    }
+  };
+  setInterval(tick, DOCS_POLL_MS);
+  setTimeout(tick, 90 * 1000);   // settle after boot, then look once
+}
+
 // ── Quest stopwatch & event log ──────────────────────────────────────────────
 const QUEST_REMIND_MS = 15 * 60 * 1000;   // public "how long we've been at it"
 const QUEST_RECAP_MS  = 60 * 60 * 1000;   // hourly summary of what happened
@@ -2913,6 +3054,14 @@ const slashCommands = [
       .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored: 100%, 50%, a number, or 0%').setRequired(false))
       .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored: 100%, 50%, a number, or 0%').setRequired(false))
       .addChannelOption(o=>o.setName('channel').setDescription('Announce this schedule here (optional)').setRequired(false)))
+    .addSubcommand(s=>s.setName('docs').setDescription('Publish the command PDFs from GitHub into a GM channel')
+      .addChannelOption(o=>o.setName('channel').setDescription('Where all three books live (GMs are pinged here)').setRequired(false))
+      .addChannelOption(o=>o.setName('player_channel').setDescription('Where the player book alone goes — posted silently, no ping').setRequired(false))
+      .addStringOption(o=>o.setName('repo').setDescription('GitHub repository, as owner/name').setRequired(false))
+      .addStringOption(o=>o.setName('branch').setDescription('Branch (default main)').setRequired(false))
+      .addStringOption(o=>o.setName('path').setDescription('Folder inside the repo, if the PDFs are not at the root').setRequired(false))
+      .addBooleanOption(o=>o.setName('push').setDescription('true = fetch and repost right now, changed or not').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop watching').setRequired(false)))
     .addSubcommand(s=>s.setName('questlog').setDescription('Where finished quest summaries are posted for everyone to read')
       .addChannelOption(o=>o.setName('channel').setDescription('Summary channel').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = stop posting summaries').setRequired(false)))
@@ -4149,6 +4298,72 @@ async function handleConfig(interaction) {
       `${existing ? '✏️ Updated' : '🌙 Added'} recovery schedule:`, line(sc), '',
       'Everyone not on an in-progress quest is covered. Quest parties keep whatever they have until they finish.',
     ].join('\n') });
+  }
+
+  if (sub === 'docs') {
+    const channel = interaction.options.getChannel('channel');
+    const playerChannel = interaction.options.getChannel('player_channel');
+    const repo = interaction.options.getString('repo');
+    const branch = interaction.options.getString('branch');
+    const path = interaction.options.getString('path');
+    const push = interaction.options.getBoolean('push');
+    const disable = interaction.options.getBoolean('disable');
+
+    if (disable) {
+      setConfig(gid, { docs_channel: null, docs_msg_id: null, docs_sha: null,
+        docs_player_channel: null, docs_player_msg_id: null });
+      return interaction.reply({ content: '📚 Stopped watching for new command books. The last posts are left where they are.' });
+    }
+
+    const fields = {};
+    if (channel) {
+      if (!channel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
+      fields.docs_channel = channel.id;
+      fields.docs_msg_id = null;   // a new home means a new standing post
+    }
+    if (playerChannel) {
+      if (!playerChannel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread for the player copy.', ephemeral: true });
+      fields.docs_player_channel = playerChannel.id;
+      fields.docs_player_msg_id = null;
+    }
+    if (repo) {
+      if (!/^[\w.-]+\/[\w.-]+$/.test(repo.trim()))
+        return interaction.reply({ content: '❌ Give the repository as `owner/name` — for example `wolffewrought/ddice`.', ephemeral: true });
+      fields.docs_repo = repo.trim();
+    }
+    if (branch) fields.docs_branch = branch.trim();
+    if (path !== null && path !== undefined) fields.docs_path = path.trim();
+    if (Object.keys(fields).length) setConfig(gid, fields);
+
+    const st = docsSettings(gid);
+    if (!st.channel || !st.repo) {
+      return interaction.reply({ ephemeral: true, content: (st.channel || st.repo)
+        ? `📚 Half set up — ${st.channel ? 'no repository yet' : 'no channel yet'}.\n\`/config docs channel:#gm-books repo:owner/name\``
+        : '📚 Not set up. `/config docs channel:#gm-books repo:owner/name`\n_The three PDFs are fetched from that repository and kept as a single, current post._' });
+    }
+
+    if (!push && !Object.keys(fields).length) {
+      return interaction.reply({ ephemeral: true, content:
+        `📚 Watching \`${st.repo}\` (${st.branch}${st.path ? `, /${st.path}` : ''}) → <#${st.channel}>, checked every 15 minutes.\n`
+        + (st.playerChannel ? `📘 Player book also posted quietly in <#${st.playerChannel}>.\n` : '')
+        + (st.msgId ? `Current post: https://discord.com/channels/${gid}/${st.channel}/${st.msgId}` : '_Nothing posted yet._') });
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+    try {
+      const out = await publishDocs(interaction.client, interaction.guild,
+        { reason: push ? 'pushed by a GM' : 'settings changed', force: !!push });
+      if (out.skipped === 'unchanged') {
+        return interaction.editReply({ content: `📚 Already up to date. Watching \`${st.repo}\` → <#${st.channel}>.` });
+      }
+      const extra = out.playerUrl ? `\n📘 Player book posted quietly in <#${st.playerChannel}>.`
+                  : out.playerError ? `\n⚠️ Player copy failed: ${out.playerError}` : '';
+      return interaction.editReply({ content: `📚 Published to <#${st.channel}> and the GMs pinged.\n${out.url}${extra}` });
+    } catch (err) {
+      return interaction.editReply({ content:
+        `❌ Couldn't publish: ${err?.message || err}\n`
+        + `_Check the repository is public, the branch is right, and the three files sit at \`${st.path ? st.path + '/' : ''}DDice-Commands-*.pdf\`._` });
+    }
   }
 
   if (sub === 'questlog') {
@@ -5753,6 +5968,7 @@ async function clearGlobalCommands() {
   await clearGlobalCommands();
   startAutoRest(client);
   startQuestClock(client);
+  startDocsWatch(client);
   client.login(process.env.DISCORD_TOKEN);
 })();
 

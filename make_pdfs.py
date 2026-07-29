@@ -814,6 +814,28 @@ CONTENT = [
 ('note', 'Everything above also works on <b>/pr</b>, which is the same command under a shorter name for use '
          'mid-scene.'),
 
+('sec', 'Publishing These Books'),
+('p', 'The three books are built outside the bot and committed to a repository. Point the bot at that '
+      'repository and it will keep <b>one current post</b> of all three in a channel of your choosing \u2014 '
+      'when a new build lands, the old post is deleted and replaced rather than the channel filling up with '
+      'stale copies.'),
+('code', [('/config docs channel:#gm-books repo:owner/name', 'set it up'),
+          ('/config docs player_channel:#rules', 'player book alone, posted silently'),
+          ('/config docs branch:live path:docs', 'if not on main, or not at the root'),
+          ('/config docs push:true', 'fetch and repost right now'),
+          ('/config docs', 'what is being watched, and the current post'),
+          ('/config docs disable:true', 'stop watching')]),
+('p', 'It looks every <b>15 minutes</b>, and <b>pings the ' + GM + ' roles</b> whenever it publishes. Checking '
+      'is cheap \u2014 it asks GitHub for the file versions rather than downloading, so a check that finds nothing '
+      'new costs three small requests.'),
+('p', 'Give it a <b>player_channel</b> as well and the <b>player book alone</b> is kept current there \u2014 '
+      'posted <b>silently</b>, with no role pinged and no notification raised, so a reference channel stays up '
+      'to date without nagging anyone. It replaces its own previous post the same way.'),
+('note', 'The new post goes up <b>before</b> the old one comes down, so a failure part-way leaves the channel '
+         'with a copy rather than none at all. The repository must be public, and the three files must be '
+         'named <b>DDice-Commands-GameMaster.pdf</b>, <b>DDice-Commands-Player.pdf</b> and '
+         '<b>DDice-Commands-Parchment.pdf</b>.'),
+
 ('sec', 'Test Tools'),
 ('p', 'Trying a feature out usually means inventing a quest or an NPC you then have to tidy out of the world. '
       '<b>/gmtest</b> makes throwaway ones instead. Everything it creates is named <b>[test]</b> and can be '
