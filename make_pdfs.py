@@ -752,6 +752,8 @@ CONTENT = [
 ('p', 'Only one reroll is offered per roll \u2014 the second result stands, and the tale moves on. If you have '
       'none left, or the scene was an ending, it continues as before without stopping to ask. Your progress '
       'is saved while it waits, so nothing is lost if you take a moment to decide.'),
+('note', 'In <b>/activity demo</b> the reroll is <b>free</b> and always offered, even with none left \u2014 a dry '
+         'run should not quietly cost a player their real rerolls just to see what the button does.'),
 ('p', 'Each scene posts with a button per stat it accepts. <b>Anyone in the channel can press one</b> \u2014 the '
       'roll uses their own sheet, honours a Hero\u2019s signature stat, and lands in the roll audit like any '
       'other. One run per channel at a time. Writing and deleting always need a ' + GM + '; starting one is '

@@ -180,7 +180,7 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN activity_players INTEGER DEFA
 // throwaway activity.
 try {
   const cols = db.prepare('PRAGMA table_info(story_runs)').all().map(c => c.name);
-  if (cols.length && !cols.includes('user_id')) {
+  if (cols.length && (!cols.includes('user_id') || !cols.includes('is_demo') || !cols.includes('busy'))) {
     db.exec('DROP TABLE story_runs');
     console.log('[activity] story_runs rebuilt for per-player runs');
   }
@@ -288,6 +288,9 @@ db.exec(`
     started_at INTEGER,
     tally_state TEXT NOT NULL DEFAULT '{}',
     gauntlet_at INTEGER NOT NULL DEFAULT 0,
+    is_demo INTEGER NOT NULL DEFAULT 0,
+    busy INTEGER NOT NULL DEFAULT 0,
+    steps INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (guild_id, channel_id, user_id)
   );
   CREATE TABLE IF NOT EXISTS autorest_schedules (
@@ -584,6 +587,34 @@ function removeQuestMember(gid, number, uid) {
   return db.prepare('DELETE FROM quest_members WHERE guild_id=? AND number=? AND user_id=?').run(gid, number, uid).changes;
 }
 // "#001-Goblin Cave"
+// What to tell the fighter whose turn it is. Written out at three separate
+// fight-start points before this, which is why only one of them learned about
+// /roll fight:true when that arrived.
+function turnPrompt(f) {
+  return f.isNpc
+    ? ' _(a GM acts with `npc:`)_'
+    : '\n_`/fight atk stat:str target:@player` — or `/roll dice:2d6+3 fight:true target:@player` for a custom roll._';
+}
+
+// A fight's turn order and HP map are stored as JSON and read back constantly.
+// One accessor each, so a shape change lands in one place rather than 24.
+const fightOrder = (fight) => JSON.parse(fight?.turn_order || '[]');
+const fightHp = (fight) => JSON.parse(fight?.hp_state || '{}');
+// Where sheets, lore, exports and merit trades all queue for a GM.
+const approvalChannelId = (gid) => approvalChannelId(gid) || null;
+
+// Resolve the `number:` option to a quest, or answer the refusal. Twelve
+// subcommands opened with the same four lines; this is those four lines.
+async function requireQuest(interaction, gid) {
+  const number = interaction.options.getInteger('number');
+  const quest = getQuest(gid, number);
+  if (!quest) {
+    await interaction.reply({ content: `❌ No quest #${String(number).padStart(3, '0')}.`, ephemeral: true });
+    return null;
+  }
+  return quest;
+}
+
 function questTag(quest) {
   return `#${String(quest.number).padStart(3, '0')}-${quest.name}`;
 }
@@ -868,6 +899,25 @@ function setRun(gid, cid, uid, fields) {
     .run(...keys.map(k => fields[k]), gid, cid, uid);
   return getRun(gid, cid, uid);
 }
+// Claim a run before acting on it. Two clicks land as two separate handler
+// invocations, and the second can start while the first is awaiting Discord —
+// without this, a double-tap spends two rerolls and advances the tale twice.
+// The UPDATE is the claim: SQLite reports how many rows it changed, so exactly
+// one caller can ever win.
+function claimRun(gid, cid, uid) {
+  return db.prepare('UPDATE story_runs SET busy=1 WHERE guild_id=? AND channel_id=? AND user_id=? AND busy=0')
+    .run(gid, cid, uid).changes === 1;
+}
+function releaseRun(gid, cid, uid) {
+  db.prepare('UPDATE story_runs SET busy=0 WHERE guild_id=? AND channel_id=? AND user_id=?').run(gid, cid, uid);
+}
+
+// A looping activity is the point — fishing should be repeatable — but nothing
+// should loop for ever. This bounds a single run so a stuck script, or someone
+// tapping Carry on for an hour, can't spin without end or bank a tally
+// indefinitely.
+const ACTIVITY_MAX_STEPS = 200;
+
 function endRun(gid, cid, uid) {
   db.prepare('DELETE FROM story_runs WHERE guild_id=? AND channel_id=? AND user_id=?').run(gid, cid, uid);
 }
@@ -1275,10 +1325,29 @@ async function advance(io, ctx, nextName, tallyState, gauntletAt = 0) {
   const { gid, cid, uid, run } = ctx;
   const next = getScene(gid, run.story, nextName);
   if (!next) { endRun(gid, cid, uid); return; }
+
+  // A looping activity is the point, but nothing loops for ever. Past the cap
+  // the run is closed out where it stands — the tally still pays, so a long
+  // honest session isn't punished, but a script that can't reach an ending and
+  // someone tapping a button all afternoon both stop here.
+  const steps = (Number(run.steps) || 0) + 1;
+  if (steps > ACTIVITY_MAX_STEPS) {
+    const story = getStory(gid, run.story);
+    const banked = tallyState[uid] || 0;
+    if (banked && story?.tally) addRenown(gid, uid, banked, `${run.story} (ran long)`);
+    endRun(gid, cid, uid);
+    try {
+      const ch = await io.guild.client.channels.fetch(cid);
+      await ch?.send(`🛑 **${run.story}** has run ${ACTIVITY_MAX_STEPS} scenes and been closed out.`
+        + (banked ? ` <@${uid}> keeps **${banked}** ${story.tally}.` : ''));
+    } catch {}
+    return;
+  }
+
   // Credit the arriving scene's GAIN to whoever got them there.
   if (next.gain) tallyState[uid] = (tallyState[uid] || 0) + next.gain;
   const updated = setRun(gid, cid, uid, { scene: next.scene,
-    tally_state: JSON.stringify(tallyState), gauntlet_at: gauntletAt });
+    tally_state: JSON.stringify(tallyState), gauntlet_at: gauntletAt, steps });
   await new Promise(r => setTimeout(r, 900));
   await postScene(io.guild, cid, updated, next);
 }
@@ -1288,13 +1357,16 @@ async function handleStoryPickButton(interaction) {
   const [, owner, sceneName, idx] = interaction.customId.split(':');
   const ctx = activeSceneFor(interaction, owner, sceneName);
   if (ctx.error) return interaction.reply({ content: ctx.error, ephemeral: true });
+  if (!claimRun(ctx.gid, ctx.cid, ctx.uid)) return interaction.reply({ content: '⏳ Still working on your last one.', ephemeral: true });
   const choices = JSON.parse(ctx.sc.choices || '[]');
   const pick = choices[Number(idx)];
   if (!pick) return interaction.reply({ content: '❌ That option has gone.', ephemeral: true });
   const name = await getDisplayName(interaction.guild, ctx.uid);
   await interaction.reply({ content: `➡️ **${name}** — ${pick.label}` });
   try { await interaction.message.edit({ components: [] }); } catch {}
-  await advance({ guild: interaction.guild }, ctx, pick.next, JSON.parse(ctx.run.tally_state || '{}'), 0);
+  try {
+    await advance({ guild: interaction.guild }, ctx, pick.next, JSON.parse(ctx.run.tally_state || '{}'), 0);
+  } finally { releaseRun(ctx.gid, ctx.cid, ctx.uid); }
 }
 
 // A roll. Anyone in the channel may answer; the only gate is that the run is
@@ -1329,16 +1401,24 @@ async function handleStoryRerollButton(interaction) {
   const [, owner, scene, statWord, next, gaAt] = interaction.customId.split(':');
   const ctx = activeSceneFor(interaction, owner, scene);
   if (ctx.error) return interaction.reply({ content: ctx.error, ephemeral: true });
-  const { gid, cid, uid, ch } = ctx;
-  if ((ch.rerolls_current ?? 0) <= 0) return interaction.reply({ content: '❌ No rerolls remaining.', ephemeral: true });
-  upsertChar(gid, uid, { rerolls_current: ch.rerolls_current - 1 });
+  const { gid, cid, uid, ch, run } = ctx;
+  if (!claimRun(gid, cid, uid)) return interaction.reply({ content: '⏳ Still working on your last one.', ephemeral: true });
+  // A demo is a dry run — it should not quietly drain a player's real rerolls
+  // just because they wanted to see what the button does.
+  const dry = !!run?.is_demo;
+  if (!dry) {
+    if ((ch.rerolls_current ?? 0) <= 0) return interaction.reply({ content: '❌ No rerolls remaining.', ephemeral: true });
+    upsertChar(gid, uid, { rerolls_current: ch.rerolls_current - 1 });
+  }
   try { await interaction.message.edit({ components: [] }); } catch {}
   const fresh = { ...ctx, ch: getChar(gid, uid) };
-  return resolveActivityRoll(fresh, statWord, null, {
-    guild: interaction.guild,
-    reply: async (content) => { await interaction.reply(typeof content === 'string' ? { content } : content); },
-    interaction,
-  }, true);
+  try {
+    return await resolveActivityRoll(fresh, statWord, null, {
+      guild: interaction.guild,
+      reply: async (content) => { await interaction.reply(typeof content === 'string' ? { content } : content); },
+      interaction,
+    }, true);
+  } finally { releaseRun(gid, cid, uid); }
 }
 
 // Take the result as it stands and move on.
@@ -1350,21 +1430,30 @@ async function handleStoryCarryOnButton(interaction) {
   if (!run) return interaction.reply({ content: '❌ You have nothing running here.', ephemeral: true });
   const sc = getScene(gid, run.story, run.scene);
   if (!sc) { endRun(gid, cid, uid); return interaction.reply({ content: '❌ That scene has gone missing.', ephemeral: true }); }
-  await interaction.reply({ content: '▶️ Onward.' });
-  try { await interaction.message.edit({ components: [] }); } catch {}
-  await advance({ guild: interaction.guild }, { gid, cid, uid, run, ch: getChar(gid, uid), sc },
-    next, JSON.parse(run.tally_state || '{}'), Number(gaAt) || 0);
+  // Carry on advances the tale, so it needs the same one-at-a-time guard the
+  // other buttons have — a double tap would otherwise skip a scene and credit
+  // an arriving GAIN twice.
+  if (!claimRun(gid, cid, uid)) return interaction.reply({ content: '⏳ Still working on your last one.', ephemeral: true });
+  try {
+    await interaction.reply({ content: '▶️ Onward.' });
+    try { await interaction.message.edit({ components: [] }); } catch {}
+    await advance({ guild: interaction.guild }, { gid, cid, uid, run, ch: getChar(gid, uid), sc },
+      next, JSON.parse(run.tally_state || '{}'), Number(gaAt) || 0);
+  } finally { releaseRun(gid, cid, uid); }
 }
 
 async function handleStoryRollButton(interaction) {
   const [, owner, sceneName, statWord] = interaction.customId.split(':');
   const ctx = activeSceneFor(interaction, owner, sceneName);
   if (ctx.error) return interaction.reply({ content: ctx.error, ephemeral: true });
-  return resolveActivityRoll(ctx, statWord, null, {
-    guild: interaction.guild,
-    reply: async (content) => { await interaction.reply({ content }); try { await interaction.message.edit({ components: [] }); } catch {} },
-    interaction,
-  });
+  if (!claimRun(ctx.gid, ctx.cid, ctx.uid)) return interaction.reply({ content: '⏳ Still working on your last one.', ephemeral: true });
+  try {
+    return await resolveActivityRoll(ctx, statWord, null, {
+      guild: interaction.guild,
+      reply: async (content) => { await interaction.reply({ content }); try { await interaction.message.edit({ components: [] }); } catch {} },
+      interaction,
+    });
+  } finally { releaseRun(ctx.gid, ctx.cid, ctx.uid); }
 }
 
 // Answer the scene by typing instead of pressing: "wis I cast into the deep
@@ -1431,13 +1520,15 @@ async function resolveActivityRoll(ctx, statWord, flavour, io, rerolled = false)
   // only if they have one to spend — otherwise it advances as before.
   const finish = async (text, next, gaAt = 0) => {
     if (text) lines.push('', text);
-    const canReroll = next && !rerolled && (ch.rerolls_current ?? 0) > 0;
+    const dryRun = !!run?.is_demo;
+    const canReroll = next && !rerolled && (dryRun || (ch.rerolls_current ?? 0) > 0);
     if (canReroll) {
       const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
       const token = `${sc.scene}:${statWord}:${next}:${gaAt}`;
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`storyrr:${uid}:${token}`)
-          .setLabel(`Reroll (${ch.rerolls_current} left)`).setStyle(ButtonStyle.Secondary),
+          .setLabel(dryRun ? 'Reroll (free — demo)' : `Reroll (${ch.rerolls_current} left)`)
+          .setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId(`storygo:${uid}:${next}:${gaAt}`)
           .setLabel('Carry on').setStyle(ButtonStyle.Primary),
       );
@@ -2245,7 +2336,7 @@ const replyThenFetch = (interaction) => async (c) => {
 // it. Silent when no approval channel is configured.
 async function refuseStatBudget({ src, gid, uid, problems, stats, reply, jumpId = null }) {
   const sent = await reply(statBudgetReply(gid, problems, stats));
-  const chId = getConfig(gid)?.approval_channel_id;
+  const chId = approvalChannelId(gid);
   if (!chId) return sent;
   const srcCh = interactionChannelId(src);
   const msgId = jumpId ?? sent?.id ?? null;
@@ -2648,7 +2739,7 @@ async function handleCharExport(interaction) {
   // isn't using approvals at all.
   const isGmUser = await isGm(interaction.guild, uid);
   if (approvalEnabled(gid) && !isGmUser && tid === uid) {
-    const chId = getConfig(gid)?.approval_channel_id;
+    const chId = approvalChannelId(gid);
     await interaction.reply({ ephemeral: true, content:
       `📤 **Export sent to <#${chId}> for a GM to look over.**\n`
       + `You'll get your sheet as soon as one releases it — by DM, or back here if your DMs are closed.\n`
@@ -3354,7 +3445,7 @@ async function handleLoreSubmit(interaction) {
   const gid = interaction.guild.id, uid = interaction.user.id;
   const body = String(interaction.fields.getTextInputValue('body') || '').trim();
   if (!body) return interaction.reply({ content: '❌ Nothing to send.', ephemeral: true });
-  const chId = getConfig(gid)?.approval_channel_id;
+  const chId = approvalChannelId(gid);
   setLore(gid, uid, { body, state: 'pending', reason: null, submitted_at: Date.now(),
     src_channel: interactionChannelId(interaction) });
   await interaction.reply({ ephemeral: true, content: chId
@@ -3428,7 +3519,7 @@ async function handleMeritGive(interaction) {
   const have = mine.merits ?? 0;
   if (have < amount) return interaction.reply({ content: `❌ You have **${have}** merit — not enough to give ${amount}.`, ephemeral: true });
 
-  const chId = getConfig(gid)?.approval_channel_id;
+  const chId = approvalChannelId(gid);
   const fromName = await getDisplayName(interaction.guild, from);
   const toName = await getDisplayName(interaction.guild, to.id);
   const trade = createMeritTrade(gid, from, to.id, amount, reason, interactionChannelId(interaction));
@@ -3482,9 +3573,14 @@ async function handleMeritTradeButton(interaction) {
     return interaction.reply({ content: `⚠️ **${fromName}** only has **${have}** merit now — the trade can't go through.` });
   }
 
+  // Claim the trade before moving anything. Two GMs pressing Approve at the
+  // same moment would otherwise both pass the pending check and pay twice.
+  const claimed = db.prepare(`UPDATE merit_trades SET state='approved', decided_by=?, decided_at=?
+                              WHERE guild_id=? AND id=? AND state='pending'`)
+    .run(interaction.user.id, Date.now(), gid, trade.id).changes === 1;
+  if (!claimed) return interaction.reply({ content: '⏰ Someone got there first — that trade is already settled.', ephemeral: true });
   addMerits(gid, trade.from_user, -trade.amount);
   addMerits(gid, trade.to_user, trade.amount);
-  setMeritTrade(gid, trade.id, { state: 'approved', decided_by: interaction.user.id, decided_at: Date.now() });
   try { await interaction.message.edit({ content: `${interaction.message.content}\n\n✅ **Approved** by ${gmName}`, components: [] }); } catch {}
 
   const notice = `🤝 **Merit trade approved** by ${gmName} in **${interaction.guild.name}** — `
@@ -3508,7 +3604,10 @@ async function handleMeritTradeRejectModal(interaction) {
   if (!trade || trade.state !== 'pending') return interaction.reply({ content: '⏰ That trade has already been settled.', ephemeral: true });
   const reason = cleanReason(interaction.fields.getTextInputValue('reason'));
   const gmName = await getDisplayName(interaction.guild, interaction.user.id);
-  setMeritTrade(gid, trade.id, { state: 'refused', reason, decided_by: interaction.user.id, decided_at: Date.now() });
+  const claimedRefusal = db.prepare(`UPDATE merit_trades SET state='refused', reason=?, decided_by=?, decided_at=?
+                                     WHERE guild_id=? AND id=? AND state='pending'`)
+    .run(reason, interaction.user.id, Date.now(), gid, trade.id).changes === 1;
+  if (!claimedRefusal) return interaction.reply({ content: '⏰ Someone got there first — that trade is already settled.', ephemeral: true });
   try { await interaction.message?.edit({ content: `${interaction.message.content}\n\n🚫 **Refused** by ${gmName}${reason ? `\n💬 ${reason}` : ''}`, components: [] }); } catch {}
   const notice = `🚫 **Your merit trade was refused** by ${gmName} in **${interaction.guild.name}**.`
     + (reason ? `\n💬 **Reason:** ${reason}` : '') + '\nNo merit changed hands.';
@@ -3741,8 +3840,8 @@ async function handleStory(interaction) {
     saveStory(gid, interaction.user.id, parsed);
     const first = getScene(gid, parsed.name, parsed.start);
     const run = setRun(gid, cid, interaction.user.id, { story: parsed.name, scene: first.scene,
-      started_at: Date.now(), tally_state: '{}', gauntlet_at: 0 });
-    await interaction.reply({ content: '🎣 **Fishing (demo)** — a dry run. Nothing you catch will be awarded.\nThis one is yours; others can start their own alongside it.' });
+      started_at: Date.now(), tally_state: '{}', gauntlet_at: 0, is_demo: 1 });
+    await interaction.reply({ content: '🎣 **Fishing (demo)** — a dry run. Nothing you catch will be awarded, and rerolls here are free.\nThis one is yours; others can start their own alongside it.' });
     return postScene(interaction.guild, cid, run, first);
   }
 
@@ -3933,7 +4032,7 @@ async function handleConfig(interaction) {
       return interaction.reply({ content: '✅ Sheet approval **disabled** — new sheets work immediately.' });
     }
     if (!channel) {
-      const cur = getConfig(gid)?.approval_channel_id;
+      const cur = approvalChannelId(gid);
       return interaction.reply({ content: cur
         ? `📋 New sheets await approval in <#${cur}>. Turn off with \`/config approvals disable:true\`.`
         : '📋 Sheet approval is **off**. Set a channel with `/config approvals channel:#x`.', ephemeral: true });
@@ -4308,7 +4407,7 @@ async function handleChar(interaction) {
 
     if (needsApproval) {
       // Reply first so the approval post can link back to a real message.
-      const chId = getConfig(gid)?.approval_channel_id;
+      const chId = approvalChannelId(gid);
       await interaction.reply({ content: chId
         ? `✅ Sheet submitted — ${summary}\n\n⏳ **Awaiting GM approval.** You can't roll or fight until it's approved.\n📬 **You'll get a DM as soon as a GM decides** — if your DMs are closed, the notice will be posted here instead.\n🔒 Once approved, only a GM can change your sheet, so check it over now with \`/char show\`.`
         : `✅ Sheet saved — ${summary}\n\n⚠️ No approval channel set; ask a GM to check \`/config approvals\`.` });
@@ -4455,7 +4554,7 @@ async function handleChar(interaction) {
     if (!ch) return interaction.reply({ content: '❌ You don\'t have a character sheet yet — make one with `/char create`.', ephemeral: true });
     if (!approvalEnabled(gid)) return interaction.reply({ content: '✅ This server doesn\'t use sheet approval — your sheet is already usable.', ephemeral: true });
     if (ch.approval_state === 'pending') {
-      const chId = getConfig(gid)?.approval_channel_id;
+      const chId = approvalChannelId(gid);
       return interaction.reply({ content: `⏳ Your sheet is already waiting${chId ? ` in <#${chId}>` : ''}. A GM will get to it.`, ephemeral: true });
     }
     if (ch.approval_state === 'approved') return interaction.reply({ content: '✅ Your sheet is already approved. Ask a GM if you need a change.', ephemeral: true });
@@ -5967,7 +6066,7 @@ function sheetEditLock(gid, callerId, targetId, isGmCaller) {
 // Approval is only enforced once a GM has set an approval channel; without one
 // the whole feature stays dormant so existing servers are unaffected.
 function approvalEnabled(gid) {
-  return !!getConfig(gid)?.approval_channel_id;
+  return !!approvalChannelId(gid);
 }
 function sheetApproved(gid, ch) {
   if (!ch) return false;
@@ -6020,7 +6119,7 @@ function exportButtons(uid) {
 // Post an export request to the approval channel. Returns the channel id, or
 // null if it couldn't be delivered.
 async function requestSheetExport(interaction, gid, uid, payload, fmt) {
-  const chId = getConfig(gid)?.approval_channel_id;
+  const chId = approvalChannelId(gid);
   if (!chId) return null;
   const nm = await getDisplayName(interaction.guild, uid);
   const roles = getGmRoleIds(gid);
@@ -6063,7 +6162,7 @@ function approvalButtons(uid) {
 // `src` is anything with .client / .guild / .channelId — a ChatInputInteraction
 // or a plain Message, since sheets arrive by slash command and by paste.
 async function requestSheetApproval(src, gid, uid, submitMessageId = null) {
-  const chId = getConfig(gid)?.approval_channel_id;
+  const chId = approvalChannelId(gid);
   if (!chId) return null;
   const ch = getChar(gid, uid);
   if (!ch) return null;
@@ -6168,7 +6267,7 @@ async function finishSheetEdit({ src, gid, callerId, targetId, isGmCaller, conte
     return out;
   }
   upsertChar(gid, targetId, { approval_state: 'pending', approval_reason: null });
-  const chId = getConfig(gid)?.approval_channel_id;
+  const chId = approvalChannelId(gid);
   const sent = await reply(content + (chId
     ? `\n\n⏳ **Sent to <#${chId}> for GM approval.** You can't roll or fight until it's signed off. Spotted a mistake? Edit it and it goes back to the front of the queue.\n📬 You'll get a DM as soon as they do.`
     : '\n\n⚠️ No approval channel set — ask a GM to check `/config approvals`.'));
@@ -6183,7 +6282,7 @@ async function finishSheetEdit({ src, gid, callerId, targetId, isGmCaller, conte
 async function warnApprovalUnreachable(src, gid, uid) {
   const roles = getGmRoleIds(gid);
   const ping = roles.length ? roles.map(r => `<@&${r}>` ).join(' ') + ' ' : '';
-  const chId = getConfig(gid)?.approval_channel_id;
+  const chId = approvalChannelId(gid);
   const text = `${ping}⚠️ **A sheet is waiting for approval but I couldn't post it to ${chId ? `<#${chId}>` : 'the approval channel'}.**\n`
     + `👤 <@${uid}> is locked out until a GM decides.\n`
     + `Check I can **View Channel** and **Send Messages** there, then see \`/config approvals list:true\`.`;
@@ -6362,7 +6461,7 @@ async function applyAutoNpcRerolls(guild, gid, cid, channel) {
   let fight = getFight(gid, cid);
   if (!fight || !fight.auto_npc) return fight;
   const rr = JSON.parse(fight.rr_state || '{}');
-  const turnOrder = JSON.parse(fight.turn_order);
+  const turnOrder = fightOrder(fight);
   const attackerId = turnOrder[fight.turn_index];
   const defenderId = fight.current_target;
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -6421,7 +6520,7 @@ function resolveFightTarget(interaction, gid, fight) {
     if (!npc) return { error: `❌ NPC **${targetNpcName}** not found.` };
     fid = npcFighterId(npc.name);
   }
-  if (!JSON.parse(fight.turn_order).includes(fid)) return { error: '❌ That fighter is not in this fight.' };
+  if (!fightOrder(fight).includes(fid)) return { error: '❌ That fighter is not in this fight.' };
   return { fid };
 }
 
@@ -6713,8 +6812,8 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active' || !fight.auto_npc) return false;
   if (fight.phase !== 'attack') return false;
-  const order = JSON.parse(fight.turn_order);
-  const hpState = JSON.parse(fight.hp_state);
+  const order = fightOrder(fight);
+  const hpState = fightHp(fight);
   const attackerId = order[fight.turn_index];
   if (!isNpcFighter(attackerId)) return false; // current fighter is a player — wait for them
 
@@ -6791,10 +6890,10 @@ async function autoNpcDefend(guild, gid, cid, channel) {
 // announceFightEnd when the fight finished, and `nextF` is the fighter whose
 // turn it now is (null when the fight ended).
 async function resolveExchange(guild, gid, cid, fight) {
-  const turnOrder = JSON.parse(fight.turn_order);
+  const turnOrder = fightOrder(fight);
   const attackerId = turnOrder[fight.turn_index];
   const defenderId = fight.current_target;
-  const hpState = JSON.parse(fight.hp_state);
+  const hpState = fightHp(fight);
   const floor = fightFloor(fight);
   const W = fightWords(floor);
   const autoOn = !!fight.auto_npc;
@@ -7004,9 +7103,7 @@ async function handleFight(interaction) {
       const lines = [`⚔️ **${W.started} Turn order (manual):**`, ''];
       if (banner) { lines.splice(1, 0, banner); }
       ordered.forEach((f,i) => lines.push(`${i+1}. **${f.name}**${f.isNpc ? ' 🎭' : ''}`));
-      lines.push('', `🎯 **${ordered[0].name}** goes first!${ordered[0].isNpc
-        ? ' _(a GM acts with `npc:`)_'
-        : '\n_`/fight atk stat:str target:@player` — or `/roll dice:2d6+3 fight:true target:@player` for a custom roll._'}${turnPing(gid, ordered[0])}`);
+      lines.push('', `🎯 **${ordered[0].name}** goes first!${turnPrompt(ordered[0])}${turnPing(gid, ordered[0])}`);
       upsertFight(gid, cid, {
         state: 'active', turn_order: JSON.stringify(turnOrder), turn_index: 0,
         phase: 'attack', current_target: null,
@@ -7046,7 +7143,7 @@ async function handleFight(interaction) {
     });
     lines.push('');
     const first = initiatives[0];
-    lines.push(`🎯 **${first.name}** goes first!${first.isNpc ? ' (GM acts with `npc:`)' : ' Use `/fight atk` to attack.'}${turnPing(gid, first)}`);
+    lines.push(`🎯 **${first.name}** goes first!${turnPrompt(first)}${turnPing(gid, first)}`);
 
     upsertFight(gid, cid, {
       state: 'active',
@@ -7072,8 +7169,8 @@ async function handleFight(interaction) {
     const names = expandNpcList(gid, interaction.options.getString('npc'));
     if (!names.length) return interaction.reply({ content: '❌ Name at least one NPC.', ephemeral: true });
 
-    const turnOrder = JSON.parse(fight.turn_order);
-    const hpState = JSON.parse(fight.hp_state);
+    const turnOrder = fightOrder(fight);
+    const hpState = fightHp(fight);
     const rrState = JSON.parse(fight.rr_state || '{}');
     const added = [];
     for (const npcName of names) {
@@ -7106,7 +7203,7 @@ async function handleFight(interaction) {
     const f = await resolveFighter(interaction.guild, gid, fid);
     const value = interaction.options.getInteger('value');
     const newHp = Math.min(value, f.maxHp || value);
-    const prev = JSON.parse(fight.hp_state)[fid] ?? '?';
+    const prev = fightHp(fight)[fid] ?? '?';
     setFighterHp(gid, fid, newHp); // sheet write → syncFightHp mirrors into hp_state
     const note = value > (f.maxHp || value) ? ' (capped at max)' : '';
     const hpFloor = fightFloor(fight);
@@ -7125,11 +7222,11 @@ async function handleFight(interaction) {
     const t = resolveFightTarget(interaction, gid, fight);
     if (t.error) return interaction.reply({ content: t.error, ephemeral: true });
     const fid = t.fid;
-    const turnOrder = JSON.parse(fight.turn_order);
+    const turnOrder = fightOrder(fight);
     const removedPos = turnOrder.indexOf(fid);
 
     const f = await resolveFighter(interaction.guild, gid, fid);
-    const hpState = JSON.parse(fight.hp_state);
+    const hpState = fightHp(fight);
     const rrState = JSON.parse(fight.rr_state || '{}');
     const newOrder = turnOrder.filter(id => id !== fid);
     delete hpState[fid]; delete rrState[fid];
@@ -7149,7 +7246,7 @@ async function handleFight(interaction) {
       upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState) });
       await interaction.reply({ content: lines.join('\n') });
       await announceFightEnd(interaction.guild, gid, cid, chan, {
-        headline, log: kickLog, roster: turnOrder, hpState: JSON.parse(fight.hp_state), floor: kickFloor,
+        headline, log: kickLog, roster: turnOrder, hpState: fightHp(fight), floor: kickFloor,
       });
       return;
     }
@@ -7175,7 +7272,7 @@ async function handleFight(interaction) {
     if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can refill NPC rerolls.', ephemeral: true });
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
-    const turnOrder = JSON.parse(fight.turn_order);
+    const turnOrder = fightOrder(fight);
     const rrState = JSON.parse(fight.rr_state || '{}');
     const raw = (interaction.options.getString('npcs') || '').trim();
     let targets;
@@ -7351,7 +7448,9 @@ async function handleFight(interaction) {
       const lines = [`⚔️ **${W.started} (NPCs auto-piloted)**`, ...(banner ? [banner] : []), '', '**Initiative:**'];
       inits.forEach((it,i)=>{ const f=F[it.fid]; lines.push(`${i+1}. **${f.name}${f.isNpc?' 🎭':''}** — 🎲 [${it.roll}] + ⚡ ${f.stats.dex} DEX = **${it.total}**`); });
       const firstF = F[order[0]];
-      lines.push('', firstF.isNpc ? `🤖 **${firstF.name}** is an NPC — the bot will take its turn automatically.` : `🎯 **${firstF.name}** goes first! Use \`/fight atk\` to attack.${turnPing(gid, firstF)}`);
+      lines.push('', firstF.isNpc
+        ? `🤖 **${firstF.name}** is an NPC — the bot will take its turn automatically.`
+        : `🎯 **${firstF.name}** goes first!${turnPrompt(firstF)}${turnPing(gid, firstF)}`);
       await interaction.reply({ content: lines.join('\n') });
       // If the first fighter is an NPC, kick off its turn
       if (firstF.isNpc) { await sleep(1200); await runAutoNpcChain(interaction.guild, gid, cid, channel); }
@@ -7505,7 +7604,7 @@ async function handleFight(interaction) {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
 
-    const currentOrder = JSON.parse(fight.turn_order);
+    const currentOrder = fightOrder(fight);
     const seqStr = interaction.options.getString('sequence');
     const playersStr = interaction.options.getString('players');
 
@@ -7563,7 +7662,7 @@ async function handleFight(interaction) {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
 
-    const turnOrder = JSON.parse(fight.turn_order);
+    const turnOrder = fightOrder(fight);
     const currentId = turnOrder[fight.turn_index];
     const npcActAs = interaction.options.getString('npc'); // GM acting as an NPC
 
@@ -7600,7 +7699,7 @@ async function handleFight(interaction) {
     if (!turnOrder.includes(targetId)) return interaction.reply({ content: '❌ That target is not in this fight.', ephemeral: true });
     if (targetId === actorId) return interaction.reply({ content: '❌ You cannot target yourself.', ephemeral: true });
 
-    const hpState = JSON.parse(fight.hp_state);
+    const hpState = fightHp(fight);
     const atkFloor = fightFloor(fight);
     if (hpState[targetId] !== undefined && hpState[targetId] <= atkFloor) {
       return interaction.reply({ content: atkFloor > 0 ? '❌ That fighter has already yielded the bout.' : '❌ That target is already down.', ephemeral: true });
@@ -7760,7 +7859,7 @@ async function handleFight(interaction) {
     let fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
 
-    const turnOrder = JSON.parse(fight.turn_order);
+    const turnOrder = fightOrder(fight);
     const isAttacker = turnOrder[fight.turn_index] === uid;
     const isDefender = fight.current_target === uid && fight.phase === 'defend';
 
@@ -7862,12 +7961,12 @@ async function handleFight(interaction) {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
 
-    const turnOrder = JSON.parse(fight.turn_order);
+    const turnOrder = fightOrder(fight);
     if (!turnOrder.includes(uid)) return interaction.reply({ content: '❌ You are not in this fight.', ephemeral: true });
 
     const member = await interaction.guild.members.fetch(uid).catch(()=>null);
     const name = member?.nickname || member?.user.username || uid;
-    const hpState = JSON.parse(fight.hp_state);
+    const hpState = fightHp(fight);
 
     // HP state preserved as-is
     const newOrder = turnOrder.filter(id => id !== uid);
@@ -7910,8 +8009,8 @@ async function handleFight(interaction) {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: false });
 
-    const turnOrder = JSON.parse(fight.turn_order);
-    const hpState = JSON.parse(fight.hp_state);
+    const turnOrder = fightOrder(fight);
+    const hpState = fightHp(fight);
     const rrState = JSON.parse(fight.rr_state || '{}');
     const fxState = JSON.parse(fight.effect_state || '{}');
     const currentId = turnOrder[fight.turn_index];
@@ -7964,7 +8063,7 @@ async function handleFight(interaction) {
     if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can skip turns.', ephemeral: true });
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
-    const turnOrder = JSON.parse(fight.turn_order);
+    const turnOrder = fightOrder(fight);
     const hpState = JSON.parse(fight.hp_state || '{}');
     const attackerId = turnOrder[fight.turn_index];
     const waitedOnId = fight.phase === 'defend' ? fight.current_target : attackerId;
@@ -9485,9 +9584,9 @@ async function handleQuest(interaction) {
   }
 
   if (sub === 'show' || sub === 'roster') {
-    const number = interaction.options.getInteger('number');
-    const quest = getQuest(gid, number);
-    if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const number = quest.number;
     if (sub === 'show') return interaction.reply({ content: await renderQuest(interaction.guild, quest) });
     // roster
     const party = getQuestMembers(gid, number, 'party');
@@ -9505,9 +9604,9 @@ async function handleQuest(interaction) {
   }
 
   if (sub === 'apply' || sub === 'withdraw') {
-    const number = interaction.options.getInteger('number');
-    const quest = getQuest(gid, number);
-    if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const number = quest.number;
     const res = sub === 'apply' ? await questApply(interaction.guild, quest, uid) : await questWithdraw(interaction.guild, quest, uid);
     if (res.error) return interaction.reply({ content: res.error, ephemeral: true });
     await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, number));
@@ -9551,9 +9650,9 @@ async function handleQuest(interaction) {
   }
 
   if (sub === 'post') {
-    const number = interaction.options.getInteger('number');
-    const quest = getQuest(gid, number);
-    if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const number = quest.number;
     const channel = interaction.options.getChannel('channel') ?? await interactionChannel(interaction);
     if (!channel) return interaction.reply({ content: '❌ I can\'t access that channel. Pick one explicitly with `channel:`.', ephemeral: true });
     if (!channel.isTextBased?.() && !channel.isThread?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
@@ -9564,9 +9663,9 @@ async function handleQuest(interaction) {
   }
 
   if (sub === 'runchannel') {
-    const number = interaction.options.getInteger('number');
-    const quest = getQuest(gid, number);
-    if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const number = quest.number;
     const channel = interaction.options.getChannel('channel') ?? await interactionChannel(interaction);
     if (!channel) return interaction.reply({ content: '❌ I can\'t access that channel. Pick one explicitly with `channel:`.', ephemeral: true });
     updateQuest(gid, number, { run_channel_id: channel.id });
@@ -9575,9 +9674,9 @@ async function handleQuest(interaction) {
   }
 
   if (sub === 'approve') {
-    const number = interaction.options.getInteger('number');
-    const quest = getQuest(gid, number);
-    if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const number = quest.number;
     const target = interaction.options.getUser('user');
     const force = interaction.options.getBoolean('force') ?? false;
     const party = getQuestMembers(gid, number, 'party');
@@ -9593,9 +9692,9 @@ async function handleQuest(interaction) {
   }
 
   if (sub === 'kick') {
-    const number = interaction.options.getInteger('number');
-    const quest = getQuest(gid, number);
-    if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const number = quest.number;
     const target = interaction.options.getUser('user');
     const removed = removeQuestMember(gid, number, target.id);
     if (!removed) return interaction.reply({ content: 'They\'re not on this quest.', ephemeral: true });
@@ -9605,9 +9704,9 @@ async function handleQuest(interaction) {
   }
 
   if (sub === 'start') {
-    const number = interaction.options.getInteger('number');
-    const quest = getQuest(gid, number);
-    if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const number = quest.number;
     if (quest.status === 'completed') return interaction.reply({ content: '❌ That quest is already completed.', ephemeral: true });
     const party = getQuestMembers(gid, number, 'party');
     if (!party.length) return interaction.reply({ content: '❌ No party members yet — approve applicants first.', ephemeral: true });
@@ -9651,9 +9750,9 @@ async function handleQuest(interaction) {
   }
 
   if (sub === 'pause' || sub === 'resume') {
-    const number = interaction.options.getInteger('number');
-    const quest = getQuest(gid, number);
-    if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const number = quest.number;
     if (quest.status !== 'active') return interaction.reply({ content: '❌ That quest is not running.', ephemeral: true });
     const paused = !!quest.paused;
     if (sub === 'pause') {
@@ -9670,9 +9769,9 @@ async function handleQuest(interaction) {
   }
 
   if (sub === 'note') {
-    const number = interaction.options.getInteger('number');
-    const quest = getQuest(gid, number);
-    if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const number = quest.number;
     if (quest.status !== 'active') return interaction.reply({ content: '❌ That quest is not running.', ephemeral: true });
     const text = interaction.options.getString('text');
     const kind = interaction.options.getString('kind') || 'note';
@@ -9681,9 +9780,9 @@ async function handleQuest(interaction) {
   }
 
   if (sub === 'timeline') {
-    const number = interaction.options.getInteger('number');
-    const quest = getQuest(gid, number);
-    if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const number = quest.number;
     const events = questEvents(gid, number);
     if (!events.length) return interaction.reply({ content: `📜 **${questTag(quest)}** has nothing logged yet.`, ephemeral: true });
     return replyLong(interaction, [
@@ -9692,9 +9791,9 @@ async function handleQuest(interaction) {
   }
 
   if (sub === 'complete') {
-    const number = interaction.options.getInteger('number');
-    const quest = getQuest(gid, number);
-    if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const number = quest.number;
     if (quest.status === 'completed') return interaction.reply({ content: '❌ That quest is already completed.', ephemeral: true });
     const party = getQuestMembers(gid, number, 'party');
     if (!party.length) return interaction.reply({ content: '❌ No party members to reward. Approve applicants first.', ephemeral: true });
@@ -9793,9 +9892,9 @@ async function handleQuest(interaction) {
   }
 
   if (sub === 'delete') {
-    const number = interaction.options.getInteger('number');
-    const quest = getQuest(gid, number);
-    if (!quest) return interaction.reply({ content: `❌ No quest #${String(number).padStart(3,'0')}.`, ephemeral: true });
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const number = quest.number;
     return requestConfirm(interaction, `Delete **${questTag(quest)}** permanently? This clears its roster and removes it from the board.`, async () => {
       // Best-effort: strip buttons from the posted message
       if (quest.post_channel_id && quest.post_message_id) {
