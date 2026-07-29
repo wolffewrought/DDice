@@ -81,8 +81,20 @@ try { db.exec('ALTER TABLE characters ADD COLUMN approval_reason TEXT'); } catch
 // The emoji columns carry a default (⚔️/🗡️), so their value can't tell us whether
 // a player actually picked one. These record that they did, per slot, so a sheet
 // can be required to be finished before a GM ever sees it.
-try { db.exec('ALTER TABLE characters ADD COLUMN weapon1emoji_set INTEGER DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN weapon2emoji_set INTEGER DEFAULT 0'); } catch {}
+// The ALTER only succeeds on the boot that introduces the column, so the
+// backfill beside it runs exactly once. Without it, every character approved
+// before this existed would be told to choose an emoji they already have the
+// moment they next edited their sheet.
+try {
+  db.exec('ALTER TABLE characters ADD COLUMN weapon1emoji_set INTEGER DEFAULT 0');
+  db.exec("UPDATE characters SET weapon1emoji_set=1 WHERE weapon1 IS NOT NULL AND TRIM(weapon1) <> '' AND weapon1emoji IS NOT NULL");
+  console.log('[migrate] existing weapon 1 emoji choices preserved');
+} catch {}
+try {
+  db.exec('ALTER TABLE characters ADD COLUMN weapon2emoji_set INTEGER DEFAULT 0');
+  db.exec("UPDATE characters SET weapon2emoji_set=1 WHERE weapon2 IS NOT NULL AND TRIM(weapon2) <> '' AND weapon2emoji IS NOT NULL");
+  console.log('[migrate] existing weapon 2 emoji choices preserved');
+} catch {}
 
 // ── Quest timing ─────────────────────────────────────────────────────────────
 // A quest runs on a stopwatch: started_at is when the current stretch began,
@@ -152,6 +164,16 @@ try { db.exec('ALTER TABLE quests ADD COLUMN instance_of INTEGER'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN merits INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN renown INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN lore TEXT'); } catch {}
+// An NPC carries what it fights with, the same as a player — otherwise weapon
+// stat restrictions could never apply to the side the bot plays.
+try { db.exec('ALTER TABLE npcs ADD COLUMN weapon1 TEXT'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN weapon2 TEXT'); } catch {}
+// Which stat the auto-pilot should reach for. Without this it always takes the
+// highest, so a character who fights with finesse over force had no say.
+try { db.exec('ALTER TABLE npcs ADD COLUMN preferred_atk TEXT'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN preferred_def TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN preferred_atk TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN preferred_def TEXT'); } catch {}
 // One reroll per roll. A saved roll is marked the moment it is rerolled, so a
 // second attempt on the same result is refused rather than letting someone
 // chain rerolls until the dice agree with them.
@@ -1432,7 +1454,12 @@ function sceneStats(sc, run) {
 // 0 = off, 1 = full (the long-standing default), 2 = compressed.
 const CARD_OFF = 0, CARD_FULL = 1, CARD_COMPACT = 2;
 function cardMode(ch) {
-  const v = Number(ch?.profile_enabled);
+  // NULL and undefined both mean "never chose" and must read as the long-standing
+  // default. Coercing first would turn a NULL into 0 and silently switch an old
+  // character's card off.
+  const raw = ch?.profile_enabled;
+  if (raw === null || raw === undefined || raw === '') return CARD_FULL;
+  const v = Number(raw);
   return v === CARD_COMPACT ? CARD_COMPACT : v === CARD_OFF ? CARD_OFF : CARD_FULL;
 }
 const CARD_NAME = { [CARD_OFF]: 'Off', [CARD_FULL]: 'Full', [CARD_COMPACT]: 'Compressed' };
@@ -1462,7 +1489,7 @@ async function handleStoryRerollButton(interaction) {
   try {
     return await resolveActivityRoll(fresh, statWord, null, {
       guild: interaction.guild,
-      reply: async (content) => { await interaction.reply(typeof content === 'string' ? { content } : content); },
+      reply: async (c) => { await interaction.reply(asPayload(c)); },
       interaction,
     }, true);
   } finally { releaseRun(gid, cid, uid); }
@@ -1497,7 +1524,7 @@ async function handleStoryRollButton(interaction) {
   try {
     return await resolveActivityRoll(ctx, statWord, null, {
       guild: interaction.guild,
-      reply: async (content) => { await interaction.reply({ content }); try { await interaction.message.edit({ components: [] }); } catch {} },
+      reply: async (c) => { await interaction.reply(asPayload(c)); try { await interaction.message.edit({ components: [] }); } catch {} },
       interaction,
     });
   } finally { releaseRun(ctx.gid, ctx.cid, ctx.uid); }
@@ -1525,10 +1552,15 @@ async function tryActivityTypedRoll(message, content) {
 
   await resolveActivityRoll({ gid, cid, uid, run, ch, sc }, stat, (m[2] || '').trim() || null, {
     guild: message.guild,
-    reply: async (c) => { await message.reply(c).catch(()=>{}); },
+    reply: async (c) => { await message.reply(asPayload(c)).catch(()=>{}); },
   });
   return true;
 }
+
+// A scene reply is sometimes just text and sometimes text plus buttons. Every
+// shim goes through this so it cannot matter which one a caller sent — passing
+// an object where a string was expected was what broke the roll buttons.
+const asPayload = (c) => (typeof c === 'string' ? { content: c } : c);
 
 async function resolveActivityRoll(ctx, statWord, flavour, io, rerolled = false) {
   const { gid, cid, uid, run, ch, sc } = ctx;
@@ -3276,6 +3308,13 @@ const slashCommands = [
           {name:'🦉 Wisdom (WIS)',value:'wis'},
           {name:'🍀 Luck (LCK)',value:'lck'})))
     .addSubcommand(s=>s.setName('submit').setDescription('Send your sheet to the GMs for approval again'))
+    .addSubcommand(s=>s.setName('prefer').setDescription('Which stats the bot should use when it rolls for you on auto')
+      .addStringOption(o=>o.setName('atk').setDescription('Attack with').setRequired(false)
+        .addChoices({name:'💪 Strength',value:'str'},{name:'🫀 Constitution',value:'con'},{name:'⚡ Dexterity',value:'dex'},
+                    {name:'🧠 Wisdom',value:'wis'},{name:'🍀 Luck',value:'lck'},{name:'✖️ Clear it',value:'none'}))
+      .addStringOption(o=>o.setName('def').setDescription('Defend with').setRequired(false)
+        .addChoices({name:'💪 Strength',value:'str'},{name:'🫀 Constitution',value:'con'},{name:'⚡ Dexterity',value:'dex'},
+                    {name:'🧠 Wisdom',value:'wis'},{name:'🍀 Luck',value:'lck'},{name:'✖️ Clear it',value:'none'})))
     .addSubcommand(s=>s.setName('summary').setDescription('Everything about a character on one page')
       .addUserOption(o=>o.setName('user').setDescription('Whose character').setRequired(false)))
     .addSubcommand(s=>s.setName('inventory').setDescription('Items a character is carrying')
@@ -3403,6 +3442,14 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('con').setDescription('Constitution').setRequired(false))
       .addIntegerOption(o=>o.setName('dex').setDescription('Dexterity').setRequired(false))
       .addIntegerOption(o=>o.setName('wis').setDescription('Wisdom').setRequired(false))
+      .addStringOption(o=>o.setName('weapon1').setDescription('What they fight with — restricts their stats if the weapon does').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('weapon2').setDescription('A second weapon').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('atk_stat').setDescription('Which stat the bot should attack with on auto').setRequired(false)
+        .addChoices({name:'💪 Strength',value:'str'},{name:'🫀 Constitution',value:'con'},{name:'⚡ Dexterity',value:'dex'},
+                    {name:'🧠 Wisdom',value:'wis'},{name:'🍀 Luck',value:'lck'},{name:'✖️ Clear it',value:'none'}))
+      .addStringOption(o=>o.setName('def_stat').setDescription('Which stat the bot should defend with on auto').setRequired(false)
+        .addChoices({name:'💪 Strength',value:'str'},{name:'🫀 Constitution',value:'con'},{name:'⚡ Dexterity',value:'dex'},
+                    {name:'🧠 Wisdom',value:'wis'},{name:'🍀 Luck',value:'lck'},{name:'✖️ Clear it',value:'none'}))
       .addIntegerOption(o=>o.setName('lck').setDescription('Luck').setRequired(false))
       .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
         .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'})))
@@ -3478,6 +3525,14 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('dex').setDescription('Dexterity').setRequired(true))
       .addIntegerOption(o=>o.setName('wis').setDescription('Wisdom').setRequired(true))
       .addIntegerOption(o=>o.setName('lck').setDescription('Luck').setRequired(true))
+      .addStringOption(o=>o.setName('weapon1').setDescription('What they fight with — restricts their stats if the weapon does').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('weapon2').setDescription('A second weapon').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('atk_stat').setDescription('Which stat the bot should attack with on auto').setRequired(false)
+        .addChoices({name:'💪 Strength',value:'str'},{name:'🫀 Constitution',value:'con'},{name:'⚡ Dexterity',value:'dex'},
+                    {name:'🧠 Wisdom',value:'wis'},{name:'🍀 Luck',value:'lck'},{name:'✖️ Clear it',value:'none'}))
+      .addStringOption(o=>o.setName('def_stat').setDescription('Which stat the bot should defend with on auto').setRequired(false)
+        .addChoices({name:'💪 Strength',value:'str'},{name:'🫀 Constitution',value:'con'},{name:'⚡ Dexterity',value:'dex'},
+                    {name:'🧠 Wisdom',value:'wis'},{name:'🍀 Luck',value:'lck'},{name:'✖️ Clear it',value:'none'}))
       .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
         .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'})))
     .addSubcommand(s=>s.setName('sheet').setDescription('An NPC\'s full record — stats, standing, inventory, rolls, lore')
@@ -3959,7 +4014,21 @@ async function handleNpcPages(interaction, sub) {
   lines.push(`❤️  HP          ${npc.hp_current} / ${max}`);
   lines.push('', `💪  STR         ${npc.str ?? 0}`, `🫀  CON         ${npc.con ?? 0}`,
              `⚡  DEX         ${npc.dex ?? 0}`, `🧠  WIS         ${npc.wis ?? 0}`, `🍀  LCK         ${npc.lck ?? 0}`);
+  if (npc.weapon1 || npc.weapon2) {
+    lines.push('');
+    for (const w of [npc.weapon1, npc.weapon2].filter(Boolean)) {
+      const row = getWeaponRow(gid, w);
+      const bits = [];
+      if (row?.atk_stats) bits.push(`⚔️ ${parseStatList(row.atk_stats).map(x => x.toUpperCase()).join('/')}`);
+      if (row?.def_stats) bits.push(`🛡️ ${parseStatList(row.def_stats).map(x => x.toUpperCase()).join('/')}`);
+      lines.push(`⚔️  ${w}${bits.length ? `  ·  ${bits.join(' ')}` : ''}`);
+    }
+  }
 
+  if (npc.preferred_atk || npc.preferred_def) {
+    lines.push('', `🎯  Auto — ⚔️ ${npc.preferred_atk ? STAT_LABELS[npc.preferred_atk] : 'best allowed'}`
+      + ` · 🛡️ ${npc.preferred_def ? STAT_LABELS[npc.preferred_def] : 'best allowed'}`);
+  }
   lines.push('', `🏅 **Standing** — **${npc.merits ?? 0}** merit${(npc.merits ?? 0) === 1 ? '' : 's'} · 💠 **${npc.renown ?? 0}** renown`);
   const ev = standingEvents(gid, id, 10);
   for (const e of ev) {
@@ -5223,6 +5292,43 @@ async function handleChar(interaction) {
       ...loreLines()]);
   }
 
+  if (sub === 'prefer') {
+    const ch = getChar(gid, callerId);
+    if (!ch) return interaction.reply({ content: '❌ You need a character sheet first — `/char create`.', ephemeral: true });
+    const atk = interaction.options.getString('atk');
+    const def = interaction.options.getString('def');
+    if (atk === null && def === null) {
+      const say = (v, kind) => {
+        if (!v) return `_no preference — the bot uses your best allowed stat_`;
+        const allowed = allowedFightStats(gid, ch, kind);
+        const honoured = !allowed || allowed.includes(v);
+        return `**${STAT_LABELS[v]}**` + (honoured ? '' : ' _(your weapons don\'t allow it, so your best is used instead)_');
+      };
+      return interaction.reply({ ephemeral: true, content: [
+        '🎯 **When the bot rolls for you on auto**',
+        `⚔️ Attack — ${say(ch.preferred_atk, 'atk')}`,
+        `🛡️ Defend — ${say(ch.preferred_def, 'def')}`,
+        '', '_`/char prefer atk:Dexterity` to set one, or `atk:Clear it` to remove it._',
+      ].join('\n') });
+    }
+    const fields = {};
+    if (atk !== null) fields.preferred_atk = atk === 'none' ? null : atk;
+    if (def !== null) fields.preferred_def = def === 'none' ? null : def;
+    upsertChar(gid, callerId, fields);
+    const after = getChar(gid, callerId);
+    const line = (v, kind, what) => {
+      if (!v) return `${what} — _no preference, your best allowed stat is used_`;
+      const allowed = allowedFightStats(gid, after, kind);
+      return `${what} — **${STAT_LABELS[v]}**`
+        + (allowed && !allowed.includes(v) ? ` ⚠️ _your weapons don't allow it, so your best is used instead_` : '');
+    };
+    return interaction.reply({ ephemeral: true, content: [
+      '🎯 **Auto-roll preference saved.**',
+      line(after.preferred_atk, 'atk', '⚔️ Attack'),
+      line(after.preferred_def, 'def', '🛡️ Defend'),
+    ].join('\n') });
+  }
+
   if (sub === 'edit') {
     if (!(await isGm(interaction.guild, callerId)))
       return interaction.reply({ content: '❌ Only GMs can reword items.', ephemeral: true });
@@ -5907,6 +6013,19 @@ client.on('interactionCreate', async interaction => {
       console.log(`Autocomplete: cmd=${interaction.commandName} sub=${interaction.options.getSubcommand(false)} focused=${focusedOption.name} value=${focusedOption.value}`);
 
       // Quest number autocomplete — shows "#001-Goblin Cave" filtered by status per subcommand
+      // Any weapon slot, on any command, offers what the server actually has —
+      // so an NPC can only be handed a weapon whose stat rules are known.
+      if (focusedOption.name === 'weapon1' || focusedOption.name === 'weapon2') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        const rows = db.prepare('SELECT * FROM weapons WHERE guild_id=? ORDER BY name').all(interaction.guild.id);
+        const pick = rows.filter(w => w.name.toLowerCase().includes(v)).slice(0, 25);
+        return interaction.respond(pick.map(w => {
+          const a = w.atk_stats ? parseStatList(w.atk_stats).map(x => x.toUpperCase()).join('/') : 'any';
+          const d = w.def_stats ? parseStatList(w.def_stats).map(x => x.toUpperCase()).join('/') : 'any';
+          return { name: `${w.name} — ⚔️${a} 🛡️${d}`.slice(0, 100), value: w.name };
+        })).catch(()=>{});
+      }
+
       if (interaction.commandName === 'quest' && focusedOption.name === 'number') {
         const sub = interaction.options.getSubcommand(false);
         let quests = listQuests(interaction.guild.id);
@@ -6532,9 +6651,21 @@ function weaponStatRefusal(gid, subject, kind, stat) {
 
 // The auto-pilot picks the best stat it is actually allowed to use, rather than
 // always reaching for STR or DEX.
-function autoFightStat(stats, allowed = null) {
+function autoFightStat(stats, allowed = null, prefer = null) {
   const pool = (allowed && allowed.length) ? allowed : ['str', 'dex'];
+  // A stated preference wins, but only where the weapon permits it — so setting
+  // one can never break a weapon's rules, it just quietly does nothing there.
+  const want = resolveStatWord(prefer);
+  if (want && (!allowed || allowed.includes(want))) return want;
   return pool.reduce((best, k) => ((stats?.[k] ?? 0) > (stats?.[best] ?? 0) ? k : best), pool[0]);
+}
+
+// Everything the auto-pilot needs to know about one fighter, in one call: what
+// they are carrying, what they would rather use, and what they are best at.
+function chooseAutoStat(gid, id, stats, kind) {
+  const subject = pageSubject(gid, id);
+  return autoFightStat(stats, allowedFightStats(gid, subject, kind),
+    subject?.[kind === 'def' ? 'preferred_def' : 'preferred_atk']);
 }
 // Roll a d20 + modifier, returning { nat, total }.
 function autoRoll(mod, adv = false) {
@@ -7461,7 +7592,7 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   const targetF = await resolveFighter(guild, gid, targetId);
 
   // The bot fights within the same rules a player does.
-  const stat = autoFightStat(attacker.stats, allowedFightStats(gid, pageSubject(gid, attackerId), 'atk'));
+  const stat = chooseAutoStat(gid, attackerId, attacker.stats, 'atk');
   const atkBonus = consumeAtkBonus(gid, cid, attackerId);
   const attRow = attacker.isNpc ? getNpc(gid, attacker.name) : getChar(gid, attackerId);
   const a = autoRoll((attacker.stats[stat] ?? 0) + atkBonus, hasSignatureAdvantage(attRow, stat));
@@ -7493,7 +7624,7 @@ async function autoNpcDefend(guild, gid, cid, channel) {
   if (fight.phase !== 'defend' || !isNpcFighter(fight.current_target)) return false;
 
   const defender = await resolveFighter(guild, gid, fight.current_target);
-  const stat = autoFightStat(defender.stats, allowedFightStats(gid, pageSubject(gid, fight.current_target), 'def'));
+  const stat = chooseAutoStat(gid, fight.current_target, defender.stats, 'def');
   const flat = consumeFlatDef(gid, cid, fight.current_target);
   const defRow = defender.isNpc ? getNpc(gid, defender.name) : getChar(gid, fight.current_target);
   const d = autoRoll(flat ? 0 : (defender.stats[stat] ?? 0), !flat && hasSignatureAdvantage(defRow, stat));
@@ -8123,8 +8254,8 @@ async function handleFight(interaction) {
       const defenderId = opponents[Math.floor(Math.random() * opponents.length)];
 
       const atkF = F[attackerId], defF = F[defenderId];
-      const aStat = autoFightStat(atkF.stats, allowedFightStats(gid, pageSubject(gid, atkF.id), 'atk'));
-      const dStat = autoFightStat(defF.stats, allowedFightStats(gid, pageSubject(gid, defF.id), 'def'));
+      const aStat = chooseAutoStat(gid, atkF.id, atkF.stats, 'atk');
+      const dStat = chooseAutoStat(gid, defF.id, defF.stats, 'def');
       // Consume carry-over effects: attacker's riposte bonus, defender's flat-d20.
       const atkBonus = fxState[attackerId]?.atkBonus ?? 0;
       const defFlat = !!fxState[defenderId]?.flatDef;
@@ -8872,11 +9003,30 @@ async function handleNpc(interaction) {
       if (v !== null && (v < 0 || v > 99)) return interaction.reply({ content: `❌ ${n} must be between 0 and 99.`, ephemeral: true });
     }
     const order = interaction.options.getString('order') ?? null;
+    // Weapons behave like stats here: supply one to set it, "none" to clear it,
+    // omit it entirely to leave whatever they already carry alone.
+    const weap = {};
+    for (const slot of ['weapon1', 'weapon2']) {
+      const v = interaction.options.getString(slot);
+      if (v === null) continue;
+      const t = v.trim();
+      if (/^(none|clear|-)$/i.test(t)) { weap[slot] = null; continue; }
+      if (!getWeaponRow(gid, t)) {
+        return interaction.reply({ ephemeral: true, content:
+          `❌ **${t}** isn't on the weapon list. Add it with \`/weapon add name:${t}\` first, so its stat rules are known.` });
+      }
+      weap[slot] = getWeaponRow(gid, t).name;   // canonical casing
+    }
+    for (const [opt, col] of [['atk_stat', 'preferred_atk'], ['def_stat', 'preferred_def']]) {
+      const v = interaction.options.getString(opt);
+      if (v === null) continue;
+      weap[col] = (v === 'none') ? null : v;
+    }
     const existed = !!getNpc(gid, name);
 
     // Only write what was actually supplied — omitting a stat leaves it as-is
     // (so an NPC can be registered by name now and statted up later).
-    const fields = {};
+    const fields = { ...weap };
     for (const [k, v] of [['str',str],['con',con],['dex',dex],['wis',wis],['lck',lck]]) {
       if (v !== null) fields[k] = v;
     }
