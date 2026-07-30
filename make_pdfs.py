@@ -893,6 +893,13 @@ CONTENT = [
 ('p', 'Pressing <b>Revive</b> brings them back at full HP and <b>deletes both posts</b> \u2014 a death that was '
       'undone does not linger in the hall. If the same character falls again, the button carries a tally '
       'beside it: <b>Fallen 3\u00d7 \u00b7 revived 2\u00d7</b>.'),
+('p', '<b>The fallen take no further part.</b> A dead character cannot roll, cannot answer an activity, '
+      'cannot fight and cannot apply for new work \u2014 and a dead <b>NPC</b> is the same: it cannot be spoken '
+      'as with <b>/pr say</b>, cannot roll, cannot be fought as, and the auto-pilot passes over it rather '
+      'than taking its turn. Nobody can attack one either.'),
+('note', 'Refusals are private. A slash command answers only to whoever ran it; a typed roll is answered by '
+         'DM, falling back to a channel reply if your DMs are shut \u2014 being told your character is dead in '
+         'front of the table every time you forget is its own small punishment.'),
 ('note', 'Nothing is deleted from the character. A fallen one keeps their whole record, so a revival costs '
          'nothing and the account can be rebuilt. Until they are brought back they cannot roll: the fallen '
          'take no more actions.'),

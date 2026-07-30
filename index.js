@@ -1563,7 +1563,7 @@ async function tryActivityTypedRoll(message, content) {
   if (!sceneStats(sc, run).map(resolveStatWord).includes(stat)) return false;   // wrong stat for this step
 
   const gate = sheetGate(gid, uid);
-  if (gate) { await message.reply(gate).catch(()=>{}); return true; }
+  if (gate) { await replyQuietly(message, gate); return true; }
   const ch = getChar(gid, uid);
   if (!ch) { await message.reply('❌ You need a character sheet to take part — `/char create`.').catch(()=>{}); return true; }
 
@@ -5721,7 +5721,7 @@ async function handleProfile(interaction) {
 async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
   const gid = message.guild.id, cid = message.channel.id, uid = message.author.id;
   const gateMsg = sheetGate(gid, uid);
-  if (gateMsg) return message.reply(gateMsg);
+  if (gateMsg) return replyQuietly(message, gateMsg);
   let notation, label, flavour, statRolled = null;
 
   if (isReroll) {
@@ -5776,7 +5776,7 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
 async function handleHeal(message, rest) {
   const gid = message.guild.id, uid = message.author.id, cid = message.channel.id;
   const gateMsg = sheetGate(gid, uid);
-  if (gateMsg) return message.reply(gateMsg);
+  if (gateMsg) return replyQuietly(message, gateMsg);
   // Accept the mention anywhere in the argument, not just flush at the start —
   // "!heal @user", "!heal  @user" and "!heal please @user" all work.
   const mentionMatch = rest.match(/<@!?(\d+)>/);
@@ -7085,6 +7085,25 @@ function purgeSubjectRecords(gid, id) {
   return counts;
 }
 
+// A typed message has no ephemeral reply, so a death refusal goes by DM where
+// possible: being told your character is dead in front of the table, every time
+// you forget, is its own small punishment.
+async function replyQuietly(message, content) {
+  try { await message.author.send(content); return true; }
+  catch { await message.reply(content).catch(()=>{}); return false; }
+}
+
+// The refusal a dead character gets, whoever they are. NPCs could still speak,
+// roll and fight after being killed — only player sheets were ever checked.
+function deathGate(gid, id) {
+  const subject = pageSubject(gid, id);
+  if (!subject?.died_at) return null;
+  const fell = `<t:${Math.floor(Number(subject.died_at) / 1000)}:R>`;
+  return isNpcFighter(id)
+    ? `🕯️ **${subject.name}** fell ${fell} and takes no further part. \`/gmrevive npc:${subject.name}\` brings them back.`
+    : `🕯️ **${subject.displayName ?? 'That character'}** fell ${fell} and can no longer act. A GM can bring them back with \`/gmrevive\`.`;
+}
+
 function isFallen(gid, id) {
   return !!pageSubject(gid, id)?.died_at;
 }
@@ -7825,6 +7844,8 @@ async function postAsNpc(channel, gid, npcName, content) {
 // If the next current fighter is also an NPC after resolution, the resolve handler
 // will call this again. Returns true if it acted.
 async function runAutoNpcTurn(guild, gid, cid, channel) {
+  // A fallen NPC is skipped rather than refused — nobody pressed anything, and
+  // the fight should carry on around them.
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active' || !fight.auto_npc) return false;
   if (fight.phase !== 'attack') return false;
@@ -7832,11 +7853,12 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   const hpState = fightHp(fight);
   const attackerId = order[fight.turn_index];
   if (!isNpcFighter(attackerId)) return false; // current fighter is a player — wait for them
+  if (isFallen(gid, attackerId)) return false;  // fallen NPCs take no turn
 
   const attacker = await resolveFighter(guild, gid, attackerId);
   // pick a random opponent still standing (above the bout floor / 0)
   const npcFloor = fightFloor(fight);
-  const opponents = order.filter(fid => fid !== attackerId && (hpState[fid] ?? 0) > npcFloor);
+  const opponents = order.filter(fid => fid !== attackerId && (hpState[fid] ?? 0) > npcFloor && !isFallen(gid, fid));
   if (!opponents.length) return false;
   const targetId = opponents[Math.floor(Math.random() * opponents.length)];
   const targetF = await resolveFighter(guild, gid, targetId);
@@ -7872,6 +7894,7 @@ async function autoNpcDefend(guild, gid, cid, channel) {
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active' || !fight.auto_npc) return false;
   if (fight.phase !== 'defend' || !isNpcFighter(fight.current_target)) return false;
+  if (isFallen(gid, fight.current_target)) return false;   // the fallen do not defend
 
   const defender = await resolveFighter(guild, gid, fight.current_target);
   const stat = chooseAutoStat(gid, fight.current_target, defender.stats, 'def');
@@ -8689,6 +8712,10 @@ async function handleFight(interaction) {
     if (npcActAs) {
       if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can act as an NPC.', ephemeral: true });
       actorId = npcFighterId(npcActAs);
+      {
+        const gate0 = deathGate(gid, actorId);
+        if (gate0) return interaction.reply({ content: gate0, ephemeral: true });
+      }
       if (!isNpcFighter(currentId) || currentId !== actorId) {
         const cur = await resolveFighter(interaction.guild, gid, currentId);
         return interaction.reply({ content: `⚠️ It's **${cur.name}**'s turn, not **${npcActAs}**'s.`, ephemeral: true });
@@ -9559,6 +9586,12 @@ async function handlePr(interaction) {
   }
 
   if (sub === 'say') {
+    {
+      // Roleplay included: a fallen NPC has no more lines.
+      const npcName0 = (interaction.options.getString('name') || '').trim();
+      const gate0 = npcName0 ? deathGate(gid, npcFighterId(npcName0)) : null;
+      if (gate0) return interaction.reply({ content: gate0, ephemeral: true });
+    }
     const name = interaction.options.getString('name');
     const action = interaction.options.getString('action');
     const speech = interaction.options.getString('speech');
@@ -9600,6 +9633,11 @@ async function handlePr(interaction) {
   }
 
   if (sub === 'roll') {
+    {
+      const npcName0 = (interaction.options.getString('name') || '').trim();
+      const gate0 = npcName0 ? deathGate(gid, npcFighterId(npcName0)) : null;
+      if (gate0) return interaction.reply({ content: gate0, ephemeral: true });
+    }
     const category = interaction.options.getString('category') ?? 'all';
     const name     = interaction.options.getString('name');
     // Creating an NPC's webhook is slow; defer so we never miss the 3s ack.
