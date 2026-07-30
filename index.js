@@ -10277,10 +10277,12 @@ async function handleGmHeal(interaction) {
     const maxCharges0 = cfg0.heal_charges ?? 3;
     const lines = [];
     let players = 0, npcs = 0;
+    // Counted across both branches below, so it has to live out here — it was
+    // declared inside the players block and threw for a scope:NPCs heal.
+    let fallenSkipped = 0;
 
     if (scope === 'players' || scope === 'all') {
       const sheets = db.prepare('SELECT * FROM characters WHERE guild_id=?').all(gid);
-      let fallenSkipped = 0;
       for (const ch of sheets) {
         // A heal is not a resurrection — that needs /gmrevive and a decision.
         if (ch.died_at) { fallenSkipped++; continue; }
