@@ -157,6 +157,25 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN memorial_channel TEXT'); } ca
 // the story without the bookkeeping. Both message ids are kept so a revival can
 // clear the pair.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN memorial_public_channel TEXT'); } catch {}
+// A forum where each approved character gets a page of their own. The thread is
+// the character's; the bot only needs to know which thread belongs to whom so it
+// can link to it.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN char_forum TEXT'); } catch {}
+// A duel is a proposal until a GM signs it off. One open proposal per player,
+// so the board can't be papered with them.
+try { db.exec(`CREATE TABLE IF NOT EXISTS duels (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, opener TEXT NOT NULL,
+  fighters TEXT NOT NULL DEFAULT '[]', terms TEXT,
+  state TEXT NOT NULL DEFAULT 'open',
+  msg_id TEXT, approval_msg_id TEXT,
+  created_at INTEGER NOT NULL, decided_by TEXT, decided_at INTEGER, reason TEXT
+)`); } catch (e) { console.error('duels schema', e); }
+try { db.exec(`CREATE TABLE IF NOT EXISTS char_pages (
+  guild_id TEXT NOT NULL, user_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL, url TEXT, title TEXT, at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, user_id)
+)`); } catch (e) { console.error('char_pages schema', e); }
 try { db.exec('ALTER TABLE deaths ADD COLUMN public_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE deaths ADD COLUMN revived_at INTEGER'); } catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN died_at INTEGER'); } catch {}
@@ -189,6 +208,19 @@ try { db.exec('ALTER TABLE npcs ADD COLUMN weapon2 TEXT'); } catch {}
 // highest, so a character who fights with finesse over force had no say.
 try { db.exec('ALTER TABLE npcs ADD COLUMN preferred_atk TEXT'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN preferred_def TEXT'); } catch {}
+// Hero used to occupy the class slot, which meant a Hero could be nothing else.
+// As a flag it sits alongside a class and a knight order, and a GM can toggle
+// it without rewriting the sheet. The backfill runs on the boot that adds the
+// column, moving anyone whose class said Hero across and freeing that slot.
+try {
+  db.exec('ALTER TABLE characters ADD COLUMN is_hero INTEGER DEFAULT 0');
+  db.exec("UPDATE characters SET is_hero=1, class=NULL WHERE class='Hero' COLLATE NOCASE");
+  console.log('[migrate] existing Heroes moved to the hero flag');
+} catch {}
+try {
+  db.exec('ALTER TABLE npcs ADD COLUMN is_hero INTEGER DEFAULT 0');
+  db.exec("UPDATE npcs SET is_hero=1, class=NULL WHERE class='Hero' COLLATE NOCASE");
+} catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN preferred_atk TEXT'); } catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN preferred_def TEXT'); } catch {}
 // One reroll per roll. A saved roll is marked the moment it is rerolled, so a
@@ -1737,20 +1769,56 @@ function questBusyUsers(gid) {
   return new Set(rows.map(r => r.user_id));
 }
 
-// Apply one schedule to everyone not out on a quest.
+// Everyone standing in an active fight anywhere on this server. Healing them
+// on a timer would undo an exchange partway through — the one thing a scheduled
+// rest must never do.
+function fightBusyUsers(gid) {
+  const out = new Set();
+  let rows;
+  try { rows = db.prepare(`SELECT turn_order FROM fights WHERE guild_id=? AND state='active'`).all(gid); }
+  catch { return out; }
+  for (const r of rows) {
+    let order = [];
+    try { order = JSON.parse(r.turn_order || '[]'); } catch {}
+    for (const fid of order) if (!isNpcFighter(fid)) out.add(fid);
+  }
+  return out;
+}
+
+// The NPC half of the same question. Kept separate because a fight stores NPCs
+// by their prefixed id and the roster works in plain names.
+function fightingNpcNames(gid) {
+  const out = new Set();
+  let rows;
+  try { rows = db.prepare(`SELECT turn_order FROM fights WHERE guild_id=? AND state='active'`).all(gid); }
+  catch { return out; }
+  for (const r of rows) {
+    let order = [];
+    try { order = JSON.parse(r.turn_order || '[]'); } catch {}
+    for (const fid of order) {
+      const name = npcNameFromFighter(fid);
+      if (name) out.add(name);
+    }
+  }
+  return out;
+}
+
+// Apply one schedule to everyone not out on a quest or mid-fight.
 async function runAutoRest(guild, sc) {
   const gid = guild.id;
   const cfg = getConfig(gid) || {};
   const maxCharges = cfg.heal_charges ?? 3;
   const busy = questBusyUsers(gid);
+  const fighting = fightBusyUsers(gid);
   const sheets = db.prepare('SELECT * FROM characters WHERE guild_id=?').all(gid);
-  const restored = [], skipped = [];
+  const restored = [], skipped = [], inFight = [];
   for (const ch of sheets) {
     const name = await getDisplayName(guild, ch.user_id);
     // The fallen do not recover. Healing them to full while still dead leaves a
     // character in a state the rest of the bot can't read.
     if (ch.died_at) continue;
     if (busy.has(ch.user_id)) { skipped.push(name); continue; }
+    if (fighting.has(ch.user_id)) { inFight.push(name); continue; }
     const updates = {};
     const hpR = resolveRestToken(sc.hp, maxHp(ch, gid), '0%', ch.hp_current ?? 0);
     if (hpR.changed) updates.hp_current = hpR.value;
@@ -1759,11 +1827,30 @@ async function runAutoRest(guild, sc) {
     if (Object.keys(updates).length) upsertChar(gid, ch.user_id, updates);
     // Heal charges only mean anything to a White Knight with WIS 5+.
     const healR = resolveRestToken(sc.heal, maxCharges, '0%', getHealCharges(gid, ch.user_id, maxCharges).current);
-    if (healR.changed && isWhiteKnight(ch)) setHealCharges(gid, ch.user_id, healR.value);
-    restored.push(name);
+    const healed = healR.changed && isWhiteKnight(ch);
+    if (healed) setHealCharges(gid, ch.user_id, healR.value);
+    // A schedule that touches nothing shouldn't claim to have restored anyone —
+    // a charges-only rest was listing every player on the server.
+    if (Object.keys(updates).length || healed) restored.push(name);
   }
+
+  // NPCs rest too. They have only HP — no rerolls, no heal charges — so a
+  // schedule's HP setting is the whole of it. The same two exclusions apply:
+  // the fallen stay fallen, and nobody is healed out of a fight in progress.
+  const npcFighting = fightingNpcNames(gid);
+  for (const npc of getAllNpcs(gid)) {
+    if (npc.died_at) continue;
+    if (npcFighting.has(npc.name)) { inFight.push(`${npc.name} 🎭`); continue; }
+    const max = maxHpFromCon(gid, npc.con);
+    const hpR = resolveRestToken(sc.hp, max, '0%', npc.hp_current ?? 0);
+    if (!hpR.changed) continue;
+    upsertNpc(gid, npc.name, { hp_current: hpR.value });
+    setFighterHp(gid, npcFighterId(npc.name), hpR.value);
+    restored.push(`${npc.name} 🎭`);
+  }
+
   upsertSchedule(gid, sc.name, { last_run: Date.now() });
-  return { restored, skipped };
+  return { restored, skipped, inFight };
 }
 
 // Post the result where the GM asked for it, if anywhere.
@@ -1773,6 +1860,9 @@ async function announceAutoRest(guild, sc, result) {
   lines.push(result.restored.length
     ? `❤️ Restored: **${result.restored.length}** — ${result.restored.join(', ')}`
     : '❤️ Nobody to restore.');
+  if (result.inFight?.length) {
+    lines.push(`⚔️ Mid-fight, left as they are: **${result.inFight.length}** — ${result.inFight.join(', ')}`);
+  }
   if (result.skipped.length) {
     lines.push(`🎒 Out on a quest, left as they are: **${result.skipped.length}** — ${result.skipped.join(', ')}`);
   }
@@ -1936,6 +2026,17 @@ function docsSettings(gid) {
 }
 const docFileUrl = (st, file) =>
   `https://raw.githubusercontent.com/${st.repo}/${st.branch}/${st.path ? st.path + '/' : ''}${file}`;
+
+// The player handbook, wherever this server keeps it: the copy published into
+// a player channel when one exists, else the raw file straight from GitHub.
+// Null when docs aren't configured — the help link simply stays off.
+function playerHandbookLink(gid) {
+  const st = docsSettings(gid);
+  if (st.playerChannel && st.playerMsgId)
+    return `https://discord.com/channels/${gid}/${st.playerChannel}/${st.playerMsgId}`;
+  if (st.repo) return docFileUrl(st, DOC_PLAYER_FILE);
+  return null;
+}
 
 // A fingerprint of the three files as they currently stand on GitHub. Uses the
 // contents API rather than downloading, so a poll that finds nothing new costs
@@ -3246,6 +3347,23 @@ const slashCommands = [
       .addStringOption(o=>o.setName('value').setDescription('New value').setRequired(true))),
 
   new SlashCommandBuilder()
+    .setName('duel').setDescription('Raise a duel for a GM to sign off')
+    .addStringOption(o=>o.setName('terms').setDescription('First blood? To yield? Anything the GMs should know').setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName('gmsearch').setDescription('Find characters by order, class or status')
+    .addStringOption(o=>o.setName('order').setDescription('Knight order').setRequired(false)
+      .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'},{name:'— none set —',value:'__none__'}))
+    .addStringOption(o=>o.setName('class').setDescription('Class').setRequired(false)
+      .addChoices({name:'Vanguard',value:'Vanguard'},{name:'Defender',value:'Defender'},
+                  {name:'Siege Knight',value:'Siege Knight'},{name:'— none set —',value:'__none__'}))
+    .addBooleanOption(o=>o.setName('hero').setDescription('Only Heroes, or only non-Heroes').setRequired(false))
+    .addStringOption(o=>o.setName('who').setDescription('Players, NPCs, or both (default both)').setRequired(false)
+      .addChoices({name:'Players',value:'players'},{name:'NPCs',value:'npcs'},{name:'Both',value:'both'}))
+    .addBooleanOption(o=>o.setName('fallen').setDescription('Include the fallen (default no)').setRequired(false))
+    .addStringOption(o=>o.setName('name').setDescription('Part of a name').setRequired(false)),
+
+  new SlashCommandBuilder()
     .setName('gmqueue').setDescription('Everything waiting on a GM, in one place'),
 
   new SlashCommandBuilder()
@@ -3293,6 +3411,9 @@ const slashCommands = [
       .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored: 100%, 50%, a number, or 0%').setRequired(false))
       .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored: 100%, 50%, a number, or 0%').setRequired(false))
       .addChannelOption(o=>o.setName('channel').setDescription('Announce this schedule here (optional)').setRequired(false)))
+    .addSubcommand(s=>s.setName('charforum').setDescription('A forum where each approved character gets a page')
+      .addChannelOption(o=>o.setName('channel').setDescription('The forum channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop making pages').setRequired(false)))
     .addSubcommand(s=>s.setName('memorial').setDescription('Where fallen characters are recorded and remembered')
       .addChannelOption(o=>o.setName('channel').setDescription('GM record — the full account, with a Revive button').setRequired(false))
       .addChannelOption(o=>o.setName('public').setDescription('Public hall — the story alone, no figures').setRequired(false))
@@ -3352,7 +3473,7 @@ const slashCommands = [
       .addStringOption(o=>o.setName('order').setDescription('Knight order').setRequired(false)
         .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'}))
       .addStringOption(o=>o.setName('class').setDescription('Character class').setRequired(false)
-        .addChoices({name:'Hero',value:'Hero'},{name:'Vanguard',value:'Vanguard'},{name:'Defender',value:'Defender'},{name:'Siege Knight',value:'Siege Knight'}))
+        .addChoices({name:'Vanguard',value:'Vanguard'},{name:'Defender',value:'Defender'},{name:'Siege Knight',value:'Siege Knight'}))
       .addStringOption(o=>o.setName('weapon1emoji').setDescription('Emoji for weapon slot 1').setRequired(false)
         .addChoices({name:'⚔️ Swords',value:'⚔️'},{name:'🗡️ Dagger',value:'🗡️'},{name:'🏹 Bow',value:'🏹'},{name:'🔱 Trident',value:'🔱'},{name:'⛏️ Pickaxe',value:'⛏️'},{name:'🛡️ Shield',value:'🛡️'},{name:'🪄 Wand',value:'🪄'}))
       .addStringOption(o=>o.setName('weapon1').setDescription('Weapon slot 1 — pick from list or type your own').setRequired(false).setAutocomplete(true))
@@ -3368,6 +3489,13 @@ const slashCommands = [
       .addStringOption(o=>o.setName('custom').setDescription('Or paste a server custom emoji (overrides the dropdown)').setRequired(false))
       .addUserOption(o=>o.setName('user').setDescription('Target player (GM only)').setRequired(false)))
     .addSubcommand(s=>s.setName('show').setDescription('Display a character card').addUserOption(o=>o.setName('user').setDescription('User to show').setRequired(false)))
+    .addSubcommand(s=>s.setName('page').setDescription('Link a character to their forum page, or make one (GM)')
+      .addUserOption(o=>o.setName('user').setDescription('Whose character').setRequired(true))
+      .addChannelOption(o=>o.setName('thread').setDescription('An existing thread to link — omit to create one').setRequired(false))
+      .addBooleanOption(o=>o.setName('unlink').setDescription('true = forget their page').setRequired(false)))
+    .addSubcommand(s=>s.setName('hero').setDescription('Grant or remove Hero status (GM)')
+      .addUserOption(o=>o.setName('user').setDescription('Whose character').setRequired(true))
+      .addBooleanOption(o=>o.setName('value').setDescription('true = a Hero, false = not').setRequired(true)))
     .addSubcommand(s=>s.setName('signature').setDescription('Set a Hero\'s signature stat — advantage on that stat (GM)')
       .addUserOption(o=>o.setName('user').setDescription('The Hero').setRequired(true))
       .addStringOption(o=>o.setName('stat').setDescription('Stat to designate (needs 5+); omit to clear').setRequired(false)
@@ -3452,14 +3580,16 @@ const slashCommands = [
     .setName('help').setDescription('Show all commands by category')
     .addStringOption(o=>o.setName('category').setDescription('Specific category to view').setRequired(false)
       .addChoices(
+        {name:'Getting Started',value:'start'},
         {name:'Dice Rolling',value:'dice'},
         {name:'Character Sheet',value:'character'},
         {name:'HP, Healing & Rerolls',value:'hp'},
-        {name:'Fights',value:'fight'},
-        {name:'NPCs',value:'npc'},
-        {name:'Tags',value:'tags'},
+        {name:'Fights & Duels',value:'fight'},
+        {name:'Activities & Renown',value:'activities'},
         {name:'Merits & Ranks',value:'progression'},
         {name:'Quest Board',value:'quests'},
+        {name:'Tags',value:'tags'},
+        {name:'NPCs',value:'npc'},
         {name:'GM & Config',value:'gm'}
       )),
 
@@ -3515,7 +3645,7 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('wis').setDescription('Wisdom').setRequired(false))
       .addIntegerOption(o=>o.setName('lck').setDescription('Luck').setRequired(false))
       .addStringOption(o=>o.setName('class').setDescription('Their class — optional, and Hero gives a signature stat').setRequired(false)
-        .addChoices({name:'Hero',value:'Hero'},{name:'Vanguard',value:'Vanguard'},{name:'Defender',value:'Defender'},
+        .addChoices({name:'Vanguard',value:'Vanguard'},{name:'Defender',value:'Defender'},
                     {name:'Siege Knight',value:'Siege Knight'},{name:'✖️ Clear it',value:'none'}))
       .addStringOption(o=>o.setName('weapon1').setDescription('What they fight with — restricts their stats if the weapon does').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('weapon2').setDescription('A second weapon').setRequired(false).setAutocomplete(true))
@@ -3600,7 +3730,7 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('wis').setDescription('Wisdom').setRequired(true))
       .addIntegerOption(o=>o.setName('lck').setDescription('Luck').setRequired(true))
       .addStringOption(o=>o.setName('class').setDescription('Their class — optional, and Hero gives a signature stat').setRequired(false)
-        .addChoices({name:'Hero',value:'Hero'},{name:'Vanguard',value:'Vanguard'},{name:'Defender',value:'Defender'},
+        .addChoices({name:'Vanguard',value:'Vanguard'},{name:'Defender',value:'Defender'},
                     {name:'Siege Knight',value:'Siege Knight'},{name:'✖️ Clear it',value:'none'}))
       .addStringOption(o=>o.setName('weapon1').setDescription('What they fight with — restricts their stats if the weapon does').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('weapon2').setDescription('A second weapon').setRequired(false).setAutocomplete(true))
@@ -4152,6 +4282,226 @@ async function resolveMortal(interaction) {
 // Work waiting on a decision lived in four different commands, and pending lore
 // had no listing at all — a submission whose queue post was deleted was simply
 // invisible. This is the one place to look.
+// Search the roster. Reads in the same order everything else does, with each
+// character's forum page hung off their line where they have one.
+// Raise one. A player gets a single open proposal at a time — the limit is the
+// whole reason this is a command rather than free-form messages.
+async function handleDuel(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const gate = sheetGate(gid, uid);
+  if (gate) return interaction.reply({ content: gate, ephemeral: true });
+  if (!getChar(gid, uid)) return interaction.reply({ content: '❌ You need a character sheet first — `/char create`.', ephemeral: true });
+
+  const mine = openDuelFor(gid, uid);
+  if (mine) {
+    const where = mine.msg_id ? `https://discord.com/channels/${gid}/${mine.channel_id}/${mine.msg_id}` : null;
+    return interaction.reply({ ephemeral: true, content:
+      `⚔️ You already have a duel open${mine.state === 'pending' ? ' and with the GMs' : ''}.\n`
+      + (where ? `${where}\n` : '') + '_Withdraw it there before raising another._' });
+  }
+  const elsewhere = duelElsewhere(gid, uid);
+  if (elsewhere) return interaction.reply({ ephemeral: true, content:
+    '⚔️ You are already standing in someone else\'s duel. Step out of that one first.' });
+
+  const terms = (interaction.options.getString('terms') || '').trim() || null;
+  const info = db.prepare(`INSERT INTO duels (guild_id,channel_id,opener,fighters,terms,created_at)
+                           VALUES (?,?,?,?,?,?)`)
+    .run(gid, interactionChannelId(interaction), uid, JSON.stringify([uid]), terms, Date.now());
+  const d = getDuel(gid, info.lastInsertRowid);
+  const lines = await renderDuel(interaction.guild, d);
+  await interaction.reply({ content: lines.join('\n'), components: duelButtons(d), allowedMentions: { parse: [] } });
+  const msg = await interaction.fetchReply();
+  setDuel(gid, d.id, { msg_id: msg.id });
+}
+
+async function handleDuelButton(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const [action, idRaw] = interaction.customId.split(':');
+  const d = getDuel(gid, Number(idRaw));
+  if (!d) return interaction.reply({ content: '❌ That duel has gone.', ephemeral: true });
+  if (!DUEL_LIVE.includes(d.state)) return interaction.reply({ content: `❌ That duel is already ${d.state}.`, ephemeral: true });
+
+  const fighters = duelFighters(d);
+
+  if (action === 'dueljoin') {
+    if (d.state !== 'open') return interaction.reply({ content: '⏳ That one is already with the GMs.', ephemeral: true });
+    const g2 = sheetGate(gid, uid);
+    if (g2) return interaction.reply({ content: g2, ephemeral: true });
+    if (!getChar(gid, uid)) return interaction.reply({ content: '❌ You need a character sheet to duel — `/char create`.', ephemeral: true });
+    if (fighters.includes(uid)) return interaction.reply({ content: 'You are already standing in this one.', ephemeral: true });
+    const busy = duelElsewhere(gid, uid, d.id) || openDuelFor(gid, uid);
+    if (busy) return interaction.reply({ content: '⚔️ You are already in another duel. Step out of that one first.', ephemeral: true });
+    if (fighters.length >= 8) return interaction.reply({ content: '❌ Eight is as many as one duel takes.', ephemeral: true });
+    fighters.push(uid);
+    const updated = setDuel(gid, d.id, { fighters: JSON.stringify(fighters) });
+    await interaction.reply({ content: `⚔️ <@${uid}> stands in.`, allowedMentions: { parse: [] } });
+    return refreshDuel(interaction.client, interaction.guild, updated);
+  }
+
+  if (action === 'duelout') {
+    if (uid === d.opener) return interaction.reply({ content: '❌ You raised this one — withdraw it instead.', ephemeral: true });
+    if (!fighters.includes(uid)) return interaction.reply({ content: 'You are not in this one.', ephemeral: true });
+    const updated = setDuel(gid, d.id, { fighters: JSON.stringify(fighters.filter(x => x !== uid)) });
+    await interaction.reply({ content: `↩️ <@${uid}> steps out.`, allowedMentions: { parse: [] } });
+    return refreshDuel(interaction.client, interaction.guild, updated);
+  }
+
+  if (action === 'duelcancel') {
+    const isGmUser = await isGm(interaction.guild, uid);
+    if (uid !== d.opener && !isGmUser) return interaction.reply({ content: '❌ Only whoever raised it, or a GM, can withdraw it.', ephemeral: true });
+    const updated = setDuel(gid, d.id, { state: 'cancelled', decided_by: uid, decided_at: Date.now() });
+    await interaction.reply({ content: '↩️ Duel withdrawn.' });
+    await refreshDuel(interaction.client, interaction.guild, updated);
+    if (d.approval_msg_id) {
+      const chId = approvalChannelId(gid);
+      try {
+        const ch = await interaction.client.channels.fetch(chId);
+        const m = await ch.messages.fetch(d.approval_msg_id);
+        await m.edit({ content: `~~⚔️ Duel #${d.id}~~\n↩️ *Withdrawn.*`, components: [] });
+      } catch {}
+    }
+    return;
+  }
+
+  if (action === 'duelsend') {
+    if (uid !== d.opener) return interaction.reply({ content: '❌ Only whoever raised it can send it.', ephemeral: true });
+    if (fighters.length < 2) return interaction.reply({ content: '❌ A duel needs at least two.', ephemeral: true });
+    const chId = approvalChannelId(gid);
+    if (!chId) return interaction.reply({ content: '❌ No approval channel is set — ask a GM to run `/config approvals`.', ephemeral: true });
+
+    const updated = setDuel(gid, d.id, { state: 'pending' });
+    await interaction.reply({ content: '📨 Sent to the GMs.', ephemeral: true });
+    await refreshDuel(interaction.client, interaction.guild, updated);
+    try {
+      const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+      const roles = getGmRoleIds(gid);
+      const ch = await interaction.client.channels.fetch(chId);
+      const names = [];
+      for (const f of fighters) names.push(`<@${f}> (**${await getDisplayName(interaction.guild, f)}**)`);
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`duelok:${d.id}`).setLabel('Allow it').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`duelno:${d.id}`).setLabel('Decline').setStyle(ButtonStyle.Danger));
+      const m = await ch.send({ allowedMentions: { roles }, components: [row], content: [
+        `${roles.map(r => `<@&${r}>`).join(' ')} ⚔️ **Duel #${d.id}** — raised by <@${d.opener}>`,
+        d.terms ? `📜 ${d.terms}` : '_No terms set._',
+        `**Standing in:** ${names.join(' · ')}`,
+        `_In <#${d.channel_id}>._`,
+      ].join('\n') });
+      setDuel(gid, d.id, { approval_msg_id: m.id });
+    } catch (err) {
+      console.error('[duel] could not queue:', err?.message || err);
+      await interaction.followUp({ ephemeral: true, content: `⚠️ Couldn't reach the approval channel: ${err?.message || err}` }).catch(()=>{});
+    }
+    return;
+  }
+
+  // A GM's decision
+  if (!(await isGm(interaction.guild, uid)))
+    return interaction.reply({ content: '❌ Only GMs can decide on a duel.', ephemeral: true });
+  if (action === 'duelno') {
+    return showRejectReasonModal(interaction, `duelrej:${d.id}`, 'Decline duel', 'e.g. not while the siege is on.');
+  }
+  const gmName = await getDisplayName(interaction.guild, uid);
+  const updated = setDuel(gid, d.id, { state: 'approved', decided_by: uid, decided_at: Date.now() });
+  try { await interaction.message.edit({ content: `${interaction.message.content}\n\n✅ **Allowed** by ${gmName}`, components: [] }); } catch {}
+  await refreshDuel(interaction.client, interaction.guild, updated);
+  await interaction.reply({ content: `✅ Duel #${d.id} allowed. Start it with \`/fight start players:${fighters.map(f => `<@${f}>`).join(' ')}\`` });
+  try {
+    const ch = await interaction.client.channels.fetch(d.channel_id);
+    await ch.send({ content: `⚔️ **Duel #${d.id} is allowed** — ${fighters.map(f => `<@${f}>`).join(' vs ')}. A GM will start it.`,
+      allowedMentions: { users: fighters } });
+  } catch {}
+}
+
+async function handleDuelRejectModal(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can decide on a duel.', ephemeral: true });
+  const d = getDuel(gid, Number(interaction.customId.split(':')[1]));
+  if (!d || !DUEL_LIVE.includes(d.state)) return interaction.reply({ content: '⏰ That duel has already been settled.', ephemeral: true });
+  const reason = cleanReason(interaction.fields.getTextInputValue('reason'));
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+  const updated = setDuel(gid, d.id, { state: 'declined', reason, decided_by: interaction.user.id, decided_at: Date.now() });
+  try { await interaction.message?.edit({ content: `${interaction.message.content}\n\n🚫 **Declined** by ${gmName}${reason ? `\n💬 ${reason}` : ''}`, components: [] }); } catch {}
+  await refreshDuel(interaction.client, interaction.guild, updated);
+  await interaction.reply({ content: `🚫 Duel #${d.id} declined${reason ? ` — “${reason}”` : ''}.` });
+  try {
+    const ch = await interaction.client.channels.fetch(d.channel_id);
+    await ch.send({ content: `🚫 **Duel #${d.id} was declined** by ${gmName}${reason ? ` — ${reason}` : ''}.`, allowedMentions: { parse: [] } });
+  } catch {}
+}
+
+async function handleGmSearch(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can search the roster.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+
+  const wantOrder = interaction.options.getString('order');
+  const wantClass = interaction.options.getString('class');
+  const wantHero = interaction.options.getBoolean('hero');
+  const who = interaction.options.getString('who') ?? 'both';
+  const withFallen = interaction.options.getBoolean('fallen') ?? false;
+  const nameBit = (interaction.options.getString('name') || '').trim().toLowerCase();
+
+  const matches = (row, name) => {
+    if (!withFallen && row?.died_at) return false;
+    if (wantOrder === '__none__' ? !!row?.order_name : (wantOrder && row?.order_name !== wantOrder)) return false;
+    if (wantClass === '__none__' ? !!row?.class : (wantClass && row?.class !== wantClass)) return false;
+    if (wantHero !== null && wantHero !== undefined && isHero(row) !== wantHero) return false;
+    if (nameBit && !String(name).toLowerCase().includes(nameBit)) return false;
+    return true;
+  };
+
+  const entries = [];
+  if (who !== 'npcs') {
+    for (const ch of db.prepare('SELECT * FROM characters WHERE guild_id=?').all(gid)) {
+      const nm = await getDisplayName(interaction.guild, ch.user_id);
+      if (!matches(ch, nm)) continue;
+      const bits = [];
+      if (ch.class) bits.push(ch.class);
+      if (isHero(ch)) bits.push('🦸 Hero');
+      if (ch.died_at) bits.push('🕯️ fallen');
+      const link = charPageLink(gid, ch.user_id, 'page');
+      entries.push({ row: ch, name: nm,
+        text: `**${nm}**${bits.length ? ` — ${bits.join(' · ')}` : ''}${link ? ` · 📖 ${link}` : ''}` });
+    }
+  }
+  if (who !== 'players') {
+    for (const npc of getAllNpcs(gid)) {
+      if (!matches(npc, npc.name)) continue;
+      const bits = [];
+      if (npc.class) bits.push(npc.class);
+      if (isHero(npc)) bits.push('🦸 Hero');
+      if (npc.died_at) bits.push('🕯️ fallen');
+      entries.push({ row: npc, name: npc.name, isNpc: true,
+        text: `**${npc.name}**${bits.length ? ` — ${bits.join(' · ')}` : ''}` });
+    }
+  }
+
+  const filters = [
+    wantOrder && (wantOrder === '__none__' ? 'no order' : wantOrder),
+    wantClass && (wantClass === '__none__' ? 'no class' : wantClass),
+    wantHero === true ? 'Heroes' : wantHero === false ? 'not Heroes' : null,
+    who !== 'both' ? who : null,
+    nameBit ? `name contains “${nameBit}”` : null,
+    withFallen ? 'including the fallen' : null,
+  ].filter(Boolean);
+
+  if (!entries.length) {
+    return interaction.editReply({ content: `🔍 **Nothing matched.**${filters.length ? `\n_${filters.join(' · ')}_` : ''}` });
+  }
+  const lines = [`🔍 **${entries.length} character${entries.length === 1 ? '' : 's'}**`
+    + (filters.length ? ` — ${filters.join(' · ')}` : ''), ''];
+  for (const g of groupRoster(entries)) {
+    lines.push(`**${g.label}**`);
+    for (const e of g.rows) lines.push(`  ${e.text}`);
+    lines.push('');
+  }
+  if (lines[lines.length - 1] === '') lines.pop();
+  return replyLong(interaction, lines, { ephemeral: true });
+}
+
 async function handleGmQueue(interaction) {
   const gid = interaction.guild.id;
   if (!(await isGm(interaction.guild, interaction.user.id)))
@@ -4182,6 +4532,18 @@ async function handleGmQueue(interaction) {
     lines.push(`📜 **Lore** — ${lore.length}`);
     for (const l of lore) {
       lines.push(`• <@${l.user_id}>${ago(l.submitted_at)}${jump(getConfig(gid)?.approval_channel_id, l.msg_id)}`);
+    }
+    lines.push('');
+  }
+
+  // Duels
+  const duels = db.prepare(`SELECT * FROM duels WHERE guild_id=? AND state='pending' ORDER BY created_at`).all(gid);
+  if (duels.length) {
+    total += duels.length;
+    lines.push(`⚔️ **Duels** — ${duels.length}`);
+    for (const d of duels) {
+      lines.push(`• \`#${d.id}\` <@${d.opener}> · ${duelFighters(d).length} standing in`
+        + ago(d.created_at) + jump(approvalChannelId(gid), d.approval_msg_id));
     }
     lines.push('');
   }
@@ -4845,7 +5207,9 @@ async function handleConfig(interaction) {
       await announceAutoRest(interaction.guild, existing, result);
       return interaction.followUp({ content:
         `✅ **${existing.name}** — restored **${result.restored.length}**`
-        + (result.skipped.length ? `, left **${result.skipped.length}** out on quests alone.` : '.') });
+        + (result.skipped.length ? `, left **${result.skipped.length}** out on quests` : '')
+        + (result.inFight?.length ? `, left **${result.inFight.length}** mid-fight` : '')
+        + '.' });
     }
 
     // Add or update. Every amount is validated up front so a typo can't sit in
@@ -4870,6 +5234,30 @@ async function handleConfig(interaction) {
       `${existing ? '✏️ Updated' : '🌙 Added'} recovery schedule:`, line(sc), '',
       'Everyone not on an in-progress quest is covered. Quest parties keep whatever they have until they finish.',
     ].join('\n') });
+  }
+
+  if (sub === 'charforum') {
+    if (interaction.options.getBoolean('disable')) {
+      setConfig(gid, { char_forum: null });
+      return interaction.reply({ content: '📖 No new character pages will be made. Existing ones stay linked.' });
+    }
+    const channel = interaction.options.getChannel('channel');
+    if (!channel) {
+      const cur = getConfig(gid)?.char_forum;
+      const count = db.prepare('SELECT COUNT(*) AS c FROM char_pages WHERE guild_id=?').get(gid).c;
+      return interaction.reply({ ephemeral: true, content: cur
+        ? `📖 Character pages live in <#${cur}> — ${count} linked so far.`
+        : '📖 No character forum set. `/config charforum channel:#character-sheets`' });
+    }
+    // A forum is channel type 15; anything else has no threads to create.
+    if (channel.type !== 15) {
+      return interaction.reply({ ephemeral: true, content:
+        `❌ <#${channel.id}> is not a forum channel. Make a **Forum** and point me at that — each character gets a post in it.` });
+    }
+    setConfig(gid, { char_forum: channel.id });
+    return interaction.reply({ content:
+      `📖 Character pages will be made in <#${channel.id}> when a sheet is approved.\n`
+      + '_`/char page` links an existing thread by hand, or makes one now._' });
   }
 
   if (sub === 'memorial') {
@@ -5274,6 +5662,45 @@ async function handleChar(interaction) {
     });
   }
 
+  if (sub === 'page') {
+    if (!(await isGm(interaction.guild, callerId)))
+      return interaction.reply({ content: '❌ Only GMs can link character pages.', ephemeral: true });
+    const who = interaction.options.getUser('user');
+    const nm3 = await getDisplayName(interaction.guild, who.id);
+    if (interaction.options.getBoolean('unlink')) {
+      clearCharPage(gid, who.id);
+      return interaction.reply({ content: `📖 **${nm3}** is no longer linked to a page. The thread itself is untouched.` });
+    }
+    const thread = interaction.options.getChannel('thread');
+    if (thread) {
+      setCharPage(gid, who.id, thread.id, `https://discord.com/channels/${gid}/${thread.id}`, nm3);
+      return interaction.reply({ content: `📖 **${nm3}** is linked to <#${thread.id}>. It shows on \`/char show\`.` });
+    }
+    await interaction.deferReply();
+    try {
+      const made = await ensureCharPage(interaction.client, interaction.guild, who.id, nm3);
+      if (made.skipped) return interaction.editReply({ content: '❌ No character forum is set — `/config charforum channel:#character-sheets`, or pass a `thread:` to link one by hand.' });
+      return interaction.editReply({ content: made.existing
+        ? `📖 **${nm3}** already has a page: ${made.url}`
+        : `📖 Made a page for **${nm3}**: ${made.url}` });
+    } catch (err) {
+      return interaction.editReply({ content: `❌ Couldn't make it: ${err?.message || err}` });
+    }
+  }
+
+  if (sub === 'hero') {
+    if (!(await isGm(interaction.guild, callerId)))
+      return interaction.reply({ content: '❌ Only GMs can grant Hero status.', ephemeral: true });
+    const who = interaction.options.getUser('user');
+    const on = interaction.options.getBoolean('value');
+    const nm2 = await getDisplayName(interaction.guild, who.id);
+    if (!getChar(gid, who.id)) return interaction.reply({ content: `❌ **${nm2}** has no character sheet.`, ephemeral: true });
+    upsertChar(gid, who.id, { is_hero: on ? 1 : 0, ...(on ? {} : { signature_stat: null }) });
+    return interaction.reply({ content: on
+      ? `🦸 **${nm2}** is now a **Hero**. Their class and knight order are unaffected — set a signature stat with \`/char signature\`.`
+      : `**${nm2}** is no longer a Hero. Any signature stat has been cleared.` });
+  }
+
   if (sub === 'signature') {
     if (!(await isGm(interaction.guild, callerId)))
       return interaction.reply({ content: '❌ Only GMs can set a Hero\'s signature stat.', ephemeral: true });
@@ -5669,7 +6096,10 @@ async function handleProfile(interaction) {
     const dn = await getDisplayName(interaction.guild, uid);
     const cfg = getConfig(gid); const mc = cfg.heal_charges??3;
     const hr = getHealCharges(gid, uid, mc);
-    return interaction.reply({ content: buildCharCard(ch, dn, hr.current, mc, gid).join('\n'), ephemeral: true });
+    const card = buildCharCard(ch, dn, hr.current, mc, gid);
+    const link = charPageLink(gid, uid);
+    if (link) card.push('', `📖 ${link}`);
+    return interaction.reply({ content: card.join('\n'), ephemeral: true });
   }
   if (sub === 'save') {
     const slot = interaction.options.getString('slotname');
@@ -6247,6 +6677,7 @@ async function routeButton(interaction) {
     if (interaction.customId.startsWith('loreok:') || interaction.customId.startsWith('loreno:')) return handleLoreButton(interaction);
     if (interaction.customId.startsWith('tradeok:') || interaction.customId.startsWith('tradeno:')) return handleMeritTradeButton(interaction);
     if (interaction.customId.startsWith('revive:')) return handleReviveButton(interaction);
+    if (/^duel(join|out|send|cancel|ok|no):/.test(interaction.customId)) return handleDuelButton(interaction);
     if (interaction.customId.startsWith('questapply:') || interaction.customId.startsWith('questwithdraw:')) {
       return handleQuestButton(interaction);
     }
@@ -6383,9 +6814,32 @@ client.on('interactionCreate', async interaction => {
     if (interaction.customId.startsWith('gmkill:')) return handleGmKillModal(interaction);
     if (interaction.customId.startsWith('lorereject:')) return handleLoreRejectModal(interaction);
     if (interaction.customId.startsWith('traderej:')) return handleMeritTradeRejectModal(interaction);
+    if (interaction.customId.startsWith('duelrej:')) return handleDuelRejectModal(interaction);
     if (interaction.customId.startsWith('sheetreject:')) return handleSheetRejectModal(interaction);
     if (interaction.customId.startsWith('exportreject:')) return handleExportRejectModal(interaction);
     return;
+  }
+
+  // A target picked from the menu executes the strike directly — the same
+  // path as a fully-typed /fight atk, via runFightAttack. The picker message
+  // is ephemeral so only its invoker can ever see it; the ownership guard is
+  // belt-and-braces against a forged component (GMs pass for NPC actors).
+  if (interaction.isStringSelectMenu?.() && interaction.customId.startsWith('fighttarget:')) {
+    try {
+      const [, actorId, stat, mode, flavEnc] = interaction.customId.split(':');
+      if (interaction.user.id !== actorId && !(await isGm(interaction.guild, interaction.user.id))) {
+        return interaction.reply({ content: '🎯 That choice is not yours to make.', ephemeral: true });
+      }
+      const gid = interaction.guild.id;
+      const cid = interactionChannelId(interaction);
+      const targetId = interaction.values[0];
+      const flavour = decodeURIComponent(flavEnc || '') || null;
+      return await runFightAttack({ interaction, gid, cid, actorId, targetId, stat, mode, flavour });
+    } catch (err) {
+      console.error('[fighttarget]', err?.message || err, '\n', err?.stack || '');
+      try { await interaction.followUp({ content: `⚠️ That pick hit an error:\n\`${err?.message || err}\``, ephemeral: true }); } catch {}
+      return;
+    }
   }
 
   if (interaction.isButton()) {
@@ -6408,6 +6862,8 @@ client.on('interactionCreate', async interaction => {
 
   if (!interaction.isChatInputCommand()) return;
   try {
+    if (interaction.commandName === 'duel') return await handleDuel(interaction);
+    if (interaction.commandName === 'gmsearch') return await handleGmSearch(interaction);
     if (interaction.commandName === 'gmqueue') return await handleGmQueue(interaction);
     if (interaction.commandName === 'gmkill') return await handleGmKill(interaction);
     if (interaction.commandName === 'gmrevive') return await handleGmRevive(interaction);
@@ -7333,7 +7789,156 @@ async function warnApprovalUnreachable(src, gid, uid) {
 // if the stat later drops below 5 the advantage simply stops applying.
 const SIGNATURE_MIN = 5;
 function isHero(row) {
-  return String(row?.class || '').toLowerCase() === 'hero';
+  // The flag is authoritative; the old class value is still honoured so a sheet
+  // written before the change keeps working if the backfill never ran.
+  return !!row?.is_hero || String(row?.class || '').toLowerCase() === 'hero';
+}
+
+// ── Duels ────────────────────────────────────────────────────────────────────
+// A player raises a challenge, others attach themselves, and when the opener is
+// happy it goes to the GMs as one message. Nothing starts a fight until a GM
+// says so.
+const DUEL_LIVE = ['open', 'pending'];
+
+function openDuelFor(gid, uid) {
+  return db.prepare(`SELECT * FROM duels WHERE guild_id=? AND opener=? AND state IN ('open','pending')`).get(gid, uid);
+}
+function getDuel(gid, id) {
+  return db.prepare('SELECT * FROM duels WHERE guild_id=? AND id=?').get(gid, id);
+}
+function setDuel(gid, id, fields) {
+  const keys = Object.keys(fields || {});
+  if (keys.length) db.prepare(`UPDATE duels SET ${keys.map(k => `${k}=?`).join(',')} WHERE guild_id=? AND id=?`)
+    .run(...keys.map(k => fields[k]), gid, id);
+  return getDuel(gid, id);
+}
+const duelFighters = (d) => { try { return JSON.parse(d?.fighters || '[]'); } catch { return []; } };
+
+// Is this player already committed to a duel someone else opened?
+function duelElsewhere(gid, uid, exceptId = null) {
+  const rows = db.prepare(`SELECT * FROM duels WHERE guild_id=? AND state IN ('open','pending')`).all(gid);
+  return rows.find(d => d.id !== exceptId && duelFighters(d).includes(uid)) || null;
+}
+
+async function renderDuel(guild, d) {
+  const names = [];
+  for (const uid of duelFighters(d)) names.push(`<@${uid}>`);
+  const lines = [
+    `⚔️ **Duel** — raised by <@${d.opener}>`,
+    d.terms ? `📜 ${d.terms}` : '_No terms set._',
+    '',
+    names.length ? `**Standing in:** ${names.join(' · ')}` : '_Nobody has stepped up yet._',
+  ];
+  if (d.state === 'pending') lines.push('', '⏳ _With the GMs._');
+  if (d.state === 'approved') lines.push('', '✅ _Approved._');
+  if (d.state === 'declined') lines.push('', `🚫 _Declined${d.reason ? ` — ${d.reason}` : ''}._`);
+  if (d.state === 'cancelled') lines.push('', '↩️ _Withdrawn._');
+  return lines;
+}
+
+function duelButtons(d) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  if (d.state !== 'open') return [];
+  const many = duelFighters(d).length >= 2;
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`dueljoin:${d.id}`).setLabel('Stand in').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`duelout:${d.id}`).setLabel('Step out').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`duelsend:${d.id}`).setLabel(many ? 'Send to the GMs' : 'Send (needs 2)')
+      .setStyle(ButtonStyle.Success).setDisabled(!many),
+    new ButtonBuilder().setCustomId(`duelcancel:${d.id}`).setLabel('Withdraw').setStyle(ButtonStyle.Danger),
+  )];
+}
+
+// Redraw the proposal in place, so the post is always current.
+async function refreshDuel(client, guild, d) {
+  if (!d?.msg_id) return;
+  try {
+    const ch = await client.channels.fetch(d.channel_id);
+    const msg = await ch.messages.fetch(d.msg_id);
+    const lines = await renderDuel(guild, d);
+    await msg.edit({ content: lines.join('\n'), components: duelButtons(d), allowedMentions: { parse: [] } });
+  } catch (err) { console.error('[duel] could not refresh:', err?.message || err); }
+}
+
+// ── Character pages (forum) ──────────────────────────────────────────────────
+function getCharPage(gid, uid) {
+  return db.prepare('SELECT * FROM char_pages WHERE guild_id=? AND user_id=?').get(gid, uid);
+}
+function setCharPage(gid, uid, threadId, url, title) {
+  db.prepare(`INSERT INTO char_pages (guild_id,user_id,thread_id,url,title,at) VALUES (?,?,?,?,?,?)
+              ON CONFLICT(guild_id,user_id) DO UPDATE SET thread_id=excluded.thread_id,
+              url=excluded.url, title=excluded.title, at=excluded.at`)
+    .run(gid, uid, threadId, url, title, Date.now());
+}
+function clearCharPage(gid, uid) {
+  db.prepare('DELETE FROM char_pages WHERE guild_id=? AND user_id=?').run(gid, uid);
+}
+// A link to hang off a sheet, or nothing if they have no page.
+function charPageLink(gid, uid, label = 'Character page') {
+  const pg = getCharPage(gid, uid);
+  return pg?.url ? `[${label}](${pg.url})` : null;
+}
+
+// Create the forum post for a character, or move an existing one's link along.
+// Best-effort by design: a missing forum, a lost permission or a locked channel
+// should never stop a sheet being approved.
+async function ensureCharPage(client, guild, uid, displayName) {
+  const gid = guild.id;
+  const forumId = getConfig(gid)?.char_forum;
+  if (!forumId) return { skipped: 'no forum set' };
+  const existing = getCharPage(gid, uid);
+  if (existing?.thread_id) {
+    // Confirm it still exists; if a GM deleted the thread, make a fresh one.
+    try { await client.channels.fetch(existing.thread_id); return { existing: true, url: existing.url }; }
+    catch { clearCharPage(gid, uid); }
+  }
+  const forum = await client.channels.fetch(forumId);
+  if (!forum?.threads?.create) throw new Error('that channel is not a forum');
+  const thread = await forum.threads.create({
+    name: displayName.slice(0, 90),
+    message: { content: `📖 **${displayName}** — this thread is theirs. Lore, art and notes go here.\n_Linked from \`/char show\`._` },
+  });
+  const url = `https://discord.com/channels/${gid}/${thread.id}`;
+  setCharPage(gid, uid, thread.id, url, displayName);
+  return { created: true, url };
+}
+
+// ── Roster ordering ──────────────────────────────────────────────────────────
+// Every list of characters reads the same way: Heroes first as their own group,
+// then by knight order, then by class, then by name. One comparator so a roster,
+// a global heal and an NPC list can't drift into three different orders.
+const KNIGHT_ORDER_RANK = Object.keys(KNIGHT_EMOJIS)
+  .reduce((m, name, i) => (m[name] = i, m), {});
+const CLASS_RANK = { 'Vanguard': 0, 'Defender': 1, 'Siege Knight': 2 };
+
+function rosterKey(row, name, isNpc = false) {
+  return {
+    // Players and NPCs are separate halves of a list, not interleaved.
+    npc: isNpc ? 1 : 0,
+    hero: isHero(row) ? 0 : 1,
+    order: row?.order_name ? (KNIGHT_ORDER_RANK[row.order_name] ?? 98) : 99,
+    cls: row?.class ? (CLASS_RANK[row.class] ?? 98) : 99,
+    name: String(name ?? '').toLowerCase(),
+  };
+}
+function compareRoster(a, b) {
+  return a.npc - b.npc || a.hero - b.hero || a.order - b.order || a.cls - b.cls || a.name.localeCompare(b.name);
+}
+// Sort [{ row, name, ... }] into reading order and return it grouped for display.
+function groupRoster(entries) {
+  const keyed = entries.map(e => ({ ...e, _k: rosterKey(e.row, e.name, !!e.isNpc) }));
+  keyed.sort((x, y) => compareRoster(x._k, y._k));
+  const groups = [];
+  let head = null;
+  for (const e of keyed) {
+    const inner = e._k.hero === 0 ? '🦸 Heroes'
+      : e.row?.order_name ? `${KNIGHT_EMOJIS[e.row.order_name] ?? '⚪'} ${e.row.order_name}`
+      : '⬜ No order';
+    const label = e._k.npc ? `🎭 NPCs · ${inner}` : inner;
+    if (label !== head) { groups.push({ label, rows: [], isNpc: !!e._k.npc }); head = label; }
+    groups[groups.length - 1].rows.push(e);
+  }
+  return groups;
 }
 // Does this character/NPC row get advantage on `stat` right now?
 function hasSignatureAdvantage(row, stat) {
@@ -7795,11 +8400,15 @@ async function fighterCharCard(guild, gid, fid) {
     return {
       displayName: name + ' 🎭',
       order_name: npc.order_name || null,
-      class: null,
+      // NPCs have classes, weapons and Hero status of their own now — this shim
+      // predates all three and was blanking them on the fight card.
+      class: npc.class || null,
+      is_hero: npc.is_hero ? 1 : 0,
+      signature_stat: npc.signature_stat || null,
       hp_current: npc.hp_current ?? 0,
       rerolls_current: 0,
       str: npc.str ?? 0, con: npc.con ?? 0, dex: npc.dex ?? 0, wis: npc.wis ?? 0, lck: npc.lck ?? 0,
-      weapon1: null, weapon2: null, weapon1emoji: null, weapon2emoji: null,
+      weapon1: npc.weapon1 || null, weapon2: npc.weapon2 || null, weapon1emoji: null, weapon2emoji: null,
       _isNpc: true,
     };
   }
@@ -7811,6 +8420,8 @@ async function fighterCharCard(guild, gid, fid) {
 
 // Post a message into a channel AS an NPC (via its webhook, with name + avatar),
 // matching how /pr posts. Falls back to a plain channel.send if the webhook fails.
+// Returns the sent message when the API hands one back (so callers can build
+// audit jump links), otherwise a bare truthy/falsy success flag.
 // Speaking as an NPC in a quest's channel is a roleplay beat worth logging.
 function noteNpcSpeech(gid, channel, npcName) {
   try { noteQuestActivity(gid, channel?.id, 'rp', `${npcName} speaks`); } catch {}
@@ -7821,20 +8432,20 @@ async function postAsNpc(channel, gid, npcName, content) {
   const npc = getNpc(gid, npcName);
   try {
     const webhookClient = await npcWebhookIn(channel, gid, npcName, npc?.image_url);
-    await webhookClient.send({ content, username: npcName, avatarURL: npc?.image_url ?? BLANK_AVATAR });
-    return true;
+    const sent = await webhookClient.send({ content, username: npcName, avatarURL: npc?.image_url ?? BLANK_AVATAR });
+    return sent ?? true;
   } catch (err) {
     // A stored webhook can be deleted server-side; drop it and retry once.
     console.error('postAsNpc webhook error:', err.message);
     try {
       db.prepare('DELETE FROM npc_webhooks WHERE guild_id=? AND channel_id=? AND npc_name=?').run(gid, channel.id, npcName);
       const fresh = await npcWebhookIn(channel, gid, npcName, npc?.image_url);
-      await fresh.send({ content, username: npcName, avatarURL: npc?.image_url ?? BLANK_AVATAR });
-      return true;
+      const sent2 = await fresh.send({ content, username: npcName, avatarURL: npc?.image_url ?? BLANK_AVATAR });
+      return sent2 ?? true;
     } catch (err2) {
       console.error('postAsNpc retry failed:', err2.message);
-      await channel.send(content).catch(()=>{});
-      return false;
+      const plain = await channel.send(content).catch(()=>null);
+      return plain ?? false;
     }
   }
 }
@@ -8065,6 +8676,145 @@ async function runAutoNpcChain(guild, gid, cid, channel) {
   }
   // Safety cap reached — tell the GM instead of stalling silently
   await channel.send('⚠️ Auto chain paused after a very long fight (safety limit). Use `/fight status` to review, `/fight resolve` to continue a pending exchange, or `/fight end`.').catch(()=>{});
+}
+
+// ── Shared attack executor ───────────────────────────────────────────────
+// The whole strike — validation, roll, card, phase flip — lifted out of the
+// atk subcommand so two surfaces share one path:
+//   · handleFight 'atk' (slash command; turn/actor already validated upstream,
+//     so the re-checks here pass straight through)
+//   · the fighttarget: select menu, where the fight may have moved on between
+//     the menu appearing and the click — every gate is re-checked before any
+//     die is thrown.
+// `refuse` adapts to the surface: ephemeral reply for the command, an in-place
+// update that also strips the stale menu for the picker.
+async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, mode, flavour }) {
+  const uid = interaction.user.id;
+  const fromMenu = !!interaction.isStringSelectMenu?.();
+  const refuse = (content) => fromMenu
+    ? interaction.update({ components: [], content })
+    : interaction.reply({ content, ephemeral: true });
+
+  const chan = await interactionChannel(interaction);
+  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+
+  const fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
+
+  if (isNpcFighter(actorId) && !(await isGm(interaction.guild, uid))) {
+    return refuse('❌ Only GMs can act as an NPC.');
+  }
+  {
+    const gate0 = deathGate(gid, actorId);
+    if (gate0) return refuse(gate0);
+  }
+  const turnOrder = fightOrder(fight);
+  const currentId = turnOrder[fight.turn_index];
+  if (currentId !== actorId) {
+    const cur = await resolveFighter(interaction.guild, gid, currentId);
+    return refuse(`⚠️ It's **${cur.name}**'s turn to attack.`);
+  }
+  if (fight.phase !== 'attack') return refuse('❌ Waiting for defender to roll first.');
+  if (!isNpcFighter(actorId)) {
+    const gateMsg = sheetGate(gid, actorId);
+    if (gateMsg && !(await isGm(interaction.guild, uid))) return refuse(gateMsg);
+  }
+  {
+    // What you are carrying decides what you can swing, shoot or brace with.
+    const refusal = weaponStatRefusal(gid, pageSubject(gid, actorId), 'atk', stat);
+    if (refusal) return refuse(refusal);
+  }
+  if (!turnOrder.includes(targetId)) return refuse('❌ That target is not in this fight.');
+  if (targetId === actorId) return refuse('❌ You cannot target yourself.');
+
+  const hpState = fightHp(fight);
+  const atkFloor = fightFloor(fight);
+  if (hpState[targetId] !== undefined && hpState[targetId] <= atkFloor) {
+    return refuse(atkFloor > 0 ? '❌ That fighter has already yielded the bout.' : '❌ That target is already down.');
+  }
+
+    const actor = await resolveFighter(interaction.guild, gid, actorId);
+    const targetF = await resolveFighter(interaction.guild, gid, targetId);
+    const statVal = actor.stats[stat] ?? 0;
+    // Consume a pending riposte bonus from a previous nat-20 defence.
+    const atkBonus = consumeAtkBonus(gid, cid, actorId);
+    // Hero signature advantage (players and Hero NPCs alike)
+    const sigRowA = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
+    mode = applySignatureMode(sigRowA, stat, mode);
+    const effTotal = statVal + atkBonus;
+    let nat, total, rollLine;
+    const bonusTag = atkBonus ? ` +${atkBonus} riposte` : '';
+    const modStr = effTotal > 0 ? ` +${effTotal}` : effTotal < 0 ? ` ${effTotal}` : '';
+
+    if (mode === 'adv') {
+      const r1 = rollDie(20), r2 = rollDie(20);
+      nat = Math.max(r1, r2); const dropped = Math.min(r1, r2);
+      total = nat + effTotal;
+      rollLine = `⚔️  1d20+${STAT_LABELS[stat]}${bonusTag} (advantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+    } else if (mode === 'dis') {
+      const r1 = rollDie(20), r2 = rollDie(20);
+      nat = Math.min(r1, r2); const dropped = Math.max(r1, r2);
+      total = nat + effTotal;
+      rollLine = `⚔️  1d20+${STAT_LABELS[stat]}${bonusTag} (disadvantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+    } else {
+      nat = rollDie(20); total = nat + effTotal;
+      rollLine = `⚔️  1d20+${STAT_LABELS[stat]}${bonusTag} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+    }
+    const targetName = targetF.name + (targetF.isNpc ? ' 🎭' : '');
+    const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
+    const actorCard = await fighterCharCard(interaction.guild, gid, actorId);
+
+    const headerLabel = `⚔️ Attacks ${targetName} with ${STAT_LABELS[stat]}`;
+    const card = buildRollEmbed({
+      rollLine, label: headerLabel, isReroll: false,
+      char: actorCard, healCharges: 0, maxCharges: 0,
+      flavour: flavour || null, total, critType, tags: null, gid,
+    });
+    const autoOn = !!fight.auto_npc;
+    const defHint = targetF.isNpc
+      ? (autoOn ? `🤖 **${targetF.name}** defends automatically...` : `🛡️ A GM defends for **${targetF.name}** with \`/fight def npc:${targetF.name}\`.`)
+      : `🛡️ <@${targetId}> — \`/fight def stat:dex\`, or \`/roll dice:2d6 fight:true\` for a custom roll.`;
+
+    upsertFight(gid, cid, {
+      phase: 'defend', current_target: targetId,
+      atk_roll: total, atk_nat: nat, atk_stat: stat, atk_mode: mode, atk_sides: 20,
+      def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
+      atk_rerolled: 0, def_rerolled: 0,
+    });
+    if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, `atk ${STAT_LABELS[stat]}`);
+    // The audit mirror links to the public card. Webhook and follow-up posts
+    // can't be resolved via fetchReply, so their ids are captured here; a plain
+    // public slash reply stays null and the mirror falls back to fetchReply.
+    let auditMsgId = null;
+    if (actor.isNpc) {
+      // Menu path: ack the picker first (interaction tokens are short-lived),
+      // then post the NPC's card through its webhook. Slash path keeps its
+      // original order: card, hint, then the private ack.
+      if (fromMenu) await interaction.update({ components: [], content: `✅ Attacked as **${actor.name}**.` })
+        .catch(err => console.error('[fighttarget] ack', err?.message || err));
+      const npcMsg = await postAsNpc(chan, gid, actor.name, card);
+      auditMsgId = npcMsg?.id ?? null;
+      await chan.send(defHint).catch(()=>{});
+      if (!fromMenu) await interaction.reply({ content: `✅ Attacked as **${actor.name}**.`, ephemeral: true });
+    } else if (fromMenu) {
+      // The picker message is ephemeral, so the card can't live there: collapse
+      // the menu in place and send the card as a public follow-up.
+      await interaction.update({ components: [], content: `🎯 **${targetName}** it is.` })
+        .catch(err => console.error('[fighttarget] ack', err?.message || err));
+      const pub = await interaction.followUp({ content: `${card}\n\n${defHint}`, ephemeral: false });
+      auditMsgId = pub?.id ?? null;
+    } else {
+      await interaction.reply({ content: `${card}\n\n${defHint}` });
+    }
+    recordRoll(gid, { userId: uid, channelId: cid, interaction, messageId: auditMsgId,
+      input: `/fight atk stat:${stat}${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
+      context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 attacks ${targetF.name}` : `fight · attacks ${targetF.name}` });
+    // NPCs-only mode: the bot rolls the targeted NPC's defence and resolves.
+    if (autoOn && targetF.isNpc) {
+      await new Promise(r=>setTimeout(r,1200));
+      await runAutoNpcChain(interaction.guild, gid, cid, chan);
+    }
+    return;
 }
 
 async function handleFight(interaction) {
@@ -8737,91 +9487,39 @@ async function handleFight(interaction) {
     const flavour = interaction.options.getString('flavour') ?? null;
     let mode = interaction.options.getString('roll') ?? 'normal';
 
-    if (!targetUser && !targetNpc) return interaction.reply({ content: '❌ Pick a `target` (player) or `target_npc` (NPC) to attack.', ephemeral: true });
-    {
-      // What you are carrying decides what you can swing, shoot or brace with.
-      const refusal = weaponStatRefusal(gid, pageSubject(gid, actorId), 'atk', stat);
-      if (refusal) return interaction.reply({ content: refusal, ephemeral: true });
+    if (!targetUser && !targetNpc) {
+      // Rather than making someone type a name, offer what is actually there.
+      // With one opponent left there is nothing to choose, so just say who.
+      const order = fightOrder(fight);
+      const hp = fightHp(fight);
+      const floor = fight.practice ? PRACTICE_FLOOR : 0;
+      const live = order.filter(fid => fid !== actorId && (hp[fid] ?? 0) > floor && !isFallen(gid, fid));
+      if (!live.length) return interaction.reply({ content: '❌ Nobody left standing to attack.', ephemeral: true });
+      if (live.length === 1) {
+        const only = await resolveFighter(interaction.guild, gid, live[0]);
+        return interaction.reply({ ephemeral: true, content:
+          `❌ Say who you are attacking — there is only **${only.name}** left, so: \`/fight atk stat:${stat} `
+          + `${only.isNpc ? `target_npc:${only.name}` : `target:@${only.name}`}\`` });
+      }
+      const { ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
+      const opts = [];
+      for (const fid of live.slice(0, 25)) {
+        const f = await resolveFighter(interaction.guild, gid, fid);
+        opts.push({ label: `${f.name}`.slice(0, 100), value: fid,
+          description: `${hp[fid] ?? 0} HP${f.isNpc ? ' · NPC' : ''}`.slice(0, 100),
+          emoji: f.isNpc ? '🎭' : '⚔️' });
+      }
+      const row = new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(`fighttarget:${actorId}:${stat}:${mode}:${encodeURIComponent(flavour ?? '')}`)
+          .setPlaceholder('Who are you attacking?')
+          .addOptions(opts));
+      return interaction.reply({ ephemeral: true, components: [row],
+        content: `🎯 **${live.length} still standing.** Pick your target.` });
     }
     if (targetUser && targetNpc) return interaction.reply({ content: '❌ Choose either a player target or an NPC target, not both.', ephemeral: true });
     const targetId = targetNpc ? npcFighterId(targetNpc) : targetUser.id;
-
-    if (!turnOrder.includes(targetId)) return interaction.reply({ content: '❌ That target is not in this fight.', ephemeral: true });
-    if (targetId === actorId) return interaction.reply({ content: '❌ You cannot target yourself.', ephemeral: true });
-
-    const hpState = fightHp(fight);
-    const atkFloor = fightFloor(fight);
-    if (hpState[targetId] !== undefined && hpState[targetId] <= atkFloor) {
-      return interaction.reply({ content: atkFloor > 0 ? '❌ That fighter has already yielded the bout.' : '❌ That target is already down.', ephemeral: true });
-    }
-
-    const actor = await resolveFighter(interaction.guild, gid, actorId);
-    const targetF = await resolveFighter(interaction.guild, gid, targetId);
-    const statVal = actor.stats[stat] ?? 0;
-    // Consume a pending riposte bonus from a previous nat-20 defence.
-    const atkBonus = consumeAtkBonus(gid, cid, actorId);
-    // Hero signature advantage (players and Hero NPCs alike)
-    const sigRowA = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
-    mode = applySignatureMode(sigRowA, stat, mode);
-    const effTotal = statVal + atkBonus;
-    let nat, total, rollLine;
-    const bonusTag = atkBonus ? ` +${atkBonus} riposte` : '';
-    const modStr = effTotal > 0 ? ` +${effTotal}` : effTotal < 0 ? ` ${effTotal}` : '';
-
-    if (mode === 'adv') {
-      const r1 = rollDie(20), r2 = rollDie(20);
-      nat = Math.max(r1, r2); const dropped = Math.min(r1, r2);
-      total = nat + effTotal;
-      rollLine = `⚔️  1d20+${STAT_LABELS[stat]}${bonusTag} (advantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
-    } else if (mode === 'dis') {
-      const r1 = rollDie(20), r2 = rollDie(20);
-      nat = Math.min(r1, r2); const dropped = Math.max(r1, r2);
-      total = nat + effTotal;
-      rollLine = `⚔️  1d20+${STAT_LABELS[stat]}${bonusTag} (disadvantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
-    } else {
-      nat = rollDie(20); total = nat + effTotal;
-      rollLine = `⚔️  1d20+${STAT_LABELS[stat]}${bonusTag} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
-    }
-    recordRoll(gid, { userId: uid, channelId: cid, interaction,
-      input: `/fight atk stat:${stat}${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
-      context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 attacks ${targetF.name}` : `fight · attacks ${targetF.name}` });
-
-    const targetName = targetF.name + (targetF.isNpc ? ' 🎭' : '');
-    const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
-    const actorCard = await fighterCharCard(interaction.guild, gid, actorId);
-
-    const headerLabel = `⚔️ Attacks ${targetName} with ${STAT_LABELS[stat]}`;
-    const card = buildRollEmbed({
-      rollLine, label: headerLabel, isReroll: false,
-      char: actorCard, healCharges: 0, maxCharges: 0,
-      flavour: flavour || null, total, critType, tags: null, gid,
-    });
-    const autoOn = !!fight.auto_npc;
-    const defHint = targetF.isNpc
-      ? (autoOn ? `🤖 **${targetF.name}** defends automatically...` : `🛡️ A GM defends for **${targetF.name}** with \`/fight def npc:${targetF.name}\`.`)
-      : `🛡️ <@${targetId}> — \`/fight def stat:dex\`, or \`/roll dice:2d6 fight:true\` for a custom roll.`;
-
-    upsertFight(gid, cid, {
-      phase: 'defend', current_target: targetId,
-      atk_roll: total, atk_nat: nat, atk_stat: stat, atk_mode: mode, atk_sides: 20,
-      def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
-      atk_rerolled: 0, def_rerolled: 0,
-    });
-    if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, `atk ${STAT_LABELS[stat]}`);
-    if (actor.isNpc) {
-      // Post the NPC's card through its webhook, ack the GM privately
-      await postAsNpc(chan, gid, actor.name, card);
-      await chan.send(defHint).catch(()=>{});
-      await interaction.reply({ content: `✅ Attacked as **${actor.name}**.`, ephemeral: true });
-    } else {
-      await interaction.reply({ content: `${card}\n\n${defHint}` });
-    }
-    // NPCs-only mode: the bot rolls the targeted NPC's defence and resolves.
-    if (autoOn && targetF.isNpc) {
-      await new Promise(r=>setTimeout(r,1200));
-      await runAutoNpcChain(interaction.guild, gid, cid, chan);
-    }
-    return;
+    return await runFightAttack({ interaction, gid, cid, actorId, targetId, stat, mode, flavour });
   }
 
   // ── DEF (normal / adv / dis) ──────────────────────────────────────────────
@@ -8886,10 +9584,6 @@ async function handleFight(interaction) {
       const label = flat ? `🛡️  1d20${flatTag}` : `🛡️  1d20+${STAT_LABELS[stat]}`;
       rollLine = `${label} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
-    recordRoll(gid, { userId: uid, channelId: cid, interaction,
-      input: `/fight def stat:${stat}${isNpcFighter(defenderId) ? ` npc:${defender.name}` : ''}`, rollLine, nat, sides: 20,
-      context: isNpcFighter(defenderId) ? `fight · GM as ${defender.name} 🎭 defends` : 'fight · defends' });
-
     const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
     const defCard = await fighterCharCard(interaction.guild, gid, defenderId);
     const card = buildRollEmbed({
@@ -8900,12 +9594,21 @@ async function handleFight(interaction) {
 
     upsertFight(gid, cid, { def_roll: total, def_nat: nat, def_stat: stat, def_mode: mode, def_sides: 20 });
     if (!defender.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, `def ${STAT_LABELS[stat]}`);
+    // Same audit-link discipline as the attack: capture the public card's id
+    // so the mirror can link to it; a plain public reply resolves via fetchReply.
+    let auditMsgId = null;
     if (defender.isNpc) {
-      await postAsNpc(chan, gid, defender.name, card);
+      const npcMsg = await postAsNpc(chan, gid, defender.name, card);
+      auditMsgId = npcMsg?.id ?? null;
       await chan.send('⚡ Use `/fight resolve` to resolve this exchange.').catch(()=>{});
-      return interaction.reply({ content: `✅ Defended as **${defender.name}**.`, ephemeral: true });
+      await interaction.reply({ content: `✅ Defended as **${defender.name}**.`, ephemeral: true });
+    } else {
+      await interaction.reply({ content: `${card}\n\n⚡ Use \`/fight resolve\` to resolve this exchange.` });
     }
-    return interaction.reply({ content: `${card}\n\n⚡ Use \`/fight resolve\` to resolve this exchange.` });
+    recordRoll(gid, { userId: uid, channelId: cid, interaction, messageId: auditMsgId,
+      input: `/fight def stat:${stat}${isNpcFighter(defenderId) ? ` npc:${defender.name}` : ''}`, rollLine, nat, sides: 20,
+      context: isNpcFighter(defenderId) ? `fight · GM as ${defender.name} 🎭 defends` : 'fight · defends' });
+    return;
   }
 
   // ── REROLLS ────────────────────────────────────────────────────────────────
@@ -9411,12 +10114,12 @@ async function handleNpc(interaction) {
     const npc = getNpc(gid, name);
     if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found.`, ephemeral: true });
     if (interaction.options.getBoolean('remove')) {
-      upsertNpc(gid, npc.name, { class: null, signature_stat: null });
+      upsertNpc(gid, npc.name, { is_hero: 0, signature_stat: null });   // clear the flag, keep any class
       return interaction.reply({ content: `✅ **${npc.name}** is no longer a Hero.` });
     }
     const stat = interaction.options.getString('stat');
     if (!stat) {
-      upsertNpc(gid, npc.name, { class: 'Hero' });
+      upsertNpc(gid, npc.name, { is_hero: 1 });
       return interaction.reply({ content: `🦸 **${npc.name}** is now a **Hero**. Give them a signature stat with \`/npc hero name:${npc.name} stat:…\`.` });
     }
     const val = npc[stat] ?? 0;
@@ -9832,9 +10535,31 @@ async function handleWeapon(interaction) {
 // ─────────────────────────────────────────────
 
 const HELP_CATEGORIES = {
+  start: {
+    title: '🌟 Getting Started',
+    blurb: 'the whole game in one page — begin here',
+    body: [
+      '_New to the server? This is the whole game in one page. Every group below also has its own page — `/help category:...`._',
+      '',
+      '**1 · Make your character** — `/char create` walks you through stats, class, order and weapons. You spend a fixed allowance across STR/CON/DEX/WIS/LCK with a minimum in each — `/config statallowance` shows this server\'s numbers. If sheet approval is on, a GM checks your sheet before it goes live, and you\'ll be told either way.',
+      '**2 · Roll dice** — type `1d20` bare, `r1d20+5 ambush` for a label, or just a stat word like `str` or `wis`. `ra`/`rd` roll with advantage or disadvantage, and `rr` rerolls your last roll for a token. `/roll` is the guided version with dropdowns.',
+      '**3 · Your card** — `/p on` puts your character card under your rolls, HP and tokens included. `/p style` compresses it, `/char show` opens the full sheet any time.',
+      '**4 · HP and rests** — `!hp -3` after a hit, `lrest` for a full rest, `srest` for a breather. White Knights (WIS ≥ 5) can `!heal @friend`.',
+      '**5 · Fights** — a GM opens one with `/fight start` and initiative sets the order. On your turn, `/fight atk stat:str` — leave the target off and a menu appears; picking someone rolls the attack on the spot. The defender answers with `/fight def stat:dex`, either side may spend a token on `/fight rr`, and `/fight resolve` settles the exchange. When it all ends, a 🏁 result and a full recap post on their own.',
+      '**6 · Duels** — `/duel opponent:@rival terms:first blood` raises one. A GM signs it off and starts the fight.',
+      '**7 · Quests** — `/quest board` shows what\'s posted. Tap **Apply** on a quest post (or `/quest apply number:N`), a GM approves the party, and merits pay out when it completes.',
+      '**8 · Activities** — minigames written for this server: branching scenes with rolls and rewards. `/activity list` to browse, `/activity run name:Fishing` to start one here. When a scene asks for a roll, just type the stat word — `wis`, or `wis steady does it` to add flavour — and the story moves.',
+      '**9 · Renown & merits** — renown is the coin quests, encounters and activities pay out; spend it as the server allows (`/renown view`). Merits are lifetime honour that only climbs, and ranks hang off them (`/merit view`, `/rank list`). You can offer merit to a friend with `/merit give` — a GM signs it off.',
+      '**10 · Death** — characters can fall. That call belongs to a GM: a memorial is posted, the sheet locks, and the fallen keep their history. Revival is possible when the story allows it.',
+      '',
+      '_Lost mid-game? `/help category:X` for any group, `/stat` for what each stat means, `/lastroll` if you forgot what you just threw._',
+    ],
+  },
   dice: {
     title: '🎲 Dice Rolling',
+    blurb: 'notation, stat words, advantage, rerolls',
     body: [
+      '_Dice work three ways — bare notation, quick stat words, or the guided `/roll` — and all of them read your sheet and post the same cards._',
       '`1d20` or `r1d20+5` — roll dice (prefix `r`, `!r`, `!roll`, or bare notation)',
       '`r1d20+5 label` — add a label; new lines become *italic* / **bold** flavour',
       '`ra1d20+5` — roll with **advantage** (drops lowest)',
@@ -9847,26 +10572,32 @@ const HELP_CATEGORIES = {
       '`strrr` / `dexrra` / `conrrd` — reroll using a stat set · add a label like `strrr atk`',
       '`?1d20+5` — success check (crit/success/fail tiers)',
       '`/dr` — slash version with dropdowns for roll type & success',
+      '`/lastroll` — recall the last thing you rolled in this channel',
     ],
   },
   character: {
     title: '📜 Character Sheet',
+    blurb: 'sheets, approval, lore, profiles, weapons',
     body: [
+      '_Your sheet is the one source of truth — stats, class, order and weapons — and fights, activities and heals all read from it._',
       '`/char create` — set up a full character at once (stats, order, class, weapons, weapon emojis)',
       '`/char set field:STR value:14` — set one field at a time (with approvals on, any change to your own sheet goes back to the GMs)',
       '`/char weaponemoji slot:Weapon 1 emoji:⚔️` — pick a weapon slot emoji',
       '`/char show [user]` — view a character sheet',
+      '`/char lore` — write your character\'s story and send it to the GMs',
       'Players spend an exact stat allowance across STR/CON/DEX/WIS/LCK with a minimum in each — GMs aren\'t limited. Run `/config statallowance` to see or change this server\'s numbers',
       '`/char submit` — send your sheet back to the GMs after a rejection, unchanged',
       '`/char export [format:Image]` — export your sheet as text or image. With approvals on it goes to the GMs first and reaches you when one releases it',
       '`/char signature user:@a stat:str` — set a Hero\'s signature stat (GM)',
-      '`/profile on/off/show/save/load/saves` — manage profile display & snapshots',
+      '`/profile on/off/show/save/load/saves` — manage profile display & snapshots (shorthand: `/p`)',
       '`/weapon add/remove/list` — manage the server weapon list (GM)',
     ],
   },
   hp: {
     title: '❤️ HP, Healing & Rerolls',
+    blurb: 'damage, healing, rests, tokens',
     body: [
+      '_HP and reroll tokens live on your sheet and follow you everywhere, fights included — rests are how they come back._',
       '`!hp +5` / `!hp -3` — adjust your HP (or `!hp @user +5`)',
       '`!heal @user` / `!h @user` — White Knight heal (WIS ≥ 5 only)',
       '`!rerolls +1` / `!rerolls @user -1` — adjust reroll tokens',
@@ -9874,8 +10605,10 @@ const HELP_CATEGORIES = {
     ],
   },
   fight: {
-    title: '⚔️ Fights',
+    title: '⚔️ Fights & Duels',
+    blurb: 'turn-based combat, and duels a GM referees',
     body: [
+      '_Fights are turn-based exchanges — attacker rolls, defender answers, the clash resolves. GMs referee; NPCs fight through them or on autopilot._',
       '`/fight start players:@a @b npcs:Goblin, Orc` — begin a fight with any number of players and GM NPCs (auto-rolls DEX initiative)',
       '`/fight start ... manual:true` — keep the order you listed fighters in (no roll)',
       '`/fight start ... practice:true` — friendly bout: fighters yield at 2 HP and are never driven below it',
@@ -9883,10 +10616,12 @@ const HELP_CATEGORIES = {
       '`/fight addnpc npc:Goblin, Orc` — add one or more NPCs mid-fight',
       '`/fight order sequence:@a, Goblin, @b` — set the turn order, players and NPCs (GM)',
       '`/fight atk stat:str target:@user` — attack a player · add `target_npc:Name` to hit an NPC',
+      '`/fight atk stat:str` — leave the target off and a menu appears; picking someone rolls the attack on the spot',
       '`/fight atk stat:str npc:Goblin target:@user` — GM attacks AS an NPC on its turn',
       '`/fight def stat:dex` — defend · GM defends as an NPC with `npc:Name`',
       '`/fight rr` — reroll (costs a token) · `/fight resolve` — resolve a clash',
       '`/fight status` — show current fight · `/fight forfeit` — drop out',
+      '`/duel opponent:@rival terms:first blood` — raise a duel; a GM signs off, then starts the fight',
       '`/fight auto mode:Full players:@a npcs:Orc` — bot resolves the whole fight (GM)',
       '`/fight refill npcs:all` — refill NPC reroll tokens to their LCK (GM)',
       '`/fight hp value:N target:@a` / `target_npc:Orc` — set HP mid-fight, sheet synced (GM)',
@@ -9901,9 +10636,78 @@ const HELP_CATEGORIES = {
       '`/fight auto mode:Demo` — example showcase fight · `/fight end` — end the fight (GM)',
     ],
   },
+  activities: {
+    title: '🎣 Activities & Renown',
+    blurb: 'server-written minigames, and the coin they pay',
+    body: [
+      '_Activities are minigames written for this server — branching scenes, rolls, choices and rewards. Renown is the currency they and quests pay out._',
+      '`/activity list` — every activity on this server · `/activity show name:X` — read one scene by scene',
+      '`/activity run name:X` — start one in this channel · `/activity stop` — stop the one running here',
+      'When a scene asks for a roll, type the stat word — `wis`, or `wis steady does it` to add flavour',
+      'A **Reroll** button sits on the scene card while a token remains — one second chance per roll',
+      'Some scenes offer **choices** as buttons; some tally renown as you play and bank it at the end',
+      '`/activity demo` — the built-in fishing tale, no stakes (GM)',
+      'GMs write activities by pasting a `[STORY]` script in chat — it\'s validated before anything is stored',
+      '`/activity set name:X scene:Y field:Z value:...` — tweak one line of one scene without re-pasting (GM)',
+      '`/activity delete name:X` — remove an activity (GM)',
+      '`/renown view [user]` — balance · `/renown leaderboard` — who holds the most · `/renown history [user]`',
+      '`/renown add/remove/set` — adjust a balance, with a reason (GM)',
+    ],
+  },
+  progression: {
+    title: '🎖️ Merits & Ranks',
+    blurb: 'lifetime honour, trades, and the ranks above',
+    body: [
+      '_Merits are lifetime honour — they only climb, and ranks hang off them. Promotions are always a GM\'s call._',
+      '`/merit view [user]` — see merits, current rank, and how many to the next',
+      '`/merit leaderboard` — top earners on the server',
+      '`/merit history [user]` — a player\'s merit timeline, or recent server activity',
+      '`/merit give user:@friend amount:N reason:...` — offer someone your merit; a GM signs it off',
+      '`/merit trades` — trades still waiting on a GM · `/merit cancel id:N` — withdraw one (yours, or any if GM)',
+      '`/merit add @user [amount]` — award merits (GM) · `/merit remove` · `/merit set`',
+      '`/rank list` — view ranks and thresholds',
+      '`/rank add name:Knight threshold:5` — create/update a rank (GM)',
+      '`/rank promote @user rank:Knight` — set a player\'s rank (GM, fully manual)',
+      '`/rank eligible` — players who\'ve met a threshold but aren\'t promoted yet (GM)',
+      '`/rank remove name:X` — delete a rank (GM)',
+    ],
+  },
+  quests: {
+    title: '📜 Quest Board',
+    blurb: 'the board, parties, and rewards',
+    body: [
+      '_The board is the server\'s job wall — GMs post, players apply, the party locks, and merits pay out at the end._',
+      '`/quest board [filter]` — list quests (open / active / completed / all)',
+      '`/quest show number:N` — full quest details · `/quest roster number:N` — applicants & party',
+      '`/quest apply number:N` — apply to join (or tap **Apply** on the post)',
+      '`/quest withdraw number:N` — leave or cancel your application',
+      '`/quest log [user]` — completed quests a player was on',
+      '`/quest create name:Goblin Cave objectives:... merit_reward:2 party_size:4 hard_cap:true` — (GM)',
+      '`/quest post number:N [channel]` — post it as an embed with an Apply button (GM)',
+      '`/quest approve number:N @user [force]` — approve an applicant; `force` overrides a hard cap (GM)',
+      '`/quest kick number:N @user` — remove a member/applicant (GM)',
+      '`/quest runchannel number:N [channel]` — set where the quest runs & rewards (GM)',
+      '`/quest start number:N` — lock the party and mark in progress (GM)',
+      '`/quest complete number:N` — finish it; merits auto-awarded, other rewards listed (GM)',
+      '`/quest delete number:N` — remove a quest (GM)',
+    ],
+  },
+  tags: {
+    title: '🏷️ Tags',
+    blurb: 'badges on players',
+    body: [
+      '_Tags are little badges on a player — flair a GM hands out, plus custom ones the server invents._',
+      '`/tag assign user:@player tag:X` — give a player a tag (GM)',
+      '`/tag remove user:@player tag:X` — remove a tag',
+      '`/tag list` — show all tags',
+      '`/tag custom action:Create emoji:⚜️ name:MyTag` — manage custom tags',
+    ],
+  },
   npc: {
     title: '🎭 NPCs',
+    blurb: 'the GM\'s cast — stat blocks, categories, voices',
     body: [
+      '_Everything for running the cast: stat blocks, categories, webhook voices and rolls._',
       '`/npc create name:X str:N ...` — create an NPC (GM)',
       '`/npc hp name:X value:N` — set an NPC\'s HP · omit value for a full heal (GM)',
       '`/npc heal names:all` · `/npc heal names:Goblin, Orc` — fully heal NPCs (GM)',
@@ -9921,18 +10725,11 @@ const HELP_CATEGORIES = {
       '💡 Upload an image to the NPC channel with the NPC name to set an avatar',
     ],
   },
-  tags: {
-    title: '🏷️ Tags',
-    body: [
-      '`/tag assign user:@player tag:X` — give a player a tag (GM)',
-      '`/tag remove user:@player tag:X` — remove a tag',
-      '`/tag list` — show all tags',
-      '`/tag custom action:Create emoji:⚜️ name:MyTag` — manage custom tags',
-    ],
-  },
   gm: {
     title: '🛠️ GM & Config',
+    blurb: 'server wiring — roles, approvals, audits, backups',
     body: [
+      '_Server wiring: roles, approvals, audits, rests, backups. Admins always count as GMs._',
       '`/config gmrole role:@Role` — add a GM role · `remove:true` · `replace:true` · omit to list',
       '_Server admins (Manage Server) always count as GMs._',
       '`/config heal charges:N` — set default heal charges',
@@ -9957,39 +10754,6 @@ const HELP_CATEGORIES = {
       '`/stat` — show stat descriptions · `/help` — this menu',
     ],
   },
-  progression: {
-    title: '🎖️ Merits & Ranks',
-    body: [
-      '`/merit view [user]` — see merits, current rank, and how many to the next',
-      '`/merit leaderboard` — top earners on the server',
-      '`/merit history [user]` — a player\'s merit timeline, or recent server activity',
-      '`/merit add @user [amount]` — award merits (GM) · `/merit remove` · `/merit set`',
-      '`/rank list` — view ranks and thresholds',
-      '`/rank add name:Knight threshold:5` — create/update a rank (GM)',
-      '`/rank promote @user rank:Knight` — set a player\'s rank (GM, fully manual)',
-      '`/rank eligible` — players who\'ve met a threshold but aren\'t promoted yet (GM)',
-      '`/rank remove name:X` — delete a rank (GM)',
-      '_Merits are a lifetime tally; promotions are always GM-decided._',
-    ],
-  },
-  quests: {
-    title: '📜 Quest Board',
-    body: [
-      '`/quest board [filter]` — list quests (open / active / completed / all)',
-      '`/quest show number:N` — full quest details · `/quest roster number:N` — applicants & party',
-      '`/quest apply number:N` — apply to join (or tap **Apply** on the post)',
-      '`/quest withdraw number:N` — leave or cancel your application',
-      '`/quest log [user]` — completed quests a player was on',
-      '`/quest create name:Goblin Cave objectives:... merit_reward:2 party_size:4 hard_cap:true` — (GM)',
-      '`/quest post number:N [channel]` — post it as an embed with an Apply button (GM)',
-      '`/quest approve number:N @user [force]` — approve an applicant; `force` overrides a hard cap (GM)',
-      '`/quest kick number:N @user` — remove a member/applicant (GM)',
-      '`/quest runchannel number:N [channel]` — set where the quest runs & rewards (GM)',
-      '`/quest start number:N` — lock the party and mark in progress (GM)',
-      '`/quest complete number:N` — finish it; merits auto-awarded, other rewards listed (GM)',
-      '`/quest delete number:N` — remove a quest (GM)',
-    ],
-  },
 };
 
 // Help categories that document GM-only tooling. Players shouldn't be able to
@@ -9999,23 +10763,30 @@ const GM_HELP_CATEGORIES = ['gm', 'npc'];
 async function handleHelp(interaction) {
   const cat = interaction.options.getString('category');
   const gm = await isGm(interaction.guild, interaction.user.id);
+  const handbook = playerHandbookLink(interaction.guild.id);
 
   if (cat && HELP_CATEGORIES[cat]) {
     if (GM_HELP_CATEGORIES.includes(cat) && !gm) {
       return interaction.reply({ content: '❌ That help section covers GM-only commands.', ephemeral: true });
     }
+    // Pages like the Getting Started guide run past one message; replyLong
+    // splits on line breaks so nothing is ever cut mid-sentence.
     const c = HELP_CATEGORIES[cat];
-    return interaction.reply({ content: `**${c.title}**\n${c.body.join('\n')}`, ephemeral: true });
+    const page = [`**${c.title}**`, ...c.body];
+    if (cat === 'start' && handbook) page.push('', `📖 [The player handbook (PDF)](<${handbook}>)`);
+    return replyLong(interaction, page, { ephemeral: true });
   }
   // Overview — hide GM sections from players entirely
-  const lines = ['**🎲 DDice — Command Help**', '', 'Use `/help category:X` for details on each group.', ''];
+  const lines = ['**🎲 DDice — Command Help**', '',
+    '_New here? `/help category:start` walks the whole game in one page._', ''];
   for (const key of Object.keys(HELP_CATEGORIES)) {
     if (GM_HELP_CATEGORIES.includes(key) && !gm) continue;
     const c = HELP_CATEGORIES[key];
-    lines.push(`${c.title} — \`/help category:${key}\``);
+    lines.push(`${c.title} — ${c.blurb} · \`/help category:${key}\``);
   }
+  if (handbook) lines.push('', `📖 [The player handbook (PDF)](<${handbook}>)`);
   lines.push('', '_Most dice commands also work with the `r` prefix or bare notation (e.g. `1d20`)._');
-  return interaction.reply({ content: lines.join('\n'), ephemeral: true });
+  return replyLong(interaction, lines, { ephemeral: true });
 }
 
 // ─────────────────────────────────────────────
@@ -10276,6 +11047,7 @@ async function handleGmHeal(interaction) {
     const cfg0 = getConfig(gid);
     const maxCharges0 = cfg0.heal_charges ?? 3;
     const lines = [];
+    const entries = [];
     let players = 0, npcs = 0;
     // Counted across both branches below, so it has to live out here — it was
     // declared inside the players block and threw for a scope:NPCs heal.
@@ -10283,6 +11055,8 @@ async function handleGmHeal(interaction) {
 
     if (scope === 'players' || scope === 'all') {
       const sheets = db.prepare('SELECT * FROM characters WHERE guild_id=?').all(gid);
+      // Gathered first so the whole roster can be put in reading order —
+      // Heroes, then knight order, then class, then name.
       for (const ch of sheets) {
         // A heal is not a resurrection — that needs /gmrevive and a decision.
         if (ch.died_at) { fallenSkipped++; continue; }
@@ -10304,7 +11078,7 @@ async function handleGmHeal(interaction) {
           setHealCharges(gid, ch.user_id, after);
           bits.push(`🛡️ ${before}→${after}`);
         }
-        if (bits.length) { players++; lines.push(`**${nm}** — ${bits.join(' · ')}`); }
+        if (bits.length) { players++; entries.push({ row: ch, name: nm, text: `**${nm}** — ${bits.join(' · ')}` }); }
       }
     }
 
@@ -10317,9 +11091,17 @@ async function handleGmHeal(interaction) {
         const max = maxHpFromCon(gid, npc.con), before = npc.hp_current ?? 0, after = compute(before, max);
         setFighterHp(gid, npcFighterId(npc.name), after);
         npcs++;
-        lines.push(`🎭 **${npc.name}** — ❤️ ${before}→${after} / ${max}`);
+        entries.push({ row: npc, name: npc.name, isNpc: true, text: `**${npc.name}** — ❤️ ${before}→${after} / ${max}` });
       }
     }
+
+    // One reading order for the whole list, grouped by heading.
+    for (const g of groupRoster(entries)) {
+      lines.push(`**${g.label}**`);
+      for (const e of g.rows) lines.push(`  ${e.text}`);
+      lines.push('');
+    }
+    if (lines.length && lines[lines.length - 1] === '') lines.pop();
 
     if (!lines.length) return interaction.editReply({ content: fallenSkipped
       ? `❌ Nothing to restore — the only characters here have fallen. \`/gmrevive\` brings one back.`
@@ -11235,6 +12017,18 @@ async function handleSheetApprovalButton(interaction) {
   const gmName = await getDisplayName(interaction.guild, interaction.user.id);
   const approved = true;
   upsertChar(gid, uid, { approval_state: 'approved', approval_reason: null });
+
+  // An approved character earns a page of their own, if a forum is set. Purely
+  // additive — a failure here must never undo an approval.
+  let pageNote = '';
+  try {
+    const who = await getDisplayName(interaction.guild, uid);
+    const made = await ensureCharPage(interaction.client, interaction.guild, uid, who);
+    if (made?.url) pageNote = `\n📖 Their page: ${made.url}`;
+  } catch (err) {
+    console.error('[charpage] could not create:', err?.message || err);
+    pageNote = `\n⚠️ _Couldn't make their forum page: ${err?.message || err}_`;
+  }
 
   // Update the request post so the queue reflects the decision
   try {
