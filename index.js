@@ -426,6 +426,11 @@ db.exec(`
     src_channel TEXT, msg_id TEXT, requested_at INTEGER,
     PRIMARY KEY (guild_id, user_id)
   );
+  CREATE TABLE IF NOT EXISTS posted_scrolls (
+    msg_id TEXT PRIMARY KEY,
+    guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+    title TEXT, body TEXT NOT NULL, flavour TEXT, created_at INTEGER
+  );
   CREATE TABLE IF NOT EXISTS import_requests (
     guild_id TEXT NOT NULL, user_id TEXT NOT NULL,
     payload TEXT NOT NULL,
@@ -3105,6 +3110,12 @@ function extractScrollData(buf) {
   try { const o = JSON.parse(buf.slice(i + SCROLL_WEAVE_MARK.length).toString('utf8')); return o && typeof o === 'object' ? o : null; }
   catch { return null; }
 }
+// A Discord message link, any client flavour, down to its ids.
+function parseMessageLink(text) {
+  const m = String(text ?? '').match(/discord(?:app)?\.com\/channels\/(\d+)\/(\d+)\/(\d+)/);
+  return m ? { guildId: m[1], channelId: m[2], messageId: m[3] } : null;
+}
+
 function validateScrollData(o) {
   if (!o || o.v !== 1 || o.kind !== 'scroll') return null;
   if (typeof o.body !== 'string' || !o.body.trim()) return null;
@@ -3703,7 +3714,7 @@ async function handleCharImport(interaction) {
     sheet = validateImportedSheet(extractSheetData(bytes));
     if (!sheet) {
       return interaction.editReply({ content:
-        '❌ No sheet is woven into that image. Only images made by `/char export` (Image or Parchment) carry one — older exports predate the weave, so re-export from the source server first.' });
+        '❌ No sheet survives in that image — Discord strips hidden data whenever an image is re-uploaded, so the woven copy rarely makes the trip. The reliable carrier is text: `/char export format:Text` on the source server, then paste its `[TTRPG SHEET]` block here.' });
     }
   } else {
     sheet = readImportBlock(pasted);
@@ -4238,7 +4249,8 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)')
-    .addAttachmentOption(o=>o.setName('image').setDescription('A scroll made by /scroll — I read it back as plain text and a fresh parchment').setRequired(false)),
+    .addAttachmentOption(o=>o.setName('image').setDescription('A scroll made by /scroll — I read it back as plain text and a fresh parchment').setRequired(false))
+    .addStringOption(o=>o.setName('link').setDescription('Or the scroll message\'s link — the reliable way; Discord strips hidden data from re-uploads').setRequired(false)),
 
   new SlashCommandBuilder()
     .setName('help').setDescription('Show all commands by category')
@@ -11688,7 +11700,7 @@ const HELP_CATEGORIES = {
       '`/config rollauditforum forum:#roll-audit` — split the mirror into books: player rolls, GM rolls, NPC rolls, NPC say (Admin)',
       'When NPC stats are hidden, fight cards mask the stat and modifier — the audit\'s NPC book gets the full card, every number revealed',
       '`/config scrollfont font:<file>` — store an .otf/.ttf; `/scroll` then writes props in it (Admin)',
-      '`/scroll` — write a title and body in a modal; the bot posts them as an ancient parchment image, the writing woven inside. `image:` hands one back — plain text out, plus a fresh parchment in this server\'s font (GM)',
+      '`/scroll` — write a title and body in a modal; the bot posts them as an ancient parchment image and remembers it. `link:` with the scroll message\'s link reads it back — plain text out, plus a fresh parchment in this server\'s font. (`image:` works only for files that never passed through a Discord re-upload) (GM)',
       '`/config approvals channel:#x` — new sheets need GM approval before use (Admin)',
       '`/config approvals list:true` — every sheet still waiting, read from the database so nothing is lost if a post failed',
       '`/config approvalforum forum:#gm-approvals` — one forum, a thread per approval type: sheets, trades, duels, lore, exports (Admin)',
@@ -11714,10 +11726,12 @@ async function handleScroll(interaction) {
   if (!(await isGm(interaction.guild, interaction.user.id))) {
     return interaction.reply({ content: '❌ Only GMs can unfurl props.', ephemeral: true });
   }
-  // An image given means "read this one back" — text always comes out, and a
-  // fresh parchment follows when this server can render one.
+  // Reading one back: a message link is the reliable route (the registry
+  // remembers every scroll the bot posts); an image works only when its woven
+  // tail survived — Discord strips it from client re-uploads.
   const att = interaction.options.getAttachment('image');
-  if (att) return handleScrollImport(interaction, gid, att);
+  const link = interaction.options.getString('link');
+  if (att || link) return handleScrollImport(interaction, gid, att, link);
   try { require('@napi-rs/canvas'); }
   catch { return interaction.reply({ content: '❌ Image generation unavailable — install `@napi-rs/canvas` to enable.', ephemeral: true }); }
   if (!ensureScrollFont(gid)) {
@@ -11739,7 +11753,16 @@ async function handleScroll(interaction) {
 // Hand a woven scroll back: the writing comes out as plain text, and when
 // this server has a font and the canvas, a fresh parchment follows — rendered
 // in THIS server's face and re-woven, so the new image round-trips too.
-async function handleScrollImport(interaction, gid, att) {
+async function handleScrollImport(interaction, gid, att, link = null) {
+  if (link) {
+    const ref = parseMessageLink(link);
+    if (!ref) return interaction.reply({ content: '❌ That isn\'t a Discord message link.', ephemeral: true });
+    const row = db.prepare('SELECT * FROM posted_scrolls WHERE msg_id=?').get(ref.messageId);
+    if (!row) return interaction.reply({ content:
+      '❌ That message isn\'t a scroll I posted — or it predates the registry. Scrolls posted from now on can always be read back by link.', ephemeral: true });
+    await interaction.deferReply({ ephemeral: true });
+    return deliverScroll(interaction, gid, { title: row.title, body: row.body, flavour: row.flavour });
+  }
   if (!/\.png$/i.test(att.name || '')) {
     return interaction.reply({ content: '❌ That isn\'t a .png — hand me a scroll image made by `/scroll`.', ephemeral: true });
   }
@@ -11756,8 +11779,14 @@ async function handleScrollImport(interaction, gid, att) {
   const scroll = validateScrollData(extractScrollData(bytes));
   if (!scroll) {
     return interaction.editReply({ content:
-      '❌ No writing is woven into that image — only scrolls made by `/scroll` carry it, and ones made before the weave predate it.' });
+      '❌ No writing survives in that image — Discord strips hidden data whenever an image is re-uploaded, so the woven copy rarely makes the trip. Use `/scroll link:` with the scroll message\'s link instead — the registry always has it.' });
   }
+  return deliverScroll(interaction, gid, scroll);
+}
+
+// Text first, always; then a fresh parchment in this server's face when it
+// can be rendered — shared by the link and image routes.
+async function deliverScroll(interaction, gid, scroll) {
   const lines = ['📜 **The scroll, read back:**', ''];
   if (scroll.title) lines.push(`**${scroll.title}**`, '');
   lines.push(scroll.body);
@@ -11798,11 +11827,16 @@ async function handleScrollModal(interaction) {
       { v: 1, kind: 'scroll', title, body, flavour });
     const { AttachmentBuilder } = require('discord.js');
     const chan = await interactionChannel(interaction);
-    await chan.send({
+    const posted = await chan.send({
       content: flavour || '📜 *An ancient parchment is unfurled…*',
       files: [new AttachmentBuilder(buf, { name: 'ancient-scroll.png' })],
     });
-    return interaction.editReply({ content: '📜 Posted.' });
+    // The registry is what makes a scroll readable later: Discord strips the
+    // woven tail from any client re-upload, but a message link finds it here.
+    db.prepare(`INSERT OR REPLACE INTO posted_scrolls (msg_id,guild_id,channel_id,title,body,flavour,created_at)
+                VALUES (?,?,?,?,?,?,?)`)
+      .run(posted.id, gid, chan.id, title, body, flavour, Date.now());
+    return interaction.editReply({ content: `📜 Posted. Read it back any time with \`/scroll link:\` and [its link](<https://discord.com/channels/${gid}/${chan.id}/${posted.id}>).` });
   } catch (err) {
     console.error('[scroll] render failed -', err?.message || err);
     return interaction.editReply({ content: `❌ The scroll wouldn't take ink — ${err?.message || err}` });
