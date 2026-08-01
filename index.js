@@ -527,6 +527,9 @@ try { db.exec('ALTER TABLE duels ADD COLUMN approval_ch_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE lore ADD COLUMN ch_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE merit_trades ADD COLUMN ch_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE export_requests ADD COLUMN ch_id TEXT'); } catch {}
+// Audit routing: same shape for the roll mirror — a JSON map
+// {forum, players, gms, npcs, say} of channel ids.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN audit_routes TEXT'); } catch {}
 
 function getChar(gid, uid) {
   return db.prepare('SELECT * FROM characters WHERE guild_id=? AND user_id=?').get(gid, uid);
@@ -3498,6 +3501,9 @@ const slashCommands = [
       .addChannelOption(o=>o.setName('channel').setDescription('Channel to mirror rolls into').setRequired(false))
       .addBooleanOption(o=>o.setName('test').setDescription('true = send a test mirror and report any problem').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = turn the mirror off').setRequired(false)))
+    .addSubcommand(s=>s.setName('rollauditforum').setDescription('Split the mirror into books — player rolls, GM rolls, NPC rolls, NPC say')
+      .addChannelOption(o=>o.setName('forum').setDescription('The forum channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = back to the single audit channel').setRequired(false)))
     .addSubcommand(s=>s.setName('cleanwebhooks').setDescription('Remove orphaned NPC webhooks to free up Discord limits')),
 
   new SlashCommandBuilder()
@@ -5227,24 +5233,85 @@ async function handleConfig(interaction) {
       approvalChannelId(gid) ? null : 'ℹ️ _No single approval channel is set — that\'s fine, the forum covers everything, and sheet approval now counts as **on**._',
     ].filter(Boolean).join('\n') });
   }
+  if (sub === 'rollauditforum') {
+    if (interaction.options.getBoolean('disable')) {
+      setConfig(gid, { audit_routes: null });
+      return interaction.reply({ content: '🎲 Audit routing **off** — every mirror goes to the single audit channel again. The forum threads stay where they are.' });
+    }
+    const forum = interaction.options.getChannel('forum');
+    if (!forum) {
+      const r = auditRoutes(gid);
+      if (!r) return interaction.reply({ ephemeral: true, content:
+        '🎲 No audit forum set. `/config rollauditforum forum:#roll-audit` — I\'ll make a thread per book: player rolls, GM rolls, NPC rolls, NPC say.' });
+      const rows = Object.entries(AUDIT_KINDS).map(([k, t]) => `${t.name} → ${r[k] ? `<#${r[k]}>` : '_missing — rerun setup_'}`);
+      return interaction.reply({ ephemeral: true, content: [`🎲 Roll audit routes into <#${r.forum}>:`, ...rows].join('\n') });
+    }
+    // A forum is channel type 15; anything else has no threads to make.
+    if (forum.type !== 15) {
+      return interaction.reply({ ephemeral: true, content:
+        `❌ <#${forum.id}> is not a forum channel. Make a **Forum** and point me at that — each audit book gets its own thread in it.` });
+    }
+    await interaction.deferReply();
+    const prev = auditRoutes(gid) || {};
+    const routes = { forum: forum.id };
+    const lines = [];
+    for (const [key, t] of Object.entries(AUDIT_KINDS)) {
+      let thread = null;
+      // Re-running setup reuses a surviving thread in this same forum, so ids
+      // (and every link already pointing at them) stay stable.
+      if (prev[key]) {
+        try {
+          const old = await interaction.client.channels.fetch(prev[key]);
+          if (old?.isThread?.() && old.parentId === forum.id) thread = await wakeThread(old);
+        } catch (err) { console.error('[rollauditforum] stale thread', key, '-', err?.message || err); }
+      }
+      if (!thread) {
+        try {
+          thread = await forum.threads.create({ name: t.name, autoArchiveDuration: 10080,
+            message: { content: `${t.about}\n_I wake this thread whenever a new entry arrives — no need to keep it active._` } });
+        } catch (err) {
+          console.error('[rollauditforum] create failed', key, '-', err?.message || err);
+          return interaction.editReply({ content:
+            `❌ Couldn't create the **${t.name}** thread — ${err?.message || err}\nCheck I can **View Channel**, **Create Posts** and **Send Messages in Posts** there, then run this again. Nothing was saved.` });
+        }
+      }
+      routes[key] = thread.id;
+      lines.push(`${t.name} → <#${thread.id}>`);
+    }
+    setConfig(gid, { audit_routes: JSON.stringify(routes) });
+    return interaction.editReply({ content: [
+      `🎲 **Roll audit now routes into <#${forum.id}>:**`, ...lines, '',
+      '_Player, GM and NPC rolls split into their books, and NPC Say starts recording who spoke as whom — it only records while this forum is set._',
+      getConfig(gid)?.roll_audit_channel_id ? null : 'ℹ️ _No single audit channel is set — that\'s fine, the forum alone turns mirroring on._',
+    ].filter(Boolean).join('\n') });
+  }
   if (sub === 'rollaudit') {
     const channel = interaction.options.getChannel('channel');
     const disable = interaction.options.getBoolean('disable');
     const test = interaction.options.getBoolean('test');
 
     if (test) {
-      const chId = getConfig(gid)?.roll_audit_channel_id;
-      if (!chId) return interaction.reply({ content: '🔇 No audit channel is set. Use `/config rollaudit channel:#x` first.', ephemeral: true });
-      let target;
-      try { target = await interaction.client.channels.fetch(chId); }
-      catch (e) { return interaction.reply({ content: `❌ I can't see <#${chId}> (id \`${chId}\`).\n**${e?.message || e}**\nAdd the bot to that channel with View Channel + Send Messages.`, ephemeral: true }); }
-      if (!target) return interaction.reply({ content: `❌ Channel \`${chId}\` no longer exists. Set a new one with \`/config rollaudit channel:#x\`.`, ephemeral: true });
-      try {
-        await target.send({ content: '🎲 **Roll audit test** — mirroring is working. Player rolls will appear here.' });
-        return interaction.reply({ content: `✅ Test message sent to <#${chId}>. If you can see it there, mirroring works.\n\n_Mirrored: player rolls, heals, fight rolls, and GM rolls (including secret ones). Not mirrored: NPC auto-rolls and rolls made inside the audit channel itself._`, ephemeral: true });
-      } catch (e) {
-        return interaction.reply({ content: `❌ I can see <#${chId}> but can't post there.\n**${e?.message || e}**\nGive the bot **Send Messages** in that channel.`, ephemeral: true });
+      const r = auditRoutes(gid);
+      const plain = getConfig(gid)?.roll_audit_channel_id || null;
+      if (!r && !plain) return interaction.reply({ content: '🔇 No audit destination is set. `/config rollaudit channel:#x` or `/config rollauditforum forum:#x` first.', ephemeral: true });
+      // With the forum, every book is exercised; without it, the one channel.
+      const targets = r
+        ? Object.entries(AUDIT_KINDS).map(([k, t]) => [t.name, r[k] || plain])
+        : [['🎲 Roll audit', plain]];
+      const report = [];
+      for (const [label, id] of targets) {
+        if (!id) { report.push(`⚠️ ${label} — no destination`); continue; }
+        try {
+          const target = await wakeThread(await interaction.client.channels.fetch(id));
+          if (!target) throw new Error('channel not found');
+          await target.send({ content: `🧪 **Audit test** — ${label} entries land here.` });
+          report.push(`✅ ${label} → <#${id}>`);
+        } catch (e) { report.push(`❌ ${label} → <#${id}> — ${e?.message || e}\nCheck **View Channel** + **Send Messages** (in Posts, for threads).`); }
       }
+      return interaction.reply({ ephemeral: true, content: [
+        '**Roll audit test:**', ...report, '',
+        '_Mirrored: every roll — players, GMs (secret ones included), GM-as-NPC and the bot\'s auto-pilot — plus NPC Say while its thread exists._',
+      ].join('\n') });
     }
     if (disable) {
       setConfig(gid, { roll_audit_channel_id: null });
@@ -8077,6 +8144,51 @@ function turnPing(gid, f) {
 // Count a roll toward the character's lifetime tally, then mirror it. Every
 // roll path already calls mirrorRoll, so this is the one place that sees them
 // all — auto rolls have no userId and are skipped, as they belong to no sheet.
+// ── Audit routing ────────────────────────────────────────────────────────────
+// One forum, a thread per book — configured by /config rollauditforum, stored
+// as JSON in guild_config.audit_routes. The single audit channel remains the
+// per-book fallback, so a server without the forum behaves exactly as before.
+const AUDIT_KINDS = {
+  players: { name: '🎲 Player Rolls', about: 'Every roll a player makes — typed, slash, heals, fights, activities.' },
+  gms:     { name: '🛡️ GM Rolls',     about: 'Rolls GMs make as themselves — secret `gmrs` rolls included.' },
+  npcs:    { name: '🎭 NPC Rolls',    about: 'NPC dice — GM-driven and auto-pilot alike.' },
+  say:     { name: '💬 NPC Say',      about: 'Who spoke as which NPC, with a jump to the line.' },
+};
+function auditRoutes(gid) {
+  const raw = getConfig(gid)?.audit_routes;
+  if (!raw) return null;
+  try { const o = JSON.parse(raw); return o && typeof o === 'object' ? o : null; }
+  catch { return null; }
+}
+function auditDestination(gid, kind) {
+  const r = auditRoutes(gid);
+  return (r && r[kind]) || getConfig(gid)?.roll_audit_channel_id || null;
+}
+// GM-ness by ids alone, for places that have no guild object in hand. Any
+// failure answers false: the roll then files under players — the busiest
+// book — rather than vanishing.
+async function isGmId(gid, uid) {
+  try { return await isGm(await client.guilds.fetch(gid), uid); }
+  catch { return false; }
+}
+// One line per spoken NPC message: which GM said it, as whom, where, and a
+// jump to the exact line. Only active when a Say thread is routed — with just
+// the single audit channel this stays silent, exactly as before the forum.
+function mirrorNpcSay(gid, { gmId, npcName, channelId, messageId = null, text }) {
+  const dest = auditRoutes(gid)?.say || null;
+  if (!dest) return;
+  (async () => {
+    const ch = await wakeThread(await client.channels.fetch(dest));
+    if (!ch) { console.error(`[rollaudit] say fetch returned null for ${dest}`); return; }
+    const quote = String(text ?? '').slice(0, 900).replace(/\n/g, '\n> ');
+    const link = messageId ? `\n[↗ Jump to the line](https://discord.com/channels/${gid}/${channelId}/${messageId})` : '';
+    await ch.send({ content: `💬 <@${gmId}> as **${npcName}** in <#${channelId}>\n> ${quote}${link}`,
+      allowedMentions: { parse: [] } });
+  })().catch(err => {
+    console.error('[rollaudit] say mirror FAILED:', err?.message || err, err?.code ? `(code ${err.code})` : '');
+  });
+}
+
 function recordRoll(gid, opts) {
   // Tally every die that was physically rolled, not just the one that counted:
   // an advantage roll threw two d20s and both belong in a lifetime history.
@@ -8101,14 +8213,23 @@ function recordRoll(gid, opts) {
 // too: the previous self-skip meant a secret `gmrs` typed in that channel went
 // to the GM's DMs and was never recorded anywhere, which is precisely the hole
 // the audit exists to close.
-function mirrorRoll(gid, { userId = null, actor = null, channelId, messageId = null, input, rollLine, context = null, interaction = null }) {
-  const chId = getConfig(gid)?.roll_audit_channel_id;
+function mirrorRoll(gid, { userId = null, actor = null, channelId, messageId = null, input, rollLine, context = null, interaction = null, kind = null }) {
+  const routes = auditRoutes(gid);
+  const plain = getConfig(gid)?.roll_audit_channel_id || null;
   // Verbose tracing: a silent mirror is impossible to diagnose otherwise.
   // These lines appear in the Railway logs and pinpoint where it stops.
-  if (!chId) { console.log('[rollaudit] skip — no audit channel configured'); return; }
-  console.log(`[rollaudit] attempting mirror → channel ${chId} (roll from ${channelId})`);
+  if (!routes && !plain) { console.log('[rollaudit] skip — no audit destination configured'); return; }
+  let dest = '?';
   (async () => {
-    const ch = await client.channels.fetch(chId);
+    // Which book does the entry belong in? An explicit kind wins (GM-as-NPC
+    // fight rolls, /pr rolls); a bot-attributed roll is NPC by definition;
+    // otherwise the roller's GM-ness decides.
+    const k = kind ?? (actor ? 'npcs' : ((userId && await isGmId(gid, userId)) ? 'gms' : 'players'));
+    const chId = auditDestination(gid, k);
+    if (!chId) { console.log(`[rollaudit] skip — no destination for '${k}'`); return; }
+    dest = `${k} @ ${chId}`;
+    console.log(`[rollaudit] attempting mirror → ${dest} (roll from ${channelId})`);
+    const ch = await wakeThread(await client.channels.fetch(chId));
     if (!ch) { console.error(`[rollaudit] fetch returned null for ${chId}`); return; }
     // Slash commands: resolve the bot's reply so the audit entry can still link.
     if (!messageId && interaction) {
@@ -8128,7 +8249,7 @@ function mirrorRoll(gid, { userId = null, actor = null, channelId, messageId = n
   })().catch(err => {
     // Never break the roll itself, but do leave a trace — a silent mirror is
     // impossible to diagnose. Surfaced to the GM by /config rollaudit test.
-    console.error(`[rollaudit] mirror to ${chId} FAILED:`, err?.message || err, err?.code ? `(code ${err.code})` : '');
+    console.error(`[rollaudit] mirror (${dest}) FAILED:`, err?.message || err, err?.code ? `(code ${err.code})` : '');
   });
 }
 
@@ -8916,6 +9037,7 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
       await interaction.reply({ content: `${card}\n\n${defHint}` });
     }
     recordRoll(gid, { userId: uid, channelId: cid, interaction, messageId: auditMsgId,
+      kind: isNpcFighter(actorId) ? 'npcs' : null,
       input: `/fight atk stat:${stat}${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
       context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 attacks ${targetF.name}` : `fight · attacks ${targetF.name}` });
     // NPCs-only mode: the bot rolls the targeted NPC's defence and resolves.
@@ -9715,6 +9837,7 @@ async function handleFight(interaction) {
       await interaction.reply({ content: `${card}\n\n⚡ Use \`/fight resolve\` to resolve this exchange.` });
     }
     recordRoll(gid, { userId: uid, channelId: cid, interaction, messageId: auditMsgId,
+      kind: isNpcFighter(defenderId) ? 'npcs' : null,
       input: `/fight def stat:${stat}${isNpcFighter(defenderId) ? ` npc:${defender.name}` : ''}`, rollLine, nat, sides: 20,
       context: isNpcFighter(defenderId) ? `fight · GM as ${defender.name} 🎭 defends` : 'fight · defends' });
     return;
@@ -10365,6 +10488,7 @@ async function handlePr(interaction) {
     const critType = detectCrit(result, mode);
     const rollLine = maskNpcRollLine(gid, buildRollLine(result, mode, critType, null));
     recordRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction, result,
+      kind: 'npcs',
       input: `/pr reroll ${last.notation}${last.label ? ' ' + last.label : ''}`,
       rollLine: buildRollLine(result, mode, critType, null),
       context: `as NPC **${npc.name}** · reroll` });
@@ -10440,7 +10564,9 @@ async function handlePr(interaction) {
 
     const chan = await interactionChannel(interaction);
     if (!chan) return interaction.reply({ content: '❌ I can\'t access this channel.', ephemeral: true });
-    await postAsNpc(chan, gid, npc.name, body);
+    const said = await postAsNpc(chan, gid, npc.name, body);
+    mirrorNpcSay(gid, { gmId: interaction.user.id, npcName: npc.name, channelId: chan.id,
+      messageId: said?.id ?? null, text: body });
     return interaction.reply({ content: `🎭 Spoke as **${npc.name}**.`, ephemeral: true });
   }
 
@@ -10502,6 +10628,7 @@ async function handlePr(interaction) {
     // Posted through the NPC's webhook, so the audit is the only place this ties
     // back to the GM who actually rolled it.
     recordRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction, result,
+      kind: 'npcs',
       input: `/pr roll ${notation}${label ? ' ' + label : ''}`,
       rollLine: buildRollLine(result, mode, critType, null),
       context: `as NPC **${npc.name}**` });
@@ -10852,6 +10979,7 @@ const HELP_CATEGORIES = {
       '`/config fightping enabled:true` — @-mention players on their turn · off by default (Admin)',
       '`/config rollaudit channel:#x` — mirror all rolls (players + GMs) to a GM-only channel (Admin)',
       '`/config rollaudit test:true` — send a test mirror and report any problem (Admin)',
+      '`/config rollauditforum forum:#roll-audit` — split the mirror into books: player rolls, GM rolls, NPC rolls, NPC say (Admin)',
       '`/config approvals channel:#x` — new sheets need GM approval before use (Admin)',
       '`/config approvals list:true` — every sheet still waiting, read from the database so nothing is lost if a post failed',
       '`/config approvalforum forum:#gm-approvals` — one forum, a thread per approval type: sheets, trades, duels, lore, exports (Admin)',
@@ -12272,7 +12400,9 @@ async function handleNpcSayModal(interaction) {
 
   const chan = await interactionChannel(interaction);
   if (!chan) return interaction.reply({ content: '❌ I can\'t access this channel.', ephemeral: true });
-  await postAsNpc(chan, gid, npc.name, body);
+  const said = await postAsNpc(chan, gid, npc.name, body);
+  mirrorNpcSay(gid, { gmId: interaction.user.id, npcName: npc.name, channelId: chan.id,
+    messageId: said?.id ?? null, text: body });
   return interaction.reply({ content: `🎭 Posted as **${npc.name}**.`, ephemeral: true });
 }
 
