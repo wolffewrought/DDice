@@ -426,6 +426,12 @@ db.exec(`
     src_channel TEXT, msg_id TEXT, requested_at INTEGER,
     PRIMARY KEY (guild_id, user_id)
   );
+  CREATE TABLE IF NOT EXISTS import_requests (
+    guild_id TEXT NOT NULL, user_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    src_channel TEXT, msg_id TEXT, ch_id TEXT, requested_at INTEGER,
+    PRIMARY KEY (guild_id, user_id)
+  );
   CREATE TABLE IF NOT EXISTS profile_saves (
     guild_id TEXT NOT NULL, user_id TEXT NOT NULL, slot_name TEXT NOT NULL,
     snapshot TEXT NOT NULL, saved_at TEXT NOT NULL,
@@ -2961,6 +2967,16 @@ async function sendLong(channel, content) {
 // line boundaries so long lists (quest board, npc list, recaps) never fail
 // silently. First chunk is the reply; the rest are follow-ups. Pass an array of
 // lines OR a pre-joined string.
+// Chunked delivery to any channel or user — the career summary and long
+// sheets overflow one message. Files ride the last chunk so nothing arrives
+// after the attachment.
+async function sendLong(target, content, { files = null, ...opts } = {}) {
+  const chunks = chunkLines(content);
+  for (let i = 0; i < chunks.length; i++) {
+    await target.send({ content: chunks[i], ...(i === chunks.length - 1 && files ? { files } : {}), ...opts });
+  }
+}
+
 async function replyLong(interaction, content, opts = {}) {
   const LIMIT = 1900; // headroom under 2000 for safety
   const text = Array.isArray(content) ? content.join('\n') : String(content);
@@ -3105,24 +3121,9 @@ function wrapScrollLines(measure, text, maxWidth) {
 }
 
 // The parchment itself: cream ground, burnt corners, speckle, a double gold
-// rule with maroon diamond cornerstones — the DDice parchment look.
-function renderScroll({ family, title, body }) {
-  const { createCanvas } = require('@napi-rs/canvas');
-  const W = 1000, PAD = 90;
-  const titleSize = 62, bodySize = 40, lineH = Math.round(bodySize * 1.35);
-
-  // Measure with a scratch canvas so the real one can be sized to fit.
-  const scratch = createCanvas(8, 8).getContext('2d');
-  scratch.font = `${bodySize}px "${family}"`;
-  const lines = wrapScrollLines(t => scratch.measureText(t).width, body, W - PAD * 2);
-  scratch.font = `${titleSize}px "${family}"`;
-  const titleLines = title ? wrapScrollLines(t => scratch.measureText(t).width, title, W - PAD * 2) : [];
-
-  const titleBlock = titleLines.length ? titleLines.length * Math.round(titleSize * 1.25) + 34 : 0;
-  const H = Math.min(2600, PAD * 2 + titleBlock + Math.max(lines.length, 1) * lineH);
-  const canvas = createCanvas(W, H);
-  const ctx = canvas.getContext('2d');
-
+// rule with maroon diamond cornerstones — the DDice parchment look. Shared
+// by the /scroll prop and the parchment sheet export.
+function paintParchment(ctx, W, H) {
   ctx.fillStyle = '#f3e9d2';
   ctx.fillRect(0, 0, W, H);
   // Burnt corners: one soft radial stain in each.
@@ -3151,6 +3152,25 @@ function renderScroll({ family, title, body }) {
     ctx.save(); ctx.translate(dx, dy); ctx.rotate(Math.PI / 4);
     ctx.fillRect(-7, -7, 14, 14); ctx.restore();
   }
+}
+
+function renderScroll({ family, title, body }) {
+  const { createCanvas } = require('@napi-rs/canvas');
+  const W = 1000, PAD = 90;
+  const titleSize = 62, bodySize = 40, lineH = Math.round(bodySize * 1.35);
+
+  // Measure with a scratch canvas so the real one can be sized to fit.
+  const scratch = createCanvas(8, 8).getContext('2d');
+  scratch.font = `${bodySize}px "${family}"`;
+  const lines = wrapScrollLines(t => scratch.measureText(t).width, body, W - PAD * 2);
+  scratch.font = `${titleSize}px "${family}"`;
+  const titleLines = title ? wrapScrollLines(t => scratch.measureText(t).width, title, W - PAD * 2) : [];
+
+  const titleBlock = titleLines.length ? titleLines.length * Math.round(titleSize * 1.25) + 34 : 0;
+  const H = Math.min(2600, PAD * 2 + titleBlock + Math.max(lines.length, 1) * lineH);
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext('2d');
+  paintParchment(ctx, W, H);
 
   let y = PAD + (titleLines.length ? titleSize : bodySize) * 0.2;
   if (titleLines.length) {
@@ -3165,6 +3185,212 @@ function renderScroll({ family, title, body }) {
   ctx.textAlign = 'left';
   for (const ln of lines) { y += lineH; if (ln) ctx.fillText(ln, PAD, y); }
 
+  return canvas.toBuffer('image/png');
+}
+
+// ── Sheet round-trip weave ───────────────────────────────────────────────────
+// Every image export carries the sheet itself, woven after the PNG bytes —
+// image viewers ignore the tail, Discord preserves it, and /char import reads
+// it back. The same trick Scriptorium plays with its PDFs.
+const SHEET_WEAVE_MARK = 'DDICESHEETv1';
+function exportPayloadObj(char, displayName) {
+  return { v: 1, name: displayName,
+    order: char.order_name || null, class: char.class || null,
+    str: char.str ?? 0, con: char.con ?? 0, dex: char.dex ?? 0, wis: char.wis ?? 0, lck: char.lck ?? 0,
+    weapon1: char.weapon1 || null, weapon1emoji: char.weapon1emoji || null,
+    weapon2: char.weapon2 || null, weapon2emoji: char.weapon2emoji || null };
+}
+function embedSheetData(png, obj) {
+  return Buffer.concat([png, Buffer.from('\n' + SHEET_WEAVE_MARK + JSON.stringify(obj), 'utf8')]);
+}
+// Returns the woven sheet, or null when the file carries none / it's mangled.
+function extractSheetData(buf) {
+  const i = buf.indexOf(SHEET_WEAVE_MARK);
+  if (i === -1) return null;
+  try { const o = JSON.parse(buf.slice(i + SHEET_WEAVE_MARK.length).toString('utf8')); return o && typeof o === 'object' ? o : null; }
+  catch { return null; }
+}
+// ── The career summary ───────────────────────────────────────────────────────
+// Everything a character has done here, as lines for replyLong: rank and
+// merits, renown, the dice tally per die size, inventory, completed quests
+// and lore — closed by a [TTRPG SUMMARY] machine block that /char import
+// reads back. The block carries merits, renown, the full tally by-map,
+// items and lore; quests and rank ride only in the readable part.
+const SUMMARY_MARK = '[TTRPG SUMMARY]';
+function careerPayloadObj(gid, uid, displayName) {
+  const tally = rollTallyAll(gid, uid);
+  const t = {};
+  for (const [sides, b] of Object.entries(tally.bySize)) t[sides] = b.by;
+  const items = listItems(gid, uid).slice(0, 40).map(r => r.note ? { i: r.item, n: r.note } : { i: r.item });
+  const loreRow = getLore(gid, uid);
+  return { v: 1, kind: 'summary', name: displayName,
+    merits: getMerits(gid, uid), renown: getRenown(gid, uid),
+    tally: t, items,
+    lore: loreRow?.state === 'approved' ? loreRow.body.slice(0, 900) : null };
+}
+function buildCareerSummary(gid, uid, displayName) {
+  const ch = getChar(gid, uid) || {};
+  const tally = rollTallyAll(gid, uid);
+  const quests = getPlayerCompletedQuests(gid, uid);
+  const items = listItems(gid, uid);
+  const lines = [`📜 **${displayName} — the record so far**${isFallen(gid, uid) ? ' 🕯️' : ''}`];
+  const standing = [];
+  if (ch.rank_name) standing.push(ch.rank_name);
+  standing.push(`🎖️ ${getMerits(gid, uid)} merits`, `🪙 ${getRenown(gid, uid)} renown`);
+  lines.push(standing.join(' · '));
+  lines.push('');
+  if (tally.total) {
+    lines.push(`**Dice** — ${tally.total} rolled lifetime`);
+    for (const [sides, b] of Object.entries(tally.bySize).sort((a, z) => z[0] - a[0])) {
+      const avg = (b.sum / b.total).toFixed(1);
+      const bits = [`${b.total} rolled`, `avg ${avg}`];
+      if (b.by[sides]) bits.push(`${sides}s ×${b.by[sides]}`);
+      if (b.by[1]) bits.push(`1s ×${b.by[1]}`);
+      lines.push(`d${sides} — ${bits.join(' · ')}`);
+    }
+    lines.push('');
+  }
+  if (items.length) {
+    lines.push(`**Pack** — ${items.length} item${items.length === 1 ? '' : 's'}`);
+    for (const r of items.slice(0, 15)) lines.push(`• ${r.item}${r.note ? ` — ${r.note}` : ''}`);
+    if (items.length > 15) lines.push(`…and ${items.length - 15} more`);
+    lines.push('');
+  }
+  if (quests.length) {
+    lines.push(`**Quests completed** — ${quests.length}`);
+    for (const q of quests.slice(0, 10)) lines.push(`• #${q.number} ${q.name}`);
+    if (quests.length > 10) lines.push(`…and ${quests.length - 10} more`);
+    lines.push('');
+  }
+  const loreRow = getLore(gid, uid);
+  if (loreRow?.state === 'approved') lines.push('**Lore** — on file, travels with the block', '');
+  // The machine tail. If a prodigious tally makes it too long to paste, the
+  // dice history is dropped from the block (never from the reading above).
+  const payload = careerPayloadObj(gid, uid, displayName);
+  let json = JSON.stringify(payload);
+  if (json.length > 1500) { payload.tally = {}; json = JSON.stringify(payload);
+    lines.push('_Dice history too long to travel — the block below carries everything else._'); }
+  lines.push('```', SUMMARY_MARK, json, '```');
+  return lines;
+}
+// Read a pasted career block back. Same tolerance as the sheet parser.
+function parseCareerSummary(text) {
+  const t = String(text ?? '');
+  const i = t.indexOf(SUMMARY_MARK);
+  if (i === -1) return null;
+  const rest = t.slice(i + SUMMARY_MARK.length);
+  const line = rest.split('\n').map(l => l.trim()).find(l => l.startsWith('{'));
+  if (!line) return null;
+  try { const o = JSON.parse(line); return o && o.kind === 'summary' ? o : null; }
+  catch { return null; }
+}
+// A career block is outside input too: totals clamped, tally shape checked.
+function validateImportedSummary(o) {
+  if (!o || o.v !== 1 || o.kind !== 'summary') return null;
+  const int = (n, lo, hi) => Number.isInteger(n) && n >= lo && n <= hi;
+  if (!int(o.merits ?? 0, 0, 1_000_000) || !int(o.renown ?? 0, -1_000_000, 1_000_000)) return null;
+  const tally = {};
+  if (o.tally && typeof o.tally === 'object') {
+    for (const [sides, by] of Object.entries(o.tally)) {
+      const sd = Number(sides);
+      if (!int(sd, 2, 100) || !by || typeof by !== 'object') continue;
+      const clean = {};
+      for (const [nat, count] of Object.entries(by)) {
+        const n = Number(nat);
+        if (int(n, 1, sd) && int(count, 1, 1_000_000)) clean[n] = count;
+      }
+      if (Object.keys(clean).length) tally[sd] = clean;
+    }
+  }
+  const items = Array.isArray(o.items) ? o.items.slice(0, 40)
+    .map(it => ({ i: typeof it?.i === 'string' ? it.i.trim().slice(0, 60) : '',
+                  n: (typeof it?.n === 'string' && it.n.trim()) ? it.n.trim().slice(0, 120) : null }))
+    .filter(it => it.i) : [];
+  return { kind: 'summary',
+    name: (typeof o.name === 'string' && o.name.trim()) ? o.name.trim().slice(0, 64) : 'Unnamed',
+    merits: o.merits ?? 0, renown: o.renown ?? 0, tally, items,
+    lore: (typeof o.lore === 'string' && o.lore.trim()) ? o.lore.trim().slice(0, 900) : null };
+}
+
+// The text twin of the weave: read a pasted [TTRPG SHEET] block back into
+// the same shape the woven JSON takes. Tolerant of code fences and stray
+// whitespace; stops at the blank line before the pretty section.
+function parseSheetSummary(text) {
+  const t = String(text ?? '');
+  const i = t.indexOf('[TTRPG SHEET]');
+  if (i === -1) return null;
+  const map = { NAME: 'name', ORDER: 'order', CLASS: 'class',
+    STR: 'str', CON: 'con', DEX: 'dex', WIS: 'wis', LCK: 'lck',
+    WEAPON1: 'weapon1', WEAPON1EMOJI: 'weapon1emoji', WEAPON2: 'weapon2', WEAPON2EMOJI: 'weapon2emoji' };
+  const nums = ['str', 'con', 'dex', 'wis', 'lck'];
+  const o = { v: 1 };
+  for (const raw of t.slice(i).split('\n').slice(1)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('```')) break;
+    const m = line.match(/^([A-Z0-9]+):(.*)$/);
+    if (!m) break;
+    const key = map[m[1]];
+    if (!key) continue; // HP/REROLLS travel in the block but never import
+    const val = m[2].trim();
+    o[key] = nums.includes(key) ? Number(val) : (val || null);
+  }
+  return o.name !== undefined ? o : null;
+}
+
+// Requote a pasted block for the queue post, fenced and bounded.
+function sheetSummaryQuote(block) {
+  const body = String(block).replace(/```/g, '').trim().slice(0, 500);
+  return '```\n' + body + '\n```';
+}
+
+// A woven sheet is still outside input: every field is checked and clamped
+// before a GM is even asked to look at it.
+function validateImportedSheet(o) {
+  if (!o || o.v !== 1) return null;
+  const stat = (n) => Number.isInteger(n) && n >= 0 && n <= 99;
+  if (![o.str, o.con, o.dex, o.wis, o.lck].every(stat)) return null;
+  const str_ = (v, cap) => (typeof v === 'string' && v.trim()) ? v.trim().slice(0, cap) : null;
+  return { name: str_(o.name, 64) || 'Unnamed',
+    order: str_(o.order, 40), class: str_(o.class, 40),
+    str: o.str, con: o.con, dex: o.dex, wis: o.wis, lck: o.lck,
+    weapon1: str_(o.weapon1, 60), weapon1emoji: str_(o.weapon1emoji, 8),
+    weapon2: str_(o.weapon2, 60), weapon2emoji: str_(o.weapon2emoji, 8) };
+}
+
+// The sheet on parchment: same ground as /scroll, in the guild's scroll font
+// when one is stored, a plain serif otherwise.
+function renderSheetParchment(char, displayName, gid, healLine = null) {
+  const { createCanvas } = require('@napi-rs/canvas');
+  const family = ensureScrollFont(gid) || 'serif';
+  const W = 760, PAD = 80, lineH = 52;
+  const rows = [];
+  rows.push(char.order_name || 'No Order');
+  if (char.class) rows.push(char.class);
+  rows.push('');
+  rows.push(`HP        ${char.hp_current} / ${maxHp(char, gid)}`);
+  rows.push(`Rerolls   ${char.rerolls_current} / ${maxRerolls(char)}`);
+  if (healLine) rows.push(healLine);
+  rows.push('');
+  rows.push(`STR   ${char.str}`); rows.push(`CON   ${char.con}`); rows.push(`DEX   ${char.dex}`);
+  rows.push(`WIS   ${char.wis}`); rows.push(`LCK   ${char.lck}`);
+  if (char.weapon1 || char.weapon2) {
+    rows.push('');
+    if (char.weapon1) rows.push(char.weapon1);
+    if (char.weapon2) rows.push(char.weapon2);
+  }
+  const H = Math.min(1800, PAD * 2 + 96 + rows.length * lineH);
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext('2d');
+  paintParchment(ctx, W, H);
+  ctx.fillStyle = '#6b1f1f';
+  ctx.font = `56px "${family}"`;
+  ctx.textAlign = 'center';
+  ctx.fillText(displayName, W / 2, PAD + 40);
+  ctx.fillStyle = '#382c19';
+  ctx.font = `36px "${family}"`;
+  ctx.textAlign = 'left';
+  let y = PAD + 96;
+  for (const r of rows) { y += lineH; if (r) ctx.fillText(r, PAD, y); }
   return canvas.toBuffer('image/png');
 }
 
@@ -3365,6 +3591,7 @@ async function handleCharExport(interaction) {
   textLines.push('```');
   const textContent = textLines.join('\n');
 
+
   // With approvals on, a player's own export goes to the GMs first — they only
   // get the block once a GM releases it. GMs export straight away (they're the
   // ones doing the releasing), and so does anyone exporting on a server that
@@ -3376,7 +3603,8 @@ async function handleCharExport(interaction) {
       `📤 **Export sent to <#${chId}> for a GM to look over.**\n`
       + `You'll get your sheet as soon as one releases it — by DM, or back here if your DMs are closed.\n`
       + `_This doesn't change your sheet or stop you rolling._` });
-    const posted = await requestSheetExport(interaction, gid, uid, textContent, mode);
+    const posted = await requestSheetExport(interaction, gid, uid,
+      mode === 'summary' ? buildCareerSummary(gid, uid, dn).join('\n') : textContent, mode);
     if (!posted) {
       await interaction.followUp({ ephemeral: true, content: '⚠️ Couldn\'t reach the approval channel — ask a GM to check `/config approvals`.' }).catch(()=>{});
     }
@@ -3386,17 +3614,247 @@ async function handleCharExport(interaction) {
   if (mode === 'text') {
     return interaction.reply({ content: textContent });
   }
+  if (mode === 'summary') {
+    return replyLong(interaction, buildCareerSummary(gid, tid, dn));
+  }
 
   // ── Image export ─────────────────────────────────────────────────────────────
   await interaction.deferReply();
-  const imgBuffer = await generateCharImage(char, dn, hr.current, mc, gid);
+  let imgBuffer = null;
+  try {
+    imgBuffer = mode === 'parchment'
+      ? renderSheetParchment(char, dn, gid, isWhiteKnight(char) ? `Heal      ${hr.current} / ${mc}` : null)
+      : await generateCharImage(char, dn, hr.current, mc, gid);
+  } catch (err) { console.error('[export] image render failed -', err?.message || err); }
   if (!imgBuffer) {
     return interaction.editReply({ content: textContent + '\n*Image generation unavailable — install `@napi-rs/canvas` to enable.*' });
   }
 
   const { AttachmentBuilder } = require('discord.js');
-  const attachment = new AttachmentBuilder(imgBuffer, { name: `${dn.replace(/\s+/g,'-')}-sheet.png` });
+  // The sheet rides inside the file — /char import reads it back out.
+  const woven = embedSheetData(imgBuffer, exportPayloadObj(char, dn));
+  const attachment = new AttachmentBuilder(woven, { name: `${dn.replace(/\s+/g,'-')}-sheet.png` });
   return interaction.editReply({ content: textContent, files: [attachment] });
+}
+
+// A player hands back an exported sheet image. The woven sheet is read out,
+// validated, and queued for the Sheets book with the image attached — the GM
+// sees exactly what would be written, including anything off this server's
+// allowance, before a single field changes.
+// One reading for both paste entrances: whichever block arrived, validated.
+function readImportBlock(pasted) {
+  return validateImportedSheet(parseSheetSummary(pasted))
+      ?? validateImportedSummary(parseCareerSummary(pasted));
+}
+const IMPORT_BLOCK_REFUSAL = '❌ That doesn\'t read as a sheet or career block — paste the whole `[TTRPG SHEET]` block from `/char export format:Text`, or the `[TTRPG SUMMARY]` block from `format:Summary`.';
+
+async function handleCharImport(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const att = interaction.options.getAttachment('image');
+  const pasted = interaction.options.getString('summary');
+  const dest = approvalDestination(gid, 'sheets');
+  if (!dest) {
+    return interaction.reply({ content: '❌ This server has no approval destination set — ask a GM to run `/config approvals` or `/config approvalforum`.', ephemeral: true });
+  }
+  // Nothing given: open the paste modal — slash options mangle multiline text.
+  if (!att && !pasted) {
+    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+    const modal = new ModalBuilder().setCustomId('importpaste').setTitle('Paste the sheet summary');
+    modal.addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder().setCustomId('summary').setLabel('The [TTRPG SHEET] block')
+        .setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1600)
+        .setPlaceholder('[TTRPG SHEET] or [TTRPG SUMMARY] block')));
+    return interaction.showModal(modal);
+  }
+  if (att && !/\.png$/i.test(att.name || '')) {
+    return interaction.reply({ content: '❌ That isn\'t a .png — use an image exported by `/char export`.', ephemeral: true });
+  }
+  if (att && (att.size ?? 0) > 8_000_000) {
+    return interaction.reply({ content: '❌ That file is over 8 MB — not one of mine.', ephemeral: true });
+  }
+  await interaction.deferReply({ ephemeral: true });
+  let bytes = null, sheet = null;
+  if (att) {
+    try { bytes = Buffer.from(await (await fetch(att.url)).arrayBuffer()); }
+    catch (err) {
+      console.error('[import] fetch failed -', err?.message || err);
+      return interaction.editReply({ content: `❌ Couldn't read that attachment — ${err?.message || err}` });
+    }
+    sheet = validateImportedSheet(extractSheetData(bytes));
+    if (!sheet) {
+      return interaction.editReply({ content:
+        '❌ No sheet is woven into that image. Only images made by `/char export` (Image or Parchment) carry one — older exports predate the weave, so re-export from the source server first.' });
+    }
+  } else {
+    sheet = readImportBlock(pasted);
+    if (!sheet) return interaction.editReply({ content: IMPORT_BLOCK_REFUSAL });
+  }
+  return queueSheetImport(interaction, gid, uid, sheet, bytes, att?.name || null, att ? null : pasted);
+}
+
+// Everything after validation, shared by image, option and modal entrances.
+async function queueSheetImport(interaction, gid, uid, sheet, bytes, attName, pastedBlock) {
+  const dest = approvalDestination(gid, 'sheets'); // gated by callers; needed for the supersede edit
+
+  // One live request per player: a resubmission retires the queued post.
+  const prev = getImportRequest(gid, uid);
+  if (prev?.msg_id) {
+    try {
+      const oldCh = await wakeThread(await interaction.client.channels.fetch(prev.ch_id || dest));
+      const old = await oldCh.messages.fetch(prev.msg_id);
+      await old.edit({ content: `${old.content}\n\n↻ **Superseded** — a newer import replaced this one.`, components: [] });
+    } catch (err) { console.error('[import] supersede edit failed -', err?.message || err); }
+  }
+  setImportRequest(gid, uid, sheet, interactionChannelId(interaction));
+
+  const isCareer = sheet.kind === 'summary';
+  const problems = isCareer ? [] : statBudgetProblems(gid, sheet, { requireAll: true, exact: true });
+  const src_ = pastedBlock ? sheetSummaryQuote(pastedBlock) : null;
+  const dn = await getDisplayName(interaction.guild, uid);
+  const roles = getGmRoleIds(gid);
+  const ping = roles.length ? roles.map(r => `<@&${r}>`).join(' ') + ' ' : '';
+  const lines = isCareer ? [
+    `${ping}📥 **Career import** — <@${uid}> (${dn})`,
+    `Standing of **${sheet.name}**: 🎖️ ${sheet.merits} merits · 🪙 ${sheet.renown} renown`,
+    `🎲 ${Object.values(sheet.tally).reduce((a, by) => a + Object.values(by).reduce((x, c) => x + c, 0), 0)} dice of history · 🎒 ${sheet.items.length} item${sheet.items.length === 1 ? '' : 's'}${sheet.lore ? ' · 📜 lore travels' : ''}`,
+  ] : [
+    `${ping}📥 **Sheet import** — <@${uid}> (${dn})`,
+    `Written as **${sheet.name}**${sheet.order ? ` · ${sheet.order}` : ''}${sheet.class ? ` · ${sheet.class}` : ''}`,
+    `STR ${sheet.str} · CON ${sheet.con} · DEX ${sheet.dex} · WIS ${sheet.wis} · LCK ${sheet.lck}`,
+  ];
+  if (!isCareer && (sheet.weapon1 || sheet.weapon2)) lines.push([sheet.weapon1, sheet.weapon2].filter(Boolean).join(' · '));
+  if (problems.length) lines.push(`⚠️ **Off this server's allowance:** ${problems.join('; ')}`);
+  if (src_) lines.push(src_); // text imports: the GM sees exactly what arrived
+  lines.push(isCareer
+    ? '_Approving moves their merits and renown to these totals (logged as an import), adds the dice history and items, and files the lore approved. Sheet, rank, quests and tags are untouched._'
+    : '_Approving writes this sheet in — HP refilled, rerolls set to LCK — and it arrives already approved._');
+  const { ButtonBuilder, ButtonStyle, ActionRowBuilder, AttachmentBuilder } = require('discord.js');
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`impok:${uid}`).setLabel('Approve import').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`impno:${uid}`).setLabel('Decline').setStyle(ButtonStyle.Danger));
+  try {
+    const ch = await approvalChannelFor(interaction.client, gid, 'sheets');
+    const msg = await ch.send({ content: lines.join('\n'), components: [row],
+      files: bytes ? [new AttachmentBuilder(bytes, { name: attName || 'imported-sheet.png' })] : [],
+      allowedMentions: { roles } });
+    setImportRequestMsg(gid, uid, msg.id, ch.id);
+    return interaction.editReply({ content: `📥 **Import sent to <#${ch.id}> for a GM to look over.**\nYou'll hear back here or by DM once one decides.` });
+  } catch (err) {
+    console.error('[import] queue post failed -', err?.message || err);
+    return interaction.editReply({ content: `❌ Couldn't reach the approval destination — ${err?.message || err}` });
+  }
+}
+
+async function handleImportPasteModal(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const dest = approvalDestination(gid, 'sheets');
+  if (!dest) return interaction.reply({ content: '❌ This server has no approval destination set.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+  const pasted = interaction.fields.getTextInputValue('summary');
+  const sheet = readImportBlock(pasted);
+  if (!sheet) return interaction.editReply({ content: IMPORT_BLOCK_REFUSAL });
+  return queueSheetImport(interaction, gid, uid, sheet, null, null, pasted);
+}
+
+async function handleImportRequestButton(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can decide sheet imports.', ephemeral: true });
+  const [action, uid] = interaction.customId.split(':');
+  const req = getImportRequest(gid, uid);
+  if (!req) {
+    await interaction.message.edit({ components: [] }).catch(()=>{});
+    return interaction.reply({ content: '⏰ That import is no longer pending — it was already handled or superseded.', ephemeral: true });
+  }
+  if (action === 'impno') {
+    return showRejectReasonModal(interaction, `importreject:${uid}`,
+      'Decline sheet import', 'e.g. rebuild it under our allowance.');
+  }
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+  let sheet;
+  try {
+    const raw = JSON.parse(req.payload);
+    sheet = raw.kind === 'summary' ? validateImportedSummary({ v: 1, ...raw })
+                                   : validateImportedSheet({ v: 1, ...raw });
+  } catch { sheet = null; }
+  if (!sheet) { clearImportRequest(gid, uid); return interaction.reply({ content: '❌ That stored import no longer reads — ask them to run `/char import` again.', ephemeral: true }); }
+  clearImportRequest(gid, uid);
+  if (sheet.kind === 'summary') {
+    // Move standing to the imported totals — the ledgers show the jump.
+    const meritDelta = sheet.merits - getMerits(gid, uid);
+    if (meritDelta) { addMerits(gid, uid, meritDelta); logHistory(gid, { kind: 'merit', userId: uid, amount: meritDelta, reason: `imported by ${gmName}`, actorId: interaction.user.id }); }
+    const renownDelta = sheet.renown - getRenown(gid, uid);
+    if (renownDelta) addRenown(gid, uid, renownDelta, `imported by ${gmName}`, { allowNegative: true });
+    // Dice history and pack ADD to whatever is already here.
+    const addTally = db.prepare(`INSERT INTO roll_tally (guild_id,user_id,sides,nat,count) VALUES (?,?,?,?,?)
+      ON CONFLICT(guild_id,user_id,sides,nat) DO UPDATE SET count = count + excluded.count`);
+    for (const [sides, by] of Object.entries(sheet.tally))
+      for (const [nat, count] of Object.entries(by)) addTally.run(gid, uid, Number(sides), Number(nat), count);
+    for (const it of sheet.items) addItem(gid, uid, it.i, { note: it.n, source: 'import', by: interaction.user.id });
+    if (sheet.lore) db.prepare(`INSERT INTO lore (guild_id,user_id,body,state,submitted_at,decided_by,decided_at)
+      VALUES (?,?,?,'approved',?,?,?)
+      ON CONFLICT(guild_id,user_id) DO UPDATE SET body=excluded.body, state='approved', decided_by=excluded.decided_by, decided_at=excluded.decided_at`)
+      .run(gid, uid, sheet.lore, Date.now(), interaction.user.id, Date.now());
+    try {
+      await interaction.message.edit({ content: `${interaction.message.content}\n\n✅ **Imported** by ${gmName}`, components: [] });
+    } catch {}
+    const notice2 = `✅ **Your career import was approved** by ${gmName} in **${interaction.guild.name}** — standing, dice history, pack${sheet.lore ? ' and lore' : ''} carried over.`;
+    try { await (await interaction.client.users.fetch(uid)).send({ content: notice2 }); }
+    catch {
+      try { const src = await interaction.client.channels.fetch(req.src_channel); await src.send({ content: `<@${uid}> ${notice2}` }); }
+      catch (err) { console.error('[import] notify failed -', err?.message || err); }
+    }
+    return interaction.reply({ content: `✅ Career imported for <@${uid}>.`, ephemeral: true });
+  }
+  // A new arrival takes over a fallen slot: the memorial stays as history,
+  // but the death gate lifts — nobody imports into a character they can't play.
+  const tookOverFallen = isFallen(gid, uid);
+  // Write the sheet in, then refill from what it became.
+  upsertChar(gid, uid, {
+    ...(tookOverFallen ? { died_at: null } : {}),
+    str: sheet.str, con: sheet.con, dex: sheet.dex, wis: sheet.wis, lck: sheet.lck,
+    order_name: sheet.order, class: sheet.class,
+    weapon1: sheet.weapon1, weapon1emoji: sheet.weapon1emoji,
+    weapon2: sheet.weapon2, weapon2emoji: sheet.weapon2emoji,
+    approval_state: 'approved', approval_reason: null,
+    approval_msg_id: interaction.message.id, approval_ch_id: interaction.channelId, approval_post_ok: 1,
+  });
+  const fresh = getChar(gid, uid);
+  upsertChar(gid, uid, { hp_current: maxHp(fresh, gid), rerolls_current: fresh.lck ?? 0 });
+  try {
+    await interaction.message.edit({ content: `${interaction.message.content}\n\n✅ **Imported** by ${gmName}`, components: [] });
+  } catch {}
+  const notice = `✅ **Your sheet import was approved** by ${gmName} in **${interaction.guild.name}** — **${sheet.name}** stands ready, HP full, rerolls at LCK.`;
+  try { await (await interaction.client.users.fetch(uid)).send({ content: notice }); }
+  catch {
+    try { const src = await interaction.client.channels.fetch(req.src_channel); await src.send({ content: `<@${uid}> ${notice}` }); }
+    catch (err) { console.error('[import] notify failed -', err?.message || err); }
+  }
+  return interaction.reply({ content: `✅ Imported — <@${uid}> now plays **${sheet.name}**.${tookOverFallen ? '\n🕯️ _Their fallen character\'s slot was taken over — the memorial stands, the death gate is lifted._' : ''}`, ephemeral: true });
+}
+
+async function handleImportRejectModal(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '❌ Only GMs can decline imports.', ephemeral: true });
+  const uid = interaction.customId.split(':')[1];
+  const req = getImportRequest(gid, uid);
+  if (!req) return interaction.reply({ content: '⏰ That import is no longer pending.', ephemeral: true });
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+  const reason = cleanReason(interaction.fields.getTextInputValue('reason'));
+  clearImportRequest(gid, uid);
+  try {
+    await interaction.message?.edit({ content: `${interaction.message.content}\n\n🚫 **Declined** by ${gmName}${reason ? `\n💬 ${reason}` : ''}`, components: [] });
+  } catch {}
+  const notice = `🚫 **Your sheet import was declined** by ${gmName} in **${interaction.guild.name}**.`
+    + (reason ? `\n💬 **Reason:** ${reason}` : '')
+    + `\nYou can \`/char import\` again, or build a sheet here with \`/char create\`.`;
+  try { await (await interaction.client.users.fetch(uid)).send({ content: notice }); }
+  catch {
+    try { const src = await interaction.client.channels.fetch(req.src_channel); await src.send({ content: `<@${uid}> ${notice}` }); }
+    catch (err) { console.error('[import] notify failed -', err?.message || err); }
+  }
+  return interaction.reply({ content: `🚫 Declined.`, ephemeral: true });
 }
 
 // Release or decline a queued export. Delivery mirrors sheet decisions: DM
@@ -3430,17 +3888,22 @@ async function handleExportRequestButton(interaction) {
   } catch {}
 
   let files = [];
-  if (released && req.fmt && req.fmt !== 'text') {
+  if (released && req.fmt && req.fmt !== 'text' && req.fmt !== 'summary') {
     // The image is drawn fresh at release time; the text block is exactly what
     // the GM read in the queue.
     const ch = getChar(gid, uid);
     if (ch) {
       const cfg = getConfig(gid); const mc = cfg.heal_charges ?? 3;
       const hr = getHealCharges(gid, uid, mc);
-      const buf = await generateCharImage(ch, nm, hr.current, mc, gid).catch(()=>null);
+      let buf = null;
+      try {
+        buf = req.fmt === 'parchment'
+          ? renderSheetParchment(ch, nm, gid, isWhiteKnight(ch) ? `Heal      ${hr.current} / ${mc}` : null)
+          : await generateCharImage(ch, nm, hr.current, mc, gid);
+      } catch (err) { console.error('[export] release render failed -', err?.message || err); }
       if (buf) {
         const { AttachmentBuilder } = require('discord.js');
-        files = [new AttachmentBuilder(buf, { name: `${nm.replace(/\s+/g,'-')}-sheet.png` })];
+        files = [new AttachmentBuilder(embedSheetData(buf, exportPayloadObj(ch, nm)), { name: `${nm.replace(/\s+/g,'-')}-sheet.png` })];
       }
     }
   }
@@ -3453,13 +3916,13 @@ async function handleExportRequestButton(interaction) {
   let told = 'DM';
   try {
     const user = await interaction.client.users.fetch(uid);
-    await user.send({ content: notice, files });
+    await sendLong(user, notice, { files });
   } catch {
     told = null;
     if (req.src_channel) {
       try {
         const srcChan = await interaction.client.channels.fetch(req.src_channel);
-        await srcChan.send({ content: `<@${uid}> ${notice}`, files, allowedMentions: { users: [uid] } });
+        await sendLong(srcChan, `<@${uid}> ${notice}`, { files, allowedMentions: { users: [uid] } });
         told = 'channel';
       } catch {}
     }
@@ -3714,8 +4177,11 @@ const slashCommands = [
       .addUserOption(o=>o.setName('user').setDescription('Whose lore').setRequired(false)))
     .addSubcommand(s=>s.setName('export').setDescription('Export your character sheet')
       .addStringOption(o=>o.setName('format').setDescription('Export format').setRequired(false)
-        .addChoices({name:'Text',value:'text'},{name:'Image',value:'image'}))
-      .addUserOption(o=>o.setName('user').setDescription('User to export').setRequired(false))),
+        .addChoices({name:'Text',value:'text'},{name:'Summary (career record)',value:'summary'},{name:'Image',value:'image'},{name:'Parchment image',value:'parchment'}))
+      .addUserOption(o=>o.setName('user').setDescription('User to export').setRequired(false)))
+    .addSubcommand(s=>s.setName('import').setDescription('Bring an exported sheet to this server — image or summary — for a GM to approve')
+      .addAttachmentOption(o=>o.setName('image').setDescription('A sheet image exported by DDice').setRequired(false))
+      .addStringOption(o=>o.setName('summary').setDescription('Or paste a [TTRPG SHEET] or [TTRPG SUMMARY] block from an export').setRequired(false))),
 
   new SlashCommandBuilder()
     .setName('profile').setDescription('Manage your roll card profile')
@@ -6363,6 +6829,7 @@ async function handleChar(interaction) {
   }
 
   if (sub === 'export') return handleCharExport(interaction);
+  if (sub === 'import') return handleCharImport(interaction);
   if (sub === 'show') {
     const tu = interaction.options.getUser('user') || interaction.user, tid = tu.id;
     const char = getChar(gid, tid);
@@ -7007,6 +7474,9 @@ async function routeButton(interaction) {
     if (interaction.customId.startsWith('sheetok:') || interaction.customId.startsWith('sheetno:')) {
       return handleSheetApprovalButton(interaction);
     }
+    if (interaction.customId.startsWith('impok:') || interaction.customId.startsWith('impno:')) {
+      return handleImportRequestButton(interaction);
+    }
     if (interaction.customId.startsWith('exportok:') || interaction.customId.startsWith('exportno:')) {
       return handleExportRequestButton(interaction);
     }
@@ -7134,6 +7604,7 @@ client.on('interactionCreate', async interaction => {
   if (interaction.isModalSubmit?.()) {
     if (interaction.customId.startsWith('npcsay:')) return handleNpcSayModal(interaction);
     if (interaction.customId === 'scrollwrite') return handleScrollModal(interaction);
+    if (interaction.customId === 'importpaste') return handleImportPasteModal(interaction);
     if (interaction.customId === 'loresubmit') return handleLoreSubmit(interaction);
     if (interaction.customId.startsWith('gmkill:')) return handleGmKillModal(interaction);
     if (interaction.customId.startsWith('lorereject:')) return handleLoreRejectModal(interaction);
@@ -7141,6 +7612,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.customId.startsWith('duelrej:')) return handleDuelRejectModal(interaction);
     if (interaction.customId.startsWith('sheetreject:')) return handleSheetRejectModal(interaction);
     if (interaction.customId.startsWith('exportreject:')) return handleExportRejectModal(interaction);
+    if (interaction.customId.startsWith('importreject:')) return handleImportRejectModal(interaction);
     return;
   }
 
@@ -7920,6 +8392,23 @@ function setExportRequest(gid, uid, payload, fmt, srcChannel) {
 function getExportRequest(gid, uid) {
   return db.prepare('SELECT * FROM export_requests WHERE guild_id=? AND user_id=?').get(gid, uid);
 }
+function getImportRequest(gid, uid) {
+  return db.prepare('SELECT * FROM import_requests WHERE guild_id=? AND user_id=?').get(gid, uid);
+}
+function setImportRequest(gid, uid, payload, srcChannel) {
+  db.prepare(`INSERT INTO import_requests (guild_id, user_id, payload, src_channel, requested_at)
+              VALUES (?,?,?,?,?)
+              ON CONFLICT(guild_id, user_id) DO UPDATE SET payload=excluded.payload,
+                src_channel=excluded.src_channel, msg_id=NULL, ch_id=NULL, requested_at=excluded.requested_at`)
+    .run(gid, uid, JSON.stringify(payload), srcChannel, Date.now());
+}
+function setImportRequestMsg(gid, uid, msgId, chId) {
+  db.prepare('UPDATE import_requests SET msg_id=?, ch_id=? WHERE guild_id=? AND user_id=?').run(msgId, chId, gid, uid);
+}
+function clearImportRequest(gid, uid) {
+  db.prepare('DELETE FROM import_requests WHERE guild_id=? AND user_id=?').run(gid, uid);
+}
+
 function setExportRequestMsg(gid, uid, msgId, chId = null) {
   db.prepare('UPDATE export_requests SET msg_id=?, ch_id=? WHERE guild_id=? AND user_id=?').run(msgId, chId, gid, uid);
 }
@@ -7965,7 +8454,10 @@ async function requestSheetExport(interaction, gid, uid, payload, fmt) {
     // The block can be long, so the request header and the sheet go separately
     // and the buttons ride on the last message.
     await channel.send({ content: head, allowedMentions: { roles } });
-    const msg = await channel.send({ content: payload.length > 1900 ? payload.slice(0, 1900) : payload,
+    const msg = await channel.send({
+      content: payload.length > 1900
+        ? payload.slice(0, 1820) + '\n…\n_✂️ trimmed here — the player receives the whole thing on release._'
+        : payload,
       components: [exportButtons(uid)], allowedMentions: { parse: [] } });
     setExportRequestMsg(gid, uid, msg.id, channel.id);
     return channel.id;
@@ -11015,7 +11507,8 @@ const HELP_CATEGORIES = {
       '`/char lore` — write your character\'s story and send it to the GMs',
       'Players spend an exact stat allowance across STR/CON/DEX/WIS/LCK with a minimum in each — GMs aren\'t limited. Run `/config statallowance` to see or change this server\'s numbers',
       '`/char submit` — send your sheet back to the GMs after a rejection, unchanged',
-      '`/char export [format:Image]` — export your sheet as text or image. With approvals on it goes to the GMs first and reaches you when one releases it',
+      '`/char export [format:Image]` — export your sheet as text or image; `format:Parchment image` writes it on parchment in the server\'s scroll font; `format:Summary` is your career record — rank, merits, renown, dice history, pack, quests, lore. Every image carries the sheet woven inside. With approvals on it goes to the GMs first and reaches you when one releases it',
+      '`/char import` — hand an exported sheet to this server, as the image or the pasted `[TTRPG SHEET]` summary (bare = a paste box opens); a GM approves it and you arrive ready to play',
       '`/char signature user:@a stat:str` — set a Hero\'s signature stat (GM)',
       '`/profile on/off/show/save/load/saves` — manage profile display & snapshots (shorthand: `/p`)',
       '`/weapon add/remove/list` — manage the server weapon list (GM)',
