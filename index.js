@@ -3672,6 +3672,13 @@ async function handleCharExport(interaction) {
 // validated, and queued for the Sheets book with the image attached — the GM
 // sees exactly what would be written, including anything off this server's
 // allowance, before a single field changes.
+// Attachment bytes with a hard ceiling on patience — a wedged CDN fetch after
+// a defer otherwise leaves the interaction "thinking" forever.
+async function fetchBytes(url, ms = 15_000) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(ms) });
+  return Buffer.from(await res.arrayBuffer());
+}
+
 // One reading for both paste entrances: whichever block arrived, validated.
 function readImportBlock(pasted) {
   return validateImportedSheet(parseSheetSummary(pasted))
@@ -3706,7 +3713,7 @@ async function handleCharImport(interaction) {
   await interaction.deferReply({ ephemeral: true });
   let bytes = null, sheet = null;
   if (att) {
-    try { bytes = Buffer.from(await (await fetch(att.url)).arrayBuffer()); }
+    try { bytes = await fetchBytes(att.url); }
     catch (err) {
       console.error('[import] fetch failed -', err?.message || err);
       return interaction.editReply({ content: `❌ Couldn't read that attachment — ${err?.message || err}` });
@@ -3801,15 +3808,18 @@ async function handleImportRequestButton(interaction) {
     return showRejectReasonModal(interaction, `importreject:${uid}`,
       'Decline sheet import', 'e.g. rebuild it under our allowance.');
   }
-  const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+  // Claim the row before ANY await: parse and clear are synchronous, so a
+  // second click a beat later finds nothing pending instead of applying twice.
   let sheet;
   try {
     const raw = JSON.parse(req.payload);
     sheet = raw.kind === 'summary' ? validateImportedSummary({ v: 1, ...raw })
                                    : validateImportedSheet({ v: 1, ...raw });
   } catch { sheet = null; }
-  if (!sheet) { clearImportRequest(gid, uid); return interaction.reply({ content: '❌ That stored import no longer reads — ask them to run `/char import` again.', ephemeral: true }); }
   clearImportRequest(gid, uid);
+  await interaction.deferReply({ ephemeral: true });
+  if (!sheet) { return interaction.editReply({ content: '❌ That stored import no longer reads — ask them to run `/char import` again.' }); }
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id);
   if (sheet.kind === 'summary') {
     // Move standing to the imported totals — the ledgers show the jump.
     const meritDelta = sheet.merits - getMerits(gid, uid);
@@ -3835,7 +3845,7 @@ async function handleImportRequestButton(interaction) {
       try { const src = await interaction.client.channels.fetch(req.src_channel); await src.send({ content: `<@${uid}> ${notice2}` }); }
       catch (err) { console.error('[import] notify failed -', err?.message || err); }
     }
-    return interaction.reply({ content: `✅ Career imported for <@${uid}>.`, ephemeral: true });
+    return interaction.editReply({ content: `✅ Career imported for <@${uid}>.` });
   }
   // A new arrival takes over a fallen slot: the memorial stays as history,
   // but the death gate lifts — nobody imports into a character they can't play.
@@ -3861,7 +3871,7 @@ async function handleImportRequestButton(interaction) {
     try { const src = await interaction.client.channels.fetch(req.src_channel); await src.send({ content: `<@${uid}> ${notice}` }); }
     catch (err) { console.error('[import] notify failed -', err?.message || err); }
   }
-  return interaction.reply({ content: `✅ Imported — <@${uid}> now plays **${sheet.name}**.${tookOverFallen ? '\n🕯️ _Their fallen character\'s slot was taken over — the memorial stands, the death gate is lifted._' : ''}`, ephemeral: true });
+  return interaction.editReply({ content: `✅ Imported — <@${uid}> now plays **${sheet.name}**.${tookOverFallen ? '\n🕯️ _Their fallen character\'s slot was taken over — the memorial stands, the death gate is lifted._' : ''}` });
 }
 
 async function handleImportRejectModal(interaction) {
@@ -3897,8 +3907,6 @@ async function handleExportRequestButton(interaction) {
     return interaction.reply({ content: '❌ Only GMs can release sheet exports.', ephemeral: true });
   const [action, uid] = interaction.customId.split(':');
   const req = getExportRequest(gid, uid);
-  const nm = await getDisplayName(interaction.guild, uid);
-  const gmName = await getDisplayName(interaction.guild, interaction.user.id);
   if (!req) {
     await interaction.message.edit({ components: [] }).catch(()=>{});
     return interaction.reply({ content: '⏰ That export request is no longer pending — it was already handled or superseded.', ephemeral: true });
@@ -3908,7 +3916,12 @@ async function handleExportRequestButton(interaction) {
       'Decline sheet export', 'e.g. not while the campaign is running.');
   }
   const released = true;
+  // Claim the row, then ack — the regen and delivery below can be slow, and
+  // the three-second window is what the generic banner punishes.
   clearExportRequest(gid, uid);
+  await interaction.deferReply({ ephemeral: true });
+  const nm = await getDisplayName(interaction.guild, uid);
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id);
 
   // Mark the request as decided so the queue reads cleanly.
   try {
@@ -3961,7 +3974,7 @@ async function handleExportRequestButton(interaction) {
   const delivery = told === 'DM' ? ' _(sent by DM)_'
                  : told === 'channel' ? ' _(DM blocked — posted in the channel they exported from)_'
                  : ' ⚠️ _couldn\'t reach the player — send it to them directly._';
-  return interaction.reply({ content: (released
+  return interaction.editReply({ content: (released
     ? `✅ Export released to <@${uid}> (**${nm}**).`
     : `🚫 Export declined for <@${uid}> (**${nm}**).`) + delivery,
     allowedMentions: { parse: [] } });
@@ -5876,7 +5889,7 @@ async function handleConfig(interaction) {
     }
     await interaction.deferReply();
     try {
-      const bytes = Buffer.from(await (await fetch(att.url)).arrayBuffer());
+      const bytes = await fetchBytes(att.url);
       setConfig(gid, { scroll_font: bytes, scroll_font_name: att.name });
       scrollFontCache.delete(gid); // the next /scroll registers the new face
       return interaction.editReply({ content: `📜 Scroll font set: **${att.name}** (${Math.round(bytes.length / 1024)} KB). Any GM can now \`/scroll\`.` });
@@ -5947,6 +5960,8 @@ async function handleConfig(interaction) {
       const plain = getConfig(gid)?.roll_audit_channel_id || null;
       if (!r && !plain) return interaction.reply({ content: '🔇 No audit destination is set. `/config rollaudit channel:#x` or `/config rollauditforum forum:#x` first.', ephemeral: true });
       // With the forum, every book is exercised; without it, the one channel.
+      // Four fetch-and-sends can outlast the ack window — answer first.
+      await interaction.deferReply({ ephemeral: true });
       const targets = r
         ? Object.entries(AUDIT_KINDS).map(([k, t]) => [t.name, r[k] || plain])
         : [['🎲 Roll audit', plain]];
@@ -5960,7 +5975,7 @@ async function handleConfig(interaction) {
           report.push(`✅ ${label} → <#${id}>`);
         } catch (e) { report.push(`❌ ${label} → <#${id}> — ${e?.message || e}\nCheck **View Channel** + **Send Messages** (in Posts, for threads).`); }
       }
-      return interaction.reply({ ephemeral: true, content: [
+      return interaction.editReply({ content: [
         '**Roll audit test:**', ...report, '',
         '_Mirrored: every roll — players, GMs (secret ones included), GM-as-NPC and the bot\'s auto-pilot — plus NPC Say while its thread exists._',
       ].join('\n') });
@@ -11276,6 +11291,7 @@ async function handlePr(interaction) {
     const chan = await interactionChannel(interaction);
     if (!chan) return interaction.reply({ content: '❌ I can\'t access this channel.', ephemeral: true });
     const said = await postAsNpc(chan, gid, npc.name, body);
+    if (!said) return interaction.reply({ content: `❌ I couldn't post in this channel — check my permissions here.`, ephemeral: true });
     mirrorNpcSay(gid, { gmId: interaction.user.id, npcName: npc.name, channelId: chan.id,
       messageId: said?.id ?? null, text: body });
     return interaction.reply({ content: `🎭 Spoke as **${npc.name}**.`, ephemeral: true });
@@ -11772,7 +11788,7 @@ async function handleScrollImport(interaction, gid, att, link = null) {
     return interaction.editReply({ content: '❌ That file is over 8 MB — not one of mine.' });
   }
   let bytes;
-  try { bytes = Buffer.from(await (await fetch(att.url)).arrayBuffer()); }
+  try { bytes = await fetchBytes(att.url); }
   catch (err) {
     console.error('[scroll] import fetch failed -', err?.message || err);
     return interaction.editReply({ content: `❌ Couldn't read that attachment — ${err?.message || err}` });
@@ -11833,6 +11849,7 @@ async function handleScrollModal(interaction) {
     const posted = await chan.send({
       content: flavour || '📜 *An ancient parchment is unfurled…*',
       files: [new AttachmentBuilder(buf, { name: 'ancient-scroll.png' })],
+      allowedMentions: { parse: ['users'] }, // a scene line may name a player, never wake a room
     });
     // The registry is what makes a scroll readable later: Discord strips the
     // woven tail from any client re-upload, but a message link finds it here.
@@ -13249,6 +13266,7 @@ async function handleNpcSayModal(interaction) {
   const chan = await interactionChannel(interaction);
   if (!chan) return interaction.reply({ content: '❌ I can\'t access this channel.', ephemeral: true });
   const said = await postAsNpc(chan, gid, npc.name, body);
+  if (!said) return interaction.reply({ content: `❌ I couldn't post in this channel — check my permissions here.`, ephemeral: true });
   mirrorNpcSay(gid, { gmId: interaction.user.id, npcName: npc.name, channelId: chan.id,
     messageId: said?.id ?? null, text: body });
   return interaction.reply({ content: `🎭 Posted as **${npc.name}**.`, ephemeral: true });
