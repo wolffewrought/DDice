@@ -426,11 +426,6 @@ db.exec(`
     src_channel TEXT, msg_id TEXT, requested_at INTEGER,
     PRIMARY KEY (guild_id, user_id)
   );
-  CREATE TABLE IF NOT EXISTS posted_scrolls (
-    msg_id TEXT PRIMARY KEY,
-    guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
-    title TEXT, body TEXT NOT NULL, flavour TEXT, created_at INTEGER
-  );
   CREATE TABLE IF NOT EXISTS import_requests (
     guild_id TEXT NOT NULL, user_id TEXT NOT NULL,
     payload TEXT NOT NULL,
@@ -3110,12 +3105,6 @@ function extractScrollData(buf) {
   try { const o = JSON.parse(buf.slice(i + SCROLL_WEAVE_MARK.length).toString('utf8')); return o && typeof o === 'object' ? o : null; }
   catch { return null; }
 }
-// A Discord message link, any client flavour, down to its ids.
-function parseMessageLink(text) {
-  const m = String(text ?? '').match(/discord(?:app)?\.com\/channels\/(\d+)\/(\d+)\/(\d+)/);
-  return m ? { guildId: m[1], channelId: m[2], messageId: m[3] } : null;
-}
-
 function validateScrollData(o) {
   if (!o || o.v !== 1 || o.kind !== 'scroll') return null;
   if (typeof o.body !== 'string' || !o.body.trim()) return null;
@@ -3185,7 +3174,29 @@ function paintParchment(ctx, W, H) {
   }
 }
 
-function renderScroll({ family, title, body }) {
+// A one-page PDF around one JPEG, rolled by hand with exact xref offsets.
+// Discord scrubs images on re-upload but passes PDFs byte-exact — so a
+// payload woven after %%EOF survives every round trip, Scriptorium-style.
+function makeImagePdf(jpeg, w, h) {
+  const chunks = []; let off = 0; const offs = [];
+  const push = (x) => { const b = Buffer.isBuffer(x) ? x : Buffer.from(x, 'latin1'); chunks.push(b); off += b.length; };
+  const obj = (x) => { offs.push(off); push(x); };
+  push('%PDF-1.4\n%\xE2\xE3\xCF\xD3\n');
+  obj('1 0 obj\n<</Type/Catalog/Pages 2 0 R>>\nendobj\n');
+  obj('2 0 obj\n<</Type/Pages/Kids[3 0 R]/Count 1>>\nendobj\n');
+  obj(`3 0 obj\n<</Type/Page/Parent 2 0 R/MediaBox[0 0 ${w} ${h}]/Resources<</XObject<</Im0 4 0 R>>>>/Contents 5 0 R>>\nendobj\n`);
+  offs.push(off);
+  push(`4 0 obj\n<</Type/XObject/Subtype/Image/Width ${w}/Height ${h}/ColorSpace/DeviceRGB/BitsPerComponent 8/Filter/DCTDecode/Length ${jpeg.length}>>\nstream\n`);
+  push(jpeg); push('\nendstream\nendobj\n');
+  const content = `q ${w} 0 0 ${h} 0 0 cm /Im0 Do Q`;
+  obj(`5 0 obj\n<</Length ${content.length}>>\nstream\n${content}\nendstream\nendobj\n`);
+  const xref = off;
+  push('xref\n0 6\n0000000000 65535 f \n' + offs.map(o => String(o).padStart(10, '0') + ' 00000 n \n').join(''));
+  push(`trailer\n<</Size 6/Root 1 0 R>>\nstartxref\n${xref}\n%%EOF\n`);
+  return Buffer.concat(chunks);
+}
+
+function renderScroll({ family, title, body, pdf = false }) {
   const { createCanvas } = require('@napi-rs/canvas');
   const W = 1000, PAD = 90;
   const titleSize = 62, bodySize = 40, lineH = Math.round(bodySize * 1.35);
@@ -3216,7 +3227,7 @@ function renderScroll({ family, title, body }) {
   ctx.textAlign = 'left';
   for (const ln of lines) { y += lineH; if (ln) ctx.fillText(ln, PAD, y); }
 
-  return canvas.toBuffer('image/png');
+  return pdf ? makeImagePdf(canvas.toBuffer('image/jpeg'), W, H) : canvas.toBuffer('image/png');
 }
 
 // ── Sheet round-trip weave ───────────────────────────────────────────────────
@@ -3390,7 +3401,7 @@ function validateImportedSheet(o) {
 
 // The sheet on parchment: same ground as /scroll, in the guild's scroll font
 // when one is stored, a plain serif otherwise.
-function renderSheetParchment(char, displayName, gid, healLine = null) {
+function renderSheetParchment(char, displayName, gid, healLine = null, pdf = false) {
   const { createCanvas } = require('@napi-rs/canvas');
   const family = ensureScrollFont(gid) || 'serif';
   const W = 760, PAD = 80, lineH = 52;
@@ -3422,7 +3433,7 @@ function renderSheetParchment(char, displayName, gid, healLine = null) {
   ctx.textAlign = 'left';
   let y = PAD + 96;
   for (const r of rows) { y += lineH; if (r) ctx.fillText(r, PAD, y); }
-  return canvas.toBuffer('image/png');
+  return pdf ? makeImagePdf(canvas.toBuffer('image/jpeg'), W, H) : canvas.toBuffer('image/png');
 }
 
 async function generateCharImage(char, displayName, healCharges, maxCharges, gid) {
@@ -3653,8 +3664,8 @@ async function handleCharExport(interaction) {
   await interaction.deferReply();
   let imgBuffer = null;
   try {
-    imgBuffer = mode === 'parchment'
-      ? renderSheetParchment(char, dn, gid, isWhiteKnight(char) ? `Heal      ${hr.current} / ${mc}` : null)
+    imgBuffer = (mode === 'parchment' || mode === 'pdf')
+      ? renderSheetParchment(char, dn, gid, isWhiteKnight(char) ? `Heal      ${hr.current} / ${mc}` : null, mode === 'pdf')
       : await generateCharImage(char, dn, hr.current, mc, gid);
   } catch (err) { console.error('[export] image render failed -', err?.message || err); }
   if (!imgBuffer) {
@@ -3662,9 +3673,10 @@ async function handleCharExport(interaction) {
   }
 
   const { AttachmentBuilder } = require('discord.js');
-  // The sheet rides inside the file — /char import reads it back out.
+  // The sheet rides inside the file — /char import reads it back out. The
+  // PDF is the carrier that survives Discord re-uploads.
   const woven = embedSheetData(imgBuffer, exportPayloadObj(char, dn));
-  const attachment = new AttachmentBuilder(woven, { name: `${dn.replace(/\s+/g,'-')}-sheet.png` });
+  const attachment = new AttachmentBuilder(woven, { name: `${dn.replace(/\s+/g,'-')}-sheet.${mode === 'pdf' ? 'pdf' : 'png'}` });
   return interaction.editReply({ content: textContent, files: [attachment] });
 }
 
@@ -3704,8 +3716,8 @@ async function handleCharImport(interaction) {
         .setPlaceholder('[TTRPG SHEET] or [TTRPG SUMMARY] block')));
     return interaction.showModal(modal);
   }
-  if (att && !/\.png$/i.test(att.name || '')) {
-    return interaction.reply({ content: '❌ That isn\'t a .png — use an image exported by `/char export`.', ephemeral: true });
+  if (att && !/\.(png|pdf)$/i.test(att.name || '')) {
+    return interaction.reply({ content: '❌ That isn\'t a .png or .pdf — use a file exported by `/char export`.', ephemeral: true });
   }
   if (att && (att.size ?? 0) > 8_000_000) {
     return interaction.reply({ content: '❌ That file is over 8 MB — not one of mine.', ephemeral: true });
@@ -3941,13 +3953,13 @@ async function handleExportRequestButton(interaction) {
       const hr = getHealCharges(gid, uid, mc);
       let buf = null;
       try {
-        buf = req.fmt === 'parchment'
-          ? renderSheetParchment(ch, nm, gid, isWhiteKnight(ch) ? `Heal      ${hr.current} / ${mc}` : null)
+        buf = (req.fmt === 'parchment' || req.fmt === 'pdf')
+          ? renderSheetParchment(ch, nm, gid, isWhiteKnight(ch) ? `Heal      ${hr.current} / ${mc}` : null, req.fmt === 'pdf')
           : await generateCharImage(ch, nm, hr.current, mc, gid);
       } catch (err) { console.error('[export] release render failed -', err?.message || err); }
       if (buf) {
         const { AttachmentBuilder } = require('discord.js');
-        files = [new AttachmentBuilder(embedSheetData(buf, exportPayloadObj(ch, nm)), { name: `${nm.replace(/\s+/g,'-')}-sheet.png` })];
+        files = [new AttachmentBuilder(embedSheetData(buf, exportPayloadObj(ch, nm)), { name: `${nm.replace(/\s+/g,'-')}-sheet.${req.fmt === 'pdf' ? 'pdf' : 'png'}` })];
       }
     }
   }
@@ -4221,7 +4233,7 @@ const slashCommands = [
       .addUserOption(o=>o.setName('user').setDescription('Whose lore').setRequired(false)))
     .addSubcommand(s=>s.setName('export').setDescription('Export your character sheet')
       .addStringOption(o=>o.setName('format').setDescription('Export format').setRequired(false)
-        .addChoices({name:'Text',value:'text'},{name:'Summary (career record)',value:'summary'},{name:'Image',value:'image'},{name:'Parchment image',value:'parchment'}))
+        .addChoices({name:'Text',value:'text'},{name:'Summary (career record)',value:'summary'},{name:'Image',value:'image'},{name:'Parchment image',value:'parchment'},{name:'Parchment PDF — survives Discord',value:'pdf'}))
       .addUserOption(o=>o.setName('user').setDescription('User to export').setRequired(false)))
     .addSubcommand(s=>s.setName('import').setDescription('Bring an exported sheet to this server — image or summary — for a GM to approve')
       .addAttachmentOption(o=>o.setName('image').setDescription('A sheet image exported by DDice').setRequired(false))
@@ -4262,8 +4274,7 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)')
-    .addAttachmentOption(o=>o.setName('image').setDescription('A scroll made by /scroll — I read it back as plain text and a fresh parchment').setRequired(false))
-    .addStringOption(o=>o.setName('link').setDescription('Or the scroll message\'s link — the reliable way; Discord strips hidden data from re-uploads').setRequired(false)),
+    .addAttachmentOption(o=>o.setName('file').setDescription('A scroll PDF made by /scroll — I read it back as text and a fresh copy in this server\'s font').setRequired(false)),
 
   new SlashCommandBuilder()
     .setName('help').setDescription('Show all commands by category')
@@ -11556,7 +11567,7 @@ const HELP_CATEGORIES = {
       '`/char lore` — write your character\'s story and send it to the GMs',
       'Players spend an exact stat allowance across STR/CON/DEX/WIS/LCK with a minimum in each — GMs aren\'t limited. Run `/config statallowance` to see or change this server\'s numbers',
       '`/char submit` — send your sheet back to the GMs after a rejection, unchanged',
-      '`/char export [format:Image]` — export your sheet as text or image; `format:Parchment image` writes it on parchment in the server\'s scroll font; `format:Summary` is your career record — rank, merits, renown, dice history, pack, quests, lore. Every image carries the sheet woven inside. With approvals on it goes to the GMs first and reaches you when one releases it',
+      '`/char export [format:Image]` — export your sheet as text or image; `format:Parchment image` writes it on parchment in the server\'s scroll font; `format:Parchment PDF` is the same parchment as a **PDF — the file that survives Discord re-uploads**; `format:Summary` is your career record — rank, merits, renown, dice history, pack, quests, lore. Every image and PDF carries the sheet woven inside. With approvals on it goes to the GMs first and reaches you when one releases it',
       '`/char import` — hand an exported sheet to this server, as the image or the pasted `[TTRPG SHEET]` summary (bare = a paste box opens); a GM approves it and you arrive ready to play',
       '`/char signature user:@a stat:str` — set a Hero\'s signature stat (GM)',
       '`/profile on/off/show/save/load/saves` — manage profile display & snapshots (shorthand: `/p`)',
@@ -11716,7 +11727,7 @@ const HELP_CATEGORIES = {
       '`/config rollauditforum forum:#roll-audit` — split the mirror into books: player rolls, GM rolls, NPC rolls, NPC say (Admin)',
       'When NPC stats are hidden, fight cards mask the stat and modifier — the audit\'s NPC book gets the full card, every number revealed',
       '`/config scrollfont font:<file>` — store an .otf/.ttf; `/scroll` then writes props in it (Admin)',
-      '`/scroll` — write a title and body in a modal; the bot posts them as an ancient parchment image and remembers it. `link:` with the scroll message\'s link reads it back — plain text out, plus a fresh parchment in this server\'s font. (`image:` works only for files that never passed through a Discord re-upload) (GM)',
+      '`/scroll` — write a title and body in a modal; the bot posts an ancient parchment **PDF**, the writing woven invisibly inside. Hand any scroll PDF back with `file:` to read it as plain text and get a fresh copy in this server\'s font — the file survives Discord, so scrolls travel between servers on their own (GM)',
       '`/config approvals channel:#x` — new sheets need GM approval before use (Admin)',
       '`/config approvals list:true` — every sheet still waiting, read from the database so nothing is lost if a post failed',
       '`/config approvalforum forum:#gm-approvals` — one forum, a thread per approval type: sheets, trades, duels, lore, exports (Admin)',
@@ -11744,9 +11755,10 @@ async function handleScroll(interaction) {
   // is exactly the generic "Something went wrong" banner. The write path
   // must answer with a modal (which a deferred interaction cannot show), so
   // the gate moves to the submit; the read path defers first and gates after.
-  const att = interaction.options.getAttachment('image');
-  const link = interaction.options.getString('link');
-  if (att || link) return handleScrollImport(interaction, gid, att, link);
+  // The PDF is the whole system: the parchment posts as one, the writing
+  // rides invisibly after its EOF, and handing the file back reads it out.
+  const att = interaction.options.getAttachment('file');
+  if (att) return handleScrollImport(interaction, gid, att);
   try { require('@napi-rs/canvas'); }
   catch { return interaction.reply({ content: '❌ Image generation unavailable — install `@napi-rs/canvas` to enable.', ephemeral: true }); }
   if (!ensureScrollFont(gid)) {
@@ -11768,21 +11780,13 @@ async function handleScroll(interaction) {
 // Hand a woven scroll back: the writing comes out as plain text, and when
 // this server has a font and the canvas, a fresh parchment follows — rendered
 // in THIS server's face and re-woven, so the new image round-trips too.
-async function handleScrollImport(interaction, gid, att, link = null) {
+async function handleScrollImport(interaction, gid, att) {
   await interaction.deferReply({ ephemeral: true });
   if (!(await isGm(interaction.guild, interaction.user.id))) {
     return interaction.editReply({ content: '❌ Only GMs can unfurl props.' });
   }
-  if (link) {
-    const ref = parseMessageLink(link);
-    if (!ref) return interaction.editReply({ content: '❌ That isn\'t a Discord message link.' });
-    const row = db.prepare('SELECT * FROM posted_scrolls WHERE msg_id=?').get(ref.messageId);
-    if (!row) return interaction.editReply({ content:
-      '❌ That message isn\'t a scroll I posted — or it predates the registry. Scrolls posted from now on can always be read back by link.' });
-    return deliverScroll(interaction, gid, { title: row.title, body: row.body, flavour: row.flavour });
-  }
-  if (!/\.png$/i.test(att.name || '')) {
-    return interaction.editReply({ content: '❌ That isn\'t a .png — hand me a scroll image made by `/scroll`.' });
+  if (!/\.(png|pdf)$/i.test(att.name || '')) {
+    return interaction.editReply({ content: '❌ That isn\'t a .png or .pdf — hand me a file made by `/scroll`.' });
   }
   if ((att.size ?? 0) > 8_000_000) {
     return interaction.editReply({ content: '❌ That file is over 8 MB — not one of mine.' });
@@ -11796,13 +11800,14 @@ async function handleScrollImport(interaction, gid, att, link = null) {
   const scroll = validateScrollData(extractScrollData(bytes));
   if (!scroll) {
     return interaction.editReply({ content:
-      '❌ No writing survives in that image — Discord strips hidden data whenever an image is re-uploaded, so the woven copy rarely makes the trip. Use `/scroll link:` with the scroll message\'s link instead — the registry always has it.' });
+      '❌ No writing survives in that file. A **PDF** made by `/scroll` always carries it — a PNG loses its weave the moment Discord re-uploads it, so only PDFs make the trip.' });
   }
   return deliverScroll(interaction, gid, scroll);
 }
 
-// Text first, always; then a fresh parchment in this server's face when it
-// can be rendered — shared by the link and image routes.
+// Text first, always; then a fresh woven PDF in this server's face when it
+// can be rendered — the same kind of file that was handed in, ready to
+// travel again.
 async function deliverScroll(interaction, gid, scroll) {
   const lines = ['📜 **The scroll, read back:**', ''];
   if (scroll.title) lines.push(`**${scroll.title}**`, '');
@@ -11816,11 +11821,11 @@ async function deliverScroll(interaction, gid, scroll) {
   if (!why && !family) why = 'no image — this server has no scroll font stored (`/config scrollfont`)';
   if (why) return interaction.followUp({ content: `✂️ ${why}.`, ephemeral: true });
   try {
-    const fresh = embedScrollData(renderScroll({ family, title: scroll.title, body: scroll.body }),
-      { v: 1, kind: 'scroll', title: scroll.title, body: scroll.body, flavour: scroll.flavour });
+    const payload = { v: 1, kind: 'scroll', title: scroll.title, body: scroll.body, flavour: scroll.flavour };
+    const fresh = embedScrollData(renderScroll({ family, title: scroll.title, body: scroll.body, pdf: true }), payload);
     const { AttachmentBuilder } = require('discord.js');
-    return interaction.followUp({ content: '📜 Remade on this server\'s parchment — woven again, so it round-trips too.',
-      files: [new AttachmentBuilder(fresh, { name: 'ancient-scroll.png' })], ephemeral: true });
+    return interaction.followUp({ content: '📜 Remade as a woven **PDF** in this server\'s font — hand this file back anywhere, any time.',
+      files: [new AttachmentBuilder(fresh, { name: 'ancient-scroll.pdf' })], ephemeral: true });
   } catch (err) {
     console.error('[scroll] remake failed -', err?.message || err);
     return interaction.followUp({ content: `❌ The remake wouldn't take ink — ${err?.message || err}`, ephemeral: true });
@@ -11842,21 +11847,19 @@ async function handleScrollModal(interaction) {
   const flavour = interaction.fields.getTextInputValue('flavour')?.trim() || null;
   if (!body) return interaction.editReply({ content: '❌ Nothing written.' });
   try {
-    const buf = embedScrollData(renderScroll({ family, title, body }),
+    // The scroll IS the PDF: parchment on page one (Discord previews it in
+    // the channel), the writing woven after %%EOF. Anyone who saves this
+    // file can hand it to /scroll on any server the bot stands in.
+    const buf = embedScrollData(renderScroll({ family, title, body, pdf: true }),
       { v: 1, kind: 'scroll', title, body, flavour });
     const { AttachmentBuilder } = require('discord.js');
     const chan = await interactionChannel(interaction);
-    const posted = await chan.send({
+    await chan.send({
       content: flavour || '📜 *An ancient parchment is unfurled…*',
-      files: [new AttachmentBuilder(buf, { name: 'ancient-scroll.png' })],
+      files: [new AttachmentBuilder(buf, { name: 'ancient-scroll.pdf' })],
       allowedMentions: { parse: ['users'] }, // a scene line may name a player, never wake a room
     });
-    // The registry is what makes a scroll readable later: Discord strips the
-    // woven tail from any client re-upload, but a message link finds it here.
-    db.prepare(`INSERT OR REPLACE INTO posted_scrolls (msg_id,guild_id,channel_id,title,body,flavour,created_at)
-                VALUES (?,?,?,?,?,?,?)`)
-      .run(posted.id, gid, chan.id, title, body, flavour, Date.now());
-    return interaction.editReply({ content: `📜 Posted. Read it back any time with \`/scroll link:\` and [its link](<https://discord.com/channels/${gid}/${chan.id}/${posted.id}>).` });
+    return interaction.editReply({ content: '📜 Posted — the writing rides inside the file itself.' });
   } catch (err) {
     console.error('[scroll] render failed -', err?.message || err);
     return interaction.editReply({ content: `❌ The scroll wouldn't take ink — ${err?.message || err}` });
