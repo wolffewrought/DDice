@@ -3092,6 +3092,26 @@ function ensureScrollFont(gid) {
   return family;
 }
 
+// The scroll's weave: what /scroll wrote rides invisibly inside the PNG it
+// posts, so the image can be handed back later and read out again — the
+// same trailer trick the sheet exports use, under its own mark.
+const SCROLL_WEAVE_MARK = 'DDICESCROLLv1';
+function embedScrollData(png, obj) {
+  return Buffer.concat([png, Buffer.from('\n' + SCROLL_WEAVE_MARK + JSON.stringify(obj), 'utf8')]);
+}
+function extractScrollData(buf) {
+  const i = buf.indexOf(SCROLL_WEAVE_MARK);
+  if (i === -1) return null;
+  try { const o = JSON.parse(buf.slice(i + SCROLL_WEAVE_MARK.length).toString('utf8')); return o && typeof o === 'object' ? o : null; }
+  catch { return null; }
+}
+function validateScrollData(o) {
+  if (!o || o.v !== 1 || o.kind !== 'scroll') return null;
+  if (typeof o.body !== 'string' || !o.body.trim()) return null;
+  const str_ = (v, cap) => (typeof v === 'string' && v.trim()) ? v.trim().slice(0, cap) : null;
+  return { title: str_(o.title, 80), body: o.body.trim().slice(0, 1600), flavour: str_(o.flavour, 200) };
+}
+
 // Greedy word wrap against a real measurer, hard-breaking any single word
 // wider than the line. Blank lines split paragraphs.
 function wrapScrollLines(measure, text, maxWidth) {
@@ -4217,7 +4237,8 @@ const slashCommands = [
     .setName('stat').setDescription('Show stat descriptions'),
 
   new SlashCommandBuilder()
-    .setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)'),
+    .setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)')
+    .addAttachmentOption(o=>o.setName('image').setDescription('A scroll made by /scroll — I read it back as plain text and a fresh parchment').setRequired(false)),
 
   new SlashCommandBuilder()
     .setName('help').setDescription('Show all commands by category')
@@ -11667,7 +11688,7 @@ const HELP_CATEGORIES = {
       '`/config rollauditforum forum:#roll-audit` — split the mirror into books: player rolls, GM rolls, NPC rolls, NPC say (Admin)',
       'When NPC stats are hidden, fight cards mask the stat and modifier — the audit\'s NPC book gets the full card, every number revealed',
       '`/config scrollfont font:<file>` — store an .otf/.ttf; `/scroll` then writes props in it (Admin)',
-      '`/scroll` — write a title and body in a modal; the bot posts them as an ancient parchment image (GM)',
+      '`/scroll` — write a title and body in a modal; the bot posts them as an ancient parchment image, the writing woven inside. `image:` hands one back — plain text out, plus a fresh parchment in this server\'s font (GM)',
       '`/config approvals channel:#x` — new sheets need GM approval before use (Admin)',
       '`/config approvals list:true` — every sheet still waiting, read from the database so nothing is lost if a post failed',
       '`/config approvalforum forum:#gm-approvals` — one forum, a thread per approval type: sheets, trades, duels, lore, exports (Admin)',
@@ -11693,6 +11714,10 @@ async function handleScroll(interaction) {
   if (!(await isGm(interaction.guild, interaction.user.id))) {
     return interaction.reply({ content: '❌ Only GMs can unfurl props.', ephemeral: true });
   }
+  // An image given means "read this one back" — text always comes out, and a
+  // fresh parchment follows when this server can render one.
+  const att = interaction.options.getAttachment('image');
+  if (att) return handleScrollImport(interaction, gid, att);
   try { require('@napi-rs/canvas'); }
   catch { return interaction.reply({ content: '❌ Image generation unavailable — install `@napi-rs/canvas` to enable.', ephemeral: true }); }
   if (!ensureScrollFont(gid)) {
@@ -11711,6 +11736,51 @@ async function handleScroll(interaction) {
   return interaction.showModal(modal);
 }
 
+// Hand a woven scroll back: the writing comes out as plain text, and when
+// this server has a font and the canvas, a fresh parchment follows — rendered
+// in THIS server's face and re-woven, so the new image round-trips too.
+async function handleScrollImport(interaction, gid, att) {
+  if (!/\.png$/i.test(att.name || '')) {
+    return interaction.reply({ content: '❌ That isn\'t a .png — hand me a scroll image made by `/scroll`.', ephemeral: true });
+  }
+  if ((att.size ?? 0) > 8_000_000) {
+    return interaction.reply({ content: '❌ That file is over 8 MB — not one of mine.', ephemeral: true });
+  }
+  await interaction.deferReply({ ephemeral: true });
+  let bytes;
+  try { bytes = Buffer.from(await (await fetch(att.url)).arrayBuffer()); }
+  catch (err) {
+    console.error('[scroll] import fetch failed -', err?.message || err);
+    return interaction.editReply({ content: `❌ Couldn't read that attachment — ${err?.message || err}` });
+  }
+  const scroll = validateScrollData(extractScrollData(bytes));
+  if (!scroll) {
+    return interaction.editReply({ content:
+      '❌ No writing is woven into that image — only scrolls made by `/scroll` carry it, and ones made before the weave predate it.' });
+  }
+  const lines = ['📜 **The scroll, read back:**', ''];
+  if (scroll.title) lines.push(`**${scroll.title}**`, '');
+  lines.push(scroll.body);
+  if (scroll.flavour) lines.push('', `_${scroll.flavour}_`);
+  await replyLong(interaction, lines, { ephemeral: true });
+  // Best effort from here: the text above is already delivered.
+  let why = null;
+  try { require('@napi-rs/canvas'); } catch { why = 'no image — `@napi-rs/canvas` isn\'t installed here'; }
+  const family = why ? null : ensureScrollFont(gid);
+  if (!why && !family) why = 'no image — this server has no scroll font stored (`/config scrollfont`)';
+  if (why) return interaction.followUp({ content: `✂️ ${why}.`, ephemeral: true });
+  try {
+    const fresh = embedScrollData(renderScroll({ family, title: scroll.title, body: scroll.body }),
+      { v: 1, kind: 'scroll', title: scroll.title, body: scroll.body, flavour: scroll.flavour });
+    const { AttachmentBuilder } = require('discord.js');
+    return interaction.followUp({ content: '📜 Remade on this server\'s parchment — woven again, so it round-trips too.',
+      files: [new AttachmentBuilder(fresh, { name: 'ancient-scroll.png' })], ephemeral: true });
+  } catch (err) {
+    console.error('[scroll] remake failed -', err?.message || err);
+    return interaction.followUp({ content: `❌ The remake wouldn't take ink — ${err?.message || err}`, ephemeral: true });
+  }
+}
+
 async function handleScrollModal(interaction) {
   const gid = interaction.guild.id;
   if (!(await isGm(interaction.guild, interaction.user.id))) {
@@ -11724,7 +11794,8 @@ async function handleScrollModal(interaction) {
   const flavour = interaction.fields.getTextInputValue('flavour')?.trim() || null;
   if (!body) return interaction.editReply({ content: '❌ Nothing written.' });
   try {
-    const buf = renderScroll({ family, title, body });
+    const buf = embedScrollData(renderScroll({ family, title, body }),
+      { v: 1, kind: 'scroll', title, body, flavour });
     const { AttachmentBuilder } = require('discord.js');
     const chan = await interactionChannel(interaction);
     await chan.send({
