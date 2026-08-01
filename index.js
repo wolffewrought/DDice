@@ -3778,9 +3778,9 @@ async function queueSheetImport(interaction, gid, uid, sheet, bytes, attName, pa
 
 async function handleImportPasteModal(interaction) {
   const gid = interaction.guild.id, uid = interaction.user.id;
-  const dest = approvalDestination(gid, 'sheets');
-  if (!dest) return interaction.reply({ content: '❌ This server has no approval destination set.', ephemeral: true });
   await interaction.deferReply({ ephemeral: true });
+  const dest = approvalDestination(gid, 'sheets');
+  if (!dest) return interaction.editReply({ content: '❌ This server has no approval destination set.' });
   const pasted = interaction.fields.getTextInputValue('summary');
   const sheet = readImportBlock(pasted);
   if (!sheet) return interaction.editReply({ content: IMPORT_BLOCK_REFUSAL });
@@ -11723,12 +11723,11 @@ const GM_HELP_CATEGORIES = ['gm', 'npc'];
 // again on submit — the modal can sit open for a while.
 async function handleScroll(interaction) {
   const gid = interaction.guild.id;
-  if (!(await isGm(interaction.guild, interaction.user.id))) {
-    return interaction.reply({ content: '❌ Only GMs can unfurl props.', ephemeral: true });
-  }
-  // Reading one back: a message link is the reliable route (the registry
-  // remembers every scroll the bot posts); an image works only when its woven
-  // tail survived — Discord strips it from client re-uploads.
+  // Nothing may await before the ack: Discord allows three seconds, and a
+  // cold member fetch for the GM check can eat them on a big server — that
+  // is exactly the generic "Something went wrong" banner. The write path
+  // must answer with a modal (which a deferred interaction cannot show), so
+  // the gate moves to the submit; the read path defers first and gates after.
   const att = interaction.options.getAttachment('image');
   const link = interaction.options.getString('link');
   if (att || link) return handleScrollImport(interaction, gid, att, link);
@@ -11754,22 +11753,24 @@ async function handleScroll(interaction) {
 // this server has a font and the canvas, a fresh parchment follows — rendered
 // in THIS server's face and re-woven, so the new image round-trips too.
 async function handleScrollImport(interaction, gid, att, link = null) {
+  await interaction.deferReply({ ephemeral: true });
+  if (!(await isGm(interaction.guild, interaction.user.id))) {
+    return interaction.editReply({ content: '❌ Only GMs can unfurl props.' });
+  }
   if (link) {
     const ref = parseMessageLink(link);
-    if (!ref) return interaction.reply({ content: '❌ That isn\'t a Discord message link.', ephemeral: true });
+    if (!ref) return interaction.editReply({ content: '❌ That isn\'t a Discord message link.' });
     const row = db.prepare('SELECT * FROM posted_scrolls WHERE msg_id=?').get(ref.messageId);
-    if (!row) return interaction.reply({ content:
-      '❌ That message isn\'t a scroll I posted — or it predates the registry. Scrolls posted from now on can always be read back by link.', ephemeral: true });
-    await interaction.deferReply({ ephemeral: true });
+    if (!row) return interaction.editReply({ content:
+      '❌ That message isn\'t a scroll I posted — or it predates the registry. Scrolls posted from now on can always be read back by link.' });
     return deliverScroll(interaction, gid, { title: row.title, body: row.body, flavour: row.flavour });
   }
   if (!/\.png$/i.test(att.name || '')) {
-    return interaction.reply({ content: '❌ That isn\'t a .png — hand me a scroll image made by `/scroll`.', ephemeral: true });
+    return interaction.editReply({ content: '❌ That isn\'t a .png — hand me a scroll image made by `/scroll`.' });
   }
   if ((att.size ?? 0) > 8_000_000) {
-    return interaction.reply({ content: '❌ That file is over 8 MB — not one of mine.', ephemeral: true });
+    return interaction.editReply({ content: '❌ That file is over 8 MB — not one of mine.' });
   }
-  await interaction.deferReply({ ephemeral: true });
   let bytes;
   try { bytes = Buffer.from(await (await fetch(att.url)).arrayBuffer()); }
   catch (err) {
@@ -11812,10 +11813,12 @@ async function deliverScroll(interaction, gid, scroll) {
 
 async function handleScrollModal(interaction) {
   const gid = interaction.guild.id;
-  if (!(await isGm(interaction.guild, interaction.user.id))) {
-    return interaction.reply({ content: '❌ Only GMs can unfurl props.', ephemeral: true });
-  }
+  // Ack first, gate second — the GM check can be slow on a big server and the
+  // three-second window is unforgiving.
   await interaction.deferReply({ ephemeral: true });
+  if (!(await isGm(interaction.guild, interaction.user.id))) {
+    return interaction.editReply({ content: '❌ Only GMs can unfurl props.' });
+  }
   const family = ensureScrollFont(gid);
   if (!family) return interaction.editReply({ content: '📜 The scroll font vanished — set one again with `/config scrollfont`.' });
   const title = interaction.fields.getTextInputValue('title')?.trim() || null;
