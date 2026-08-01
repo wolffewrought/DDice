@@ -517,6 +517,16 @@ try { db.exec("ALTER TABLE fights ADD COLUMN effect_state TEXT NOT NULL DEFAULT 
 // Practice bouts: HP at or below which a fighter bows out. 0 = a real fight.
 try { db.exec('ALTER TABLE fights ADD COLUMN floor_hp INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE fight_archive ADD COLUMN floor_hp INTEGER DEFAULT 0'); } catch {}
+// Approval routing: one forum, a thread per approval type. approval_routes is
+// a JSON map {forum, sheets, trades, duels, lore, exports} of channel ids. The
+// per-item *ch_id columns pin each posted request to wherever it actually
+// landed, so jump links and supersede-edits survive a routing change.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN approval_routes TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN approval_ch_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE duels ADD COLUMN approval_ch_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE lore ADD COLUMN ch_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE merit_trades ADD COLUMN ch_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE export_requests ADD COLUMN ch_id TEXT'); } catch {}
 
 function getChar(gid, uid) {
   return db.prepare('SELECT * FROM characters WHERE guild_id=? AND user_id=?').get(gid, uid);
@@ -720,6 +730,41 @@ const fightOrder = (fight) => JSON.parse(fight?.turn_order || '[]');
 const fightHp = (fight) => JSON.parse(fight?.hp_state || '{}');
 // Where sheets, lore, exports and merit trades all queue for a GM.
 const approvalChannelId = (gid) => getConfig(gid)?.approval_channel_id || null;
+
+// ── Approval routing ─────────────────────────────────────────────────────────
+// One forum, a thread per approval type — configured by /config approvalforum,
+// stored as JSON in guild_config.approval_routes. Every producer asks for its
+// own type's destination; the single approval channel remains the fallback, so
+// a server that never touches the forum behaves exactly as it always has.
+const APPROVAL_TYPES = {
+  sheets:  { name: '📋 Character Sheets', about: 'New and edited sheets, budget refusals and resubmissions land here.' },
+  trades:  { name: '🤝 Merit Trades',     about: 'Player-to-player merit offers wait here for a GM to sign off.' },
+  duels:   { name: '⚔️ Duels',            about: 'Challenges sent up for a GM to allow or decline.' },
+  lore:    { name: '📜 Lore',             about: 'Character lore submitted for a GM to read.' },
+  exports: { name: '📤 Sheet Exports',    about: 'Sheets a player asked to take away, released by a GM.' },
+};
+function approvalRoutes(gid) {
+  const raw = getConfig(gid)?.approval_routes;
+  if (!raw) return null;
+  try { const o = JSON.parse(raw); return o && typeof o === 'object' ? o : null; }
+  catch { return null; }
+}
+function approvalDestination(gid, type) {
+  const r = approvalRoutes(gid);
+  return (r && r[type]) || approvalChannelId(gid) || null;
+}
+// Forum threads nap after their auto-archive window, and a sleeping thread
+// swallows sends and edits — wake it before touching it.
+async function wakeThread(ch) {
+  if (ch?.isThread?.() && ch.archived) await ch.setArchived(false).catch(() => {});
+  return ch;
+}
+// Fetch a type's destination ready to post in.
+async function approvalChannelFor(client, gid, type) {
+  const id = approvalDestination(gid, type);
+  if (!id) return null;
+  return wakeThread(await client.channels.fetch(id));
+}
 
 // Resolve the `number:` option to a quest, or answer the refusal. Twelve
 // subcommands opened with the same four lines; this is those four lines.
@@ -2803,7 +2848,7 @@ const replyThenFetch = (interaction) => async (c) => {
 // it. Silent when no approval channel is configured.
 async function refuseStatBudget({ src, gid, uid, problems, stats, reply, jumpId = null }) {
   const sent = await reply(statBudgetReply(gid, problems, stats));
-  const chId = approvalChannelId(gid);
+  const chId = approvalDestination(gid, 'sheets');
   if (!chId) return sent;
   const srcCh = interactionChannelId(src);
   const msgId = jumpId ?? sent?.id ?? null;
@@ -2812,7 +2857,7 @@ async function refuseStatBudget({ src, gid, uid, problems, stats, reply, jumpId 
     const { budget } = statRules(gid);
     const spread = STATS.map(k => `${k.toUpperCase()} ${Number(stats?.[k]) || 0}`).join(' · ');
     const link = (srcCh && msgId) ? `\n[↗ Jump to the attempt](https://discord.com/channels/${gid}/${srcCh}/${msgId})` : '';
-    const ch = await src.client.channels.fetch(chId);
+    const ch = await approvalChannelFor(src.client, gid, 'sheets');
     await ch.send({
       content: [`📊 **Sheet turned back — point allowance**`,
                 `👤 <@${uid}> (**${nm}**)${srcCh ? ` in <#${srcCh}>` : ''}`,
@@ -3206,7 +3251,7 @@ async function handleCharExport(interaction) {
   // isn't using approvals at all.
   const isGmUser = await isGm(interaction.guild, uid);
   if (approvalEnabled(gid) && !isGmUser && tid === uid) {
-    const chId = approvalChannelId(gid);
+    const chId = approvalDestination(gid, 'exports');
     await interaction.reply({ ephemeral: true, content:
       `📤 **Export sent to <#${chId}> for a GM to look over.**\n`
       + `You'll get your sheet as soon as one releases it — by DM, or back here if your DMs are closed.\n`
@@ -3446,6 +3491,9 @@ const slashCommands = [
       .addChannelOption(o=>o.setName('channel').setDescription('Approval channel').setRequired(false))
       .addBooleanOption(o=>o.setName('list').setDescription('true = list every sheet still waiting, wherever it was posted').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = turn sheet approval off').setRequired(false)))
+    .addSubcommand(s=>s.setName('approvalforum').setDescription('One forum, a thread per approval type — sheets, trades, duels, lore, exports')
+      .addChannelOption(o=>o.setName('forum').setDescription('The forum channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = go back to the single approval channel').setRequired(false)))
     .addSubcommand(s=>s.setName('rollaudit').setDescription('Mirror every player roll to a GM-only channel')
       .addChannelOption(o=>o.setName('channel').setDescription('Channel to mirror rolls into').setRequired(false))
       .addBooleanOption(o=>o.setName('test').setDescription('true = send a test mirror and report any problem').setRequired(false))
@@ -4006,7 +4054,7 @@ async function handleLoreSubmit(interaction) {
   const gid = interaction.guild.id, uid = interaction.user.id;
   const body = String(interaction.fields.getTextInputValue('body') || '').trim();
   if (!body) return interaction.reply({ content: '❌ Nothing to send.', ephemeral: true });
-  const chId = approvalChannelId(gid);
+  const chId = approvalDestination(gid, 'lore');
   setLore(gid, uid, { body, state: 'pending', reason: null, submitted_at: Date.now(),
     src_channel: interactionChannelId(interaction) });
   await interaction.reply({ ephemeral: true, content: chId
@@ -4016,17 +4064,19 @@ async function handleLoreSubmit(interaction) {
   try {
     const nm = await getDisplayName(interaction.guild, uid);
     const roles = getGmRoleIds(gid);
-    const ch = await interaction.client.channels.fetch(chId);
+    const ch = await approvalChannelFor(interaction.client, gid, 'lore');
     const prev = getLore(gid, uid);
     if (prev?.msg_id) {
-      try { const old = await ch.messages.fetch(prev.msg_id);
+      try { const oldCh = (prev.ch_id && prev.ch_id !== ch.id)
+          ? await wakeThread(await interaction.client.channels.fetch(prev.ch_id)) : ch;
+        const old = await oldCh.messages.fetch(prev.msg_id);
         await old.edit({ content: `~~📜 Lore from <@${uid}>~~\n↩️ *Superseded — they rewrote it.*`, components: [] }); } catch {}
     }
     await ch.send({ content: `${roles.map(r => `<@&${r}>`).join(' ')} 📜 **Lore submitted** by <@${uid}> (**${nm}**)`,
       allowedMentions: { roles } });
     const msg = await ch.send({ content: body.length > 1900 ? body.slice(0, 1900) + '…' : body,
       components: [loreButtons(uid)], allowedMentions: { parse: [] } });
-    setLore(gid, uid, { msg_id: msg.id });
+    setLore(gid, uid, { msg_id: msg.id, ch_id: ch.id });
   } catch (err) { console.error('[lore] could not queue:', err?.message || err); }
 }
 
@@ -4083,7 +4133,7 @@ async function handleMeritGive(interaction) {
   const have = mine.merits ?? 0;
   if (have < amount) return interaction.reply({ content: `❌ You have **${have}** merit — not enough to give ${amount}.`, ephemeral: true });
 
-  const chId = approvalChannelId(gid);
+  const chId = approvalDestination(gid, 'trades');
   const fromName = await getDisplayName(interaction.guild, from);
   const toName = await getDisplayName(interaction.guild, to.id);
   const trade = createMeritTrade(gid, from, to.id, amount, reason, interactionChannelId(interaction));
@@ -4096,7 +4146,7 @@ async function handleMeritGive(interaction) {
 
   try {
     const roles = getGmRoleIds(gid);
-    const ch = await interaction.client.channels.fetch(chId);
+    const ch = await approvalChannelFor(interaction.client, gid, 'trades');
     const msg = await ch.send({
       content: [`${roles.map(r => `<@&${r}>`).join(' ')} 🤝 **Merit trade — trade #${trade.id}**`,
         `From <@${from}> (**${fromName}**) — holds ${have}`,
@@ -4105,7 +4155,7 @@ async function handleMeritGive(interaction) {
         reason ? `Reason: ${reason}` : 'No reason given',
       ].join('\n'),
       components: [meritTradeButtons(trade.id)], allowedMentions: { roles } });
-    setMeritTrade(gid, trade.id, { msg_id: msg.id });
+    setMeritTrade(gid, trade.id, { msg_id: msg.id, ch_id: ch.id });
   } catch (err) {
     console.error('[merit] could not queue trade:', err?.message || err);
     await interaction.followUp({ ephemeral: true, content: '⚠️ Couldn\'t reach the approval channel — ask a GM to check `/config approvals`.' }).catch(()=>{});
@@ -4353,9 +4403,10 @@ async function handleDuelButton(interaction) {
     await interaction.reply({ content: '↩️ Duel withdrawn.' });
     await refreshDuel(interaction.client, interaction.guild, updated);
     if (d.approval_msg_id) {
-      const chId = approvalChannelId(gid);
+      // Edit the queue post wherever it was actually made.
+      const chId = d.approval_ch_id || approvalDestination(gid, 'duels');
       try {
-        const ch = await interaction.client.channels.fetch(chId);
+        const ch = await wakeThread(await interaction.client.channels.fetch(chId));
         const m = await ch.messages.fetch(d.approval_msg_id);
         await m.edit({ content: `~~⚔️ Duel #${d.id}~~\n↩️ *Withdrawn.*`, components: [] });
       } catch {}
@@ -4366,7 +4417,7 @@ async function handleDuelButton(interaction) {
   if (action === 'duelsend') {
     if (uid !== d.opener) return interaction.reply({ content: '❌ Only whoever raised it can send it.', ephemeral: true });
     if (fighters.length < 2) return interaction.reply({ content: '❌ A duel needs at least two.', ephemeral: true });
-    const chId = approvalChannelId(gid);
+    const chId = approvalDestination(gid, 'duels');
     if (!chId) return interaction.reply({ content: '❌ No approval channel is set — ask a GM to run `/config approvals`.', ephemeral: true });
 
     const updated = setDuel(gid, d.id, { state: 'pending' });
@@ -4375,7 +4426,7 @@ async function handleDuelButton(interaction) {
     try {
       const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
       const roles = getGmRoleIds(gid);
-      const ch = await interaction.client.channels.fetch(chId);
+      const ch = await approvalChannelFor(interaction.client, gid, 'duels');
       const names = [];
       for (const f of fighters) names.push(`<@${f}> (**${await getDisplayName(interaction.guild, f)}**)`);
       const row = new ActionRowBuilder().addComponents(
@@ -4387,7 +4438,7 @@ async function handleDuelButton(interaction) {
         `**Standing in:** ${names.join(' · ')}`,
         `_In <#${d.channel_id}>._`,
       ].join('\n') });
-      setDuel(gid, d.id, { approval_msg_id: m.id });
+      setDuel(gid, d.id, { approval_msg_id: m.id, approval_ch_id: ch.id });
     } catch (err) {
       console.error('[duel] could not queue:', err?.message || err);
       await interaction.followUp({ ephemeral: true, content: `⚠️ Couldn't reach the approval channel: ${err?.message || err}` }).catch(()=>{});
@@ -4531,7 +4582,7 @@ async function handleGmQueue(interaction) {
     total += lore.length;
     lines.push(`📜 **Lore** — ${lore.length}`);
     for (const l of lore) {
-      lines.push(`• <@${l.user_id}>${ago(l.submitted_at)}${jump(getConfig(gid)?.approval_channel_id, l.msg_id)}`);
+      lines.push(`• <@${l.user_id}>${ago(l.submitted_at)}${jump(l.ch_id || approvalDestination(gid, 'lore'), l.msg_id)}`);
     }
     lines.push('');
   }
@@ -4543,7 +4594,7 @@ async function handleGmQueue(interaction) {
     lines.push(`⚔️ **Duels** — ${duels.length}`);
     for (const d of duels) {
       lines.push(`• \`#${d.id}\` <@${d.opener}> · ${duelFighters(d).length} standing in`
-        + ago(d.created_at) + jump(approvalChannelId(gid), d.approval_msg_id));
+        + ago(d.created_at) + jump(d.approval_ch_id || approvalDestination(gid, 'duels'), d.approval_msg_id));
     }
     lines.push('');
   }
@@ -4554,7 +4605,7 @@ async function handleGmQueue(interaction) {
     total += trades.length;
     lines.push(`🤝 **Merit trades** — ${trades.length}`);
     for (const t of trades) {
-      lines.push(`• \`#${t.id}\` <@${t.from_user}> → <@${t.to_user}> · **${t.amount}**${ago(t.created_at)}`);
+      lines.push(`• \`#${t.id}\` <@${t.from_user}> → <@${t.to_user}> · **${t.amount}**${ago(t.created_at)}${jump(t.ch_id, t.msg_id)}`);
     }
     lines.push('');
   }
@@ -5124,6 +5175,58 @@ async function handleConfig(interaction) {
     setConfig(gid, { approval_channel_id: channel.id });
     return interaction.reply({ content: `📋 New character sheets will await GM approval in <#${channel.id}>.\n⚠️ Players can't roll or fight until approved, and stats become GM-only once a sheet exists.` });
   }
+  if (sub === 'approvalforum') {
+    if (interaction.options.getBoolean('disable')) {
+      setConfig(gid, { approval_routes: null });
+      return interaction.reply({ content: '📋 Approval routing **off** — everything goes to the single approval channel again. The forum threads stay where they are, and anything already posted in them keeps working.' });
+    }
+    const forum = interaction.options.getChannel('forum');
+    if (!forum) {
+      const r = approvalRoutes(gid);
+      if (!r) return interaction.reply({ ephemeral: true, content:
+        '📋 No approval forum set. `/config approvalforum forum:#gm-approvals` — I\'ll make a thread per approval type in it.' });
+      const rows = Object.entries(APPROVAL_TYPES).map(([k, t]) => `${t.name} → ${r[k] ? `<#${r[k]}>` : '_missing — rerun setup_'}`);
+      return interaction.reply({ ephemeral: true, content: [`📋 Approvals route into <#${r.forum}>:`, ...rows].join('\n') });
+    }
+    // A forum is channel type 15; anything else has no threads to make.
+    if (forum.type !== 15) {
+      return interaction.reply({ ephemeral: true, content:
+        `❌ <#${forum.id}> is not a forum channel. Make a **Forum** and point me at that — each approval type gets its own thread in it.` });
+    }
+    await interaction.deferReply();
+    const prev = approvalRoutes(gid) || {};
+    const routes = { forum: forum.id };
+    const lines = [];
+    for (const [key, t] of Object.entries(APPROVAL_TYPES)) {
+      let thread = null;
+      // Re-running setup reuses a surviving thread in this same forum, so ids
+      // (and every link already pointing at them) stay stable.
+      if (prev[key]) {
+        try {
+          const old = await interaction.client.channels.fetch(prev[key]);
+          if (old?.isThread?.() && old.parentId === forum.id) thread = await wakeThread(old);
+        } catch (err) { console.error('[approvalforum] stale thread', key, '-', err?.message || err); }
+      }
+      if (!thread) {
+        try {
+          thread = await forum.threads.create({ name: t.name, autoArchiveDuration: 10080,
+            message: { content: `${t.about}\n_I wake this thread whenever something new arrives — no need to keep it active._` } });
+        } catch (err) {
+          console.error('[approvalforum] create failed', key, '-', err?.message || err);
+          return interaction.editReply({ content:
+            `❌ Couldn't create the **${t.name}** thread — ${err?.message || err}\nCheck I can **View Channel**, **Create Posts** and **Send Messages in Posts** there, then run this again. Nothing was saved.` });
+        }
+      }
+      routes[key] = thread.id;
+      lines.push(`${t.name} → <#${thread.id}>`);
+    }
+    setConfig(gid, { approval_routes: JSON.stringify(routes) });
+    return interaction.editReply({ content: [
+      `📋 **Approvals now route into <#${forum.id}>:**`, ...lines, '',
+      '_New requests land in their thread. Anything already pending stays where it was posted — its links and buttons keep working._',
+      approvalChannelId(gid) ? null : 'ℹ️ _No single approval channel is set — that\'s fine, the forum covers everything, and sheet approval now counts as **on**._',
+    ].filter(Boolean).join('\n') });
+  }
   if (sub === 'rollaudit') {
     const channel = interaction.options.getChannel('channel');
     const disable = interaction.options.getBoolean('disable');
@@ -5620,7 +5723,7 @@ async function handleChar(interaction) {
 
     if (needsApproval) {
       // Reply first so the approval post can link back to a real message.
-      const chId = approvalChannelId(gid);
+      const chId = approvalDestination(gid, 'sheets');
       await interaction.reply({ content: chId
         ? `✅ Sheet submitted — ${summary}\n\n⏳ **Awaiting GM approval.** You can't roll or fight until it's approved.\n📬 **You'll get a DM as soon as a GM decides** — if your DMs are closed, the notice will be posted here instead.\n🔒 Once approved, only a GM can change your sheet, so check it over now with \`/char show\`.`
         : `✅ Sheet saved — ${summary}\n\n⚠️ No approval channel set; ask a GM to check \`/config approvals\`.` });
@@ -5806,7 +5909,7 @@ async function handleChar(interaction) {
     if (!ch) return interaction.reply({ content: '❌ You don\'t have a character sheet yet — make one with `/char create`.', ephemeral: true });
     if (!approvalEnabled(gid)) return interaction.reply({ content: '✅ This server doesn\'t use sheet approval — your sheet is already usable.', ephemeral: true });
     if (ch.approval_state === 'pending') {
-      const chId = approvalChannelId(gid);
+      const chId = approvalDestination(gid, 'sheets');
       return interaction.reply({ content: `⏳ Your sheet is already waiting${chId ? ` in <#${chId}>` : ''}. A GM will get to it.`, ephemeral: true });
     }
     if (ch.approval_state === 'approved') return interaction.reply({ content: '✅ Your sheet is already approved. Ask a GM if you need a change.', ephemeral: true });
@@ -7510,10 +7613,11 @@ function sheetEditLock(gid, callerId, targetId, isGmCaller) {
 // ── Character sheet approval ──────────────────────────────────────────────────
 // approval_state: null = legacy sheet (pre-feature, treated as approved),
 // 'pending' = awaiting a GM, 'approved' = usable, 'rejected' = blocked.
-// Approval is only enforced once a GM has set an approval channel; without one
-// the whole feature stays dormant so existing servers are unaffected.
+// Approval is only enforced once a GM has set an approval channel or the
+// approval forum; without either the whole feature stays dormant so existing
+// servers are unaffected.
 function approvalEnabled(gid) {
-  return !!approvalChannelId(gid);
+  return !!approvalDestination(gid, 'sheets');
 }
 function sheetApproved(gid, ch) {
   if (!ch) return false;
@@ -7593,8 +7697,8 @@ function setExportRequest(gid, uid, payload, fmt, srcChannel) {
 function getExportRequest(gid, uid) {
   return db.prepare('SELECT * FROM export_requests WHERE guild_id=? AND user_id=?').get(gid, uid);
 }
-function setExportRequestMsg(gid, uid, msgId) {
-  db.prepare('UPDATE export_requests SET msg_id=? WHERE guild_id=? AND user_id=?').run(msgId, gid, uid);
+function setExportRequestMsg(gid, uid, msgId, chId = null) {
+  db.prepare('UPDATE export_requests SET msg_id=?, ch_id=? WHERE guild_id=? AND user_id=?').run(msgId, chId, gid, uid);
 }
 function clearExportRequest(gid, uid) {
   db.prepare('DELETE FROM export_requests WHERE guild_id=? AND user_id=?').run(gid, uid);
@@ -7610,7 +7714,7 @@ function exportButtons(uid) {
 // Post an export request to the approval channel. Returns the channel id, or
 // null if it couldn't be delivered.
 async function requestSheetExport(interaction, gid, uid, payload, fmt) {
-  const chId = approvalChannelId(gid);
+  const chId = approvalDestination(gid, 'exports');
   if (!chId) return null;
   const nm = await getDisplayName(interaction.guild, uid);
   const roles = getGmRoleIds(gid);
@@ -7624,11 +7728,14 @@ async function requestSheetExport(interaction, gid, uid, payload, fmt) {
     'Release sends this to the player; decline and they get nothing.',
   ].join('\n');
   try {
-    const channel = await interaction.client.channels.fetch(chId);
-    // Retire the player's previous request so only one is live at a time.
+    const channel = await approvalChannelFor(interaction.client, gid, 'exports');
+    // Retire the player's previous request so only one is live at a time —
+    // in whichever channel it was actually posted to.
     if (prev?.msg_id) {
       try {
-        const old = await channel.messages.fetch(prev.msg_id);
+        const oldCh = (prev.ch_id && prev.ch_id !== channel.id)
+          ? await wakeThread(await interaction.client.channels.fetch(prev.ch_id)) : channel;
+        const old = await oldCh.messages.fetch(prev.msg_id);
         await old.edit({ content: `~~📤 Export request from <@${uid}>~~\n↩️ *Superseded — they exported again; see the newer request below.*`, components: [] });
       } catch {}
     }
@@ -7637,7 +7744,7 @@ async function requestSheetExport(interaction, gid, uid, payload, fmt) {
     await channel.send({ content: head, allowedMentions: { roles } });
     const msg = await channel.send({ content: payload.length > 1900 ? payload.slice(0, 1900) : payload,
       components: [exportButtons(uid)], allowedMentions: { parse: [] } });
-    setExportRequestMsg(gid, uid, msg.id);
+    setExportRequestMsg(gid, uid, msg.id, channel.id);
     return channel.id;
   } catch { clearExportRequest(gid, uid); return null; }
 }
@@ -7653,7 +7760,7 @@ function approvalButtons(uid) {
 // `src` is anything with .client / .guild / .channelId — a ChatInputInteraction
 // or a plain Message, since sheets arrive by slash command and by paste.
 async function requestSheetApproval(src, gid, uid, submitMessageId = null) {
-  const chId = approvalChannelId(gid);
+  const chId = approvalDestination(gid, 'sheets');
   if (!chId) return null;
   const ch = getChar(gid, uid);
   if (!ch) return null;
@@ -7682,20 +7789,22 @@ async function requestSheetApproval(src, gid, uid, submitMessageId = null) {
   }
   if (srcCh && jumpId) lines.push(`\n[↗ Jump to submission](https://discord.com/channels/${gid}/${srcCh}/${jumpId})`);
   try {
-    const channel = await src.client.channels.fetch(chId);
+    const channel = await approvalChannelFor(src.client, gid, 'sheets');
     // Editing a pending sheet re-queues it. Retire the previous request so the
     // channel holds one live entry per player instead of a pile of stale ones
     // with working buttons.
     const oldId = ch.approval_msg_id;
     if (oldId) {
       try {
-        const old = await channel.messages.fetch(oldId);
+        const oldCh = (ch.approval_ch_id && ch.approval_ch_id !== channel.id)
+          ? await wakeThread(await src.client.channels.fetch(ch.approval_ch_id)) : channel;
+        const old = await oldCh.messages.fetch(oldId);
         await old.edit({ content: `~~📋 Sheet approval request for <@${uid}>~~\n↩️ *Superseded — they edited the sheet again; see the newer request below.*`, components: [] });
       } catch {}
     }
     const msg = await channel.send({ content: lines.join('\n'), components: [approvalButtons(uid)],
       allowedMentions: { roles } });
-    upsertChar(gid, uid, { approval_msg_id: msg.id, approval_post_ok: 1 });
+    upsertChar(gid, uid, { approval_msg_id: msg.id, approval_ch_id: channel.id, approval_post_ok: 1 });
     return channel.id;
   } catch (err) {
     // The sheet stays pending either way — the player is locked out, so a
@@ -7758,7 +7867,7 @@ async function finishSheetEdit({ src, gid, callerId, targetId, isGmCaller, conte
     return out;
   }
   upsertChar(gid, targetId, { approval_state: 'pending', approval_reason: null });
-  const chId = approvalChannelId(gid);
+  const chId = approvalDestination(gid, 'sheets');
   const sent = await reply(content + (chId
     ? `\n\n⏳ **Sent to <#${chId}> for GM approval.** You can't roll or fight until it's signed off. Spotted a mistake? Edit it and it goes back to the front of the queue.\n📬 You'll get a DM as soon as they do.`
     : '\n\n⚠️ No approval channel set — ask a GM to check `/config approvals`.'));
@@ -7773,7 +7882,7 @@ async function finishSheetEdit({ src, gid, callerId, targetId, isGmCaller, conte
 async function warnApprovalUnreachable(src, gid, uid) {
   const roles = getGmRoleIds(gid);
   const ping = roles.length ? roles.map(r => `<@&${r}>` ).join(' ') + ' ' : '';
-  const chId = approvalChannelId(gid);
+  const chId = approvalDestination(gid, 'sheets');
   const text = `${ping}⚠️ **A sheet is waiting for approval but I couldn't post it to ${chId ? `<#${chId}>` : 'the approval channel'}.**\n`
     + `👤 <@${uid}> is locked out until a GM decides.\n`
     + `Check I can **View Channel** and **Send Messages** there, then see \`/config approvals list:true\`.`;
@@ -10745,6 +10854,7 @@ const HELP_CATEGORIES = {
       '`/config rollaudit test:true` — send a test mirror and report any problem (Admin)',
       '`/config approvals channel:#x` — new sheets need GM approval before use (Admin)',
       '`/config approvals list:true` — every sheet still waiting, read from the database so nothing is lost if a post failed',
+      '`/config approvalforum forum:#gm-approvals` — one forum, a thread per approval type: sheets, trades, duels, lore, exports (Admin)',
       '`/config npcstats enabled:true` — reveal NPC stat blocks on roll cards · hidden by default (Admin)',
       '`/config npcchannel #channel` — set the NPC avatar channel',
       '`/config rest type:Short Rest hp:50% rerolls:0%` — tune what a rest restores (use % of max or a flat number)',
