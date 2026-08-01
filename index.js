@@ -530,6 +530,10 @@ try { db.exec('ALTER TABLE export_requests ADD COLUMN ch_id TEXT'); } catch {}
 // Audit routing: same shape for the roll mirror — a JSON map
 // {forum, players, gms, npcs, say} of channel ids.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN audit_routes TEXT'); } catch {}
+// Written props: a per-guild scroll font, stored as bytes so it survives
+// redeploys (the Railway filesystem does not).
+try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font BLOB'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font_name TEXT'); } catch {}
 
 function getChar(gid, uid) {
   return db.prepare('SELECT * FROM characters WHERE guild_id=? AND user_id=?').get(gid, uid);
@@ -2692,7 +2696,7 @@ function flavourBlock(flavour, label, total, critType) {
   return ['', '─────────────────────────────', `**${label??'roll'}** — ${totalStr(total, critType)}`, '', clean];
 }
 
-function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharges, flavour, total, critType, tags, gid }) {
+function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharges, flavour, total, critType, tags, gid, reveal = false }) {
   const lines = [];
   const lc = critPrefix(critType);
   if (label) lines.push(`${lc}**${label}**${isReroll ? ' *(reroll)*' : ''}`);
@@ -2709,7 +2713,8 @@ function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharg
   { const sig = signatureLine(char); if (sig && !char._isNpc) lines.push(sig); }
   // NPC stat blocks are hidden from players by default so their capabilities stay
   // a mystery. A GM can reveal them with /config npcstats enabled:true.
-  const hideNpcStats = char._isNpc && !(gid && getConfig(gid)?.npc_stats_visible);
+  // `reveal` builds the GM-grade audit copy: nothing is hidden there.
+  const hideNpcStats = !reveal && char._isNpc && !(gid && getConfig(gid)?.npc_stats_visible);
   if (hideNpcStats) lines.push(`❤️  ${hpCondition(char.hp_current, maxHp(char, gid))}`);
   else lines.push(`❤️  HP${pad(char.hp_current)} / ${maxHp(char, gid)}`);
   if (!char._isNpc) lines.push(`🔄  Rerolls${pad(char.rerolls_current)} / ${maxRerolls(char)}`);
@@ -3050,6 +3055,118 @@ const ORDER_PALETTE = {
 };
 const DEFAULT_PALETTE = { bg: '#f5f0e8', accent: '#8b7355', text: '#2a2a2a', border: '#8b7355', crest: '⚔️' };
 
+
+// ── Written props (/scroll) ──────────────────────────────────────────────────
+// The guild's font, registered with the canvas once per process. Returns the
+// family name to draw with, or null when no font is configured. The cache is
+// dropped by /config scrollfont so a replacement takes effect immediately.
+const scrollFontCache = new Map(); // gid -> family
+function ensureScrollFont(gid) {
+  if (scrollFontCache.has(gid)) return scrollFontCache.get(gid);
+  const cfg = getConfig(gid) || {};
+  if (!cfg.scroll_font) return null;
+  let GlobalFonts;
+  try { ({ GlobalFonts } = require('@napi-rs/canvas')); }
+  catch { return null; } // canvas not available
+  const family = `Scroll-${gid}`;
+  const tmp = require('path').join(require('os').tmpdir(), `ddice-scroll-${gid}.font`);
+  require('fs').writeFileSync(tmp, cfg.scroll_font);
+  GlobalFonts.registerFromPath(tmp, family);
+  scrollFontCache.set(gid, family);
+  return family;
+}
+
+// Greedy word wrap against a real measurer, hard-breaking any single word
+// wider than the line. Blank lines split paragraphs.
+function wrapScrollLines(measure, text, maxWidth) {
+  const out = [];
+  for (const para of String(text ?? '').split(/\n/)) {
+    const words = para.trim().split(/\s+/).filter(Boolean);
+    if (!words.length) { out.push(''); continue; }
+    let line = '';
+    for (let word of words) {
+      while (measure(word) > maxWidth && word.length > 1) {
+        // Peel off as much of an overlong word as fits on its own line.
+        let cut = word.length - 1;
+        while (cut > 1 && measure(word.slice(0, cut)) > maxWidth) cut--;
+        if (line) { out.push(line); line = ''; }
+        out.push(word.slice(0, cut));
+        word = word.slice(cut);
+      }
+      const tryLine = line ? `${line} ${word}` : word;
+      if (line && measure(tryLine) > maxWidth) { out.push(line); line = word; }
+      else line = tryLine;
+    }
+    if (line) out.push(line);
+  }
+  // A trailing blank from a trailing newline adds nothing.
+  while (out.length && out[out.length - 1] === '') out.pop();
+  return out;
+}
+
+// The parchment itself: cream ground, burnt corners, speckle, a double gold
+// rule with maroon diamond cornerstones — the DDice parchment look.
+function renderScroll({ family, title, body }) {
+  const { createCanvas } = require('@napi-rs/canvas');
+  const W = 1000, PAD = 90;
+  const titleSize = 62, bodySize = 40, lineH = Math.round(bodySize * 1.35);
+
+  // Measure with a scratch canvas so the real one can be sized to fit.
+  const scratch = createCanvas(8, 8).getContext('2d');
+  scratch.font = `${bodySize}px "${family}"`;
+  const lines = wrapScrollLines(t => scratch.measureText(t).width, body, W - PAD * 2);
+  scratch.font = `${titleSize}px "${family}"`;
+  const titleLines = title ? wrapScrollLines(t => scratch.measureText(t).width, title, W - PAD * 2) : [];
+
+  const titleBlock = titleLines.length ? titleLines.length * Math.round(titleSize * 1.25) + 34 : 0;
+  const H = Math.min(2600, PAD * 2 + titleBlock + Math.max(lines.length, 1) * lineH);
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext('2d');
+
+  ctx.fillStyle = '#f3e9d2';
+  ctx.fillRect(0, 0, W, H);
+  // Burnt corners: one soft radial stain in each.
+  for (const [cx, cy] of [[0, 0], [W, 0], [0, H], [W, H]]) {
+    const g = ctx.createRadialGradient(cx, cy, 10, cx, cy, 360);
+    g.addColorStop(0, 'rgba(112, 78, 40, 0.28)');
+    g.addColorStop(1, 'rgba(112, 78, 40, 0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+  }
+  // Speckle: age spots, deterministic enough not to matter.
+  ctx.fillStyle = 'rgba(94, 72, 43, 0.06)';
+  for (let i = 0; i < 140; i++) {
+    ctx.beginPath();
+    ctx.arc(Math.random() * W, Math.random() * H, 1 + Math.random() * 2.4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // Double gold rule with diamond cornerstones.
+  ctx.strokeStyle = '#8a6d3b';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(26, 26, W - 52, H - 52);
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(38, 38, W - 76, H - 76);
+  ctx.fillStyle = '#6b1f1f';
+  for (const [dx, dy] of [[26, 26], [W - 26, 26], [26, H - 26], [W - 26, H - 26]]) {
+    ctx.save(); ctx.translate(dx, dy); ctx.rotate(Math.PI / 4);
+    ctx.fillRect(-7, -7, 14, 14); ctx.restore();
+  }
+
+  let y = PAD + (titleLines.length ? titleSize : bodySize) * 0.2;
+  if (titleLines.length) {
+    ctx.fillStyle = '#6b1f1f';
+    ctx.font = `${titleSize}px "${family}"`;
+    ctx.textAlign = 'center';
+    for (const tl of titleLines) { y += Math.round(titleSize * 1.25); ctx.fillText(tl, W / 2, y); }
+    y += 34;
+  }
+  ctx.fillStyle = '#382c19';
+  ctx.font = `${bodySize}px "${family}"`;
+  ctx.textAlign = 'left';
+  for (const ln of lines) { y += lineH; if (ln) ctx.fillText(ln, PAD, y); }
+
+  return canvas.toBuffer('image/png');
+}
 
 async function generateCharImage(char, displayName, healCharges, maxCharges, gid) {
   let createCanvas;
@@ -3504,6 +3621,9 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('rollauditforum').setDescription('Split the mirror into books — player rolls, GM rolls, NPC rolls, NPC say')
       .addChannelOption(o=>o.setName('forum').setDescription('The forum channel').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = back to the single audit channel').setRequired(false)))
+    .addSubcommand(s=>s.setName('scrollfont').setDescription('The font /scroll props are written in — upload an .otf or .ttf')
+      .addAttachmentOption(o=>o.setName('font').setDescription('The font file (.otf / .ttf, up to 2 MB)').setRequired(false))
+      .addBooleanOption(o=>o.setName('remove').setDescription('true = forget the stored font').setRequired(false)))
     .addSubcommand(s=>s.setName('cleanwebhooks').setDescription('Remove orphaned NPC webhooks to free up Discord limits')),
 
   new SlashCommandBuilder()
@@ -3629,6 +3749,9 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('stat').setDescription('Show stat descriptions'),
+
+  new SlashCommandBuilder()
+    .setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)'),
 
   new SlashCommandBuilder()
     .setName('help').setDescription('Show all commands by category')
@@ -5232,6 +5355,36 @@ async function handleConfig(interaction) {
       '_New requests land in their thread. Anything already pending stays where it was posted — its links and buttons keep working._',
       approvalChannelId(gid) ? null : 'ℹ️ _No single approval channel is set — that\'s fine, the forum covers everything, and sheet approval now counts as **on**._',
     ].filter(Boolean).join('\n') });
+  }
+  if (sub === 'scrollfont') {
+    if (interaction.options.getBoolean('remove')) {
+      setConfig(gid, { scroll_font: null, scroll_font_name: null });
+      scrollFontCache.delete(gid);
+      return interaction.reply({ content: '📜 Scroll font forgotten — `/scroll` is off until a new one is uploaded.' });
+    }
+    const att = interaction.options.getAttachment('font');
+    if (!att) {
+      const cfg = getConfig(gid) || {};
+      return interaction.reply({ ephemeral: true, content: cfg.scroll_font
+        ? `📜 Scroll font: **${cfg.scroll_font_name || 'unnamed'}** (${Math.round(cfg.scroll_font.length / 1024)} KB). Upload another to replace it, or \`remove:true\`.`
+        : '📜 No scroll font stored. `/config scrollfont font:<file>` with an .otf or .ttf — then any GM can `/scroll`.' });
+    }
+    if (!/\.(otf|ttf)$/i.test(att.name || '')) {
+      return interaction.reply({ ephemeral: true, content: '❌ That isn\'t an .otf or .ttf file.' });
+    }
+    if ((att.size ?? 0) > 2_000_000) {
+      return interaction.reply({ ephemeral: true, content: '❌ Font files are capped at 2 MB — that one is bigger.' });
+    }
+    await interaction.deferReply();
+    try {
+      const bytes = Buffer.from(await (await fetch(att.url)).arrayBuffer());
+      setConfig(gid, { scroll_font: bytes, scroll_font_name: att.name });
+      scrollFontCache.delete(gid); // the next /scroll registers the new face
+      return interaction.editReply({ content: `📜 Scroll font set: **${att.name}** (${Math.round(bytes.length / 1024)} KB). Any GM can now \`/scroll\`.` });
+    } catch (err) {
+      console.error('[scrollfont] store failed -', err?.message || err);
+      return interaction.editReply({ content: `❌ Couldn't fetch that attachment — ${err?.message || err}` });
+    }
   }
   if (sub === 'rollauditforum') {
     if (interaction.options.getBoolean('disable')) {
@@ -6980,6 +7133,7 @@ client.on('interactionCreate', async interaction => {
   // Handle confirmation buttons
   if (interaction.isModalSubmit?.()) {
     if (interaction.customId.startsWith('npcsay:')) return handleNpcSayModal(interaction);
+    if (interaction.customId === 'scrollwrite') return handleScrollModal(interaction);
     if (interaction.customId === 'loresubmit') return handleLoreSubmit(interaction);
     if (interaction.customId.startsWith('gmkill:')) return handleGmKillModal(interaction);
     if (interaction.customId.startsWith('lorereject:')) return handleLoreRejectModal(interaction);
@@ -7051,6 +7205,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'pr') return await handlePr(interaction);
     if (interaction.commandName === 'weapon') return await handleWeapon(interaction);
     if (interaction.commandName === 'help') return await handleHelp(interaction);
+    if (interaction.commandName === 'scroll') return await handleScroll(interaction);
     if (interaction.commandName === 'lastroll') return await handleLastRoll(interaction);
     if (interaction.commandName === 'backup') return await handleBackup(interaction);
     if (interaction.commandName === 'gmheal') return await handleGmHeal(interaction);
@@ -7633,20 +7788,13 @@ function maskNpcRollLine(gid, rollLine) {
     .replace(/\]\s*[+-]\d+\s*=/g, '] =');
 }
 
-// One GM-grade line for the audit: the numbers the public card hides. Null
-// when the name isn't an NPC (auto-mode also rolls for players).
-function npcRevealLine(gid, name) {
-  const npc = getNpc(gid, name);
-  if (!npc) return null;
-  return `🔒 ❤️ ${npc.hp_current}/${maxHpFromCon(gid, npc.con)} · 💪${npc.str} 🫀${npc.con} ⚡${npc.dex} 🧠${npc.wis} 🍀${npc.lck}`;
-}
 
 // The NPC block printed under a roll card. `cur` supplies the live reroll/LCK
 // figures — the reroll path passes the refreshed row, everyone else the same one.
-function npcCardFooter(gid, npc, cur = npc) {
+function npcCardFooter(gid, npc, cur = npc, reveal = false) {
   const lines = ['─────────────────────────────', `⚔️  ${npc.name}`];
   if (npc.order_name) lines.push(`${KNIGHT_EMOJIS[npc.order_name]??'⚪'}  ${npc.order_name}`);
-  if (!npcStatsVisible(gid)) {
+  if (!reveal && !npcStatsVisible(gid)) {
     lines.push(`❤️  ${hpCondition(npc.hp_current, maxHpFromCon(gid, npc.con))}`);
   } else {
     lines.push(`❤️  HP${pad(npc.hp_current)} / ${maxHpFromCon(gid, npc.con)}`);
@@ -8221,7 +8369,7 @@ function recordRoll(gid, opts) {
 // too: the previous self-skip meant a secret `gmrs` typed in that channel went
 // to the GM's DMs and was never recorded anywhere, which is precisely the hole
 // the audit exists to close.
-function mirrorRoll(gid, { userId = null, actor = null, channelId, messageId = null, input, rollLine, context = null, interaction = null, kind = null, detail = null }) {
+function mirrorRoll(gid, { userId = null, actor = null, channelId, messageId = null, input, rollLine, context = null, interaction = null, kind = null, card = null }) {
   const routes = auditRoutes(gid);
   const plain = getConfig(gid)?.roll_audit_channel_id || null;
   // Verbose tracing: a silent mirror is impossible to diagnose otherwise.
@@ -8250,7 +8398,8 @@ function mirrorRoll(gid, { userId = null, actor = null, channelId, messageId = n
     const where = channelId ? ` in <#${channelId}>` : '';
     const cmd = clean ? ` — \`${clean}\`` : '';
     await ch.send({
-      content: `🎲 ${who}${where}${ctx}${cmd}\n${rollLine}${detail ? `\n${detail}` : ''}${link}`,
+      // A full reveal card, when one was built, stands in for the bare line.
+      content: `🎲 ${who}${where}${ctx}${cmd}\n${card ?? rollLine}${link}`,
       allowedMentions: { parse: [] }, // identity without pinging anyone
     });
     console.log('[rollaudit] mirror sent OK');
@@ -8269,12 +8418,12 @@ function mirrorAutoRoll(gid, cid, name, notation, nat, total, context) {
   try { if (getNpc(gid, name)) tallyRoll(gid, npcFighterId(name), nat, 20); } catch {}
   const mod = total - nat;
   const modStr = mod > 0 ? ` +${mod}` : (mod < 0 ? ` ${mod}` : '');
-  // Auto-mode rolls for players too: those file under the players book, and
-  // only real NPCs get the stat reveal.
-  const reveal = npcRevealLine(gid, name);
+  // Auto-mode rolls for players too: those file under the players book. Auto
+  // entries stay in line form — the audit copy was never masked, and a full
+  // card for every auto exchange would bury the book.
   mirrorRoll(gid, {
     actor: `🤖 **${name}**`, channelId: cid, input: notation,
-    kind: reveal ? 'npcs' : 'players', detail: reveal,
+    kind: getNpc(gid, name) ? 'npcs' : 'players',
     rollLine: `🎲  ${notation} → [${nat}]${modStr} = **${total}**`,
     context: context ? `auto · ${context}` : 'auto',
   });
@@ -9015,6 +9164,12 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
       char: actorCard, healCharges: 0, maxCharges: 0,
       flavour: flavour || null, total, critType, tags: null, gid,
     });
+    // The audit's copy: the same card with every number shown.
+    const auditCard = actor.isNpc ? buildRollEmbed({
+      rollLine, label: headerLabel, isReroll: false,
+      char: actorCard, healCharges: 0, maxCharges: 0,
+      flavour: flavour || null, total, critType, tags: null, gid, reveal: true,
+    }) : null;
     const autoOn = !!fight.auto_npc;
     const defHint = targetF.isNpc
       ? (autoOn ? `🤖 **${targetF.name}** defends automatically...` : `🛡️ A GM defends for **${targetF.name}** with \`/fight def npc:${targetF.name}\`.`)
@@ -9052,8 +9207,7 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
       await interaction.reply({ content: `${card}\n\n${defHint}` });
     }
     recordRoll(gid, { userId: uid, channelId: cid, interaction, messageId: auditMsgId,
-      kind: isNpcFighter(actorId) ? 'npcs' : null,
-      detail: isNpcFighter(actorId) ? npcRevealLine(gid, actor.name) : null,
+      kind: isNpcFighter(actorId) ? 'npcs' : null, card: auditCard,
       input: `/fight atk stat:${stat}${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
       context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 attacks ${targetF.name}` : `fight · attacks ${targetF.name}` });
     // NPCs-only mode: the bot rolls the targeted NPC's defence and resolves.
@@ -9842,6 +9996,12 @@ async function handleFight(interaction) {
       char: defCard, healCharges: 0, maxCharges: 0,
       flavour: flavour || null, total, critType, tags: null, gid,
     });
+    // The audit's copy: the same card with every number shown.
+    const auditCard = defender.isNpc ? buildRollEmbed({
+      rollLine, label: `🛡️ Defends with ${STAT_LABELS[stat]}`, isReroll: false,
+      char: defCard, healCharges: 0, maxCharges: 0,
+      flavour: flavour || null, total, critType, tags: null, gid, reveal: true,
+    }) : null;
 
     upsertFight(gid, cid, { def_roll: total, def_nat: nat, def_stat: stat, def_mode: mode, def_sides: 20 });
     if (!defender.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, `def ${STAT_LABELS[stat]}`);
@@ -9857,8 +10017,7 @@ async function handleFight(interaction) {
       await interaction.reply({ content: `${card}\n\n⚡ Use \`/fight resolve\` to resolve this exchange.` });
     }
     recordRoll(gid, { userId: uid, channelId: cid, interaction, messageId: auditMsgId,
-      kind: isNpcFighter(defenderId) ? 'npcs' : null,
-      detail: isNpcFighter(defenderId) ? npcRevealLine(gid, defender.name) : null,
+      kind: isNpcFighter(defenderId) ? 'npcs' : null, card: auditCard,
       input: `/fight def stat:${stat}${isNpcFighter(defenderId) ? ` npc:${defender.name}` : ''}`, rollLine, nat, sides: 20,
       context: isNpcFighter(defenderId) ? `fight · GM as ${defender.name} 🎭 defends` : 'fight · defends' });
     return;
@@ -10508,8 +10667,14 @@ async function handlePr(interaction) {
 
     const critType = detectCrit(result, mode);
     const rollLine = maskNpcRollLine(gid, buildRollLine(result, mode, critType, null));
+    const auditCard = [
+      last.label ? `${critPrefix(critType)}**${last.label}** *(reroll)*` : '*(reroll)*',
+      buildRollLine(result, mode, critType, null),
+      '',
+      ...npcCardFooter(gid, npc, updatedNpc, true),
+    ].join('\n');
     recordRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction, result,
-      kind: 'npcs', detail: npcRevealLine(gid, npc.name),
+      kind: 'npcs', card: auditCard,
       input: `/pr reroll ${last.notation}${last.label ? ' ' + last.label : ''}`,
       rollLine: buildRollLine(result, mode, critType, null),
       context: `as NPC **${npc.name}** · reroll` });
@@ -10647,9 +10812,15 @@ async function handlePr(interaction) {
     const critType = detectCrit(result, mode);
     const rollLine = maskNpcRollLine(gid, buildRollLine(result, mode, critType, null));
     // Posted through the NPC's webhook, so the audit is the only place this ties
-    // back to the GM who actually rolled it.
+    // back to the GM who actually rolled it — as the full card, fully revealed.
+    const auditCard = [
+      ...(label ? [`${critPrefix(critType)}**${label}**`] : []),
+      buildRollLine(result, mode, critType, null),
+      '',
+      ...npcCardFooter(gid, npc, npc, true),
+    ].join('\n');
     recordRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction, result,
-      kind: 'npcs', detail: npcRevealLine(gid, npc.name),
+      kind: 'npcs', card: auditCard,
       input: `/pr roll ${notation}${label ? ' ' + label : ''}`,
       rollLine: buildRollLine(result, mode, critType, null),
       context: `as NPC **${npc.name}**` });
@@ -11001,7 +11172,9 @@ const HELP_CATEGORIES = {
       '`/config rollaudit channel:#x` — mirror all rolls (players + GMs) to a GM-only channel (Admin)',
       '`/config rollaudit test:true` — send a test mirror and report any problem (Admin)',
       '`/config rollauditforum forum:#roll-audit` — split the mirror into books: player rolls, GM rolls, NPC rolls, NPC say (Admin)',
-      'When NPC stats are hidden, fight cards mask the stat and modifier — the audit\'s NPC book keeps the full line plus the NPC\'s real HP and stats',
+      'When NPC stats are hidden, fight cards mask the stat and modifier — the audit\'s NPC book gets the full card, every number revealed',
+      '`/config scrollfont font:<file>` — store an .otf/.ttf; `/scroll` then writes props in it (Admin)',
+      '`/scroll` — write a title and body in a modal; the bot posts them as an ancient parchment image (GM)',
       '`/config approvals channel:#x` — new sheets need GM approval before use (Admin)',
       '`/config approvals list:true` — every sheet still waiting, read from the database so nothing is lost if a post failed',
       '`/config approvalforum forum:#gm-approvals` — one forum, a thread per approval type: sheets, trades, duels, lore, exports (Admin)',
@@ -11019,6 +11192,58 @@ const HELP_CATEGORIES = {
 // Help categories that document GM-only tooling. Players shouldn't be able to
 // browse them — both the listing and the detail view are gated.
 const GM_HELP_CATEGORIES = ['gm', 'npc'];
+
+// /scroll: gate, then hand the GM a writing modal. All the real checks run
+// again on submit — the modal can sit open for a while.
+async function handleScroll(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id))) {
+    return interaction.reply({ content: '❌ Only GMs can unfurl props.', ephemeral: true });
+  }
+  try { require('@napi-rs/canvas'); }
+  catch { return interaction.reply({ content: '❌ Image generation unavailable — install `@napi-rs/canvas` to enable.', ephemeral: true }); }
+  if (!ensureScrollFont(gid)) {
+    return interaction.reply({ content: '📜 No scroll font is stored — an Admin sets one with `/config scrollfont font:<file>`.', ephemeral: true });
+  }
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+  const modal = new ModalBuilder().setCustomId('scrollwrite').setTitle('Write the scroll');
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('title')
+      .setLabel('Title (optional)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(80)),
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('body')
+      .setLabel('The writing itself').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1600)),
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('flavour')
+      .setLabel('Scene line above the image (optional)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(200)),
+  );
+  return interaction.showModal(modal);
+}
+
+async function handleScrollModal(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id))) {
+    return interaction.reply({ content: '❌ Only GMs can unfurl props.', ephemeral: true });
+  }
+  await interaction.deferReply({ ephemeral: true });
+  const family = ensureScrollFont(gid);
+  if (!family) return interaction.editReply({ content: '📜 The scroll font vanished — set one again with `/config scrollfont`.' });
+  const title = interaction.fields.getTextInputValue('title')?.trim() || null;
+  const body = interaction.fields.getTextInputValue('body')?.trim();
+  const flavour = interaction.fields.getTextInputValue('flavour')?.trim() || null;
+  if (!body) return interaction.editReply({ content: '❌ Nothing written.' });
+  try {
+    const buf = renderScroll({ family, title, body });
+    const { AttachmentBuilder } = require('discord.js');
+    const chan = await interactionChannel(interaction);
+    await chan.send({
+      content: flavour || '📜 *An ancient parchment is unfurled…*',
+      files: [new AttachmentBuilder(buf, { name: 'ancient-scroll.png' })],
+    });
+    return interaction.editReply({ content: '📜 Posted.' });
+  } catch (err) {
+    console.error('[scroll] render failed -', err?.message || err);
+    return interaction.editReply({ content: `❌ The scroll wouldn't take ink — ${err?.message || err}` });
+  }
+}
 
 async function handleHelp(interaction) {
   const cat = interaction.options.getString('category');
