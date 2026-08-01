@@ -7633,6 +7633,14 @@ function maskNpcRollLine(gid, rollLine) {
     .replace(/\]\s*[+-]\d+\s*=/g, '] =');
 }
 
+// One GM-grade line for the audit: the numbers the public card hides. Null
+// when the name isn't an NPC (auto-mode also rolls for players).
+function npcRevealLine(gid, name) {
+  const npc = getNpc(gid, name);
+  if (!npc) return null;
+  return `🔒 ❤️ ${npc.hp_current}/${maxHpFromCon(gid, npc.con)} · 💪${npc.str} 🫀${npc.con} ⚡${npc.dex} 🧠${npc.wis} 🍀${npc.lck}`;
+}
+
 // The NPC block printed under a roll card. `cur` supplies the live reroll/LCK
 // figures — the reroll path passes the refreshed row, everyone else the same one.
 function npcCardFooter(gid, npc, cur = npc) {
@@ -8213,7 +8221,7 @@ function recordRoll(gid, opts) {
 // too: the previous self-skip meant a secret `gmrs` typed in that channel went
 // to the GM's DMs and was never recorded anywhere, which is precisely the hole
 // the audit exists to close.
-function mirrorRoll(gid, { userId = null, actor = null, channelId, messageId = null, input, rollLine, context = null, interaction = null, kind = null }) {
+function mirrorRoll(gid, { userId = null, actor = null, channelId, messageId = null, input, rollLine, context = null, interaction = null, kind = null, detail = null }) {
   const routes = auditRoutes(gid);
   const plain = getConfig(gid)?.roll_audit_channel_id || null;
   // Verbose tracing: a silent mirror is impossible to diagnose otherwise.
@@ -8242,7 +8250,7 @@ function mirrorRoll(gid, { userId = null, actor = null, channelId, messageId = n
     const where = channelId ? ` in <#${channelId}>` : '';
     const cmd = clean ? ` — \`${clean}\`` : '';
     await ch.send({
-      content: `🎲 ${who}${where}${ctx}${cmd}\n${rollLine}${link}`,
+      content: `🎲 ${who}${where}${ctx}${cmd}\n${rollLine}${detail ? `\n${detail}` : ''}${link}`,
       allowedMentions: { parse: [] }, // identity without pinging anyone
     });
     console.log('[rollaudit] mirror sent OK');
@@ -8261,8 +8269,12 @@ function mirrorAutoRoll(gid, cid, name, notation, nat, total, context) {
   try { if (getNpc(gid, name)) tallyRoll(gid, npcFighterId(name), nat, 20); } catch {}
   const mod = total - nat;
   const modStr = mod > 0 ? ` +${mod}` : (mod < 0 ? ` ${mod}` : '');
+  // Auto-mode rolls for players too: those file under the players book, and
+  // only real NPCs get the stat reveal.
+  const reveal = npcRevealLine(gid, name);
   mirrorRoll(gid, {
     actor: `🤖 **${name}**`, channelId: cid, input: notation,
+    kind: reveal ? 'npcs' : 'players', detail: reveal,
     rollLine: `🎲  ${notation} → [${nat}]${modStr} = **${total}**`,
     context: context ? `auto · ${context}` : 'auto',
   });
@@ -8972,31 +8984,34 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     const sigRowA = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
     mode = applySignatureMode(sigRowA, stat, mode);
     const effTotal = statVal + atkBonus;
-    let nat, total, rollLine;
     const bonusTag = atkBonus ? ` +${atkBonus} riposte` : '';
     const modStr = effTotal > 0 ? ` +${effTotal}` : effTotal < 0 ? ` ${effTotal}` : '';
 
+    let nat, dropped = null, advNote = '';
     if (mode === 'adv') {
       const r1 = rollDie(20), r2 = rollDie(20);
-      nat = Math.max(r1, r2); const dropped = Math.min(r1, r2);
-      total = nat + effTotal;
-      rollLine = `⚔️  1d20+${STAT_LABELS[stat]}${bonusTag} (advantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+      nat = Math.max(r1, r2); dropped = Math.min(r1, r2); advNote = ' (advantage)';
     } else if (mode === 'dis') {
       const r1 = rollDie(20), r2 = rollDie(20);
-      nat = Math.min(r1, r2); const dropped = Math.max(r1, r2);
-      total = nat + effTotal;
-      rollLine = `⚔️  1d20+${STAT_LABELS[stat]}${bonusTag} (disadvantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+      nat = Math.min(r1, r2); dropped = Math.max(r1, r2); advNote = ' (disadvantage)';
     } else {
-      nat = rollDie(20); total = nat + effTotal;
-      rollLine = `⚔️  1d20+${STAT_LABELS[stat]}${bonusTag} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+      nat = rollDie(20);
     }
+    const total = nat + effTotal;
+    const diceBit = dropped === null ? `[${nat}]` : `[${nat}, ~~${dropped}~~]`;
+    // Two renderings of the same throw: the full line is what the audit keeps;
+    // when this server hides NPC stats, the public card drops the stat name
+    // and modifier — same convention as the auto-pilot cards.
+    const lineFor = (show) => `⚔️  1d20${show ? `+${STAT_LABELS[stat]}` : ''}${bonusTag}${advNote} → ${diceBit}${show ? modStr : ''} = ${fightTotalStr(total, nat, 20)}`;
+    const rollLine = lineFor(true);
+    const publicLine = (actor.isNpc && !npcStatsVisible(gid)) ? lineFor(false) : rollLine;
     const targetName = targetF.name + (targetF.isNpc ? ' 🎭' : '');
     const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
     const actorCard = await fighterCharCard(interaction.guild, gid, actorId);
 
     const headerLabel = `⚔️ Attacks ${targetName} with ${STAT_LABELS[stat]}`;
     const card = buildRollEmbed({
-      rollLine, label: headerLabel, isReroll: false,
+      rollLine: publicLine, label: headerLabel, isReroll: false,
       char: actorCard, healCharges: 0, maxCharges: 0,
       flavour: flavour || null, total, critType, tags: null, gid,
     });
@@ -9038,6 +9053,7 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     }
     recordRoll(gid, { userId: uid, channelId: cid, interaction, messageId: auditMsgId,
       kind: isNpcFighter(actorId) ? 'npcs' : null,
+      detail: isNpcFighter(actorId) ? npcRevealLine(gid, actor.name) : null,
       input: `/fight atk stat:${stat}${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
       context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 attacks ${targetF.name}` : `fight · attacks ${targetF.name}` });
     // NPCs-only mode: the bot rolls the targeted NPC's defence and resolves.
@@ -9798,27 +9814,31 @@ async function handleFight(interaction) {
     const effMode = flat ? 'normal' : mode;
     const modStr = flat ? '' : (effVal > 0 ? ` +${effVal}` : effVal < 0 ? ` ${effVal}` : '');
     const flatTag = flat ? ' (flat d20 — fumbled last attack)' : '';
-    let nat, total, rollLine;
 
+    let nat, dropped = null, advNote = '';
     if (effMode === 'adv') {
       const r1 = rollDie(20), r2 = rollDie(20);
-      nat = Math.max(r1, r2); const dropped = Math.min(r1, r2);
-      total = nat + effVal;
-      rollLine = `🛡️  1d20+${STAT_LABELS[stat]} (advantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+      nat = Math.max(r1, r2); dropped = Math.min(r1, r2); advNote = ' (advantage)';
     } else if (effMode === 'dis') {
       const r1 = rollDie(20), r2 = rollDie(20);
-      nat = Math.min(r1, r2); const dropped = Math.max(r1, r2);
-      total = nat + effVal;
-      rollLine = `🛡️  1d20+${STAT_LABELS[stat]} (disadvantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+      nat = Math.min(r1, r2); dropped = Math.max(r1, r2); advNote = ' (disadvantage)';
     } else {
-      nat = rollDie(20); total = nat + effVal;
-      const label = flat ? `🛡️  1d20${flatTag}` : `🛡️  1d20+${STAT_LABELS[stat]}`;
-      rollLine = `${label} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
+      nat = rollDie(20);
     }
+    const total = nat + effVal;
+    const diceBit = dropped === null ? `[${nat}]` : `[${nat}, ~~${dropped}~~]`;
+    // Same dual rendering as the attack: full line for the audit, stat name
+    // and modifier dropped from the public card when NPC stats are hidden.
+    // A flat defence has nothing to hide — no stat, no modifier.
+    const lineFor = (show) => flat
+      ? `🛡️  1d20${flatTag} → ${diceBit} = ${fightTotalStr(total, nat, 20)}`
+      : `🛡️  1d20${show ? `+${STAT_LABELS[stat]}` : ''}${advNote} → ${diceBit}${show ? modStr : ''} = ${fightTotalStr(total, nat, 20)}`;
+    const rollLine = lineFor(true);
+    const publicLine = (defender.isNpc && !npcStatsVisible(gid)) ? lineFor(false) : rollLine;
     const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
     const defCard = await fighterCharCard(interaction.guild, gid, defenderId);
     const card = buildRollEmbed({
-      rollLine, label: `🛡️ Defends with ${STAT_LABELS[stat]}`, isReroll: false,
+      rollLine: publicLine, label: `🛡️ Defends with ${STAT_LABELS[stat]}`, isReroll: false,
       char: defCard, healCharges: 0, maxCharges: 0,
       flavour: flavour || null, total, critType, tags: null, gid,
     });
@@ -9838,6 +9858,7 @@ async function handleFight(interaction) {
     }
     recordRoll(gid, { userId: uid, channelId: cid, interaction, messageId: auditMsgId,
       kind: isNpcFighter(defenderId) ? 'npcs' : null,
+      detail: isNpcFighter(defenderId) ? npcRevealLine(gid, defender.name) : null,
       input: `/fight def stat:${stat}${isNpcFighter(defenderId) ? ` npc:${defender.name}` : ''}`, rollLine, nat, sides: 20,
       context: isNpcFighter(defenderId) ? `fight · GM as ${defender.name} 🎭 defends` : 'fight · defends' });
     return;
@@ -10488,7 +10509,7 @@ async function handlePr(interaction) {
     const critType = detectCrit(result, mode);
     const rollLine = maskNpcRollLine(gid, buildRollLine(result, mode, critType, null));
     recordRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction, result,
-      kind: 'npcs',
+      kind: 'npcs', detail: npcRevealLine(gid, npc.name),
       input: `/pr reroll ${last.notation}${last.label ? ' ' + last.label : ''}`,
       rollLine: buildRollLine(result, mode, critType, null),
       context: `as NPC **${npc.name}** · reroll` });
@@ -10628,7 +10649,7 @@ async function handlePr(interaction) {
     // Posted through the NPC's webhook, so the audit is the only place this ties
     // back to the GM who actually rolled it.
     recordRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction, result,
-      kind: 'npcs',
+      kind: 'npcs', detail: npcRevealLine(gid, npc.name),
       input: `/pr roll ${notation}${label ? ' ' + label : ''}`,
       rollLine: buildRollLine(result, mode, critType, null),
       context: `as NPC **${npc.name}**` });
@@ -10980,6 +11001,7 @@ const HELP_CATEGORIES = {
       '`/config rollaudit channel:#x` — mirror all rolls (players + GMs) to a GM-only channel (Admin)',
       '`/config rollaudit test:true` — send a test mirror and report any problem (Admin)',
       '`/config rollauditforum forum:#roll-audit` — split the mirror into books: player rolls, GM rolls, NPC rolls, NPC say (Admin)',
+      'When NPC stats are hidden, fight cards mask the stat and modifier — the audit\'s NPC book keeps the full line plus the NPC\'s real HP and stats',
       '`/config approvals channel:#x` — new sheets need GM approval before use (Admin)',
       '`/config approvals list:true` — every sheet still waiting, read from the database so nothing is lost if a post failed',
       '`/config approvalforum forum:#gm-approvals` — one forum, a thread per approval type: sheets, trades, duels, lore, exports (Admin)',
