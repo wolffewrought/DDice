@@ -11727,7 +11727,7 @@ const HELP_CATEGORIES = {
       '`/config rollauditforum forum:#roll-audit` — split the mirror into books: player rolls, GM rolls, NPC rolls, NPC say (Admin)',
       'When NPC stats are hidden, fight cards mask the stat and modifier — the audit\'s NPC book gets the full card, every number revealed',
       '`/config scrollfont font:<file>` — store an .otf/.ttf; `/scroll` then writes props in it (Admin)',
-      '`/scroll` — write a title and body in a modal; the bot posts an ancient parchment **PDF**, the writing woven invisibly inside. Hand any scroll PDF back with `file:` to read it as plain text and get a fresh copy in this server\'s font — the file survives Discord, so scrolls travel between servers on their own (GM)',
+      '`/scroll` — write a title and body in a modal; the bot posts the parchment as an image everyone can see plus a **PDF** with the writing woven invisibly inside — the PDF survives Discord, so scrolls travel between servers on their own. `file:` hands any scroll PDF back: plain text out, plus a readable edition in standard type as image and woven PDF (GM)',
       '`/config approvals channel:#x` — new sheets need GM approval before use (Admin)',
       '`/config approvals list:true` — every sheet still waiting, read from the database so nothing is lost if a post failed',
       '`/config approvalforum forum:#gm-approvals` — one forum, a thread per approval type: sheets, trades, duels, lore, exports (Admin)',
@@ -11814,18 +11814,20 @@ async function deliverScroll(interaction, gid, scroll) {
   lines.push(scroll.body);
   if (scroll.flavour) lines.push('', `_${scroll.flavour}_`);
   await replyLong(interaction, lines, { ephemeral: true });
-  // Best effort from here: the text above is already delivered.
-  let why = null;
-  try { require('@napi-rs/canvas'); } catch { why = 'no image — `@napi-rs/canvas` isn\'t installed here'; }
-  const family = why ? null : ensureScrollFont(gid);
-  if (!why && !family) why = 'no image — this server has no scroll font stored (`/config scrollfont`)';
-  if (why) return interaction.followUp({ content: `✂️ ${why}.`, ephemeral: true });
+  // Best effort from here: the text above is already delivered. The readable
+  // edition is set in plain type, so no stored scroll font is needed to read.
+  try { require('@napi-rs/canvas'); }
+  catch { return interaction.followUp({ content: '✂️ No files — `@napi-rs/canvas` isn\'t installed here.', ephemeral: true }); }
   try {
     const payload = { v: 1, kind: 'scroll', title: scroll.title, body: scroll.body, flavour: scroll.flavour };
-    const fresh = embedScrollData(renderScroll({ family, title: scroll.title, body: scroll.body, pdf: true }), payload);
+    const png = renderScroll({ family: 'serif', title: scroll.title, body: scroll.body });
+    const pdfBuf = embedScrollData(renderScroll({ family: 'serif', title: scroll.title, body: scroll.body, pdf: true }), payload);
     const { AttachmentBuilder } = require('discord.js');
-    return interaction.followUp({ content: '📜 Remade as a woven **PDF** in this server\'s font — hand this file back anywhere, any time.',
-      files: [new AttachmentBuilder(fresh, { name: 'ancient-scroll.pdf' })], ephemeral: true });
+    return interaction.followUp({ content: '📜 The readable edition, in plain type — the image to see, the PDF woven to travel.',
+      files: [
+        new AttachmentBuilder(png, { name: 'scroll-readable.png' }),
+        new AttachmentBuilder(pdfBuf, { name: 'scroll-readable.pdf' }),
+      ], ephemeral: true });
   } catch (err) {
     console.error('[scroll] remake failed -', err?.message || err);
     return interaction.followUp({ content: `❌ The remake wouldn't take ink — ${err?.message || err}`, ephemeral: true });
@@ -11847,19 +11849,23 @@ async function handleScrollModal(interaction) {
   const flavour = interaction.fields.getTextInputValue('flavour')?.trim() || null;
   if (!body) return interaction.editReply({ content: '❌ Nothing written.' });
   try {
-    // The scroll IS the PDF: parchment on page one (Discord previews it in
-    // the channel), the writing woven after %%EOF. Anyone who saves this
-    // file can hand it to /scroll on any server the bot stands in.
-    const buf = embedScrollData(renderScroll({ family, title, body, pdf: true }),
-      { v: 1, kind: 'scroll', title, body, flavour });
+    // Two files, two jobs: the PNG is what everyone sees in the channel; the
+    // PDF carries the writing woven after %%EOF and survives every Discord
+    // re-upload — anyone who saves it can hand it to /scroll anywhere.
+    const payload = { v: 1, kind: 'scroll', title, body, flavour };
+    const png = renderScroll({ family, title, body });
+    const pdfBuf = embedScrollData(renderScroll({ family, title, body, pdf: true }), payload);
     const { AttachmentBuilder } = require('discord.js');
     const chan = await interactionChannel(interaction);
     await chan.send({
       content: flavour || '📜 *An ancient parchment is unfurled…*',
-      files: [new AttachmentBuilder(buf, { name: 'ancient-scroll.pdf' })],
+      files: [
+        new AttachmentBuilder(png, { name: 'ancient-scroll.png' }),
+        new AttachmentBuilder(pdfBuf, { name: 'ancient-scroll.pdf' }),
+      ],
       allowedMentions: { parse: ['users'] }, // a scene line may name a player, never wake a room
     });
-    return interaction.editReply({ content: '📜 Posted — the writing rides inside the file itself.' });
+    return interaction.editReply({ content: '📜 Posted — the image to see, the PDF to keep. The writing rides inside the PDF.' });
   } catch (err) {
     console.error('[scroll] render failed -', err?.message || err);
     return interaction.editReply({ content: `❌ The scroll wouldn't take ink — ${err?.message || err}` });
