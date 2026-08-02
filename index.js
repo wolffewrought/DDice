@@ -3105,11 +3105,19 @@ function extractScrollData(buf) {
   try { const o = JSON.parse(buf.slice(i + SCROLL_WEAVE_MARK.length).toString('utf8')); return o && typeof o === 'object' ? o : null; }
   catch { return null; }
 }
+// An archive-safe file stem: lowercase, dashes for everything else, never
+// empty. What a GM types becomes what the files are called.
+function fileSlug(s, fallback) {
+  const slug = String(s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48);
+  return slug || fallback;
+}
+
 function validateScrollData(o) {
   if (!o || o.v !== 1 || o.kind !== 'scroll') return null;
   if (typeof o.body !== 'string' || !o.body.trim()) return null;
   const str_ = (v, cap) => (typeof v === 'string' && v.trim()) ? v.trim().slice(0, cap) : null;
-  return { title: str_(o.title, 80), body: o.body.trim().slice(0, 1600), flavour: str_(o.flavour, 200) };
+  return { title: str_(o.title, 80), body: o.body.trim().slice(0, 1600), flavour: str_(o.flavour, 200),
+    name: str_(o.name, 48) };
 }
 
 // Greedy word wrap against a real measurer, hard-breaking any single word
@@ -3196,16 +3204,95 @@ function makeImagePdf(jpeg, w, h) {
   return Buffer.concat(chunks);
 }
 
+// Base-14 text into a PDF string: escape the delimiters, tame the common
+// typographic marks, drop the rest to '?'. The full unicode body always
+// arrives in the text reply — this is the printed edition.
+function pdfEscape(t) {
+  return String(t).replace(/[\u2014\u2013]/g, '-').replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"').replace(/\u2026/g, '...')
+    .replace(/[^\x20-\x7E]/g, '?').replace(/([\\()])/g, '\\$1');
+}
+// Character-count wrap for fixed-metric layouts.
+function wrapByCount(text, maxChars) {
+  const out = [];
+  for (const para of String(text ?? '').split(/\n/)) {
+    const words = para.trim().split(/\s+/).filter(Boolean);
+    if (!words.length) { out.push(''); continue; }
+    let line = '';
+    for (let w of words) {
+      while (w.length > maxChars) {
+        if (line) { out.push(line); line = ''; }
+        out.push(w.slice(0, maxChars)); w = w.slice(maxChars);
+      }
+      const t = line ? line + ' ' + w : w;
+      if (line && t.length > maxChars) { out.push(line); line = w; }
+      else line = t;
+    }
+    if (line) out.push(line);
+  }
+  while (out.length && out[out.length - 1] === '') out.pop();
+  return out;
+}
+// The readable edition as NATIVE PDF text: built-in Helvetica, cream ground,
+// gold rules, maroon diamonds and title — no font files involved anywhere,
+// so no registered OTF can leak in. The text is selectable, too.
+function makeTextPdf({ title, body }) {
+  const W = 760, PAD = 80, bodySize = 16, lineH = 24, titleSize = 26;
+  const bodyLines = wrapByCount(body, 72);
+  const titleLines = title ? wrapByCount(title, 42) : [];
+  const titleBlock = titleLines.length ? titleLines.length * 36 + 24 : 0;
+  const H = Math.min(2200, PAD * 2 + titleBlock + Math.max(bodyLines.length, 1) * lineH);
+  const ops = [];
+  ops.push(`0.953 0.914 0.824 rg 0 0 ${W} ${H} re f`);
+  ops.push(`0.541 0.427 0.231 RG 3 w 26 26 ${W - 52} ${H - 52} re S`);
+  ops.push(`1.5 w 38 38 ${W - 76} ${H - 76} re S`);
+  for (const [dx, dy] of [[26, 26], [W - 26, 26], [26, H - 26], [W - 26, H - 26]])
+    ops.push(`0.42 0.12 0.12 rg ${dx} ${dy - 10} m ${dx + 10} ${dy} l ${dx} ${dy + 10} l ${dx - 10} ${dy} l f`);
+  let y = H - PAD;
+  if (titleLines.length) {
+    ops.push('0.42 0.12 0.12 rg');
+    for (const tl of titleLines) {
+      const x = Math.max(PAD, (W - tl.length * titleSize * 0.5) / 2);
+      ops.push(`BT /F2 ${titleSize} Tf 1 0 0 1 ${x.toFixed(1)} ${y} Tm (${pdfEscape(tl)}) Tj ET`);
+      y -= 36;
+    }
+    y -= 24;
+  }
+  ops.push('0.22 0.17 0.10 rg');
+  for (const ln of bodyLines) {
+    if (ln) ops.push(`BT /F1 ${bodySize} Tf 1 0 0 1 ${PAD} ${y} Tm (${pdfEscape(ln)}) Tj ET`);
+    y -= lineH;
+  }
+  const content = ops.join('\n');
+  const chunks = []; let off = 0; const offs = [];
+  const push = (x) => { const b = Buffer.isBuffer(x) ? x : Buffer.from(x, 'latin1'); chunks.push(b); off += b.length; };
+  const obj = (x) => { offs.push(off); push(x); };
+  push('%PDF-1.4\n%\xE2\xE3\xCF\xD3\n');
+  obj('1 0 obj\n<</Type/Catalog/Pages 2 0 R>>\nendobj\n');
+  obj('2 0 obj\n<</Type/Pages/Kids[3 0 R]/Count 1>>\nendobj\n');
+  obj(`3 0 obj\n<</Type/Page/Parent 2 0 R/MediaBox[0 0 ${W} ${H}]/Resources<</Font<</F1 5 0 R/F2 6 0 R>>>>/Contents 4 0 R>>\nendobj\n`);
+  obj(`4 0 obj\n<</Length ${content.length}>>\nstream\n${content}\nendstream\nendobj\n`);
+  obj('5 0 obj\n<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>\nendobj\n');
+  obj('6 0 obj\n<</Type/Font/Subtype/Type1/BaseFont/Helvetica-Bold>>\nendobj\n');
+  const xref = off;
+  push('xref\n0 7\n0000000000 65535 f \n' + offs.map(o => String(o).padStart(10, '0') + ' 00000 n \n').join(''));
+  push(`trailer\n<</Size 7/Root 1 0 R>>\nstartxref\n${xref}\n%%EOF\n`);
+  return Buffer.concat(chunks);
+}
+
 function renderScroll({ family, title, body, pdf = false }) {
   const { createCanvas } = require('@napi-rs/canvas');
   const W = 1000, PAD = 90;
   const titleSize = 62, bodySize = 40, lineH = Math.round(bodySize * 1.35);
+  // 'standard' asks for the plain system face. It must stay UNQUOTED: a
+  // quoted unknown family falls back to the registered scroll OTF.
+  const fontOf = (px) => family === 'standard' ? `${px}px sans-serif` : `${px}px "${family}"`;
 
   // Measure with a scratch canvas so the real one can be sized to fit.
   const scratch = createCanvas(8, 8).getContext('2d');
-  scratch.font = `${bodySize}px "${family}"`;
+  scratch.font = fontOf(bodySize);
   const lines = wrapScrollLines(t => scratch.measureText(t).width, body, W - PAD * 2);
-  scratch.font = `${titleSize}px "${family}"`;
+  scratch.font = fontOf(titleSize);
   const titleLines = title ? wrapScrollLines(t => scratch.measureText(t).width, title, W - PAD * 2) : [];
 
   const titleBlock = titleLines.length ? titleLines.length * Math.round(titleSize * 1.25) + 34 : 0;
@@ -3217,13 +3304,13 @@ function renderScroll({ family, title, body, pdf = false }) {
   let y = PAD + (titleLines.length ? titleSize : bodySize) * 0.2;
   if (titleLines.length) {
     ctx.fillStyle = '#6b1f1f';
-    ctx.font = `${titleSize}px "${family}"`;
+    ctx.font = fontOf(titleSize);
     ctx.textAlign = 'center';
     for (const tl of titleLines) { y += Math.round(titleSize * 1.25); ctx.fillText(tl, W / 2, y); }
     y += 34;
   }
   ctx.fillStyle = '#382c19';
-  ctx.font = `${bodySize}px "${family}"`;
+  ctx.font = fontOf(bodySize);
   ctx.textAlign = 'left';
   for (const ln of lines) { y += lineH; if (ln) ctx.fillText(ln, PAD, y); }
 
@@ -3403,7 +3490,10 @@ function validateImportedSheet(o) {
 // when one is stored, a plain serif otherwise.
 function renderSheetParchment(char, displayName, gid, healLine = null, pdf = false) {
   const { createCanvas } = require('@napi-rs/canvas');
-  const family = ensureScrollFont(gid) || 'serif';
+  // Unquoted generic when no font is stored: GlobalFonts is process-global,
+  // so a quoted unknown family could fall back to ANOTHER guild's OTF.
+  const fam = ensureScrollFont(gid);
+  const fontOf = (px) => fam ? `${px}px "${fam}"` : `${px}px serif`;
   const W = 760, PAD = 80, lineH = 52;
   const rows = [];
   rows.push(char.order_name || 'No Order');
@@ -3425,11 +3515,11 @@ function renderSheetParchment(char, displayName, gid, healLine = null, pdf = fal
   const ctx = canvas.getContext('2d');
   paintParchment(ctx, W, H);
   ctx.fillStyle = '#6b1f1f';
-  ctx.font = `56px "${family}"`;
+  ctx.font = fontOf(56);
   ctx.textAlign = 'center';
   ctx.fillText(displayName, W / 2, PAD + 40);
   ctx.fillStyle = '#382c19';
-  ctx.font = `36px "${family}"`;
+  ctx.font = fontOf(36);
   ctx.textAlign = 'left';
   let y = PAD + 96;
   for (const r of rows) { y += lineH; if (r) ctx.fillText(r, PAD, y); }
@@ -11773,6 +11863,9 @@ async function handleScroll(interaction) {
       .setLabel('The writing itself').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1600)),
     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('flavour')
       .setLabel('Scene line above the image (optional)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(200)),
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('filename')
+      .setLabel('File name for archiving (optional)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(48)
+      .setPlaceholder('e.g. kings-pact — becomes kings-pact.png / .pdf')),
   );
   return interaction.showModal(modal);
 }
@@ -11819,14 +11912,15 @@ async function deliverScroll(interaction, gid, scroll) {
   try { require('@napi-rs/canvas'); }
   catch { return interaction.followUp({ content: '✂️ No files — `@napi-rs/canvas` isn\'t installed here.', ephemeral: true }); }
   try {
-    const payload = { v: 1, kind: 'scroll', title: scroll.title, body: scroll.body, flavour: scroll.flavour };
-    const png = renderScroll({ family: 'serif', title: scroll.title, body: scroll.body });
-    const pdfBuf = embedScrollData(renderScroll({ family: 'serif', title: scroll.title, body: scroll.body, pdf: true }), payload);
+    const payload = { v: 1, kind: 'scroll', title: scroll.title, body: scroll.body, flavour: scroll.flavour, name: scroll.name ?? null };
+    const stem = fileSlug(scroll.name || scroll.title, 'scroll');
+    const png = renderScroll({ family: 'standard', title: scroll.title, body: scroll.body });
+    const pdfBuf = embedScrollData(makeTextPdf({ title: scroll.title, body: scroll.body }), payload);
     const { AttachmentBuilder } = require('discord.js');
-    return interaction.followUp({ content: '📜 The readable edition, in plain type — the image to see, the PDF woven to travel.',
+    return interaction.followUp({ content: '📜 The readable edition, in plain type — the image to see, the PDF woven to travel (its text is selectable, too).',
       files: [
-        new AttachmentBuilder(png, { name: 'scroll-readable.png' }),
-        new AttachmentBuilder(pdfBuf, { name: 'scroll-readable.pdf' }),
+        new AttachmentBuilder(png, { name: `${stem}-readable.png` }),
+        new AttachmentBuilder(pdfBuf, { name: `${stem}-readable.pdf` }),
       ], ephemeral: true });
   } catch (err) {
     console.error('[scroll] remake failed -', err?.message || err);
@@ -11847,12 +11941,13 @@ async function handleScrollModal(interaction) {
   const title = interaction.fields.getTextInputValue('title')?.trim() || null;
   const body = interaction.fields.getTextInputValue('body')?.trim();
   const flavour = interaction.fields.getTextInputValue('flavour')?.trim() || null;
+  const stem = fileSlug(interaction.fields.getTextInputValue('filename') || title, 'ancient-scroll');
   if (!body) return interaction.editReply({ content: '❌ Nothing written.' });
   try {
     // Two files, two jobs: the PNG is what everyone sees in the channel; the
     // PDF carries the writing woven after %%EOF and survives every Discord
     // re-upload — anyone who saves it can hand it to /scroll anywhere.
-    const payload = { v: 1, kind: 'scroll', title, body, flavour };
+    const payload = { v: 1, kind: 'scroll', title, body, flavour, name: stem };
     const png = renderScroll({ family, title, body });
     const pdfBuf = embedScrollData(renderScroll({ family, title, body, pdf: true }), payload);
     const { AttachmentBuilder } = require('discord.js');
@@ -11860,12 +11955,12 @@ async function handleScrollModal(interaction) {
     await chan.send({
       content: flavour || '📜 *An ancient parchment is unfurled…*',
       files: [
-        new AttachmentBuilder(png, { name: 'ancient-scroll.png' }),
-        new AttachmentBuilder(pdfBuf, { name: 'ancient-scroll.pdf' }),
+        new AttachmentBuilder(png, { name: `${stem}.png` }),
+        new AttachmentBuilder(pdfBuf, { name: `${stem}.pdf` }),
       ],
       allowedMentions: { parse: ['users'] }, // a scene line may name a player, never wake a room
     });
-    return interaction.editReply({ content: '📜 Posted — the image to see, the PDF to keep. The writing rides inside the PDF.' });
+    return interaction.editReply({ content: `📜 Posted as **${stem}.png / .pdf** — the image to see, the PDF to keep. The writing rides inside the PDF.` });
   } catch (err) {
     console.error('[scroll] render failed -', err?.message || err);
     return interaction.editReply({ content: `❌ The scroll wouldn't take ink — ${err?.message || err}` });
