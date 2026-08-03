@@ -540,6 +540,8 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN audit_routes TEXT'); } catch 
 // redeploys (the Railway filesystem does not).
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font BLOB'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font_name TEXT'); } catch {}
+// A shelf for the props: every /scroll's named PDF is also filed here.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_archive_id TEXT'); } catch {}
 
 function getChar(gid, uid) {
   return db.prepare('SELECT * FROM characters WHERE guild_id=? AND user_id=?').get(gid, uid);
@@ -3383,19 +3385,23 @@ function careerPayloadObj(gid, uid, displayName) {
     tally: t, items,
     lore: loreRow?.state === 'approved' ? loreRow.body.slice(0, 900) : null };
 }
-function buildCareerSummary(gid, uid, displayName) {
+function buildCareerSummary(gid, uid, displayName, { plain = false } = {}) {
+  // plain: no markdown, no emoji — lines fit base-14 type on the career PDF.
+  const B = (t) => plain ? t : `**${t}**`;
   const ch = getChar(gid, uid) || {};
   const tally = rollTallyAll(gid, uid);
   const quests = getPlayerCompletedQuests(gid, uid);
   const items = listItems(gid, uid);
-  const lines = [`📜 **${displayName} — the record so far**${isFallen(gid, uid) ? ' 🕯️' : ''}`];
+  const lines = plain ? [] : [`📜 **${displayName} — the record so far**${isFallen(gid, uid) ? ' 🕯️' : ''}`];
   const standing = [];
   if (ch.rank_name) standing.push(ch.rank_name);
-  standing.push(`🎖️ ${getMerits(gid, uid)} merits`, `🪙 ${getRenown(gid, uid)} renown`);
+  standing.push(plain ? `${getMerits(gid, uid)} merits` : `🎖️ ${getMerits(gid, uid)} merits`,
+                plain ? `${getRenown(gid, uid)} renown` : `🪙 ${getRenown(gid, uid)} renown`);
+  if (plain && isFallen(gid, uid)) standing.push('fallen');
   lines.push(standing.join(' · '));
   lines.push('');
   if (tally.total) {
-    lines.push(`**Dice** — ${tally.total} rolled lifetime`);
+    lines.push(`${B('Dice')} — ${tally.total} rolled lifetime`);
     for (const [sides, b] of Object.entries(tally.bySize).sort((a, z) => z[0] - a[0])) {
       const avg = (b.sum / b.total).toFixed(1);
       const bits = [`${b.total} rolled`, `avg ${avg}`];
@@ -3406,21 +3412,22 @@ function buildCareerSummary(gid, uid, displayName) {
     lines.push('');
   }
   if (items.length) {
-    lines.push(`**Pack** — ${items.length} item${items.length === 1 ? '' : 's'}`);
-    for (const r of items.slice(0, 15)) lines.push(`• ${r.item}${r.note ? ` — ${r.note}` : ''}`);
+    lines.push(`${B('Pack')} — ${items.length} item${items.length === 1 ? '' : 's'}`);
+    for (const r of items.slice(0, 15)) lines.push(`${plain ? '-' : '•'} ${r.item}${r.note ? ` — ${r.note}` : ''}`);
     if (items.length > 15) lines.push(`…and ${items.length - 15} more`);
     lines.push('');
   }
   if (quests.length) {
-    lines.push(`**Quests completed** — ${quests.length}`);
-    for (const q of quests.slice(0, 10)) lines.push(`• #${q.number} ${q.name}`);
+    lines.push(`${B('Quests completed')} — ${quests.length}`);
+    for (const q of quests.slice(0, 10)) lines.push(`${plain ? '-' : '•'} #${q.number} ${q.name}`);
     if (quests.length > 10) lines.push(`…and ${quests.length - 10} more`);
     lines.push('');
   }
   const loreRow = getLore(gid, uid);
-  if (loreRow?.state === 'approved') lines.push('**Lore** — on file, travels with the block', '');
+  if (loreRow?.state === 'approved') lines.push(`${B('Lore')} — on file, travels with the block`, '');
   // The machine tail. If a prodigious tally makes it too long to paste, the
   // dice history is dropped from the block (never from the reading above).
+  if (plain) return lines; // the PDF weaves its payload after the EOF instead
   const payload = careerPayloadObj(gid, uid, displayName);
   let json = JSON.stringify(payload);
   if (json.length > 1500) { payload.tally = {}; json = JSON.stringify(payload);
@@ -3492,6 +3499,32 @@ function parseSheetSummary(text) {
   return o.name !== undefined ? o : null;
 }
 
+// NPCs travel too: the same weave, their own kind. The whole villain —
+// stats, class, hero flag, signature, auto-pilot preferences, lore — rides
+// a parchment PDF and lands on any server by /npc import, GM-direct.
+function npcPayloadObj(npc) {
+  return { v: 1, kind: 'npc', name: npc.name,
+    order: npc.order_name || null, class: npc.class || null,
+    str: npc.str ?? 0, con: npc.con ?? 0, dex: npc.dex ?? 0, wis: npc.wis ?? 0, lck: npc.lck ?? 0,
+    weapon1: npc.weapon1 || null, weapon2: npc.weapon2 || null,
+    is_hero: npc.is_hero ? 1 : 0, signature: npc.signature_stat || null,
+    atk: npc.preferred_atk || null, def: npc.preferred_def || null,
+    lore: npc.lore ? String(npc.lore).slice(0, 900) : null };
+}
+function validateImportedNpc(o) {
+  if (!o || o.v !== 1 || o.kind !== 'npc') return null;
+  const stat = (n) => Number.isInteger(n) && n >= 0 && n <= 99;
+  if (![o.str, o.con, o.dex, o.wis, o.lck].every(stat)) return null;
+  const str_ = (v, cap) => (typeof v === 'string' && v.trim()) ? v.trim().slice(0, cap) : null;
+  const st = (v) => ['str', 'con', 'dex', 'wis', 'lck'].includes(v) ? v : null;
+  return { name: str_(o.name, 60) || 'Unnamed',
+    order: str_(o.order, 40), class: str_(o.class, 40),
+    str: o.str, con: o.con, dex: o.dex, wis: o.wis, lck: o.lck,
+    weapon1: str_(o.weapon1, 60), weapon2: str_(o.weapon2, 60),
+    is_hero: o.is_hero ? 1 : 0, signature: st(o.signature), atk: st(o.atk), def: st(o.def),
+    lore: str_(o.lore, 900) };
+}
+
 // Requote a pasted block for the queue post, fenced and bounded.
 function sheetSummaryQuote(block) {
   const body = String(block).replace(/```/g, '').trim().slice(0, 500);
@@ -3502,6 +3535,7 @@ function sheetSummaryQuote(block) {
 // before a GM is even asked to look at it.
 function validateImportedSheet(o) {
   if (!o || o.v !== 1) return null;
+  if (o.kind && o.kind !== 'sheet') return null; // careers and NPCs read elsewhere
   const stat = (n) => Number.isInteger(n) && n >= 0 && n <= 99;
   if (![o.str, o.con, o.dex, o.wis, o.lck].every(stat)) return null;
   const str_ = (v, cap) => (typeof v === 'string' && v.trim()) ? v.trim().slice(0, cap) : null;
@@ -3776,6 +3810,15 @@ async function handleCharExport(interaction) {
   if (mode === 'summary') {
     return replyLong(interaction, buildCareerSummary(gid, tid, dn));
   }
+  if (mode === 'careerpdf') {
+    // The record as a native-text PDF, career woven after the EOF — imports
+    // back through /char import like any other carrier.
+    const buf = embedSheetData(
+      makeTextPdf({ title: `${dn} — the record so far`, body: buildCareerSummary(gid, tid, dn, { plain: true }).join('\n') }),
+      careerPayloadObj(gid, tid, dn));
+    const { AttachmentBuilder } = require('discord.js');
+    return interaction.reply({ files: [new AttachmentBuilder(buf, { name: `${dn.replace(/\s+/g,'-')}-career.pdf` })] });
+  }
 
   // ── Image export ─────────────────────────────────────────────────────────────
   await interaction.deferReply();
@@ -3847,10 +3890,11 @@ async function handleCharImport(interaction) {
       console.error('[import] fetch failed -', err?.message || err);
       return interaction.editReply({ content: `❌ Couldn't read that attachment — ${err?.message || err}` });
     }
-    sheet = validateImportedSheet(extractSheetData(bytes));
+    const woven = extractSheetData(bytes);
+    sheet = validateImportedSheet(woven) ?? validateImportedSummary(woven);
     if (!sheet) {
       return interaction.editReply({ content:
-        '❌ No sheet survives in that image — Discord strips hidden data whenever an image is re-uploaded, so the woven copy rarely makes the trip. The reliable carrier is text: `/char export format:Text` on the source server, then paste its `[TTRPG SHEET]` block here.' });
+        '❌ No sheet survives in that file — Discord strips hidden data whenever an IMAGE is re-uploaded, so only PDF exports make the trip. The other carrier that always works is text: `/char export format:Text` (or Summary) on the source server, then paste its block here.' });
     }
   } else {
     sheet = readImportBlock(pasted);
@@ -3890,6 +3934,27 @@ async function queueSheetImport(interaction, gid, uid, sheet, bytes, attName, pa
     `STR ${sheet.str} · CON ${sheet.con} · DEX ${sheet.dex} · WIS ${sheet.wis} · LCK ${sheet.lck}`,
   ];
   if (!isCareer && (sheet.weapon1 || sheet.weapon2)) lines.push([sheet.weapon1, sheet.weapon2].filter(Boolean).join(' · '));
+  // Importing over someone who already exists: show precisely what changes.
+  const cur = getChar(gid, uid);
+  if (cur) {
+    if (isCareer) {
+      const dm = getMerits(gid, uid), dr = getRenown(gid, uid);
+      if (dm !== sheet.merits || dr !== sheet.renown)
+        lines.push(`↺ **Over their current standing:** 🎖️ ${dm}→${sheet.merits} · 🪙 ${dr}→${sheet.renown}`);
+    } else {
+      const diffs = [];
+      for (const k of ['str', 'con', 'dex', 'wis', 'lck'])
+        if ((cur[k] ?? 0) !== sheet[k]) diffs.push(`${k.toUpperCase()} ${cur[k] ?? 0}→${sheet[k]}`);
+      if ((cur.order_name || null) !== sheet.order) diffs.push(`${cur.order_name || 'No Order'}→${sheet.order || 'No Order'}`);
+      if ((cur.class || null) !== sheet.class) diffs.push(`${cur.class || 'no class'}→${sheet.class || 'no class'}`);
+      const w = (a, b) => (a || '—') + '→' + (b || '—');
+      if ((cur.weapon1 || null) !== sheet.weapon1) diffs.push(w(cur.weapon1, sheet.weapon1));
+      if ((cur.weapon2 || null) !== sheet.weapon2) diffs.push(w(cur.weapon2, sheet.weapon2));
+      lines.push(diffs.length
+        ? `↺ **Over their current sheet:** ${diffs.join(' · ')}`
+        : '↺ _Identical to their current sheet._');
+    }
+  }
   if (problems.length) lines.push(`⚠️ **Off this server's allowance:** ${problems.join('; ')}`);
   if (src_) lines.push(src_); // text imports: the GM sees exactly what arrived
   lines.push(isCareer
@@ -4061,7 +4126,14 @@ async function handleExportRequestButton(interaction) {
   } catch {}
 
   let files = [];
-  if (released && req.fmt && req.fmt !== 'text' && req.fmt !== 'summary') {
+  if (released && req.fmt === 'careerpdf') {
+    const nm2 = await getDisplayName(interaction.guild, uid).catch(() => 'them');
+    const buf = embedSheetData(
+      makeTextPdf({ title: `${nm2} — the record so far`, body: buildCareerSummary(gid, uid, nm2, { plain: true }).join('\n') }),
+      careerPayloadObj(gid, uid, nm2));
+    const { AttachmentBuilder } = require('discord.js');
+    files = [new AttachmentBuilder(buf, { name: `${nm2.replace(/\s+/g,'-')}-career.pdf` })];
+  } else if (released && req.fmt && req.fmt !== 'text' && req.fmt !== 'summary') {
     // The image is drawn fresh at release time; the text block is exactly what
     // the GM read in the queue.
     const ch = getChar(gid, uid);
@@ -4260,6 +4332,9 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('scrollfont').setDescription('The font /scroll props are written in — upload an .otf or .ttf')
       .addAttachmentOption(o=>o.setName('font').setDescription('The font file (.otf / .ttf, up to 2 MB)').setRequired(false))
       .addBooleanOption(o=>o.setName('remove').setDescription('true = forget the stored font').setRequired(false)))
+    .addSubcommand(s=>s.setName('scrollarchive').setDescription('A library channel — every /scroll\'s named PDF is also filed there')
+      .addChannelOption(o=>o.setName('channel').setDescription('The archive channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop archiving').setRequired(false)))
     .addSubcommand(s=>s.setName('cleanwebhooks').setDescription('Remove orphaned NPC webhooks to free up Discord limits')),
 
   new SlashCommandBuilder()
@@ -4350,7 +4425,7 @@ const slashCommands = [
       .addUserOption(o=>o.setName('user').setDescription('Whose lore').setRequired(false)))
     .addSubcommand(s=>s.setName('export').setDescription('Export your character sheet')
       .addStringOption(o=>o.setName('format').setDescription('Export format').setRequired(false)
-        .addChoices({name:'Text',value:'text'},{name:'Summary (career record)',value:'summary'},{name:'Image',value:'image'},{name:'Parchment image',value:'parchment'},{name:'Parchment PDF — survives Discord',value:'pdf'}))
+        .addChoices({name:'Text',value:'text'},{name:'Summary (career record)',value:'summary'},{name:'Image',value:'image'},{name:'Parchment image',value:'parchment'},{name:'Parchment PDF — survives Discord',value:'pdf'},{name:'Career PDF — the record, survives Discord',value:'careerpdf'}))
       .addUserOption(o=>o.setName('user').setDescription('User to export').setRequired(false)))
     .addSubcommand(s=>s.setName('import').setDescription('Bring an exported sheet to this server — image or summary — for a GM to approve')
       .addAttachmentOption(o=>o.setName('image').setDescription('A sheet image exported by DDice').setRequired(false))
@@ -4388,6 +4463,9 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('stat').setDescription('Show stat descriptions'),
+
+  new SlashCommandBuilder()
+    .setName('dicereport').setDescription('The server\'s dice health — who rolls, how the d20s run, the hot and cold hands (GM)'),
 
   new SlashCommandBuilder()
     .setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)')
@@ -4509,6 +4587,10 @@ const slashCommands = [
       .addBooleanOption(o=>o.setName('remove').setDescription('true = strip Hero status from this NPC').setRequired(false)))
     .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server')
       .addStringOption(o=>o.setName('category').setDescription('Only show NPCs in this category').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('export').setDescription('An NPC as a woven parchment PDF — it survives Discord and imports anywhere')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('import').setDescription('Bring an exported NPC PDF onto this server — applied directly, you are the approver')
+      .addAttachmentOption(o=>o.setName('file').setDescription('An NPC PDF made by /npc export').setRequired(true)))
     .addSubcommand(s=>s.setName('categorylist').setDescription('List all NPC categories'))
     .addSubcommand(s=>s.setName('categorycreate').setDescription('Create a new NPC category')
       .addStringOption(o=>o.setName('name').setDescription('Category name').setRequired(true)))
@@ -6020,11 +6102,40 @@ async function handleConfig(interaction) {
       const bytes = await fetchBytes(att.url);
       setConfig(gid, { scroll_font: bytes, scroll_font_name: att.name });
       scrollFontCache.delete(gid); // the next /scroll registers the new face
-      return interaction.editReply({ content: `📜 Scroll font set: **${att.name}** (${Math.round(bytes.length / 1024)} KB). Any GM can now \`/scroll\`.` });
+      // Prove the face works NOW, not at the first /scroll: a one-line sample.
+      let files = [];
+      try {
+        const family = ensureScrollFont(gid);
+        if (family) {
+          const { AttachmentBuilder } = require('discord.js');
+          files = [new AttachmentBuilder(
+            renderScroll({ family, title: null, body: 'The quick brown fox — 0123456789' }),
+            { name: 'font-sample.png' })];
+        }
+      } catch (err) { console.error('[scrollfont] sample failed -', err?.message || err); }
+      return interaction.editReply({ content: `📜 Scroll font set: **${att.name}** (${Math.round(bytes.length / 1024)} KB). Any GM can now \`/scroll\`.${files.length ? '' : '\n⚠️ _No sample — the face stored, but rendering it here failed; watch the first /scroll._'}`, files });
     } catch (err) {
       console.error('[scrollfont] store failed -', err?.message || err);
       return interaction.editReply({ content: `❌ Couldn't fetch that attachment — ${err?.message || err}` });
     }
+  }
+  if (sub === 'scrollarchive') {
+    if (interaction.options.getBoolean('disable')) {
+      setConfig(gid, { scroll_archive_id: null });
+      return interaction.reply({ content: '📚 Manual archive channel cleared. If the roll-audit forum is set, its 📜 Scrolls book keeps archiving — that\'s the automatic default.' });
+    }
+    const ch = interaction.options.getChannel('channel');
+    if (!ch) {
+      const cur = getConfig(gid)?.scroll_archive_id;
+      const book = auditRoutes(gid)?.scrolls;
+      return interaction.reply({ ephemeral: true, content: cur
+        ? `📚 Scroll archive: <#${cur}> (manual override). \`disable:true\` falls back to the audit forum's 📜 Scrolls book${book ? ` (<#${book}>)` : ' when one is set'}.`
+        : book
+          ? `📚 Archiving to the audit forum's 📜 Scrolls book: <#${book}> — automatic. Point me at a channel here to override.`
+          : '📚 No archive yet. Set the roll-audit forum and its 📜 Scrolls book archives automatically — or `/config scrollarchive channel:#library` for a plain channel.' });
+    }
+    setConfig(gid, { scroll_archive_id: ch.id });
+    return interaction.reply({ content: `📚 Scroll archive set: <#${ch.id}> — every \`/scroll\` now also files its named PDF there.` });
   }
   if (sub === 'rollauditforum') {
     if (interaction.options.getBoolean('disable')) {
@@ -6035,7 +6146,7 @@ async function handleConfig(interaction) {
     if (!forum) {
       const r = auditRoutes(gid);
       if (!r) return interaction.reply({ ephemeral: true, content:
-        '🎲 No audit forum set. `/config rollauditforum forum:#roll-audit` — I\'ll make a thread per book: player rolls, GM rolls, NPC rolls, NPC say.' });
+        '🎲 No audit forum set. `/config rollauditforum forum:#roll-audit` — I\'ll make a thread per book: player rolls, GM rolls, NPC rolls, NPC say, and the 📜 Scrolls archive.' });
       const rows = Object.entries(AUDIT_KINDS).map(([k, t]) => `${t.name} → ${r[k] ? `<#${r[k]}>` : '_missing — rerun setup_'}`);
       return interaction.reply({ ephemeral: true, content: [`🎲 Roll audit routes into <#${r.forum}>:`, ...rows].join('\n') });
     }
@@ -7854,6 +7965,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'weapon') return await handleWeapon(interaction);
     if (interaction.commandName === 'help') return await handleHelp(interaction);
     if (interaction.commandName === 'scroll') return await handleScroll(interaction);
+    if (interaction.commandName === 'dicereport') return await handleDiceReport(interaction);
     if (interaction.commandName === 'lastroll') return await handleLastRoll(interaction);
     if (interaction.commandName === 'backup') return await handleBackup(interaction);
     if (interaction.commandName === 'gmheal') return await handleGmHeal(interaction);
@@ -8977,7 +9089,17 @@ const AUDIT_KINDS = {
   gms:     { name: '🛡️ GM Rolls',     about: 'Rolls GMs make as themselves — secret `gmrs` rolls included.' },
   npcs:    { name: '🎭 NPC Rolls',    about: 'NPC dice — GM-driven and auto-pilot alike.' },
   say:     { name: '💬 NPC Say',      about: 'Who spoke as which NPC, with a jump to the line.' },
+  scrolls: { name: '📜 Scrolls',      about: 'Every prop, both directions — the writing, the parchment, the woven PDF; unfurlings and read-backs alike.' },
 };
+// Where scroll records go: a manually configured channel overrides; else the
+// audit forum's 📜 Scrolls book; else nowhere. Threads are woken on the way.
+async function scrollArchiveChannel(client, gid) {
+  const id = getConfig(gid)?.scroll_archive_id ?? auditRoutes(gid)?.scrolls ?? null;
+  if (!id) return null;
+  const ch = await client.channels.fetch(id);
+  return ch?.isThread?.() ? wakeThread(ch) : ch;
+}
+
 function auditRoutes(gid) {
   const raw = getConfig(gid)?.audit_routes;
   if (!raw) return null;
@@ -11051,6 +11173,59 @@ async function handleNpc(interaction) {
   if (!(await isGm(interaction.guild, uid)))
     return interaction.reply({ content: '❌ Only GMs can manage NPCs.', ephemeral: true });
 
+  if (sub === 'export') {
+    const name = interaction.options.getString('name');
+    const npc = getNpc(gid, name);
+    if (!npc) return interaction.reply({ content: `❌ No NPC called **${name}** here.`, ephemeral: true });
+    await interaction.deferReply({ ephemeral: true });
+    try {
+      const charLike = { order_name: npc.order_name, class: npc.class, str: npc.str, con: npc.con,
+        dex: npc.dex, wis: npc.wis, lck: npc.lck, hp_current: npc.hp_current, rerolls_current: npc.lck ?? 0 };
+      const buf = embedSheetData(renderSheetParchment(charLike, npc.name, gid, null, true), npcPayloadObj(npc));
+      const { AttachmentBuilder } = require('discord.js');
+      return interaction.editReply({ content: `🎭 **${npc.name}**, packed for the road — the PDF survives Discord; \`/npc import\` unpacks it anywhere.`,
+        files: [new AttachmentBuilder(buf, { name: `${fileSlug(npc.name, 'npc')}-npc.pdf` })] });
+    } catch (err) {
+      console.error('[npc] export failed -', err?.message || err);
+      return interaction.editReply({ content: `❌ Couldn't pack them — ${err?.message || err}` });
+    }
+  }
+  if (sub === 'import') {
+    const att = interaction.options.getAttachment('file');
+    if (!/\.(png|pdf)$/i.test(att?.name || '')) {
+      return interaction.reply({ content: '❌ That isn\'t a .png or .pdf — use a file made by `/npc export`.', ephemeral: true });
+    }
+    if ((att.size ?? 0) > 8_000_000) {
+      return interaction.reply({ content: '❌ That file is over 8 MB — not one of mine.', ephemeral: true });
+    }
+    await interaction.deferReply({ ephemeral: true });
+    let bytes;
+    try { bytes = await fetchBytes(att.url); }
+    catch (err) {
+      console.error('[npc] import fetch failed -', err?.message || err);
+      return interaction.editReply({ content: `❌ Couldn't read that attachment — ${err?.message || err}` });
+    }
+    const imp = validateImportedNpc(extractSheetData(bytes));
+    if (!imp) {
+      return interaction.editReply({ content: '❌ No NPC is woven into that file — only PDFs made by `/npc export` carry one.' });
+    }
+    const existed = !!getNpc(gid, imp.name);
+    // GM-direct: you clicked it, you approved it. Webhooks and standing stay local.
+    upsertNpc(gid, imp.name, {
+      order_name: imp.order, class: imp.class,
+      str: imp.str, con: imp.con, dex: imp.dex, wis: imp.wis, lck: imp.lck,
+      weapon1: imp.weapon1, weapon2: imp.weapon2,
+      is_hero: imp.is_hero, signature_stat: imp.signature,
+      preferred_atk: imp.atk, preferred_def: imp.def,
+      lore: imp.lore, died_at: null,
+    });
+    const fresh = getNpc(gid, imp.name);
+    upsertNpc(gid, imp.name, { hp_current: maxHpFromCon(gid, fresh.con) });
+    return interaction.editReply({ content: [
+      `✅ **${imp.name}** ${existed ? 'overwritten' : 'arrives'} — HP full, ready for the board.`,
+      '', ...npcCardFooter(gid, getNpc(gid, imp.name), getNpc(gid, imp.name), true),
+    ].join('\n') });
+  }
   if (sub === 'create' || sub === 'pr_create') {
     const name = interaction.options.getString('name');
     if (name.length > 50) return interaction.reply({ content: '❌ NPC name is too long (max 50 characters).', ephemeral: true });
@@ -11843,7 +12018,10 @@ const HELP_CATEGORIES = {
       '`/config rollaudit test:true` — send a test mirror and report any problem (Admin)',
       '`/config rollauditforum forum:#roll-audit` — split the mirror into books: player rolls, GM rolls, NPC rolls, NPC say (Admin)',
       'When NPC stats are hidden, fight cards mask the stat and modifier — the audit\'s NPC book gets the full card, every number revealed',
-      '`/config scrollfont font:<file>` — store an .otf/.ttf; `/scroll` then writes props in it (Admin)',
+      '`/config scrollfont font:<file>` — store an .otf/.ttf; the reply renders a sample line so you see it works. `/scroll` then writes props in it (Admin)',
+      '`/config scrollarchive` — the 📜 Scrolls book in the roll-audit forum archives every scroll automatically, both directions, text + image + PDF; `channel:#x` overrides with a plain channel (Admin)',
+      '`/npc export name:<npc>` / `/npc import file:<pdf>` — a villain packed as a woven parchment PDF; import applies directly, GM-as-approver — stats, class, hero flag, auto-pilot preferences and lore travel, standing and webhooks stay local',
+      '`/dicereport` — the table\'s dice health: top rollers, hot and cold d20 hands, nat leaders, the full d20 spread',
       '`/scroll` — write a title and body in a modal; the bot posts the parchment as an image everyone can see plus a **PDF** with the writing woven invisibly inside — the PDF survives Discord, so scrolls travel between servers on their own. `file:` hands any scroll PDF back: plain text out, plus a readable edition in standard type as image and woven PDF (GM)',
       '`/config approvals channel:#x` — new sheets need GM approval before use (Admin)',
       '`/config approvals list:true` — every sheet still waiting, read from the database so nothing is lost if a post failed',
@@ -11865,6 +12043,70 @@ const GM_HELP_CATEGORIES = ['gm', 'npc'];
 
 // /scroll: gate, then hand the GM a writing modal. All the real checks run
 // again on submit — the modal can sit open for a while.
+// Pure aggregation over raw tally rows, so the shape is testable without a
+// database: totals per player, the guild's d20 spread, hot and cold hands.
+function aggregateDiceHealth(rows, { minD20 = 20 } = {}) {
+  const perUser = new Map(); // uid -> { total, d20c, d20s, n1, n20 }
+  const spread = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [i + 1, 0]));
+  for (const r of rows) {
+    const u = perUser.get(r.user_id) ?? { total: 0, d20c: 0, d20s: 0, n1: 0, n20: 0 };
+    u.total += r.count;
+    if (r.sides === 20) {
+      u.d20c += r.count; u.d20s += r.nat * r.count;
+      if (r.nat === 1) u.n1 += r.count;
+      if (r.nat === 20) u.n20 += r.count;
+      spread[r.nat] = (spread[r.nat] ?? 0) + r.count;
+    }
+    perUser.set(r.user_id, u);
+  }
+  const users = [...perUser.entries()].map(([uid, u]) => ({ uid, ...u, avg: u.d20c ? u.d20s / u.d20c : null }));
+  const eligible = users.filter(u => u.d20c >= minD20);
+  return {
+    totalRolls: users.reduce((a, u) => a + u.total, 0),
+    d20Total: users.reduce((a, u) => a + u.d20c, 0),
+    topRollers: [...users].sort((a, b) => b.total - a.total).slice(0, 5),
+    hot: [...eligible].sort((a, b) => b.avg - a.avg).slice(0, 3),
+    cold: [...eligible].sort((a, b) => a.avg - b.avg).slice(0, 3),
+    natLeaders: {
+      n20: [...users].sort((a, b) => b.n20 - a.n20).filter(u => u.n20)[0] ?? null,
+      n1: [...users].sort((a, b) => b.n1 - a.n1).filter(u => u.n1)[0] ?? null,
+    },
+    spread,
+  };
+}
+
+async function handleDiceReport(interaction) {
+  const gid = interaction.guild.id;
+  await interaction.deferReply({ ephemeral: true });
+  if (!(await isGm(interaction.guild, interaction.user.id))) {
+    return interaction.editReply({ content: '❌ GMs only — the table\'s dice are their business.' });
+  }
+  const rows = db.prepare('SELECT user_id, sides, nat, count FROM roll_tally WHERE guild_id=?').all(gid);
+  if (!rows.length) return interaction.editReply({ content: '🎲 No dice history yet — the report writes itself as they roll.' });
+  const h = aggregateDiceHealth(rows);
+  const nameOf = async (uid) => uid.startsWith('npc_') ? `🎭 ${uid.slice(4)}` : await getDisplayName(interaction.guild, uid).catch(() => uid);
+  const lines = [`🎲 **Dice health** — ${h.totalRolls} rolls on record, ${h.d20Total} of them d20s`, ''];
+  lines.push('**Top rollers**');
+  for (const u of h.topRollers) lines.push(`• ${await nameOf(u.uid)} — ${u.total} rolls${u.d20c ? ` · d20 avg ${u.avg.toFixed(1)}` : ''}`);
+  if (h.hot.length) {
+    lines.push('', '**Hot and cold hands** _(min 20 d20s)_');
+    for (const u of h.hot) lines.push(`🔥 ${await nameOf(u.uid)} — avg ${u.avg.toFixed(1)} over ${u.d20c}`);
+    for (const u of h.cold) lines.push(`🧊 ${await nameOf(u.uid)} — avg ${u.avg.toFixed(1)} over ${u.d20c}`);
+  }
+  if (h.natLeaders.n20 || h.natLeaders.n1) {
+    lines.push('');
+    if (h.natLeaders.n20) lines.push(`👑 Most nat 20s: ${await nameOf(h.natLeaders.n20.uid)} ×${h.natLeaders.n20.n20}`);
+    if (h.natLeaders.n1) lines.push(`💀 Most nat 1s: ${await nameOf(h.natLeaders.n1.uid)} ×${h.natLeaders.n1.n1}`);
+  }
+  const maxCount = Math.max(...Object.values(h.spread), 1);
+  lines.push('', '**The d20 spread**');
+  for (let n = 1; n <= 20; n++) {
+    const c = h.spread[n] ?? 0;
+    lines.push(`\`${String(n).padStart(2)}\` ${'█'.repeat(Math.max(c ? 1 : 0, Math.round((c / maxCount) * 18)))} ${c}`);
+  }
+  return replyLong(interaction, lines, { ephemeral: true });
+}
+
 async function handleScroll(interaction) {
   const gid = interaction.guild.id;
   // Nothing may await before the ack: Discord allows three seconds, and a
@@ -11944,11 +12186,24 @@ async function deliverScroll(interaction, gid, scroll) {
     const png = renderScroll({ family: 'standard', title: scroll.title, body: scroll.body });
     const pdfBuf = embedScrollData(makeTextPdf({ title: scroll.title, body: scroll.body }), payload);
     const { AttachmentBuilder } = require('discord.js');
-    return interaction.followUp({ content: '📜 The readable edition, in plain type — the image to see, the PDF woven to travel (its text is selectable, too).',
+    const out = await interaction.followUp({ content: '📜 The readable edition, in plain type — the image to see, the PDF woven to travel (its text is selectable, too).',
       files: [
         new AttachmentBuilder(png, { name: `${stem}-readable.png` }),
         new AttachmentBuilder(pdfBuf, { name: `${stem}-readable.pdf` }),
       ], ephemeral: true });
+    // The archive shows imports as well as exports — same record shape.
+    try {
+      const arch = await scrollArchiveChannel(interaction.client, gid);
+      if (arch) await sendLong(arch, [
+        `📖 **${stem}** · read back by <@${interaction.user.id}> in <#${interactionChannelId(interaction)}>`,
+        '', ...(scroll.title ? [`**${scroll.title}**`, ''] : []), scroll.body,
+        ...(scroll.flavour ? ['', `_${scroll.flavour}_`] : []),
+      ], { files: [
+        new AttachmentBuilder(renderScroll({ family: 'standard', title: scroll.title, body: scroll.body }), { name: `${stem}-readable.png` }),
+        new AttachmentBuilder(pdfBuf, { name: `${stem}-readable.pdf` }),
+      ], allowedMentions: { parse: [] } });
+    } catch (err) { console.error('[scroll] read-back archive failed -', err?.message || err); }
+    return out;
   } catch (err) {
     console.error('[scroll] remake failed -', err?.message || err);
     return interaction.followUp({ content: `❌ The remake wouldn't take ink — ${err?.message || err}`, ephemeral: true });
@@ -11987,7 +12242,27 @@ async function handleScrollModal(interaction) {
       ],
       allowedMentions: { parse: ['users'] }, // a scene line may name a player, never wake a room
     });
-    return interaction.editReply({ content: `📜 Posted as **${stem}.png / .pdf** — the image to see, the PDF to keep. The writing rides inside the PDF.` });
+    // The library copy — the whole record: writing, parchment, woven PDF.
+    // Best-effort, and the ack says whether it made it.
+    let archived = '';
+    try {
+      const arch = await scrollArchiveChannel(interaction.client, gid);
+      if (arch) {
+        await sendLong(arch, [
+          `📚 **${stem}** · unfurled by <@${interaction.user.id}> in <#${chan.id}>`,
+          '', ...(title ? [`**${title}**`, ''] : []), body,
+          ...(flavour ? ['', `_${flavour}_`] : []),
+        ], { files: [
+          new AttachmentBuilder(png, { name: `${stem}.png` }),
+          new AttachmentBuilder(pdfBuf, { name: `${stem}.pdf` }),
+        ], allowedMentions: { parse: [] } });
+        archived = ` · archived to <#${arch.id}>`;
+      }
+    } catch (err) {
+      console.error('[scroll] archive failed -', err?.message || err);
+      archived = ' · ⚠️ archive copy failed — check my access to the archive';
+    }
+    return interaction.editReply({ content: `📜 Posted as **${stem}.png / .pdf** — the image to see, the PDF to keep. The writing rides inside the PDF.${archived}` });
   } catch (err) {
     console.error('[scroll] render failed -', err?.message || err);
     return interaction.editReply({ content: `❌ The scroll wouldn't take ink — ${err?.message || err}` });
