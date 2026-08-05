@@ -259,7 +259,7 @@ try { db.exec("ALTER TABLE fights ADD COLUMN log_state TEXT DEFAULT '{}'"); } ca
 try { db.exec("ALTER TABLE fights ADD COLUMN effect_state TEXT DEFAULT '{}'"); } catch {}
 try {
   // Unified event log for merit changes (kind='merit'). Amount is signed; reason
-  // is free text; quest_number links quest-driven awards. Read by /merit history.
+  // is free text; quest_number links quest-driven awards. Read by /standing merit history.
   db.exec(`CREATE TABLE IF NOT EXISTS history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id TEXT NOT NULL,
@@ -542,6 +542,37 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font BLOB'); } catch {
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font_name TEXT'); } catch {}
 // A shelf for the props: every /scroll's named PDF is also filed here.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_archive_id TEXT'); } catch {}
+// Grappling: which attack-phase roll is pending, and who holds whom.
+try { db.exec('ALTER TABLE fights ADD COLUMN atk_kind TEXT'); } catch {}
+try { db.exec("ALTER TABLE fights ADD COLUMN grapples TEXT DEFAULT '{}'"); } catch {}
+// Quest board forum + GM planning mirror.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_forum TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_plan_forum TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN plan_thread_id TEXT'); } catch {}
+// The questline pipeline: a stage per quest, tag ids per guild, run records.
+try { db.exec('ALTER TABLE quests ADD COLUMN stage TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_plan_tags TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_dm_thread TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_plan_books TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN index_thread_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN index_msg_id TEXT'); } catch {}
+db.exec(`CREATE TABLE IF NOT EXISTS quest_runs (
+  guild_id TEXT NOT NULL,
+  root_number INTEGER NOT NULL,
+  number INTEGER NOT NULL,
+  completed_at INTEGER NOT NULL,
+  gm_id TEXT,
+  party TEXT,
+  npcs TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS gm_profiles (
+  guild_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  style TEXT,
+  brief TEXT,
+  available INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (guild_id, user_id)
+)`);
 
 function getChar(gid, uid) {
   return db.prepare('SELECT * FROM characters WHERE guild_id=? AND user_id=?').get(gid, uid);
@@ -1111,6 +1142,16 @@ function runsIn(gid, cid) {
 // lines, a run of descending rolls, natural-20/1 overrides, plain button
 // choices with no roll at all, and a tally that accumulates across a loop and
 // cashes out at the end.
+// Parse + validate + store in one motion; every authoring route — chat
+// paste, /activity create modal, or an attached .txt — lands here.
+function storeActivityScript(gid, uid, text) {
+  const parsed = parseStoryScript(text);
+  if (parsed.error) return { error: parsed.error };
+  const count = saveStory(gid, uid, parsed);
+  return { name: parsed.name, saved: [`🎮 **${parsed.name}** saved — **${count}** scene${count === 1 ? '' : 's'}, starting at \`${parsed.start}\`.`,
+    `Run it with \`/activity run name:${parsed.name}\`, or read it back with \`/activity show name:${parsed.name}\`.`].join('\n') };
+}
+
 function parseStoryScript(text) {
   const lines = String(text || '').split(/\r?\n/);
   const head = lines.findIndex(l => /^\s*\[(STORY|ACTIVITY)\]/i.test(l));
@@ -2429,7 +2470,7 @@ async function npcWebhookIn(channel, gid, npcName, imageUrl) {
   const { WebhookClient } = require('discord.js');
 
   // A thread cannot own a webhook. Discord requires one on the parent channel,
-  // with posts routed in by thread id — so a /pr say inside any thread or forum
+  // with posts routed in by thread id — so a /npc say inside any thread or forum
   // post used to throw here and quietly fall back to speaking as the bot.
   // Webhooks are therefore stored against the parent and shared by its threads.
   const inThread = typeof channel.isThread === 'function' && channel.isThread();
@@ -2548,6 +2589,70 @@ function getUncategorisedNpcs(gid) {
 }
 
 // ── Fight helpers ─────────────────────────────────────────────────────────────
+// The grapple map lives on the fight row: { heldId: holderId }. It dies with
+// the fight, and any knockout purges the holds it was part of.
+function fightGrapples(fight) {
+  try { const m = JSON.parse(fight?.grapples || '{}'); return m && typeof m === 'object' ? m : {}; }
+  catch { return {}; }
+}
+function setFightGrapples(gid, cid, map) {
+  upsertFight(gid, cid, { grapples: JSON.stringify(map) });
+}
+function grappleHolderOf(fight, id) { return fightGrapples(fight)[id] ?? null; }
+// A shield in either hand — by name, any type.
+function hasShieldEquipped(subject) {
+  return [subject?.weapon1, subject?.weapon2].filter(Boolean)
+    .some(w => /\b(shield|buckler|targe|kite|tower|pavise|aegis)\b/i.test(w));
+}
+// A blade in either hand — swords, polearms, daggers and kin. Maces,
+// shields and firearms do not qualify.
+function hasBladeEquipped(subject) {
+  return [subject?.weapon1, subject?.weapon2].filter(Boolean)
+    .some(w => /\b(\w*sword|\w*blade|sabre|saber|katana|scimitar|rapier|falchion|claymore|glaive|halberd|spear|pike|naginata|partisan|lance|polearm|dagger|dirk|knife|kris|estoc|cutlass)\b/i.test(w));
+}
+// Pull and clear a per-fighter effect flag from the fight's effect_state.
+function consumeEffectFlag(gid, cid, fid, key) {
+  const fight = getFight(gid, cid);
+  const all = JSON.parse(fight?.effect_state || '{}');
+  const on = !!all[fid]?.[key];
+  if (on) {
+    delete all[fid][key];
+    if (!Object.keys(all[fid]).length) delete all[fid];
+    upsertFight(gid, cid, { effect_state: JSON.stringify(all) });
+  }
+  return on;
+}
+const consumeFlatAtk = (gid, cid, fid) => consumeEffectFlag(gid, cid, fid, 'flatAtk');
+// A successful feint: the target's very next rolled action is a straight d20.
+const consumeFooled = (gid, cid, fid) => consumeEffectFlag(gid, cid, fid, 'fooled');
+// Set a per-fighter effect flag (the mirror of consumeEffectFlag).
+function setEffectFlag(gid, cid, fid, key) {
+  const fight = getFight(gid, cid);
+  const all = JSON.parse(fight?.effect_state || '{}');
+  (all[fid] = all[fid] || {})[key] = true;
+  upsertFight(gid, cid, { effect_state: JSON.stringify(all) });
+}
+// The once-per-round abilities clear when the fighter's own turn comes round.
+function clearRoundFlag(gid, cid, fid) {
+  consumeEffectFlag(gid, cid, fid, 'deflected');
+  consumeEffectFlag(gid, cid, fid, 'disarmUsed');
+}
+// One write for a round ability's after-effects: the used flag and the flat
+// penalty it trades for.
+function markRoundSpecial(gid, cid, fid, usedKey, flatKey) {
+  const fight = getFight(gid, cid);
+  const all = JSON.parse(fight?.effect_state || '{}');
+  (all[fid] = all[fid] || {})[usedKey] = true;
+  all[fid][flatKey] = true;
+  upsertFight(gid, cid, { effect_state: JSON.stringify(all) });
+}
+const markDisarmUsed = (gid, cid, fid) => markRoundSpecial(gid, cid, fid, 'disarmUsed', 'flatDef');
+
+function grappleHeldTargetOf(fight, id) {
+  for (const [t, h] of Object.entries(fightGrapples(fight))) if (h === id) return t;
+  return null;
+}
+
 function getFight(gid, cid) {
   return db.prepare('SELECT * FROM fights WHERE guild_id=? AND channel_id=?').get(gid, cid);
 }
@@ -4190,6 +4295,8 @@ const KNIGHTS = ['White Knight','Black Knight','Gold Knight','Grey Knight','Blue
 const slashCommands = [
   new SlashCommandBuilder()
     .setName('activity').setDescription('Run a minigame written for this server')
+    .addSubcommand(s=>s.setName('create').setDescription('Write an activity — opens a paste window, or attach a .txt script (GM)')
+      .addAttachmentOption(o=>o.setName('file').setDescription('An [ACTIVITY] script as a text file (for scripts over 4000 characters)').setRequired(false)))
     .addSubcommand(s=>s.setName('list').setDescription('Every activity on this server'))
     .addSubcommand(s=>s.setName('show').setDescription('Read an activity scene by scene')
       .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true)))
@@ -4224,39 +4331,63 @@ const slashCommands = [
     .addStringOption(o=>o.setName('terms').setDescription('First blood? To yield? Anything the GMs should know').setRequired(false)),
 
   new SlashCommandBuilder()
-    .setName('gmsearch').setDescription('Find characters by order, class or status')
-    .addStringOption(o=>o.setName('order').setDescription('Knight order').setRequired(false)
-      .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'},{name:'— none set —',value:'__none__'}))
-    .addStringOption(o=>o.setName('class').setDescription('Class').setRequired(false)
-      .addChoices({name:'Vanguard',value:'Vanguard'},{name:'Defender',value:'Defender'},
-                  {name:'Siege Knight',value:'Siege Knight'},{name:'— none set —',value:'__none__'}))
-    .addBooleanOption(o=>o.setName('hero').setDescription('Only Heroes, or only non-Heroes').setRequired(false))
-    .addStringOption(o=>o.setName('who').setDescription('Players, NPCs, or both (default both)').setRequired(false)
-      .addChoices({name:'Players',value:'players'},{name:'NPCs',value:'npcs'},{name:'Both',value:'both'}))
-    .addBooleanOption(o=>o.setName('fallen').setDescription('Include the fallen (default no)').setRequired(false))
-    .addStringOption(o=>o.setName('name').setDescription('Part of a name').setRequired(false)),
-
-  new SlashCommandBuilder()
-    .setName('gmqueue').setDescription('Everything waiting on a GM, in one place'),
-
-  new SlashCommandBuilder()
-    .setName('gmkill').setDescription('Mark a character as fallen and post their memorial (GM)')
-    .addUserOption(o=>o.setName('user').setDescription('The player whose character has fallen').setRequired(false))
-    .addStringOption(o=>o.setName('npc').setDescription('Or the NPC').setRequired(false))
-    .addBooleanOption(o=>o.setName('anyway').setDescription('true = kill even though they are still standing').setRequired(false)),
-
-  new SlashCommandBuilder()
-    .setName('gmrevive').setDescription('Bring a fallen character back (GM)')
-    .addUserOption(o=>o.setName('user').setDescription('The player').setRequired(false))
-    .addStringOption(o=>o.setName('npc').setDescription('Or the NPC').setRequired(false)),
-
-  new SlashCommandBuilder()
-    .setName('gmtest').setDescription('Throwaway test data for trying features out (GM)')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addSubcommand(s=>s.setName('quest').setDescription('A ready-made quest with a party, so you can test the board and timer'))
-    .addSubcommand(s=>s.setName('npc').setDescription('An NPC with stats, items, standing and a roll history already on it'))
-    .addSubcommand(s=>s.setName('list').setDescription('Everything /gmtest has created'))
-    .addSubcommand(s=>s.setName('clean').setDescription('Delete every test quest and NPC this made')),
+    .setName('gm').setDescription('GM tools — search, queue, kill, revive, heal, roll and test data (GM)')
+    .addSubcommand(s=>s.setName('search').setDescription('Find characters by order, class or status')
+      .addStringOption(o=>o.setName('order').setDescription('Knight order').setRequired(false)
+        .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'},{name:'— none set —',value:'__none__'}))
+      .addStringOption(o=>o.setName('class').setDescription('Class').setRequired(false)
+        .addChoices({name:'Vanguard',value:'Vanguard'},{name:'Defender',value:'Defender'},
+                    {name:'Siege Knight',value:'Siege Knight'},{name:'— none set —',value:'__none__'}))
+      .addBooleanOption(o=>o.setName('hero').setDescription('Only Heroes, or only non-Heroes').setRequired(false))
+      .addStringOption(o=>o.setName('who').setDescription('Players, NPCs, or both (default both)').setRequired(false)
+        .addChoices({name:'Players',value:'players'},{name:'NPCs',value:'npcs'},{name:'Both',value:'both'}))
+      .addBooleanOption(o=>o.setName('fallen').setDescription('Include the fallen (default no)').setRequired(false))
+      .addStringOption(o=>o.setName('name').setDescription('Part of a name').setRequired(false)))
+    .addSubcommand(s=>s.setName('queue').setDescription('Everything waiting on a GM, in one place'))
+    .addSubcommand(s=>s.setName('kill').setDescription('Mark a character as fallen and post their memorial')
+      .addUserOption(o=>o.setName('user').setDescription('The player whose character has fallen').setRequired(false))
+      .addStringOption(o=>o.setName('npc').setDescription('Or the NPC').setRequired(false))
+      .addBooleanOption(o=>o.setName('anyway').setDescription('true = kill even though they are still standing').setRequired(false)))
+    .addSubcommand(s=>s.setName('revive').setDescription('Bring a fallen character back')
+      .addUserOption(o=>o.setName('user').setDescription('The player').setRequired(false))
+      .addStringOption(o=>o.setName('npc').setDescription('Or the NPC').setRequired(false)))
+    .addSubcommand(s=>s.setName('heal').setDescription('Restore HP, rerolls or heal charges — players or NPCs')
+      .addUserOption(o=>o.setName('user').setDescription('Player to restore').setRequired(false))
+      .addStringOption(o=>o.setName('npc').setDescription('NPC to restore — or "all" for every NPC').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('global').setDescription('Restore everyone at once instead of naming one').setRequired(false)
+        .addChoices(
+          {name:'👥 Players — every character sheet',value:'players'},
+          {name:'🎭 NPCs — every NPC',value:'npcs'},
+          {name:'🌍 Everyone — players and NPCs together',value:'all'}))
+      .addStringOption(o=>o.setName('amount').setDescription('How much to restore (default: full)').setRequired(false)
+        .addChoices(
+          {name:'❤️ Full — restore to maximum',value:'full'},
+          {name:'🩹 Half — restore half of maximum',value:'half'},
+          {name:'➕ Add — add the value below',value:'add'},
+          {name:'➖ Subtract — remove the value below',value:'sub'},
+          {name:'🎯 Exact — set to the value below',value:'exact'}))
+      .addIntegerOption(o=>o.setName('value').setDescription('Number used by Add / Subtract / Exact').setRequired(false).setMinValue(-99).setMaxValue(99))
+      .addStringOption(o=>o.setName('restore').setDescription('What to restore (default: HP only)').setRequired(false)
+        .addChoices(
+          {name:'❤️ HP only',value:'hp'},
+          {name:'🔄 Rerolls only',value:'rerolls'},
+          {name:'🛡️ Heal charges only',value:'charges'},
+          {name:'✨ Everything — HP, rerolls and charges',value:'all'})))
+    .addSubcommand(s=>s.setName('roll').setDescription('A GM roll — public, or secret (visible only to you); the audit sees both')
+      .addStringOption(o=>o.setName('notation').setDescription('Dice notation e.g. 1d20+5').setRequired(true))
+      .addStringOption(o=>o.setName('label').setDescription('Roll label e.g. perception').setRequired(false))
+      .addBooleanOption(o=>o.setName('secret').setDescription('true = only you see the result (the roll audit still records it)').setRequired(false))
+      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
+      .addStringOption(o=>o.setName('flavour').setDescription('Flavour text').setRequired(false)))
+    .addSubcommandGroup(g => {
+      g.setName('test').setDescription('Throwaway test data for trying features out');
+      g.addSubcommand(s=>s.setName('quest').setDescription('A ready-made quest with a party, so you can test the board and timer'));
+      g.addSubcommand(s=>s.setName('npc').setDescription('An NPC with stats, items, standing and a roll history already on it'));
+      g.addSubcommand(s=>s.setName('list').setDescription('Everything /gm test has created'));
+      g.addSubcommand(s=>s.setName('clean').setDescription('Delete every test quest and NPC this made'));
+      return g;
+    }),
 
   new SlashCommandBuilder()
     .setName('config').setDescription('Server configuration (Admin only)')
@@ -4287,6 +4418,12 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('charforum').setDescription('A forum where each approved character gets a page')
       .addChannelOption(o=>o.setName('channel').setDescription('The forum channel').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = stop making pages').setRequired(false)))
+    .addSubcommand(s=>s.setName('questforum').setDescription('A forum where each posted quest gets its own thread')
+      .addChannelOption(o=>o.setName('channel').setDescription('The forum channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = post quests as plain messages again').setRequired(false)))
+    .addSubcommand(s=>s.setName('questplanning').setDescription('A private GM forum — /quest create opens a planning thread there')
+      .addChannelOption(o=>o.setName('channel').setDescription('The GM-only forum channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop making planning threads').setRequired(false)))
     .addSubcommand(s=>s.setName('memorial').setDescription('Where fallen characters are recorded and remembered')
       .addChannelOption(o=>o.setName('channel').setDescription('GM record — the full account, with a Revive button').setRequired(false))
       .addChannelOption(o=>o.setName('public').setDescription('Public hall — the story alone, no figures').setRequired(false))
@@ -4429,7 +4566,35 @@ const slashCommands = [
       .addUserOption(o=>o.setName('user').setDescription('User to export').setRequired(false)))
     .addSubcommand(s=>s.setName('import').setDescription('Bring an exported sheet to this server — image or summary — for a GM to approve')
       .addAttachmentOption(o=>o.setName('image').setDescription('A sheet image exported by DDice').setRequired(false))
-      .addStringOption(o=>o.setName('summary').setDescription('Or paste a [TTRPG SHEET] or [TTRPG SUMMARY] block from an export').setRequired(false))),
+      .addStringOption(o=>o.setName('summary').setDescription('Or paste a [TTRPG SHEET] or [TTRPG SUMMARY] block from an export').setRequired(false)))
+    .addSubcommandGroup(g=>g.setName('weapon').setDescription('The server weapon list (GM)')
+      .addSubcommand(s=>s.setName('add').setDescription('Add a weapon to the server list')
+        .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true))
+        .addStringOption(o=>o.setName('atk').setDescription('Stats it can attack with — e.g. wis, or str|dex. Blank = any').setRequired(false))
+        .addStringOption(o=>o.setName('def').setDescription('Stats it can defend with. Blank = any').setRequired(false))
+        .addStringOption(o=>o.setName('note').setDescription('How it handles, for the list').setRequired(false)))
+      .addSubcommand(s=>s.setName('stats').setDescription('Set or clear what a weapon can fight with (GM)')
+        .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true))
+        .addStringOption(o=>o.setName('atk').setDescription('Attack stats — e.g. wis, or str|dex. "any" clears it').setRequired(false))
+        .addStringOption(o=>o.setName('def').setDescription('Defence stats. "any" clears it').setRequired(false))
+        .addStringOption(o=>o.setName('note').setDescription('How it handles').setRequired(false)))
+      .addSubcommand(s=>s.setName('remove').setDescription('Remove a weapon from the server list')
+        .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true)))
+      .addSubcommand(s=>s.setName('list').setDescription('List all server weapons')))
+    .addSubcommandGroup(g=>g.setName('tag').setDescription('Player tags (GM)')
+      .addSubcommand(s=>s.setName('assign').setDescription('Assign a tag to a player')
+        .addUserOption(o=>o.setName('user').setDescription('Target player').setRequired(true))
+        .addStringOption(o=>o.setName('tag').setDescription('Tag name').setRequired(true)))
+      .addSubcommand(s=>s.setName('remove').setDescription('Remove a tag from a player')
+        .addUserOption(o=>o.setName('user').setDescription('Target player').setRequired(true))
+        .addStringOption(o=>o.setName('tag').setDescription('Tag name').setRequired(true)))
+      .addSubcommand(s=>s.setName('list').setDescription('List tags for a player')
+        .addUserOption(o=>o.setName('user').setDescription('Target player').setRequired(false)))
+      .addSubcommand(s=>s.setName('custom').setDescription('Manage custom tags')
+        .addStringOption(o=>o.setName('action').setDescription('Action').setRequired(true)
+          .addChoices({name:'Create',value:'create'},{name:'Delete',value:'delete'},{name:'List',value:'list'}))
+        .addStringOption(o=>o.setName('emoji').setDescription('Emoji for the tag (create only)').setRequired(false))
+        .addStringOption(o=>o.setName('name').setDescription('Tag name (create/delete)').setRequired(false)))),
 
   new SlashCommandBuilder()
     .setName('profile').setDescription('Manage your roll card profile')
@@ -4444,22 +4609,6 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('save').setDescription('Snapshot current tracker state').addStringOption(o=>o.setName('slotname').setDescription('Name for this save').setRequired(true)))
     .addSubcommand(s=>s.setName('load').setDescription('Restore a saved snapshot').addStringOption(o=>o.setName('slotname').setDescription('Name of the save to load').setRequired(true)))
     .addSubcommand(s=>s.setName('saves').setDescription('List all your saved snapshots')),
-
-  new SlashCommandBuilder()
-    .setName('tag').setDescription('Manage player tags (GM only)')
-    .addSubcommand(s=>s.setName('assign').setDescription('Assign a tag to a player')
-      .addUserOption(o=>o.setName('user').setDescription('Target player').setRequired(true))
-      .addStringOption(o=>o.setName('tag').setDescription('Tag name').setRequired(true)))
-    .addSubcommand(s=>s.setName('remove').setDescription('Remove a tag from a player')
-      .addUserOption(o=>o.setName('user').setDescription('Target player').setRequired(true))
-      .addStringOption(o=>o.setName('tag').setDescription('Tag name').setRequired(true)))
-    .addSubcommand(s=>s.setName('list').setDescription('List tags for a player')
-      .addUserOption(o=>o.setName('user').setDescription('Target player').setRequired(false)))
-    .addSubcommand(s=>s.setName('custom').setDescription('Manage custom tags')
-      .addStringOption(o=>o.setName('action').setDescription('Action').setRequired(true)
-        .addChoices({name:'Create',value:'create'},{name:'Delete',value:'delete'},{name:'List',value:'list'}))
-      .addStringOption(o=>o.setName('emoji').setDescription('Emoji for the tag (create only)').setRequired(false))
-      .addStringOption(o=>o.setName('name').setDescription('Tag name (create/delete)').setRequired(false))),
 
   new SlashCommandBuilder()
     .setName('stat').setDescription('Show stat descriptions'),
@@ -4499,39 +4648,23 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('hours').setDescription('How often, in hours (default 24)').setRequired(false).setMinValue(1).setMaxValue(720))),
 
   new SlashCommandBuilder()
-    .setName('weapon').setDescription('Manage the server weapon list (GM only)')
-    .addSubcommand(s=>s.setName('add').setDescription('Add a weapon to the server list')
-      .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true))
-      .addStringOption(o=>o.setName('atk').setDescription('Stats it can attack with — e.g. wis, or str|dex. Blank = any').setRequired(false))
-      .addStringOption(o=>o.setName('def').setDescription('Stats it can defend with. Blank = any').setRequired(false))
-      .addStringOption(o=>o.setName('note').setDescription('How it handles, for the list').setRequired(false)))
-    .addSubcommand(s=>s.setName('stats').setDescription('Set or clear what a weapon can fight with (GM)')
-      .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true))
-      .addStringOption(o=>o.setName('atk').setDescription('Attack stats — e.g. wis, or str|dex. "any" clears it').setRequired(false))
-      .addStringOption(o=>o.setName('def').setDescription('Defence stats. "any" clears it').setRequired(false))
-      .addStringOption(o=>o.setName('note').setDescription('How it handles').setRequired(false)))
-    .addSubcommand(s=>s.setName('remove').setDescription('Remove a weapon from the server list')
-      .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true)))
-    .addSubcommand(s=>s.setName('list').setDescription('List all server weapons')),
-
-  new SlashCommandBuilder()
-    .setName('dr').setDescription('Roll dice with full options')
-    .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
-      .addChoices(
-        {name:'Normal (default)',value:'normal'},
-        {name:'Advantage',value:'adv'},
-        {name:'Disadvantage',value:'dis'},
-        {name:'Reroll',value:'rr'},
-        {name:'Reroll with Advantage',value:'rra'},
-        {name:'Reroll with Disadvantage',value:'rrd'}
-      ))
-    .addStringOption(o=>o.setName('notation').setDescription('Dice notation e.g. 1d20+5').setRequired(false))
-    .addStringOption(o=>o.setName('label').setDescription('Roll label e.g. atk').setRequired(false))
-    .addStringOption(o=>o.setName('flavour').setDescription('Flavour text').setRequired(false))
-    .addBooleanOption(o=>o.setName('success').setDescription('Show success outcome').setRequired(false)),
-
-  new SlashCommandBuilder()
-    .setName('npc').setDescription('Manage NPCs (GM only)')
+    .setName('npc').setDescription('Manage NPCs — create, sheets, speaking and rolling as them (GM only)')
+    .addSubcommand(s=>s.setName('say').setDescription('Speak or act as an NPC — leave both blank for a writing box')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('action').setDescription('What the NPC does — posted in italics').setRequired(false))
+      .addStringOption(o=>o.setName('speech').setDescription('What the NPC says — wrapped in quote marks').setRequired(false))
+      .addStringOption(o=>o.setName('raw').setDescription('Post exactly as typed — overrides action/speech').setRequired(false)))
+    .addSubcommand(s=>s.setName('roll').setDescription('Roll as an NPC via webhook')
+      .addStringOption(o=>o.setName('category').setDescription('Filter NPCs by category').setRequired(true)
+        .addChoices({name:'All',value:'all'}))
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('notation').setDescription('Dice notation e.g. 1d20+5 (default: 1d20)').setRequired(false))
+      .addStringOption(o=>o.setName('stat').setDescription('Stat label (optional — auto adds modifier)').setRequired(false)
+        .addChoices({name:'STR',value:'STR'},{name:'CON',value:'CON'},{name:'DEX',value:'DEX'},{name:'WIS',value:'WIS'},{name:'LCK',value:'LCK'}))
+      .addStringOption(o=>o.setName('label').setDescription('Additional label (optional)').setRequired(false))
+      .addStringOption(o=>o.setName('flavour').setDescription('Flavour text').setRequired(false))
+      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'})))
     .addSubcommand(s=>s.setName('create').setDescription('Create an NPC')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
       .addIntegerOption(o=>o.setName('str').setDescription('Strength').setRequired(false))
@@ -4604,59 +4737,6 @@ const slashCommands = [
       .addStringOption(o=>o.setName('category').setDescription('Category name').setRequired(true))),
 
   new SlashCommandBuilder()
-    .setName('pr').setDescription('Roll or manage NPCs as a GM persona (GM only)')
-    .addSubcommand(s=>s.setName('say').setDescription('Speak or act as an NPC — leave both blank for a writing box')
-      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
-      .addStringOption(o=>o.setName('action').setDescription('What the NPC does — posted in italics').setRequired(false))
-      .addStringOption(o=>o.setName('speech').setDescription('What the NPC says — wrapped in quote marks').setRequired(false))
-      .addStringOption(o=>o.setName('raw').setDescription('Post exactly as typed — overrides action/speech').setRequired(false)))
-    .addSubcommand(s=>s.setName('roll').setDescription('Roll as an NPC via webhook')
-      .addStringOption(o=>o.setName('category').setDescription('Filter NPCs by category').setRequired(true)
-        .addChoices({name:'All',value:'all'}))
-      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
-      .addStringOption(o=>o.setName('notation').setDescription('Dice notation e.g. 1d20+5 (default: 1d20)').setRequired(false))
-      .addStringOption(o=>o.setName('stat').setDescription('Stat label (optional — auto adds modifier)').setRequired(false)
-        .addChoices({name:'STR',value:'STR'},{name:'CON',value:'CON'},{name:'DEX',value:'DEX'},{name:'WIS',value:'WIS'},{name:'LCK',value:'LCK'}))
-      .addStringOption(o=>o.setName('label').setDescription('Additional label (optional)').setRequired(false))
-      .addStringOption(o=>o.setName('flavour').setDescription('Flavour text').setRequired(false))
-      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
-        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'})))
-    .addSubcommand(s=>s.setName('create').setDescription('Create an NPC')
-      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
-      .addIntegerOption(o=>o.setName('str').setDescription('Strength').setRequired(true))
-      .addIntegerOption(o=>o.setName('con').setDescription('Constitution').setRequired(true))
-      .addIntegerOption(o=>o.setName('dex').setDescription('Dexterity').setRequired(true))
-      .addIntegerOption(o=>o.setName('wis').setDescription('Wisdom').setRequired(true))
-      .addIntegerOption(o=>o.setName('lck').setDescription('Luck').setRequired(true))
-      .addStringOption(o=>o.setName('class').setDescription('Their class — optional, and Hero gives a signature stat').setRequired(false)
-        .addChoices({name:'Vanguard',value:'Vanguard'},{name:'Defender',value:'Defender'},
-                    {name:'Siege Knight',value:'Siege Knight'},{name:'✖️ Clear it',value:'none'}))
-      .addStringOption(o=>o.setName('weapon1').setDescription('What they fight with — restricts their stats if the weapon does').setRequired(false).setAutocomplete(true))
-      .addStringOption(o=>o.setName('weapon2').setDescription('A second weapon').setRequired(false).setAutocomplete(true))
-      .addStringOption(o=>o.setName('atk_stat').setDescription('Which stat the bot should attack with on auto').setRequired(false)
-        .addChoices({name:'💪 Strength',value:'str'},{name:'🫀 Constitution',value:'con'},{name:'⚡ Dexterity',value:'dex'},
-                    {name:'🧠 Wisdom',value:'wis'},{name:'🍀 Luck',value:'lck'},{name:'✖️ Clear it',value:'none'}))
-      .addStringOption(o=>o.setName('def_stat').setDescription('Which stat the bot should defend with on auto').setRequired(false)
-        .addChoices({name:'💪 Strength',value:'str'},{name:'🫀 Constitution',value:'con'},{name:'⚡ Dexterity',value:'dex'},
-                    {name:'🧠 Wisdom',value:'wis'},{name:'🍀 Luck',value:'lck'},{name:'✖️ Clear it',value:'none'}))
-      .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
-        .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'})))
-    .addSubcommand(s=>s.setName('sheet').setDescription('An NPC\'s full record — stats, standing, inventory, rolls, lore')
-      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true)))
-    .addSubcommand(s=>s.setName('give').setDescription('Give an NPC an item')
-      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
-      .addStringOption(o=>o.setName('item').setDescription('What they receive').setRequired(true))
-      .addStringOption(o=>o.setName('note').setDescription('A detail about it').setRequired(false)))
-    .addSubcommand(s=>s.setName('take').setDescription('Take an item from an NPC')
-      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
-      .addIntegerOption(o=>o.setName('id').setDescription('Item number from /npc sheet').setRequired(true)))
-    .addSubcommand(s=>s.setName('npclore').setDescription('Write an NPC\'s lore')
-      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
-      .addStringOption(o=>o.setName('text').setDescription('Their story \u2014 or "none" to clear').setRequired(true)))
-    .addSubcommand(s=>s.setName('delete').setDescription('Delete an NPC').addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true)))
-    .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server')),
-
-  new SlashCommandBuilder()
     .setName('fight').setDescription('Manage a fight between players')
     .addSubcommand(s=>s.setName('start').setDescription('Start a fight')
       .addStringOption(o=>o.setName('players').setDescription('Players to include — @mention them, space-separated').setRequired(false))
@@ -4695,6 +4775,51 @@ const slashCommands = [
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
       .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
+    .addSubcommand(s=>s.setName('grapple').setDescription('Attempt to grapple a target — STR only; they answer with /fight save')
+      .addUserOption(o=>o.setName('target').setDescription('Player to grapple').setRequired(false))
+      .addStringOption(o=>o.setName('target_npc').setDescription('NPC to grapple instead of a player').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('npc').setDescription('Grapple AS this NPC (GM, when it is the NPC\'s turn)').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
+      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
+    .addSubcommand(s=>s.setName('save').setDescription('Your STR save against the pending grapple')
+      .addStringOption(o=>o.setName('npc').setDescription('Save AS this NPC (GM, when the NPC is the target)').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
+      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
+    .addSubcommand(s=>s.setName('escape').setDescription('Break a grapple on your turn — 1d20+STR vs the grappler\'s STR score; strain still applies')
+      .addStringOption(o=>o.setName('npc').setDescription('Escape AS this NPC (GM, when it is the held NPC\'s turn)').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
+      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
+    .addSubcommand(s=>s.setName('release').setDescription('Release your grapple — a free action. GMs may also part any hold')
+      .addStringOption(o=>o.setName('npc').setDescription('Release AS this NPC holder (GM)').setRequired(false).setAutocomplete(true))
+      .addUserOption(o=>o.setName('target').setDescription('GM: force-release the hold on this player').setRequired(false))
+      .addStringOption(o=>o.setName('target_npc').setDescription('GM: force-release the hold on this NPC').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('deflect').setDescription('Shield deflection vs a PvE attack — STR or DEX roll to turn the blow; may redirect it')
+      .addStringOption(o=>o.setName('stat').setDescription('Stat to deflect with (STR 4+ required either way)').setRequired(false)
+        .addChoices({name:'STR (default)',value:'str'},{name:'DEX',value:'dex'}))
+      .addStringOption(o=>o.setName('redirect_npc').setDescription('Enemy to redirect the deflected blow into (optional)').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
+      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
+    .addSubcommand(s=>s.setName('disarm').setDescription('Disarm a PvE attacker — DEX roll to beat the strike; they spend a turn retrieving')
+      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
+      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
+    .addSubcommand(s=>s.setName('feint').setDescription('Deceive an opponent — WIS vs WIS; fooled targets roll their next action flat')
+      .addStringOption(o=>o.setName('feint').setDescription('What you pretend to do (vs what you actually plan)').setRequired(true))
+      .addUserOption(o=>o.setName('target').setDescription('Player to deceive').setRequired(false))
+      .addStringOption(o=>o.setName('target_npc').setDescription('NPC to deceive instead of a player').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('npc').setDescription('Feint AS this NPC (GM, when it is the NPC\'s turn)').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
+      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
+    .addSubcommand(s=>s.setName('insight').setDescription('Your WIS insight check against the pending feint')
+      .addStringOption(o=>o.setName('npc').setDescription('Roll AS this NPC (GM, when the NPC is the target)').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
+      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
     .addSubcommand(s=>s.setName('rr').setDescription('Reroll last fight roll (costs 1 reroll token)')
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'})))
@@ -4715,45 +4840,7 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('end').setDescription('End the fight (GM only)')),
 
   new SlashCommandBuilder()
-    .setName('p').setDescription('Shorthand for /profile')
-    .addSubcommand(s=>s.setName('card').setDescription('How much of your sheet shows when you roll')
-      .addStringOption(o=>o.setName('style').setDescription('Full card, one compressed line, or nothing').setRequired(true)
-        .addChoices({name:'Full — the whole sheet',value:'full'},
-                    {name:'Compressed — one line of stats',value:'compact'},
-                    {name:'Off — plain text rolls',value:'off'})))
-    .addSubcommand(s=>s.setName('on').setDescription('Enable profile embed, max HP and rerolls'))
-    .addSubcommand(s=>s.setName('off').setDescription('Disable profile embed'))
-    .addSubcommand(s=>s.setName('show').setDescription('Preview your profile without rolling'))
-    .addSubcommand(s=>s.setName('save').setDescription('Snapshot current tracker state').addStringOption(o=>o.setName('slotname').setDescription('Name for this save').setRequired(true)))
-    .addSubcommand(s=>s.setName('load').setDescription('Restore a saved snapshot').addStringOption(o=>o.setName('slotname').setDescription('Name of the save to load').setRequired(true)))
-    .addSubcommand(s=>s.setName('saves').setDescription('List all your saved snapshots')),
-
-  new SlashCommandBuilder()
-    .setName('gmheal').setDescription('Restore HP, rerolls or heal charges — players or NPCs (GM)')
-    .addUserOption(o=>o.setName('user').setDescription('Player to restore').setRequired(false))
-    .addStringOption(o=>o.setName('npc').setDescription('NPC to restore — or "all" for every NPC').setRequired(false).setAutocomplete(true))
-    .addStringOption(o=>o.setName('global').setDescription('Restore everyone at once instead of naming one').setRequired(false)
-      .addChoices(
-        {name:'👥 Players — every character sheet',value:'players'},
-        {name:'🎭 NPCs — every NPC',value:'npcs'},
-        {name:'🌍 Everyone — players and NPCs together',value:'all'}))
-    .addStringOption(o=>o.setName('amount').setDescription('How much to restore (default: full)').setRequired(false)
-      .addChoices(
-        {name:'❤️ Full — restore to maximum',value:'full'},
-        {name:'🩹 Half — restore half of maximum',value:'half'},
-        {name:'➕ Add — add the value below',value:'add'},
-        {name:'➖ Subtract — remove the value below',value:'sub'},
-        {name:'🎯 Exact — set to the value below',value:'exact'}))
-    .addIntegerOption(o=>o.setName('value').setDescription('Number used by Add / Subtract / Exact').setRequired(false).setMinValue(-99).setMaxValue(99))
-    .addStringOption(o=>o.setName('restore').setDescription('What to restore (default: HP only)').setRequired(false)
-      .addChoices(
-        {name:'❤️ HP only',value:'hp'},
-        {name:'🔄 Rerolls only',value:'rerolls'},
-        {name:'🛡️ Heal charges only',value:'charges'},
-        {name:'✨ Everything — HP, rerolls and charges',value:'all'})),
-
-  new SlashCommandBuilder()
-    .setName('roll').setDescription('Roll dice with optional stat, advantage and RP flavour')
+    .setName('roll').setDescription('Roll dice — bare /roll is a flat 1d20; add a stat, notation, advantage or flavour')
     .addStringOption(o=>o.setName('stat').setDescription('Roll 1d20 + this stat from your sheet').setRequired(false)
       .addChoices(
         {name:'💪 Strength (STR)',value:'str'},
@@ -4761,7 +4848,7 @@ const slashCommands = [
         {name:'⚡ Dexterity (DEX)',value:'dex'},
         {name:'🦉 Wisdom (WIS)',value:'wis'},
         {name:'🍀 Luck (LCK)',value:'lck'}))
-    .addStringOption(o=>o.setName('dice').setDescription('Custom notation instead of a stat, e.g. 2d6+3').setRequired(false))
+    .addStringOption(o=>o.setName('dice').setDescription('Custom notation instead of a stat, e.g. 2d6+3 (blank + no stat = flat 1d20)').setRequired(false))
     .addStringOption(o=>o.setName('mode').setDescription('Advantage or disadvantage').setRequired(false)
       .addChoices(
         {name:'Normal',value:'normal'},
@@ -4774,66 +4861,63 @@ const slashCommands = [
     .addStringOption(o=>o.setName('flavour').setDescription('RP text posted with the roll — *italic* and **bold** work').setRequired(false)),
 
   new SlashCommandBuilder()
-    .setName('renown').setDescription('Renown — the currency earned and spent on quests, encounters and activities')
-    .addSubcommand(s=>s.setName('view').setDescription('Your renown, or another player\'s')
-      .addUserOption(o=>o.setName('user').setDescription('Whose renown').setRequired(false)))
-    .addSubcommand(s=>s.setName('leaderboard').setDescription('Who holds the most renown'))
-    .addSubcommand(s=>s.setName('history').setDescription('Where a player\'s renown came from and went')
-      .addUserOption(o=>o.setName('user').setDescription('Whose history').setRequired(false)))
-    .addSubcommand(s=>s.setName('gain').setDescription('A character\'s standing rises (GM)')
-      .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
-      .addIntegerOption(o=>o.setName('amount').setDescription('How much').setRequired(true).setMinValue(1))
-      .addStringOption(o=>o.setName('reason').setDescription('What earned it').setRequired(false)))
-    .addSubcommand(s=>s.setName('loss').setDescription('A character\'s standing falls (GM)')
-      .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
-      .addIntegerOption(o=>o.setName('amount').setDescription('How much').setRequired(true).setMinValue(1))
-      .addStringOption(o=>o.setName('reason').setDescription('What cost them').setRequired(false)))
-    .addSubcommand(s=>s.setName('set').setDescription('Set an exact balance (GM)')
-      .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
-      .addIntegerOption(o=>o.setName('amount').setDescription('New balance').setRequired(true).setMinValue(0))),
-
-  new SlashCommandBuilder()
-    .setName('merit').setDescription('Track player merit / experience (GM only)')
-    .addSubcommand(s=>s.setName('give').setDescription('Offer some of your merit to another character — a GM signs it off')
-      .addUserOption(o=>o.setName('user').setDescription('Who receives it').setRequired(true))
-      .addIntegerOption(o=>o.setName('amount').setDescription('How much').setRequired(true).setMinValue(1))
-      .addStringOption(o=>o.setName('reason').setDescription('What it is for — payment, tribute, a debt').setRequired(false)))
-    .addSubcommand(s=>s.setName('trades').setDescription('Merit trades still waiting on a GM'))
-    .addSubcommand(s=>s.setName('cancel').setDescription('Withdraw a merit trade — your own, or any if you are a GM')
-      .addIntegerOption(o=>o.setName('id').setDescription('Trade number from /merit trades').setRequired(true)))
-    .addSubcommand(s=>s.setName('add').setDescription('Award merits to a player (GM)')
-      .addUserOption(o=>o.setName('user').setDescription('Player').setRequired(true))
-      .addIntegerOption(o=>o.setName('amount').setDescription('How many merits (default 1)').setRequired(false).setMinValue(1).setMaxValue(999)))
-    .addSubcommand(s=>s.setName('remove').setDescription('Remove merits from a player (GM)')
-      .addUserOption(o=>o.setName('user').setDescription('Player').setRequired(true))
-      .addIntegerOption(o=>o.setName('amount').setDescription('How many to remove (default 1)').setRequired(false).setMinValue(1).setMaxValue(999)))
-    .addSubcommand(s=>s.setName('set').setDescription('Set a player\'s merit total exactly (GM)')
-      .addUserOption(o=>o.setName('user').setDescription('Player').setRequired(true))
-      .addIntegerOption(o=>o.setName('amount').setDescription('Exact merit total').setRequired(true).setMinValue(0).setMaxValue(99999)))
-    .addSubcommand(s=>s.setName('view').setDescription('View merits and rank progress')
-      .addUserOption(o=>o.setName('user').setDescription('Player (defaults to you)').setRequired(false)))
-    .addSubcommand(s=>s.setName('history').setDescription('Merit history — one player\'s timeline, or recent server activity')
-      .addUserOption(o=>o.setName('user').setDescription('Player (omit for recent server-wide activity)').setRequired(false)))
-    .addSubcommand(s=>s.setName('leaderboard').setDescription('Show the server merit leaderboard')),
-
-  new SlashCommandBuilder()
-    .setName('rank').setDescription('Define ranks and promote players (GM only)')
-    .addSubcommand(s=>s.setName('add').setDescription('Create or update a rank with a merit threshold (GM)')
-      .addStringOption(o=>o.setName('name').setDescription('Rank name, e.g. Knight').setRequired(true))
-      .addIntegerOption(o=>o.setName('threshold').setDescription('Merits required to be eligible').setRequired(true).setMinValue(0).setMaxValue(99999))
-      .addIntegerOption(o=>o.setName('order').setDescription('Sort order (low = junior). Defaults to threshold order').setRequired(false).setMinValue(0).setMaxValue(999)))
-    .addSubcommand(s=>s.setName('remove').setDescription('Delete a rank (GM)')
-      .addStringOption(o=>o.setName('name').setDescription('Rank name').setRequired(true).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('list').setDescription('List all ranks and their thresholds'))
-    .addSubcommand(s=>s.setName('promote').setDescription('Set a player\'s rank (GM)')
-      .addUserOption(o=>o.setName('user').setDescription('Player').setRequired(true))
-      .addStringOption(o=>o.setName('rank').setDescription('Rank to assign').setRequired(true).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('eligible').setDescription('List players who meet a rank\'s threshold but don\'t hold it (GM)')),
+    .setName('standing').setDescription('Standing — renown, merits and ranks in one place')
+    .addSubcommandGroup(g=>g.setName('renown').setDescription('Renown — the currency earned and spent on quests, encounters and activities')
+      .addSubcommand(s=>s.setName('view').setDescription('Your renown, or another player\'s')
+        .addUserOption(o=>o.setName('user').setDescription('Whose renown').setRequired(false)))
+      .addSubcommand(s=>s.setName('leaderboard').setDescription('Who holds the most renown'))
+      .addSubcommand(s=>s.setName('history').setDescription('Where a player\'s renown came from and went')
+        .addUserOption(o=>o.setName('user').setDescription('Whose history').setRequired(false)))
+      .addSubcommand(s=>s.setName('gain').setDescription('A character\'s standing rises (GM)')
+        .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+        .addIntegerOption(o=>o.setName('amount').setDescription('How much').setRequired(true).setMinValue(1))
+        .addStringOption(o=>o.setName('reason').setDescription('What earned it').setRequired(false)))
+      .addSubcommand(s=>s.setName('loss').setDescription('A character\'s standing falls (GM)')
+        .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+        .addIntegerOption(o=>o.setName('amount').setDescription('How much').setRequired(true).setMinValue(1))
+        .addStringOption(o=>o.setName('reason').setDescription('What cost them').setRequired(false)))
+      .addSubcommand(s=>s.setName('set').setDescription('Set an exact balance (GM)')
+        .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+        .addIntegerOption(o=>o.setName('amount').setDescription('New balance').setRequired(true).setMinValue(0))))
+    .addSubcommandGroup(g=>g.setName('merit').setDescription('Merit / experience — earning, trading and totals')
+      .addSubcommand(s=>s.setName('give').setDescription('Offer some of your merit to another character — a GM signs it off')
+        .addUserOption(o=>o.setName('user').setDescription('Who receives it').setRequired(true))
+        .addIntegerOption(o=>o.setName('amount').setDescription('How much').setRequired(true).setMinValue(1))
+        .addStringOption(o=>o.setName('reason').setDescription('What it is for — payment, tribute, a debt').setRequired(false)))
+      .addSubcommand(s=>s.setName('trades').setDescription('Merit trades still waiting on a GM'))
+      .addSubcommand(s=>s.setName('cancel').setDescription('Withdraw a merit trade — your own, or any if you are a GM')
+        .addIntegerOption(o=>o.setName('id').setDescription('Trade number from /standing merit trades').setRequired(true)))
+      .addSubcommand(s=>s.setName('add').setDescription('Award merits to a player (GM)')
+        .addUserOption(o=>o.setName('user').setDescription('Player').setRequired(true))
+        .addIntegerOption(o=>o.setName('amount').setDescription('How many merits (default 1)').setRequired(false).setMinValue(1).setMaxValue(999)))
+      .addSubcommand(s=>s.setName('remove').setDescription('Remove merits from a player (GM)')
+        .addUserOption(o=>o.setName('user').setDescription('Player').setRequired(true))
+        .addIntegerOption(o=>o.setName('amount').setDescription('How many to remove (default 1)').setRequired(false).setMinValue(1).setMaxValue(999)))
+      .addSubcommand(s=>s.setName('set').setDescription('Set a player\'s merit total exactly (GM)')
+        .addUserOption(o=>o.setName('user').setDescription('Player').setRequired(true))
+        .addIntegerOption(o=>o.setName('amount').setDescription('Exact merit total').setRequired(true).setMinValue(0).setMaxValue(99999)))
+      .addSubcommand(s=>s.setName('view').setDescription('View merits and rank progress')
+        .addUserOption(o=>o.setName('user').setDescription('Player (defaults to you)').setRequired(false)))
+      .addSubcommand(s=>s.setName('history').setDescription('Merit history — one player\'s timeline, or recent server activity')
+        .addUserOption(o=>o.setName('user').setDescription('Player (omit for recent server-wide activity)').setRequired(false)))
+      .addSubcommand(s=>s.setName('leaderboard').setDescription('Show the server merit leaderboard')))
+    .addSubcommandGroup(g=>g.setName('rank').setDescription('Ranks — thresholds, promotion and eligibility')
+      .addSubcommand(s=>s.setName('add').setDescription('Create or update a rank with a merit threshold (GM)')
+        .addStringOption(o=>o.setName('name').setDescription('Rank name, e.g. Knight').setRequired(true))
+        .addIntegerOption(o=>o.setName('threshold').setDescription('Merits required to be eligible').setRequired(true).setMinValue(0).setMaxValue(99999))
+        .addIntegerOption(o=>o.setName('order').setDescription('Sort order (low = junior). Defaults to threshold order').setRequired(false).setMinValue(0).setMaxValue(999)))
+      .addSubcommand(s=>s.setName('remove').setDescription('Delete a rank (GM)')
+        .addStringOption(o=>o.setName('name').setDescription('Rank name').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(s=>s.setName('list').setDescription('List all ranks and their thresholds'))
+      .addSubcommand(s=>s.setName('promote').setDescription('Set a player\'s rank (GM)')
+        .addUserOption(o=>o.setName('user').setDescription('Player').setRequired(true))
+        .addStringOption(o=>o.setName('rank').setDescription('Rank to assign').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(s=>s.setName('eligible').setDescription('List players who meet a rank\'s threshold but don\'t hold it (GM)'))),
 
   new SlashCommandBuilder()
     .setName('quest').setDescription('Quest board — create, post, join and complete quests')
-    .addSubcommand(s=>s.setName('create').setDescription('Create a quest (GM)')
-      .addStringOption(o=>o.setName('name').setDescription('Quest name, e.g. Goblin Cave').setRequired(true))
+    .addSubcommand(s=>s.setName('create').setDescription('Create a quest — leave name blank for a writing window (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('Quest name — leave blank to write everything in a window').setRequired(false))
       .addStringOption(o=>o.setName('objectives').setDescription('What the party must do').setRequired(false))
       .addStringOption(o=>o.setName('lore').setDescription('Story / background').setRequired(false))
       .addStringOption(o=>o.setName('details').setDescription('Extra details / conditions').setRequired(false))
@@ -4844,56 +4928,83 @@ const slashCommands = [
       .addStringOption(o=>o.setName('gm_style').setDescription('How you run a table, so players know what to expect').setRequired(false)
         .addChoices({name:'⚙️ Mechanics-focused',value:'mechanics'},{name:'🎭 Roleplay-focused',value:'rp'},
                     {name:'⚖️ Mixed elements',value:'mixed'},{name:'⚔️ Combat-heavy',value:'combat'},
+                    {name:'🧩 Puzzle & investigation',value:'puzzle'},{name:'🗺️ Sandbox — led by the players',value:'sandbox'}))
+      .addIntegerOption(o=>o.setName('from').setDescription('Copy fields from an existing quest as a fresh draft').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('edit').setDescription('Edit a quest — bare opens a prefilled window; numeric options apply directly (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('merit_reward').setDescription('Merits each member earns on completion').setRequired(false).setMinValue(0).setMaxValue(999))
+      .addIntegerOption(o=>o.setName('party_size').setDescription('Party size (cap or suggestion)').setRequired(false).setMinValue(1).setMaxValue(99))
+      .addBooleanOption(o=>o.setName('hard_cap').setDescription('True = enforce party size; false = suggestion').setRequired(false))
+      .addStringOption(o=>o.setName('gm_style').setDescription('How you run a table').setRequired(false)
+        .addChoices({name:'⚙️ Mechanics-focused',value:'mechanics'},{name:'🎭 Roleplay-focused',value:'rp'},
+                    {name:'⚖️ Mixed elements',value:'mixed'},{name:'⚔️ Combat-heavy',value:'combat'},
                     {name:'🧩 Puzzle & investigation',value:'puzzle'},{name:'🗺️ Sandbox — led by the players',value:'sandbox'})))
     .addSubcommand(s=>s.setName('instance').setDescription('Run your own copy of a quest, separate from anyone else\'s (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest to copy').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest to copy').setRequired(true).setAutocomplete(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('gm_style').setDescription('How you run a table, so players know what to expect').setRequired(false)
         .addChoices({name:'⚙️ Mechanics-focused',value:'mechanics'},{name:'🎭 Roleplay-focused',value:'rp'},
                     {name:'⚖️ Mixed elements',value:'mixed'},{name:'⚔️ Combat-heavy',value:'combat'},
                     {name:'🧩 Puzzle & investigation',value:'puzzle'},{name:'🗺️ Sandbox — led by the players',value:'sandbox'})))
     .addSubcommand(s=>s.setName('post').setDescription('Post a quest to a channel/thread as an embed (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true))
       .addChannelOption(o=>o.setName('channel').setDescription('Where to post (defaults to here)').setRequired(false)))
     .addSubcommand(s=>s.setName('board').setDescription('List quests on the board')
       .addStringOption(o=>o.setName('filter').setDescription('Which quests to show').setRequired(false)
         .addChoices({name:'Open',value:'open'},{name:'In progress',value:'active'},{name:'Completed',value:'completed'},{name:'All',value:'all'})))
     .addSubcommand(s=>s.setName('show').setDescription('Show one quest in full')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('apply').setDescription('Apply to join a quest')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('withdraw').setDescription('Withdraw your application or leave a quest')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('roster').setDescription('Show a quest\'s applicants and party')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('log').setDescription('Completed quests a player was on')
       .addUserOption(o=>o.setName('user').setDescription('Player (defaults to you)').setRequired(false)))
     .addSubcommand(s=>s.setName('approve').setDescription('Approve an applicant onto the party (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true))
       .addUserOption(o=>o.setName('user').setDescription('Applicant to approve').setRequired(true))
       .addBooleanOption(o=>o.setName('force').setDescription('Add even if it exceeds a hard cap').setRequired(false)))
     .addSubcommand(s=>s.setName('kick').setDescription('Remove a member or applicant from a quest (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true))
       .addUserOption(o=>o.setName('user').setDescription('Player to remove').setRequired(true)))
     .addSubcommand(s=>s.setName('runchannel').setDescription('Set where this quest is run and rewarded (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true))
       .addChannelOption(o=>o.setName('channel').setDescription('Thread or channel (defaults to here)').setRequired(false)))
     .addSubcommand(s=>s.setName('start').setDescription('Mark a quest in progress, locking the party (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('pause').setDescription('Stop the clock — the time so far is kept (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true)))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('resume').setDescription('Start the clock again where it left off (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true)))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('dm').setDescription('Your DM card on the 🎲 roster — style, brief, availability (GM)')
+      .addStringOption(o=>o.setName('style').setDescription('Your GM style, e.g. Grimdark · RP-heavy · Fast combat').setRequired(false))
+      .addStringOption(o=>o.setName('brief').setDescription('A short breakdown of what running with you is like').setRequired(false))
+      .addBooleanOption(o=>o.setName('available').setDescription('false = step off the roster for now').setRequired(false)))
+    .addSubcommand(s=>s.setName('npc').setDescription('Attach an NPC to a quest\'s run record (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
+      .addBooleanOption(o=>o.setName('remove').setDescription('true = detach instead').setRequired(false)))
+    .addSubcommand(s=>s.setName('history').setDescription('A quest\'s run ledger — completion count, GMs, parties, NPCs')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number (any instance)').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('stage').setDescription('Move a quest through the planning pipeline (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('stage').setDescription('Pipeline stage').setRequired(true)
+        .addChoices({name:'🌱 Concept',value:'concept'},{name:'⏳ Awaiting Approval',value:'awaiting'},{name:'✅ Approved',value:'approved'})))
+    .addSubcommand(s=>s.setName('archive').setDescription('Take a quest off the board — board thread locked, applications closed (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('note').setDescription('Mark something on the quest log (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('text').setDescription('What happened').setRequired(true))
       .addStringOption(o=>o.setName('kind').setDescription('What sort of moment').setRequired(false)
-        .addChoices({name:'🎭 Roleplay',value:'rp'},{name:'⚔️ Combat',value:'combat'},{name:'📝 Note',value:'note'})))
+        .addChoices({name:'🎭 Roleplay',value:'rp'},{name:'⚔️ Combat',value:'combat'},{name:'📝 Note',value:'note'}))
+      .addBooleanOption(o=>o.setName('public').setDescription('true = also post it in the quest\'s board thread (default: planning thread only)').setRequired(false)))
     .addSubcommand(s=>s.setName('timeline').setDescription('The full log of a quest so far')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true)))
-    .addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — award merits to the party (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — award merits to the party (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('delete').setDescription('Delete a quest permanently (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))),
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true))),
 ];
 
 // ─────────────────────────────────────────────
@@ -4977,7 +5088,7 @@ async function handleMeritGive(interaction) {
   if (!mine) return interaction.reply({ content: '❌ You need a character sheet first — `/char create`.', ephemeral: true });
   // The fallen settle no debts. Receiving is allowed — an estate can still be
   // paid into — but a dead character cannot hand their merit away.
-  if (mine.died_at) return interaction.reply({ content: '🕯️ Your character has fallen and can no longer trade. A GM can bring them back with `/gmrevive`.', ephemeral: true });
+  if (mine.died_at) return interaction.reply({ content: '🕯️ Your character has fallen and can no longer trade. A GM can bring them back with `/gm revive`.', ephemeral: true });
   if (!getChar(gid, to.id)) return interaction.reply({ content: `❌ **${await getDisplayName(interaction.guild, to.id)}** has no character sheet.`, ephemeral: true });
 
   // Checked now and again at approval — merit can be spent in between.
@@ -5490,7 +5601,7 @@ async function handleGmQueue(interaction) {
     return interaction.editReply({ content: '✅ **Nothing waiting.** No sheets, lore, trades or applicants outstanding.' });
   }
   lines.unshift(`🗂️ **${total} thing${total === 1 ? '' : 's'} waiting on a GM**`, '');
-  lines.push('_Sheets and lore are decided on their queue posts · `/merit cancel` or the trade buttons · `/quest approve`._');
+  lines.push('_Sheets and lore are decided on their queue posts · `/standing merit cancel` or the trade buttons · `/quest approve`._');
   return replyLong(interaction, lines, { ephemeral: true });
 }
 
@@ -5675,7 +5786,7 @@ async function handleGmTest(interaction) {
       name: `${GMTEST_PREFIX}Trial of the Sunken Vault`,
       lore: 'A test quest. Nothing here is canon.',
       objectives: 'Try the board, the clock and the summary.',
-      details: 'Made by /gmtest — delete it with /gmtest clean.',
+      details: 'Made by /gm test — delete it with /gm test clean.',
       rewards: 'A tarnished silver key (test)',
       merit_reward: 1, party_size: 4, party_hard: false, created_by: uid,
     });
@@ -5688,7 +5799,7 @@ async function handleGmTest(interaction) {
       `Try: \`/quest start number:${number}\` → \`/quest note number:${number} text:Something happened\``,
       `→ \`/quest timeline number:${number}\` → \`/quest pause\` / \`/quest resume\` → \`/quest complete number:${number}\``,
       '',
-      '_Reminders land every 15 minutes and a recap on the hour. `/gmtest clean` removes it._',
+      '_Reminders land every 15 minutes and a recap on the hour. `/gm test clean` removes it._',
     ].join('\n') });
   }
 
@@ -5714,7 +5825,7 @@ async function handleGmTest(interaction) {
       '',
       `Try: \`/npc sheet name:${name}\` → \`/npc give name:${name} item:…\` → \`/fight start npcs:${name}\``,
       '',
-      '_`/gmtest clean` removes it._',
+      '_`/gm test clean` removes it._',
     ].join('\n') });
   }
 
@@ -5723,7 +5834,7 @@ async function handleGmTest(interaction) {
       .all(gid, GMTEST_PREFIX + '%');
     const npcs = db.prepare('SELECT name FROM npcs WHERE guild_id=? AND name LIKE ? ORDER BY name')
       .all(gid, GMTEST_PREFIX + '%');
-    if (!quests.length && !npcs.length) return interaction.reply({ content: '🧪 Nothing has been made by `/gmtest`.', ephemeral: true });
+    if (!quests.length && !npcs.length) return interaction.reply({ content: '🧪 Nothing has been made by `/gm test`.', ephemeral: true });
     const lines = ['🧪 **Test data**', ''];
     for (const q of quests) lines.push(`📜 #${String(q.number).padStart(3, '0')} ${q.name} — ${q.status}`);
     for (const npcRow of npcs) lines.push(`🎭 ${npcRow.name}`);
@@ -5809,11 +5920,34 @@ async function handleStory(interaction) {
   const isGmUser = await isGm(interaction.guild, interaction.user.id);
   // Writing, tweaking and deleting always need a GM. Running one is a separate
   // question, and stays GM-only until a server opens it up.
-  const AUTHORING = ['delete', 'set', 'demo'];
+  const AUTHORING = ['create', 'delete', 'set', 'demo'];
   if (AUTHORING.includes(sub) && !isGmUser)
     return interaction.reply({ content: '❌ Only GMs can write or change activities.', ephemeral: true });
   if (!isGmUser && !(getConfig(gid)?.activity_players))
     return interaction.reply({ content: '❌ Activities are GM-led on this server for now. Ask a GM to start one.', ephemeral: true });
+
+  if (sub === 'create') {
+    const file = interaction.options.getAttachment('file');
+    if (file) {
+      // A long script arrives as a text file — same validation, same storage.
+      await interaction.deferReply();
+      try {
+        const bytes = await fetchBytes(file.url, 512 * 1024);
+        const r = storeActivityScript(gid, interaction.user.id, bytes.toString('utf8'));
+        return interaction.editReply({ content: r.error ? `❌ **Couldn't read that activity.** ${r.error}` : r.saved });
+      } catch (err) {
+        return interaction.editReply({ content: `❌ Couldn't read the file — ${err?.message || err}. Plain \`.txt\` works best.` });
+      }
+    }
+    const { ModalBuilder, ActionRowBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+    const modal = new ModalBuilder().setCustomId('activitycreate').setTitle('Write an activity').addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('script')
+        .setLabel('Your [ACTIVITY] script')
+        .setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(4000)
+        .setPlaceholder('[ACTIVITY] Fishing\nSCENE find\nSAY 🎣 You survey the water...\nROLL wis DC12\n  PASS -> cast\n  FAIL -> find\n\u2026over 4000 chars? attach a .txt via file: instead')),
+    );
+    return interaction.showModal(modal);
+  }
 
   // A throwaway copy of the fishing loop for trying the system out. Saved under
   // a reserved name with every reward stripped, so a demo run can't move
@@ -6310,6 +6444,71 @@ async function handleConfig(interaction) {
       `${existing ? '✏️ Updated' : '🌙 Added'} recovery schedule:`, line(sc), '',
       'Everyone not on an in-progress quest is covered. Quest parties keep whatever they have until they finish.',
     ].join('\n') });
+  }
+
+  if (sub === 'questforum' || sub === 'questplanning') {
+    const key = sub === 'questforum' ? 'quest_forum' : 'quest_plan_forum';
+    const noun = sub === 'questforum' ? 'public quest board' : 'GM quest planning';
+    if (interaction.options.getBoolean('disable')) {
+      setConfig(gid, { [key]: null });
+      return interaction.reply({ content: `🗺️ ${noun[0].toUpperCase()}${noun.slice(1)} forum unset. Existing threads stay where they are.` });
+    }
+    const channel = interaction.options.getChannel('channel');
+    if (!channel) {
+      const cur = getConfig(gid)?.[key];
+      return interaction.reply({ ephemeral: true, content: cur
+        ? `🗺️ The ${noun} forum is <#${cur}>.`
+        : `🗺️ No ${noun} forum set. \`/config ${sub} channel:#your-forum\`` });
+    }
+    // A forum is channel type 15; anything else has no threads to create.
+    if (channel.type !== 15) {
+      return interaction.reply({ ephemeral: true, content:
+        `❌ <#${channel.id}> is not a forum channel. Make a **Forum** and point me at that — each quest gets a thread in it.` });
+    }
+    setConfig(gid, { [key]: channel.id });
+    if (sub === 'questplanning') {
+      await interaction.deferReply();
+      let tagNote = '', dmNote = '';
+      try {
+        const map = await ensurePlanTags(channel, gid);
+        tagNote = `\n🏷️ Pipeline tags ready: ${QUEST_STAGES.map(([k, e, l]) => map[k] ? `${e} ${l}` : `⚠️ ${l}`).join(' · ')}`;
+      } catch (err) {
+        tagNote = `\n⚠️ Couldn't set the pipeline tags — ${err?.message || err}. I need **Manage Channel** on the forum; run this again once granted.`;
+      }
+      // The pipeline books — idempotent: existing books keep their ids, the
+      // rest are created, exactly like the roll-audit forum's setup.
+      try {
+        const prev = questBooks(gid);
+        const legacyRoster = getConfig(gid)?.quest_dm_thread;
+        const map = {};
+        const made = [];
+        for (const [bkey, emoji, label, about] of QUEST_BOOKS) {
+          let thread = null;
+          const knownId = prev[bkey] ?? (bkey === 'dms' ? legacyRoster : null);
+          if (knownId) {
+            try {
+              const old = await interaction.client.channels.fetch(knownId);
+              if (old?.isThread?.() && old.parentId === channel.id) thread = await wakeThread(old);
+            } catch { /* stale — remake below */ }
+          }
+          if (!thread) {
+            thread = await channel.threads.create({ name: `${emoji} ${label}`, autoArchiveDuration: 10080,
+              message: { content: `${emoji} **${label}**\n${about}\n_I wake this book whenever something new arrives — no need to keep it active._` } });
+            await thread.pin().catch(() => {});
+            made.push(label);
+          }
+          map[bkey] = thread.id;
+        }
+        setConfig(gid, { quest_plan_books: JSON.stringify(map), quest_dm_thread: map.dms });
+        await refreshDmRoster(interaction.client, interaction.guild, gid);
+        dmNote = `\n📚 Books: ${QUEST_BOOKS.map(([k, e, l]) => `${e} <#${map[k]}>`).join(' · ')}${made.length ? `\n_(new: ${made.join(', ')})_` : ''}`;
+      } catch (err) {
+        dmNote = `\n⚠️ Couldn't make the pipeline books — ${err?.message || err}. Check **Create Posts** and **Send Messages in Posts**, then run this again.`;
+      }
+      return interaction.editReply({ content: `🗺️ GM planning forum set to <#${channel.id}> — \`/quest create\` opens a planning thread there; \`/quest post\` flips the quest onto the public board.${tagNote}${dmNote}` });
+    }
+    return interaction.reply({ content:
+      `🗺️ Quest board forum set to <#${channel.id}> — \`/quest post\` now opens a thread there per quest.` });
   }
 
   if (sub === 'charforum') {
@@ -7460,6 +7659,39 @@ async function handleRest(message, rest, type) {
   await message.reply(lines.join('\n'));
 }
 
+// The slash twin of the gmr / gmrs chat shorthands — same roll, same audit
+// mirror; ‘secret’ lands as an ephemeral reply instead of a DM.
+async function runGmRollSlash(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can use GM rolls.', ephemeral: true });
+  const notation = interaction.options.getString('notation');
+  const label = interaction.options.getString('label');
+  const flavour = interaction.options.getString('flavour');
+  const secret = interaction.options.getBoolean('secret') ?? false;
+  const mode = interaction.options.getString('roll') || 'normal';
+  const result = mode === 'adv' ? rollAdvantage(notation) : mode === 'dis' ? rollDisadvantage(notation) : rollNotation(notation);
+  if (!result) return interaction.reply({ content: '❌ Invalid notation. Try `/gm roll notation:1d20+5 label:perception`.', ephemeral: true });
+  const critType = detectCrit(result, mode);
+  const rollLine = buildRollLine(result, mode, critType);
+  const lc = critPrefix(critType);
+  const lines = [];
+  if (label) lines.push(`${lc}**${label}**`);
+  lines.push(rollLine);
+  if (flavour) {
+    lines.push('', '─────────────────────────────');
+    lines.push(`**${label ?? 'roll'}** — ${totalStr(result.total, critType)}`);
+    lines.push(`*${flavour}*`);
+  }
+  const content = lines.join('\n');
+  mirrorRoll(gid, {
+    userId: uid, channelId: interactionChannelId(interaction), messageId: null,
+    input: `/gm roll ${notation}${label ? ' ' + label : ''}${secret ? ' 🔒' : ''}`, rollLine,
+    context: secret ? 'GM roll · 🔒 secret' : 'GM roll',
+  });
+  if (secret) return interaction.reply({ content: `🔒 **Secret GM Roll**\n${content}`, ephemeral: true });
+  return interaction.reply({ content });
+}
+
 async function handleGmRoll(message, rest, secret) {
   const gid = message.guild.id, uid = message.author.id;
   if (!(await isGm(message.guild, uid))) return message.reply('❌ Only GMs can use GM rolls.');
@@ -7805,9 +8037,9 @@ client.on('interactionCreate', async interaction => {
         return await interaction.respond(choices);
       }
 
-      // Rank name autocomplete (/rank remove, /rank promote)
-      if ((interaction.commandName === 'rank' && focusedOption.name === 'rank') ||
-          (interaction.commandName === 'rank' && focusedOption.name === 'name' && interaction.options.getSubcommand(false) === 'remove')) {
+      // Rank name autocomplete (/standing rank remove, /standing rank promote)
+      if ((interaction.commandName === 'standing' && focusedOption.name === 'rank') ||
+          (interaction.commandName === 'standing' && focusedOption.name === 'name' && interaction.options.getSubcommand(false) === 'remove')) {
         const v = String(focusedOption.value).toLowerCase();
         const choices = getRanks(interaction.guild.id)
           .filter(r => r.name.toLowerCase().includes(v))
@@ -7816,7 +8048,7 @@ client.on('interactionCreate', async interaction => {
         return await interaction.respond(choices);
       }
 
-      if (interaction.commandName === 'gmheal' && focusedOption.name === 'npc') {
+      if (interaction.commandName === 'gm' && focusedOption.name === 'npc') {
         const v = String(focusedOption.value).toLowerCase();
         const choices = [{ name: 'all', value: 'all' },
           ...getAllNpcs(interaction.guild.id).map(n => ({ name: n.name.slice(0,100), value: n.name }))]
@@ -7833,7 +8065,17 @@ client.on('interactionCreate', async interaction => {
         return await interaction.respond(choices);
       }
 
-      if ((interaction.commandName === 'pr' || interaction.commandName === 'npc') && focusedOption.name === 'name') {
+      if (interaction.commandName === 'quest' && (focusedOption.name === 'number' || focusedOption.name === 'from')) {
+        const typed = String(focusedOption.value ?? '').toLowerCase();
+        const rows = db.prepare('SELECT number, name, status FROM quests WHERE guild_id=? ORDER BY number DESC LIMIT 100').all(interaction.guild.id);
+        const choices = rows
+          .filter(q => !typed || String(q.number).includes(typed) || (q.name || '').toLowerCase().includes(typed))
+          .slice(0, 25)
+          .map(q => ({ name: `#${String(q.number).padStart(3, '0')} — ${q.name} (${q.status})`.slice(0, 100), value: q.number }));
+        return await interaction.respond(choices);
+      }
+      if ((interaction.commandName === 'npc'
+           || interaction.commandName === 'quest') && focusedOption.name === 'name') {
         const focused = focusedOption.value;
         const npcs = getAllNpcs(interaction.guild.id);
         const filtered = npcs
@@ -7862,7 +8104,7 @@ client.on('interactionCreate', async interaction => {
       }
       // Fight NPC fields — suggest server NPC names
       if (interaction.commandName === 'fight' &&
-          (focusedOption.name === 'npc' || focusedOption.name === 'target_npc')) {
+          (focusedOption.name === 'npc' || focusedOption.name === 'target_npc' || focusedOption.name === 'redirect_npc')) {
         const focused = (focusedOption.value || '').toString().toLowerCase();
         const npcs = getAllNpcs(interaction.guild.id);
         const filtered = npcs
@@ -7889,6 +8131,59 @@ client.on('interactionCreate', async interaction => {
 
   // Handle confirmation buttons
   if (interaction.isModalSubmit?.()) {
+    if (interaction.customId.startsWith('questcreate:')) {
+      const gidq = interaction.guild.id;
+      if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ Only GMs can manage quests.', ephemeral: true });
+      const [, m, p, h, ...styleParts] = interaction.customId.split(':');
+      return finishQuestCreate(interaction, gidq, interaction.user.id, {
+        name: interaction.fields.getTextInputValue('name'),
+        objectives: interaction.fields.getTextInputValue('objectives') || null,
+        lore: interaction.fields.getTextInputValue('lore') || null,
+        details: interaction.fields.getTextInputValue('details') || null,
+        rewards: interaction.fields.getTextInputValue('rewards') || null,
+        merit_reward: parseInt(m) || 0,
+        party_size: p ? parseInt(p) : null,
+        party_hard: h === '1',
+        gm_style: styleParts.join(':') || null,
+      });
+    }
+    if (interaction.customId.startsWith('questedit:')) {
+      const gidq = interaction.guild.id;
+      if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ Only GMs can manage quests.', ephemeral: true });
+      const number = parseInt(interaction.customId.split(':')[1]);
+      const quest = getQuest(gidq, number);
+      if (!quest) return interaction.reply({ content: '❌ That quest no longer exists.', ephemeral: true });
+      const name = interaction.fields.getTextInputValue('name').trim();
+      if (!name || name.length > 80) return interaction.reply({ content: '❌ Quest name must be 1–80 characters.', ephemeral: true });
+      // Thread renames and refreshes can outlast the 3-second window.
+      await interaction.deferReply();
+      updateQuest(gidq, number, { name,
+        objectives: interaction.fields.getTextInputValue('objectives') || null,
+        lore: interaction.fields.getTextInputValue('lore') || null,
+        details: interaction.fields.getTextInputValue('details') || null,
+        rewards: interaction.fields.getTextInputValue('rewards') || null });
+      const fresh = getQuest(gidq, number);
+      // A renamed quest renames its threads — best-effort.
+      for (const tid of [fresh.plan_thread_id, fresh.post_channel_id]) {
+        if (!tid) continue;
+        try {
+          const th = await interaction.client.channels.fetch(tid);
+          if (th?.isThread?.()) { if (th.archived) await wakeThread(th); await th.setName(`#${number} — ${name}`.slice(0, 100)); }
+        } catch { /* best-effort */ }
+      }
+      await refreshQuestPost(interaction.client, interaction.guild, fresh);
+      await syncQuestBook(interaction.client, interaction.guild, gidq, fresh);
+      await questAnnounce(interaction.client, fresh, '✏️ Quest edited.', { board: false });
+      return interaction.editReply({ content: `✏️ **${questTag(fresh)}** updated.\n\n${await renderQuest(interaction.guild, fresh)}` });
+    }
+    if (interaction.customId === 'activitycreate') {
+      const gid2 = interaction.guild.id;
+      if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ Only GMs can add activities.', ephemeral: true });
+      const r = storeActivityScript(gid2, interaction.user.id, interaction.fields.getTextInputValue('script'));
+      return interaction.reply(r.error
+        ? { content: `❌ **Couldn't read that activity.** ${r.error}\n_Your script is still in the paste window — press Dismiss, fix it, and try again (or paste it straight into chat)._`, ephemeral: true }
+        : { content: r.saved });
+    }
     if (interaction.customId.startsWith('npcsay:')) return handleNpcSayModal(interaction);
     if (interaction.customId === 'scrollwrite') return handleScrollModal(interaction);
     if (interaction.customId === 'importpaste') return handleImportPasteModal(interaction);
@@ -7946,32 +8241,44 @@ client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
   try {
     if (interaction.commandName === 'duel') return await handleDuel(interaction);
-    if (interaction.commandName === 'gmsearch') return await handleGmSearch(interaction);
-    if (interaction.commandName === 'gmqueue') return await handleGmQueue(interaction);
-    if (interaction.commandName === 'gmkill') return await handleGmKill(interaction);
-    if (interaction.commandName === 'gmrevive') return await handleGmRevive(interaction);
-    if (interaction.commandName === 'gmtest') return await handleGmTest(interaction);
-    if (interaction.commandName === 'renown') return await handleRenown(interaction);
+    if (interaction.commandName === 'gm') {
+      if (interaction.options.getSubcommandGroup(false) === 'test') return await handleGmTest(interaction);
+      const gmSub = interaction.options.getSubcommand();
+      if (gmSub === 'search') return await handleGmSearch(interaction);
+      if (gmSub === 'queue') return await handleGmQueue(interaction);
+      if (gmSub === 'kill') return await handleGmKill(interaction);
+      if (gmSub === 'revive') return await handleGmRevive(interaction);
+      if (gmSub === 'heal') return await handleGmHeal(interaction);
+      if (gmSub === 'roll') return await runGmRollSlash(interaction);
+    }
     if (interaction.commandName === 'activity') return await handleStory(interaction);
     if (interaction.commandName === 'config') return await handleConfig(interaction);
-    if (interaction.commandName === 'char') return await handleChar(interaction);
-    if (interaction.commandName === 'profile' || interaction.commandName === 'p') return await handleProfile(interaction);
-    if (interaction.commandName === 'tag') return await handleTag(interaction);
+    if (interaction.commandName === 'char') {
+      const cg = interaction.options.getSubcommandGroup(false);
+      if (cg === 'weapon') return await handleWeapon(interaction);
+      if (cg === 'tag') return await handleTag(interaction);
+      return await handleChar(interaction);
+    }
+    if (interaction.commandName === 'profile') return await handleProfile(interaction);
     if (interaction.commandName === 'stat') return await handleStat(interaction);
-    if (interaction.commandName === 'dr') return await handleSlashRoll(interaction);
     if (interaction.commandName === 'fight') return await handleFight(interaction);
-    if (interaction.commandName === 'npc') return await handleNpc(interaction);
-    if (interaction.commandName === 'pr') return await handlePr(interaction);
-    if (interaction.commandName === 'weapon') return await handleWeapon(interaction);
+    if (interaction.commandName === 'npc') {
+      const npcSub = interaction.options.getSubcommand(false);
+      if (npcSub === 'say' || npcSub === 'roll') return await handlePr(interaction);
+      return await handleNpc(interaction);
+    }
     if (interaction.commandName === 'help') return await handleHelp(interaction);
     if (interaction.commandName === 'scroll') return await handleScroll(interaction);
     if (interaction.commandName === 'dicereport') return await handleDiceReport(interaction);
     if (interaction.commandName === 'lastroll') return await handleLastRoll(interaction);
     if (interaction.commandName === 'backup') return await handleBackup(interaction);
-    if (interaction.commandName === 'gmheal') return await handleGmHeal(interaction);
     if (interaction.commandName === 'roll') return await handleRollSlash(interaction);
-    if (interaction.commandName === 'merit') return await handleMerit(interaction);
-    if (interaction.commandName === 'rank') return await handleRank(interaction);
+    if (interaction.commandName === 'standing') {
+      const sg = interaction.options.getSubcommandGroup(false);
+      if (sg === 'renown') return await handleRenown(interaction);
+      if (sg === 'merit') return await handleMerit(interaction);
+      if (sg === 'rank') return await handleRank(interaction);
+    }
     if (interaction.commandName === 'quest') return await handleQuest(interaction);
   } catch (err) {
     console.error(`[${interaction.commandName}] error:`, err);
@@ -8068,13 +8375,10 @@ client.on('messageCreate', async message => {
 
   // Sheet import detection — check before prefix matching
   // Pasted scenario script — GM only, and validated before anything is stored.
-  if (/^\s*\[STORY\]/im.test(content)) {
+  if (/^\s*\[(STORY|ACTIVITY)\]/im.test(content)) {
     if (!(await isGm(message.guild, message.author.id))) return message.reply('❌ Only GMs can add activities.');
-    const parsed = parseStoryScript(content);
-    if (parsed.error) return message.reply(`❌ **Couldn't read that activity.** ${parsed.error}`);
-    const count = saveStory(message.guild.id, message.author.id, parsed);
-    return message.reply([`🎮 **${parsed.name}** saved — **${count}** scene${count === 1 ? '' : 's'}, starting at \`${parsed.start}\`.`,
-      `Run it with \`/activity run name:${parsed.name}\`, or read it back with \`/activity show name:${parsed.name}\`.`].join('\n'));
+    const r = storeActivityScript(message.guild.id, message.author.id, content);
+    return message.reply(r.error ? `❌ **Couldn't read that activity.** ${r.error}` : r.saved);
   }
 
   if (content.includes('[TTRPG SHEET]')) {
@@ -8643,8 +8947,8 @@ function deathGate(gid, id) {
   if (!subject?.died_at) return null;
   const fell = `<t:${Math.floor(Number(subject.died_at) / 1000)}:R>`;
   return isNpcFighter(id)
-    ? `🕯️ **${subject.name}** fell ${fell} and takes no further part. \`/gmrevive npc:${subject.name}\` brings them back.`
-    : `🕯️ **${subject.displayName ?? 'That character'}** fell ${fell} and can no longer act. A GM can bring them back with \`/gmrevive\`.`;
+    ? `🕯️ **${subject.name}** fell ${fell} and takes no further part. \`/gm revive npc:${subject.name}\` brings them back.`
+    : `🕯️ **${subject.displayName ?? 'That character'}** fell ${fell} and can no longer act. A GM can bring them back with \`/gm revive\`.`;
 }
 
 function isFallen(gid, id) {
@@ -8655,7 +8959,7 @@ function sheetGate(gid, uid) {
   const ch = getChar(gid, uid);
   if (!ch) return null;                            // "no sheet" handled by callers
   // The fallen take no more actions until a GM says otherwise.
-  if (ch.died_at) return '🕯️ Your character has fallen. A GM can bring them back with `/gmrevive`.';
+  if (ch.died_at) return '🕯️ Your character has fallen. A GM can bring them back with `/gm revive`.';
   if (sheetApproved(gid, ch)) return null;         // single source of truth
   if (ch.approval_state === 'pending') return '⏳ Your character sheet is **awaiting GM approval** — you can\'t roll or fight until it\'s approved.';
   return '🚫 Your character sheet was **rejected** by a GM.'
@@ -9168,7 +9472,7 @@ function mirrorRoll(gid, { userId = null, actor = null, channelId, messageId = n
   let dest = '?';
   (async () => {
     // Which book does the entry belong in? An explicit kind wins (GM-as-NPC
-    // fight rolls, /pr rolls); a bot-attributed roll is NPC by definition;
+    // fight rolls, /npc rolls); a bot-attributed roll is NPC by definition;
     // otherwise the roller's GM-ness decides.
     const k = kind ?? (actor ? 'npcs' : ((userId && await isGmId(gid, userId)) ? 'gms' : 'players'));
     const chId = auditDestination(gid, k);
@@ -9356,6 +9660,8 @@ function fightAwaiting(gid, cid, uid) {
   const currentId = order[fight.turn_index];
   if (fight.phase === 'attack') return currentId === uid ? { fight, kind: 'atk' } : null;
   if (fight.phase === 'defend' && fight.def_roll === null) {
+    // Grapples and feints have their own answers; a custom roll cannot stand in.
+    if (fight.atk_kind) return null;
     return fight.current_target === uid ? { fight, kind: 'def' } : null;
   }
   return null;
@@ -9600,7 +9906,7 @@ async function fighterCharCard(guild, gid, fid) {
 }
 
 // Post a message into a channel AS an NPC (via its webhook, with name + avatar),
-// matching how /pr posts. Falls back to a plain channel.send if the webhook fails.
+// matching how /npc posts. Falls back to a plain channel.send if the webhook fails.
 // Returns the sent message when the API hands one back (so callers can build
 // audit jump links), otherwise a bare truthy/falsy success flag.
 // Speaking as an NPC in a quest's channel is a roleplay beat worth logging.
@@ -9646,6 +9952,8 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   const attackerId = order[fight.turn_index];
   if (!isNpcFighter(attackerId)) return false; // current fighter is a player — wait for them
   if (isFallen(gid, attackerId)) return false;  // fallen NPCs take no turn
+  if (await retrievalTurn(guild, gid, cid, attackerId,
+      async (l) => channel.send(l.join('\n')).catch(()=>{}))) return true;
 
   const attacker = await resolveFighter(guild, gid, attackerId);
   // pick a random opponent still standing (above the bout floor / 0)
@@ -9657,10 +9965,11 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
 
   // The bot fights within the same rules a player does.
   const stat = chooseAutoStat(gid, attackerId, attacker.stats, 'atk');
-  const atkBonus = consumeAtkBonus(gid, cid, attackerId);
+  const fooledAuto = consumeFooled(gid, cid, attackerId);
+  const atkBonus = fooledAuto ? 0 : consumeAtkBonus(gid, cid, attackerId);
   const attRow = attacker.isNpc ? getNpc(gid, attacker.name) : getChar(gid, attackerId);
-  const a = autoRoll((attacker.stats[stat] ?? 0) + atkBonus, hasSignatureAdvantage(attRow, stat));
-  mirrorAutoRoll(gid, cid, attacker.name, `1d20${a.adv ? ' (adv)' : ''}`, a.nat, a.total, `fight attack (${STAT_LABELS[stat]})`);
+  const a = autoRoll(fooledAuto ? 0 : ((attacker.stats[stat] ?? 0) + atkBonus), !fooledAuto && hasSignatureAdvantage(attRow, stat));
+  mirrorAutoRoll(gid, cid, attacker.name, `1d20${a.adv ? ' (adv)' : ''}`, a.nat, a.total, fooledAuto ? `fight attack (${STAT_LABELS[stat]}, fooled — flat)` : `fight attack (${STAT_LABELS[stat]})`);
 
   upsertFight(gid, cid, {
     phase: 'defend', current_target: targetId,
@@ -9689,8 +9998,27 @@ async function autoNpcDefend(guild, gid, cid, channel) {
   if (isFallen(gid, fight.current_target)) return false;   // the fallen do not defend
 
   const defender = await resolveFighter(guild, gid, fight.current_target);
+  if (fight.atk_kind === 'grapple') {
+    // Grapple saves are STR-only; the auto NPC rolls its own.
+    const drow = getNpc(gid, defender.name);
+    const d = autoRoll(defender.stats.str ?? 0, hasSignatureAdvantage(drow, 'str'));
+    mirrorAutoRoll(gid, cid, defender.name, `1d20${d.adv ? ' (adv)' : ''}`, d.nat, d.total, 'grapple save (STR)');
+    const r = await resolveGrappleSave(guild, gid, cid, fight, { nat: d.nat, total: d.total, mode: d.adv ? 'adv' : 'normal' });
+    await channel.send(r.lines.join('\n')).catch(err => console.error('[auto] grapple save post -', err?.message || err));
+    return true;
+  }
+  if (fight.atk_kind === 'feint') {
+    // Insight checks are WIS-only; a fooled NPC rolls even this one flat.
+    const drow = getNpc(gid, defender.name);
+    const wasFooled = consumeFooled(gid, cid, fight.current_target);
+    const d = autoRoll(wasFooled ? 0 : (defender.stats.wis ?? 0), !wasFooled && hasSignatureAdvantage(drow, 'wis'));
+    mirrorAutoRoll(gid, cid, defender.name, `1d20${d.adv ? ' (adv)' : ''}`, d.nat, d.total, wasFooled ? 'feint insight (WIS, fooled — flat)' : 'feint insight (WIS)');
+    const r = await resolveFeintInsight(guild, gid, cid, fight, { nat: d.nat, total: d.total, mode: d.adv ? 'adv' : 'normal' });
+    await channel.send(r.lines.join('\n')).catch(err => console.error('[auto] feint insight post -', err?.message || err));
+    return true;
+  }
   const stat = chooseAutoStat(gid, fight.current_target, defender.stats, 'def');
-  const flat = consumeFlatDef(gid, cid, fight.current_target);
+  const flat = consumeFlatDef(gid, cid, fight.current_target) || consumeFooled(gid, cid, fight.current_target);
   const defRow = defender.isNpc ? getNpc(gid, defender.name) : getChar(gid, fight.current_target);
   const d = autoRoll(flat ? 0 : (defender.stats[stat] ?? 0), !flat && hasSignatureAdvantage(defRow, stat));
   mirrorAutoRoll(gid, cid, defender.name, `1d20${d.adv ? ' (adv)' : ''}`, d.nat, d.total,
@@ -9704,10 +10032,74 @@ async function autoNpcDefend(guild, gid, cid, channel) {
   return true;
 }
 
+// Advance to the next fighter still standing, starting AT from (wrapping).
+function nextStandingIndex(turnOrder, hpState, floor, from) {
+  let idx = ((from % turnOrder.length) + turnOrder.length) % turnOrder.length;
+  let safety = 0;
+  while (hpState[turnOrder[idx]] !== undefined && hpState[turnOrder[idx]] <= floor && safety < turnOrder.length) {
+    idx = (idx + 1) % turnOrder.length;
+    safety++;
+  }
+  return idx;
+}
+
+// Whose turn it becomes, and the reminder a GM needs when driving an NPC by
+// hand. Shared by every path that hands the fight onward.
+async function announceNextTurn(guild, gid, cid, lines, order, index) {
+  const nextF = await resolveFighter(guild, gid, order[index]);
+  const autoOn = !!getFight(gid, cid)?.auto_npc;
+  const hint = (autoOn && nextF.isNpc) ? '' : nextF.isNpc
+    ? `\n_A GM acts for them: \`/fight atk stat:str npc:${nextF.name} target:@player\`_`
+    : '\n_\`/fight atk stat:str target:@player\` — or \`/roll dice:2d6+3 fight:true target:@player\` for a custom roll._';
+  lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${hint}${turnPing(gid, nextF)}`);
+  return nextF;
+}
+
+// The fight is over: archive, reset the row, and shape the winner's announce.
+async function buildFightEnd(guild, gid, cid, lines, hpState, roster, floor, winnerId) {
+  const winF = await resolveFighter(guild, gid, winnerId);
+  const W = fightWords(floor);
+  const endLog = JSON.parse(getFight(gid, cid)?.log_state || '{}');
+  archiveFight(gid, cid, endLog, roster, floor);
+  upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState) });
+  return { lines, ended: true, nextF: null, announce: {
+    headline: `🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** ${W.win}!`,
+    log: endLog, roster, hpState, floor,
+  } };
+}
+
 // Auto-mode twin of the `/fight resolve` handler (channel-send based).
 // Computes damage from the stored rolls, persists HP, handles knockdown /
 // win / turn advance, and posts the summary. Returns true if the fight continues.
 // Keep the rules here in lockstep with the `resolve` subcommand in handleFight.
+// A held fighter pays 1 strain when their own turn ends. Re-reads the fight
+// row (any purge already persisted is seen), handles a strain knockout in
+// full — purge, roster shrink, and the fight end when only one stands.
+// Returns { order, endedRet } like the resolver's inner paths.
+async function applyTurnEndStrain(guild, gid, cid, hpState, order, roster, floor, lines, fid) {
+  const f = getFight(gid, cid);
+  const gmap = fightGrapples(f);
+  if (!gmap[fid]) return { order };
+  const prev = hpState[fid] ?? 0;
+  if (prev <= floor) return { order };
+  const F = await resolveFighter(guild, gid, fid);
+  const name = F.name + (F.isNpc ? ' 🎭' : '');
+  const W = fightWords(floor);
+  const nh = applyFightDamage(prev, 1, floor);
+  hpState[fid] = nh; setFighterHp(gid, fid, nh);
+  lines.push('', `🤼 The hold takes its toll — **${name}** takes **1** strain.`);
+  lines.push(hpChangeLine(gid, F.isNpc, F.name, prev, nh, F.maxHp, floor));
+  if (nh <= floor) {
+    lines.push('', `${W.icon} **${name}** ${W.out}! HP: **${nh}**`);
+    for (const [t, h] of Object.entries(gmap)) if (t === fid || h === fid) delete gmap[t];
+    setFightGrapples(gid, cid, gmap);
+    const shrunk = order.filter(id => id !== fid);
+    if (shrunk.length <= 1) return { order: shrunk, endedRet: await buildFightEnd(guild, gid, cid, lines, hpState, roster, floor, shrunk[0]) };
+    return { order: shrunk };
+  }
+  return { order };
+}
+
 // ── Exchange resolution ───────────────────────────────────────────────────────
 // One implementation of the combat rules, shared by /fight resolve and the NPC
 // auto-pilot. These used to be two ~90-line copies that had to be edited in
@@ -9728,7 +10120,6 @@ async function resolveExchange(guild, gid, cid, fight) {
   const hpState = fightHp(fight);
   const floor = fightFloor(fight);
   const W = fightWords(floor);
-  const autoOn = !!fight.auto_npc;
 
   const { hit, dmg } = resolveDamage(
     fight.atk_roll, fight.atk_nat, 20,
@@ -9752,18 +10143,23 @@ async function resolveExchange(guild, gid, cid, fight) {
   lines.push(`${defName} (**${STAT_LABELS[fight.def_stat]}**): ${fightTotalStr(fight.def_roll, fight.def_nat, 20)}`);
   lines.push('');
 
+  // The grapple layer: purge holds on any knockout, and a held attacker
+  // takes 1 strain when their turn ends — with full down handling.
+  const gmap = fightGrapples(fight);
+  const purgeGrapple = (fid, nm) => {
+    let changed = false;
+    for (const [t, h] of Object.entries(gmap)) if (t === fid || h === fid) { delete gmap[t]; changed = true; }
+    if (changed) { lines.push(`🤼 The hold involving **${nm}** breaks.`); setFightGrapples(gid, cid, gmap); }
+  };
+  // Delegates to the shared end-of-turn strain (re-reads the fight row, so a
+  // purge persisted just above is seen).
+  const applyEndStrain = (order) => applyTurnEndStrain(guild, gid, cid, hpState, order, turnOrder, floor, lines, attackerId);
+
   // Whose turn it becomes, and the reminder a GM needs when they're driving an
   // NPC by hand. Shared by the "fighter went down" and "fight continues" paths.
-  const handOver = async (order, index) => {
-    const nextF = await resolveFighter(guild, gid, order[index]);
-    const hint = (nextF.isNpc && !autoOn)
-      ? `\n_A GM acts for them: \`/fight atk stat:str npc:${nextF.name} target:@player\`_`
-      : (nextF.isNpc ? '' : '\n_`/fight atk stat:str target:@player` — or `/roll dice:2d6+3 fight:true target:@player` for a custom roll._');
-    lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${hint}${turnPing(gid, nextF)}`);
-    return nextF;
-  };
+  const handOver = (order, index) => announceNextTurn(guild, gid, cid, lines, order, index);
   const clearRolls = {
-    phase: 'attack', current_target: null,
+    phase: 'attack', current_target: null, atk_kind: null,
     atk_roll: null, atk_nat: null, atk_stat: null,
     def_roll: null, def_nat: null, def_stat: null,
     atk_rerolled: 0, def_rerolled: 0,   // a new exchange, a fresh second chance
@@ -9780,20 +10176,20 @@ async function resolveExchange(guild, gid, cid, fight) {
 
     if (newHp <= floor) {
       lines.push('', `${W.icon} **${defName}** ${W.out}! HP: **${newHp}**`);
-      const newOrder = turnOrder.filter(id => id !== defenderId);
+      purgeGrapple(defenderId, defName);
+      let newOrder = turnOrder.filter(id => id !== defenderId);
 
       if (newOrder.length <= 1) {
-        const winF = await resolveFighter(guild, gid, newOrder[0]);
-        const endLog = JSON.parse(getFight(gid, cid)?.log_state || '{}');
-        archiveFight(gid, cid, endLog, turnOrder, floor);
-        upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState) });
-        return { lines, ended: true, nextF: null, announce: {
-          headline: `🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** ${W.win}!`,
-          log: endLog, roster: turnOrder, hpState, floor,
-        } };
+        return buildFightEnd(guild, gid, cid, lines, hpState, turnOrder, floor, newOrder[0]);
       }
-
-      const newIndex = fight.turn_index % newOrder.length;
+      // The victor's turn ends too — a held attacker still pays the strain.
+      const st = await applyEndStrain(newOrder);
+      if (st.endedRet) return st.endedRet;
+      newOrder = st.order;
+      if (newOrder.length <= 1) {
+        return buildFightEnd(guild, gid, cid, lines, hpState, turnOrder, floor, newOrder[0]);
+      }
+      const newIndex = nextStandingIndex(newOrder, hpState, floor, fight.turn_index);
       const nextF = await handOver(newOrder, newIndex);
       upsertFight(gid, cid, { ...clearRolls,
         turn_order: JSON.stringify(newOrder), turn_index: newIndex,
@@ -9806,16 +10202,94 @@ async function resolveExchange(guild, gid, cid, fight) {
     for (const l of effectNoteLines(effNotes, atkName, defName)) lines.push(l);
   }
 
-  // Advance to the next fighter still standing (above the bout floor / 0).
-  let nextIndex = (fight.turn_index + 1) % turnOrder.length;
-  let safety = 0;
-  while (hpState[turnOrder[nextIndex]] !== undefined && hpState[turnOrder[nextIndex]] <= floor && safety < turnOrder.length) {
-    nextIndex = (nextIndex + 1) % turnOrder.length;
-    safety++;
-  }
-  const nextF = await handOver(turnOrder, nextIndex);
-  upsertFight(gid, cid, { ...clearRolls, turn_index: nextIndex, hp_state: JSON.stringify(hpState) });
+  // The attacker's turn ends — a held attacker pays the strain, then the
+  // fight advances to the next fighter still standing.
+  const st = await applyEndStrain([...turnOrder]);
+  if (st.endedRet) return st.endedRet;
+  const order = st.order;
+  const shrunk = order.length !== turnOrder.length;
+  const nextIndex = nextStandingIndex(order, hpState, floor, shrunk ? fight.turn_index : fight.turn_index + 1);
+  const nextF = await handOver(order, nextIndex);
+  upsertFight(gid, cid, { ...clearRolls, turn_index: nextIndex, hp_state: JSON.stringify(hpState),
+    ...(shrunk ? { turn_order: JSON.stringify(order) } : {}) });
   return { lines, ended: false, nextF, announce: null };
+}
+
+// A grapple save resolves here, whoever rolled it. The grappler's stored
+// attempt wins ties ("meets or exceeds"); a failed save writes the hold into
+// the fight's grapple map. No damage moves, so no down handling is needed —
+// the turn simply passes.
+async function resolveGrappleSave(guild, gid, cid, fight, { nat, total, mode = 'normal' }) {
+  const turnOrder = fightOrder(fight);
+  const attackerId = turnOrder[fight.turn_index];
+  const targetId = fight.current_target;
+  const hpState = fightHp(fight);
+  const floor = fightFloor(fight);
+  const atkF = await resolveFighter(guild, gid, attackerId);
+  const defF = await resolveFighter(guild, gid, targetId);
+  const atkName = atkF.name + (atkF.isNpc ? ' 🎭' : '');
+  const defName = defF.name + (defF.isNpc ? ' 🎭' : '');
+  const lines = ['─────────────────────────────', '🤼  **Grapple Resolved**', ''];
+  lines.push(`${atkName} (**STR**): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
+  lines.push(`${defName} (**STR** save${mode === 'adv' ? ', advantage' : mode === 'dis' ? ', disadvantage' : ''}): ${fightTotalStr(total, nat, 20)}`);
+  lines.push('');
+  const grappled = fight.atk_roll >= total;
+  if (grappled) {
+    const gmap = fightGrapples(fight);
+    gmap[targetId] = attackerId;
+    setFightGrapples(gid, cid, gmap);
+    lines.push(`🔒 **${defName}** is **grappled** by **${atkName}**!`);
+    lines.push(`_Immobile • 1 strain at each of their turn's ends • \`/fight escape\` (STR) or act on a flat d20. ${atkName} may \`/fight release\` freely, and cannot strike their captive._`);
+  } else {
+    lines.push(`💨 **${defName}** slips the hold — no grapple.`);
+  }
+  const clear = { phase: 'attack', current_target: null, atk_kind: null,
+    atk_roll: null, atk_nat: null, atk_stat: null,
+    def_roll: null, def_nat: null, def_stat: null,
+    atk_rerolled: 0, def_rerolled: 0 };
+  const nextIndex = nextStandingIndex(turnOrder, hpState, floor, fight.turn_index + 1);
+  const nextF = await announceNextTurn(guild, gid, cid, lines, turnOrder, nextIndex);
+  upsertFight(gid, cid, { ...clear, turn_index: nextIndex });
+  return { lines, nextF, grappled };
+}
+
+// A feint's insight check resolves here, whoever rolled it. Ties go to the
+// TARGET as written ("Failure: target's roll >= deceiver's"); a failed
+// insight sets the fooled flag — the target's very next rolled action is a
+// straight d20. No damage moves, so the turn simply passes.
+async function resolveFeintInsight(guild, gid, cid, fight, { nat, total, mode = 'normal' }) {
+  const turnOrder = fightOrder(fight);
+  const attackerId = turnOrder[fight.turn_index];
+  const targetId = fight.current_target;
+  const hpState = fightHp(fight);
+  const floor = fightFloor(fight);
+  const atkF = await resolveFighter(guild, gid, attackerId);
+  const defF = await resolveFighter(guild, gid, targetId);
+  const atkName = atkF.name + (atkF.isNpc ? ' 🎭' : '');
+  const defName = defF.name + (defF.isNpc ? ' 🎭' : '');
+  const lines = ['─────────────────────────────', '🎭  **Feint Resolved**', ''];
+  lines.push(`${atkName} (**WIS** feint): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
+  lines.push(`${defName} (**WIS** insight${mode === 'adv' ? ', advantage' : mode === 'dis' ? ', disadvantage' : ''}): ${fightTotalStr(total, nat, 20)}`);
+  lines.push('');
+  const fooled = fight.atk_roll > total;   // ties go to the target, as written
+  if (fooled) {
+    setEffectFlag(gid, cid, targetId, 'fooled');
+    lines.push(`🎭 **${defName}** is **completely fooled** by the feint!`);
+    lines.push(`_Their very next rolled action — whatever it is — is a straight d20, no bonuses._`);
+  } else {
+    lines.push(`👁️ **${defName}** sees through the feint — combat continues normally.`);
+  }
+  lines.push(`_🎭 Trade-off: **${atkName}**'s next defence roll is a flat d20._`);
+  const clear = { phase: 'attack', current_target: null, atk_kind: null,
+    atk_roll: null, atk_nat: null, atk_stat: null,
+    def_roll: null, def_nat: null, def_stat: null,
+    atk_rerolled: 0, def_rerolled: 0 };
+  const nextIndex = nextStandingIndex(turnOrder, hpState, floor, fight.turn_index + 1);
+  const nextF = await announceNextTurn(guild, gid, cid, lines, turnOrder, nextIndex);
+  upsertFight(gid, cid, { ...clear, turn_index: nextIndex });
+  // The deceiver pays the flat-defence trade-off whether the feint took or not.
+  setEffectFlag(gid, cid, attackerId, 'flatDef');
+  return { lines, nextF, fooled };
 }
 
 // Auto-pilot wrapper: posts to the channel. Returns whether the fight goes on.
@@ -9895,7 +10369,11 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     const cur = await resolveFighter(interaction.guild, gid, currentId);
     return refuse(`⚠️ It's **${cur.name}**'s turn to attack.`);
   }
-  if (fight.phase !== 'attack') return refuse('❌ Waiting for defender to roll first.');
+  if (fight.phase !== 'attack') return refuse(fight.atk_kind === 'grapple'
+    ? '🤼 A grapple is pending — the target answers with `/fight save` (STR only).'
+    : fight.atk_kind === 'feint'
+    ? '🎭 A feint is pending — the target answers with `/fight insight` (WIS only).'
+    : '❌ Waiting for defender to roll first.');
   if (!isNpcFighter(actorId)) {
     const gateMsg = sheetGate(gid, actorId);
     if (gateMsg && !(await isGm(interaction.guild, uid))) return refuse(gateMsg);
@@ -9914,19 +10392,34 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     return refuse(atkFloor > 0 ? '❌ That fighter has already yielded the bout.' : '❌ That target is already down.');
   }
 
+    // Grapple rules on the attack path: a holder cannot strike their captive,
+    // and a held fighter swings on a flat d20 — no stat, no riposte, no edge.
+    if (grappleHolderOf(fight, targetId) === actorId) {
+      return refuse('🤼 You are holding them — a grappler cannot strike their captive. `/fight release` first (it costs nothing).');
+    }
+    const restrained = !!grappleHolderOf(fight, actorId);
+    // A deflection's trade-off: the very next attack roll is a flat d20.
+    const offBalance = !restrained && consumeFlatAtk(gid, cid, actorId);
+    const fooledA = consumeFooled(gid, cid, actorId);
+    const flatSwing = restrained || offBalance || fooledA;
+    clearRoundFlag(gid, cid, actorId);
+    if (await retrievalTurn(interaction.guild, gid, cid, actorId,
+        async (l) => interaction.reply({ content: l.join('\n') }))) {
+      return kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
+    }
     const actor = await resolveFighter(interaction.guild, gid, actorId);
     const targetF = await resolveFighter(interaction.guild, gid, targetId);
-    const statVal = actor.stats[stat] ?? 0;
+    const statVal = flatSwing ? 0 : (actor.stats[stat] ?? 0);
     // Consume a pending riposte bonus from a previous nat-20 defence.
-    const atkBonus = consumeAtkBonus(gid, cid, actorId);
+    const atkBonus = flatSwing ? 0 : consumeAtkBonus(gid, cid, actorId);
     // Hero signature advantage (players and Hero NPCs alike)
     const sigRowA = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
-    mode = applySignatureMode(sigRowA, stat, mode);
+    mode = flatSwing ? 'normal' : applySignatureMode(sigRowA, stat, mode);
     const effTotal = statVal + atkBonus;
     const bonusTag = atkBonus ? ` +${atkBonus} riposte` : '';
     const modStr = effTotal > 0 ? ` +${effTotal}` : effTotal < 0 ? ` ${effTotal}` : '';
 
-    let nat, dropped = null, advNote = '';
+    let nat, dropped = null, advNote = restrained ? ' 🤼 restrained — flat d20' : offBalance ? ' 🛡️ off-balance — flat d20' : fooledA ? ' 🎭 fooled — flat d20' : '';
     if (mode === 'adv') {
       const r1 = rollDie(20), r2 = rollDie(20);
       nat = Math.max(r1, r2); dropped = Math.min(r1, r2); advNote = ' (advantage)';
@@ -10008,6 +10501,718 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     return;
 }
 
+// ── Grappling ────────────────────────────────────────────────────────
+// STR-only, contested. The attempt fills the same pending-attack slot as a
+// normal strike (atk_kind 'grapple'); the save resolves it; a held fighter
+// pays 1 strain when their own turn ends (the resolver and escape both apply
+// it); the holder may release freely and can never strike their captive.
+
+// One d20 under a roll mode: {nat, dropped}. The grapple family shares it.
+function rollD20Mode(mode) {
+  if (mode === 'adv') { const r1 = rollDie(20), r2 = rollDie(20); return { nat: Math.max(r1, r2), dropped: Math.min(r1, r2) }; }
+  if (mode === 'dis') { const r1 = rollDie(20), r2 = rollDie(20); return { nat: Math.min(r1, r2), dropped: Math.max(r1, r2) }; }
+  return { nat: rollDie(20), dropped: null };
+}
+
+async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode, flavour }) {
+  const uid = interaction.user.id;
+  const refuse = (content) => interaction.reply({ content, ephemeral: true });
+  const chan = await interactionChannel(interaction);
+  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  const fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
+  if (isNpcFighter(actorId) && !(await isGm(interaction.guild, uid))) return refuse('❌ Only GMs can act as an NPC.');
+  {
+    const gate0 = deathGate(gid, actorId);
+    if (gate0) return refuse(gate0);
+  }
+  const turnOrder = fightOrder(fight);
+  if (turnOrder[fight.turn_index] !== actorId) {
+    const cur = await resolveFighter(interaction.guild, gid, turnOrder[fight.turn_index]);
+    return refuse(`⚠️ It's **${cur.name}**'s turn to attack.`);
+  }
+  if (fight.phase !== 'attack') return refuse(fight.atk_kind === 'grapple'
+    ? '🤼 A grapple is already pending — the target answers with `/fight save`.'
+    : '❌ Waiting for defender to roll first.');
+  if (!isNpcFighter(actorId)) {
+    const gateMsg = sheetGate(gid, actorId);
+    if (gateMsg && !(await isGm(interaction.guild, uid))) return refuse(gateMsg);
+  }
+  if (!turnOrder.includes(targetId)) return refuse('❌ That target is not in this fight.');
+  if (targetId === actorId) return refuse('❌ You cannot target yourself.');
+  if (grappleHeldTargetOf(fight, actorId)) return refuse('🤼 You are already holding someone — `/fight release` first.');
+  if (grappleHolderOf(fight, actorId)) return refuse('🤼 You are held — `/fight escape`, or act on a flat d20.');
+  if (grappleHolderOf(fight, targetId)) return refuse('🤼 They are already held.');
+
+  const hpState = fightHp(fight);
+  const floor = fightFloor(fight);
+  if (hpState[targetId] !== undefined && hpState[targetId] <= floor) {
+    return refuse(floor > 0 ? '❌ That fighter has already yielded the bout.' : '❌ That target is already down.');
+  }
+
+  // A grapple attempt is an attack roll — the deflection and feint penalties
+  // clamp it too.
+  const offBalance = consumeFlatAtk(gid, cid, actorId) || consumeFooled(gid, cid, actorId);
+  clearRoundFlag(gid, cid, actorId);
+  if (await retrievalTurn(interaction.guild, gid, cid, actorId,
+      async (l) => interaction.reply({ content: l.join('\n') }))) {
+    return kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
+  }
+  const actor = await resolveFighter(interaction.guild, gid, actorId);
+  const targetF = await resolveFighter(interaction.guild, gid, targetId);
+  const statVal = offBalance ? 0 : (actor.stats.str ?? 0);
+  const sigRowA = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
+  mode = offBalance ? 'normal' : applySignatureMode(sigRowA, 'str', mode);
+  const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
+
+  const { nat, dropped } = rollD20Mode(mode);
+  const advNote = offBalance ? ' 🛡️ off-balance — flat d20' : mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '';
+  const total = nat + statVal;
+  const diceBit = dropped !== null ? `[${nat}~~${dropped}~~]` : `[${nat}]`;
+  const lineFor = (show) => `🤼  1d20${show ? '+STR' : ''}${advNote} → ${diceBit}${show ? modStr : ''} = ${fightTotalStr(total, nat, 20)}`;
+  const rollLine = lineFor(true);
+  const publicLine = (actor.isNpc && !npcStatsVisible(gid)) ? lineFor(false) : rollLine;
+  const targetName = targetF.name + (targetF.isNpc ? ' 🎭' : '');
+  const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
+  const actorCard = await fighterCharCard(interaction.guild, gid, actorId);
+
+  const headerLabel = `🤼 Attempts to grapple ${targetName}`;
+  const card = buildRollEmbed({
+    rollLine: publicLine, label: headerLabel, isReroll: false,
+    char: actorCard, healCharges: 0, maxCharges: 0,
+    flavour: flavour || null, total, critType, tags: null, gid,
+  });
+  const auditCard = actor.isNpc ? buildRollEmbed({
+    rollLine, label: headerLabel, isReroll: false,
+    char: actorCard, healCharges: 0, maxCharges: 0,
+    flavour: flavour || null, total, critType, tags: null, gid, reveal: true,
+  }) : null;
+  const autoOn = !!fight.auto_npc;
+  const saveHint = targetF.isNpc
+    ? (autoOn ? `🤖 **${targetF.name}** saves automatically...` : `🤼 A GM saves for **${targetF.name}** with \`/fight save npc:${targetF.name}\`.`)
+    : `🤼 <@${targetId}> — \`/fight save\` (STR only) to resist the hold.`;
+
+  upsertFight(gid, cid, {
+    phase: 'defend', current_target: targetId, atk_kind: 'grapple',
+    atk_roll: total, atk_nat: nat, atk_stat: 'str', atk_mode: mode, atk_sides: 20,
+    def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
+    atk_rerolled: 0, def_rerolled: 0,
+  });
+  if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'grapple STR');
+  let auditMsgId = null;
+  if (actor.isNpc) {
+    const npcMsg = await postAsNpc(chan, gid, actor.name, card);
+    auditMsgId = npcMsg?.id ?? null;
+    await chan.send(saveHint).catch(()=>{});
+    await interaction.reply({ content: `✅ Grappled as **${actor.name}**.`, ephemeral: true });
+  } else {
+    await interaction.reply({ content: `${card}\n\n${saveHint}` });
+  }
+  recordRoll(gid, { userId: uid, channelId: cid, interaction, messageId: auditMsgId,
+    kind: isNpcFighter(actorId) ? 'npcs' : null, card: auditCard,
+    input: `/fight grapple${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
+    context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 grapples ${targetF.name}` : `fight · grapples ${targetF.name}` });
+  if (autoOn && targetF.isNpc) {
+    await new Promise(r=>setTimeout(r,1200));
+    await runAutoNpcChain(interaction.guild, gid, cid, chan);
+  }
+  return;
+}
+
+// Deception — the feint. An attack-phase action, WIS-only, WIS 4+ gate,
+// PvE and PvP alike, no weapon needed. The required feint: text is the
+// declaration: what you pretend to do. A held fighter cannot feint.
+async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintText, mode, flavour }) {
+  const uid = interaction.user.id;
+  const refuse = (content) => interaction.reply({ content, ephemeral: true });
+  const chan = await interactionChannel(interaction);
+  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  const fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
+  if (isNpcFighter(actorId) && !(await isGm(interaction.guild, uid))) return refuse('❌ Only GMs can act as an NPC.');
+  {
+    const gate0 = deathGate(gid, actorId);
+    if (gate0) return refuse(gate0);
+  }
+  const turnOrder = fightOrder(fight);
+  if (turnOrder[fight.turn_index] !== actorId) {
+    const cur = await resolveFighter(interaction.guild, gid, turnOrder[fight.turn_index]);
+    return refuse(`⚠️ It's **${cur.name}**'s turn to attack.`);
+  }
+  if (fight.phase !== 'attack') return refuse(fight.atk_kind === 'feint'
+    ? '🎭 A feint is already pending — the target answers with `/fight insight`.'
+    : '❌ Waiting for defender to roll first.');
+  if (!isNpcFighter(actorId)) {
+    const gateMsg = sheetGate(gid, actorId);
+    if (gateMsg && !(await isGm(interaction.guild, uid))) return refuse(gateMsg);
+  }
+  if (!turnOrder.includes(targetId)) return refuse('❌ That target is not in this fight.');
+  if (targetId === actorId) return refuse('❌ You cannot target yourself.');
+  if (grappleHolderOf(fight, actorId)) return refuse('🤼 You are held — flat-d20 strikes or `/fight escape` only; no feinting from a hold.');
+
+  const actor = await resolveFighter(interaction.guild, gid, actorId);
+  const subjectRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
+  if ((actor.stats.wis ?? 0) < 4) return refuse('🎭 Deception needs **WIS 4+** — the mind has to be sharp.');
+  // A feint is an attack roll: the deflection trade-off and an earlier feint
+  // that fooled YOU both clamp it flat.
+  const flatFeint = consumeFlatAtk(gid, cid, actorId) || consumeFooled(gid, cid, actorId);
+  const targetF = await resolveFighter(interaction.guild, gid, targetId);
+
+  const hpState = fightHp(fight);
+  const floor = fightFloor(fight);
+  if (hpState[targetId] !== undefined && hpState[targetId] <= floor) {
+    return refuse(floor > 0 ? '❌ That fighter has already yielded the bout.' : '❌ That target is already down.');
+  }
+
+  const statVal = flatFeint ? 0 : (actor.stats.wis ?? 0);
+  mode = flatFeint ? 'normal' : applySignatureMode(subjectRow, 'wis', mode);
+  const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
+  const { nat, dropped } = rollD20Mode(mode);
+  const advNote = flatFeint ? ' 🎭 flat d20' : mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '';
+  const total = nat + statVal;
+  const diceBit = dropped !== null ? `[${nat}~~${dropped}~~]` : `[${nat}]`;
+  const lineFor = (show) => `🎭  1d20${show ? '+WIS' : ''}${advNote} → ${diceBit}${show ? modStr : ''} = ${fightTotalStr(total, nat, 20)}`;
+  const rollLine = lineFor(true);
+  const publicLine = (actor.isNpc && !npcStatsVisible(gid)) ? lineFor(false) : rollLine;
+  const targetName = targetF.name + (targetF.isNpc ? ' 🎭' : '');
+  const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
+  const actorCard = await fighterCharCard(interaction.guild, gid, actorId);
+
+  const headerLabel = `🎭 Feints at ${targetName}`;
+  const card = buildRollEmbed({
+    rollLine: publicLine, label: headerLabel, isReroll: false,
+    char: actorCard, healCharges: 0, maxCharges: 0,
+    flavour: flavour ? `${feintText} — ${flavour}` : feintText, total, critType, tags: null, gid,
+  });
+  const auditCard = actor.isNpc ? buildRollEmbed({
+    rollLine, label: headerLabel, isReroll: false,
+    char: actorCard, healCharges: 0, maxCharges: 0,
+    flavour: flavour ? `${feintText} — ${flavour}` : feintText, total, critType, tags: null, gid, reveal: true,
+  }) : null;
+  const autoOn = !!fight.auto_npc;
+  const insightHint = targetF.isNpc
+    ? (autoOn ? `🤖 **${targetF.name}** checks its insight automatically...` : `🎭 A GM rolls insight for **${targetF.name}** with \`/fight insight npc:${targetF.name}\`.`)
+    : `🎭 <@${targetId}> — \`/fight insight\` (WIS only) to see through it.`;
+
+  upsertFight(gid, cid, {
+    phase: 'defend', current_target: targetId, atk_kind: 'feint',
+    atk_roll: total, atk_nat: nat, atk_stat: 'wis', atk_mode: mode, atk_sides: 20,
+    def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
+    atk_rerolled: 0, def_rerolled: 0,
+  });
+  if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'feint WIS');
+  let auditMsgId = null;
+  if (actor.isNpc) {
+    const npcMsg = await postAsNpc(chan, gid, actor.name, card);
+    auditMsgId = npcMsg?.id ?? null;
+    await chan.send(insightHint).catch(()=>{});
+    await interaction.reply({ content: `✅ Feinted as **${actor.name}**.`, ephemeral: true });
+  } else {
+    await interaction.reply({ content: `${card}\n\n${insightHint}` });
+  }
+  recordRoll(gid, { userId: uid, channelId: cid, interaction, messageId: auditMsgId,
+    kind: isNpcFighter(actorId) ? 'npcs' : null, card: auditCard,
+    input: `/fight feint${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
+    context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 feints at ${targetF.name}` : `fight · feints at ${targetF.name}` });
+  if (autoOn && targetF.isNpc) {
+    await new Promise(r=>setTimeout(r,1200));
+    await runAutoNpcChain(interaction.guild, gid, cid, chan);
+  }
+  return;
+}
+
+async function runFightInsight({ interaction, gid, cid, actorId, mode }) {
+  const uid = interaction.user.id;
+  const refuse = (content) => interaction.reply({ content, ephemeral: true });
+  const chan = await interactionChannel(interaction);
+  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  const fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
+  if (fight.phase !== 'defend' || fight.atk_kind !== 'feint') return refuse('❌ No feint to see through.');
+  if (isNpcFighter(actorId) && !(await isGm(interaction.guild, uid))) return refuse('❌ Only GMs can act as an NPC.');
+  if (fight.current_target !== actorId) {
+    const t = await resolveFighter(interaction.guild, gid, fight.current_target);
+    return refuse(`⚠️ The feint is aimed at **${t.name}** — the insight is theirs.`);
+  }
+  const actor = await resolveFighter(interaction.guild, gid, actorId);
+  // Already fooled from an earlier feint? Even the insight rolls flat.
+  const fooledI = consumeFooled(gid, cid, actorId);
+  const statVal = fooledI ? 0 : (actor.stats.wis ?? 0);
+  const sigRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
+  mode = fooledI ? 'normal' : applySignatureMode(sigRow, 'wis', mode);
+  const { nat, dropped } = rollD20Mode(mode);
+  const total = nat + statVal;
+  const diceBit = dropped !== null ? `[${nat}~~${dropped}~~]` : `[${nat}]`;
+  const rollLine = `🎭  1d20${fooledI ? '' : '+WIS'} (insight)${fooledI ? ' 🎭 fooled — flat d20' : ''} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)}`;
+  if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'feint insight WIS');
+  recordRoll(gid, { userId: uid, channelId: cid, interaction,
+    kind: isNpcFighter(actorId) ? 'npcs' : null, card: null,
+    input: `/fight insight${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
+    context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 feint insight` : 'fight · feint insight' });
+  const r = await resolveFeintInsight(interaction.guild, gid, cid, fight, { nat, total, mode });
+  if (actor.isNpc) {
+    await sendLong(chan, r.lines);
+    await interaction.reply({ content: `✅ Insight rolled as **${actor.name}**.`, ephemeral: true });
+  } else {
+    await replyLong(interaction, r.lines);
+  }
+  await kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
+  return;
+}
+
+async function runFightGrappleSave({ interaction, gid, cid, actorId, mode }) {
+  const uid = interaction.user.id;
+  const refuse = (content) => interaction.reply({ content, ephemeral: true });
+  const chan = await interactionChannel(interaction);
+  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  const fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
+  if (fight.phase !== 'defend' || fight.atk_kind !== 'grapple') return refuse('❌ No grapple to save against.');
+  if (isNpcFighter(actorId) && !(await isGm(interaction.guild, uid))) return refuse('❌ Only GMs can act as an NPC.');
+  if (fight.current_target !== actorId) {
+    const t = await resolveFighter(interaction.guild, gid, fight.current_target);
+    return refuse(`⚠️ The grapple is on **${t.name}** — the save is theirs.`);
+  }
+  const actor = await resolveFighter(interaction.guild, gid, actorId);
+  const fooledR = consumeFooled(gid, cid, actorId);
+  const statVal = fooledR ? 0 : (actor.stats.str ?? 0);
+  const sigRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
+  mode = fooledR ? 'normal' : applySignatureMode(sigRow, 'str', mode);
+  const { nat, dropped } = rollD20Mode(mode);
+  const total = nat + statVal;
+  const diceBit = dropped !== null ? `[${nat}~~${dropped}~~]` : `[${nat}]`;
+  const rollLine = `🤼  1d20+STR (save) → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)}`;
+  if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'grapple save STR');
+  recordRoll(gid, { userId: uid, channelId: cid, interaction,
+    kind: isNpcFighter(actorId) ? 'npcs' : null, card: null,
+    input: `/fight save${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
+    context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 grapple save` : 'fight · grapple save' });
+  const r = await resolveGrappleSave(interaction.guild, gid, cid, fight, { nat, total, mode });
+  if (actor.isNpc) {
+    await sendLong(chan, r.lines);
+    await interaction.reply({ content: `✅ Saved as **${actor.name}**.`, ephemeral: true });
+  } else {
+    await replyLong(interaction, r.lines);
+  }
+  await kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
+  return;
+}
+
+async function runFightEscape({ interaction, gid, cid, actorId, mode }) {
+  const uid = interaction.user.id;
+  const refuse = (content) => interaction.reply({ content, ephemeral: true });
+  const chan = await interactionChannel(interaction);
+  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  const fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
+  if (isNpcFighter(actorId) && !(await isGm(interaction.guild, uid))) return refuse('❌ Only GMs can act as an NPC.');
+  const turnOrder = fightOrder(fight);
+  if (turnOrder[fight.turn_index] !== actorId) {
+    const cur = await resolveFighter(interaction.guild, gid, turnOrder[fight.turn_index]);
+    return refuse(`⚠️ It's **${cur.name}**'s turn.`);
+  }
+  if (fight.phase !== 'attack') return refuse('❌ Resolve the pending exchange first.');
+  const holderId = grappleHolderOf(fight, actorId);
+  if (!holderId) return refuse('🤼 You are not held — nothing to escape.');
+  clearRoundFlag(gid, cid, actorId);
+  {
+    const gate0 = deathGate(gid, actorId);
+    if (gate0) return refuse(gate0);
+  }
+  const actor = await resolveFighter(interaction.guild, gid, actorId);
+  const holderF = await resolveFighter(interaction.guild, gid, holderId);
+  const dc = holderF.stats.str ?? 0;   // as written: the grappler's Strength score
+  const fooledE = consumeFooled(gid, cid, actorId);
+  const statVal = fooledE ? 0 : (actor.stats.str ?? 0);
+  const sigRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
+  mode = fooledE ? 'normal' : applySignatureMode(sigRow, 'str', mode);
+  const { nat, dropped } = rollD20Mode(mode);
+  const total = nat + statVal;
+  const diceBit = dropped !== null ? `[${nat}~~${dropped}~~]` : `[${nat}]`;
+  const actorName = actor.name + (actor.isNpc ? ' 🎭' : '');
+  const holderName = holderF.name + (holderF.isNpc ? ' 🎭' : '');
+  const rollLine = `🤼  1d20+STR → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)} vs hold **${dc}**`;
+  if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'grapple escape STR');
+  recordRoll(gid, { userId: uid, channelId: cid, interaction,
+    kind: isNpcFighter(actorId) ? 'npcs' : null, card: null,
+    input: `/fight escape${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
+    context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 escape attempt` : 'fight · escape attempt' });
+
+  const hpState = fightHp(fight);
+  const floor = fightFloor(fight);
+  const gmap = fightGrapples(fight);
+  const lines = ['─────────────────────────────', '🤼  **Escape Attempt**', ''];
+  lines.push(`${actorName} (**STR**): ${rollLine.replace('🤼  ', '')}`);
+  lines.push('');
+  const freed = total >= dc;
+  if (freed) {
+    delete gmap[actorId];
+    setFightGrapples(gid, cid, gmap);
+    lines.push(`🔓 **${actorName}** breaks free of **${holderName}**!`);
+  } else {
+    lines.push(`⛓️ The hold holds — **${actorName}** needed **${dc}** or more.`);
+  }
+  // The turn is spent either way, and the strain lands either way.
+  const st = await applyTurnEndStrain(interaction.guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, actorId);
+  if (st.endedRet) {
+    await replyLong(interaction, st.endedRet.lines);
+    return announceFightEnd(interaction.guild, gid, cid, chan, st.endedRet.announce);
+  }
+  const order = st.order;
+  const shrunk = order.length !== turnOrder.length;
+  const nextIndex = nextStandingIndex(order, hpState, floor, shrunk ? fight.turn_index : fight.turn_index + 1);
+  await announceNextTurn(interaction.guild, gid, cid, lines, order, nextIndex);
+  upsertFight(gid, cid, { phase: 'attack', current_target: null, atk_kind: null,
+    atk_roll: null, atk_nat: null, atk_stat: null, def_roll: null, def_nat: null, def_stat: null,
+    atk_rerolled: 0, def_rerolled: 0,
+    turn_index: nextIndex, hp_state: JSON.stringify(hpState),
+    ...(shrunk ? { turn_order: JSON.stringify(order) } : {}) });
+
+  if (actor.isNpc) {
+    await sendLong(chan, lines);
+    await interaction.reply({ content: `✅ Escape rolled as **${actor.name}**.`, ephemeral: true });
+  } else {
+    await replyLong(interaction, lines);
+  }
+  await kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
+  return;
+}
+
+// A knockout inside a special defence (deflect redirect, deflect failure,
+// disarm failure): purge holds, shrink the roster, end the fight if only one
+// stands. Returns { order, endedRet } like the strain helper.
+async function knockoutFromSpecial(guild, gid, cid, fight, hpState, order, roster, floor, lines, fid, nm) {
+  const W = fightWords(floor);
+  lines.push('', `${W.icon} **${nm}** ${W.out}! HP: **${hpState[fid]}**`);
+  const gmap = fightGrapples(fight);
+  let changed = false;
+  for (const [t, h] of Object.entries(gmap)) if (t === fid || h === fid) { delete gmap[t]; changed = true; }
+  if (changed) { lines.push(`🤼 The hold involving **${nm}** breaks.`); setFightGrapples(gid, cid, gmap); }
+  const shrunk = order.filter(id => id !== fid);
+  if (shrunk.length <= 1) {
+    return { order: shrunk, endedRet: await buildFightEnd(guild, gid, cid, lines, hpState, roster, floor, shrunk[0]) };
+  }
+  return { order: shrunk };
+}
+
+// After a slash-side resolution: if the fight is on auto-pilot and the turn
+// now sits with an NPC, resume the chain. Never called from the auto side
+// (the loop handles its own succession), so no call cycle.
+async function kickAutoIfNpcTurn(guild, gid, cid, channel) {
+  const f = getFight(gid, cid);
+  if (f?.auto_npc && isNpcFighter(fightOrder(f)[f.turn_index])) {
+    await new Promise(r=>setTimeout(r,1200));
+    await runAutoNpcChain(guild, gid, cid, channel);
+  }
+}
+
+// A disarmed fighter's turn is spent retrieving the weapon. Consumes the flag
+// and the turn; returns true if it did.
+async function retrievalTurn(guild, gid, cid, actorId, deliver) {
+  if (!consumeEffectFlag(gid, cid, actorId, 'disarmed')) return false;
+  const fight = getFight(gid, cid);
+  const turnOrder = fightOrder(fight);
+  const hpState = fightHp(fight);
+  const floor = fightFloor(fight);
+  const F = await resolveFighter(guild, gid, actorId);
+  const lines = [`⚔️ **${F.name}${F.isNpc ? ' 🎭' : ''}** spends the turn retrieving their weapon.`];
+  const nextIndex = nextStandingIndex(turnOrder, hpState, floor, fight.turn_index + 1);
+  await announceNextTurn(guild, gid, cid, lines, turnOrder, nextIndex);
+  upsertFight(gid, cid, { phase: 'attack', current_target: null, atk_kind: null,
+    atk_roll: null, atk_nat: null, atk_stat: null, def_roll: null, def_nat: null, def_stat: null,
+    atk_rerolled: 0, def_rerolled: 0, turn_index: nextIndex });
+  await deliver(lines);
+  return true;
+}
+
+// Shield Deflection: a defend-phase alternative for players facing a PvE
+// strike. STR 4+ and a shield required; a natural-20 strike cannot be turned;
+// once per round (the flag clears when your own turn comes). Exceed the
+// attack roll and the blow is turned — optionally into another enemy for 1
+// damage with full down handling. Fall short and it lands on you for 1.
+// Either way your next attack roll is a flat d20, the attacker's turn ends
+// (a held attacker still pays strain), and the fight advances.
+async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId, mode, flavour }) {
+  const uid = interaction.user.id;
+  const refuse = (content) => interaction.reply({ content, ephemeral: true });
+  const chan = await interactionChannel(interaction);
+  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  const fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
+  if (fight.phase !== 'defend') return refuse('❌ No attack to deflect — nothing is pending.');
+  if (fight.atk_kind === 'grapple') return refuse('🤼 A grapple cannot be deflected — answer with `/fight save`.');
+  if (fight.atk_kind === 'feint') return refuse('🎭 A feint cannot be deflected — answer with `/fight insight`.');
+  if (fight.current_target !== uid) {
+    const t = await resolveFighter(interaction.guild, gid, fight.current_target);
+    return refuse(`⚠️ The attack is on **${t.name}** — the deflection is theirs.`);
+  }
+  const turnOrder = fightOrder(fight);
+  const attackerId = turnOrder[fight.turn_index];
+  if (!isNpcFighter(attackerId)) return refuse('🛡️ Deflection works against PvE enemies only — not another player\'s strike.');
+  if (fight.atk_nat === 20) return refuse('🛡️ A **natural 20** cannot be deflected — brace with `/fight def` instead.');
+  {
+    const gate0 = deathGate(gid, uid);
+    if (gate0) return refuse(gate0);
+  }
+  const subject = getChar(gid, uid);
+  if (!hasShieldEquipped(subject)) return refuse('🛡️ Deflection needs a **shield** equipped (any type).');
+  if ((subject?.str ?? 0) < 4) return refuse('🛡️ Deflection needs **STR 4+** to hold the shield — whichever stat rolls.');
+  {
+    const fx = JSON.parse(fight.effect_state || '{}');
+    if (fx[uid]?.deflected) return refuse('🛡️ Already deflected this round — it clears when your turn comes.');
+  }
+
+  const actor = await resolveFighter(interaction.guild, gid, uid);
+  const attackerF = await resolveFighter(interaction.guild, gid, attackerId);
+  const actorName = actor.name;
+  const attackerName = attackerF.name + ' 🎭';
+
+  // The redirect target, if named, must be a standing enemy other than the attacker.
+  const hpState = fightHp(fight);
+  const floor = fightFloor(fight);
+  let redirectF = null;
+  if (redirectId) {
+    if (!isNpcFighter(redirectId)) return refuse('🛡️ Redirect into an **enemy** — pick an NPC.');
+    if (redirectId === attackerId) return refuse('🛡️ Redirect it into **another** enemy, not the one who swung.');
+    if (!turnOrder.includes(redirectId)) return refuse('❌ That enemy is not in this fight.');
+    if (hpState[redirectId] !== undefined && hpState[redirectId] <= floor) {
+      return refuse(floor > 0 ? '❌ That enemy has already yielded the bout.' : '❌ That enemy is already down.');
+    }
+    redirectF = await resolveFighter(interaction.guild, gid, redirectId);
+  }
+
+  const fooledD = consumeFooled(gid, cid, uid);
+  const statVal = fooledD ? 0 : (actor.stats[stat] ?? 0);
+  mode = fooledD ? 'normal' : applySignatureMode(subject, stat, mode);
+  const { nat, dropped } = rollD20Mode(mode);
+  const total = nat + statVal;
+  const diceBit = dropped !== null ? `[${nat}~~${dropped}~~]` : `[${nat}]`;
+  const advNote = mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '';
+  const rollLine = `🛡️  1d20+${STAT_LABELS[stat]}${advNote} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)} vs atk **${fight.atk_roll}**`;
+  saveRoll(gid, cid, uid, `1d20+${statVal}`, `shield deflection ${STAT_LABELS[stat]}`);
+  recordRoll(gid, { userId: uid, channelId: cid, interaction,
+    kind: null, card: null,
+    input: '/fight deflect', rollLine, nat, sides: 20,
+    context: `fight · shield deflection vs ${attackerF.name}` });
+
+  const lines = ['─────────────────────────────', '🛡️  **Shield Deflection**', ''];
+  if (flavour) lines.push(`_${flavour}_`, '');
+  lines.push(`${attackerName} attacks: ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
+  lines.push(`**${actorName}** (**${STAT_LABELS[stat]}**): ${rollLine.replace('🛡️  ', '')}`);
+  lines.push('');
+
+  let order = [...turnOrder];
+  const downFromDeflect = async (fid, nm) => {
+    const r = await knockoutFromSpecial(interaction.guild, gid, cid, fight, hpState, order, turnOrder, floor, lines, fid, nm);
+    order = r.order;
+    return r.endedRet ?? null;
+  };
+  const deflected = total > fight.atk_roll;   // must EXCEED the attack roll
+  if (deflected) {
+    if (redirectF) {
+      const rName = redirectF.name + ' 🎭';
+      const prevR = hpState[redirectId] ?? 0;
+      const nhR = applyFightDamage(prevR, 1, floor);
+      hpState[redirectId] = nhR; setFighterHp(gid, redirectId, nhR);
+      lines.push(`🛡️ **${actorName}** turns the blow aside — and into **${rName}** for **1** damage!`);
+      lines.push(hpChangeLine(gid, true, redirectF.name, prevR, nhR, redirectF.maxHp, floor));
+      if (nhR <= floor) {
+        const end = await downFromDeflect(redirectId, rName);
+        if (end) {
+          markDeflectUsed(gid, cid, uid);
+          await replyLong(interaction, end.lines);
+          return announceFightEnd(interaction.guild, gid, cid, chan, end.announce);
+        }
+      }
+    } else {
+      lines.push(`🛡️ **${actorName}** turns the blow aside — it strikes nothing.`);
+    }
+  } else {
+    const prev = hpState[uid] ?? 0;
+    const nh = applyFightDamage(prev, 1, floor);
+    hpState[uid] = nh; setFighterHp(gid, uid, nh);
+    lines.push(`💥 The shield is beaten aside — **${actorName}** takes **1** damage.`);
+    lines.push(hpChangeLine(gid, false, actor.name, prev, nh, actor.maxHp, floor));
+    if (nh <= floor) {
+      const end = await downFromDeflect(uid, actorName);
+      if (end) {
+        markDeflectUsed(gid, cid, uid);
+        await replyLong(interaction, end.lines);
+        return announceFightEnd(interaction.guild, gid, cid, chan, end.announce);
+      }
+    }
+  }
+  lines.push('', `_🛡️ Trade-off: **${actorName}**'s next attack roll is a flat d20._`);
+
+  // The attacker's turn ends — a held attacker still pays the strain.
+  const aiBefore = order.indexOf(attackerId);
+  const st = await applyTurnEndStrain(interaction.guild, gid, cid, hpState, order, turnOrder, floor, lines, attackerId);
+  if (st.endedRet) {
+    markDeflectUsed(gid, cid, uid);
+    await replyLong(interaction, st.endedRet.lines);
+    return announceFightEnd(interaction.guild, gid, cid, chan, st.endedRet.announce);
+  }
+  order = st.order;
+  const ai = order.indexOf(attackerId);
+  const from = ai >= 0 ? ai + 1 : aiBefore;
+  const nextIndex = nextStandingIndex(order, hpState, floor, from);
+  await announceNextTurn(interaction.guild, gid, cid, lines, order, nextIndex);
+  const shrunkOrder = order.length !== turnOrder.length;
+  upsertFight(gid, cid, { phase: 'attack', current_target: null, atk_kind: null,
+    atk_roll: null, atk_nat: null, atk_stat: null, def_roll: null, def_nat: null, def_stat: null,
+    atk_rerolled: 0, def_rerolled: 0,
+    turn_index: nextIndex, hp_state: JSON.stringify(hpState),
+    ...(shrunkOrder ? { turn_order: JSON.stringify(order) } : {}) });
+  markDeflectUsed(gid, cid, uid);
+  await replyLong(interaction, lines);
+  await kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
+  return;
+}
+
+// Both deflection after-effects in one write: the once-per-round flag and the
+// flat next attack.
+const markDeflectUsed = (gid, cid, fid) => markRoundSpecial(gid, cid, fid, 'deflected', 'flatAtk');
+
+// Disarming: a defend-phase alternative for players facing a PvE strike.
+// DEX 4+ and a blade required; once per round; PvE only. Exceed the attack
+// roll and the enemy is disarmed — zero damage, their next turn spent
+// retrieving (see retrievalTurn). Fall short and the strike lands on you
+// for 1. Either way your next DEFENCE roll is a flat d20 (the flatDef flag,
+// consumed by both manual and auto defence). The spec sets no crit
+// exception here, so a natural 20 may be disarmed — as written.
+async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
+  const uid = interaction.user.id;
+  const refuse = (content) => interaction.reply({ content, ephemeral: true });
+  const chan = await interactionChannel(interaction);
+  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  const fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
+  if (fight.phase !== 'defend') return refuse('❌ No attack to disarm — nothing is pending.');
+  if (fight.atk_kind === 'grapple') return refuse('🤼 A grapple cannot be disarmed — answer with `/fight save`.');
+  if (fight.atk_kind === 'feint') return refuse('🎭 A feint cannot be disarmed — answer with `/fight insight`.');
+  if (fight.current_target !== uid) {
+    const t = await resolveFighter(interaction.guild, gid, fight.current_target);
+    return refuse(`⚠️ The attack is on **${t.name}** — the disarm is theirs.`);
+  }
+  const turnOrder = fightOrder(fight);
+  const attackerId = turnOrder[fight.turn_index];
+  if (!isNpcFighter(attackerId)) return refuse('⚔️ Disarming works against PvE enemies only — not another player\'s strike.');
+  {
+    const gate0 = deathGate(gid, uid);
+    if (gate0) return refuse(gate0);
+  }
+  const subject = getChar(gid, uid);
+  if (!hasBladeEquipped(subject)) return refuse('⚔️ Disarming needs a **blade** equipped — maces, shields and firearms can\'t do it.');
+  if ((subject?.dex ?? 0) < 4) return refuse('⚔️ Disarming needs **DEX 4+** — the hands have to be quick.');
+  {
+    const fx = JSON.parse(fight.effect_state || '{}');
+    if (fx[uid]?.disarmUsed) return refuse('⚔️ Already attempted a disarm this round — it clears when your turn comes.');
+  }
+
+  const actor = await resolveFighter(interaction.guild, gid, uid);
+  const attackerF = await resolveFighter(interaction.guild, gid, attackerId);
+  const actorName = actor.name;
+  const attackerName = attackerF.name + ' 🎭';
+  const hpState = fightHp(fight);
+  const floor = fightFloor(fight);
+
+  const fooledDi = consumeFooled(gid, cid, uid);
+  const statVal = fooledDi ? 0 : (actor.stats.dex ?? 0);
+  mode = fooledDi ? 'normal' : applySignatureMode(subject, 'dex', mode);
+  const { nat, dropped } = rollD20Mode(mode);
+  const total = nat + statVal;
+  const diceBit = dropped !== null ? `[${nat}~~${dropped}~~]` : `[${nat}]`;
+  const advNote = mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '';
+  const rollLine = `⚔️  1d20+DEX${advNote} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)} vs atk **${fight.atk_roll}**`;
+  saveRoll(gid, cid, uid, `1d20+${statVal}`, 'weapon disarm DEX');
+  recordRoll(gid, { userId: uid, channelId: cid, interaction,
+    kind: null, card: null,
+    input: '/fight disarm', rollLine, nat, sides: 20,
+    context: `fight · weapon disarm vs ${attackerF.name}` });
+
+  const lines = ['─────────────────────────────', '⚔️  **Disarming Attempt**', ''];
+  if (flavour) lines.push(`_${flavour}_`, '');
+  lines.push(`${attackerName} attacks: ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
+  lines.push(`**${actorName}** (**DEX**): ${rollLine.replace('⚔️  ', '')}`);
+  lines.push('');
+
+  let order = [...turnOrder];
+  const disarmed = total > fight.atk_roll;   // must EXCEED the attack roll
+  if (disarmed) {
+    setEffectFlag(gid, cid, attackerId, 'disarmed');
+    lines.push(`⚔️ The blade spins from **${attackerName}**'s grip — **no damage**, and their next turn is spent retrieving it!`);
+  } else {
+    const prev = hpState[uid] ?? 0;
+    const nh = applyFightDamage(prev, 1, floor);
+    hpState[uid] = nh; setFighterHp(gid, uid, nh);
+    lines.push(`💥 The parry misses the wrist — **${actorName}** takes **1** damage.`);
+    lines.push(hpChangeLine(gid, false, actor.name, prev, nh, actor.maxHp, floor));
+    if (nh <= floor) {
+      const r = await knockoutFromSpecial(interaction.guild, gid, cid, fight, hpState, order, turnOrder, floor, lines, uid, actorName);
+      order = r.order;
+      if (r.endedRet) {
+        markDisarmUsed(gid, cid, uid);
+        await replyLong(interaction, r.endedRet.lines);
+        return announceFightEnd(interaction.guild, gid, cid, chan, r.endedRet.announce);
+      }
+    }
+  }
+  lines.push('', `_⚔️ Trade-off: **${actorName}**'s next defence roll is a flat d20._`);
+
+  // The attacker's turn ends — a held attacker still pays the strain.
+  const aiBefore = order.indexOf(attackerId);
+  const st = await applyTurnEndStrain(interaction.guild, gid, cid, hpState, order, turnOrder, floor, lines, attackerId);
+  if (st.endedRet) {
+    markDisarmUsed(gid, cid, uid);
+    await replyLong(interaction, st.endedRet.lines);
+    return announceFightEnd(interaction.guild, gid, cid, chan, st.endedRet.announce);
+  }
+  order = st.order;
+  const ai = order.indexOf(attackerId);
+  const from = ai >= 0 ? ai + 1 : aiBefore;
+  const nextIndex = nextStandingIndex(order, hpState, floor, from);
+  await announceNextTurn(interaction.guild, gid, cid, lines, order, nextIndex);
+  const shrunkOrder = order.length !== turnOrder.length;
+  upsertFight(gid, cid, { phase: 'attack', current_target: null, atk_kind: null,
+    atk_roll: null, atk_nat: null, atk_stat: null, def_roll: null, def_nat: null, def_stat: null,
+    atk_rerolled: 0, def_rerolled: 0,
+    turn_index: nextIndex, hp_state: JSON.stringify(hpState),
+    ...(shrunkOrder ? { turn_order: JSON.stringify(order) } : {}) });
+  markDisarmUsed(gid, cid, uid);
+  await replyLong(interaction, lines);
+  await kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
+  return;
+}
+
+async function runFightRelease({ interaction, gid, cid, actorId, forceTargetId = null }) {
+  const refuse = (content) => interaction.reply({ content, ephemeral: true });
+  const chan = await interactionChannel(interaction);
+  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  const fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
+  const gmap = fightGrapples(fight);
+  let heldId, holderId;
+  if (forceTargetId) {
+    heldId = forceTargetId;
+    holderId = gmap[heldId];
+    if (!holderId) return refuse('🤼 They are not held.');
+  } else {
+    heldId = grappleHeldTargetOf(fight, actorId);
+    if (!heldId) return refuse('🤼 You are not holding anyone.');
+    holderId = actorId;
+  }
+  delete gmap[heldId];
+  setFightGrapples(gid, cid, gmap);
+  const holderF = await resolveFighter(interaction.guild, gid, holderId);
+  const heldF = await resolveFighter(interaction.guild, gid, heldId);
+  const line = `🖐️ **${holderF.name}${holderF.isNpc ? ' 🎭' : ''}** releases **${heldF.name}${heldF.isNpc ? ' 🎭' : ''}** — a free action; the turn stands.`;
+  if (forceTargetId || isNpcFighter(actorId)) {
+    await chan.send(line).catch(()=>{});
+    return interaction.reply({ content: '✅ Released.', ephemeral: true });
+  }
+  return interaction.reply({ content: line });
+}
+
 async function handleFight(interaction) {
   const sub = interaction.options.getSubcommand();
   const gid = interaction.guild.id;
@@ -10087,7 +11292,8 @@ async function handleFight(interaction) {
       lines.push('', `🎯 **${ordered[0].name}** goes first!${turnPrompt(ordered[0])}${turnPing(gid, ordered[0])}`);
       upsertFight(gid, cid, {
         state: 'active', turn_order: JSON.stringify(turnOrder), turn_index: 0,
-        phase: 'attack', current_target: null,
+        phase: 'attack', current_target: null, atk_kind: null,
+        grapples: '{}', effect_state: '{}',
         atk_roll: null, atk_nat: null, atk_stat: null,
         def_roll: null, def_nat: null, def_stat: null,
         hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState),
@@ -10212,6 +11418,12 @@ async function handleFight(interaction) {
     const newOrder = turnOrder.filter(id => id !== fid);
     delete hpState[fid]; delete rrState[fid];
     clearEffects(gid, cid, fid);
+    {
+      const gmap = fightGrapples(fight);
+      let kchanged = false;
+      for (const [t, h] of Object.entries(gmap)) if (t === fid || h === fid) { delete gmap[t]; kchanged = true; }
+      if (kchanged) setFightGrapples(gid, cid, gmap);
+    }
     const lines = [`👢 **${f.name}${f.isNpc ? ' 🎭' : ''}** has been removed from the fight.`];
 
     if (newOrder.length <= 1) {
@@ -10420,7 +11632,8 @@ async function handleFight(interaction) {
       const rrState = {}; for (const fid of fighters) if (F[fid].isNpc) rrState[fid] = Math.max(0, F[fid].stats.lck ?? 0);
       upsertFight(gid, cid, {
         state: 'active', turn_order: JSON.stringify(order), turn_index: 0,
-        phase: 'attack', current_target: null,
+        phase: 'attack', current_target: null, atk_kind: null,
+        grapples: '{}', effect_state: '{}',
         atk_roll: null, atk_nat: null, atk_stat: null,
         def_roll: null, def_nat: null, def_stat: null,
         hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState), auto_npc: 1,
@@ -10718,6 +11931,8 @@ async function handleFight(interaction) {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
     if (fight.phase !== 'defend') return interaction.reply({ content: '❌ No attack to defend against yet.', ephemeral: true });
+    if (fight.atk_kind === 'grapple') return interaction.reply({ content: '🤼 That is a grapple — answer with `/fight save` (STR only).', ephemeral: true });
+    if (fight.atk_kind === 'feint') return interaction.reply({ content: '🎭 That is a feint — answer with `/fight insight` (WIS only).', ephemeral: true });
 
     const npcActAs = interaction.options.getString('npc'); // GM defending as an NPC
     const targetId = fight.current_target;
@@ -10749,8 +11964,8 @@ async function handleFight(interaction) {
       if (refusal) return interaction.reply({ content: refusal, ephemeral: true });
     }
     const statVal = defender.stats[stat] ?? 0;
-    // A previous nat-1 attack forces this defence to be a flat d20 (no stat, no adv/dis).
-    const flat = consumeFlatDef(gid, cid, defenderId);
+    // A previous nat-1 attack — or a feint that fooled you — forces a flat d20.
+    const flat = consumeFlatDef(gid, cid, defenderId) || consumeFooled(gid, cid, defenderId);
     // Hero signature advantage (ignored when the roll is forced flat)
     const sigRowD = isNpcFighter(defenderId) ? getNpc(gid, npcNameFromFighter(defenderId)) : getChar(gid, defenderId);
     if (!flat) mode = applySignatureMode(sigRowD, stat, mode);
@@ -10814,6 +12029,92 @@ async function handleFight(interaction) {
   }
 
   // ── REROLLS ────────────────────────────────────────────────────────────────
+  if (sub === 'feint') {
+    const npcActAs = interaction.options.getString('npc');
+    let actorId = interaction.user.id;
+    if (npcActAs) {
+      if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can act as an NPC.', ephemeral: true });
+      actorId = npcFighterId(npcActAs);
+    }
+    const tUser = interaction.options.getUser('target');
+    const tNpc = interaction.options.getString('target_npc');
+    if (!tUser && !tNpc) return interaction.reply({ content: '❌ Name a target — `target:@player` or `target_npc:Name`.', ephemeral: true });
+    const targetId = tNpc ? npcFighterId(tNpc) : tUser.id;
+    const feintText = interaction.options.getString('feint');
+    const mode = interaction.options.getString('roll') || 'normal';
+    const flavour = interaction.options.getString('flavour');
+    return runFightFeint({ interaction, gid, cid, actorId, targetId, feintText, mode, flavour });
+  }
+  if (sub === 'insight') {
+    const npcActAs = interaction.options.getString('npc');
+    let actorId = interaction.user.id;
+    if (npcActAs) {
+      if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can act as an NPC.', ephemeral: true });
+      actorId = npcFighterId(npcActAs);
+    }
+    const mode = interaction.options.getString('roll') || 'normal';
+    return runFightInsight({ interaction, gid, cid, actorId, mode });
+  }
+  if (sub === 'disarm') {
+    const mode = interaction.options.getString('roll') || 'normal';
+    const flavour = interaction.options.getString('flavour');
+    return runFightDisarm({ interaction, gid, cid, mode, flavour });
+  }
+  if (sub === 'deflect') {
+    const redirectNpc = interaction.options.getString('redirect_npc');
+    const stat = interaction.options.getString('stat') || 'str';
+    const mode = interaction.options.getString('roll') || 'normal';
+    const flavour = interaction.options.getString('flavour');
+    return runFightDeflect({ interaction, gid, cid, stat,
+      redirectId: redirectNpc ? npcFighterId(redirectNpc) : null, mode, flavour });
+  }
+  if (sub === 'grapple') {
+    const npcActAs = interaction.options.getString('npc');
+    let actorId = interaction.user.id;
+    if (npcActAs) {
+      if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can act as an NPC.', ephemeral: true });
+      actorId = npcFighterId(npcActAs);
+    }
+    const tUser = interaction.options.getUser('target');
+    const tNpc = interaction.options.getString('target_npc');
+    if (!tUser && !tNpc) return interaction.reply({ content: '❌ Name a target — `target:@player` or `target_npc:Name`.', ephemeral: true });
+    const targetId = tNpc ? npcFighterId(tNpc) : tUser.id;
+    const mode = interaction.options.getString('roll') || 'normal';
+    const flavour = interaction.options.getString('flavour');
+    return runFightGrapple({ interaction, gid, cid, actorId, targetId, mode, flavour });
+  }
+  if (sub === 'save') {
+    const npcActAs = interaction.options.getString('npc');
+    let actorId = interaction.user.id;
+    if (npcActAs) {
+      if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can act as an NPC.', ephemeral: true });
+      actorId = npcFighterId(npcActAs);
+    }
+    const mode = interaction.options.getString('roll') || 'normal';
+    return runFightGrappleSave({ interaction, gid, cid, actorId, mode });
+  }
+  if (sub === 'escape') {
+    const npcActAs = interaction.options.getString('npc');
+    let actorId = interaction.user.id;
+    if (npcActAs) {
+      if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can act as an NPC.', ephemeral: true });
+      actorId = npcFighterId(npcActAs);
+    }
+    const mode = interaction.options.getString('roll') || 'normal';
+    return runFightEscape({ interaction, gid, cid, actorId, mode });
+  }
+  if (sub === 'release') {
+    const npcActAs = interaction.options.getString('npc');
+    const tUser = interaction.options.getUser('target');
+    const tNpc = interaction.options.getString('target_npc');
+    let actorId = interaction.user.id;
+    if (npcActAs || tUser || tNpc) {
+      if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can release as an NPC or part someone else\'s hold.', ephemeral: true });
+      if (npcActAs) actorId = npcFighterId(npcActAs);
+    }
+    const forceTargetId = tNpc ? npcFighterId(tNpc) : (tUser ? tUser.id : null);
+    return runFightRelease({ interaction, gid, cid, actorId, forceTargetId });
+  }
   if (sub === 'rr') {
     let fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
@@ -10848,7 +12149,9 @@ async function handleFight(interaction) {
     const effMod = (origTotal != null && origNat != null) ? (origTotal - origNat) : rawStat;
     // A flat-d20 defence has mod 0 while the fighter's stat is non-zero — keep it flat
     // (no stat, no advantage/disadvantage) on the reroll too.
-    const isFlat = !isAttacker && effMod === 0 && rawStat !== 0;
+    // A flat roll (fumbled defence, restrained/off-balance/fooled attack) stays
+    // flat on the reroll: mod 0 while the fighter's real stat is non-zero.
+    const isFlat = effMod === 0 && rawStat !== 0;
     const bonus = isAttacker ? Math.max(0, effMod - rawStat) : 0; // riposte carried into the reroll
     const effMode = isFlat ? 'normal' : mode;
     const modStr = isFlat ? '' : (effMod > 0 ? ` +${effMod}` : effMod < 0 ? ` ${effMod}` : '');
@@ -10927,9 +12230,16 @@ async function handleFight(interaction) {
     const name = member?.nickname || member?.user.username || uid;
     const hpState = fightHp(fight);
 
-    // HP state preserved as-is
+    // HP state preserved as-is; any hold they were part of breaks with them.
     const newOrder = turnOrder.filter(id => id !== uid);
     const lines = [`🏳️ **${name}** forfeits the fight! Their HP remains at **${hpState[uid] ?? 0}**.`];
+    {
+      const gmap = fightGrapples(fight);
+      let changed = false;
+      for (const [t, h] of Object.entries(gmap)) if (t === uid || h === uid) { delete gmap[t]; changed = true; }
+      if (changed) { lines.push(`🤼 The hold involving **${name}** breaks.`); setFightGrapples(gid, cid, gmap); }
+    }
+    clearEffects(gid, cid, uid);
 
     let ffAnnounce = null;
     if (newOrder.length <= 1) {
@@ -11074,89 +12384,6 @@ async function handleFight(interaction) {
   }
 }
 
-async function handleSlashRoll(interaction) {
-  {
-    // Every other roll path already refuses the fallen; this one was missed.
-    const gate0 = sheetGate(interaction.guild.id, interaction.user.id);
-    if (gate0) return interaction.reply({ content: gate0, ephemeral: true });
-  }
-  const gid = interaction.guild.id;
-  const uid = interaction.user.id;
-  const rollType = interaction.options.getString('roll') ?? 'normal';
-  const notation = interaction.options.getString('notation');
-  const label = interaction.options.getString('label') ?? null;
-  const flavour = interaction.options.getString('flavour') ?? null;
-  const successCheck = interaction.options.getBoolean('success') ?? false;
-
-  const isReroll = rollType === 'rr' || rollType === 'rra' || rollType === 'rrd';
-  const mode = rollType === 'adv' || rollType === 'rra' ? 'adv'
-             : rollType === 'dis' || rollType === 'rrd' ? 'dis'
-             : 'normal';
-
-  let finalNotation = notation;
-  let finalLabel = label;
-  let finalFlavour = flavour;
-
-  if (isReroll) {
-    const last = getLastRoll(gid, interactionChannelId(interaction), uid);
-    if (!last) return interaction.reply({ content: '❌ No previous roll found in this channel.', ephemeral: true });
-    const char = getChar(gid, uid);
-    if (!char || char.rerolls_current <= 0) return interaction.reply({ content: '❌ No rerolls remaining.', ephemeral: true });
-    upsertChar(gid, uid, { rerolls_current: char.rerolls_current - 1 });
-    finalNotation = last.notation;
-    finalLabel = label || last.label;
-  } else {
-    // Stat quick roll
-    if (notation && ['str','con','dex','wis','lck'].includes(notation.toLowerCase())) {
-      const char = getChar(gid, uid);
-      const statVal = char?.[notation.toLowerCase()] ?? 0;
-      finalNotation = `1d20+${statVal}`;
-      finalLabel = label || notation.toLowerCase();
-    } else if (!notation) {
-      return interaction.reply({ content: '❌ Please provide a dice notation e.g. 1d20+5', ephemeral: true });
-    }
-  }
-
-  let result;
-  if (mode === 'adv') result = rollAdvantage(finalNotation);
-  else if (mode === 'dis') result = rollDisadvantage(finalNotation);
-  else result = rollNotation(finalNotation);
-
-  if (!result) return interaction.reply({ content: '❌ Could not parse dice notation.', ephemeral: true });
-
-  saveRoll(gid, interactionChannelId(interaction), uid, finalNotation, finalLabel);
-  const critType = detectCrit(result, mode);
-  const naturalRoll = mode === 'normal' ? result.rolls?.[0] : result.chosen;
-  const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides ?? 20) : null;
-  const rollLine = buildRollLine(result, mode, critType, successResult);
-  recordRoll(gid, { userId: uid, channelId: interactionChannelId(interaction), interaction, result,
-    input: `/dr ${finalNotation}${finalLabel ? ' ' + finalLabel : ''}`, rollLine,
-    context: successCheck ? 'success check' : null });
-
-  // Build flavour lines
-  let cleanFlavour = null;
-  if (finalFlavour) {
-    cleanFlavour = finalFlavour.split('\n').map(l => l.trim()).filter(l => l.length > 0).join('\n\n');
-  }
-
-  const char = getChar(gid, uid);
-  const profileEnabled = char ? cardMode(char) !== CARD_OFF : false;
-  let content;
-  if (profileEnabled && char) {
-    const cfg = getConfig(gid);
-    const maxCharges = cfg.heal_charges ?? 3;
-    const healRow = getHealCharges(gid, uid, maxCharges);
-    const tags = getPlayerTags(gid, uid);
-    let displayName = interaction.user.username;
-    try { const m = await interaction.guild.members.fetch(uid); displayName = m.nickname || m.user.username; } catch {}
-    content = buildRollEmbed({ rollLine, label: finalLabel, isReroll, char: { ...char, displayName }, healCharges: healRow.current, maxCharges, flavour: cleanFlavour, total: result.total, critType, tags, gid });
-  } else {
-    content = buildPlainRoll({ rollLine, label: finalLabel, isReroll, flavour: cleanFlavour, total: result.total, critType });
-  }
-
-  await interaction.reply({ content });
-}
-
 // ─────────────────────────────────────────────
 //  NPC SYSTEM
 // ─────────────────────────────────────────────
@@ -11289,7 +12516,7 @@ async function handleNpc(interaction) {
         ? '\n📋 Some stats still unset (showing as 0) — fill them in later with `/npc create`.'
         : '';
     const unlistedNote = unlisted.length
-      ? `\n📝 ${unlisted.map(w => `**${w}**`).join(' and ')} ${unlisted.length === 1 ? 'is' : 'are'} not on the weapon list, so ${unlisted.length === 1 ? 'it restricts' : 'they restrict'} nothing. \`/weapon add\` to give ${unlisted.length === 1 ? 'it' : 'them'} stat rules.`
+      ? `\n📝 ${unlisted.map(w => `**${w}**`).join(' and ')} ${unlisted.length === 1 ? 'is' : 'are'} not on the weapon list, so ${unlisted.length === 1 ? 'it restricts' : 'they restrict'} nothing. \`/char weapon add\` to give ${unlisted.length === 1 ? 'it' : 'them'} stat rules.`
       : '';
     await interaction.reply({ content: `✅ NPC **${name}** ${existed ? 'updated' : 'created'}.${orderLine}${statNote}${unlistedNote}\n💡 Upload an image to the NPC channel with \`${name}\` as the message text to set their avatar.` });
     registerSlashCommands(gid).catch(console.error);
@@ -11518,7 +12745,7 @@ async function handlePr(interaction) {
     ].join('\n');
     recordRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction, result,
       kind: 'npcs', card: auditCard,
-      input: `/pr reroll ${last.notation}${last.label ? ' ' + last.label : ''}`,
+      input: `/npc reroll ${last.notation}${last.label ? ' ' + last.label : ''}`,
       rollLine: buildRollLine(result, mode, critType, null),
       context: `as NPC **${npc.name}** · reroll` });
     const lines = [];
@@ -11665,7 +12892,7 @@ async function handlePr(interaction) {
     ].join('\n');
     recordRoll(gid, { userId: interaction.user.id, channelId: interactionChannelId(interaction), interaction, result,
       kind: 'npcs', card: auditCard,
-      input: `/pr roll ${notation}${label ? ' ' + label : ''}`,
+      input: `/npc roll ${notation}${label ? ' ' + label : ''}`,
       rollLine: buildRollLine(result, mode, critType, null),
       context: `as NPC **${npc.name}**` });
 
@@ -11790,14 +13017,14 @@ async function handleWeapon(interaction) {
   }
   if (sub === 'list') {
     const rows = db.prepare('SELECT * FROM weapons WHERE guild_id=? ORDER BY name').all(gid);
-    if (!rows.length) return interaction.reply({ content: '❌ No weapons added yet. Use `/weapon add` to add one.', ephemeral: true });
+    if (!rows.length) return interaction.reply({ content: '❌ No weapons added yet. Use `/char weapon add` to add one.', ephemeral: true });
     const short = (v) => parseStatList(v).map(x => x.toUpperCase()).join('/');
     const lines = ['**⚔️ Server weapons**', ''];
     for (const w of rows) {
       lines.push(`• **${w.name}** — ⚔️ ${w.atk_stats ? short(w.atk_stats) : 'any'} · 🛡️ ${w.def_stats ? short(w.def_stats) : 'any'}`
         + (w.note ? `\n  _${w.note}_` : ''));
     }
-    lines.push('', '_A GM sets these with `/weapon stats`. "any" means the weapon restricts nothing._');
+    lines.push('', '_A GM sets these with `/char weapon stats`. "any" means the weapon restricts nothing._');
     return replyLong(interaction, lines);
   }
 }
@@ -11815,13 +13042,13 @@ const HELP_CATEGORIES = {
       '',
       '**1 · Make your character** — `/char create` walks you through stats, class, order and weapons. You spend a fixed allowance across STR/CON/DEX/WIS/LCK with a minimum in each — `/config statallowance` shows this server\'s numbers. If sheet approval is on, a GM checks your sheet before it goes live, and you\'ll be told either way.',
       '**2 · Roll dice** — type `1d20` bare, `r1d20+5 ambush` for a label, or just a stat word like `str` or `wis`. `ra`/`rd` roll with advantage or disadvantage, and `rr` rerolls your last roll for a token. `/roll` is the guided version with dropdowns.',
-      '**3 · Your card** — `/p on` puts your character card under your rolls, HP and tokens included. `/p style` compresses it, `/char show` opens the full sheet any time.',
+      '**3 · Your card** — `/profile on` puts your character card under your rolls, HP and tokens included. `/profile card` compresses it, `/char show` opens the full sheet any time.',
       '**4 · HP and rests** — `!hp -3` after a hit, `lrest` for a full rest, `srest` for a breather. White Knights (WIS ≥ 5) can `!heal @friend`.',
       '**5 · Fights** — a GM opens one with `/fight start` and initiative sets the order. On your turn, `/fight atk stat:str` — leave the target off and a menu appears; picking someone rolls the attack on the spot. The defender answers with `/fight def stat:dex`, either side may spend a token on `/fight rr`, and `/fight resolve` settles the exchange. When it all ends, a 🏁 result and a full recap post on their own.',
       '**6 · Duels** — `/duel opponent:@rival terms:first blood` raises one. A GM signs it off and starts the fight.',
       '**7 · Quests** — `/quest board` shows what\'s posted. Tap **Apply** on a quest post (or `/quest apply number:N`), a GM approves the party, and merits pay out when it completes.',
       '**8 · Activities** — minigames written for this server: branching scenes with rolls and rewards. `/activity list` to browse, `/activity run name:Fishing` to start one here. When a scene asks for a roll, just type the stat word — `wis`, or `wis steady does it` to add flavour — and the story moves.',
-      '**9 · Renown & merits** — renown is the coin quests, encounters and activities pay out; spend it as the server allows (`/renown view`). Merits are lifetime honour that only climbs, and ranks hang off them (`/merit view`, `/rank list`). You can offer merit to a friend with `/merit give` — a GM signs it off.',
+      '**9 · Renown & merits** — renown is the coin quests, encounters and activities pay out; spend it as the server allows (`/standing renown view`). Merits are lifetime honour that only climbs, and ranks hang off them (`/standing merit view`, `/standing rank list`). You can offer merit to a friend with `/standing merit give` — a GM signs it off.',
       '**10 · Death** — characters can fall. That call belongs to a GM: a memorial is posted, the sheet locks, and the fallen keep their history. Revival is possible when the story allows it.',
       '',
       '_Lost mid-game? `/help category:X` for any group, `/stat` for what each stat means, `/lastroll` if you forgot what you just threw._',
@@ -11837,13 +13064,13 @@ const HELP_CATEGORIES = {
       '`ra1d20+5` — roll with **advantage** (drops lowest)',
       '`rd1d20+5` — roll with **disadvantage** (drops highest)',
       '`rr` / `rra` / `rrd` — reroll (costs a token)',
-      '`/roll` — guided roll: pick a stat, advantage, success check, label and RP flavour',
+      '`/roll` — bare, a flat 1d20; or pick a stat, advantage, success check, label and RP flavour',
       '`str` / `con` / `dex` / `wis` / `lck` — quick stat roll. On its own with nothing else, so ordinary chat that starts with a stat name isn\'t rolled',
       '`r str atk` or `?str atk` — a plain stat roll **with a label**',
       '`wisa` / `dexd` — quick stat roll with **advantage** / **disadvantage** (a label may follow: `dexd guard`)',
       '`strrr` / `dexrra` / `conrrd` — reroll using a stat set · add a label like `strrr atk`',
       '`?1d20+5` — success check (crit/success/fail tiers)',
-      '`/dr` — slash version with dropdowns for roll type & success',
+      '`/gm roll` — slash version with dropdowns for roll type & success',
       '`/lastroll` — recall the last thing you rolled in this channel',
     ],
   },
@@ -11862,8 +13089,8 @@ const HELP_CATEGORIES = {
       '`/char export [format:Image]` — export your sheet as text or image; `format:Parchment image` writes it on parchment in the server\'s scroll font; `format:Parchment PDF` is the same parchment as a **PDF — the file that survives Discord re-uploads**; `format:Summary` is your career record — rank, merits, renown, dice history, pack, quests, lore. Every image and PDF carries the sheet woven inside. With approvals on it goes to the GMs first and reaches you when one releases it',
       '`/char import` — hand an exported sheet to this server, as the image or the pasted `[TTRPG SHEET]` summary (bare = a paste box opens); a GM approves it and you arrive ready to play',
       '`/char signature user:@a stat:str` — set a Hero\'s signature stat (GM)',
-      '`/profile on/off/show/save/load/saves` — manage profile display & snapshots (shorthand: `/p`)',
-      '`/weapon add/remove/list` — manage the server weapon list (GM)',
+      '`/profile on/off/show/save/load/saves` — manage profile display & snapshots',
+      '`/char weapon add/remove/list` — manage the server weapon list (GM)',
     ],
   },
   hp: {
@@ -11892,6 +13119,12 @@ const HELP_CATEGORIES = {
       '`/fight atk stat:str` — leave the target off and a menu appears; picking someone rolls the attack on the spot',
       '`/fight atk stat:str npc:Goblin target:@user` — GM attacks AS an NPC on its turn',
       '`/fight def stat:dex` — defend · GM defends as an NPC with `npc:Name`',
+      '`/fight grapple target:@user` — STR-only grapple attempt; the target answers with `/fight save` (STR). Meets-or-exceeds and the hold takes: immobile, 1 strain at each of their turn\'s ends, actions on a flat d20',
+      '`/fight escape` — on your turn while held: 1d20+STR vs the grappler\'s STR score to break free — the strain lands either way',
+      '`/fight release` — the holder lets go freely (no action); a grappler can never strike their own captive. GMs may part any hold with `target:`',
+      '`/fight deflect` — shield deflection vs a PvE strike (shield + STR 4+, once per round, crits undeflectable): roll STR or DEX (`stat:`) to beat the attack roll, optionally `redirect_npc:` into another enemy for 1 damage. Either way your next attack is a flat d20',
+      '`/fight disarm` — disarm a PvE attacker (blade + DEX 4+, once per round): roll DEX to beat the attack roll — no damage, but they spend their next turn retrieving the weapon. Either way your next defence is a flat d20',
+      '`/fight feint feint:"..."` — deceive an opponent as your attack action (WIS 4+, PvE and PvP): they answer with `/fight insight` (WIS). Beat their roll — ties go to them — and their very next rolled action is a straight d20. Either way your next defence is a flat d20',
       '`/fight rr` — reroll (costs a token) · `/fight resolve` — resolve a clash',
       '`/fight status` — show current fight · `/fight forfeit` — drop out',
       '`/duel opponent:@rival terms:first blood` — raise a duel; a GM signs off, then starts the fight',
@@ -11920,11 +13153,11 @@ const HELP_CATEGORIES = {
       'A **Reroll** button sits on the scene card while a token remains — one second chance per roll',
       'Some scenes offer **choices** as buttons; some tally renown as you play and bank it at the end',
       '`/activity demo` — the built-in fishing tale, no stakes (GM)',
-      'GMs write activities by pasting a `[STORY]` script in chat — it\'s validated before anything is stored',
+      '`/activity create` — write one: a paste window opens (or attach a `.txt` with `file:` for long scripts). Pasting an `[ACTIVITY]` script straight into chat works too — every route is validated before anything is stored (GM)',
       '`/activity set name:X scene:Y field:Z value:...` — tweak one line of one scene without re-pasting (GM)',
       '`/activity delete name:X` — remove an activity (GM)',
-      '`/renown view [user]` — balance · `/renown leaderboard` — who holds the most · `/renown history [user]`',
-      '`/renown add/remove/set` — adjust a balance, with a reason (GM)',
+      '`/standing renown view [user]` — balance · `/standing renown leaderboard` — who holds the most · `/standing renown history [user]`',
+      '`/standing renown add/remove/set` — adjust a balance, with a reason (GM)',
     ],
   },
   progression: {
@@ -11932,17 +13165,17 @@ const HELP_CATEGORIES = {
     blurb: 'lifetime honour, trades, and the ranks above',
     body: [
       '_Merits are lifetime honour — they only climb, and ranks hang off them. Promotions are always a GM\'s call._',
-      '`/merit view [user]` — see merits, current rank, and how many to the next',
-      '`/merit leaderboard` — top earners on the server',
-      '`/merit history [user]` — a player\'s merit timeline, or recent server activity',
-      '`/merit give user:@friend amount:N reason:...` — offer someone your merit; a GM signs it off',
-      '`/merit trades` — trades still waiting on a GM · `/merit cancel id:N` — withdraw one (yours, or any if GM)',
-      '`/merit add @user [amount]` — award merits (GM) · `/merit remove` · `/merit set`',
-      '`/rank list` — view ranks and thresholds',
-      '`/rank add name:Knight threshold:5` — create/update a rank (GM)',
-      '`/rank promote @user rank:Knight` — set a player\'s rank (GM, fully manual)',
-      '`/rank eligible` — players who\'ve met a threshold but aren\'t promoted yet (GM)',
-      '`/rank remove name:X` — delete a rank (GM)',
+      '`/standing merit view [user]` — see merits, current rank, and how many to the next',
+      '`/standing merit leaderboard` — top earners on the server',
+      '`/standing merit history [user]` — a player\'s merit timeline, or recent server activity',
+      '`/standing merit give user:@friend amount:N reason:...` — offer someone your merit; a GM signs it off',
+      '`/standing merit trades` — trades still waiting on a GM · `/standing merit cancel id:N` — withdraw one (yours, or any if GM)',
+      '`/standing merit add @user [amount]` — award merits (GM) · `/standing merit remove` · `/standing merit set`',
+      '`/standing rank list` — view ranks and thresholds',
+      '`/standing rank add name:Knight threshold:5` — create/update a rank (GM)',
+      '`/standing rank promote @user rank:Knight` — set a player\'s rank (GM, fully manual)',
+      '`/standing rank eligible` — players who\'ve met a threshold but aren\'t promoted yet (GM)',
+      '`/standing rank remove name:X` — delete a rank (GM)',
     ],
   },
   quests: {
@@ -11956,7 +13189,16 @@ const HELP_CATEGORIES = {
       '`/quest withdraw number:N` — leave or cancel your application',
       '`/quest log [user]` — completed quests a player was on',
       '`/quest create name:Goblin Cave objectives:... merit_reward:2 party_size:4 hard_cap:true` — (GM)',
-      '`/quest post number:N [channel]` — post it as an embed with an Apply button (GM)',
+      '`/quest create` — bare, a five-field writing window opens (add `from:N` to seed it from an existing quest); with `name:` everything stays inline (GM)',
+      '`/quest edit number:N` — the same window, prefilled — the natural editor; renames follow onto the board and planning threads. Numeric options (`merit_reward:` etc.) apply directly without the window (GM)',
+      '`/quest post number:N [channel]` — post it with an Apply button; with a quest forum set, this opens the quest\'s own board thread (GM)',
+      '`/config questforum channel:#forum` — the board becomes a forum: one thread per quest, lifecycle mirrored in, archived on completion (Admin)',
+      '`/config questplanning channel:#gm-forum` — `/quest create` opens a private GM planning thread; every application and event mirrors there. Sets up the pipeline tags (🌱⏳✅📌🗄️🏁) and the 🎲 DM roster (Admin)',
+      '`/quest stage number:N stage:` — move a quest through Concept / Awaiting Approval / Approved; posting, archiving and completing re-tag automatically (GM)',
+      '`/quest archive number:N` — pull a quest off the board: applications close, the board thread locks; `/quest post` re-lists it (GM)',
+      '`/quest dm style:... brief:... [available:false]` — your card on the 🎲 DMs Available roster (GM)',
+      '`/quest npc number:N name:Orc [remove]` — attach the NPCs a run involves; they land on the run record (GM)',
+      '`/quest history number:N` — the run ledger: how many completions, and each run\'s GM, party and NPCs',
       '`/quest approve number:N @user [force]` — approve an applicant; `force` overrides a hard cap (GM)',
       '`/quest kick number:N @user` — remove a member/applicant (GM)',
       '`/quest runchannel number:N [channel]` — set where the quest runs & rewards (GM)',
@@ -11970,10 +13212,10 @@ const HELP_CATEGORIES = {
     blurb: 'badges on players',
     body: [
       '_Tags are little badges on a player — flair a GM hands out, plus custom ones the server invents._',
-      '`/tag assign user:@player tag:X` — give a player a tag (GM)',
-      '`/tag remove user:@player tag:X` — remove a tag',
-      '`/tag list` — show all tags',
-      '`/tag custom action:Create emoji:⚜️ name:MyTag` — manage custom tags',
+      '`/char tag assign user:@player tag:X` — give a player a tag (GM)',
+      '`/char tag remove user:@player tag:X` — remove a tag',
+      '`/char tag list` — show all tags',
+      '`/char tag custom action:Create emoji:⚜️ name:MyTag` — manage custom tags',
     ],
   },
   npc: {
@@ -11984,17 +13226,17 @@ const HELP_CATEGORIES = {
       '`/npc create name:X str:N ...` — create an NPC (GM)',
       '`/npc hp name:X value:N` — set an NPC\'s HP · omit value for a full heal (GM)',
       '`/npc heal names:all` · `/npc heal names:Goblin, Orc` — fully heal NPCs (GM)',
-      '`/gmheal user:@a` / `npc:all` — restore HP, rerolls or charges, any amount (GM)',
+      '`/gm heal user:@a` / `npc:all` — restore HP, rerolls or charges, any amount (GM)',
       '`/npc copy name:Goblin new_name:Goblin 2` — duplicate an NPC (GM)',
       '`/npc show name:Goblin` — full stat block for one NPC',
       '`/npc hero name:X stat:str` — make an NPC a Hero with a signature stat (GM)',
-      '`/pr say name:X message:...` — speak or act as an NPC, no dice (GM)',
+      '`/npc say name:X message:...` — speak or act as an NPC, no dice (GM)',
       '`/npc list category:Bandits` — list only one category\'s NPCs',
       '`/npc list` · `/npc delete name:X`',
       '`/npc categorycreate/categorydelete/categorylist` — manage categories',
       '`/npc categoryassign/categoryremove` — sort NPCs into categories',
-      '`/pr roll category:X name:Y notation:1d20 stat:STR` — roll as an NPC',
-      '`/pr reroll name:X` — reroll an NPC roll (costs a token)',
+      '`/npc roll category:X name:Y notation:1d20 stat:STR` — roll as an NPC',
+      '`/npc reroll name:X` — reroll an NPC roll (costs a token)',
       '💡 Upload an image to the NPC channel with the NPC name to set an avatar',
     ],
   },
@@ -12517,13 +13759,13 @@ function makeConfirmButtons(token) {
 }
 
 
-// ── /gmheal ───────────────────────────────────────────────────────────────────
+// ── /gm heal ───────────────────────────────────────────────────────────────────
 // One GM command for restoring resources, on a player or an NPC (or every NPC).
 // HP changes go through setFighterHp so any active fight stays in sync.
 async function handleGmHeal(interaction) {
   const gid = interaction.guild.id, uid = interaction.user.id;
   if (!(await isGm(interaction.guild, uid)))
-    return interaction.reply({ content: '❌ Only GMs can use `/gmheal`.', ephemeral: true });
+    return interaction.reply({ content: '❌ Only GMs can use `/gm heal`.', ephemeral: true });
 
   const targetUser = interaction.options.getUser('user');
   const npcArg = (interaction.options.getString('npc') || '').trim();
@@ -12567,7 +13809,7 @@ async function handleGmHeal(interaction) {
       // Gathered first so the whole roster can be put in reading order —
       // Heroes, then knight order, then class, then name.
       for (const ch of sheets) {
-        // A heal is not a resurrection — that needs /gmrevive and a decision.
+        // A heal is not a resurrection — that needs /gm revive and a decision.
         if (ch.died_at) { fallenSkipped++; continue; }
         const nm = await getDisplayName(interaction.guild, ch.user_id);
         const bits = [];
@@ -12613,7 +13855,7 @@ async function handleGmHeal(interaction) {
     if (lines.length && lines[lines.length - 1] === '') lines.pop();
 
     if (!lines.length) return interaction.editReply({ content: fallenSkipped
-      ? `❌ Nothing to restore — the only characters here have fallen. \`/gmrevive\` brings one back.`
+      ? `❌ Nothing to restore — the only characters here have fallen. \`/gm revive\` brings one back.`
       : '❌ Nothing to restore — no sheets or NPCs on this server.' });
     const what = scope === 'players' ? `${players} player${players === 1 ? '' : 's'}`
                : scope === 'npcs' ? `${npcs} NPC${npcs === 1 ? '' : 's'}`
@@ -12687,7 +13929,7 @@ async function handleRollSlash(interaction) {
   const gid = interaction.guild.id, uid = interaction.user.id;
   const cid = interactionChannelId(interaction);
   const stat = interaction.options.getString('stat');
-  const dice = (interaction.options.getString('dice') || '').trim();
+  let dice = (interaction.options.getString('dice') || '').trim();
   const mode = interaction.options.getString('mode') || 'normal';
   const successCheck = interaction.options.getBoolean('success_check') ?? false;
   const label = (interaction.options.getString('label') || '').trim() || null;
@@ -12696,7 +13938,8 @@ async function handleRollSlash(interaction) {
   const fightTarget = interaction.options.getUser('target');
 
   if (stat && dice) return interaction.reply({ content: '❌ Pick either a **stat** or custom **dice**, not both.', ephemeral: true });
-  if (!stat && !dice) return interaction.reply({ content: '❌ Choose a **stat** or enter **dice** (e.g. `2d6+3`).', ephemeral: true });
+  // Bare /roll: a flat d20, no stat, no fuss.
+  if (!stat && !dice) dice = '1d20';
 
   const gateMsg = sheetGate(gid, uid);
   if (gateMsg) return interaction.reply({ content: gateMsg, ephemeral: true });
@@ -12738,6 +13981,8 @@ async function handleRollSlash(interaction) {
       const f = getFight(gid, cid);
       const why = !f || f.state !== 'active' ? 'There is no fight running here.'
         : f.phase === 'attack' ? 'It is not your turn to attack.'
+        : f.atk_kind === 'grapple' ? 'That is a grapple — answer with `/fight save` (STR only).'
+        : f.atk_kind === 'feint' ? 'That is a feint — answer with `/fight insight` (WIS only).'
         : f.def_roll !== null ? 'That exchange already has both rolls — `/fight resolve` it.'
         : 'You are not the one being attacked.';
       return interaction.reply({ content: `❌ ${why} The roll was not submitted.`, ephemeral: true });
@@ -12872,7 +14117,7 @@ async function handleMerit(interaction) {
     } else if (current) {
       lines.push('🏔️ Highest rank threshold reached.');
     }
-    if (!current && !next) lines.push('_No ranks defined yet — a GM can add them with `/rank add`._');
+    if (!current && !next) lines.push('_No ranks defined yet — a GM can add them with `/standing rank add`._');
     return interaction.reply({ content: lines.join('\n') });
   }
 
@@ -12929,7 +14174,7 @@ async function handleMerit(interaction) {
     const ch = getChar(gid, target.id);
     const lines = [`🎖️ **${name}**: ${before} → **${after}** merit${after === 1 ? '' : 's'} (${sub === 'add' ? '+' : '−'}${amt}).`];
     if (sub === 'add' && current && current.name !== ch?.rank_name) {
-      lines.push(`✅ Now eligible for **${current.name}** — promote with \`/rank promote\`.`);
+      lines.push(`✅ Now eligible for **${current.name}** — promote with \`/standing rank promote\`.`);
     } else if (next) {
       const togo = next.threshold - after;
       if (togo > 0) lines.push(`📈 ${togo} more to **${next.name}**.`);
@@ -12957,7 +14202,7 @@ async function handleRank(interaction) {
 
   if (sub === 'list') {
     const ranks = getRanks(gid);
-    if (!ranks.length) return interaction.reply({ content: '📋 No ranks defined. A GM can add them with `/rank add`.', ephemeral: true });
+    if (!ranks.length) return interaction.reply({ content: '📋 No ranks defined. A GM can add them with `/standing rank add`.', ephemeral: true });
     const lines = ['🏅 **Ranks** (junior → senior)', ''];
     ranks.forEach((r, i) => lines.push(`**${i+1}. ${r.name}** — ${r.threshold} merit${r.threshold === 1 ? '' : 's'}`));
     return replyLong(interaction, lines);
@@ -12988,7 +14233,7 @@ async function handleRank(interaction) {
     const rankName = interaction.options.getString('rank');
     const ranks = getRanks(gid);
     const rank = ranks.find(r => r.name.toLowerCase() === rankName.toLowerCase());
-    if (!rank) return interaction.reply({ content: `❌ No rank named **${rankName}**. See \`/rank list\`.`, ephemeral: true });
+    if (!rank) return interaction.reply({ content: `❌ No rank named **${rankName}**. See \`/standing rank list\`.`, ephemeral: true });
     upsertChar(gid, target.id, { rank_name: rank.name });
     const name = await getDisplayName(interaction.guild, target.id);
     const merits = getMerits(gid, target.id);
@@ -13095,11 +14340,170 @@ function questApplyButton(number) {
   );
 }
 
+// The questline pipeline, expressed as forum tags on the planning forum.
+const QUEST_STAGES = [
+  ['concept',   '🌱', 'Concept'],
+  ['awaiting',  '⏳', 'Awaiting Approval'],
+  ['approved',  '✅', 'Approved'],
+  ['board',     '📌', 'On the Board'],
+  ['archived',  '🗄️', 'Archived'],
+  ['completed', '🏁', 'Completed'],
+];
+// Make sure the planning forum carries every pipeline tag; returns the
+// name→tagId map (and stores it). Idempotent — existing tags are kept.
+async function ensurePlanTags(forum, gid) {
+  const have = forum.availableTags ?? [];
+  const missing = QUEST_STAGES.filter(([, , label]) => !have.some(t => t.name === label));
+  if (missing.length) {
+    await forum.setAvailableTags([
+      ...have.map(t => ({ id: t.id, name: t.name, moderated: t.moderated,
+        emoji: t.emoji ? { id: t.emoji.id ?? null, name: t.emoji.name ?? null } : undefined })),
+      ...missing.map(([, emoji, label]) => ({ name: label, emoji: { id: null, name: emoji } })),
+    ]);
+  }
+  const fresh = (await forum.fetch()).availableTags ?? [];
+  const map = {};
+  for (const [key, , label] of QUEST_STAGES) {
+    const t = fresh.find(x => x.name === label);
+    if (t) map[key] = t.id;
+  }
+  setConfig(gid, { quest_plan_tags: JSON.stringify(map) });
+  return map;
+}
+// Re-tag a quest's planning thread for its current stage, keeping any
+// non-pipeline tags a GM added by hand. Best-effort.
+async function syncPlanStage(client, gid, quest) {
+  if (!quest?.plan_thread_id || !quest.stage) return;
+  try {
+    const map = JSON.parse(getConfig(gid)?.quest_plan_tags || '{}');
+    const want = map[quest.stage];
+    if (!want) return;
+    const thread = await client.channels.fetch(quest.plan_thread_id);
+    if (!thread?.isThread?.()) return;
+    if (thread.archived) await wakeThread(thread);
+    const pipeline = new Set(Object.values(map));
+    const keep = (thread.appliedTags ?? []).filter(id => !pipeline.has(id));
+    await thread.setAppliedTags([...keep, want].slice(0, 5));
+  } catch { /* tags are decoration — never fail the command over them */ }
+}
+const questRootNumber = (quest) => quest.instance_of ?? quest.number;
+
+// The pipeline books — one thread per section, the audit-forum pattern.
+const QUEST_BOOKS = [
+  ['concept',   '🌱', 'Concept',            'Quests being written. `/quest stage` moves them onward.'],
+  ['awaiting',  '⏳', 'Awaiting Approval',   'Concepts waiting on a nod.'],
+  ['approved',  '✅', 'Approved',            'Ready to run — `/quest post` opens them on the public board (marked 📌 here while listed).'],
+  ['dms',       '🎲', 'DMs Available',       'Who can run for you, their style, and a short brief. GMs: `/quest dm`.'],
+  ['archived',  '🗄️', 'Archived',            'Off the board. `/quest post` re-lists any of them.'],
+  ['completed', '🏁', 'Completed',           'Every finished adventure, with its run counter.'],
+];
+const questBooks = (gid) => { try { return JSON.parse(getConfig(gid)?.quest_plan_books || '{}'); } catch { return {}; } };
+const questBookKeyFor = (stage) => stage === 'board' ? 'approved' : stage;
+
+// One index entry per quest: name · GM · party · links, run counter when done.
+async function questIndexEntry(guild, gid, quest) {
+  const gmName = quest.gm_id ? await getDisplayName(guild, quest.gm_id) : '—';
+  const party = getQuestMembers(gid, quest.number, 'party').length;
+  const cap = quest.party_size ? `/${quest.party_size}` : '';
+  const bits = [`**${questTag(quest)}**${quest.stage === 'board' ? ' 📌 on the board' : ''}`,
+    `🎲 GM **${gmName}** · 👥 ${party}${cap}`];
+  if (quest.stage === 'completed') {
+    const root = questRootNumber(quest);
+    const runs = db.prepare('SELECT COUNT(*) AS c FROM quest_runs WHERE guild_id=? AND root_number=?').get(gid, root).c;
+    bits.push(`🏁 completed ×${runs}`);
+  }
+  const links = [];
+  if (quest.plan_thread_id) links.push(`🗺️ <#${quest.plan_thread_id}>`);
+  if (quest.post_channel_id) links.push(`📌 <#${quest.post_channel_id}>`);
+  if (links.length) bits.push(links.join(' · '));
+  return bits.join('\n');
+}
+
+// Move (or refresh) a quest's index entry into the book its stage belongs to.
+// Delete-and-repost keeps each book reading newest-last, like the audit books.
+async function syncQuestBook(client, guild, gid, questRow) {
+  const quest = getQuest(gid, questRow.number) ?? questRow;
+  const books = questBooks(gid);
+  const key = questBookKeyFor(quest.stage);
+  const bookId = key ? books[key] : null;
+  // Clear the old entry wherever it sits.
+  if (quest.index_thread_id && quest.index_msg_id) {
+    try {
+      const old = await client.channels.fetch(quest.index_thread_id);
+      if (old?.isThread?.()) { if (old.archived) await wakeThread(old); await old.messages.delete(quest.index_msg_id); }
+    } catch { /* already gone */ }
+  }
+  if (!bookId) { updateQuest(gid, quest.number, { index_thread_id: null, index_msg_id: null }); return; }
+  try {
+    const book = await client.channels.fetch(bookId);
+    if (!book?.isThread?.()) return;
+    if (book.archived) await wakeThread(book);
+    const msg = await book.send(await questIndexEntry(guild, gid, quest));
+    updateQuest(gid, quest.number, { index_thread_id: book.id, index_msg_id: msg.id });
+  } catch { /* the kanban is decoration — never fail the command over it */ }
+}
+
+// Stage tag + book entry in one call — the single pipeline sync.
+async function syncQuestPipeline(client, guild, gid, quest) {
+  await syncPlanStage(client, gid, quest);
+  await syncQuestBook(client, guild, gid, quest);
+}
+
+// Re-render the 🎲 DMs Available roster thread's starter from gm_profiles.
+// Best-effort; a missing thread just means the roster isn't set up yet.
+async function refreshDmRoster(client, guild, gid) {
+  const threadId = questBooks(gid).dms ?? getConfig(gid)?.quest_dm_thread;
+  if (!threadId) return false;
+  try {
+    const thread = await client.channels.fetch(threadId);
+    if (!thread?.isThread?.()) return false;
+    if (thread.archived) await wakeThread(thread);
+    const rows = db.prepare('SELECT user_id, style, brief, available FROM gm_profiles WHERE guild_id=? ORDER BY available DESC, user_id').all(gid);
+    const lines = ['🎲 **DMs Available**', ''];
+    const avail = rows.filter(r => r.available);
+    const away = rows.filter(r => !r.available);
+    if (!avail.length) lines.push('_No DMs available right now._');
+    for (const r of avail) {
+      const nm = await getDisplayName(guild, r.user_id);
+      lines.push(`**${nm}**${r.style ? ` — _${r.style}_` : ''}`);
+      if (r.brief) lines.push(`> ${r.brief}`);
+      lines.push('');
+    }
+    if (away.length) {
+      const names = [];
+      for (const r of away) names.push(await getDisplayName(guild, r.user_id));
+      lines.push(`_Currently away: ${names.join(', ')}_`);
+    }
+    lines.push('', '_GMs: `/quest dm style:... brief:...` puts your card here; `available:false` steps back._');
+    const starter = await thread.fetchStarterMessage();
+    await starter.edit({ content: lines.join('\n').slice(0, 2000) });
+    return true;
+  } catch { return false; }
+}
+
+// A quest speaks in two places: its public board thread (when the board is a
+// forum) and its GM planning thread. One-line lifecycle mirrors go to both,
+// each woken first. Fire-safe — a missing or deleted thread is ignored.
+async function questAnnounce(client, quest, line, { board = true, plan = true } = {}) {
+  const targets = [];
+  if (board && quest.post_channel_id) targets.push(quest.post_channel_id);
+  if (plan && quest.plan_thread_id && quest.plan_thread_id !== quest.post_channel_id) targets.push(quest.plan_thread_id);
+  for (const id of targets) {
+    try {
+      const ch = await client.channels.fetch(id);
+      if (!ch?.isThread?.()) continue;   // plain-channel posts don't get mirrors
+      await wakeThread(ch);
+      await ch.send(line);
+    } catch { /* thread gone or unreadable — the mirror is best-effort */ }
+  }
+}
+
 // Refresh a quest's posted message in place, if one exists.
 async function refreshQuestPost(client, guild, quest) {
   if (!quest.post_channel_id || !quest.post_message_id) return;
   try {
     const ch = await client.channels.fetch(quest.post_channel_id);
+    if (ch?.isThread?.() && ch.archived) await wakeThread(ch);
     const msg = await ch.messages.fetch(quest.post_message_id);
     const components = quest.status === 'open' ? [questApplyButton(quest.number)] : [];
     await msg.edit({ content: await renderQuest(guild, quest), components });
@@ -13115,16 +14519,67 @@ async function questApply(guild, quest, uid) {
   if (mine?.state === 'party') return { error: 'You\'re already on this quest\'s party.' };
   if (mine?.state === 'applied') return { error: 'You\'ve already applied — hang tight for the GM.' };
   setQuestMember(gid, quest.number, uid, 'applied');
+  await questAnnounce(guild.client, quest, `⏳ **${await getDisplayName(guild, uid)}** applied to join.`);
   return { ok: `⏳ Applied to **${questTag(quest)}**. A GM will review.` };
 }
 async function questWithdraw(guild, quest, uid) {
   const gid = guild.id;
   const removed = removeQuestMember(gid, quest.number, uid);
   if (!removed) return { error: 'You\'re not on this quest.' };
+  await questAnnounce(guild.client, quest, `↩️ **${await getDisplayName(guild, uid)}** withdrew.`);
   return { ok: `↩️ Withdrawn from **${questTag(quest)}**.` };
 }
 
 // ── QUEST command ─────────────────────────────────────────────────────────────
+// One modal text row — shared by the quest create and edit windows.
+function questTextRow(id, label, style, required, value) {
+  const { ActionRowBuilder, TextInputBuilder } = require('discord.js');
+  const t = new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(style)
+    .setRequired(required).setMaxLength(id === 'name' ? 80 : 4000);
+  if (value) t.setValue(String(value).slice(0, id === 'name' ? 80 : 4000));
+  return new ActionRowBuilder().addComponents(t);
+}
+
+// The creation flow proper — slash path and modal path land here alike.
+async function finishQuestCreate(interaction, gid, uid, f) {
+  const name = (f.name || '').trim();
+  if (!name || name.length > 80) return interaction.reply({ content: '❌ Quest name must be 1–80 characters.', ephemeral: true });
+  // Forum thread creation can outlast the 3-second window — acknowledge first.
+  if (!interaction.deferred && !interaction.replied) await interaction.deferReply();
+  const number = createQuest(gid, {
+    name,
+    objectives: f.objectives ?? null,
+    lore: f.lore ?? null,
+    details: f.details ?? null,
+    rewards: f.rewards ?? null,
+    merit_reward: f.merit_reward ?? 0,
+    party_size: f.party_size ?? null,
+    party_hard: f.party_hard ?? false,
+    created_by: uid,
+  });
+  updateQuest(gid, number, { gm_id: uid, gm_style: f.gm_style ?? null, stage: 'concept' });
+  let quest = getQuest(gid, number);
+  let planLine = '';
+  const planForumId = getConfig(gid)?.quest_plan_forum;
+  if (planForumId) {
+    try {
+      const forum = await interaction.client.channels.fetch(planForumId);
+      const tagMap = JSON.parse(getConfig(gid)?.quest_plan_tags || '{}');
+      const thread = await forum.threads.create({ name: `#${number} — ${quest.name}`.slice(0, 100), autoArchiveDuration: 10080,
+        appliedTags: tagMap.concept ? [tagMap.concept] : [],
+        message: { content: `🗺️ **GM planning** — ${questTag(quest)}\n\n${await renderQuest(interaction.guild, quest)}\n\n_Draft. \`/quest post number:${number}\` opens it on the public board; every application and turn of the quest will be mirrored here._` } });
+      updateQuest(gid, number, { plan_thread_id: thread.id });
+      quest = getQuest(gid, number);
+      await syncQuestBook(interaction.client, interaction.guild, gid, quest);
+      quest = getQuest(gid, number);
+      planLine = `\n🗺️ Planning thread: <#${thread.id}>`;
+    } catch (err) {
+      planLine = `\n⚠️ Couldn't open a planning thread — ${err?.message || err}. Check my forum permissions there.`;
+    }
+  }
+  return interaction.editReply({ content: `✅ Created **${questTag(quest)}**.${planLine}\n\n${await renderQuest(interaction.guild, quest)}\n\n_Post it with_ \`/quest post number:${number}\`_._` });
+}
+
 async function handleQuest(interaction) {
   const gid = interaction.guild.id, uid = interaction.user.id;
   const sub = interaction.options.getSubcommand();
@@ -13173,7 +14628,7 @@ async function handleQuest(interaction) {
     // Withdrawing is always allowed — a fallen character should still be able to
     // come off a roster. Signing up for new work is not.
     if (sub === 'apply' && isFallen(gid, uid))
-      return interaction.reply({ content: '🕯️ Your character has fallen and cannot take on new work. A GM can bring them back with `/gmrevive`.', ephemeral: true });
+      return interaction.reply({ content: '🕯️ Your character has fallen and cannot take on new work. A GM can bring them back with `/gm revive`.', ephemeral: true });
     const res = sub === 'apply' ? await questApply(interaction.guild, quest, uid) : await questWithdraw(interaction.guild, quest, uid);
     if (res.error) return interaction.reply({ content: res.error, ephemeral: true });
     await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, number));
@@ -13198,29 +14653,115 @@ async function handleQuest(interaction) {
   if (!gm) return interaction.reply({ content: '❌ Only GMs can manage quests.', ephemeral: true });
 
   if (sub === 'create') {
-    const name = interaction.options.getString('name').trim();
-    if (!name || name.length > 80) return interaction.reply({ content: '❌ Quest name must be 1–80 characters.', ephemeral: true });
-    const number = createQuest(gid, {
-      name,
-      objectives: interaction.options.getString('objectives'),
-      lore: interaction.options.getString('lore'),
-      details: interaction.options.getString('details'),
-      rewards: interaction.options.getString('rewards'),
-      merit_reward: interaction.options.getInteger('merit_reward') ?? 0,
-      party_size: interaction.options.getInteger('party_size'),
-      party_hard: interaction.options.getBoolean('hard_cap') ?? false,
-      created_by: uid,
-    });
-    updateQuest(gid, number, { gm_id: uid, gm_style: interaction.options.getString('gm_style') ?? null });
-    const quest = getQuest(gid, number);
-    return interaction.reply({ content: `✅ Created **${questTag(quest)}**.\n\n${await renderQuest(interaction.guild, quest)}\n\n_Post it with_ \`/quest post number:${number}\`_._` });
+    const fromN = interaction.options.getInteger('from');
+    const srcQ = fromN ? getQuest(gid, fromN) : null;
+    if (fromN && !srcQ) return interaction.reply({ content: `❌ No quest #${String(fromN).padStart(3, '0')} to copy from.`, ephemeral: true });
+    const f = {
+      name: interaction.options.getString('name')?.trim() || null,
+      objectives: interaction.options.getString('objectives') ?? srcQ?.objectives ?? null,
+      lore: interaction.options.getString('lore') ?? srcQ?.lore ?? null,
+      details: interaction.options.getString('details') ?? srcQ?.details ?? null,
+      rewards: interaction.options.getString('rewards') ?? srcQ?.rewards ?? null,
+      merit_reward: interaction.options.getInteger('merit_reward') ?? srcQ?.merit_reward ?? 0,
+      party_size: interaction.options.getInteger('party_size') ?? srcQ?.party_size ?? null,
+      party_hard: interaction.options.getBoolean('hard_cap') ?? (srcQ ? !!srcQ.party_hard : false),
+      gm_style: interaction.options.getString('gm_style') ?? srcQ?.gm_style ?? null,
+    };
+    if (!f.name) {
+      // No name given — open the writing window. The numeric choices ride the
+      // customId so the modal submit can carry them into the creation.
+      const { ModalBuilder, TextInputStyle } = require('discord.js');
+      const modal = new ModalBuilder()
+        .setCustomId(`questcreate:${f.merit_reward}:${f.party_size ?? ''}:${f.party_hard ? 1 : 0}:${f.gm_style ?? ''}`)
+        .setTitle(srcQ ? `New quest from #${fromN}`.slice(0, 45) : 'Write a quest')
+        .addComponents(
+          questTextRow('name', 'Quest name', TextInputStyle.Short, true, srcQ ? `${srcQ.name} (copy)` : null),
+          questTextRow('objectives', 'Objectives — what the party must do', TextInputStyle.Paragraph, false, f.objectives),
+          questTextRow('lore', 'Lore / background', TextInputStyle.Paragraph, false, f.lore),
+          questTextRow('details', 'Details / conditions', TextInputStyle.Paragraph, false, f.details),
+          questTextRow('rewards', 'Rewards, distributed by the GM', TextInputStyle.Paragraph, false, f.rewards),
+        );
+      return interaction.showModal(modal);
+    }
+    return finishQuestCreate(interaction, gid, uid, f);
+  }
+
+  if (sub === 'edit') {
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const mr = interaction.options.getInteger('merit_reward');
+    const ps = interaction.options.getInteger('party_size');
+    const hc = interaction.options.getBoolean('hard_cap');
+    const gs = interaction.options.getString('gm_style');
+    if (mr !== null || ps !== null || hc !== null || gs !== null) {
+      // Numeric tweaks apply on the spot — no modal needed.
+      const upd = {};
+      if (mr !== null) upd.merit_reward = mr;
+      if (ps !== null) upd.party_size = ps;
+      if (hc !== null) upd.party_hard = hc ? 1 : 0;
+      if (gs !== null) upd.gm_style = gs;
+      updateQuest(gid, quest.number, upd);
+      const fresh = getQuest(gid, quest.number);
+      await refreshQuestPost(interaction.client, interaction.guild, fresh);
+      await syncQuestBook(interaction.client, interaction.guild, gid, fresh);
+      await questAnnounce(interaction.client, fresh, '✏️ Quest numbers updated.', { board: false });
+      return interaction.reply({ content: `✏️ **${questTag(fresh)}** updated.\n\n${await renderQuest(interaction.guild, fresh)}` });
+    }
+    // Bare edit — the writing window again, prefilled with what stands.
+    const { ModalBuilder, TextInputStyle } = require('discord.js');
+    const modal = new ModalBuilder()
+      .setCustomId(`questedit:${quest.number}`)
+      .setTitle(`Edit #${String(quest.number).padStart(3, '0')}`.slice(0, 45))
+      .addComponents(
+        questTextRow('name', 'Quest name', TextInputStyle.Short, true, quest.name),
+        questTextRow('objectives', 'Objectives — what the party must do', TextInputStyle.Paragraph, false, quest.objectives),
+        questTextRow('lore', 'Lore / background', TextInputStyle.Paragraph, false, quest.lore),
+        questTextRow('details', 'Details / conditions', TextInputStyle.Paragraph, false, quest.details),
+        questTextRow('rewards', 'Rewards, distributed by the GM', TextInputStyle.Paragraph, false, quest.rewards),
+      );
+    return interaction.showModal(modal);
   }
 
   if (sub === 'post') {
-    const quest = await requireQuest(interaction, gid);
+    let quest = await requireQuest(interaction, gid);
     if (!quest) return;
     const number = quest.number;
-    const channel = interaction.options.getChannel('channel') ?? await interactionChannel(interaction);
+    const explicit = interaction.options.getChannel('channel');
+    const forumId = getConfig(gid)?.quest_forum;
+    if (forumId && !explicit) {
+      // The board is a forum: this quest gets (or already has) its own thread.
+      try {
+        const forum = await interaction.client.channels.fetch(forumId);
+        if (quest.status === 'archived') {
+          // Re-listing an archived quest: applications reopen.
+          updateQuest(gid, number, { status: 'open' });
+          quest = getQuest(gid, number);
+        }
+        if (quest.post_channel_id) {
+          const old = await interaction.client.channels.fetch(quest.post_channel_id).catch(() => null);
+          if (old?.isThread?.() && old.parentId === forum.id) {
+            await old.setLocked(false).catch(() => {});
+            await wakeThread(old);
+            await refreshQuestPost(interaction.client, interaction.guild, quest);
+            updateQuest(gid, number, { stage: 'board' });
+            await syncQuestPipeline(interaction.client, interaction.guild, gid, getQuest(gid, number));
+            return interaction.reply({ content: `📌 **${questTag(quest)}** is ${quest.status === 'open' ? 'back on' : 'already on'} the board — <#${old.id}> (refreshed).`, ephemeral: true });
+          }
+        }
+        const components = quest.status === 'open' ? [questApplyButton(number)] : [];
+        const thread = await forum.threads.create({ name: `#${number} — ${quest.name}`.slice(0, 100), autoArchiveDuration: 10080,
+          message: { content: await renderQuest(interaction.guild, quest), components } });
+        // A forum starter message shares its thread's id — the refresh plumbing
+        // needs nothing new.
+        updateQuest(gid, number, { post_channel_id: thread.id, post_message_id: thread.id, stage: 'board' });
+        await syncQuestPipeline(interaction.client, interaction.guild, gid, getQuest(gid, number));
+        await questAnnounce(interaction.client, getQuest(gid, number), `📌 Opened on the public board — <#${thread.id}>.`, { board: false });
+        return interaction.reply({ content: `📌 **${questTag(quest)}** is on the board — <#${thread.id}>.`, ephemeral: true });
+      } catch (err) {
+        return interaction.reply({ content: `❌ Couldn't open the board thread — ${err?.message || err}. Check my **Create Posts** and **Send Messages in Posts** permissions in <#${forumId}>, or pass a \`channel:\` to post plainly.`, ephemeral: true });
+      }
+    }
+    const channel = explicit ?? await interactionChannel(interaction);
     if (!channel) return interaction.reply({ content: '❌ I can\'t access that channel. Pick one explicitly with `channel:`.', ephemeral: true });
     if (!channel.isTextBased?.() && !channel.isThread?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
     const components = quest.status === 'open' ? [questApplyButton(number)] : [];
@@ -13251,7 +14792,7 @@ async function handleQuest(interaction) {
     // A GM can still do it — but knowingly, not by forgetting.
     if (isFallen(gid, target.id) && !force) {
       return interaction.reply({ ephemeral: true, content:
-        `🕯️ **${await getDisplayName(interaction.guild, target.id)}** has fallen. Bring them back with \`/gmrevive\`, or re-run with \`force:true\` if they are joining as a ghost.` });
+        `🕯️ **${await getDisplayName(interaction.guild, target.id)}** has fallen. Bring them back with \`/gm revive\`, or re-run with \`force:true\` if they are joining as a ghost.` });
     }
     if (quest.party_size && quest.party_hard && party.length >= quest.party_size && !force) {
       return interaction.reply({ content: `❌ Party is at the hard cap (${quest.party_size}). Re-run with \`force:true\` to override.`, ephemeral: true });
@@ -13260,6 +14801,8 @@ async function handleQuest(interaction) {
     await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, number));
     const nm = await getDisplayName(interaction.guild, target.id);
     const over = quest.party_size && party.length + 1 > quest.party_size ? ' (over suggested size)' : '';
+    await questAnnounce(interaction.client, getQuest(gid, number), `✅ **${nm}** joins the party${over}.`);
+    await syncQuestBook(interaction.client, interaction.guild, gid, getQuest(gid, number));
     return interaction.reply({ content: `✅ **${nm}** added to **${questTag(quest)}**${over}.` });
   }
 
@@ -13272,6 +14815,8 @@ async function handleQuest(interaction) {
     if (!removed) return interaction.reply({ content: 'They\'re not on this quest.', ephemeral: true });
     await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, number));
     const nm = await getDisplayName(interaction.guild, target.id);
+    await questAnnounce(interaction.client, getQuest(gid, number), `👢 **${nm}** was removed from the party.`);
+    await syncQuestBook(interaction.client, interaction.guild, gid, getQuest(gid, number));
     return interaction.reply({ content: `👢 Removed **${nm}** from **${questTag(quest)}**.` });
   }
 
@@ -13290,6 +14835,7 @@ async function handleQuest(interaction) {
       gm_id: quest.gm_id ?? uid });
     logQuestEvent(gid, number, 'start', `Quest begins — ${party.length} on the party`, uid);
     await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, number));
+    await questAnnounce(interaction.client, getQuest(gid, number), `▶️ **Quest begins** — ${party.length} on the party. The clock is running.`);
     return interaction.reply({ content:
       `🟡 **${questTag(quest)}** is now in progress with ${party.length} member${party.length === 1 ? '' : 's'}. Applications are closed.\n`
       + `⏱️ The clock is running${quest.run_channel_id ? ` in <#${quest.run_channel_id}>` : ' — set a channel with `/quest runchannel` for reminders'}.` });
@@ -13332,12 +14878,102 @@ async function handleQuest(interaction) {
       // Bank the running stretch, then stop the clock.
       updateQuest(gid, number, { elapsed_ms: questElapsed(quest), paused: 1, started_at: null });
       logQuestEvent(gid, number, 'pause', 'Paused', uid);
+      await questAnnounce(interaction.client, getQuest(gid, number), `⏸️ Paused at **${fmtElapsed(questElapsed(getQuest(gid, number)))}**.`);
       return interaction.reply({ content: `⏸️ **${questTag(quest)}** paused at **${fmtElapsed(questElapsed(getQuest(gid, number)))}**. The clock and the log are kept.` });
     }
     if (!paused) return interaction.reply({ content: '❌ It is already running.', ephemeral: true });
     updateQuest(gid, number, { paused: 0, started_at: Date.now() });
     logQuestEvent(gid, number, 'resume', 'Resumed', uid);
+    await questAnnounce(interaction.client, getQuest(gid, number), `▶️ Resumed at **${fmtElapsed(questElapsed(getQuest(gid, number)))}**.`);
     return interaction.reply({ content: `▶️ **${questTag(quest)}** resumed at **${fmtElapsed(questElapsed(getQuest(gid, number)))}**.` });
+  }
+
+  if (sub === 'dm') {
+    if (!gm) return interaction.reply({ content: '❌ The DM roster is for GMs.', ephemeral: true });
+    const style = interaction.options.getString('style');
+    const brief = interaction.options.getString('brief');
+    const available = interaction.options.getBoolean('available');
+    const cur = db.prepare('SELECT * FROM gm_profiles WHERE guild_id=? AND user_id=?').get(gid, uid);
+    db.prepare(`INSERT INTO gm_profiles (guild_id, user_id, style, brief, available) VALUES (?,?,?,?,?)
+      ON CONFLICT(guild_id, user_id) DO UPDATE SET style=excluded.style, brief=excluded.brief, available=excluded.available`)
+      .run(gid, uid, style ?? cur?.style ?? null, brief ?? cur?.brief ?? null,
+           available === null || available === undefined ? (cur?.available ?? 1) : (available ? 1 : 0));
+    const posted = await refreshDmRoster(interaction.client, interaction.guild, gid);
+    return interaction.reply({ ephemeral: true, content: posted
+      ? `🎲 Your DM card is on the roster${available === false ? ' (marked away)' : ''} — <#${getConfig(gid)?.quest_dm_thread}>.`
+      : '🎲 Card saved. No roster thread yet — an Admin sets one up with `/config questplanning channel:#gm-forum`.' });
+  }
+
+  if (sub === 'npc') {
+    if (!gm) return interaction.reply({ content: '❌ Only GMs attach NPCs.', ephemeral: true });
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const name = interaction.options.getString('name');
+    const npc = getNpc(gid, name);
+    if (!npc) return interaction.reply({ content: `❌ No NPC named **${name}**.`, ephemeral: true });
+    const fid = npcFighterId(npc.name);
+    if (interaction.options.getBoolean('remove')) {
+      const removed = removeQuestMember(gid, quest.number, fid);
+      if (!removed) return interaction.reply({ content: `🎭 **${npc.name}** wasn't attached.`, ephemeral: true });
+      await questAnnounce(interaction.client, quest, `🎭 NPC detached: **${npc.name}**.`, { board: false });
+      return interaction.reply({ content: `🎭 **${npc.name}** detached from **${questTag(quest)}**.` });
+    }
+    setQuestMember(gid, quest.number, fid, 'npc');
+    await questAnnounce(interaction.client, quest, `🎭 NPC attached: **${npc.name}**.`, { board: false });
+    return interaction.reply({ content: `🎭 **${npc.name}** attached to **${questTag(quest)}** — they'll be on the run record.` });
+  }
+
+  if (sub === 'history') {
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const root = questRootNumber(quest);
+    const rootQuest = root === quest.number ? quest : (getQuest(gid, root) ?? quest);
+    const runs = db.prepare('SELECT * FROM quest_runs WHERE guild_id=? AND root_number=? ORDER BY completed_at').all(gid, root);
+    if (!runs.length) return interaction.reply({ content: `🏁 **${questTag(rootQuest)}** has no completed runs yet.`, ephemeral: true });
+    const lines = [`🏁 **${questTag(rootQuest)}** — completed **${runs.length}** time${runs.length === 1 ? '' : 's'}`, ''];
+    let k = 0;
+    for (const r of runs) {
+      k++;
+      const gmName = r.gm_id ? await getDisplayName(interaction.guild, r.gm_id) : '—';
+      const partyIds = JSON.parse(r.party || '[]');
+      const partyNames = [];
+      for (const id of partyIds) partyNames.push(await getDisplayName(interaction.guild, id));
+      const npcNames = JSON.parse(r.npcs || '[]');
+      lines.push(`**#${k}** — <t:${Math.floor(r.completed_at / 1000)}:d> · GM **${gmName}**${r.number !== root ? ` · _instance #${r.number}_` : ''}`);
+      lines.push(`👥 ${partyNames.join(', ') || '—'}   🎭 ${npcNames.join(', ') || '—'}`);
+      lines.push('');
+    }
+    return replyLong(interaction, lines, { ephemeral: true });
+  }
+
+  if (sub === 'stage') {
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const stage = interaction.options.getString('stage');
+    updateQuest(gid, quest.number, { stage });
+    const fresh = getQuest(gid, quest.number);
+    await syncQuestPipeline(interaction.client, interaction.guild, gid, fresh);
+    const S = QUEST_STAGES.find(([k]) => k === stage);
+    await questAnnounce(interaction.client, fresh, `${S[1]} Stage → **${S[2]}**.`, { board: false });
+    return interaction.reply({ content: `${S[1]} **${questTag(quest)}** → **${S[2]}**.` });
+  }
+
+  if (sub === 'archive') {
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    if (quest.status === 'completed') return interaction.reply({ content: '❌ Completed quests keep their record — nothing to archive.', ephemeral: true });
+    updateQuest(gid, quest.number, { status: 'archived', stage: 'archived' });
+    const fresh = getQuest(gid, quest.number);
+    await refreshQuestPost(interaction.client, interaction.guild, fresh);   // the Apply button drops
+    await questAnnounce(interaction.client, fresh, '🗄️ Taken off the board — applications are closed. `/quest post` re-lists it.');
+    if (fresh.post_channel_id) {
+      try {
+        const bt = await interaction.client.channels.fetch(fresh.post_channel_id);
+        if (bt?.isThread?.()) { await bt.setLocked(true).catch(() => {}); await bt.setArchived(true); }
+      } catch { /* best-effort */ }
+    }
+    await syncQuestPipeline(interaction.client, interaction.guild, gid, fresh);
+    return interaction.reply({ content: `🗄️ **${questTag(quest)}** is off the board.` });
   }
 
   if (sub === 'note') {
@@ -13348,6 +14984,8 @@ async function handleQuest(interaction) {
     const text = interaction.options.getString('text');
     const kind = interaction.options.getString('kind') || 'note';
     logQuestEvent(gid, number, kind, text, uid);
+    const pub = interaction.options.getBoolean('public') ?? false;
+    await questAnnounce(interaction.client, quest, `${QUEST_EVENT_ICON[kind] ?? '📝'} \`${fmtElapsed(questElapsed(quest))}\` — ${text}`, { board: pub });
     return interaction.reply({ content: `${QUEST_EVENT_ICON[kind] ?? '📝'} \`${fmtElapsed(questElapsed(quest))}\` — ${text}` });
   }
 
@@ -13410,6 +15048,33 @@ async function handleQuest(interaction) {
       lines.push('', `🎁 **GM to distribute:** ${quest.rewards}`);
       lines.push(`Party: ${partyNames.join(', ')}`);
     }
+    {
+      const done = getQuest(gid, number);
+      updateQuest(gid, number, { stage: 'completed' });
+      // The run record: who ran it, who was on it, which NPCs took part —
+      // keyed to the ROOT quest so instances share one counter.
+      const root = questRootNumber(done);
+      const npcIds = getQuestMembers(gid, number, 'npc');
+      const npcNames = npcIds.map(id => npcNameFromFighter(id));
+      db.prepare('INSERT INTO quest_runs (guild_id, root_number, number, completed_at, gm_id, party, npcs) VALUES (?,?,?,?,?,?,?)')
+        .run(gid, root, number, Date.now(), done.gm_id ?? uid, JSON.stringify(party), JSON.stringify(npcNames));
+      const runCount = db.prepare('SELECT COUNT(*) AS c FROM quest_runs WHERE guild_id=? AND root_number=?').get(gid, root).c;
+      await syncQuestPipeline(interaction.client, interaction.guild, gid, getQuest(gid, number));
+      const rootQuest = root === number ? getQuest(gid, number) : getQuest(gid, root);
+      if (rootQuest?.plan_thread_id) {
+        const gmName = await getDisplayNameCached(interaction.guild, done.gm_id ?? uid, nameCache);
+        const rec = `🏁 **Run #${runCount}** — <t:${Math.floor(Date.now() / 1000)}:d> · ⏱️ ${fmtElapsed(runMs)} · GM **${gmName}**\n👥 ${partyNames.join(', ') || '—'}\n🎭 ${npcNames.join(', ') || '—'}`;
+        await questAnnounce(interaction.client, rootQuest, rec, { board: false });
+      }
+      await questAnnounce(interaction.client, done, `🎉 **Complete!** Run **#${runCount}** of this adventure — ran for **${fmtElapsed(runMs)}**${quest.merit_reward > 0 ? ` — **+${quest.merit_reward}** merit${quest.merit_reward === 1 ? '' : 's'} to the party` : ''}.`);
+      // The board thread's tale is told — tuck it away.
+      if (done.post_channel_id) {
+        try {
+          const bt = await interaction.client.channels.fetch(done.post_channel_id);
+          if (bt?.isThread?.()) await bt.setArchived(true);
+        } catch { /* best-effort */ }
+      }
+    }
 
     // The summary: the whole timeline, the party, and how long it took.
     const partyNames = [];
@@ -13471,6 +15136,12 @@ async function handleQuest(interaction) {
       // Best-effort: strip buttons from the posted message
       if (quest.post_channel_id && quest.post_message_id) {
         try { const ch = await interaction.client.channels.fetch(quest.post_channel_id); const m = await ch.messages.fetch(quest.post_message_id); await m.edit({ content: `~~${questTag(quest)}~~ _(deleted)_`, components: [] }); } catch {}
+      }
+      if (quest.index_thread_id && quest.index_msg_id) {
+        try {
+          const bk = await interaction.client.channels.fetch(quest.index_thread_id);
+          if (bk?.isThread?.()) { if (bk.archived) await wakeThread(bk); await bk.messages.delete(quest.index_msg_id); }
+        } catch { /* already gone */ }
       }
       deleteQuest(gid, number);
       return `🗑️ **${questTag(quest)}** deleted.`;
@@ -13654,7 +15325,7 @@ async function handleExportRejectModal(interaction) {
     allowedMentions: { parse: [] } });
 }
 
-// Submission from the /pr say writing box.
+// Submission from the /npc say writing box.
 async function handleNpcSayModal(interaction) {
   const gid = interaction.guild.id;
   if (!(await isGm(interaction.guild, interaction.user.id)))
