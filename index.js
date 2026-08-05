@@ -14465,7 +14465,12 @@ async function refreshDmRoster(client, guild, gid) {
     if (!avail.length) lines.push('_No DMs available right now._');
     for (const r of avail) {
       const nm = await getDisplayName(guild, r.user_id);
+      // The tracker: quests they have authored (roots only — instances copy
+      // someone else's writing) and parties they have guided to completion.
+      const written = db.prepare('SELECT COUNT(*) AS c FROM quests WHERE guild_id=? AND created_by=? AND instance_of IS NULL').get(gid, r.user_id).c;
+      const guided = db.prepare('SELECT COUNT(*) AS c FROM quest_runs WHERE guild_id=? AND gm_id=?').get(gid, r.user_id).c;
       lines.push(`**${nm}**${r.style ? ` — _${r.style}_` : ''}`);
+      lines.push(`✍️ **${written}** written · 🧭 **${guided}** guided`);
       if (r.brief) lines.push(`> ${r.brief}`);
       lines.push('');
     }
@@ -14577,6 +14582,7 @@ async function finishQuestCreate(interaction, gid, uid, f) {
       planLine = `\n⚠️ Couldn't open a planning thread — ${err?.message || err}. Check my forum permissions there.`;
     }
   }
+  await refreshDmRoster(interaction.client, interaction.guild, gid);
   return interaction.editReply({ content: `✅ Created **${questTag(quest)}**.${planLine}\n\n${await renderQuest(interaction.guild, quest)}\n\n_Post it with_ \`/quest post number:${number}\`_._` });
 }
 
@@ -15066,6 +15072,7 @@ async function handleQuest(interaction) {
         const rec = `🏁 **Run #${runCount}** — <t:${Math.floor(Date.now() / 1000)}:d> · ⏱️ ${fmtElapsed(runMs)} · GM **${gmName}**\n👥 ${partyNames.join(', ') || '—'}\n🎭 ${npcNames.join(', ') || '—'}`;
         await questAnnounce(interaction.client, rootQuest, rec, { board: false });
       }
+      await refreshDmRoster(interaction.client, interaction.guild, gid);
       await questAnnounce(interaction.client, done, `🎉 **Complete!** Run **#${runCount}** of this adventure — ran for **${fmtElapsed(runMs)}**${quest.merit_reward > 0 ? ` — **+${quest.merit_reward}** merit${quest.merit_reward === 1 ? '' : 's'} to the party` : ''}.`);
       // The board thread's tale is told — tuck it away.
       if (done.post_channel_id) {
