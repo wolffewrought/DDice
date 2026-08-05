@@ -14281,7 +14281,7 @@ function questStatusBadge(status) {
 }
 
 // Build the full text block for a quest (used by post/show).
-async function renderQuest(guild, quest) {
+async function renderQuest(guild, quest, { applyHint = true } = {}) {
   const gid = guild.id;
   const party = getQuestMembers(gid, quest.number, 'party');
   const applied = getQuestMembers(gid, quest.number, 'applied');
@@ -14328,7 +14328,7 @@ async function renderQuest(guild, quest) {
     lines.push(`Applicants: ${names.join('  ')}`);
   }
   if (quest.run_channel_id) lines.push(`\n📍 Runs in <#${quest.run_channel_id}>`);
-  if (quest.status === 'open') lines.push(`\n_Apply with the button below or_ \`/quest apply number:${quest.number}\``);
+  if (applyHint && quest.status === 'open') lines.push(`\n_Apply with the button below or_ \`/quest apply number:${quest.number}\``);
   return lines.join('\n');
 }
 
@@ -14567,7 +14567,7 @@ async function finishQuestCreate(interaction, gid, uid, f) {
       const tagMap = JSON.parse(getConfig(gid)?.quest_plan_tags || '{}');
       const thread = await forum.threads.create({ name: `#${number} — ${quest.name}`.slice(0, 100), autoArchiveDuration: 10080,
         appliedTags: tagMap.concept ? [tagMap.concept] : [],
-        message: { content: `🗺️ **GM planning** — ${questTag(quest)}\n\n${await renderQuest(interaction.guild, quest)}\n\n_Draft. \`/quest post number:${number}\` opens it on the public board; every application and turn of the quest will be mirrored here._` } });
+        message: { content: `🗺️ **GM planning** — ${questTag(quest)}\n\n${await renderQuest(interaction.guild, quest, { applyHint: false })}\n\n_Draft. \`/quest post number:${number}\` opens it on the public board; every application and turn of the quest will be mirrored here._` } });
       updateQuest(gid, number, { plan_thread_id: thread.id });
       quest = getQuest(gid, number);
       await syncQuestBook(interaction.client, interaction.guild, gid, quest);
