@@ -9571,7 +9571,9 @@ async function autoFightCard(guild, gid, fighter, kind, stat, nat, total, target
     : `🛡️ ${who} defends with ${STAT_LABELS[stat]}`;
   const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
   const charCard = await fighterCharCard(guild, gid, fighter.id);
-  return buildRollEmbed({
+  // The auto loop's rolls for a PLAYER honour their card style too; the
+  // wrapper leaves NPC cards full on its own.
+  return styledFightCard(gid, fighter.id, {
     rollLine, label, isReroll,
     char: charCard, healCharges: 0, maxCharges: 0,
     flavour: null, total, critType, tags: null, gid,
