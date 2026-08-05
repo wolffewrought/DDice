@@ -9880,6 +9880,21 @@ function expandNpcTokens(gid, str) {
 
 // Build a character-shaped object for buildRollEmbed from any fighter id.
 // Players use their real character row; NPCs are adapted from the NPC record.
+// A fight card honours the roller's /profile card style: Full stays the full
+// sheet card; Compressed — and Off, since a fight roll is a stat roll and a
+// bare total explains nothing — folds to the compact line + stat line, same
+// as /roll. NPCs and the audit's reveal cards always render full.
+function styledFightCard(gid, actorId, args) {
+  if (isNpcFighter(actorId) || args.char?._isNpc) return buildRollEmbed(args);
+  const char = getChar(gid, actorId);
+  if (!char || cardMode(char) === CARD_FULL) return buildRollEmbed(args);
+  const lines = [];
+  if (args.label) lines.push(`${critPrefix(args.critType)}**${args.label}**${args.isReroll ? ' *(reroll)*' : ''}`);
+  lines.push(args.rollLine, statLine(char, gid));
+  if (args.flavour) lines.push(...flavourBlock(args.flavour, args.label, args.total, args.critType));
+  return lines.join('\n');
+}
+
 async function fighterCharCard(guild, gid, fid) {
   if (isNpcFighter(fid)) {
     const name = npcNameFromFighter(fid);
@@ -10442,7 +10457,7 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     const actorCard = await fighterCharCard(interaction.guild, gid, actorId);
 
     const headerLabel = `⚔️ Attacks ${targetName} with ${STAT_LABELS[stat]}`;
-    const card = buildRollEmbed({
+    const card = styledFightCard(gid, actorId, {
       rollLine: publicLine, label: headerLabel, isReroll: false,
       char: actorCard, healCharges: 0, maxCharges: 0,
       flavour: flavour || null, total, critType, tags: null, gid,
@@ -10577,7 +10592,7 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
   const actorCard = await fighterCharCard(interaction.guild, gid, actorId);
 
   const headerLabel = `🤼 Attempts to grapple ${targetName}`;
-  const card = buildRollEmbed({
+  const card = styledFightCard(gid, actorId, {
     rollLine: publicLine, label: headerLabel, isReroll: false,
     char: actorCard, healCharges: 0, maxCharges: 0,
     flavour: flavour || null, total, critType, tags: null, gid,
@@ -10679,7 +10694,7 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
   const actorCard = await fighterCharCard(interaction.guild, gid, actorId);
 
   const headerLabel = `🎭 Feints at ${targetName}`;
-  const card = buildRollEmbed({
+  const card = styledFightCard(gid, actorId, {
     rollLine: publicLine, label: headerLabel, isReroll: false,
     char: actorCard, healCharges: 0, maxCharges: 0,
     flavour: flavour ? `${feintText} — ${flavour}` : feintText, total, critType, tags: null, gid,
@@ -11996,7 +12011,7 @@ async function handleFight(interaction) {
     const publicLine = (defender.isNpc && !npcStatsVisible(gid)) ? lineFor(false) : rollLine;
     const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
     const defCard = await fighterCharCard(interaction.guild, gid, defenderId);
-    const card = buildRollEmbed({
+    const card = styledFightCard(gid, defenderId, {
       rollLine: publicLine, label: `🛡️ Defends with ${STAT_LABELS[stat]}`, isReroll: false,
       char: defCard, healCharges: 0, maxCharges: 0,
       flavour: flavour || null, total, critType, tags: null, gid,
