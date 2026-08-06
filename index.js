@@ -540,7 +540,7 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN audit_routes TEXT'); } catch 
 // redeploys (the Railway filesystem does not).
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font BLOB'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font_name TEXT'); } catch {}
-// A shelf for the props: every /scroll's named PDF is also filed here.
+// A shelf for the props: every /gm scroll's named PDF is also filed here.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_archive_id TEXT'); } catch {}
 // Grappling: which attack-phase roll is pending, and who holds whom.
 try { db.exec('ALTER TABLE fights ADD COLUMN atk_kind TEXT'); } catch {}
@@ -872,7 +872,7 @@ function getHealCharges(gid, uid, max) {
 function setHealCharges(gid, uid, cur) {
   db.prepare('INSERT OR REPLACE INTO heal_charges (guild_id,user_id,current) VALUES (?,?,?)').run(gid, uid, cur);
 }
-// The character card, in one place so /char show and /char summary agree.
+// The character card, in one place so /char view show and /char view summary agree.
 function buildCharCard(ch, displayName, healNow, maxCharges, gid) {
   const lines = [`⚔️  **${displayName}**`,
     ch.order_name ? `${KNIGHT_EMOJIS[ch.order_name] ?? '⚪'}  ${ch.order_name}` : 'No order set'];
@@ -3180,7 +3180,7 @@ const ORDER_PALETTE = {
 const DEFAULT_PALETTE = { bg: '#f5f0e8', accent: '#8b7355', text: '#2a2a2a', border: '#8b7355', crest: '⚔️' };
 
 
-// ── Written props (/scroll) ──────────────────────────────────────────────────
+// ── Written props (/gm scroll) ──────────────────────────────────────────────────
 // The guild's font, registered with the canvas once per process. Returns the
 // family name to draw with, or null when no font is configured. The cache is
 // dropped by /config mechanics scrollfont so a replacement takes effect immediately.
@@ -3200,7 +3200,7 @@ function ensureScrollFont(gid) {
   return family;
 }
 
-// The scroll's weave: what /scroll wrote rides invisibly inside the PNG it
+// The scroll's weave: what /gm scroll wrote rides invisibly inside the PNG it
 // posts, so the image can be handed back later and read out again — the
 // same trailer trick the sheet exports use, under its own mark.
 const SCROLL_WEAVE_MARK = 'DDICESCROLLv1';
@@ -3280,7 +3280,7 @@ function wrapScrollLines(measure, text, maxWidth) {
 
 // The parchment itself: cream ground, burnt corners, speckle, a double gold
 // rule with maroon diamond cornerstones — the DDice parchment look. Shared
-// by the /scroll prop and the parchment sheet export.
+// by the /gm scroll prop and the parchment sheet export.
 function paintParchment(ctx, W, H) {
   ctx.fillStyle = '#f3e9d2';
   ctx.fillRect(0, 0, W, H);
@@ -3652,7 +3652,7 @@ function validateImportedSheet(o) {
     weapon2: str_(o.weapon2, 60), weapon2emoji: str_(o.weapon2emoji, 8) };
 }
 
-// The sheet on parchment: same ground as /scroll, in the guild's scroll font
+// The sheet on parchment: same ground as /gm scroll, in the guild's scroll font
 // when one is stored, a plain serif otherwise.
 function renderSheetParchment(char, displayName, gid, healLine = null, pdf = false) {
   const { createCanvas } = require('@napi-rs/canvas');
@@ -4376,6 +4376,18 @@ const slashCommands = [
           {name:'✨ Everything — HP, rerolls and charges',value:'all'})))
     .addSubcommand(s=>s.setName('questwipe').setDescription('Delete EVERY quest on this server — confirm-gated (GM)')
       .addBooleanOption(o=>o.setName('runs').setDescription('true = also erase the run ledger and DM guided-counters (default: history kept)').setRequired(false)))
+    .addSubcommand(s=>s.setName('check').setDescription('Which channels and forums are set up for the bot, and which await (GM)'))
+    .addSubcommand(s=>s.setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)')
+      .addAttachmentOption(o=>o.setName('file').setDescription('A scroll PDF made by /gm scroll — I read it back as text and a fresh copy in this server\'s font').setRequired(false)))
+    .addSubcommand(s=>s.setName('dicereport').setDescription('The server\'s dice health — who rolls, how the d20s run, the hot and cold hands (GM)'))
+    .addSubcommandGroup(g => {
+      g.setName('backup').setDescription('Database backup');
+      g.addSubcommand(s=>s.setName('now').setDescription('Export the database to this channel'));
+      g.addSubcommand(s=>s.setName('auto').setDescription('Toggle daily automatic backups')
+        .addStringOption(o=>o.setName('channel').setDescription('Channel for backups (or type off to disable)').setRequired(true))
+        .addIntegerOption(o=>o.setName('hours').setDescription('How often, in hours (default 24)').setRequired(false).setMinValue(1).setMaxValue(720)));
+      return g;
+    })
     .addSubcommand(s=>s.setName('roll').setDescription('A GM roll — public, or secret (visible only to you); the audit sees both')
       .addStringOption(o=>o.setName('notation').setDescription('Dice notation e.g. 1d20+5').setRequired(true))
       .addStringOption(o=>o.setName('label').setDescription('Roll label e.g. perception').setRequired(false))
@@ -4440,7 +4452,7 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('rollauditforum').setDescription('Split the mirror into books — player rolls, GM rolls, NPC rolls, NPC say')
       .addChannelOption(o=>o.setName('forum').setDescription('The forum channel').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = back to the single audit channel').setRequired(false)));
-      g.addSubcommand(s=>s.setName('scrollarchive').setDescription('A library channel — every /scroll\'s named PDF is also filed there')
+      g.addSubcommand(s=>s.setName('scrollarchive').setDescription('A library channel — every /gm scroll\'s named PDF is also filed there')
       .addChannelOption(o=>o.setName('channel').setDescription('The archive channel').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = stop archiving').setRequired(false)));
       return g;
@@ -4481,7 +4493,7 @@ const slashCommands = [
       .addBooleanOption(o=>o.setName('enabled').setDescription('true = ping, false = silent (default); omit to show current').setRequired(false)));
       g.addSubcommand(s=>s.setName('npcstats').setDescription('Show NPC stat blocks on their roll cards (default: hidden)')
       .addBooleanOption(o=>o.setName('enabled').setDescription('true = players see NPC stats; false = hidden (default)').setRequired(false)));
-      g.addSubcommand(s=>s.setName('scrollfont').setDescription('The font /scroll props are written in — upload an .otf or .ttf')
+      g.addSubcommand(s=>s.setName('scrollfont').setDescription('The font /gm scroll props are written in — upload an .otf or .ttf')
       .addAttachmentOption(o=>o.setName('font').setDescription('The font file (.otf / .ttf, up to 2 MB)').setRequired(false))
       .addBooleanOption(o=>o.setName('remove').setDescription('true = forget the stored font').setRequired(false)));
       g.addSubcommand(s=>s.setName('cleanwebhooks').setDescription('Remove orphaned NPC webhooks to free up Discord limits'));
@@ -4524,7 +4536,6 @@ const slashCommands = [
         .addChoices({name:'⚔️ Swords',value:'⚔️'},{name:'🗡️ Dagger',value:'🗡️'},{name:'🏹 Bow',value:'🏹'},{name:'🔱 Trident',value:'🔱'},{name:'⛏️ Pickaxe',value:'⛏️'},{name:'🛡️ Shield',value:'🛡️'},{name:'🪄 Wand',value:'🪄'}))
       .addStringOption(o=>o.setName('custom').setDescription('Or paste a server custom emoji (overrides the dropdown)').setRequired(false))
       .addUserOption(o=>o.setName('user').setDescription('Target player (GM only)').setRequired(false)))
-    .addSubcommand(s=>s.setName('show').setDescription('Display a character card').addUserOption(o=>o.setName('user').setDescription('User to show').setRequired(false)))
     .addSubcommand(s=>s.setName('page').setDescription('Link a character to their forum page, or make one (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Whose character').setRequired(true))
       .addChannelOption(o=>o.setName('thread').setDescription('An existing thread to link — omit to create one').setRequired(false))
@@ -4550,30 +4561,19 @@ const slashCommands = [
       .addStringOption(o=>o.setName('def').setDescription('Defend with').setRequired(false)
         .addChoices({name:'💪 Strength',value:'str'},{name:'🫀 Constitution',value:'con'},{name:'⚡ Dexterity',value:'dex'},
                     {name:'🧠 Wisdom',value:'wis'},{name:'🍀 Luck',value:'lck'},{name:'✖️ Clear it',value:'none'})))
-    .addSubcommand(s=>s.setName('summary').setDescription('Everything about a character on one page')
-      .addUserOption(o=>o.setName('user').setDescription('Whose character').setRequired(false)))
-    .addSubcommand(s=>s.setName('inventory').setDescription('Items a character is carrying')
-      .addUserOption(o=>o.setName('user').setDescription('Whose inventory').setRequired(false)))
     .addSubcommand(s=>s.setName('give').setDescription('Give a character an item (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
       .addStringOption(o=>o.setName('item').setDescription('What they receive').setRequired(true))
       .addStringOption(o=>o.setName('note').setDescription('A detail about it').setRequired(false)))
     .addSubcommand(s=>s.setName('edit').setDescription('Reword an item a character is carrying (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Whose item').setRequired(true))
-      .addIntegerOption(o=>o.setName('id').setDescription('Item number from /char inventory').setRequired(true))
+      .addIntegerOption(o=>o.setName('id').setDescription('Item number from /char view inventory').setRequired(true))
       .addStringOption(o=>o.setName('item').setDescription('New name for it').setRequired(false))
       .addStringOption(o=>o.setName('note').setDescription('New detail \u2014 or "none" to clear').setRequired(false)))
     .addSubcommand(s=>s.setName('take').setDescription('Remove an item from a character (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
-      .addIntegerOption(o=>o.setName('id').setDescription('Item number from /char inventory').setRequired(true)))
-    .addSubcommand(s=>s.setName('standing').setDescription('Merit and renown, and where each came from')
-      .addUserOption(o=>o.setName('user').setDescription('Whose standing').setRequired(false)))
-    .addSubcommand(s=>s.setName('rollhistory').setDescription('Every natural die this character has ever rolled')
-      .addUserOption(o=>o.setName('user').setDescription('Whose rolls').setRequired(false))
-      .addIntegerOption(o=>o.setName('sides').setDescription('Die size (default 20)').setRequired(false).setMinValue(2).setMaxValue(100)))
+      .addIntegerOption(o=>o.setName('id').setDescription('Item number from /char view inventory').setRequired(true)))
     .addSubcommand(s=>s.setName('lore').setDescription('Write your character\'s lore and send it to the GMs'))
-    .addSubcommand(s=>s.setName('showlore').setDescription('Read a character\'s approved lore')
-      .addUserOption(o=>o.setName('user').setDescription('Whose lore').setRequired(false)))
     .addSubcommand(s=>s.setName('export').setDescription('Export your character sheet')
       .addStringOption(o=>o.setName('format').setDescription('Export format').setRequired(false)
         .addChoices({name:'Text',value:'text'},{name:'Summary (career record)',value:'summary'},{name:'Image',value:'image'},{name:'Parchment image',value:'parchment'},{name:'Parchment PDF — survives Discord',value:'pdf'},{name:'Career PDF — the record, survives Discord',value:'careerpdf'}))
@@ -4581,6 +4581,38 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('import').setDescription('Bring an exported sheet to this server — image or summary — for a GM to approve')
       .addAttachmentOption(o=>o.setName('image').setDescription('A sheet image exported by DDice').setRequired(false))
       .addStringOption(o=>o.setName('summary').setDescription('Or paste a [TTRPG SHEET] or [TTRPG SUMMARY] block from an export').setRequired(false)))
+    .addSubcommandGroup(g => {
+      g.setName('view').setDescription('Read a character — sheet, standing, history, lore, inventory, summary');
+      g.addSubcommand(s=>s.setName('show').setDescription('Display a character card').addUserOption(o=>o.setName('user').setDescription('User to show').setRequired(false)));
+      g.addSubcommand(s=>s.setName('summary').setDescription('Everything about a character on one page')
+      .addUserOption(o=>o.setName('user').setDescription('Whose character').setRequired(false)));
+      g.addSubcommand(s=>s.setName('inventory').setDescription('Items a character is carrying')
+      .addUserOption(o=>o.setName('user').setDescription('Whose inventory').setRequired(false)));
+      g.addSubcommand(s=>s.setName('standing').setDescription('Merit and renown, and where each came from')
+      .addUserOption(o=>o.setName('user').setDescription('Whose standing').setRequired(false)));
+      g.addSubcommand(s=>s.setName('rollhistory').setDescription('Every natural die this character has ever rolled')
+      .addUserOption(o=>o.setName('user').setDescription('Whose rolls').setRequired(false))
+      .addIntegerOption(o=>o.setName('sides').setDescription('Die size (default 20)').setRequired(false).setMinValue(2).setMaxValue(100)));
+      g.addSubcommand(s=>s.setName('showlore').setDescription('Read a character\'s approved lore')
+      .addUserOption(o=>o.setName('user').setDescription('Whose lore').setRequired(false)));
+      return g;
+    })
+    .addSubcommand(s=>s.setName('stat').setDescription('Show stat descriptions'))
+    .addSubcommandGroup(g => {
+      g.setName('profile').setDescription('Your roll card profile — display, snapshots');
+      g.addSubcommand(s=>s.setName('card').setDescription('How much of your sheet shows when you roll')
+        .addStringOption(o=>o.setName('style').setDescription('Full card, one compressed line, or nothing').setRequired(true)
+          .addChoices({name:'Full — the whole sheet',value:'full'},
+                      {name:'Compressed — one line of stats',value:'compact'},
+                      {name:'Off — plain text rolls',value:'off'})));
+      g.addSubcommand(s=>s.setName('on').setDescription('Enable profile embed, max HP and rerolls'));
+      g.addSubcommand(s=>s.setName('off').setDescription('Disable profile embed'));
+      g.addSubcommand(s=>s.setName('show').setDescription('Preview your profile without rolling'));
+      g.addSubcommand(s=>s.setName('save').setDescription('Snapshot current tracker state').addStringOption(o=>o.setName('slotname').setDescription('Name for this save').setRequired(true)));
+      g.addSubcommand(s=>s.setName('load').setDescription('Restore a saved snapshot').addStringOption(o=>o.setName('slotname').setDescription('Name of the save to load').setRequired(true)));
+      g.addSubcommand(s=>s.setName('saves').setDescription('List all your saved snapshots'));
+      return g;
+    })
     .addSubcommandGroup(g=>g.setName('weapon').setDescription('The server weapon list (GM)')
       .addSubcommand(s=>s.setName('add').setDescription('Add a weapon to the server list')
         .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true))
@@ -4611,30 +4643,6 @@ const slashCommands = [
         .addStringOption(o=>o.setName('name').setDescription('Tag name (create/delete)').setRequired(false)))),
 
   new SlashCommandBuilder()
-    .setName('profile').setDescription('Manage your roll card profile')
-    .addSubcommand(s=>s.setName('card').setDescription('How much of your sheet shows when you roll')
-      .addStringOption(o=>o.setName('style').setDescription('Full card, one compressed line, or nothing').setRequired(true)
-        .addChoices({name:'Full — the whole sheet',value:'full'},
-                    {name:'Compressed — one line of stats',value:'compact'},
-                    {name:'Off — plain text rolls',value:'off'})))
-    .addSubcommand(s=>s.setName('on').setDescription('Enable profile embed, max HP and rerolls'))
-    .addSubcommand(s=>s.setName('off').setDescription('Disable profile embed'))
-    .addSubcommand(s=>s.setName('show').setDescription('Preview your profile without rolling'))
-    .addSubcommand(s=>s.setName('save').setDescription('Snapshot current tracker state').addStringOption(o=>o.setName('slotname').setDescription('Name for this save').setRequired(true)))
-    .addSubcommand(s=>s.setName('load').setDescription('Restore a saved snapshot').addStringOption(o=>o.setName('slotname').setDescription('Name of the save to load').setRequired(true)))
-    .addSubcommand(s=>s.setName('saves').setDescription('List all your saved snapshots')),
-
-  new SlashCommandBuilder()
-    .setName('stat').setDescription('Show stat descriptions'),
-
-  new SlashCommandBuilder()
-    .setName('dicereport').setDescription('The server\'s dice health — who rolls, how the d20s run, the hot and cold hands (GM)'),
-
-  new SlashCommandBuilder()
-    .setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)')
-    .addAttachmentOption(o=>o.setName('file').setDescription('A scroll PDF made by /scroll — I read it back as text and a fresh copy in this server\'s font').setRequired(false)),
-
-  new SlashCommandBuilder()
     .setName('help').setDescription('Show all commands by category')
     .addStringOption(o=>o.setName('category').setDescription('Specific category to view').setRequired(false)
       .addChoices(
@@ -4650,19 +4658,6 @@ const slashCommands = [
         {name:'NPCs',value:'npc'},
         {name:'GM & Config',value:'gm'}
       )),
-
-  new SlashCommandBuilder()
-    .setName('lastroll').setDescription('Show your most recent roll in this channel'),
-
-  new SlashCommandBuilder()
-    .setName('check').setDescription('Which channels and forums are set up for the bot, and which await (GM)'),
-
-  new SlashCommandBuilder()
-    .setName('backup').setDescription('Database backup (GM only)')
-    .addSubcommand(s=>s.setName('now').setDescription('Export the database to this channel'))
-    .addSubcommand(s=>s.setName('auto').setDescription('Toggle daily automatic backups')
-      .addStringOption(o=>o.setName('channel').setDescription('Channel for backups (or type off to disable)').setRequired(true))
-      .addIntegerOption(o=>o.setName('hours').setDescription('How often, in hours (default 24)').setRequired(false).setMinValue(1).setMaxValue(720))),
 
   new SlashCommandBuilder()
     .setName('npc').setDescription('Manage NPCs — create, sheets, speaking and rolling as them (GM only)')
@@ -4858,6 +4853,7 @@ const slashCommands = [
         {name:'🎭 Feint',value:'feint'},{name:'👁️ Insight',value:'insight'}))
     .addStringOption(o=>o.setName('target_npc').setDescription('Ability actions: NPC target instead of a player').setRequired(false).setAutocomplete(true))
     .addStringOption(o=>o.setName('feint').setDescription('Feint only: what you pretend to do').setRequired(false))
+    .addBooleanOption(o=>o.setName('last').setDescription('true = show your most recent roll in this channel instead of rolling').setRequired(false))
     .addStringOption(o=>o.setName('label').setDescription('What the roll is for, e.g. perception').setRequired(false))
     .addStringOption(o=>o.setName('flavour').setDescription('RP text posted with the roll — *italic* and **bold** work').setRequired(false)),
 
@@ -5059,7 +5055,7 @@ async function handleLoreButton(interaction) {
   setLore(gid, uid, { state: 'approved', reason: null, decided_by: interaction.user.id, decided_at: Date.now() });
   try { await interaction.message.edit({ content: `${interaction.message.content}\n\n✅ **Approved** by ${gmName}`, components: [] }); } catch {}
   const told = await notifyPlayer(interaction, gid, uid,
-    `✅ **Your lore was approved** by ${gmName} in **${interaction.guild.name}** — it shows on \`/char showlore\` now.`);
+    `✅ **Your lore was approved** by ${gmName} in **${interaction.guild.name}** — it shows on \`/char view showlore\` now.`);
   return interaction.reply({ content: `✅ Lore approved for <@${uid}>.` + deliveryNote(told), allowedMentions: { parse: [] } });
 }
 
@@ -6221,14 +6217,14 @@ async function handleConfig(interaction) {
     if (interaction.options.getBoolean('remove')) {
       setConfig(gid, { scroll_font: null, scroll_font_name: null });
       scrollFontCache.delete(gid);
-      return interaction.reply({ content: '📜 Scroll font forgotten — `/scroll` is off until a new one is uploaded.' });
+      return interaction.reply({ content: '📜 Scroll font forgotten — `/gm scroll` is off until a new one is uploaded.' });
     }
     const att = interaction.options.getAttachment('font');
     if (!att) {
       const cfg = getConfig(gid) || {};
       return interaction.reply({ ephemeral: true, content: cfg.scroll_font
         ? `📜 Scroll font: **${cfg.scroll_font_name || 'unnamed'}** (${Math.round(cfg.scroll_font.length / 1024)} KB). Upload another to replace it, or \`remove:true\`.`
-        : '📜 No scroll font stored. `/config mechanics scrollfont font:<file>` with an .otf or .ttf — then any GM can `/scroll`.' });
+        : '📜 No scroll font stored. `/config mechanics scrollfont font:<file>` with an .otf or .ttf — then any GM can `/gm scroll`.' });
     }
     if (!/\.(otf|ttf)$/i.test(att.name || '')) {
       return interaction.reply({ ephemeral: true, content: '❌ That isn\'t an .otf or .ttf file.' });
@@ -6240,8 +6236,8 @@ async function handleConfig(interaction) {
     try {
       const bytes = await fetchBytes(att.url);
       setConfig(gid, { scroll_font: bytes, scroll_font_name: att.name });
-      scrollFontCache.delete(gid); // the next /scroll registers the new face
-      // Prove the face works NOW, not at the first /scroll: a one-line sample.
+      scrollFontCache.delete(gid); // the next /gm scroll registers the new face
+      // Prove the face works NOW, not at the first /gm scroll: a one-line sample.
       let files = [];
       try {
         const family = ensureScrollFont(gid);
@@ -6252,7 +6248,7 @@ async function handleConfig(interaction) {
             { name: 'font-sample.png' })];
         }
       } catch (err) { console.error('[scrollfont] sample failed -', err?.message || err); }
-      return interaction.editReply({ content: `📜 Scroll font set: **${att.name}** (${Math.round(bytes.length / 1024)} KB). Any GM can now \`/scroll\`.${files.length ? '' : '\n⚠️ _No sample — the face stored, but rendering it here failed; watch the first /scroll._'}`, files });
+      return interaction.editReply({ content: `📜 Scroll font set: **${att.name}** (${Math.round(bytes.length / 1024)} KB). Any GM can now \`/gm scroll\`.${files.length ? '' : '\n⚠️ _No sample — the face stored, but rendering it here failed; watch the first /gm scroll._'}`, files });
     } catch (err) {
       console.error('[scrollfont] store failed -', err?.message || err);
       return interaction.editReply({ content: `❌ Couldn't fetch that attachment — ${err?.message || err}` });
@@ -6274,7 +6270,7 @@ async function handleConfig(interaction) {
           : '📚 No archive yet. Set the roll-audit forum and its 📜 Scrolls book archives automatically — or `/config channels scrollarchive channel:#library` for a plain channel.' });
     }
     setConfig(gid, { scroll_archive_id: ch.id });
-    return interaction.reply({ content: `📚 Scroll archive set: <#${ch.id}> — every \`/scroll\` now also files its named PDF there.` });
+    return interaction.reply({ content: `📚 Scroll archive set: <#${ch.id}> — every \`/gm scroll\` now also files its named PDF there.` });
   }
   if (sub === 'rollauditforum') {
     if (interaction.options.getBoolean('disable')) {
@@ -6696,7 +6692,7 @@ async function handleConfig(interaction) {
     }
     if (!channel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
     setConfig(gid, { quest_log_channel: channel.id });
-    return interaction.reply({ content: `📜 Finished quests will be written up in <#${channel.id}>, and linked on each player's \`/char standing\`.` });
+    return interaction.reply({ content: `📜 Finished quests will be written up in <#${channel.id}>, and linked on each player's \`/char view standing\`.` });
   }
 
   if (sub === 'activities') {
@@ -6860,7 +6856,7 @@ async function handleChar(interaction) {
     if (targetId !== callerId && !isGmUser) return interaction.reply({ content: '❌ Only GMs can set stats for other players.', ephemeral: true });
     // BUG 2: /char create skipped the approval lock entirely, so an approved
     // player could rewrite their whole sheet with it — the one door left open
-    // after /char set, /char weaponemoji, /profile load and sheet import were
+    // after /char set, /char weaponemoji, /char profile load and sheet import were
     // all shut.
     {
       const lock = sheetEditLock(gid, callerId, targetId, isGmUser);
@@ -6942,7 +6938,7 @@ async function handleChar(interaction) {
       // Reply first so the approval post can link back to a real message.
       const chId = approvalDestination(gid, 'sheets');
       await interaction.reply({ content: chId
-        ? `✅ Sheet submitted — ${summary}\n\n⏳ **Awaiting GM approval.** You can't roll or fight until it's approved.\n📬 **You'll get a DM as soon as a GM decides** — if your DMs are closed, the notice will be posted here instead.\n🔒 Once approved, only a GM can change your sheet, so check it over now with \`/char show\`.`
+        ? `✅ Sheet submitted — ${summary}\n\n⏳ **Awaiting GM approval.** You can't roll or fight until it's approved.\n📬 **You'll get a DM as soon as a GM decides** — if your DMs are closed, the notice will be posted here instead.\n🔒 Once approved, only a GM can change your sheet, so check it over now with \`/char view show\`.`
         : `✅ Sheet saved — ${summary}\n\n⚠️ No approval channel set; ask a GM to check \`/config channels approvals\`.` });
       let submitId = null;
       try { const rep = await interaction.fetchReply(); submitId = rep?.id ?? null; } catch {}
@@ -6994,7 +6990,7 @@ async function handleChar(interaction) {
     const thread = interaction.options.getChannel('thread');
     if (thread) {
       setCharPage(gid, who.id, thread.id, `https://discord.com/channels/${gid}/${thread.id}`, nm3);
-      return interaction.reply({ content: `📖 **${nm3}** is linked to <#${thread.id}>. It shows on \`/char show\`.` });
+      return interaction.reply({ content: `📖 **${nm3}** is linked to <#${thread.id}>. It shows on \`/char view show\`.` });
     }
     await interaction.deferReply();
     try {
@@ -7405,11 +7401,11 @@ async function handleProfile(interaction) {
     if (!ch) { upsertChar(gid, uid, {}); ch = getChar(gid, uid); }
     upsertChar(gid, uid, { profile_enabled:1, hp_current:maxHp(ch, gid), rerolls_current:maxRerolls(ch) });
     if (isWhiteKnight(ch)) { const cfg=getConfig(gid); setHealCharges(gid,uid,cfg.heal_charges??3); }
-    return interaction.reply({ content: '✅ Profile enabled (full card). HP and rerolls maxed out. `/profile card` picks a style.', ephemeral: true });
+    return interaction.reply({ content: '✅ Profile enabled (full card). HP and rerolls maxed out. `/char profile card` picks a style.', ephemeral: true });
   }
   if (sub === 'off') {
     upsertChar(gid, uid, { profile_enabled: 0 });
-    return interaction.reply({ content: '⏸️ Profile disabled. Rolls post as plain text. `/profile card style:Compressed` gives a one-line version instead.', ephemeral: true });
+    return interaction.reply({ content: '⏸️ Profile disabled. Rolls post as plain text. `/char profile card style:Compressed` gives a one-line version instead.', ephemeral: true });
   }
   if (sub === 'show') {
     const ch = getChar(gid, uid);
@@ -7770,7 +7766,7 @@ async function runGmRollSlash(interaction) {
   return interaction.reply({ content });
 }
 
-// /check — the setup mirror. Unset first (with the command that sets each),
+// /gm check — the setup mirror. Unset first (with the command that sets each),
 // then the set ones with links, every stored id fetch-verified.
 async function handleCheck(interaction) {
   const gid = interaction.guild.id;
@@ -7800,7 +7796,7 @@ async function handleCheck(interaction) {
     ['🖼️ NPC image bank', cfg.npc_channel_id, '`/config channels npcchannel channel:#`', null],
     ['📚 GM docs (the PDFs)', cfg.docs_channel, '`/config channels docs channel:# repo:owner/name`', null],
     ['📜 Scroll library', cfg.scroll_archive_id, '`/config channels scrollarchive channel:#`', null],
-    ['💾 Backups', cfg.backup_channel_id, '`/backup auto channel:#`', null],
+    ['💾 Backups', cfg.backup_channel_id, '`/gm backup auto channel:#`', null],
   ];
   const unset = [], set = [];
   for (const [label, id, cmd, note] of checks) {
@@ -8389,7 +8385,9 @@ client.on('interactionCreate', async interaction => {
   try {
     if (interaction.commandName === 'duel') return await handleDuel(interaction);
     if (interaction.commandName === 'gm') {
-      if (interaction.options.getSubcommandGroup(false) === 'test') return await handleGmTest(interaction);
+      const gmGroup = interaction.options.getSubcommandGroup(false);
+      if (gmGroup === 'test') return await handleGmTest(interaction);
+      if (gmGroup === 'backup') return await handleBackup(interaction);
       const gmSub = interaction.options.getSubcommand();
       if (gmSub === 'search') return await handleGmSearch(interaction);
       if (gmSub === 'queue') return await handleGmQueue(interaction);
@@ -8397,6 +8395,9 @@ client.on('interactionCreate', async interaction => {
       if (gmSub === 'revive') return await handleGmRevive(interaction);
       if (gmSub === 'heal') return await handleGmHeal(interaction);
       if (gmSub === 'questwipe') return await runGmQuestWipe(interaction);
+      if (gmSub === 'check') return await handleCheck(interaction);
+      if (gmSub === 'scroll') return await handleScroll(interaction);
+      if (gmSub === 'dicereport') return await handleDiceReport(interaction);
       if (gmSub === 'roll') return await runGmRollSlash(interaction);
     }
     if (interaction.commandName === 'activity') return await handleStory(interaction);
@@ -8405,10 +8406,10 @@ client.on('interactionCreate', async interaction => {
       const cg = interaction.options.getSubcommandGroup(false);
       if (cg === 'weapon') return await handleWeapon(interaction);
       if (cg === 'tag') return await handleTag(interaction);
-      return await handleChar(interaction);
+      if (cg === 'profile') return await handleProfile(interaction);
+      if (!cg && interaction.options.getSubcommand(false) === 'stat') return await handleStat(interaction);
+      return await handleChar(interaction);   // the view group's leaves keep their names — handleChar dispatches them as ever
     }
-    if (interaction.commandName === 'profile') return await handleProfile(interaction);
-    if (interaction.commandName === 'stat') return await handleStat(interaction);
     if (interaction.commandName === 'fight') return await handleFight(interaction);
     if (interaction.commandName === 'npc') {
       const npcSub = interaction.options.getSubcommand(false);
@@ -8416,11 +8417,6 @@ client.on('interactionCreate', async interaction => {
       return await handleNpc(interaction);
     }
     if (interaction.commandName === 'help') return await handleHelp(interaction);
-    if (interaction.commandName === 'scroll') return await handleScroll(interaction);
-    if (interaction.commandName === 'dicereport') return await handleDiceReport(interaction);
-    if (interaction.commandName === 'lastroll') return await handleLastRoll(interaction);
-    if (interaction.commandName === 'check') return await handleCheck(interaction);
-    if (interaction.commandName === 'backup') return await handleBackup(interaction);
     if (interaction.commandName === 'roll') return await handleRollSlash(interaction);
     if (interaction.commandName === 'standing') {
       const sg = interaction.options.getSubcommandGroup(false);
@@ -9273,7 +9269,7 @@ async function requestSheetApproval(src, gid, uid, submitMessageId = null) {
 
 // Does this edit put the sheet (back) in the approval queue? Any change a player
 // makes to their OWN sheet does, while approvals are on. Without this, /char set,
-// /profile load and a pasted sheet were each a way to build a character the GMs
+// /char profile load and a pasted sheet were each a way to build a character the GMs
 // never saw: they only checked the edit *lock*, which lets a sheet with no
 // approval_state through, and nothing ever moved it to 'pending'.
 // Every sheet still waiting on a GM, oldest first — the record of truth behind
@@ -9308,7 +9304,7 @@ async function finishSheetEdit({ src, gid, callerId, targetId, isGmCaller, conte
   if (short.length) {
     const note = statBudgetReply(gid, short, getChar(gid, targetId)) + '\n_Saved, but not sent to the GMs yet._';
     const out = await reply(content + '\n\n' + note);
-    // `link: false` marks a caller whose reply is ephemeral (/profile load).
+    // `link: false` marks a caller whose reply is ephemeral (/char profile load).
     // The refusal belongs where they're working, so post it there as well.
     let inChannel = out;
     if (!link) {
@@ -9461,7 +9457,7 @@ async function ensureCharPage(client, guild, uid, displayName) {
   if (!forum?.threads?.create) throw new Error('that channel is not a forum');
   const thread = await forum.threads.create({
     name: displayName.slice(0, 90),
-    message: { content: `📖 **${displayName}** — this thread is theirs. Lore, art and notes go here.\n_Linked from \`/char show\`._` },
+    message: { content: `📖 **${displayName}** — this thread is theirs. Lore, art and notes go here.\n_Linked from \`/char view show\`._` },
   });
   const url = `https://discord.com/channels/${gid}/${thread.id}`;
   setCharPage(gid, uid, thread.id, url, displayName);
@@ -10031,7 +10027,7 @@ function expandNpcTokens(gid, str) {
 
 // Build a character-shaped object for buildRollEmbed from any fighter id.
 // Players use their real character row; NPCs are adapted from the NPC record.
-// A fight card honours the roller's /profile card style: Full stays the full
+// A fight card honours the roller's /char profile card style: Full stays the full
 // sheet card; Compressed — and Off, since a fight roll is a stat roll and a
 // bare total explains nothing — folds to the compact line + stat line, same
 // as /roll. NPCs and the audit's reveal cards always render full.
@@ -13219,7 +13215,7 @@ const HELP_CATEGORIES = {
       '',
       '**1 · Make your character** — `/char create` walks you through stats, class, order and weapons. You spend a fixed allowance across STR/CON/DEX/WIS/LCK with a minimum in each — `/config mechanics statallowance` shows this server\'s numbers. If sheet approval is on, a GM checks your sheet before it goes live, and you\'ll be told either way.',
       '**2 · Roll dice** — type `1d20` bare, `r1d20+5 ambush` for a label, or just a stat word like `str` or `wis`. `ra`/`rd` roll with advantage or disadvantage, and `rr` rerolls your last roll for a token. `/roll` is the guided version with dropdowns.',
-      '**3 · Your card** — `/profile on` puts your character card under your rolls, HP and tokens included. `/profile card` compresses it, `/char show` opens the full sheet any time.',
+      '**3 · Your card** — `/char profile on` puts your character card under your rolls, HP and tokens included. `/char profile card` compresses it, `/char view show` opens the full sheet any time.',
       '**4 · HP and rests** — `!hp -3` after a hit, `lrest` for a full rest, `srest` for a breather. White Knights (WIS ≥ 5) can `!heal @friend`.',
       '**5 · Fights** — a GM opens one with `/fight start` and initiative sets the order. On your turn, `/fight atk stat:str` — leave the target off and a menu appears; picking someone rolls the attack on the spot. The defender answers with `/fight def stat:dex`, either side may spend a token on `/fight rr`, and `/fight resolve` settles the exchange. When it all ends, a 🏁 result and a full recap post on their own.',
       '**6 · Duels** — `/duel opponent:@rival terms:first blood` raises one. A GM signs it off and starts the fight.',
@@ -13228,7 +13224,7 @@ const HELP_CATEGORIES = {
       '**9 · Renown & merits** — renown is the coin quests, encounters and activities pay out; spend it as the server allows (`/standing renown view`). Merits are lifetime honour that only climbs, and ranks hang off them (`/standing merit view`, `/standing rank list`). You can offer merit to a friend with `/standing merit give` — a GM signs it off.',
       '**10 · Death** — characters can fall. That call belongs to a GM: a memorial is posted, the sheet locks, and the fallen keep their history. Revival is possible when the story allows it.',
       '',
-      '_Lost mid-game? `/help category:X` for any group, `/stat` for what each stat means, `/lastroll` if you forgot what you just threw._',
+      '_Lost mid-game? `/help category:X` for any group, `/char stat` for what each stat means, `/roll last:true` if you forgot what you just threw._',
     ],
   },
   dice: {
@@ -13248,7 +13244,7 @@ const HELP_CATEGORIES = {
       '`strrr` / `dexrra` / `conrrd` — reroll using a stat set · add a label like `strrr atk`',
       '`?1d20+5` — success check (crit/success/fail tiers)',
       '`/gm roll` — slash version with dropdowns for roll type & success',
-      '`/lastroll` — recall the last thing you rolled in this channel',
+      '`/roll last:true` — recall the last thing you rolled in this channel',
     ],
   },
   character: {
@@ -13259,14 +13255,14 @@ const HELP_CATEGORIES = {
       '`/char create` — set up a full character at once (stats, order, class, weapons, weapon emojis)',
       '`/char set field:STR value:14` — set one field at a time (with approvals on, any change to your own sheet goes back to the GMs)',
       '`/char weaponemoji slot:Weapon 1 emoji:⚔️` — pick a weapon slot emoji',
-      '`/char show [user]` — view a character sheet',
+      '`/char view show [user]` — view a character sheet',
       '`/char lore` — write your character\'s story and send it to the GMs',
       'Players spend an exact stat allowance across STR/CON/DEX/WIS/LCK with a minimum in each — GMs aren\'t limited. Run `/config mechanics statallowance` to see or change this server\'s numbers',
       '`/char submit` — send your sheet back to the GMs after a rejection, unchanged',
       '`/char export [format:Image]` — export your sheet as text or image; `format:Parchment image` writes it on parchment in the server\'s scroll font; `format:Parchment PDF` is the same parchment as a **PDF — the file that survives Discord re-uploads**; `format:Summary` is your career record — rank, merits, renown, dice history, pack, quests, lore. Every image and PDF carries the sheet woven inside. With approvals on it goes to the GMs first and reaches you when one releases it',
       '`/char import` — hand an exported sheet to this server, as the image or the pasted `[TTRPG SHEET]` summary (bare = a paste box opens); a GM approves it and you arrive ready to play',
       '`/char signature user:@a stat:str` — set a Hero\'s signature stat (GM)',
-      '`/profile on/off/show/save/load/saves` — manage profile display & snapshots',
+      '`/char profile on/off/show/save/load/saves` — manage profile display & snapshots',
       '`/char weapon add/remove/list` — manage the server weapon list (GM)',
     ],
   },
@@ -13370,7 +13366,7 @@ const HELP_CATEGORIES = {
       '`/quest edit number:N` — the same window, prefilled — the natural editor; renames follow onto the board and planning threads. Numeric options (`merit_reward:` etc.) apply directly without the window (GM)',
       '`/quest post number:N [channel]` — post it with an Apply button; with a quest forum set, this opens the quest\'s own board thread (GM)',
       '`/gm questwipe [runs:true]` — delete every quest on the server, confirm-gated; the run ledger and DM counters survive unless runs:true (GM)',
-      '`/check` — the setup mirror: every channel-backed feature, unset first with the command that sets it, then the set ones with links — stored ids are verified live (GM)',
+      '`/gm check` — the setup mirror: every channel-backed feature, unset first with the command that sets it, then the set ones with links — stored ids are verified live (GM)',
       '`/config channels questforum channel:#forum` — the board becomes a forum: one thread per quest, lifecycle mirrored in, archived on completion (Admin)',
       '`/config channels questthreads channel:#forum` — optional split: per-quest planning threads (and their stage tags) open here, so the planning forum holds only the books (Admin)',
       '`/config channels questplanning channel:#gm-forum` — `/quest create` opens a private GM planning thread; every application and event mirrors there. Sets up the pipeline tags (🌱⏳✅📌🗄️🏁) and the 🎲 DM roster (Admin)',
@@ -13440,11 +13436,11 @@ const HELP_CATEGORIES = {
       '`/config channels rollaudit test:true` — send a test mirror and report any problem (Admin)',
       '`/config channels rollauditforum forum:#roll-audit` — split the mirror into books: player rolls, GM rolls, NPC rolls, NPC say (Admin)',
       'When NPC stats are hidden, fight cards mask the stat and modifier — the audit\'s NPC book gets the full card, every number revealed',
-      '`/config mechanics scrollfont font:<file>` — store an .otf/.ttf; the reply renders a sample line so you see it works. `/scroll` then writes props in it (Admin)',
+      '`/config mechanics scrollfont font:<file>` — store an .otf/.ttf; the reply renders a sample line so you see it works. `/gm scroll` then writes props in it (Admin)',
       '`/config channels scrollarchive` — the 📜 Scrolls book in the roll-audit forum archives every scroll automatically, both directions, text + image + PDF; `channel:#x` overrides with a plain channel (Admin)',
       '`/npc export name:<npc>` / `/npc import file:<pdf>` — a villain packed as a woven parchment PDF; import applies directly, GM-as-approver — stats, class, hero flag, auto-pilot preferences and lore travel, standing and webhooks stay local',
-      '`/dicereport` — the table\'s dice health: top rollers, hot and cold d20 hands, nat leaders, the full d20 spread',
-      '`/scroll` — write a title and body in a modal; the bot posts the parchment as an image everyone can see plus a **PDF** with the writing woven invisibly inside — the PDF survives Discord, so scrolls travel between servers on their own. `file:` hands any scroll PDF back: plain text out, plus a readable edition in standard type as image and woven PDF (GM)',
+      '`/gm dicereport` — the table\'s dice health: top rollers, hot and cold d20 hands, nat leaders, the full d20 spread',
+      '`/gm scroll` — write a title and body in a modal; the bot posts the parchment as an image everyone can see plus a **PDF** with the writing woven invisibly inside — the PDF survives Discord, so scrolls travel between servers on their own. `file:` hands any scroll PDF back: plain text out, plus a readable edition in standard type as image and woven PDF (GM)',
       '`/config channels approvals channel:#x` — new sheets need GM approval before use (Admin)',
       '`/config channels approvals list:true` — every sheet still waiting, read from the database so nothing is lost if a post failed',
       '`/config channels approvalforum forum:#gm-approvals` — one forum, a thread per approval type: sheets, trades, duels, lore, exports (Admin)',
@@ -13453,8 +13449,8 @@ const HELP_CATEGORIES = {
       '`/config mechanics rest type:Short Rest hp:50% rerolls:0%` — tune what a rest restores (use % of max or a flat number)',
       '`/config mechanics cleanwebhooks` — remove orphaned NPC webhooks',
       '`gmr` / `gmrs 1d20+5` — public / secret GM roll',
-      '`/backup now` — export the database · `/backup auto` — daily backups',
-      '`/stat` — show stat descriptions · `/help` — this menu',
+      '`/gm backup now` — export the database · `/gm backup auto` — daily backups',
+      '`/char stat` — show stat descriptions · `/help` — this menu',
     ],
   },
 };
@@ -13463,7 +13459,7 @@ const HELP_CATEGORIES = {
 // browse them — both the listing and the detail view are gated.
 const GM_HELP_CATEGORIES = ['gm', 'npc'];
 
-// /scroll: gate, then hand the GM a writing modal. All the real checks run
+// /gm scroll: gate, then hand the GM a writing modal. All the real checks run
 // again on submit — the modal can sit open for a while.
 // Pure aggregation over raw tally rows, so the shape is testable without a
 // database: totals per player, the guild's d20 spread, hot and cold hands.
@@ -13570,7 +13566,7 @@ async function handleScrollImport(interaction, gid, att) {
     return interaction.editReply({ content: '❌ Only GMs can unfurl props.' });
   }
   if (!/\.(png|pdf)$/i.test(att.name || '')) {
-    return interaction.editReply({ content: '❌ That isn\'t a .png or .pdf — hand me a file made by `/scroll`.' });
+    return interaction.editReply({ content: '❌ That isn\'t a .png or .pdf — hand me a file made by `/gm scroll`.' });
   }
   if ((att.size ?? 0) > 8_000_000) {
     return interaction.editReply({ content: '❌ That file is over 8 MB — not one of mine.' });
@@ -13584,7 +13580,7 @@ async function handleScrollImport(interaction, gid, att) {
   const scroll = validateScrollData(extractScrollData(bytes));
   if (!scroll) {
     return interaction.editReply({ content:
-      '❌ No writing survives in that file. A **PDF** made by `/scroll` always carries it — a PNG loses its weave the moment Discord re-uploads it, so only PDFs make the trip.' });
+      '❌ No writing survives in that file. A **PDF** made by `/gm scroll` always carries it — a PNG loses its weave the moment Discord re-uploads it, so only PDFs make the trip.' });
   }
   return deliverScroll(interaction, gid, scroll);
 }
@@ -13650,7 +13646,7 @@ async function handleScrollModal(interaction) {
   try {
     // Two files, two jobs: the PNG is what everyone sees in the channel; the
     // PDF carries the writing woven after %%EOF and survives every Discord
-    // re-upload — anyone who saves it can hand it to /scroll anywhere.
+    // re-upload — anyone who saves it can hand it to /gm scroll anywhere.
     const payload = { v: 1, kind: 'scroll', title, body, flavour, name: stem };
     const png = renderScroll({ family, title, body });
     const pdfBuf = embedScrollData(renderScroll({ family, title, body, pdf: true }), payload);
@@ -13807,7 +13803,7 @@ async function handleBackup(interaction) {
         const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
         return await interaction.editReply({
           content: `✅ Database backup (${(fs.statSync(snap).size / 1024).toFixed(1)} KB). Save this somewhere safe.\n`
-            + '_Set a channel with `/backup auto` and each backup will replace the last there._',
+            + '_Set a channel with `/gm backup auto` and each backup will replace the last there._',
           files: [new AttachmentBuilder(snap, { name: `ddice-backup-${stamp}.db` })] });
       } finally { try { fs.unlinkSync(snap); } catch {} }
     } catch (err) {
@@ -13901,7 +13897,7 @@ async function backupTick() {
       try {
         const last = Number(row.backup_last) || 0;
         // First run after enabling: start the clock rather than firing at once,
-        // since /backup auto already posts one immediately.
+        // since /gm backup auto already posts one immediately.
         if (!last) { setConfig(row.guild_id, { backup_last: Date.now() }); continue; }
         if (Date.now() - last < backupInterval(row)) continue;
         await publishBackup(client, row.guild_id, row.backup_channel_id, { reason: 'scheduled backup' });
@@ -14108,6 +14104,8 @@ async function handleGmHeal(interaction) {
 async function handleRollSlash(interaction) {
   const gid = interaction.guild.id, uid = interaction.user.id;
   const cid = interactionChannelId(interaction);
+  // last:true is a pure read — show the most recent roll, touch nothing.
+  if (interaction.options.getBoolean('last')) return handleLastRoll(interaction);
   // The fight bridge: an ability picked here rides the exact /fight machinery.
   const fightAction = interaction.options.getString('action');
   if (fightAction) return handleFight(interaction, fightAction);
@@ -15331,7 +15329,7 @@ async function handleQuest(interaction) {
     for (const id of party) ins.run(gid, number, id, questTag(quest), summaryUrl, runMs, Date.now());
 
     lines.push('', ...(summaryUrl
-      ? [`📜 [Read the full summary](${summaryUrl}) — it is on everyone's \`/char standing\` too.`]
+      ? [`📜 [Read the full summary](${summaryUrl}) — it is on everyone's \`/char view standing\` too.`]
       : ['_No quest log channel set, so the summary was not posted — a GM can set one with `/config channels questlog`._']));
     if (!logChId) lines.push(...summary.slice(2, 14));
 

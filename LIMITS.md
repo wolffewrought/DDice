@@ -7,8 +7,8 @@ Every ceiling future development can run into, with where the bot stands today
 
 | Limit | Value | DDice today |
 |---|---|---|
-| Global slash commands per app | 100 | 17 |
-| **Subcommands + groups per command** | **25** | nothing at the wall: config 2 (channels 13 + mechanics 12) · quest 20 · fight 17 · char 23 · npc 21 · gm 8 · standing 3 groups |
+| Global slash commands per app | 100 | 11 |
+| **Subcommands + groups per command** | **25** | nothing at the wall: config 2 · quest 20 · fight 17 · char 20 (view/profile/weapon/tag groups) · npc 21 · gm 12 (backup/test groups) · standing 3 groups |
 | Subcommands per group | 25 | largest group: standing merit 9 |
 | Options per (sub)command | 25 | largest: /quest create ~10 |
 | Choices per option | 25 | largest: Knight order 9 |
