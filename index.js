@@ -554,6 +554,7 @@ try { db.exec('ALTER TABLE quests ADD COLUMN stage TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_plan_tags TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_dm_thread TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_plan_books TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_thread_forum TEXT'); } catch {}
 try { db.exec('ALTER TABLE quests ADD COLUMN index_thread_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE quests ADD COLUMN index_msg_id TEXT'); } catch {}
 db.exec(`CREATE TABLE IF NOT EXISTS quest_runs (
@@ -4424,6 +4425,9 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('questplanning').setDescription('A private GM forum — /quest create opens a planning thread there')
       .addChannelOption(o=>o.setName('channel').setDescription('The GM-only forum channel').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = stop making planning threads').setRequired(false)))
+    .addSubcommand(s=>s.setName('questthreads').setDescription('A secondary forum for per-quest planning threads — the books keep the planning forum to themselves')
+      .addChannelOption(o=>o.setName('channel').setDescription('The forum channel for quest threads').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = quest threads open in the planning forum again').setRequired(false)))
     .addSubcommand(s=>s.setName('memorial').setDescription('Where fallen characters are recorded and remembered')
       .addChannelOption(o=>o.setName('channel').setDescription('GM record — the full account, with a Revive button').setRequired(false))
       .addChannelOption(o=>o.setName('public').setDescription('Public hall — the story alone, no figures').setRequired(false))
@@ -4639,6 +4643,9 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('lastroll').setDescription('Show your most recent roll in this channel'),
+
+  new SlashCommandBuilder()
+    .setName('check').setDescription('Which channels and forums are set up for the bot, and which await (GM)'),
 
   new SlashCommandBuilder()
     .setName('backup').setDescription('Database backup (GM only)')
@@ -6446,6 +6453,41 @@ async function handleConfig(interaction) {
     ].join('\n') });
   }
 
+  if (sub === 'questthreads') {
+    if (interaction.options.getBoolean('disable')) {
+      setConfig(gid, { quest_thread_forum: null });
+      // The stage tags follow the threads home to the planning forum.
+      const planId = getConfig(gid)?.quest_plan_forum;
+      let back = '';
+      if (planId) {
+        try { await ensurePlanTags(await interaction.client.channels.fetch(planId), gid); back = ' Pipeline tags restored there.'; }
+        catch { back = ' ⚠️ Couldn\'t restore the pipeline tags there — re-run `/config questplanning`.'; }
+      }
+      return interaction.reply({ content: `🗺️ Quest threads will open in the planning forum again.${back} Existing threads stay where they are.` });
+    }
+    const channel = interaction.options.getChannel('channel');
+    if (!channel) {
+      const cur = getConfig(gid)?.quest_thread_forum;
+      return interaction.reply({ ephemeral: true, content: cur
+        ? `🗺️ Per-quest planning threads open in <#${cur}>.`
+        : '🗺️ No secondary forum set — quest threads open in the planning forum. `/config questthreads channel:#your-forum` splits them out.' });
+    }
+    if (channel.type !== 15) {
+      return interaction.reply({ ephemeral: true, content:
+        `❌ <#${channel.id}> is not a forum channel. Make a **Forum** — each quest's planning thread opens there.` });
+    }
+    await interaction.deferReply();
+    setConfig(gid, { quest_thread_forum: channel.id });
+    let tagNote = '';
+    try {
+      await ensurePlanTags(channel, gid);
+      tagNote = '\n🏷️ Pipeline tags moved here — they ride the quest threads, so the books keep the planning forum clean.';
+    } catch (err) {
+      tagNote = `\n⚠️ Couldn't set the pipeline tags — ${err?.message || err}. I need **Manage Channel** here; run this again once granted.`;
+    }
+    return interaction.editReply({ content: `🗺️ Quest planning threads now open in <#${channel.id}> — the planning forum keeps only the books.${tagNote}\n_Existing quest threads stay where they are._` });
+  }
+
   if (sub === 'questforum' || sub === 'questplanning') {
     const key = sub === 'questforum' ? 'quest_forum' : 'quest_plan_forum';
     const noun = sub === 'questforum' ? 'public quest board' : 'GM quest planning';
@@ -6469,11 +6511,16 @@ async function handleConfig(interaction) {
     if (sub === 'questplanning') {
       await interaction.deferReply();
       let tagNote = '', dmNote = '';
-      try {
-        const map = await ensurePlanTags(channel, gid);
-        tagNote = `\n🏷️ Pipeline tags ready: ${QUEST_STAGES.map(([k, e, l]) => map[k] ? `${e} ${l}` : `⚠️ ${l}`).join(' · ')}`;
-      } catch (err) {
-        tagNote = `\n⚠️ Couldn't set the pipeline tags — ${err?.message || err}. I need **Manage Channel** on the forum; run this again once granted.`;
+      const splitForum = getConfig(gid)?.quest_thread_forum;
+      if (splitForum) {
+        tagNote = `\n🏷️ Pipeline tags live on the quest-threads forum — <#${splitForum}>.`;
+      } else {
+        try {
+          const map = await ensurePlanTags(channel, gid);
+          tagNote = `\n🏷️ Pipeline tags ready: ${QUEST_STAGES.map(([k, e, l]) => map[k] ? `${e} ${l}` : `⚠️ ${l}`).join(' · ')}`;
+        } catch (err) {
+          tagNote = `\n⚠️ Couldn't set the pipeline tags — ${err?.message || err}. I need **Manage Channel** on the forum; run this again once granted.`;
+        }
       }
       // The pipeline books — idempotent: existing books keep their ids, the
       // rest are created, exactly like the roll-audit forum's setup.
@@ -7692,6 +7739,53 @@ async function runGmRollSlash(interaction) {
   return interaction.reply({ content });
 }
 
+// /check — the setup mirror. Unset first (with the command that sets each),
+// then the set ones with links, every stored id fetch-verified.
+async function handleCheck(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ The setup check is for GMs.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+  const cfg = getConfig(gid) || {};
+  const routes = (k) => { try { return JSON.parse(cfg[k] || '{}'); } catch { return {}; } };
+  const auditR = routes('audit_routes');
+  const apprR = routes('approval_routes');
+  const planBooks = routes('quest_plan_books');
+  const checks = [
+    ['📌 Quest board forum', cfg.quest_forum, '`/config questforum channel:#forum`', null],
+    ['🗺️ GM quest planning forum', cfg.quest_plan_forum, '`/config questplanning channel:#gm-forum`',
+      Object.keys(planBooks).length ? `${Object.keys(planBooks).length} books` : null],
+    ['🧵 Quest threads forum', cfg.quest_thread_forum, '`/config questthreads channel:#` (optional — threads default into the planning forum)',
+      cfg.quest_thread_forum ? 'per-quest threads + stage tags' : null],
+    ['📜 Roll audit', auditR.forum ?? cfg.roll_audit_channel_id,
+      '`/config rollauditforum forum:#forum` (books) · or `/config rollaudit channel:#`',
+      auditR.forum ? 'books' : (cfg.roll_audit_channel_id ? 'single channel' : null)],
+    ['📖 Character pages forum', cfg.char_forum, '`/config charforum channel:#forum`', null],
+    ['⚖️ Approvals', apprR.forum ?? cfg.approval_channel_id,
+      '`/config approvalforum forum:#forum` · or `/config approvals channel:#`',
+      apprR.forum ? 'threads per type' : (cfg.approval_channel_id ? 'single channel' : null)],
+    ['🪶 Memorial — GM record', cfg.memorial_channel, '`/config memorial channel:#`', null],
+    ['🕯️ Memorial — public hall', cfg.memorial_public_channel, '`/config memorial public:#`', null],
+    ['📜 Quest log', cfg.quest_log_channel, '`/config questlog channel:#`', null],
+    ['🖼️ NPC image bank', cfg.npc_channel_id, '`/config npcchannel channel:#`', null],
+    ['📚 GM docs (the PDFs)', cfg.docs_channel, '`/config docs channel:# repo:owner/name`', null],
+    ['📜 Scroll library', cfg.scroll_archive_id, '`/config scrollarchive channel:#`', null],
+    ['💾 Backups', cfg.backup_channel_id, '`/backup auto channel:#`', null],
+  ];
+  const unset = [], set = [];
+  for (const [label, id, cmd, note] of checks) {
+    if (!id) { unset.push(`• ${label} — ${cmd}`); continue; }
+    let ok = false;
+    try { const ch = await interaction.client.channels.fetch(id); ok = !!ch; } catch { /* gone or hidden */ }
+    if (ok) set.push(`• ${label} — <#${id}>${note ? ` · ${note}` : ''}`);
+    else set.push(`⚠️ ${label} — set but unreachable (deleted, or hidden from me) — re-run ${cmd}`);
+  }
+  const lines = ['🧭 **Channel & forum check**', ''];
+  if (unset.length) { lines.push(`❌ **Not set** (${unset.length})`, ...unset, ''); }
+  else lines.push('✅ Everything channel-backed is configured.', '');
+  if (set.length) { lines.push(`✅ **Set** (${set.length})`, ...set); }
+  return interaction.editReply({ content: lines.join('\n').slice(0, 2000) });
+}
+
 async function handleGmRoll(message, rest, secret) {
   const gid = message.guild.id, uid = message.author.id;
   if (!(await isGm(message.guild, uid))) return message.reply('❌ Only GMs can use GM rolls.');
@@ -8072,6 +8166,11 @@ client.on('interactionCreate', async interaction => {
           .filter(q => !typed || String(q.number).includes(typed) || (q.name || '').toLowerCase().includes(typed))
           .slice(0, 25)
           .map(q => ({ name: `#${String(q.number).padStart(3, '0')} — ${q.name} (${q.status})`.slice(0, 100), value: q.number }));
+        // An honest empty state beats Discord's "No options match your search".
+        if (!choices.length) return await interaction.respond([{
+          name: rows.length ? '— nothing matches that — clear it to see every quest —'
+                            : '— no quests on this server yet — /quest create makes the first —',
+          value: 0 }]);
         return await interaction.respond(choices);
       }
       if ((interaction.commandName === 'npc'
@@ -8271,6 +8370,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'scroll') return await handleScroll(interaction);
     if (interaction.commandName === 'dicereport') return await handleDiceReport(interaction);
     if (interaction.commandName === 'lastroll') return await handleLastRoll(interaction);
+    if (interaction.commandName === 'check') return await handleCheck(interaction);
     if (interaction.commandName === 'backup') return await handleBackup(interaction);
     if (interaction.commandName === 'roll') return await handleRollSlash(interaction);
     if (interaction.commandName === 'standing') {
@@ -10838,7 +10938,10 @@ async function runFightEscape({ interaction, gid, cid, actorId, mode }) {
   }
   const actor = await resolveFighter(interaction.guild, gid, actorId);
   const holderF = await resolveFighter(interaction.guild, gid, holderId);
-  const dc = holderF.stats.str ?? 0;   // as written: the grappler's Strength score
+  // The hold answers with a live roll of its own: STR vs STR every attempt.
+  const holderRow = isNpcFighter(holderId) ? getNpc(gid, npcNameFromFighter(holderId)) : getChar(gid, holderId);
+  const hold = autoRoll(holderF.stats.str ?? 0, hasSignatureAdvantage(holderRow, 'str'));
+  mirrorAutoRoll(gid, cid, holderF.name, `1d20${hold.adv ? ' (adv)' : ''}`, hold.nat, hold.total, 'grapple hold (STR)');
   const fooledE = consumeFooled(gid, cid, actorId);
   const statVal = fooledE ? 0 : (actor.stats.str ?? 0);
   const sigRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
@@ -10848,7 +10951,7 @@ async function runFightEscape({ interaction, gid, cid, actorId, mode }) {
   const diceBit = dropped !== null ? `[${nat}~~${dropped}~~]` : `[${nat}]`;
   const actorName = actor.name + (actor.isNpc ? ' 🎭' : '');
   const holderName = holderF.name + (holderF.isNpc ? ' 🎭' : '');
-  const rollLine = `🤼  1d20+STR → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)} vs hold **${dc}**`;
+  const rollLine = `🤼  1d20+STR → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)} vs hold ${fightTotalStr(hold.total, hold.nat, 20)}`;
   if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'grapple escape STR');
   recordRoll(gid, { userId: uid, channelId: cid, interaction,
     kind: isNpcFighter(actorId) ? 'npcs' : null, card: null,
@@ -10859,15 +10962,16 @@ async function runFightEscape({ interaction, gid, cid, actorId, mode }) {
   const floor = fightFloor(fight);
   const gmap = fightGrapples(fight);
   const lines = ['─────────────────────────────', '🤼  **Escape Attempt**', ''];
-  lines.push(`${actorName} (**STR**): ${rollLine.replace('🤼  ', '')}`);
+  lines.push(`${actorName} (**STR** escape): ${fightTotalStr(total, nat, 20)}`);
+  lines.push(`${holderName} (**STR** hold${hold.adv ? ', advantage' : ''}): ${fightTotalStr(hold.total, hold.nat, 20)}`);
   lines.push('');
-  const freed = total >= dc;
+  const freed = total > hold.total;   // ties keep the hold — the grappler's tie rule
   if (freed) {
     delete gmap[actorId];
     setFightGrapples(gid, cid, gmap);
     lines.push(`🔓 **${actorName}** breaks free of **${holderName}**!`);
   } else {
-    lines.push(`⛓️ The hold holds — **${actorName}** needed **${dc}** or more.`);
+    lines.push(`⛓️ The hold holds — **${holderName}**'s grip beats **${total}**${total === hold.total ? ' (ties go to the grappler)' : ''}.`);
   }
   // The turn is spent either way, and the strain lands either way.
   const st = await applyTurnEndStrain(interaction.guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, actorId);
@@ -13209,7 +13313,9 @@ const HELP_CATEGORIES = {
       '`/quest create` — bare, a five-field writing window opens (add `from:N` to seed it from an existing quest); with `name:` everything stays inline (GM)',
       '`/quest edit number:N` — the same window, prefilled — the natural editor; renames follow onto the board and planning threads. Numeric options (`merit_reward:` etc.) apply directly without the window (GM)',
       '`/quest post number:N [channel]` — post it with an Apply button; with a quest forum set, this opens the quest\'s own board thread (GM)',
+      '`/check` — the setup mirror: every channel-backed feature, unset first with the command that sets it, then the set ones with links — stored ids are verified live (GM)',
       '`/config questforum channel:#forum` — the board becomes a forum: one thread per quest, lifecycle mirrored in, archived on completion (Admin)',
+      '`/config questthreads channel:#forum` — optional split: per-quest planning threads (and their stage tags) open here, so the planning forum holds only the books (Admin)',
       '`/config questplanning channel:#gm-forum` — `/quest create` opens a private GM planning thread; every application and event mirrors there. Sets up the pipeline tags (🌱⏳✅📌🗄️🏁) and the 🎲 DM roster (Admin)',
       '`/quest stage number:N stage:` — move a quest through Concept / Awaiting Approval / Approved; posting, archiving and completing re-tag automatically (GM)',
       '`/quest archive number:N` — pull a quest off the board: applications close, the board thread locks; `/quest post` re-lists it (GM)',
@@ -14582,7 +14688,7 @@ async function finishQuestCreate(interaction, gid, uid, f) {
   updateQuest(gid, number, { gm_id: uid, gm_style: f.gm_style ?? null, stage: 'concept' });
   let quest = getQuest(gid, number);
   let planLine = '';
-  const planForumId = getConfig(gid)?.quest_plan_forum;
+  const planForumId = getConfig(gid)?.quest_thread_forum ?? getConfig(gid)?.quest_plan_forum;
   if (planForumId) {
     try {
       const forum = await interaction.client.channels.fetch(planForumId);
