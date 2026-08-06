@@ -779,7 +779,7 @@ const fightHp = (fight) => JSON.parse(fight?.hp_state || '{}');
 const approvalChannelId = (gid) => getConfig(gid)?.approval_channel_id || null;
 
 // ── Approval routing ─────────────────────────────────────────────────────────
-// One forum, a thread per approval type — configured by /config approvalforum,
+// One forum, a thread per approval type — configured by /config channels approvalforum,
 // stored as JSON in guild_config.approval_routes. Every producer asks for its
 // own type's destination; the single approval channel remains the fallback, so
 // a server that never touches the forum behaves exactly as it always has.
@@ -1820,7 +1820,7 @@ async function resolveActivityRoll(ctx, statWord, flavour, io, rerolled = false)
 // ── Scheduled recovery ────────────────────────────────────────────────────────
 // A guild can run any number of named schedules, each with its own interval and
 // its own strength. "half HP every 6 hours" and "everything back every 24" can
-// sit side by side. Amounts use the same tokens as /config rest — 100%, 50%, a
+// sit side by side. Amounts use the same tokens as /config mechanics rest — 100%, 50%, a
 // flat number, or 0% to leave that resource alone — so they round down the same
 // way and there's one format to learn.
 const AUTOREST_HOURS_DEFAULT = 6;
@@ -2688,7 +2688,7 @@ function listProfiles(gid, uid) {
   return db.prepare('SELECT slot_name,saved_at FROM profile_saves WHERE guild_id=? AND user_id=? ORDER BY saved_at DESC').all(gid, uid);
 }
 // ── Max HP ────────────────────────────────────────────────────────────────────
-// max HP = CON + a flat base, set per guild with /config hpbase. The base used
+// max HP = CON + a flat base, set per guild with /config mechanics hpbase. The base used
 // to be a hard-coded 2 written out at fourteen separate sites; it lives here now
 // so a server can run CON+3 (or CON+0) without any of them drifting apart.
 const HP_BASE_DEFAULT = 2;
@@ -2826,7 +2826,7 @@ function buildRollEmbed({ rollLine, label, isReroll, char, healCharges, maxCharg
   if (char.class) lines.push(`🏅  ${char.class}`);
   { const sig = signatureLine(char); if (sig && !char._isNpc) lines.push(sig); }
   // NPC stat blocks are hidden from players by default so their capabilities stay
-  // a mystery. A GM can reveal them with /config npcstats enabled:true.
+  // a mystery. A GM can reveal them with /config mechanics npcstats enabled:true.
   // `reveal` builds the GM-grade audit copy: nothing is hidden there.
   const hideNpcStats = !reveal && char._isNpc && !(gid && getConfig(gid)?.npc_stats_visible);
   if (hideNpcStats) lines.push(`❤️  ${hpCondition(char.hp_current, maxHp(char, gid))}`);
@@ -2885,7 +2885,7 @@ const resolveStatWord = (w) => STAT_ALIASES[String(w || '').toLowerCase()] ?? nu
 // A player building their own sheet spends exactly the guild's allowance across
 // the five stats, with a minimum in each. GMs are exempt entirely — building for
 // a player, adjusting one, or making their own sheet. Both numbers are set per
-// guild with /config statallowance; these are the defaults.
+// guild with /config mechanics statallowance; these are the defaults.
 const STAT_BUDGET_DEFAULT = 15;
 const STAT_MIN_DEFAULT = 1;
 function statRules(gid) {
@@ -3183,7 +3183,7 @@ const DEFAULT_PALETTE = { bg: '#f5f0e8', accent: '#8b7355', text: '#2a2a2a', bor
 // ── Written props (/scroll) ──────────────────────────────────────────────────
 // The guild's font, registered with the canvas once per process. Returns the
 // family name to draw with, or null when no font is configured. The cache is
-// dropped by /config scrollfont so a replacement takes effect immediately.
+// dropped by /config mechanics scrollfont so a replacement takes effect immediately.
 const scrollFontCache = new Map(); // gid -> family
 function ensureScrollFont(gid) {
   if (scrollFontCache.has(gid)) return scrollFontCache.get(gid);
@@ -3905,7 +3905,7 @@ async function handleCharExport(interaction) {
     const posted = await requestSheetExport(interaction, gid, uid,
       mode === 'summary' ? buildCareerSummary(gid, uid, dn).join('\n') : textContent, mode);
     if (!posted) {
-      await interaction.followUp({ ephemeral: true, content: '⚠️ Couldn\'t reach the approval channel — ask a GM to check `/config approvals`.' }).catch(()=>{});
+      await interaction.followUp({ ephemeral: true, content: '⚠️ Couldn\'t reach the approval channel — ask a GM to check `/config channels approvals`.' }).catch(()=>{});
     }
     return;
   }
@@ -3970,7 +3970,7 @@ async function handleCharImport(interaction) {
   const pasted = interaction.options.getString('summary');
   const dest = approvalDestination(gid, 'sheets');
   if (!dest) {
-    return interaction.reply({ content: '❌ This server has no approval destination set — ask a GM to run `/config approvals` or `/config approvalforum`.', ephemeral: true });
+    return interaction.reply({ content: '❌ This server has no approval destination set — ask a GM to run `/config channels approvals` or `/config channels approvalforum`.', ephemeral: true });
   }
   // Nothing given: open the paste modal — slash options mangle multiline text.
   if (!att && !pasted) {
@@ -4374,6 +4374,8 @@ const slashCommands = [
           {name:'🔄 Rerolls only',value:'rerolls'},
           {name:'🛡️ Heal charges only',value:'charges'},
           {name:'✨ Everything — HP, rerolls and charges',value:'all'})))
+    .addSubcommand(s=>s.setName('questwipe').setDescription('Delete EVERY quest on this server — confirm-gated (GM)')
+      .addBooleanOption(o=>o.setName('runs').setDescription('true = also erase the run ledger and DM guided-counters (default: history kept)').setRequired(false)))
     .addSubcommand(s=>s.setName('roll').setDescription('A GM roll — public, or secret (visible only to you); the audit sees both')
       .addStringOption(o=>o.setName('notation').setDescription('Dice notation e.g. 1d20+5').setRequired(true))
       .addStringOption(o=>o.setName('label').setDescription('Roll label e.g. perception').setRequired(false))
@@ -4393,20 +4395,70 @@ const slashCommands = [
   new SlashCommandBuilder()
     .setName('config').setDescription('Server configuration (Admin only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addSubcommand(s=>s.setName('gmrole').setDescription('Add, remove or list GM roles — several can be set')
+    .addSubcommandGroup(g => {
+      g.setName('channels').setDescription('Where things live — forums, channels and publishing');
+      g.addSubcommand(s=>s.setName('npcchannel').setDescription('Set the NPC image bank channel')
+      .addChannelOption(o=>o.setName('channel').setDescription('Channel to watch for NPC avatar uploads').setRequired(true)));
+      g.addSubcommand(s=>s.setName('charforum').setDescription('A forum where each approved character gets a page')
+      .addChannelOption(o=>o.setName('channel').setDescription('The forum channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop making pages').setRequired(false)));
+      g.addSubcommand(s=>s.setName('questforum').setDescription('A forum where each posted quest gets its own thread')
+      .addChannelOption(o=>o.setName('channel').setDescription('The forum channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = post quests as plain messages again').setRequired(false)));
+      g.addSubcommand(s=>s.setName('questplanning').setDescription('A private GM forum — /quest create opens a planning thread there')
+      .addChannelOption(o=>o.setName('channel').setDescription('The GM-only forum channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop making planning threads').setRequired(false)));
+      g.addSubcommand(s=>s.setName('questthreads').setDescription('A secondary forum for per-quest planning threads — the books keep the planning forum to themselves')
+      .addChannelOption(o=>o.setName('channel').setDescription('The forum channel for quest threads').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = quest threads open in the planning forum again').setRequired(false)));
+      g.addSubcommand(s=>s.setName('memorial').setDescription('Where fallen characters are recorded and remembered')
+      .addChannelOption(o=>o.setName('channel').setDescription('GM record — the full account, with a Revive button').setRequired(false))
+      .addChannelOption(o=>o.setName('public').setDescription('Public hall — the story alone, no figures').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop posting memorials').setRequired(false)));
+      g.addSubcommand(s=>s.setName('docs').setDescription('Publish the command PDFs from GitHub into a GM channel')
+      .addChannelOption(o=>o.setName('channel').setDescription('Where all three books live (GMs are pinged here)').setRequired(false))
+      .addChannelOption(o=>o.setName('player_channel').setDescription('Where the player book alone goes — posted silently, no ping').setRequired(false))
+      .addStringOption(o=>o.setName('repo').setDescription('GitHub repository, as owner/name').setRequired(false))
+      .addStringOption(o=>o.setName('branch').setDescription('Branch (default main)').setRequired(false))
+      .addStringOption(o=>o.setName('path').setDescription('Folder inside the repo, if the PDFs are not at the root').setRequired(false))
+      .addBooleanOption(o=>o.setName('push').setDescription('true = fetch and repost right now, changed or not').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop watching').setRequired(false)));
+      g.addSubcommand(s=>s.setName('questlog').setDescription('Where finished quest summaries are posted for everyone to read')
+      .addChannelOption(o=>o.setName('channel').setDescription('Summary channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop posting summaries').setRequired(false)));
+      g.addSubcommand(s=>s.setName('approvals').setDescription('Channel where new character sheets await GM approval')
+      .addChannelOption(o=>o.setName('channel').setDescription('Approval channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('list').setDescription('true = list every sheet still waiting, wherever it was posted').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = turn sheet approval off').setRequired(false)));
+      g.addSubcommand(s=>s.setName('approvalforum').setDescription('One forum, a thread per approval type — sheets, trades, duels, lore, exports')
+      .addChannelOption(o=>o.setName('forum').setDescription('The forum channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = go back to the single approval channel').setRequired(false)));
+      g.addSubcommand(s=>s.setName('rollaudit').setDescription('Mirror every player roll to a GM-only channel')
+      .addChannelOption(o=>o.setName('channel').setDescription('Channel to mirror rolls into').setRequired(false))
+      .addBooleanOption(o=>o.setName('test').setDescription('true = send a test mirror and report any problem').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = turn the mirror off').setRequired(false)));
+      g.addSubcommand(s=>s.setName('rollauditforum').setDescription('Split the mirror into books — player rolls, GM rolls, NPC rolls, NPC say')
+      .addChannelOption(o=>o.setName('forum').setDescription('The forum channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = back to the single audit channel').setRequired(false)));
+      g.addSubcommand(s=>s.setName('scrollarchive').setDescription('A library channel — every /scroll\'s named PDF is also filed there')
+      .addChannelOption(o=>o.setName('channel').setDescription('The archive channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop archiving').setRequired(false)));
+      return g;
+    })
+    .addSubcommandGroup(g => {
+      g.setName('mechanics').setDescription('How the game runs — roles, rests, stats and toggles');
+      g.addSubcommand(s=>s.setName('gmrole').setDescription('Add, remove or list GM roles — several can be set')
       .addRoleOption(o=>o.setName('role').setDescription('Role to add (or remove, with remove:true)').setRequired(false))
       .addBooleanOption(o=>o.setName('remove').setDescription('true = remove this role instead of adding it').setRequired(false))
-      .addBooleanOption(o=>o.setName('replace').setDescription('true = make this the ONLY GM role').setRequired(false)))
-    .addSubcommand(s=>s.setName('heal').setDescription('Set max Heal charges for White Knights').addIntegerOption(o=>o.setName('charges').setDescription('Number of charges').setRequired(true).setMinValue(1).setMaxValue(10)))
-    .addSubcommand(s=>s.setName('npcchannel').setDescription('Set the NPC image bank channel')
-      .addChannelOption(o=>o.setName('channel').setDescription('Channel to watch for NPC avatar uploads').setRequired(true)))
-    .addSubcommand(s=>s.setName('rest').setDescription('Set how much a rest restores (e.g. 50% or a flat number like 3)')
+      .addBooleanOption(o=>o.setName('replace').setDescription('true = make this the ONLY GM role').setRequired(false)));
+      g.addSubcommand(s=>s.setName('heal').setDescription('Set max Heal charges for White Knights').addIntegerOption(o=>o.setName('charges').setDescription('Number of charges').setRequired(true).setMinValue(1).setMaxValue(10)));
+      g.addSubcommand(s=>s.setName('rest').setDescription('Set how much a rest restores (e.g. 50% or a flat number like 3)')
       .addStringOption(o=>o.setName('type').setDescription('Which rest to configure').setRequired(true)
         .addChoices({name:'Long Rest',value:'lrest'},{name:'Short Rest',value:'srest'}))
       .addStringOption(o=>o.setName('hp').setDescription('HP restored — "50%" of max, or a flat number like "3"').setRequired(false))
       .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored — "50%" of max, or a flat number like "1"').setRequired(false))
-      .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored — "50%" of max, or a flat number like "2"').setRequired(false)))
-    .addSubcommand(s=>s.setName('autorest').setDescription('Scheduled recovery: named schedules, each with its own timing and strength')
+      .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored — "50%" of max, or a flat number like "2"').setRequired(false)));
+      g.addSubcommand(s=>s.setName('autorest').setDescription('Scheduled recovery: named schedules, each with its own timing and strength')
       .addStringOption(o=>o.setName('action').setDescription('What to do').setRequired(false)
         .addChoices({name:'List',value:'list'},{name:'Add or update',value:'set'},{name:'Remove',value:'remove'},
                     {name:'Run now',value:'run'},{name:'Pause',value:'pause'},{name:'Resume',value:'resume'}))
@@ -4415,68 +4467,26 @@ const slashCommands = [
       .addStringOption(o=>o.setName('hp').setDescription('HP restored: 100%, 50%, a flat number, or 0% to skip').setRequired(false))
       .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored: 100%, 50%, a number, or 0%').setRequired(false))
       .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored: 100%, 50%, a number, or 0%').setRequired(false))
-      .addChannelOption(o=>o.setName('channel').setDescription('Announce this schedule here (optional)').setRequired(false)))
-    .addSubcommand(s=>s.setName('charforum').setDescription('A forum where each approved character gets a page')
-      .addChannelOption(o=>o.setName('channel').setDescription('The forum channel').setRequired(false))
-      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop making pages').setRequired(false)))
-    .addSubcommand(s=>s.setName('questforum').setDescription('A forum where each posted quest gets its own thread')
-      .addChannelOption(o=>o.setName('channel').setDescription('The forum channel').setRequired(false))
-      .addBooleanOption(o=>o.setName('disable').setDescription('true = post quests as plain messages again').setRequired(false)))
-    .addSubcommand(s=>s.setName('questplanning').setDescription('A private GM forum — /quest create opens a planning thread there')
-      .addChannelOption(o=>o.setName('channel').setDescription('The GM-only forum channel').setRequired(false))
-      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop making planning threads').setRequired(false)))
-    .addSubcommand(s=>s.setName('questthreads').setDescription('A secondary forum for per-quest planning threads — the books keep the planning forum to themselves')
-      .addChannelOption(o=>o.setName('channel').setDescription('The forum channel for quest threads').setRequired(false))
-      .addBooleanOption(o=>o.setName('disable').setDescription('true = quest threads open in the planning forum again').setRequired(false)))
-    .addSubcommand(s=>s.setName('memorial').setDescription('Where fallen characters are recorded and remembered')
-      .addChannelOption(o=>o.setName('channel').setDescription('GM record — the full account, with a Revive button').setRequired(false))
-      .addChannelOption(o=>o.setName('public').setDescription('Public hall — the story alone, no figures').setRequired(false))
-      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop posting memorials').setRequired(false)))
-    .addSubcommand(s=>s.setName('docs').setDescription('Publish the command PDFs from GitHub into a GM channel')
-      .addChannelOption(o=>o.setName('channel').setDescription('Where all three books live (GMs are pinged here)').setRequired(false))
-      .addChannelOption(o=>o.setName('player_channel').setDescription('Where the player book alone goes — posted silently, no ping').setRequired(false))
-      .addStringOption(o=>o.setName('repo').setDescription('GitHub repository, as owner/name').setRequired(false))
-      .addStringOption(o=>o.setName('branch').setDescription('Branch (default main)').setRequired(false))
-      .addStringOption(o=>o.setName('path').setDescription('Folder inside the repo, if the PDFs are not at the root').setRequired(false))
-      .addBooleanOption(o=>o.setName('push').setDescription('true = fetch and repost right now, changed or not').setRequired(false))
-      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop watching').setRequired(false)))
-    .addSubcommand(s=>s.setName('questlog').setDescription('Where finished quest summaries are posted for everyone to read')
-      .addChannelOption(o=>o.setName('channel').setDescription('Summary channel').setRequired(false))
-      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop posting summaries').setRequired(false)))
-    .addSubcommand(s=>s.setName('activities').setDescription('Who may start an activity — GMs only, or anyone')
-      .addBooleanOption(o=>o.setName('players').setDescription('true = players can start them too (writing stays GM-only)').setRequired(false)))
-    .addSubcommand(s=>s.setName('hpbase').setDescription('Flat points added to CON for max HP (default 2, so CON+2)')
-      .addIntegerOption(o=>o.setName('base').setDescription('Max HP = CON + this. 3 gives CON+3, 0 gives plain CON').setRequired(false).setMinValue(0).setMaxValue(50)))
-    .addSubcommand(s=>s.setName('statallowance').setDescription('Points a player spends building a sheet, and the minimum per stat')
+      .addChannelOption(o=>o.setName('channel').setDescription('Announce this schedule here (optional)').setRequired(false)));
+      g.addSubcommand(s=>s.setName('activities').setDescription('Who may start an activity — GMs only, or anyone')
+      .addBooleanOption(o=>o.setName('players').setDescription('true = players can start them too (writing stays GM-only)').setRequired(false)));
+      g.addSubcommand(s=>s.setName('hpbase').setDescription('Flat points added to CON for max HP (default 2, so CON+2)')
+      .addIntegerOption(o=>o.setName('base').setDescription('Max HP = CON + this. 3 gives CON+3, 0 gives plain CON').setRequired(false).setMinValue(0).setMaxValue(50)));
+      g.addSubcommand(s=>s.setName('statallowance').setDescription('Points a player spends building a sheet, and the minimum per stat')
       .addIntegerOption(o=>o.setName('points').setDescription('Total points to spend across the 5 stats (default 15)').setRequired(false).setMinValue(5).setMaxValue(200))
-      .addIntegerOption(o=>o.setName('minimum').setDescription('Minimum in every stat (default 1, 0 allows empty stats)').setRequired(false).setMinValue(0).setMaxValue(20)))
-    .addSubcommand(s=>s.setName('npcreroll').setDescription('NPC auto-reroll threshold: natural die ≤ N (0 disables)')
-      .addIntegerOption(o=>o.setName('threshold').setDescription('1–19, or 0 to disable (default 8); omit to show current').setRequired(false).setMinValue(0).setMaxValue(19)))
-    .addSubcommand(s=>s.setName('fightping').setDescription('@-mention players when it becomes their turn in a fight')
-      .addBooleanOption(o=>o.setName('enabled').setDescription('true = ping, false = silent (default); omit to show current').setRequired(false)))
-    .addSubcommand(s=>s.setName('npcstats').setDescription('Show NPC stat blocks on their roll cards (default: hidden)')
-      .addBooleanOption(o=>o.setName('enabled').setDescription('true = players see NPC stats; false = hidden (default)').setRequired(false)))
-    .addSubcommand(s=>s.setName('approvals').setDescription('Channel where new character sheets await GM approval')
-      .addChannelOption(o=>o.setName('channel').setDescription('Approval channel').setRequired(false))
-      .addBooleanOption(o=>o.setName('list').setDescription('true = list every sheet still waiting, wherever it was posted').setRequired(false))
-      .addBooleanOption(o=>o.setName('disable').setDescription('true = turn sheet approval off').setRequired(false)))
-    .addSubcommand(s=>s.setName('approvalforum').setDescription('One forum, a thread per approval type — sheets, trades, duels, lore, exports')
-      .addChannelOption(o=>o.setName('forum').setDescription('The forum channel').setRequired(false))
-      .addBooleanOption(o=>o.setName('disable').setDescription('true = go back to the single approval channel').setRequired(false)))
-    .addSubcommand(s=>s.setName('rollaudit').setDescription('Mirror every player roll to a GM-only channel')
-      .addChannelOption(o=>o.setName('channel').setDescription('Channel to mirror rolls into').setRequired(false))
-      .addBooleanOption(o=>o.setName('test').setDescription('true = send a test mirror and report any problem').setRequired(false))
-      .addBooleanOption(o=>o.setName('disable').setDescription('true = turn the mirror off').setRequired(false)))
-    .addSubcommand(s=>s.setName('rollauditforum').setDescription('Split the mirror into books — player rolls, GM rolls, NPC rolls, NPC say')
-      .addChannelOption(o=>o.setName('forum').setDescription('The forum channel').setRequired(false))
-      .addBooleanOption(o=>o.setName('disable').setDescription('true = back to the single audit channel').setRequired(false)))
-    .addSubcommand(s=>s.setName('scrollfont').setDescription('The font /scroll props are written in — upload an .otf or .ttf')
+      .addIntegerOption(o=>o.setName('minimum').setDescription('Minimum in every stat (default 1, 0 allows empty stats)').setRequired(false).setMinValue(0).setMaxValue(20)));
+      g.addSubcommand(s=>s.setName('npcreroll').setDescription('NPC auto-reroll threshold: natural die ≤ N (0 disables)')
+      .addIntegerOption(o=>o.setName('threshold').setDescription('1–19, or 0 to disable (default 8); omit to show current').setRequired(false).setMinValue(0).setMaxValue(19)));
+      g.addSubcommand(s=>s.setName('fightping').setDescription('@-mention players when it becomes their turn in a fight')
+      .addBooleanOption(o=>o.setName('enabled').setDescription('true = ping, false = silent (default); omit to show current').setRequired(false)));
+      g.addSubcommand(s=>s.setName('npcstats').setDescription('Show NPC stat blocks on their roll cards (default: hidden)')
+      .addBooleanOption(o=>o.setName('enabled').setDescription('true = players see NPC stats; false = hidden (default)').setRequired(false)));
+      g.addSubcommand(s=>s.setName('scrollfont').setDescription('The font /scroll props are written in — upload an .otf or .ttf')
       .addAttachmentOption(o=>o.setName('font').setDescription('The font file (.otf / .ttf, up to 2 MB)').setRequired(false))
-      .addBooleanOption(o=>o.setName('remove').setDescription('true = forget the stored font').setRequired(false)))
-    .addSubcommand(s=>s.setName('scrollarchive').setDescription('A library channel — every /scroll\'s named PDF is also filed there')
-      .addChannelOption(o=>o.setName('channel').setDescription('The archive channel').setRequired(false))
-      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop archiving').setRequired(false)))
-    .addSubcommand(s=>s.setName('cleanwebhooks').setDescription('Remove orphaned NPC webhooks to free up Discord limits')),
+      .addBooleanOption(o=>o.setName('remove').setDescription('true = forget the stored font').setRequired(false)));
+      g.addSubcommand(s=>s.setName('cleanwebhooks').setDescription('Remove orphaned NPC webhooks to free up Discord limits'));
+      return g;
+    }),
 
   new SlashCommandBuilder()
     .setName('char').setDescription('Character setup and display')
@@ -4782,48 +4792,24 @@ const slashCommands = [
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
       .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
-    .addSubcommand(s=>s.setName('grapple').setDescription('Attempt to grapple a target — STR only; they answer with /fight save')
-      .addUserOption(o=>o.setName('target').setDescription('Player to grapple').setRequired(false))
-      .addStringOption(o=>o.setName('target_npc').setDescription('NPC to grapple instead of a player').setRequired(false).setAutocomplete(true))
-      .addStringOption(o=>o.setName('npc').setDescription('Grapple AS this NPC (GM, when it is the NPC\'s turn)').setRequired(false).setAutocomplete(true))
-      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
-        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
-      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
-    .addSubcommand(s=>s.setName('save').setDescription('Your STR save against the pending grapple')
-      .addStringOption(o=>o.setName('npc').setDescription('Save AS this NPC (GM, when the NPC is the target)').setRequired(false).setAutocomplete(true))
-      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
-        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
-      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
-    .addSubcommand(s=>s.setName('escape').setDescription('Break a grapple on your turn — 1d20+STR vs the grappler\'s STR score; strain still applies')
-      .addStringOption(o=>o.setName('npc').setDescription('Escape AS this NPC (GM, when it is the held NPC\'s turn)').setRequired(false).setAutocomplete(true))
-      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
-        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
-      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
-    .addSubcommand(s=>s.setName('release').setDescription('Release your grapple — a free action. GMs may also part any hold')
-      .addStringOption(o=>o.setName('npc').setDescription('Release AS this NPC holder (GM)').setRequired(false).setAutocomplete(true))
-      .addUserOption(o=>o.setName('target').setDescription('GM: force-release the hold on this player').setRequired(false))
-      .addStringOption(o=>o.setName('target_npc').setDescription('GM: force-release the hold on this NPC').setRequired(false).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('deflect').setDescription('Shield deflection vs a PvE attack — STR or DEX roll to turn the blow; may redirect it')
-      .addStringOption(o=>o.setName('stat').setDescription('Stat to deflect with (STR 4+ required either way)').setRequired(false)
+    .addSubcommand(s=>s.setName('act').setDescription('A fight ability — pick it from the menu; grapple, feint, deflect and the rest')
+      .addStringOption(o=>o.setName('action').setDescription('The ability').setRequired(true)
+        .addChoices(
+          {name:'🤼 Grapple — STR; they answer with Save',value:'grapple'},
+          {name:'💪 Save — your STR vs the pending grapple',value:'save'},
+          {name:'🏃 Escape — opposed STR vs the hold, on your turn',value:'escape'},
+          {name:'✋ Release — let a hold go (free action)',value:'release'},
+          {name:'🛡️ Deflect — STR/DEX vs a PvE attack, may redirect',value:'deflect'},
+          {name:'🗡️ Disarm — DEX vs a PvE attacker',value:'disarm'},
+          {name:'🎭 Feint — WIS vs WIS; fooled targets roll flat',value:'feint'},
+          {name:'👁️ Insight — your WIS against the pending feint',value:'insight'}))
+      .addUserOption(o=>o.setName('target').setDescription('Player target (grapple/feint; GM force-release)').setRequired(false))
+      .addStringOption(o=>o.setName('target_npc').setDescription('NPC target instead of a player').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('npc').setDescription('Act AS this NPC (GM, on the NPC\'s turn)').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('feint').setDescription('Feint only: what you pretend to do').setRequired(false))
+      .addStringOption(o=>o.setName('stat').setDescription('Deflect only: STR (default) or DEX').setRequired(false)
         .addChoices({name:'STR (default)',value:'str'},{name:'DEX',value:'dex'}))
-      .addStringOption(o=>o.setName('redirect_npc').setDescription('Enemy to redirect the deflected blow into (optional)').setRequired(false).setAutocomplete(true))
-      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
-        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
-      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
-    .addSubcommand(s=>s.setName('disarm').setDescription('Disarm a PvE attacker — DEX roll to beat the strike; they spend a turn retrieving')
-      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
-        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
-      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
-    .addSubcommand(s=>s.setName('feint').setDescription('Deceive an opponent — WIS vs WIS; fooled targets roll their next action flat')
-      .addStringOption(o=>o.setName('feint').setDescription('What you pretend to do (vs what you actually plan)').setRequired(true))
-      .addUserOption(o=>o.setName('target').setDescription('Player to deceive').setRequired(false))
-      .addStringOption(o=>o.setName('target_npc').setDescription('NPC to deceive instead of a player').setRequired(false).setAutocomplete(true))
-      .addStringOption(o=>o.setName('npc').setDescription('Feint AS this NPC (GM, when it is the NPC\'s turn)').setRequired(false).setAutocomplete(true))
-      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
-        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
-      .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
-    .addSubcommand(s=>s.setName('insight').setDescription('Your WIS insight check against the pending feint')
-      .addStringOption(o=>o.setName('npc').setDescription('Roll AS this NPC (GM, when the NPC is the target)').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('redirect_npc').setDescription('Deflect only: enemy to redirect the blow into').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
       .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
@@ -4864,6 +4850,14 @@ const slashCommands = [
     .addBooleanOption(o=>o.setName('success_check').setDescription('Show a success/partial/fail outcome').setRequired(false))
     .addBooleanOption(o=>o.setName('fight').setDescription('Submit this roll into the fight here, in place of /fight atk or /fight def').setRequired(false))
     .addUserOption(o=>o.setName('target').setDescription('Who you are attacking, when this roll is a fight attack').setRequired(false))
+    .addStringOption(o=>o.setName('action').setDescription('A fight ability instead of a plain roll — same menu as /fight act').setRequired(false)
+      .addChoices(
+        {name:'🤼 Grapple',value:'grapple'},{name:'💪 Save',value:'save'},
+        {name:'🏃 Escape',value:'escape'},{name:'✋ Release',value:'release'},
+        {name:'🛡️ Deflect',value:'deflect'},{name:'🗡️ Disarm',value:'disarm'},
+        {name:'🎭 Feint',value:'feint'},{name:'👁️ Insight',value:'insight'}))
+    .addStringOption(o=>o.setName('target_npc').setDescription('Ability actions: NPC target instead of a player').setRequired(false).setAutocomplete(true))
+    .addStringOption(o=>o.setName('feint').setDescription('Feint only: what you pretend to do').setRequired(false))
     .addStringOption(o=>o.setName('label').setDescription('What the roll is for, e.g. perception').setRequired(false))
     .addStringOption(o=>o.setName('flavour').setDescription('RP text posted with the roll — *italic* and **bold** work').setRequired(false)),
 
@@ -4947,43 +4941,57 @@ const slashCommands = [
                     {name:'⚖️ Mixed elements',value:'mixed'},{name:'⚔️ Combat-heavy',value:'combat'},
                     {name:'🧩 Puzzle & investigation',value:'puzzle'},{name:'🗺️ Sandbox — led by the players',value:'sandbox'})))
     .addSubcommand(s=>s.setName('instance').setDescription('Run your own copy of a quest, separate from anyone else\'s (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest to copy').setRequired(true).setAutocomplete(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest to copy').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('gm_style').setDescription('How you run a table, so players know what to expect').setRequired(false)
         .addChoices({name:'⚙️ Mechanics-focused',value:'mechanics'},{name:'🎭 Roleplay-focused',value:'rp'},
                     {name:'⚖️ Mixed elements',value:'mixed'},{name:'⚔️ Combat-heavy',value:'combat'},
                     {name:'🧩 Puzzle & investigation',value:'puzzle'},{name:'🗺️ Sandbox — led by the players',value:'sandbox'})))
     .addSubcommand(s=>s.setName('post').setDescription('Post a quest to a channel/thread as an embed (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addChannelOption(o=>o.setName('channel').setDescription('Where to post (defaults to here)').setRequired(false)))
     .addSubcommand(s=>s.setName('board').setDescription('List quests on the board')
       .addStringOption(o=>o.setName('filter').setDescription('Which quests to show').setRequired(false)
         .addChoices({name:'Open',value:'open'},{name:'In progress',value:'active'},{name:'Completed',value:'completed'},{name:'All',value:'all'})))
     .addSubcommand(s=>s.setName('show').setDescription('Show one quest in full')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true)))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('apply').setDescription('Apply to join a quest')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true)))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('withdraw').setDescription('Withdraw your application or leave a quest')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true)))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('roster').setDescription('Show a quest\'s applicants and party')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true)))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('log').setDescription('Completed quests a player was on')
       .addUserOption(o=>o.setName('user').setDescription('Player (defaults to you)').setRequired(false)))
     .addSubcommand(s=>s.setName('approve').setDescription('Approve an applicant onto the party (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addUserOption(o=>o.setName('user').setDescription('Applicant to approve').setRequired(true))
       .addBooleanOption(o=>o.setName('force').setDescription('Add even if it exceeds a hard cap').setRequired(false)))
     .addSubcommand(s=>s.setName('kick').setDescription('Remove a member or applicant from a quest (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addUserOption(o=>o.setName('user').setDescription('Player to remove').setRequired(true)))
+    .addSubcommandGroup(g => {
+      g.setName('run').setDescription('Running a quest — start to completion');
+      g.addSubcommand(s=>s.setName('start').setDescription('Mark a quest in progress, locking the party (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('pause').setDescription('Stop the clock — the time so far is kept (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('resume').setDescription('Start the clock again where it left off (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('note').setDescription('Mark something on the quest log (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('text').setDescription('What happened').setRequired(true))
+      .addStringOption(o=>o.setName('kind').setDescription('What sort of moment').setRequired(false)
+        .addChoices({name:'🎭 Roleplay',value:'rp'},{name:'⚔️ Combat',value:'combat'},{name:'📝 Note',value:'note'}))
+      .addBooleanOption(o=>o.setName('public').setDescription('true = also post it in the quest\'s board thread (default: planning thread only)').setRequired(false)));
+      g.addSubcommand(s=>s.setName('timeline').setDescription('The full log of a quest so far')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — award merits to the party (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)));
+      return g;
+    })
     .addSubcommand(s=>s.setName('runchannel').setDescription('Set where this quest is run and rewarded (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addChannelOption(o=>o.setName('channel').setDescription('Thread or channel (defaults to here)').setRequired(false)))
-    .addSubcommand(s=>s.setName('start').setDescription('Mark a quest in progress, locking the party (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('pause').setDescription('Stop the clock — the time so far is kept (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('resume').setDescription('Start the clock again where it left off (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('dm').setDescription('Your DM card on the 🎲 roster — style, brief, availability (GM)')
       .addStringOption(o=>o.setName('style').setDescription('Your GM style, e.g. Grimdark · RP-heavy · Fast combat').setRequired(false))
       .addStringOption(o=>o.setName('brief').setDescription('A short breakdown of what running with you is like').setRequired(false))
@@ -5000,18 +5008,8 @@ const slashCommands = [
         .addChoices({name:'🌱 Concept',value:'concept'},{name:'⏳ Awaiting Approval',value:'awaiting'},{name:'✅ Approved',value:'approved'})))
     .addSubcommand(s=>s.setName('archive').setDescription('Take a quest off the board — board thread locked, applications closed (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('note').setDescription('Mark something on the quest log (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
-      .addStringOption(o=>o.setName('text').setDescription('What happened').setRequired(true))
-      .addStringOption(o=>o.setName('kind').setDescription('What sort of moment').setRequired(false)
-        .addChoices({name:'🎭 Roleplay',value:'rp'},{name:'⚔️ Combat',value:'combat'},{name:'📝 Note',value:'note'}))
-      .addBooleanOption(o=>o.setName('public').setDescription('true = also post it in the quest\'s board thread (default: planning thread only)').setRequired(false)))
-    .addSubcommand(s=>s.setName('timeline').setDescription('The full log of a quest so far')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — award merits to the party (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('delete').setDescription('Delete a quest permanently (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true).setAutocomplete(true))),
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))),
 ];
 
 // ─────────────────────────────────────────────
@@ -5028,7 +5026,7 @@ async function handleLoreSubmit(interaction) {
     src_channel: interactionChannelId(interaction) });
   await interaction.reply({ ephemeral: true, content: chId
     ? `📜 **Lore sent to <#${chId}> for a GM to read.** You'll hear back once they decide.`
-    : '📜 Lore saved, but no approval channel is set — ask a GM to run `/config approvals`.' });
+    : '📜 Lore saved, but no approval channel is set — ask a GM to run `/config channels approvals`.' });
   if (!chId) return;
   try {
     const nm = await getDisplayName(interaction.guild, uid);
@@ -5110,7 +5108,7 @@ async function handleMeritGive(interaction) {
   await interaction.reply({ content:
     `🤝 **${fromName}** offers **${amount} merit** to **${toName}**${reason ? ` — ${reason}` : ''}.\n`
     + (chId ? `_Held for a GM to sign off${chId ? ` in <#${chId}>` : ''}. Nothing moves until then._`
-            : '_⚠️ No approval channel is set, so no GM has been told — ask one to run `/config approvals`._') });
+            : '_⚠️ No approval channel is set, so no GM has been told — ask one to run `/config channels approvals`._') });
   if (!chId) return;
 
   try {
@@ -5127,7 +5125,7 @@ async function handleMeritGive(interaction) {
     setMeritTrade(gid, trade.id, { msg_id: msg.id, ch_id: ch.id });
   } catch (err) {
     console.error('[merit] could not queue trade:', err?.message || err);
-    await interaction.followUp({ ephemeral: true, content: '⚠️ Couldn\'t reach the approval channel — ask a GM to check `/config approvals`.' }).catch(()=>{});
+    await interaction.followUp({ ephemeral: true, content: '⚠️ Couldn\'t reach the approval channel — ask a GM to check `/config channels approvals`.' }).catch(()=>{});
   }
 }
 
@@ -5387,7 +5385,7 @@ async function handleDuelButton(interaction) {
     if (uid !== d.opener) return interaction.reply({ content: '❌ Only whoever raised it can send it.', ephemeral: true });
     if (fighters.length < 2) return interaction.reply({ content: '❌ A duel needs at least two.', ephemeral: true });
     const chId = approvalDestination(gid, 'duels');
-    if (!chId) return interaction.reply({ content: '❌ No approval channel is set — ask a GM to run `/config approvals`.', ephemeral: true });
+    if (!chId) return interaction.reply({ content: '❌ No approval channel is set — ask a GM to run `/config channels approvals`.', ephemeral: true });
 
     const updated = setDuel(gid, d.id, { state: 'pending' });
     await interaction.reply({ content: '📨 Sent to the GMs.', ephemeral: true });
@@ -5681,7 +5679,7 @@ async function handleGmKillModal(interaction) {
     + (gmChId ? ` Recorded in <#${gmChId}>.` : '') + (pubChId ? ` Remembered in <#${pubChId}>.` : '') });
   if (!gmChId && !pubChId) {
     return interaction.followUp({ ephemeral: true,
-      content: '⚠️ No memorial channel is set, so nothing was posted — `/config memorial channel:#gm-records public:#the-fallen`.\n\n'
+      content: '⚠️ No memorial channel is set, so nothing was posted — `/config channels memorial channel:#gm-records public:#the-fallen`.\n\n'
         + gmLines.join('\n') });
   }
 
@@ -5732,7 +5730,7 @@ async function handleGmKillModal(interaction) {
       + '_Check I can **View Channel**, **Send Messages** and **Embed Links** there._' }).catch(()=>{});
   } else if (gmChId && !pubChId) {
     await interaction.followUp({ ephemeral: true, content:
-      '📋 _Posted to the GM record only — no public hall is set. `/config memorial public:#the-fallen` adds one._' }).catch(()=>{});
+      '📋 _Posted to the GM record only — no public hall is set. `/config channels memorial public:#the-fallen` adds one._' }).catch(()=>{});
   }
 }
 
@@ -5803,8 +5801,8 @@ async function handleGmTest(interaction) {
     return interaction.reply({ ephemeral: true, content: [
       `🧪 Created **${questTag(quest)}** with you on the party, running in this channel.`,
       '',
-      `Try: \`/quest start number:${number}\` → \`/quest note number:${number} text:Something happened\``,
-      `→ \`/quest timeline number:${number}\` → \`/quest pause\` / \`/quest resume\` → \`/quest complete number:${number}\``,
+      `Try: \`/quest run start number:${number}\` → \`/quest run note number:${number} text:Something happened\``,
+      `→ \`/quest run timeline number:${number}\` → \`/quest run pause\` / \`/quest run resume\` → \`/quest run complete number:${number}\``,
       '',
       '_Reminders land every 15 minutes and a recap on the hour. `/gm test clean` removes it._',
     ].join('\n') });
@@ -6087,7 +6085,7 @@ async function handleConfig(interaction) {
 
     // No role given → list what's configured
     if (!role) {
-      if (!current.length) return interaction.reply({ content: '📋 No GM roles set. Add one with `/config gmrole role:@Role`.\n_Server admins (Manage Server) always count as GMs._', ephemeral: true });
+      if (!current.length) return interaction.reply({ content: '📋 No GM roles set. Add one with `/config mechanics gmrole role:@Role`.\n_Server admins (Manage Server) always count as GMs._', ephemeral: true });
       const names = current.map(id => `<@&${id}>`).join(', ');
       return interaction.reply({ content: `📋 GM roles: ${names}\n_Server admins (Manage Server) always count as GMs._`, ephemeral: true, allowedMentions: { parse: [] } });
     }
@@ -6114,7 +6112,7 @@ async function handleConfig(interaction) {
     const v = interaction.options.getBoolean('enabled');
     if (v === null) {
       const cur = !!getConfig(gid)?.fight_ping;
-      return interaction.reply({ content: `🔔 Turn pings are **${cur ? 'on' : 'off'}**${cur ? '' : ' (default)'}. Set with \`/config fightping enabled:true\`.`, ephemeral: true });
+      return interaction.reply({ content: `🔔 Turn pings are **${cur ? 'on' : 'off'}**${cur ? '' : ' (default)'}. Set with \`/config mechanics fightping enabled:true\`.`, ephemeral: true });
     }
     setConfig(gid, { fight_ping: v ? 1 : 0 });
     return interaction.reply({ content: v ? '🔔 Turn pings **on** — players get an @mention when it\'s their turn.' : '🔕 Turn pings **off**.' });
@@ -6123,7 +6121,7 @@ async function handleConfig(interaction) {
     const v = interaction.options.getBoolean('enabled');
     if (v === null) {
       const cur = !!getConfig(gid)?.npc_stats_visible;
-      return interaction.reply({ content: `🎭 NPC stat blocks are **${cur ? 'visible' : 'hidden'}**${cur ? '' : ' (default)'} on roll cards. Change with \`/config npcstats enabled:true\`.`, ephemeral: true });
+      return interaction.reply({ content: `🎭 NPC stat blocks are **${cur ? 'visible' : 'hidden'}**${cur ? '' : ' (default)'} on roll cards. Change with \`/config mechanics npcstats enabled:true\`.`, ephemeral: true });
     }
     setConfig(gid, { npc_stats_visible: v ? 1 : 0 });
     return interaction.reply({ content: v
@@ -6160,8 +6158,8 @@ async function handleConfig(interaction) {
     if (!channel) {
       const cur = approvalChannelId(gid);
       return interaction.reply({ content: cur
-        ? `📋 New sheets await approval in <#${cur}>. Turn off with \`/config approvals disable:true\`.`
-        : '📋 Sheet approval is **off**. Set a channel with `/config approvals channel:#x`.', ephemeral: true });
+        ? `📋 New sheets await approval in <#${cur}>. Turn off with \`/config channels approvals disable:true\`.`
+        : '📋 Sheet approval is **off**. Set a channel with `/config channels approvals channel:#x`.', ephemeral: true });
     }
     if (!channel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
     setConfig(gid, { approval_channel_id: channel.id });
@@ -6176,7 +6174,7 @@ async function handleConfig(interaction) {
     if (!forum) {
       const r = approvalRoutes(gid);
       if (!r) return interaction.reply({ ephemeral: true, content:
-        '📋 No approval forum set. `/config approvalforum forum:#gm-approvals` — I\'ll make a thread per approval type in it.' });
+        '📋 No approval forum set. `/config channels approvalforum forum:#gm-approvals` — I\'ll make a thread per approval type in it.' });
       const rows = Object.entries(APPROVAL_TYPES).map(([k, t]) => `${t.name} → ${r[k] ? `<#${r[k]}>` : '_missing — rerun setup_'}`);
       return interaction.reply({ ephemeral: true, content: [`📋 Approvals route into <#${r.forum}>:`, ...rows].join('\n') });
     }
@@ -6230,7 +6228,7 @@ async function handleConfig(interaction) {
       const cfg = getConfig(gid) || {};
       return interaction.reply({ ephemeral: true, content: cfg.scroll_font
         ? `📜 Scroll font: **${cfg.scroll_font_name || 'unnamed'}** (${Math.round(cfg.scroll_font.length / 1024)} KB). Upload another to replace it, or \`remove:true\`.`
-        : '📜 No scroll font stored. `/config scrollfont font:<file>` with an .otf or .ttf — then any GM can `/scroll`.' });
+        : '📜 No scroll font stored. `/config mechanics scrollfont font:<file>` with an .otf or .ttf — then any GM can `/scroll`.' });
     }
     if (!/\.(otf|ttf)$/i.test(att.name || '')) {
       return interaction.reply({ ephemeral: true, content: '❌ That isn\'t an .otf or .ttf file.' });
@@ -6273,7 +6271,7 @@ async function handleConfig(interaction) {
         ? `📚 Scroll archive: <#${cur}> (manual override). \`disable:true\` falls back to the audit forum's 📜 Scrolls book${book ? ` (<#${book}>)` : ' when one is set'}.`
         : book
           ? `📚 Archiving to the audit forum's 📜 Scrolls book: <#${book}> — automatic. Point me at a channel here to override.`
-          : '📚 No archive yet. Set the roll-audit forum and its 📜 Scrolls book archives automatically — or `/config scrollarchive channel:#library` for a plain channel.' });
+          : '📚 No archive yet. Set the roll-audit forum and its 📜 Scrolls book archives automatically — or `/config channels scrollarchive channel:#library` for a plain channel.' });
     }
     setConfig(gid, { scroll_archive_id: ch.id });
     return interaction.reply({ content: `📚 Scroll archive set: <#${ch.id}> — every \`/scroll\` now also files its named PDF there.` });
@@ -6287,7 +6285,7 @@ async function handleConfig(interaction) {
     if (!forum) {
       const r = auditRoutes(gid);
       if (!r) return interaction.reply({ ephemeral: true, content:
-        '🎲 No audit forum set. `/config rollauditforum forum:#roll-audit` — I\'ll make a thread per book: player rolls, GM rolls, NPC rolls, NPC say, and the 📜 Scrolls archive.' });
+        '🎲 No audit forum set. `/config channels rollauditforum forum:#roll-audit` — I\'ll make a thread per book: player rolls, GM rolls, NPC rolls, NPC say, and the 📜 Scrolls archive.' });
       const rows = Object.entries(AUDIT_KINDS).map(([k, t]) => `${t.name} → ${r[k] ? `<#${r[k]}>` : '_missing — rerun setup_'}`);
       return interaction.reply({ ephemeral: true, content: [`🎲 Roll audit routes into <#${r.forum}>:`, ...rows].join('\n') });
     }
@@ -6338,7 +6336,7 @@ async function handleConfig(interaction) {
     if (test) {
       const r = auditRoutes(gid);
       const plain = getConfig(gid)?.roll_audit_channel_id || null;
-      if (!r && !plain) return interaction.reply({ content: '🔇 No audit destination is set. `/config rollaudit channel:#x` or `/config rollauditforum forum:#x` first.', ephemeral: true });
+      if (!r && !plain) return interaction.reply({ content: '🔇 No audit destination is set. `/config channels rollaudit channel:#x` or `/config channels rollauditforum forum:#x` first.', ephemeral: true });
       // With the forum, every book is exercised; without it, the one channel.
       // Four fetch-and-sends can outlast the ack window — answer first.
       await interaction.deferReply({ ephemeral: true });
@@ -6366,13 +6364,13 @@ async function handleConfig(interaction) {
     }
     if (!channel) {
       const cur = getConfig(gid)?.roll_audit_channel_id;
-      if (!cur) return interaction.reply({ content: '🔇 Roll mirroring is **off**. Set a channel with `/config rollaudit channel:#x`.', ephemeral: true });
+      if (!cur) return interaction.reply({ content: '🔇 Roll mirroring is **off**. Set a channel with `/config channels rollaudit channel:#x`.', ephemeral: true });
       let reach = '❓ unknown';
       try {
         const t = await interaction.client.channels.fetch(cur);
         reach = t ? `✅ reachable (**#${t.name ?? '?'}**)` : '❌ fetch returned nothing';
       } catch (e) { reach = `❌ cannot access — ${e?.message || e}`; }
-      return interaction.reply({ content: `🎲 Audit channel: <#${cur}>\nStored id: \`${cur}\`\nBot access: ${reach}\n\nSend a live test with \`/config rollaudit test:true\`.`, ephemeral: true });
+      return interaction.reply({ content: `🎲 Audit channel: <#${cur}>\nStored id: \`${cur}\`\nBot access: ${reach}\n\nSend a live test with \`/config channels rollaudit test:true\`.`, ephemeral: true });
     }
     if (!channel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
     setConfig(gid, { roll_audit_channel_id: channel.id });
@@ -6395,7 +6393,7 @@ async function handleConfig(interaction) {
       const all = listSchedules(gid);
       if (!all.length) return interaction.reply({ ephemeral: true, content:
         '🌙 No recovery schedules yet.\n'
-        + 'Add one with `/config autorest action:Add or update name:Breather hours:6 hp:50% rerolls:0% heal:0%`.\n'
+        + 'Add one with `/config mechanics autorest action:Add or update name:Breather hours:6 hp:50% rerolls:0% heal:0%`.\n'
         + 'Amounts take `100%`, `50%`, a flat number, or `0%` to leave that resource alone. Percentages round down.' });
       return replyLong(interaction, ['🌙 **Recovery schedules**', '', ...all.map(line), '',
         '_Anyone on an in-progress quest is skipped by every schedule._'], { ephemeral: true });
@@ -6461,7 +6459,7 @@ async function handleConfig(interaction) {
       let back = '';
       if (planId) {
         try { await ensurePlanTags(await interaction.client.channels.fetch(planId), gid); back = ' Pipeline tags restored there.'; }
-        catch { back = ' ⚠️ Couldn\'t restore the pipeline tags there — re-run `/config questplanning`.'; }
+        catch { back = ' ⚠️ Couldn\'t restore the pipeline tags there — re-run `/config channels questplanning`.'; }
       }
       return interaction.reply({ content: `🗺️ Quest threads will open in the planning forum again.${back} Existing threads stay where they are.` });
     }
@@ -6470,7 +6468,7 @@ async function handleConfig(interaction) {
       const cur = getConfig(gid)?.quest_thread_forum;
       return interaction.reply({ ephemeral: true, content: cur
         ? `🗺️ Per-quest planning threads open in <#${cur}>.`
-        : '🗺️ No secondary forum set — quest threads open in the planning forum. `/config questthreads channel:#your-forum` splits them out.' });
+        : '🗺️ No secondary forum set — quest threads open in the planning forum. `/config channels questthreads channel:#your-forum` splits them out.' });
     }
     if (channel.type !== 15) {
       return interaction.reply({ ephemeral: true, content:
@@ -6569,7 +6567,7 @@ async function handleConfig(interaction) {
       const count = db.prepare('SELECT COUNT(*) AS c FROM char_pages WHERE guild_id=?').get(gid).c;
       return interaction.reply({ ephemeral: true, content: cur
         ? `📖 Character pages live in <#${cur}> — ${count} linked so far.`
-        : '📖 No character forum set. `/config charforum channel:#character-sheets`' });
+        : '📖 No character forum set. `/config channels charforum channel:#character-sheets`' });
     }
     // A forum is channel type 15; anything else has no threads to create.
     if (channel.type !== 15) {
@@ -6595,7 +6593,7 @@ async function handleConfig(interaction) {
       if (cfg.memorial_channel) bits.push(`📋 GM record in <#${cfg.memorial_channel}> — full account, with a Revive button.`);
       if (cfg.memorial_public_channel) bits.push(`🕯️ Public hall in <#${cfg.memorial_public_channel}> — the story alone.`);
       return interaction.reply({ ephemeral: true, content: bits.length ? bits.join('\n')
-        : '🕯️ No memorial channels set. `/config memorial channel:#gm-records public:#the-fallen`' });
+        : '🕯️ No memorial channels set. `/config channels memorial channel:#gm-records public:#the-fallen`' });
     }
     const fields = {};
     for (const [opt, key, what] of [[channel, 'memorial_channel', 'GM record'], [pub, 'memorial_public_channel', 'public hall']]) {
@@ -6648,8 +6646,8 @@ async function handleConfig(interaction) {
     const st = docsSettings(gid);
     if (!st.channel || !st.repo) {
       return interaction.reply({ ephemeral: true, content: (st.channel || st.repo)
-        ? `📚 Half set up — ${st.channel ? 'no repository yet' : 'no channel yet'}.\n\`/config docs channel:#gm-books repo:owner/name\``
-        : '📚 Not set up. `/config docs channel:#gm-books repo:owner/name`\n_The three PDFs are fetched from that repository and kept as a single, current post._' });
+        ? `📚 Half set up — ${st.channel ? 'no repository yet' : 'no channel yet'}.\n\`/config channels docs channel:#gm-books repo:owner/name\``
+        : '📚 Not set up. `/config channels docs channel:#gm-books repo:owner/name`\n_The three PDFs are fetched from that repository and kept as a single, current post._' });
     }
 
     const cfg0 = getConfig(gid) || {};
@@ -6694,7 +6692,7 @@ async function handleConfig(interaction) {
       const cur = getConfig(gid)?.quest_log_channel;
       return interaction.reply({ ephemeral: true, content: cur
         ? `📜 Quest summaries are posted in <#${cur}>.`
-        : '📜 No quest log channel set. `/config questlog channel:#chronicle`' });
+        : '📜 No quest log channel set. `/config channels questlog channel:#chronicle`' });
     }
     if (!channel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
     setConfig(gid, { quest_log_channel: channel.id });
@@ -6706,7 +6704,7 @@ async function handleConfig(interaction) {
     if (players === null) {
       return interaction.reply({ ephemeral: true, content: getConfig(gid)?.activity_players
         ? '🎮 Anyone can start an activity. Writing and deleting them is still GM-only.'
-        : '🎮 Activities are **GM-led** — only a GM can start one. Open it up with `/config activities players:true`.' });
+        : '🎮 Activities are **GM-led** — only a GM can start one. Open it up with `/config mechanics activities players:true`.' });
     }
     setConfig(gid, { activity_players: players ? 1 : 0 });
     return interaction.reply({ content: players
@@ -6719,7 +6717,7 @@ async function handleConfig(interaction) {
     const cur = hpBase(gid);
     if (base === null) {
       return interaction.reply({ content:
-        `❤️ Max HP is **CON + ${cur}**. Change it with \`/config hpbase base:3\`.`, ephemeral: true });
+        `❤️ Max HP is **CON + ${cur}**. Change it with \`/config mechanics hpbase base:3\`.`, ephemeral: true });
     }
     setConfig(gid, { hp_base: base });
     return interaction.reply({ content:
@@ -6735,7 +6733,7 @@ async function handleConfig(interaction) {
     if (points === null && minimum === null) {
       return interaction.reply({ content:
         `📊 Players spend exactly **${cur.budget} points** across the 5 stats, minimum **${cur.min}** in each.\n`
-        + `Change it with \`/config statallowance points:20 minimum:2\`. GMs are never limited.`, ephemeral: true });
+        + `Change it with \`/config mechanics statallowance points:20 minimum:2\`. GMs are never limited.`, ephemeral: true });
     }
     const budget = points ?? cur.budget;
     const min = minimum ?? cur.min;
@@ -6754,7 +6752,7 @@ async function handleConfig(interaction) {
     if (v === null) {
       const cur = getNpcRrThreshold(gid);
       const state = cur === 0 ? '**disabled**' : `natural die **≤ ${cur}**`;
-      return interaction.reply({ content: `🔁 NPC auto-rerolls: ${state}${cur === NPC_RR_NAT_MAX ? ' (default)' : ''}. Set with \`/config npcreroll threshold:N\` — 0 disables.`, ephemeral: true });
+      return interaction.reply({ content: `🔁 NPC auto-rerolls: ${state}${cur === NPC_RR_NAT_MAX ? ' (default)' : ''}. Set with \`/config mechanics npcreroll threshold:N\` — 0 disables.`, ephemeral: true });
     }
     setConfig(gid, { npc_rr_threshold: v });
     return interaction.reply({ content: v === 0 ? '✅ NPC auto-rerolls **disabled**.' : `✅ NPCs now auto-reroll on a natural die of **${v} or less**.`, ephemeral: true });
@@ -6945,12 +6943,12 @@ async function handleChar(interaction) {
       const chId = approvalDestination(gid, 'sheets');
       await interaction.reply({ content: chId
         ? `✅ Sheet submitted — ${summary}\n\n⏳ **Awaiting GM approval.** You can't roll or fight until it's approved.\n📬 **You'll get a DM as soon as a GM decides** — if your DMs are closed, the notice will be posted here instead.\n🔒 Once approved, only a GM can change your sheet, so check it over now with \`/char show\`.`
-        : `✅ Sheet saved — ${summary}\n\n⚠️ No approval channel set; ask a GM to check \`/config approvals\`.` });
+        : `✅ Sheet saved — ${summary}\n\n⚠️ No approval channel set; ask a GM to check \`/config channels approvals\`.` });
       let submitId = null;
       try { const rep = await interaction.fetchReply(); submitId = rep?.id ?? null; } catch {}
       const posted = await requestSheetApproval(interaction, gid, targetId, submitId);
       if (!posted) {
-        await interaction.followUp({ content: '⚠️ Couldn\'t reach the approval channel — ask a GM to check `/config approvals`.', ephemeral: true }).catch(()=>{});
+        await interaction.followUp({ content: '⚠️ Couldn\'t reach the approval channel — ask a GM to check `/config channels approvals`.', ephemeral: true }).catch(()=>{});
       }
       return;
     }
@@ -7001,7 +6999,7 @@ async function handleChar(interaction) {
     await interaction.deferReply();
     try {
       const made = await ensureCharPage(interaction.client, interaction.guild, who.id, nm3);
-      if (made.skipped) return interaction.editReply({ content: '❌ No character forum is set — `/config charforum channel:#character-sheets`, or pass a `thread:` to link one by hand.' });
+      if (made.skipped) return interaction.editReply({ content: '❌ No character forum is set — `/config channels charforum channel:#character-sheets`, or pass a `thread:` to link one by hand.' });
       return interaction.editReply({ content: made.existing
         ? `📖 **${nm3}** already has a page: ${made.url}`
         : `📖 Made a page for **${nm3}**: ${made.url}` });
@@ -7706,6 +7704,39 @@ async function handleRest(message, rest, type) {
   await message.reply(lines.join('\n'));
 }
 
+// /gm questwipe — the whole board, gone. Confirm-gated; book index entries are
+// cleared best-effort; threads stay (deleting dozens is rate-limit suicide —
+// re-running /config channels questplanning remakes clean books any time). The run
+// ledger — the source of the DM cards' guided counters — survives unless
+// runs:true says otherwise.
+async function runGmQuestWipe(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ Only GMs can wipe the board.', ephemeral: true });
+  const wipeRuns = interaction.options.getBoolean('runs') ?? false;
+  const qCount = db.prepare('SELECT COUNT(*) AS c FROM quests WHERE guild_id=?').get(gid).c;
+  const rCount = db.prepare('SELECT COUNT(*) AS c FROM quest_runs WHERE guild_id=?').get(gid).c;
+  if (!qCount && !(wipeRuns && rCount)) return interaction.reply({ content: '🗺️ The board is already empty.', ephemeral: true });
+  return requestConfirm(interaction,
+    `Delete **all ${qCount} quest${qCount === 1 ? '' : 's'}** on this server — rosters, timelines and book entries included${wipeRuns ? `, **plus the run ledger (${rCount} run${rCount === 1 ? '' : 's'}) and the DM guided-counters**` : ` (the run ledger's ${rCount} run${rCount === 1 ? '' : 's'} and DM counters stay)`}? Board and planning threads are left where they stand.`,
+    async () => {
+      const quests = db.prepare('SELECT number, index_thread_id, index_msg_id FROM quests WHERE guild_id=?').all(gid);
+      let cleared = 0;
+      for (const q of quests) {
+        if (!q.index_thread_id || !q.index_msg_id) continue;
+        try {
+          const bk = await interaction.client.channels.fetch(q.index_thread_id);
+          if (bk?.isThread?.()) { if (bk.archived) await wakeThread(bk); await bk.messages.delete(q.index_msg_id); cleared++; }
+        } catch { /* already gone */ }
+      }
+      db.prepare('DELETE FROM quest_members WHERE guild_id=?').run(gid);
+      db.prepare('DELETE FROM quest_events WHERE guild_id=?').run(gid);
+      db.prepare('DELETE FROM quests WHERE guild_id=?').run(gid);
+      if (wipeRuns) db.prepare('DELETE FROM quest_runs WHERE guild_id=?').run(gid);
+      await refreshDmRoster(interaction.client, interaction.guild, gid);
+      return `🗑️ **${qCount}** quest${qCount === 1 ? '' : 's'} wiped — ${cleared} book entr${cleared === 1 ? 'y' : 'ies'} cleared${wipeRuns ? `, run ledger erased (${rCount})` : ', run ledger kept'}. Threads remain; \`/config channels questplanning\` remakes clean books any time.`;
+    });
+}
+
 // The slash twin of the gmr / gmrs chat shorthands — same roll, same audit
 // mirror; ‘secret’ lands as an ephemeral reply instead of a DM.
 async function runGmRollSlash(interaction) {
@@ -7751,24 +7782,24 @@ async function handleCheck(interaction) {
   const apprR = routes('approval_routes');
   const planBooks = routes('quest_plan_books');
   const checks = [
-    ['📌 Quest board forum', cfg.quest_forum, '`/config questforum channel:#forum`', null],
-    ['🗺️ GM quest planning forum', cfg.quest_plan_forum, '`/config questplanning channel:#gm-forum`',
+    ['📌 Quest board forum', cfg.quest_forum, '`/config channels questforum channel:#forum`', null],
+    ['🗺️ GM quest planning forum', cfg.quest_plan_forum, '`/config channels questplanning channel:#gm-forum`',
       Object.keys(planBooks).length ? `${Object.keys(planBooks).length} books` : null],
-    ['🧵 Quest threads forum', cfg.quest_thread_forum, '`/config questthreads channel:#` (optional — threads default into the planning forum)',
+    ['🧵 Quest threads forum', cfg.quest_thread_forum, '`/config channels questthreads channel:#` (optional — threads default into the planning forum)',
       cfg.quest_thread_forum ? 'per-quest threads + stage tags' : null],
     ['📜 Roll audit', auditR.forum ?? cfg.roll_audit_channel_id,
-      '`/config rollauditforum forum:#forum` (books) · or `/config rollaudit channel:#`',
+      '`/config channels rollauditforum forum:#forum` (books) · or `/config channels rollaudit channel:#`',
       auditR.forum ? 'books' : (cfg.roll_audit_channel_id ? 'single channel' : null)],
-    ['📖 Character pages forum', cfg.char_forum, '`/config charforum channel:#forum`', null],
+    ['📖 Character pages forum', cfg.char_forum, '`/config channels charforum channel:#forum`', null],
     ['⚖️ Approvals', apprR.forum ?? cfg.approval_channel_id,
-      '`/config approvalforum forum:#forum` · or `/config approvals channel:#`',
+      '`/config channels approvalforum forum:#forum` · or `/config channels approvals channel:#`',
       apprR.forum ? 'threads per type' : (cfg.approval_channel_id ? 'single channel' : null)],
-    ['🪶 Memorial — GM record', cfg.memorial_channel, '`/config memorial channel:#`', null],
-    ['🕯️ Memorial — public hall', cfg.memorial_public_channel, '`/config memorial public:#`', null],
-    ['📜 Quest log', cfg.quest_log_channel, '`/config questlog channel:#`', null],
-    ['🖼️ NPC image bank', cfg.npc_channel_id, '`/config npcchannel channel:#`', null],
-    ['📚 GM docs (the PDFs)', cfg.docs_channel, '`/config docs channel:# repo:owner/name`', null],
-    ['📜 Scroll library', cfg.scroll_archive_id, '`/config scrollarchive channel:#`', null],
+    ['🪶 Memorial — GM record', cfg.memorial_channel, '`/config channels memorial channel:#`', null],
+    ['🕯️ Memorial — public hall', cfg.memorial_public_channel, '`/config channels memorial public:#`', null],
+    ['📜 Quest log', cfg.quest_log_channel, '`/config channels questlog channel:#`', null],
+    ['🖼️ NPC image bank', cfg.npc_channel_id, '`/config channels npcchannel channel:#`', null],
+    ['📚 GM docs (the PDFs)', cfg.docs_channel, '`/config channels docs channel:# repo:owner/name`', null],
+    ['📜 Scroll library', cfg.scroll_archive_id, '`/config channels scrollarchive channel:#`', null],
     ['💾 Backups', cfg.backup_channel_id, '`/backup auto channel:#`', null],
   ];
   const unset = [], set = [];
@@ -8081,6 +8112,23 @@ async function routeButton(interaction) {
     if (interaction.customId.startsWith('tradeok:') || interaction.customId.startsWith('tradeno:')) return handleMeritTradeButton(interaction);
     if (interaction.customId.startsWith('revive:')) return handleReviveButton(interaction);
     if (/^duel(join|out|send|cancel|ok|no):/.test(interaction.customId)) return handleDuelButton(interaction);
+    if (interaction.customId.startsWith('queststage:')) {
+      const gid = interaction.guild.id;
+      if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ Only GMs advance the pipeline.', ephemeral: true });
+      const number = parseInt(interaction.customId.split(':')[1]);
+      const quest = getQuest(gid, number);
+      if (!quest) return interaction.reply({ content: '❌ That quest no longer exists.', ephemeral: true });
+      const next = quest.stage === 'concept' ? 'awaiting' : quest.stage === 'awaiting' ? 'approved' : null;
+      if (!next) return interaction.reply({ content: '✅ Past the hand-set stages — `/quest post` opens the board from here.', ephemeral: true });
+      updateQuest(gid, number, { stage: next });
+      const fresh = getQuest(gid, number);
+      // Answer the press by updating the button in place, then sync the rest.
+      await interaction.update({ components: questStageRow(fresh) });
+      await syncQuestPipeline(interaction.client, interaction.guild, gid, fresh);
+      const S = QUEST_STAGES.find(([k]) => k === next);
+      await questAnnounce(interaction.client, fresh, `${S[1]} Stage → **${S[2]}** — <@${interaction.user.id}>.`, { board: false });
+      return;
+    }
     if (interaction.customId.startsWith('questapply:') || interaction.customId.startsWith('questwithdraw:')) {
       return handleQuestButton(interaction);
     }
@@ -8202,7 +8250,7 @@ client.on('interactionCreate', async interaction => {
         return await interaction.respond(choices.slice(0, 25));
       }
       // Fight NPC fields — suggest server NPC names
-      if (interaction.commandName === 'fight' &&
+      if ((interaction.commandName === 'fight' || (interaction.commandName === 'roll' && focusedOption.name === 'target_npc')) &&
           (focusedOption.name === 'npc' || focusedOption.name === 'target_npc' || focusedOption.name === 'redirect_npc')) {
         const focused = (focusedOption.value || '').toString().toLowerCase();
         const npcs = getAllNpcs(interaction.guild.id);
@@ -8348,6 +8396,7 @@ client.on('interactionCreate', async interaction => {
       if (gmSub === 'kill') return await handleGmKill(interaction);
       if (gmSub === 'revive') return await handleGmRevive(interaction);
       if (gmSub === 'heal') return await handleGmHeal(interaction);
+      if (gmSub === 'questwipe') return await runGmQuestWipe(interaction);
       if (gmSub === 'roll') return await runGmRollSlash(interaction);
     }
     if (interaction.commandName === 'activity') return await handleStory(interaction);
@@ -8446,7 +8495,7 @@ client.on('messageCreate', async message => {
     // otherwise. These lines show in the Railway logs.
     console.log(`[npcimg] attachment in ${message.channel.id}; configured=${cfg.npc_channel_id || 'NONE'}; text="${message.content}"`);
     if (!cfg.npc_channel_id) {
-      await message.reply('⚠️ No NPC image channel is set. An admin needs to run `/config npcchannel`.').catch(()=>{});
+      await message.reply('⚠️ No NPC image channel is set. An admin needs to run `/config channels npcchannel`.').catch(()=>{});
       return;
     }
     if (message.channel.id === cfg.npc_channel_id) {
@@ -8875,7 +8924,7 @@ function autoRoll(mod, adv = false) {
 
 // Default: auto NPCs only spend a reroll token when the natural die was this or lower.
 const NPC_RR_NAT_MAX = 8;
-// Per-guild override via /config npcreroll (0 disables auto rerolls entirely).
+// Per-guild override via /config mechanics npcreroll (0 disables auto rerolls entirely).
 function getNpcRrThreshold(gid) {
   const v = getConfig(gid)?.npc_rr_threshold;
   return (v === null || v === undefined) ? NPC_RR_NAT_MAX : v;
@@ -9215,7 +9264,7 @@ async function requestSheetApproval(src, gid, uid, submitMessageId = null) {
     return channel.id;
   } catch (err) {
     // The sheet stays pending either way — the player is locked out, so a
-    // failure here must never be silent. Flagged for /config approvals list.
+    // failure here must never be silent. Flagged for /config channels approvals list.
     console.error('[approvals] could not post request for', uid, '-', err?.message || err);
     upsertChar(gid, uid, { approval_post_ok: 0 });
     return null;
@@ -9228,7 +9277,7 @@ async function requestSheetApproval(src, gid, uid, submitMessageId = null) {
 // never saw: they only checked the edit *lock*, which lets a sheet with no
 // approval_state through, and nothing ever moved it to 'pending'.
 // Every sheet still waiting on a GM, oldest first — the record of truth behind
-// /config approvals list:true.
+// /config channels approvals list:true.
 function listPendingSheets(gid) {
   return db.prepare(`SELECT user_id, approval_requested_at, approval_src_channel, approval_post_ok
                      FROM characters WHERE guild_id=? AND approval_state='pending'
@@ -9277,7 +9326,7 @@ async function finishSheetEdit({ src, gid, callerId, targetId, isGmCaller, conte
   const chId = approvalDestination(gid, 'sheets');
   const sent = await reply(content + (chId
     ? `\n\n⏳ **Sent to <#${chId}> for GM approval.** You can't roll or fight until it's signed off. Spotted a mistake? Edit it and it goes back to the front of the queue.\n📬 You'll get a DM as soon as they do.`
-    : '\n\n⚠️ No approval channel set — ask a GM to check `/config approvals`.'));
+    : '\n\n⚠️ No approval channel set — ask a GM to check `/config channels approvals`.'));
   const posted = await requestSheetApproval(src, gid, targetId, link ? (sent?.id ?? null) : null);
   if (!posted) await warnApprovalUnreachable(src, gid, targetId);
   return sent;
@@ -9292,7 +9341,7 @@ async function warnApprovalUnreachable(src, gid, uid) {
   const chId = approvalDestination(gid, 'sheets');
   const text = `${ping}⚠️ **A sheet is waiting for approval but I couldn't post it to ${chId ? `<#${chId}>` : 'the approval channel'}.**\n`
     + `👤 <@${uid}> is locked out until a GM decides.\n`
-    + `Check I can **View Channel** and **Send Messages** there, then see \`/config approvals list:true\`.`;
+    + `Check I can **View Channel** and **Send Messages** there, then see \`/config channels approvals list:true\`.`;
   try {
     const ch = src.channel ?? await src.client.channels.fetch(interactionChannelId(src));
     if (ch?.send) await ch.send({ content: text, allowedMentions: { roles } });
@@ -9470,12 +9519,12 @@ function applySignatureMode(row, stat, mode) {
   return hasSignatureAdvantage(row, stat) ? 'adv' : mode;
 }
 
-// Optional real @mention when announcing a player's turn (opt-in: /config fightping).
+// Optional real @mention when announcing a player's turn (opt-in: /config mechanics fightping).
 function turnPing(gid, f) {
   if (!f || f.isNpc || !getConfig(gid)?.fight_ping) return '';
   return ` <@${f.id}>`;
 }
-// Mirror a roll to the GM audit channel (set with /config rollaudit).
+// Mirror a roll to the GM audit channel (set with /config channels rollaudit).
 // Fire-and-forget: an unset, deleted, or unreadable channel must never break
 // the roll itself. Covers player rolls AND GM rolls (including secret ones, so
 // GMs are accountable to each other). NPC auto-rolls are not mirrored.
@@ -9485,7 +9534,7 @@ function turnPing(gid, f) {
 // roll path already calls mirrorRoll, so this is the one place that sees them
 // all — auto rolls have no userId and are skipped, as they belong to no sheet.
 // ── Audit routing ────────────────────────────────────────────────────────────
-// One forum, a thread per book — configured by /config rollauditforum, stored
+// One forum, a thread per book — configured by /config channels rollauditforum, stored
 // as JSON in guild_config.audit_routes. The single audit channel remains the
 // per-book fallback, so a server without the forum behaves exactly as before.
 const AUDIT_KINDS = {
@@ -9599,7 +9648,7 @@ function mirrorRoll(gid, { userId = null, actor = null, channelId, messageId = n
     console.log('[rollaudit] mirror sent OK');
   })().catch(err => {
     // Never break the roll itself, but do leave a trace — a silent mirror is
-    // impossible to diagnose. Surfaced to the GM by /config rollaudit test.
+    // impossible to diagnose. Surfaced to the GM by /config channels rollaudit test.
     console.error(`[rollaudit] mirror (${dest}) FAILED:`, err?.message || err, err?.code ? `(code ${err.code})` : '');
   });
 }
@@ -10356,7 +10405,7 @@ async function resolveGrappleSave(guild, gid, cid, fight, { nat, total, mode = '
     gmap[targetId] = attackerId;
     setFightGrapples(gid, cid, gmap);
     lines.push(`🔒 **${defName}** is **grappled** by **${atkName}**!`);
-    lines.push(`_Immobile • 1 strain at each of their turn's ends • \`/fight escape\` (STR) or act on a flat d20. ${atkName} may \`/fight release\` freely, and cannot strike their captive._`);
+    lines.push(`_Immobile • 1 strain at each of their turn's ends • \`/fight act action:Escape\` (STR) or act on a flat d20. ${atkName} may \`/fight act action:Release\` freely, and cannot strike their captive._`);
   } else {
     lines.push(`💨 **${defName}** slips the hold — no grapple.`);
   }
@@ -10487,9 +10536,9 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     return refuse(`⚠️ It's **${cur.name}**'s turn to attack.`);
   }
   if (fight.phase !== 'attack') return refuse(fight.atk_kind === 'grapple'
-    ? '🤼 A grapple is pending — the target answers with `/fight save` (STR only).'
+    ? '🤼 A grapple is pending — the target answers with `/fight act action:Save` (STR only).'
     : fight.atk_kind === 'feint'
-    ? '🎭 A feint is pending — the target answers with `/fight insight` (WIS only).'
+    ? '🎭 A feint is pending — the target answers with `/fight act action:Insight` (WIS only).'
     : '❌ Waiting for defender to roll first.');
   if (!isNpcFighter(actorId)) {
     const gateMsg = sheetGate(gid, actorId);
@@ -10512,7 +10561,7 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     // Grapple rules on the attack path: a holder cannot strike their captive,
     // and a held fighter swings on a flat d20 — no stat, no riposte, no edge.
     if (grappleHolderOf(fight, targetId) === actorId) {
-      return refuse('🤼 You are holding them — a grappler cannot strike their captive. `/fight release` first (it costs nothing).');
+      return refuse('🤼 You are holding them — a grappler cannot strike their captive. `/fight act action:Release` first (it costs nothing).');
     }
     const restrained = !!grappleHolderOf(fight, actorId);
     // A deflection's trade-off: the very next attack roll is a flat d20.
@@ -10649,7 +10698,7 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
     return refuse(`⚠️ It's **${cur.name}**'s turn to attack.`);
   }
   if (fight.phase !== 'attack') return refuse(fight.atk_kind === 'grapple'
-    ? '🤼 A grapple is already pending — the target answers with `/fight save`.'
+    ? '🤼 A grapple is already pending — the target answers with `/fight act action:Save`.'
     : '❌ Waiting for defender to roll first.');
   if (!isNpcFighter(actorId)) {
     const gateMsg = sheetGate(gid, actorId);
@@ -10657,8 +10706,8 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
   }
   if (!turnOrder.includes(targetId)) return refuse('❌ That target is not in this fight.');
   if (targetId === actorId) return refuse('❌ You cannot target yourself.');
-  if (grappleHeldTargetOf(fight, actorId)) return refuse('🤼 You are already holding someone — `/fight release` first.');
-  if (grappleHolderOf(fight, actorId)) return refuse('🤼 You are held — `/fight escape`, or act on a flat d20.');
+  if (grappleHeldTargetOf(fight, actorId)) return refuse('🤼 You are already holding someone — `/fight act action:Release` first.');
+  if (grappleHolderOf(fight, actorId)) return refuse('🤼 You are held — `/fight act action:Escape`, or act on a flat d20.');
   if (grappleHolderOf(fight, targetId)) return refuse('🤼 They are already held.');
 
   const hpState = fightHp(fight);
@@ -10706,8 +10755,8 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
   }) : null;
   const autoOn = !!fight.auto_npc;
   const saveHint = targetF.isNpc
-    ? (autoOn ? `🤖 **${targetF.name}** saves automatically...` : `🤼 A GM saves for **${targetF.name}** with \`/fight save npc:${targetF.name}\`.`)
-    : `🤼 <@${targetId}> — \`/fight save\` (STR only) to resist the hold.`;
+    ? (autoOn ? `🤖 **${targetF.name}** saves automatically...` : `🤼 A GM saves for **${targetF.name}** with \`/fight act action:Save npc:${targetF.name}\`.`)
+    : `🤼 <@${targetId}> — \`/fight act action:Save\` (STR only) to resist the hold.`;
 
   upsertFight(gid, cid, {
     phase: 'defend', current_target: targetId, atk_kind: 'grapple',
@@ -10727,7 +10776,7 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
   }
   recordRoll(gid, { userId: uid, channelId: cid, interaction, messageId: auditMsgId,
     kind: isNpcFighter(actorId) ? 'npcs' : null, card: auditCard,
-    input: `/fight grapple${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
+    input: `/fight act action:Grapple${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
     context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 grapples ${targetF.name}` : `fight · grapples ${targetF.name}` });
   if (autoOn && targetF.isNpc) {
     await new Promise(r=>setTimeout(r,1200));
@@ -10757,7 +10806,7 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
     return refuse(`⚠️ It's **${cur.name}**'s turn to attack.`);
   }
   if (fight.phase !== 'attack') return refuse(fight.atk_kind === 'feint'
-    ? '🎭 A feint is already pending — the target answers with `/fight insight`.'
+    ? '🎭 A feint is already pending — the target answers with `/fight act action:Insight`.'
     : '❌ Waiting for defender to roll first.');
   if (!isNpcFighter(actorId)) {
     const gateMsg = sheetGate(gid, actorId);
@@ -10765,7 +10814,7 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
   }
   if (!turnOrder.includes(targetId)) return refuse('❌ That target is not in this fight.');
   if (targetId === actorId) return refuse('❌ You cannot target yourself.');
-  if (grappleHolderOf(fight, actorId)) return refuse('🤼 You are held — flat-d20 strikes or `/fight escape` only; no feinting from a hold.');
+  if (grappleHolderOf(fight, actorId)) return refuse('🤼 You are held — flat-d20 strikes or `/fight act action:Escape` only; no feinting from a hold.');
 
   const actor = await resolveFighter(interaction.guild, gid, actorId);
   const subjectRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
@@ -10808,8 +10857,8 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
   }) : null;
   const autoOn = !!fight.auto_npc;
   const insightHint = targetF.isNpc
-    ? (autoOn ? `🤖 **${targetF.name}** checks its insight automatically...` : `🎭 A GM rolls insight for **${targetF.name}** with \`/fight insight npc:${targetF.name}\`.`)
-    : `🎭 <@${targetId}> — \`/fight insight\` (WIS only) to see through it.`;
+    ? (autoOn ? `🤖 **${targetF.name}** checks its insight automatically...` : `🎭 A GM rolls insight for **${targetF.name}** with \`/fight act action:Insight npc:${targetF.name}\`.`)
+    : `🎭 <@${targetId}> — \`/fight act action:Insight\` (WIS only) to see through it.`;
 
   upsertFight(gid, cid, {
     phase: 'defend', current_target: targetId, atk_kind: 'feint',
@@ -10829,7 +10878,7 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
   }
   recordRoll(gid, { userId: uid, channelId: cid, interaction, messageId: auditMsgId,
     kind: isNpcFighter(actorId) ? 'npcs' : null, card: auditCard,
-    input: `/fight feint${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
+    input: `/fight act action:Feint${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
     context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 feints at ${targetF.name}` : `fight · feints at ${targetF.name}` });
   if (autoOn && targetF.isNpc) {
     await new Promise(r=>setTimeout(r,1200));
@@ -10864,7 +10913,7 @@ async function runFightInsight({ interaction, gid, cid, actorId, mode }) {
   if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'feint insight WIS');
   recordRoll(gid, { userId: uid, channelId: cid, interaction,
     kind: isNpcFighter(actorId) ? 'npcs' : null, card: null,
-    input: `/fight insight${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
+    input: `/fight act action:Insight${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
     context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 feint insight` : 'fight · feint insight' });
   const r = await resolveFeintInsight(interaction.guild, gid, cid, fight, { nat, total, mode });
   if (actor.isNpc) {
@@ -10902,7 +10951,7 @@ async function runFightGrappleSave({ interaction, gid, cid, actorId, mode }) {
   if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'grapple save STR');
   recordRoll(gid, { userId: uid, channelId: cid, interaction,
     kind: isNpcFighter(actorId) ? 'npcs' : null, card: null,
-    input: `/fight save${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
+    input: `/fight act action:Save${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
     context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 grapple save` : 'fight · grapple save' });
   const r = await resolveGrappleSave(interaction.guild, gid, cid, fight, { nat, total, mode });
   if (actor.isNpc) {
@@ -10955,7 +11004,7 @@ async function runFightEscape({ interaction, gid, cid, actorId, mode }) {
   if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'grapple escape STR');
   recordRoll(gid, { userId: uid, channelId: cid, interaction,
     kind: isNpcFighter(actorId) ? 'npcs' : null, card: null,
-    input: `/fight escape${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
+    input: `/fight act action:Escape${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
     context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 escape attempt` : 'fight · escape attempt' });
 
   const hpState = fightHp(fight);
@@ -11061,8 +11110,8 @@ async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
   if (fight.phase !== 'defend') return refuse('❌ No attack to deflect — nothing is pending.');
-  if (fight.atk_kind === 'grapple') return refuse('🤼 A grapple cannot be deflected — answer with `/fight save`.');
-  if (fight.atk_kind === 'feint') return refuse('🎭 A feint cannot be deflected — answer with `/fight insight`.');
+  if (fight.atk_kind === 'grapple') return refuse('🤼 A grapple cannot be deflected — answer with `/fight act action:Save`.');
+  if (fight.atk_kind === 'feint') return refuse('🎭 A feint cannot be deflected — answer with `/fight act action:Insight`.');
   if (fight.current_target !== uid) {
     const t = await resolveFighter(interaction.guild, gid, fight.current_target);
     return refuse(`⚠️ The attack is on **${t.name}** — the deflection is theirs.`);
@@ -11113,7 +11162,7 @@ async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId
   saveRoll(gid, cid, uid, `1d20+${statVal}`, `shield deflection ${STAT_LABELS[stat]}`);
   recordRoll(gid, { userId: uid, channelId: cid, interaction,
     kind: null, card: null,
-    input: '/fight deflect', rollLine, nat, sides: 20,
+    input: '/fight act action:Deflect', rollLine, nat, sides: 20,
     context: `fight · shield deflection vs ${attackerF.name}` });
 
   const lines = ['─────────────────────────────', '🛡️  **Shield Deflection**', ''];
@@ -11209,8 +11258,8 @@ async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
   if (fight.phase !== 'defend') return refuse('❌ No attack to disarm — nothing is pending.');
-  if (fight.atk_kind === 'grapple') return refuse('🤼 A grapple cannot be disarmed — answer with `/fight save`.');
-  if (fight.atk_kind === 'feint') return refuse('🎭 A feint cannot be disarmed — answer with `/fight insight`.');
+  if (fight.atk_kind === 'grapple') return refuse('🤼 A grapple cannot be disarmed — answer with `/fight act action:Save`.');
+  if (fight.atk_kind === 'feint') return refuse('🎭 A feint cannot be disarmed — answer with `/fight act action:Insight`.');
   if (fight.current_target !== uid) {
     const t = await resolveFighter(interaction.guild, gid, fight.current_target);
     return refuse(`⚠️ The attack is on **${t.name}** — the disarm is theirs.`);
@@ -11248,7 +11297,7 @@ async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
   saveRoll(gid, cid, uid, `1d20+${statVal}`, 'weapon disarm DEX');
   recordRoll(gid, { userId: uid, channelId: cid, interaction,
     kind: null, card: null,
-    input: '/fight disarm', rollLine, nat, sides: 20,
+    input: '/fight act action:Disarm', rollLine, nat, sides: 20,
     context: `fight · weapon disarm vs ${attackerF.name}` });
 
   const lines = ['─────────────────────────────', '⚔️  **Disarming Attempt**', ''];
@@ -11334,8 +11383,12 @@ async function runFightRelease({ interaction, gid, cid, actorId, forceTargetId =
   return interaction.reply({ content: line });
 }
 
-async function handleFight(interaction) {
-  const sub = interaction.options.getSubcommand();
+async function handleFight(interaction, forced) {
+  let sub = forced ?? interaction.options.getSubcommand();
+  if (sub === 'act') sub = interaction.options.getString('action');
+  if (sub === 'feint' && !interaction.options.getString('feint')) {
+    return interaction.reply({ content: '❌ A feint needs `feint:` — what you pretend to do.', ephemeral: true });
+  }
   const gid = interaction.guild.id;
   const cid = interactionChannelId(interaction);
   const uid = interaction.user.id;
@@ -12052,8 +12105,8 @@ async function handleFight(interaction) {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
     if (fight.phase !== 'defend') return interaction.reply({ content: '❌ No attack to defend against yet.', ephemeral: true });
-    if (fight.atk_kind === 'grapple') return interaction.reply({ content: '🤼 That is a grapple — answer with `/fight save` (STR only).', ephemeral: true });
-    if (fight.atk_kind === 'feint') return interaction.reply({ content: '🎭 That is a feint — answer with `/fight insight` (WIS only).', ephemeral: true });
+    if (fight.atk_kind === 'grapple') return interaction.reply({ content: '🤼 That is a grapple — answer with `/fight act action:Save` (STR only).', ephemeral: true });
+    if (fight.atk_kind === 'feint') return interaction.reply({ content: '🎭 That is a feint — answer with `/fight act action:Insight` (WIS only).', ephemeral: true });
 
     const npcActAs = interaction.options.getString('npc'); // GM defending as an NPC
     const targetId = fight.current_target;
@@ -12183,7 +12236,10 @@ async function handleFight(interaction) {
   }
   if (sub === 'deflect') {
     const redirectNpc = interaction.options.getString('redirect_npc');
-    const stat = interaction.options.getString('stat') || 'str';
+    // /roll's stat option offers five stats; deflection takes STR or DEX only —
+    // anything else folds to the STR default (the /fight act choices already constrain).
+    const statRaw = interaction.options.getString('stat');
+    const stat = statRaw === 'dex' ? 'dex' : 'str';
     const mode = interaction.options.getString('roll') || 'normal';
     const flavour = interaction.options.getString('flavour');
     return runFightDeflect({ interaction, gid, cid, stat,
@@ -13161,7 +13217,7 @@ const HELP_CATEGORIES = {
     body: [
       '_New to the server? This is the whole game in one page. Every group below also has its own page — `/help category:...`._',
       '',
-      '**1 · Make your character** — `/char create` walks you through stats, class, order and weapons. You spend a fixed allowance across STR/CON/DEX/WIS/LCK with a minimum in each — `/config statallowance` shows this server\'s numbers. If sheet approval is on, a GM checks your sheet before it goes live, and you\'ll be told either way.',
+      '**1 · Make your character** — `/char create` walks you through stats, class, order and weapons. You spend a fixed allowance across STR/CON/DEX/WIS/LCK with a minimum in each — `/config mechanics statallowance` shows this server\'s numbers. If sheet approval is on, a GM checks your sheet before it goes live, and you\'ll be told either way.',
       '**2 · Roll dice** — type `1d20` bare, `r1d20+5 ambush` for a label, or just a stat word like `str` or `wis`. `ra`/`rd` roll with advantage or disadvantage, and `rr` rerolls your last roll for a token. `/roll` is the guided version with dropdowns.',
       '**3 · Your card** — `/profile on` puts your character card under your rolls, HP and tokens included. `/profile card` compresses it, `/char show` opens the full sheet any time.',
       '**4 · HP and rests** — `!hp -3` after a hit, `lrest` for a full rest, `srest` for a breather. White Knights (WIS ≥ 5) can `!heal @friend`.',
@@ -13205,7 +13261,7 @@ const HELP_CATEGORIES = {
       '`/char weaponemoji slot:Weapon 1 emoji:⚔️` — pick a weapon slot emoji',
       '`/char show [user]` — view a character sheet',
       '`/char lore` — write your character\'s story and send it to the GMs',
-      'Players spend an exact stat allowance across STR/CON/DEX/WIS/LCK with a minimum in each — GMs aren\'t limited. Run `/config statallowance` to see or change this server\'s numbers',
+      'Players spend an exact stat allowance across STR/CON/DEX/WIS/LCK with a minimum in each — GMs aren\'t limited. Run `/config mechanics statallowance` to see or change this server\'s numbers',
       '`/char submit` — send your sheet back to the GMs after a rejection, unchanged',
       '`/char export [format:Image]` — export your sheet as text or image; `format:Parchment image` writes it on parchment in the server\'s scroll font; `format:Parchment PDF` is the same parchment as a **PDF — the file that survives Discord re-uploads**; `format:Summary` is your career record — rank, merits, renown, dice history, pack, quests, lore. Every image and PDF carries the sheet woven inside. With approvals on it goes to the GMs first and reaches you when one releases it',
       '`/char import` — hand an exported sheet to this server, as the image or the pasted `[TTRPG SHEET]` summary (bare = a paste box opens); a GM approves it and you arrive ready to play',
@@ -13240,12 +13296,12 @@ const HELP_CATEGORIES = {
       '`/fight atk stat:str` — leave the target off and a menu appears; picking someone rolls the attack on the spot',
       '`/fight atk stat:str npc:Goblin target:@user` — GM attacks AS an NPC on its turn',
       '`/fight def stat:dex` — defend · GM defends as an NPC with `npc:Name`',
-      '`/fight grapple target:@user` — STR-only grapple attempt; the target answers with `/fight save` (STR). Meets-or-exceeds and the hold takes: immobile, 1 strain at each of their turn\'s ends, actions on a flat d20',
-      '`/fight escape` — on your turn while held: 1d20+STR vs the grappler\'s STR score to break free — the strain lands either way',
-      '`/fight release` — the holder lets go freely (no action); a grappler can never strike their own captive. GMs may part any hold with `target:`',
-      '`/fight deflect` — shield deflection vs a PvE strike (shield + STR 4+, once per round, crits undeflectable): roll STR or DEX (`stat:`) to beat the attack roll, optionally `redirect_npc:` into another enemy for 1 damage. Either way your next attack is a flat d20',
-      '`/fight disarm` — disarm a PvE attacker (blade + DEX 4+, once per round): roll DEX to beat the attack roll — no damage, but they spend their next turn retrieving the weapon. Either way your next defence is a flat d20',
-      '`/fight feint feint:"..."` — deceive an opponent as your attack action (WIS 4+, PvE and PvP): they answer with `/fight insight` (WIS). Beat their roll — ties go to them — and their very next rolled action is a straight d20. Either way your next defence is a flat d20',
+      '`/fight act action:Grapple target:@user` — STR-only grapple attempt; the target answers with `/fight act action:Save` (STR). Meets-or-exceeds and the hold takes: immobile, 1 strain at each of their turn\'s ends, actions on a flat d20',
+      '`/fight act action:Escape` — on your turn while held: 1d20+STR vs the grappler\'s STR score to break free — the strain lands either way',
+      '`/fight act action:Release` — the holder lets go freely (no action); a grappler can never strike their own captive. GMs may part any hold with `target:`',
+      '`/fight act action:Deflect` — shield deflection vs a PvE strike (shield + STR 4+, once per round, crits undeflectable): roll STR or DEX (`stat:`) to beat the attack roll, optionally `redirect_npc:` into another enemy for 1 damage. Either way your next attack is a flat d20',
+      '`/fight act action:Disarm` — disarm a PvE attacker (blade + DEX 4+, once per round): roll DEX to beat the attack roll — no damage, but they spend their next turn retrieving the weapon. Either way your next defence is a flat d20',
+      '`/fight act action:Feint feint:"..."` — deceive an opponent as your attack action (WIS 4+, PvE and PvP): they answer with `/fight act action:Insight` (WIS). Beat their roll — ties go to them — and their very next rolled action is a straight d20. Either way your next defence is a flat d20',
       '`/fight rr` — reroll (costs a token) · `/fight resolve` — resolve a clash',
       '`/fight status` — show current fight · `/fight forfeit` — drop out',
       '`/duel opponent:@rival terms:first blood` — raise a duel; a GM signs off, then starts the fight',
@@ -13313,11 +13369,12 @@ const HELP_CATEGORIES = {
       '`/quest create` — bare, a five-field writing window opens (add `from:N` to seed it from an existing quest); with `name:` everything stays inline (GM)',
       '`/quest edit number:N` — the same window, prefilled — the natural editor; renames follow onto the board and planning threads. Numeric options (`merit_reward:` etc.) apply directly without the window (GM)',
       '`/quest post number:N [channel]` — post it with an Apply button; with a quest forum set, this opens the quest\'s own board thread (GM)',
+      '`/gm questwipe [runs:true]` — delete every quest on the server, confirm-gated; the run ledger and DM counters survive unless runs:true (GM)',
       '`/check` — the setup mirror: every channel-backed feature, unset first with the command that sets it, then the set ones with links — stored ids are verified live (GM)',
-      '`/config questforum channel:#forum` — the board becomes a forum: one thread per quest, lifecycle mirrored in, archived on completion (Admin)',
-      '`/config questthreads channel:#forum` — optional split: per-quest planning threads (and their stage tags) open here, so the planning forum holds only the books (Admin)',
-      '`/config questplanning channel:#gm-forum` — `/quest create` opens a private GM planning thread; every application and event mirrors there. Sets up the pipeline tags (🌱⏳✅📌🗄️🏁) and the 🎲 DM roster (Admin)',
-      '`/quest stage number:N stage:` — move a quest through Concept / Awaiting Approval / Approved; posting, archiving and completing re-tag automatically (GM)',
+      '`/config channels questforum channel:#forum` — the board becomes a forum: one thread per quest, lifecycle mirrored in, archived on completion (Admin)',
+      '`/config channels questthreads channel:#forum` — optional split: per-quest planning threads (and their stage tags) open here, so the planning forum holds only the books (Admin)',
+      '`/config channels questplanning channel:#gm-forum` — `/quest create` opens a private GM planning thread; every application and event mirrors there. Sets up the pipeline tags (🌱⏳✅📌🗄️🏁) and the 🎲 DM roster (Admin)',
+      '`/quest stage number:N stage:` — move a quest through Concept / Awaiting Approval / Approved — or just press the **advance button** at the bottom of its planning thread; posting, archiving and completing re-tag automatically (GM)',
       '`/quest archive number:N` — pull a quest off the board: applications close, the board thread locks; `/quest post` re-lists it (GM)',
       '`/quest dm style:... brief:... [available:false]` — your card on the 🎲 DMs Available roster (GM)',
       '`/quest npc number:N name:Orc [remove]` — attach the NPCs a run involves; they land on the run record (GM)',
@@ -13325,8 +13382,8 @@ const HELP_CATEGORIES = {
       '`/quest approve number:N @user [force]` — approve an applicant; `force` overrides a hard cap (GM)',
       '`/quest kick number:N @user` — remove a member/applicant (GM)',
       '`/quest runchannel number:N [channel]` — set where the quest runs & rewards (GM)',
-      '`/quest start number:N` — lock the party and mark in progress (GM)',
-      '`/quest complete number:N` — finish it; merits auto-awarded, other rewards listed (GM)',
+      '`/quest run start number:N` — lock the party and mark in progress (GM)',
+      '`/quest run complete number:N` — finish it; merits auto-awarded, other rewards listed (GM)',
       '`/quest delete number:N` — remove a quest (GM)',
     ],
   },
@@ -13368,33 +13425,33 @@ const HELP_CATEGORIES = {
     blurb: 'server wiring — roles, approvals, audits, backups',
     body: [
       '_Server wiring: roles, approvals, audits, rests, backups. Admins always count as GMs._',
-      '`/config gmrole role:@Role` — add a GM role · `remove:true` · `replace:true` · omit to list',
+      '`/config mechanics gmrole role:@Role` — add a GM role · `remove:true` · `replace:true` · omit to list',
       '_Server admins (Manage Server) always count as GMs._',
-      '`/config heal charges:N` — set default heal charges',
-      '`/config hpbase base:3` — max HP formula: CON + this (default 2)',
-      '`/config activities players:true` — let players start activities themselves (writing stays GM-only)',
-      '`/config autorest action:List` — see every recovery schedule',
-      '`/config autorest action:Add or update name:Breather hours:6 hp:50% rerolls:0% heal:0%` — a light top-up',
-      '`/config autorest action:Add or update name:Full Recovery hours:24 hp:100% rerolls:100% heal:100%` — the works',
+      '`/config mechanics heal charges:N` — set default heal charges',
+      '`/config mechanics hpbase base:3` — max HP formula: CON + this (default 2)',
+      '`/config mechanics activities players:true` — let players start activities themselves (writing stays GM-only)',
+      '`/config mechanics autorest action:List` — see every recovery schedule',
+      '`/config mechanics autorest action:Add or update name:Breather hours:6 hp:50% rerolls:0% heal:0%` — a light top-up',
+      '`/config mechanics autorest action:Add or update name:Full Recovery hours:24 hp:100% rerolls:100% heal:100%` — the works',
       'Amounts take `100%`, `50%`, a flat number, or `0%` to skip that resource. Percentages round down. Quest parties are always skipped',
-      '`/config npcreroll threshold:N` — NPC auto-reroll on nat ≤ N · 0 disables · omit to show',
-      '`/config fightping enabled:true` — @-mention players on their turn · off by default (Admin)',
-      '`/config rollaudit channel:#x` — mirror all rolls (players + GMs) to a GM-only channel (Admin)',
-      '`/config rollaudit test:true` — send a test mirror and report any problem (Admin)',
-      '`/config rollauditforum forum:#roll-audit` — split the mirror into books: player rolls, GM rolls, NPC rolls, NPC say (Admin)',
+      '`/config mechanics npcreroll threshold:N` — NPC auto-reroll on nat ≤ N · 0 disables · omit to show',
+      '`/config mechanics fightping enabled:true` — @-mention players on their turn · off by default (Admin)',
+      '`/config channels rollaudit channel:#x` — mirror all rolls (players + GMs) to a GM-only channel (Admin)',
+      '`/config channels rollaudit test:true` — send a test mirror and report any problem (Admin)',
+      '`/config channels rollauditforum forum:#roll-audit` — split the mirror into books: player rolls, GM rolls, NPC rolls, NPC say (Admin)',
       'When NPC stats are hidden, fight cards mask the stat and modifier — the audit\'s NPC book gets the full card, every number revealed',
-      '`/config scrollfont font:<file>` — store an .otf/.ttf; the reply renders a sample line so you see it works. `/scroll` then writes props in it (Admin)',
-      '`/config scrollarchive` — the 📜 Scrolls book in the roll-audit forum archives every scroll automatically, both directions, text + image + PDF; `channel:#x` overrides with a plain channel (Admin)',
+      '`/config mechanics scrollfont font:<file>` — store an .otf/.ttf; the reply renders a sample line so you see it works. `/scroll` then writes props in it (Admin)',
+      '`/config channels scrollarchive` — the 📜 Scrolls book in the roll-audit forum archives every scroll automatically, both directions, text + image + PDF; `channel:#x` overrides with a plain channel (Admin)',
       '`/npc export name:<npc>` / `/npc import file:<pdf>` — a villain packed as a woven parchment PDF; import applies directly, GM-as-approver — stats, class, hero flag, auto-pilot preferences and lore travel, standing and webhooks stay local',
       '`/dicereport` — the table\'s dice health: top rollers, hot and cold d20 hands, nat leaders, the full d20 spread',
       '`/scroll` — write a title and body in a modal; the bot posts the parchment as an image everyone can see plus a **PDF** with the writing woven invisibly inside — the PDF survives Discord, so scrolls travel between servers on their own. `file:` hands any scroll PDF back: plain text out, plus a readable edition in standard type as image and woven PDF (GM)',
-      '`/config approvals channel:#x` — new sheets need GM approval before use (Admin)',
-      '`/config approvals list:true` — every sheet still waiting, read from the database so nothing is lost if a post failed',
-      '`/config approvalforum forum:#gm-approvals` — one forum, a thread per approval type: sheets, trades, duels, lore, exports (Admin)',
-      '`/config npcstats enabled:true` — reveal NPC stat blocks on roll cards · hidden by default (Admin)',
-      '`/config npcchannel #channel` — set the NPC avatar channel',
-      '`/config rest type:Short Rest hp:50% rerolls:0%` — tune what a rest restores (use % of max or a flat number)',
-      '`/config cleanwebhooks` — remove orphaned NPC webhooks',
+      '`/config channels approvals channel:#x` — new sheets need GM approval before use (Admin)',
+      '`/config channels approvals list:true` — every sheet still waiting, read from the database so nothing is lost if a post failed',
+      '`/config channels approvalforum forum:#gm-approvals` — one forum, a thread per approval type: sheets, trades, duels, lore, exports (Admin)',
+      '`/config mechanics npcstats enabled:true` — reveal NPC stat blocks on roll cards · hidden by default (Admin)',
+      '`/config channels npcchannel #channel` — set the NPC avatar channel',
+      '`/config mechanics rest type:Short Rest hp:50% rerolls:0%` — tune what a rest restores (use % of max or a flat number)',
+      '`/config mechanics cleanwebhooks` — remove orphaned NPC webhooks',
       '`gmr` / `gmrs 1d20+5` — public / secret GM roll',
       '`/backup now` — export the database · `/backup auto` — daily backups',
       '`/stat` — show stat descriptions · `/help` — this menu',
@@ -13486,7 +13543,7 @@ async function handleScroll(interaction) {
   try { require('@napi-rs/canvas'); }
   catch { return interaction.reply({ content: '❌ Image generation unavailable — install `@napi-rs/canvas` to enable.', ephemeral: true }); }
   if (!ensureScrollFont(gid)) {
-    return interaction.reply({ content: '📜 No scroll font is stored — an Admin sets one with `/config scrollfont font:<file>`.', ephemeral: true });
+    return interaction.reply({ content: '📜 No scroll font is stored — an Admin sets one with `/config mechanics scrollfont font:<file>`.', ephemeral: true });
   }
   const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
   const modal = new ModalBuilder().setCustomId('scrollwrite').setTitle('Write the scroll');
@@ -13584,7 +13641,7 @@ async function handleScrollModal(interaction) {
     return interaction.editReply({ content: '❌ Only GMs can unfurl props.' });
   }
   const family = ensureScrollFont(gid);
-  if (!family) return interaction.editReply({ content: '📜 The scroll font vanished — set one again with `/config scrollfont`.' });
+  if (!family) return interaction.editReply({ content: '📜 The scroll font vanished — set one again with `/config mechanics scrollfont`.' });
   const title = interaction.fields.getTextInputValue('title')?.trim() || null;
   const body = interaction.fields.getTextInputValue('body')?.trim();
   const flavour = interaction.fields.getTextInputValue('flavour')?.trim() || null;
@@ -14051,6 +14108,9 @@ async function handleGmHeal(interaction) {
 async function handleRollSlash(interaction) {
   const gid = interaction.guild.id, uid = interaction.user.id;
   const cid = interactionChannelId(interaction);
+  // The fight bridge: an ability picked here rides the exact /fight machinery.
+  const fightAction = interaction.options.getString('action');
+  if (fightAction) return handleFight(interaction, fightAction);
   const stat = interaction.options.getString('stat');
   let dice = (interaction.options.getString('dice') || '').trim();
   const mode = interaction.options.getString('mode') || 'normal';
@@ -14104,8 +14164,8 @@ async function handleRollSlash(interaction) {
       const f = getFight(gid, cid);
       const why = !f || f.state !== 'active' ? 'There is no fight running here.'
         : f.phase === 'attack' ? 'It is not your turn to attack.'
-        : f.atk_kind === 'grapple' ? 'That is a grapple — answer with `/fight save` (STR only).'
-        : f.atk_kind === 'feint' ? 'That is a feint — answer with `/fight insight` (WIS only).'
+        : f.atk_kind === 'grapple' ? 'That is a grapple — answer with `/fight act action:Save` (STR only).'
+        : f.atk_kind === 'feint' ? 'That is a feint — answer with `/fight act action:Insight` (WIS only).'
         : f.def_roll !== null ? 'That exchange already has both rolls — `/fight resolve` it.'
         : 'You are not the one being attacked.';
       return interaction.reply({ content: `❌ ${why} The roll was not submitted.`, ephemeral: true });
@@ -14507,9 +14567,35 @@ async function syncPlanStage(client, gid, quest) {
     const pipeline = new Set(Object.values(map));
     const keep = (thread.appliedTags ?? []).filter(id => !pipeline.has(id));
     await thread.setAppliedTags([...keep, want].slice(0, 5));
+    // The advance button on the starter follows the stage too.
+    try {
+      const starter = await thread.fetchStarterMessage();
+      await starter.edit({ components: questStageRow(quest) });
+    } catch { /* starter gone — nothing to keep current */ }
   } catch { /* tags are decoration — never fail the command over them */ }
 }
 const questRootNumber = (quest) => quest.instance_of ?? quest.number;
+
+// The stage-advance button for a planning thread's starter. One press walks
+// 🌱 Concept → ⏳ Awaiting Approval → ✅ Approved; at Approved it becomes a
+// disabled signpost toward /quest post, and past the hand stages it is gone.
+function questStageRow(quest) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  if (quest.stage === 'concept' || quest.stage === 'awaiting') {
+    const next = quest.stage === 'concept'
+      ? { emoji: '⏳', label: 'Advance → Awaiting Approval' }
+      : { emoji: '✅', label: 'Advance → Approved' };
+    return [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`queststage:${quest.number}`)
+        .setLabel(`${next.emoji} ${next.label}`).setStyle(ButtonStyle.Primary))];
+  }
+  if (quest.stage === 'approved') {
+    return [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`queststage:${quest.number}`)
+        .setLabel('✅ Approved — /quest post opens the board').setStyle(ButtonStyle.Secondary).setDisabled(true))];
+  }
+  return [];
+}
 
 // The pipeline books — one thread per section, the audit-forum pattern.
 const QUEST_BOOKS = [
@@ -14695,7 +14781,7 @@ async function finishQuestCreate(interaction, gid, uid, f) {
       const tagMap = JSON.parse(getConfig(gid)?.quest_plan_tags || '{}');
       const thread = await forum.threads.create({ name: `#${number} — ${quest.name}`.slice(0, 100), autoArchiveDuration: 10080,
         appliedTags: tagMap.concept ? [tagMap.concept] : [],
-        message: { content: `🗺️ **GM planning** — ${questTag(quest)}\n\n${await renderQuest(interaction.guild, quest, { applyHint: false })}\n\n_Draft. \`/quest post number:${number}\` opens it on the public board; every application and turn of the quest will be mirrored here._` } });
+        message: { components: questStageRow(quest), content: `🗺️ **GM planning** — ${questTag(quest)}\n\n${await renderQuest(interaction.guild, quest, { applyHint: false })}\n\n_Draft. \`/quest post number:${number}\` opens it on the public board; every application and turn of the quest will be mirrored here._` } });
       updateQuest(gid, number, { plan_thread_id: thread.id });
       quest = getQuest(gid, number);
       await syncQuestBook(interaction.client, interaction.guild, gid, quest);
@@ -15030,7 +15116,7 @@ async function handleQuest(interaction) {
     const posted = await refreshDmRoster(interaction.client, interaction.guild, gid);
     return interaction.reply({ ephemeral: true, content: posted
       ? `🎲 Your DM card is on the roster${available === false ? ' (marked away)' : ''} — <#${getConfig(gid)?.quest_dm_thread}>.`
-      : '🎲 Card saved. No roster thread yet — an Admin sets one up with `/config questplanning channel:#gm-forum`.' });
+      : '🎲 Card saved. No roster thread yet — an Admin sets one up with `/config channels questplanning channel:#gm-forum`.' });
   }
 
   if (sub === 'npc') {
@@ -15246,7 +15332,7 @@ async function handleQuest(interaction) {
 
     lines.push('', ...(summaryUrl
       ? [`📜 [Read the full summary](${summaryUrl}) — it is on everyone's \`/char standing\` too.`]
-      : ['_No quest log channel set, so the summary was not posted — a GM can set one with `/config questlog`._']));
+      : ['_No quest log channel set, so the summary was not posted — a GM can set one with `/config channels questlog`._']));
     if (!logChId) lines.push(...summary.slice(2, 14));
 
     // Announce in the designated run channel if set and different from here
