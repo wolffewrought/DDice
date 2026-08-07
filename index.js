@@ -15108,6 +15108,32 @@ async function announceStage(client, gid, quest, line) {
   } catch { /* the status line is decoration */ }
 }
 
+// Every channel trace one quest owns, deleted in one call: the board
+// thread (or post), the planning thread whole, the book entry, the create
+// card. Used by /quest delete for the quest AND each of its instances.
+async function sweepQuestChannels(client, gid, quest) {
+  if (quest.post_channel_id) {
+    try {
+      const ch = await client.channels.fetch(quest.post_channel_id);
+      if (ch?.isThread?.()) await ch.delete('quest deleted');
+      else if (quest.post_message_id) { const m = await ch.messages.fetch(quest.post_message_id); await m.delete(); }
+    } catch { /* already gone */ }
+  }
+  if (quest.plan_thread_id) {
+    try {
+      const th = await client.channels.fetch(quest.plan_thread_id);
+      if (th?.isThread?.()) await th.delete('quest deleted');
+    } catch { /* already gone */ }
+  }
+  if (quest.index_thread_id && quest.index_msg_id) {
+    try {
+      const bk = await client.channels.fetch(quest.index_thread_id);
+      if (bk?.isThread?.()) { if (bk.archived) await wakeThread(bk); await bk.messages.delete(quest.index_msg_id); }
+    } catch { /* already gone */ }
+  }
+  await sweepCreateCard(client, gid, quest);
+}
+
 // Sweep the create card out of its channel — called when the board takes
 // over (post) or the quest dies (delete). Best-effort.
 async function sweepCreateCard(client, gid, quest) {
@@ -15824,23 +15850,15 @@ async function handleQuest(interaction, forced) {
     const quest = await requireQuest(interaction, gid);
     if (!quest) return;
     const number = quest.number;
-    return requestConfirm(interaction, `Delete **${questTag(quest)}** permanently? This clears its roster and removes it from the board.`, async () => {
-      // Best-effort: strip buttons from the posted message
-      if (quest.post_channel_id && quest.post_message_id) {
-        try { const ch = await interaction.client.channels.fetch(quest.post_channel_id); const m = await ch.messages.fetch(quest.post_message_id); await m.edit({ content: `~~${questTag(quest)}~~ _(deleted)_`, components: [] }); } catch {}
+    const kids = db.prepare('SELECT number, name FROM quests WHERE guild_id=? AND instance_of=?').all(gid, number);
+    const kidNote = kids.length ? ` **Its ${kids.length} instance${kids.length > 1 ? 's' : ''}** (${kids.map(k => `#${k.number}`).join(', ')}) **go with it, threads and all.**` : '';
+    return requestConfirm(interaction, `Delete **${questTag(quest)}** permanently? This clears its roster and **deletes every trace in the related channels** — its board ${getConfig(gid)?.quest_forum ? 'thread' : 'post'}, its planning thread (applications and notes included), its book entry and its create card.${kidNote}`, async () => {
+      const doomed = [...db.prepare('SELECT * FROM quests WHERE guild_id=? AND instance_of=?').all(gid, number), quest];
+      for (const q of doomed) {
+        await sweepQuestChannels(interaction.client, gid, q);
+        deleteQuest(gid, q.number);
       }
-      if (quest.index_thread_id && quest.index_msg_id) {
-        try {
-          const bk = await interaction.client.channels.fetch(quest.index_thread_id);
-          if (bk?.isThread?.()) { if (bk.archived) await wakeThread(bk); await bk.messages.delete(quest.index_msg_id); }
-        } catch { /* already gone */ }
-      }
-      if (quest.stage_msg_id && quest.plan_thread_id) {
-        try { const th = await interaction.client.channels.fetch(quest.plan_thread_id); await th.messages.delete(quest.stage_msg_id); } catch { /* gone */ }
-      }
-      await sweepCreateCard(interaction.client, gid, quest);
-      deleteQuest(gid, number);
-      return `🗑️ **${questTag(quest)}** deleted.`;
+      return `🗑️ **${questTag(quest)}** deleted${doomed.length > 1 ? ` — with ${doomed.length - 1} instance${doomed.length > 2 ? 's' : ''}, threads and all` : ''}.`;
     });
   }
 }
