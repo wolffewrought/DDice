@@ -543,6 +543,16 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font_name TEXT'); } ca
 // A shelf for the props: every /gm scroll's named PDF is also filed here.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_archive_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_threads TEXT'); } catch {} // forum mode: JSON map gmId → thread id
+try { db.exec('ALTER TABLE chars ADD COLUMN next_mark TEXT'); } catch {} // 🔼/🔽 on their very next roll, anywhere
+try { db.exec(`CREATE TABLE IF NOT EXISTS dc_drafts (
+  guild_id TEXT NOT NULL, token TEXT NOT NULL, ids TEXT, npcs TEXT, reveal TEXT,
+  created_at INTEGER NOT NULL, PRIMARY KEY (guild_id, token)
+)`); } catch (e) { console.error('dc_drafts schema', e); }
+try { db.exec(`CREATE TABLE IF NOT EXISTS dc_cards (
+  guild_id TEXT NOT NULL, message_id TEXT NOT NULL,
+  s_flavour TEXT, f_flavour TEXT, s_sanction TEXT, f_sanction TEXT,
+  created_at INTEGER NOT NULL, PRIMARY KEY (guild_id, message_id)
+)`); } catch (e) { console.error('dc_cards schema', e); }
 // Grappling: which attack-phase roll is pending, and who holds whom.
 try { db.exec('ALTER TABLE fights ADD COLUMN atk_kind TEXT'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN grapples TEXT DEFAULT '{}'"); } catch {}
@@ -1736,7 +1746,7 @@ async function resolveActivityRoll(ctx, statWord, flavour, io, rerolled = false)
 
   const stat = resolveStatWord(statWord);
   const mod = stat ? (ch[stat] ?? 0) : 0;
-  const mode = stat ? applySignatureMode(ch, stat, 'normal') : 'normal';
+  const mode = applyNextMark(gid, uid, stat ? applySignatureMode(ch, stat, 'normal') : 'normal');
   const result = mode === 'adv' ? rollAdvantage(`1d20+${mod}`)
                : mode === 'dis' ? rollDisadvantage(`1d20+${mod}`)
                : rollNotation(`1d20+${mod}`);
@@ -2643,6 +2653,19 @@ function consumeEffectFlag(gid, cid, fid, key) {
 const consumeFlatAtk = (gid, cid, fid) => consumeEffectFlag(gid, cid, fid, 'flatAtk');
 // A successful feint: the target's very next rolled action is a straight d20.
 const consumeFooled = (gid, cid, fid) => consumeEffectFlag(gid, cid, fid, 'fooled');
+// A called check can mark a character's NEXT roll — 🔼 or 🔽 — and the
+// mark is GENERAL: it rides the sheet, not any fight, and bites the very
+// next roll anywhere — a chat `!r`, an activity, any fight path, a check
+// press. Consumed once, replacing the mode outright (signature already
+// folded — even a flat roll can be thrown at advantage). NPC ids pass
+// through untouched: the autopilot rolls its own weather.
+function applyNextMark(gid, uid, mode) {
+  if (!uid || String(uid).startsWith('npc_')) return mode;
+  const ch = getChar(gid, uid);
+  if (!ch?.next_mark) return mode;
+  upsertChar(gid, uid, { next_mark: null });
+  return ch.next_mark === 'adv' ? 'adv' : ch.next_mark === 'dis' ? 'dis' : mode;
+}
 // Set a per-fighter effect flag (the mirror of consumeEffectFlag).
 function setEffectFlag(gid, cid, fid, key) {
   const fight = getFight(gid, cid);
@@ -4400,24 +4423,40 @@ const slashCommands = [
       .addAttachmentOption(o=>o.setName('file').setDescription('A scroll PDF made by /gm scroll — I read it back as text and a fresh copy in this server\'s font').setRequired(false)))
     .addSubcommand(s=>s.setName('dicereport').setDescription('The server\'s dice health — who rolls, how the d20s run, the hot and cold hands (GM)'))
     .addSubcommand(s=>s.setName('dc').setDescription('Call a check — stat or dice vs DC, roll buttons for players, instant rolls for NPCs (GM)')
-      .addIntegerOption(o=>o.setName('dc').setDescription('The difficulty to beat').setRequired(true).setMinValue(1).setMaxValue(99))
+      // ─ the scene ─
+      .addStringOption(o=>o.setName('flavour').setDescription('The scene — shown on the check card').setRequired(false))
+      // ─ who ─
+      .addUserOption(o=>o.setName('target').setDescription('One player to test').setRequired(false))
+      .addStringOption(o=>o.setName('targets').setDescription('Several players — @mention them, space-separated').setRequired(false))
+      .addStringOption(o=>o.setName('npcs').setDescription('NPCs to test — names, comma-separated; they roll instantly on the card').setRequired(false).setAutocomplete(true))
+      // ─ the check ─
+      .addIntegerOption(o=>o.setName('dc').setDescription('The difficulty to beat — leave it out and a writing window opens instead').setRequired(false).setMinValue(1).setMaxValue(99))
       .addStringOption(o=>o.setName('stat').setDescription('The stat this check tests (omit with dice: for a pure notation check)').setRequired(false)
         .addChoices({name:'💪 Strength (STR)',value:'str'},{name:'🫀 Constitution (CON)',value:'con'},
                     {name:'⚡ Dexterity (DEX)',value:'dex'},{name:'🧠 Wisdom (WIS)',value:'wis'},{name:'🍀 Luck (LCK)',value:'lck'}))
       .addStringOption(o=>o.setName('dice').setDescription('Custom notation instead of a stat roll, e.g. 2d6+1 (12 chars max)').setRequired(false))
-      .addUserOption(o=>o.setName('target').setDescription('One player to test').setRequired(false))
-      .addStringOption(o=>o.setName('targets').setDescription('Several players — @mention them, space-separated').setRequired(false))
-      .addStringOption(o=>o.setName('npcs').setDescription('NPCs to test — names, comma-separated; they roll instantly on the card').setRequired(false).setAutocomplete(true))
-      .addStringOption(o=>o.setName('mode').setDescription('Impose advantage or disadvantage on the roll').setRequired(false)
-        .addChoices({name:'Normal (default)',value:'normal'},{name:'🔼 Advantage',value:'adv'},{name:'🔽 Disadvantage',value:'dis'}))
-      .addBooleanOption(o=>o.setName('flat').setDescription('true = a bare d20 — no stat bonus, no signature advantage').setRequired(false))
-      .addIntegerOption(o=>o.setName('modifier').setDescription('A raw bonus or penalty on their total, e.g. -2').setRequired(false).setMinValue(-20).setMaxValue(20))
       .addBooleanOption(o=>o.setName('secret').setDescription('true = the DC stays hidden; you get it ephemerally').setRequired(false))
       .addStringOption(o=>o.setName('reveal').setDescription('With secret:true — @mention players who are told the DC privately when they roll').setRequired(false))
-      .addStringOption(o=>o.setName('on_fail').setDescription('A consequence for failing').setRequired(false)
-        .addChoices({name:'🎭 Flat next fight action — their next roll in a live fight here is a bare d20',value:'flat'}))
-      .addIntegerOption(o=>o.setName('damage').setDescription('HP lost on a fail (sheet and any live fight stay in sync)').setRequired(false).setMinValue(1).setMaxValue(20))
-      .addStringOption(o=>o.setName('flavour').setDescription('Set the scene — shown on the check card').setRequired(false)))
+      .addStringOption(o=>o.setName('mode').setDescription('How they roll it — advantage, disadvantage, or a bare d20').setRequired(false)
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'🔼 Advantage',value:'adv'},
+                    {name:'🔽 Disadvantage',value:'dis'},{name:'🎲 Bare d20 — no stat, no signature',value:'flat'}))
+      .addIntegerOption(o=>o.setName('modifier').setDescription('A raw bonus or penalty on their total, e.g. -2').setRequired(false).setMinValue(-20).setMaxValue(20))
+      // ─ on failure ─
+      .addStringOption(o=>o.setName('fail_flavour').setDescription('Revealed with a failure — hidden until then').setRequired(false))
+      .addStringOption(o=>o.setName('on_fail').setDescription('A mark on their next roll if they fail').setRequired(false)
+        .addChoices({name:'🔼 Advantage on their next roll',value:'adv'},
+                    {name:'🔽 Disadvantage on their next roll',value:'dis'},
+                    {name:'🎭 Flat — their next fight action is a bare d20',value:'flat'}))
+      .addStringOption(o=>o.setName('fail_sanction').setDescription('A stat shift on failure, e.g. dex-1 (±5, floor 0)').setRequired(false))
+      .addIntegerOption(o=>o.setName('fail_damage').setDescription('HP lost on a failure (sheet and any live fight stay in sync)').setRequired(false).setMinValue(1).setMaxValue(20))
+      // ─ on success ─
+      .addStringOption(o=>o.setName('success_flavour').setDescription('Revealed with a success — hidden until then').setRequired(false))
+      .addStringOption(o=>o.setName('on_success').setDescription('A mark on their next roll if they succeed').setRequired(false)
+        .addChoices({name:'🔼 Advantage on their next roll',value:'adv'},
+                    {name:'🔽 Disadvantage on their next roll',value:'dis'},
+                    {name:'🎭 Flat — their next fight action is a bare d20',value:'flat'}))
+      .addStringOption(o=>o.setName('success_sanction').setDescription('A stat shift on success, e.g. lck+1 (±5, floor 0)').setRequired(false))
+      .addIntegerOption(o=>o.setName('success_damage').setDescription('HP lost even in success — the cost of doing it').setRequired(false).setMinValue(1).setMaxValue(20)))
     .addSubcommand(s=>s.setName('reroll').setDescription('Correct a player\'s mistaken roll — no token spent, their own reroll right untouched (GM)')
       .addUserOption(o=>o.setName('target').setDescription('Whose roll to correct').setRequired(true))
       .addStringOption(o=>o.setName('stat').setDescription('The stat it should have used').setRequired(false)
@@ -7557,6 +7596,7 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
   }
 
   let result;
+  mode = applyNextMark(gid, uid, mode);
   if (mode === 'adv') result = rollAdvantage(notation);
   else if (mode === 'dis') result = rollDisadvantage(notation);
   else result = rollNotation(notation);
@@ -7895,16 +7935,123 @@ function rollDcCheck({ stat, notation, dc, gmMode, flat, modifier, subject, sig 
   return { result, nat, total, passed, band, rollLine, mode };
 }
 
+// The check line from the form: a stat or a notation, a DC, and any of
+// hidden · bare/flat · adv · dis · ±N. Order doesn't matter; the first
+// bare number is the DC. Returns null when no DC is found.
+function parseDcLine(text) {
+  const out = { stat: null, notation: null, dc: null, mode: 'normal', flat: false, secret: false, modifier: 0 };
+  for (const tk of String(text || '').trim().split(/[\s,]+/).filter(Boolean)) {
+    const t = tk.toLowerCase();
+    if (/^(str|con|dex|wis|lck)$/.test(t)) { out.stat = t; continue; }
+    if (/^\d+$/.test(t) && out.dc === null) { out.dc = parseInt(t); continue; }
+    if (/^\d*d\d+([+-]\d+)?$/.test(t)) { out.notation = t; continue; }
+    if (/^(hidden|secret)$/.test(t)) { out.secret = true; continue; }
+    if (/^(bare|flat)$/.test(t)) { out.flat = true; continue; }
+    if (/^(adv|advantage)$/.test(t)) { out.mode = 'adv'; continue; }
+    if (/^(dis|disadvantage)$/.test(t)) { out.mode = 'dis'; continue; }
+    if (/^[+-]\d+$/.test(t)) { out.modifier = parseInt(t); continue; }
+  }
+  if (out.dc === null || out.dc < 1 || out.dc > 99) return null;
+  if (out.notation && (out.notation.length > 12 || !parseNotation(out.notation))) return null;
+  return out;
+}
+
+// An outcome box: a leading tag line carries the rules, everything after
+// it is what the players read. `[dis dex-1 -3hp]` — any order, any subset,
+// brackets optional on a first line that holds nothing else.
+function parseOutcomeBlock(text) {
+  const out = { mark: '', sanction: null, damage: 0, narration: null };
+  let body = String(text || '').replace(/\r/g, '').trim();
+  if (!body) return out;
+  const lines = body.split('\n');
+  const head = lines[0].trim();
+  const bracket = /^\[([^\]]*)\]$/.exec(head);
+  const tagsOnly = bracket ? bracket[1]
+    : /^[a-z0-9+\-\s,]+$/i.test(head) && /\b(adv|dis|bare|flat|hp)\b|[+-]\d/i.test(head) && lines.length > 1 ? head : null;
+  if (tagsOnly !== null) {
+    for (const tk of tagsOnly.split(/[\s,]+/).filter(Boolean)) {
+      const t = tk.toLowerCase().replace(/^\[|\]$/g, '');
+      if (/^(adv|advantage)$/.test(t)) { out.mark = 'adv'; continue; }
+      if (/^(dis|disadvantage)$/.test(t)) { out.mark = 'dis'; continue; }
+      if (/^(bare|flat)$/.test(t)) { out.mark = 'flat'; continue; }
+      const hp = /^-?(\d+)hp$/.exec(t);
+      if (hp) { out.damage = Math.min(20, parseInt(hp[1])); continue; }
+      const sx = parseSanction(t);
+      if (sx) { out.sanction = sx; continue; }
+    }
+    body = lines.slice(1).join('\n').trim();
+  }
+  out.narration = body || null;
+  return out;
+}
+
+// A signed stat shift like `dex-1` or `lck+2` — the check's sanction.
+// Returns { stat, delta } or null when the text doesn't read.
+function parseSanction(raw) {
+  const m = /^\s*(str|con|dex|wis|lck)\s*([+-]\d)\s*$/i.exec(raw || '');
+  if (!m) return null;
+  const delta = parseInt(m[2]);
+  if (!delta || Math.abs(delta) > 5) return null;
+  return { stat: m[1].toLowerCase(), delta };
+}
+function sanctionLabel(sx) {
+  return `${STAT_LABELS[sx.stat]} ${sx.delta > 0 ? '+' : '−'}${Math.abs(sx.delta)}`;
+}
+// Apply a sanction to whoever rolled — sheet-live, floor 0, noted in lines.
+function applyDcSanction({ gid, id, isNpc, sanction, lines }) {
+  if (!sanction) return;
+  if (isNpc) {
+    const npc = getNpc(gid, npcNameFromFighter(id));
+    if (!npc) return;
+    const now = Math.max(0, (npc[sanction.stat] ?? 0) + sanction.delta);
+    upsertNpc(gid, npc.name, { [sanction.stat]: now });
+    lines.push(`⚖️ ${sanctionLabel(sanction)} — now **${now}**.`);
+  } else {
+    const ch = getChar(gid, id);
+    if (!ch) return;
+    const now = Math.max(0, (ch[sanction.stat] ?? 0) + sanction.delta);
+    upsertChar(gid, id, { [sanction.stat]: now });
+    lines.push(`⚖️ ${sanctionLabel(sanction)} — now **${now}**.`);
+  }
+}
+// The outcome trimmings a card carries — keyed by its message, pruned weekly.
+function saveDcCard(gid, msgId, o) {
+  try {
+    db.prepare('DELETE FROM dc_cards WHERE created_at < ?').run(Date.now() - 7 * 86400_000);
+    db.prepare(`INSERT OR REPLACE INTO dc_cards (guild_id, message_id, s_flavour, f_flavour, s_sanction, f_sanction, created_at)
+                VALUES (?,?,?,?,?,?,?)`).run(gid, msgId, o.sF ?? null, o.fF ?? null, o.sS ?? null, o.fS ?? null, Date.now());
+  } catch { /* trimmings only */ }
+}
+function getDcCard(gid, msgId) {
+  try { return db.prepare('SELECT * FROM dc_cards WHERE guild_id=? AND message_id=?').get(gid, msgId) || null; }
+  catch { return null; }
+}
+
+// A mark landing on whoever rolled. flat rides the fooled flag (fight-scoped,
+// NPCs included — the autopilot honours it); adv/dis ride advNext/disNext,
+// consumed by the player's next attack, grapple, feint, insight, defence or
+// check press. NPC autopilot rolls its own weather, so adv/dis on an NPC is
+// an honest note rather than a silent nothing.
+function applyDcMark({ gid, cid, id, isNpc, mark, lines }) {
+  if (!mark) return;
+  const f = getFight(gid, cid);
+  const inFight = f?.state === 'active' && fightOrder(f).includes(id);
+  if (mark === 'flat') {
+    if (inFight) { setEffectFlag(gid, cid, id, 'fooled'); lines.push('🎭 Their next fight action rolls **flat**.'); }
+    else lines.push('_🎭 (no live fight here — the flat mark has nowhere to land)_');
+    return;
+  }
+  if (isNpc) { lines.push(`_${mark === 'adv' ? '🔼' : '🔽'} (marks steer player rolls — the NPC autopilot rolls its own weather)_`); return; }
+  upsertChar(gid, id, { next_mark: mark });
+  lines.push(mark === 'adv'
+    ? '🔼 Their next roll — **anywhere, fight or free RP** — is at **advantage**.'
+    : '🔽 Their next roll — **anywhere, fight or free RP** — is at **disadvantage**.');
+}
+
 // The fail consequences: a flat-next-action mark when a fight is live here,
 // and HP damage that the sheet-and-fight plumbing keeps in sync.
-function applyDcFailEffects({ gid, cid, id, isNpc, onFail, damage, lines }) {
-  if (onFail === 'flat') {
-    const f = getFight(gid, cid);
-    if (f?.state === 'active' && fightOrder(f).includes(id)) {
-      setEffectFlag(gid, cid, id, 'fooled');
-      lines.push('🎭 Their next fight action rolls **flat**.');
-    } else lines.push('_🎭 (no live fight here — the flat mark has nowhere to land)_');
-  }
+function applyDcOutcome({ gid, cid, id, isNpc, mark, damage, lines }) {
+  applyDcMark({ gid, cid, id, isNpc, mark, lines });
   if (damage) {
     if (isNpc) {
       const npc = getNpc(gid, npcNameFromFighter(id));
@@ -7918,8 +8065,83 @@ function applyDcFailEffects({ gid, cid, id, isNpc, onFail, damage, lines }) {
   }
 }
 
+// The writing window. Nothing may await before it opens — a deferred
+// interaction cannot show a modal, and the GM check can be slow on a big
+// server — so the gate moves to the submit, exactly as /gm scroll does.
+// What the command picked waits in dc_drafts under this interaction's id.
+function showDcForm(interaction) {
+  const gid = interaction.guild.id;
+  const one = interaction.options.getUser('target');
+  const ids = [...new Set([...(one ? [one.id] : []), ...parsePlayerMentions(interaction.options.getString('targets') || '')])];
+  const npcs = (interaction.options.getString('npcs') || '').split(',').map(x => x.trim()).filter(Boolean);
+  const reveal = interaction.options.getString('reveal') || '';
+  try {
+    db.prepare('DELETE FROM dc_drafts WHERE created_at < ?').run(Date.now() - 86400_000);
+    db.prepare('INSERT OR REPLACE INTO dc_drafts (guild_id, token, ids, npcs, reveal, created_at) VALUES (?,?,?,?,?,?)')
+      .run(gid, interaction.id, ids.join(','), npcs.join(','), reveal, Date.now());
+  } catch { /* the form still works — the targets box carries them */ }
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+  const modal = new ModalBuilder().setCustomId(`dcform:${interaction.id}`).setTitle('Call a check');
+  const T = (id, label, style, placeholder, max, required = false) =>
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId(id).setLabel(label)
+      .setStyle(style).setRequired(required).setMaxLength(max).setPlaceholder(placeholder));
+  modal.addComponents(
+    T('scene', 'The scene — shown on the card', TextInputStyle.Paragraph,
+      'What they face. Left blank, the card is just the check.', 900),
+    T('check', 'The check — e.g. dex 14 hidden', TextInputStyle.Short,
+      'stat or dice, then the DC · add: hidden · bare · adv · dis · -2', 60, true),
+    T('success', 'On success — tags, then the words', TextInputStyle.Paragraph,
+      '[adv] or [lck+1] or [-2hp] on line one — then what they read', 900),
+    T('fail', 'On failure — tags, then the words', TextInputStyle.Paragraph,
+      '[dis] [dex-1] [-3hp] — same shape, and the words they dread', 900),
+    T('targets', 'Targets — @players and/or NPCs', TextInputStyle.Short,
+      'blank keeps the ones you picked · @Ari @Bo Orc, Goblin', 200),
+  );
+  return interaction.showModal(modal);
+}
+
+// The form comes back: read it, gate it, and post the very same card the
+// options path posts — one machine, two doors.
+async function handleDcFormSubmit(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id))) {
+    return interaction.reply({ content: '❌ Only GMs call checks.', ephemeral: true });
+  }
+  const token = interaction.customId.split(':')[1];
+  let draft = null;
+  try { draft = db.prepare('SELECT * FROM dc_drafts WHERE guild_id=? AND token=?').get(gid, token) || null; } catch {}
+  try { db.prepare('DELETE FROM dc_drafts WHERE guild_id=? AND token=?').run(gid, token); } catch {}
+
+  const line = parseDcLine(interaction.fields.getTextInputValue('check'));
+  if (!line) {
+    return interaction.reply({ ephemeral: true, content: '❌ The check line needs a difficulty — something like `dex 14`, or `2d6+1 8 hidden`. Nothing was posted; call it again and the window reopens.' });
+  }
+  const succ = parseOutcomeBlock(interaction.fields.getTextInputValue('success'));
+  const fail = parseOutcomeBlock(interaction.fields.getTextInputValue('fail'));
+  const typed = interaction.fields.getTextInputValue('targets') || '';
+  const typedIds = parsePlayerMentions(typed);
+  const typedNpcs = typed.replace(/<@!?\d+>/g, '').split(/[\s,]+/).map(x => x.trim()).filter(Boolean);
+  const ids = [...new Set([...(draft?.ids ? draft.ids.split(',').filter(Boolean) : []), ...typedIds])];
+  const npcNames = [...new Set([...(draft?.npcs ? draft.npcs.split(',').filter(Boolean) : []), ...typedNpcs])];
+  if (!ids.length && !npcNames.length) {
+    return interaction.reply({ ephemeral: true, content: '❌ Nobody was named — pick targets on the command, or name them in the form\'s last box.' });
+  }
+  if (ids.length > 25) return interaction.reply({ content: '❌ Twenty-five player targets is the most one check can carry.', ephemeral: true });
+
+  return postDcCheck(interaction, {
+    stat: line.stat, notation: line.notation, dc: line.dc, gmMode: line.mode, flat: line.flat,
+    modifier: line.modifier, secret: line.secret,
+    revealSet: new Set(parsePlayerMentions(draft?.reveal || '')),
+    onFail: fail.mark, onSucc: succ.mark, damage: fail.damage, sDamage: succ.damage,
+    flavour: interaction.fields.getTextInputValue('scene') || null,
+    sF: succ.narration, fF: fail.narration, sS: succ.sanction, fS: fail.sanction,
+    ids, npcNames,
+  });
+}
+
 async function runGmDcCheck(interaction) {
-  const gid = interaction.guild.id, cid = interactionChannelId(interaction);
+  // Bare of a difficulty, this is a writing window — nothing may await first.
+  if (interaction.options.getInteger('dc') === null) return showDcForm(interaction);
   if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ Only GMs call checks.', ephemeral: true });
   const stat = interaction.options.getString('stat');
   const notation = (interaction.options.getString('dice') || '').trim() || null;
@@ -7927,28 +8149,51 @@ async function runGmDcCheck(interaction) {
     return interaction.reply({ content: '❌ `dice:` needs plain notation up to 12 characters, e.g. `2d6+1`.', ephemeral: true });
   }
   const dc = interaction.options.getInteger('dc');
-  const gmMode = interaction.options.getString('mode') || 'normal';
-  const flat = interaction.options.getBoolean('flat') ?? false;
+  const modeRaw = interaction.options.getString('mode') || 'normal';
+  const flat = modeRaw === 'flat';                 // 🎲 Bare d20 lives in mode: now
+  const gmMode = flat ? 'normal' : modeRaw;
   const modifier = interaction.options.getInteger('modifier') ?? 0;
   const secret = interaction.options.getBoolean('secret') ?? false;
   const revealSet = new Set(parsePlayerMentions(interaction.options.getString('reveal') || ''));
   const onFail = interaction.options.getString('on_fail') || '';
-  const damage = interaction.options.getInteger('damage') ?? 0;
+  const onSucc = interaction.options.getString('on_success') || '';
+  const damage = interaction.options.getInteger('fail_damage') ?? 0;
+  const sDamage = interaction.options.getInteger('success_damage') ?? 0;
   const flavour = interaction.options.getString('flavour');
+  const sF = interaction.options.getString('success_flavour');
+  const fF = interaction.options.getString('fail_flavour');
+  const sSRaw = interaction.options.getString('success_sanction');
+  const fSRaw = interaction.options.getString('fail_sanction');
+  const sS = parseSanction(sSRaw), fS = parseSanction(fSRaw);
+  if (sSRaw && !sS) return interaction.reply({ content: '❌ `success_sanction:` reads like `lck+1` — a stat and a signed step, ±5 at most.', ephemeral: true });
+  if (fSRaw && !fS) return interaction.reply({ content: '❌ `fail_sanction:` reads like `dex-1` — a stat and a signed step, ±5 at most.', ephemeral: true });
   const one = interaction.options.getUser('target');
   const ids = [...new Set([...(one ? [one.id] : []), ...parsePlayerMentions(interaction.options.getString('targets') || '')])];
   const npcNames = (interaction.options.getString('npcs') || '').split(',').map(x => x.trim()).filter(Boolean);
   if (!ids.length && !npcNames.length) return interaction.reply({ content: '❌ Name at least one target — `target:`, `targets:@a @b`, or `npcs:Orc, Goblin`.', ephemeral: true });
   if (ids.length > 25) return interaction.reply({ content: '❌ Twenty-five player targets is the most one check can carry.', ephemeral: true });
 
+  return postDcCheck(interaction, { stat, notation, dc, gmMode, flat, modifier, secret, revealSet,
+    onFail, onSucc, damage, sDamage, flavour, sF, fF, sS, fS, ids, npcNames });
+}
+
+// The card itself — reached from the options path and from the form alike.
+async function postDcCheck(interaction, { stat, notation, dc, gmMode, flat, modifier, secret, revealSet,
+                                          onFail, onSucc, damage, sDamage = 0, flavour, sF, fF, sS, fS, ids, npcNames }) {
+  const gid = interaction.guild.id, cid = interactionChannelId(interaction);
   const face = notation ?? (stat ? STAT_LABELS[stat] : 'flat d20');
   const terms = [];
   if (gmMode === 'adv') terms.push('🔼 advantage');
   if (gmMode === 'dis') terms.push('🔽 disadvantage');
   if (flat && !notation && stat) terms.push('🎲 flat d20 — no stat bonus');
   if (modifier) terms.push(`${modifier > 0 ? '+' : ''}${modifier} to the total`);
-  if (onFail === 'flat') terms.push('🎭 fail: next fight action flat');
+  const markWord = { flat: '🎭 next fight action flat', adv: '🔼 next roll at advantage', dis: '🔽 next roll at disadvantage' };
+  if (onFail) terms.push(`fail: ${markWord[onFail]}`);
+  if (onSucc) terms.push(`success: ${markWord[onSucc]}`);
   if (damage) terms.push(`💥 fail: -${damage} HP`);
+  if (sDamage) terms.push(`💥 success: -${sDamage} HP`);
+  if (sS) terms.push(`⚖️ success: ${sanctionLabel(sS)}`);
+  if (fS) terms.push(`⚖️ fail: ${sanctionLabel(fS)}`);
   const lines = [`🎯 **${stat && !notation ? STAT_LABELS[stat] + ' check' : face + ' check'} — DC ${secret ? '???' : dc}**`];
   if (ids.length) lines.push(`${ids.map(id => `<@${id}>`).join(' ')} — press your name to roll.`);
   if (terms.length) lines.push(`_${terms.join(' · ')}_`);
@@ -7962,7 +8207,11 @@ async function runGmDcCheck(interaction) {
     if (!r) continue;
     mirrorAutoRoll(gid, cid, npc.name, `${notation ?? '1d20'}${r.mode !== 'normal' ? ` (${r.mode})` : ''}`, r.nat, r.total, `GM check vs DC ${dc}`);
     lines.push('', `🎭 **${npc.name}** — ${r.rollLine}`, secret ? r.band : `${r.band} vs DC ${dc}`);
-    if (!r.passed) applyDcFailEffects({ gid, cid, id: npcFighterId(npc.name), isNpc: true, onFail, damage, lines });
+    const oFlav = r.passed ? sF : fF;
+    if (oFlav) lines.push(`_${oFlav}_`);
+    applyDcSanction({ gid, id: npcFighterId(npc.name), isNpc: true, sanction: r.passed ? sS : fS, lines });
+    applyDcOutcome({ gid, cid, id: npcFighterId(npc.name), isNpc: true,
+      mark: r.passed ? onSucc : onFail, damage: r.passed ? sDamage : damage, lines });
   }
 
   const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
@@ -7971,7 +8220,7 @@ async function runGmDcCheck(interaction) {
   for (const uid of ids) {
     const nm = await getDisplayName(interaction.guild, uid);
     const secCode = !secret ? 0 : revealSet.has(uid) ? 2 : 1;
-    buttons.push(new ButtonBuilder().setCustomId(`dcroll:${uid}:${field}:${dc}:${gmMode}:${flat ? 1 : 0}:${modifier}:${secCode}:${onFail || '-'}:${damage}`)
+    buttons.push(new ButtonBuilder().setCustomId(`dcroll:${uid}:${field}:${dc}:${gmMode}:${flat ? 1 : 0}:${modifier}:${secCode}:${onFail || '-'}:${damage}:${onSucc || '-'}:${sDamage}`)
       .setLabel(`🎲 ${nm.slice(0, 70)}`).setStyle(ButtonStyle.Primary));
   }
   const rows = [];
@@ -7979,6 +8228,12 @@ async function runGmDcCheck(interaction) {
 
   await interaction.reply({ content: lines.join('\n'), components: rows,
     allowedMentions: { users: ids } });
+  if (ids.length && (sF || fF || sS || fS)) {
+    try { const rep = await interaction.fetchReply();
+      saveDcCard(gid, rep.id, { sF, fF, sS: sS ? `${sS.stat}${sS.delta > 0 ? '+' : ''}${sS.delta}` : null,
+                                        fS: fS ? `${fS.stat}${fS.delta > 0 ? '+' : ''}${fS.delta}` : null });
+    } catch { /* trimmings only */ }
+  }
   if (secret) await interaction.followUp({ ephemeral: true, content: `🤫 The DC is **${dc}**.` }).catch(() => {});
   return;
 }
@@ -7986,10 +8241,12 @@ async function runGmDcCheck(interaction) {
 // mirrors to the audit, and darkens their button so nobody rolls twice.
 async function runDcRollPress(interaction) {
   const gid = interaction.guild.id, cid = interactionChannelId(interaction);
-  const [, uid, field, dcS, gmMode, flatS, modS, secS, onFailRaw, dmgS] = interaction.customId.split(':');
+  const [, uid, field, dcS, gmMode, flatS, modS, secS, onFailRaw, dmgS, onSuccRaw, sDmgS] = interaction.customId.split(':');
   if (interaction.user.id !== uid) return interaction.reply({ content: '🎯 That button belongs to someone else — yours has your name on it.', ephemeral: true });
   const dc = parseInt(dcS), flat = flatS === '1', modifier = parseInt(modS) || 0;
   const secret = secS !== '0', whisper = secS === '2', onFail = onFailRaw === '-' ? '' : (onFailRaw || ''), damage = parseInt(dmgS) || 0;
+  const onSucc = onSuccRaw === '-' ? '' : (onSuccRaw || '');
+  const sDmg = parseInt(sDmgS) || 0;
   const notation = field.includes('d') ? field : null;
   const stat = notation ? null : (field === 'x' ? null : field);
   const gate = sheetGate(gid, uid);
@@ -7997,7 +8254,8 @@ async function runDcRollPress(interaction) {
   const ch = getChar(gid, uid);
   if (!ch) return interaction.reply({ content: '❌ You need a character sheet — `/char create`.', ephemeral: true });
 
-  const r = rollDcCheck({ stat, notation, dc, gmMode, flat, modifier, subject: ch, sig: ch });
+  const markedMode = applyNextMark(gid, uid, gmMode);
+  const r = rollDcCheck({ stat, notation, dc, gmMode: markedMode, flat, modifier, subject: ch, sig: ch });
   if (!r) return interaction.reply({ content: '❌ That check\'s notation no longer reads.', ephemeral: true });
   const { nat, total, passed, band, rollLine, result } = r;
   const faceLabel = notation ?? (stat ? STAT_LABELS[stat] : 'flat d20');
@@ -8012,7 +8270,13 @@ async function runDcRollPress(interaction) {
   await interaction.update({ components: rebuilt });
   const nm = await getDisplayName(interaction.guild, uid);
   const out = [`🎯 **${nm}** — ${faceLabel} vs **DC ${secret ? '???' : dc}**`, rollLine, band];
-  if (!passed) applyDcFailEffects({ gid, cid, id: uid, isNpc: false, onFail, damage, lines: out });
+  const card = getDcCard(gid, interaction.message?.id);
+  const oFlav = card ? (passed ? card.s_flavour : card.f_flavour) : null;
+  if (oFlav) out.push(`_${oFlav}_`);
+  applyDcSanction({ gid, id: uid, isNpc: false,
+    sanction: parseSanction(card ? (passed ? card.s_sanction : card.f_sanction) : null), lines: out });
+  applyDcOutcome({ gid, cid, id: uid, isNpc: false,
+    mark: passed ? onSucc : onFail, damage: passed ? sDmg : damage, lines: out });
   await interaction.followUp({ content: out.join('\n') });
   if (whisper) await interaction.followUp({ ephemeral: true,
     content: `🤫 Your eyes catch what others miss — the DC is **${dc}**. You ${passed ? 'cleared' : 'missed'} it by **${Math.abs(total - dc)}**.` }).catch(() => {});
@@ -8675,6 +8939,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.customId.startsWith('gmkill:')) return handleGmKillModal(interaction);
     if (interaction.customId.startsWith('lorereject:')) return handleLoreRejectModal(interaction);
     if (interaction.customId.startsWith('traderej:')) return handleMeritTradeRejectModal(interaction);
+    if (interaction.customId.startsWith('dcform:')) return handleDcFormSubmit(interaction);
     if (interaction.customId.startsWith('duelrej:')) return handleDuelRejectModal(interaction);
     if (interaction.customId.startsWith('sheetreject:')) return handleSheetRejectModal(interaction);
     if (interaction.customId.startsWith('exportreject:')) return handleExportRejectModal(interaction);
@@ -10961,6 +11226,7 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     // Hero signature advantage (players and Hero NPCs alike)
     const sigRowA = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
     mode = flatSwing ? 'normal' : applySignatureMode(sigRowA, stat, mode);
+    mode = applyNextMark(gid, actorId, mode);
     const effTotal = statVal + atkBonus;
     const bonusTag = atkBonus ? ` +${atkBonus} riposte` : '';
     const modStr = effTotal > 0 ? ` +${effTotal}` : effTotal < 0 ? ` ${effTotal}` : '';
@@ -11109,6 +11375,7 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
   const statVal = offBalance ? 0 : (actor.stats.str ?? 0);
   const sigRowA = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
   mode = offBalance ? 'normal' : applySignatureMode(sigRowA, 'str', mode);
+  mode = applyNextMark(gid, actorId, mode);
   const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
 
   const { nat, dropped } = rollD20Mode(mode);
@@ -11212,6 +11479,7 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
 
   const statVal = flatFeint ? 0 : (actor.stats.wis ?? 0);
   mode = flatFeint ? 'normal' : applySignatureMode(subjectRow, 'wis', mode);
+  mode = applyNextMark(gid, actorId, mode);
   const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
   const { nat, dropped } = rollD20Mode(mode);
   const advNote = flatFeint ? ' 🎭 flat d20' : mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '';
@@ -11286,6 +11554,7 @@ async function runFightInsight({ interaction, gid, cid, actorId, mode }) {
   const statVal = fooledI ? 0 : (actor.stats.wis ?? 0);
   const sigRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
   mode = fooledI ? 'normal' : applySignatureMode(sigRow, 'wis', mode);
+  mode = applyNextMark(gid, actorId, mode);
   const { nat, dropped } = rollD20Mode(mode);
   const total = nat + statVal;
   const diceBit = dropped !== null ? `[${nat}~~${dropped}~~]` : `[${nat}]`;
@@ -12540,6 +12809,7 @@ async function handleFight(interaction, forced) {
     // Hero signature advantage (ignored when the roll is forced flat)
     const sigRowD = isNpcFighter(defenderId) ? getNpc(gid, npcNameFromFighter(defenderId)) : getChar(gid, defenderId);
     if (!flat) mode = applySignatureMode(sigRowD, stat, mode);
+    mode = applyNextMark(gid, targetId, mode);
     const effVal = flat ? 0 : statVal;
     const effMode = flat ? 'normal' : mode;
     const modStr = flat ? '' : (effVal > 0 ? ` +${effVal}` : effVal < 0 ? ` ${effVal}` : '');
@@ -13771,7 +14041,8 @@ const HELP_CATEGORIES = {
       '`/quest create` — bare, a five-field writing window opens (add `from:N` to seed it from an existing quest); with `name:` everything stays inline (GM)',
       '`/quest edit number:N` — the same window, prefilled — the natural editor; renames follow onto the board and planning threads. Numeric options (`merit_reward:` etc.) apply directly without the window (GM)',
       '`/quest post number:N [channel]` — post it with an Apply button; with a quest forum set, this opens the quest\'s own board thread (GM)',
-      '`/gm dc stat: dc: targets:@a @b` — call a check: each target gets a roll button; impose advantage/disadvantage, `flat:` strips the stat bonus, `modifier:` adjusts the total, `flavour:` sets the scene; `secret:true` hides the DC and `reveal:@a` whispers it to chosen eyes (GM)',
+      '`/gm dc target:@a` (no `dc:`) — opens a writing window: the scene, the check line (`dex 14 hidden`), and an on-success and on-failure box that each take `[adv] [dis] [bare] [dex-1] [-3hp]` tags before the words (GM)',
+      '`/gm dc stat: dc: targets:@a @b` — call a check: each target gets a roll button; `mode:` sets how they roll it — advantage, disadvantage, or a bare d20 that strips stat and signature; `modifier:` adjusts the total, `flavour:` sets the scene; `success_flavour:`/`fail_flavour:` are revealed with each result; `success_sanction:`/`fail_sanction:` shift a stat by decree (e.g. `dex-1`); `fail_damage:`/`success_damage:` cost HP on that outcome; `on_success:`/`on_fail:` mark their next roll 🔼/🔽 anywhere — fight or free RP, spent by whatever they roll next (🎭 flat stays a fight mark); `secret:true` hides the DC and `reveal:@a` whispers it to chosen eyes (GM)',
       '`/gm reroll target:@p [stat:] [mode:] [flat:true]` — correct a mistaken roll by decree: replaces their pending fight roll or their last roll here — no token spent, their own reroll right untouched (GM)',
       '`/gm queue` — everything waiting on a GM, in one place',
       '`/gm search` — find characters by order, class or status (GM)',
@@ -14563,7 +14834,7 @@ async function handleRollSlash(interaction) {
   }
 
   // Hero signature advantage applies to stat rolls
-  const effMode = stat ? applySignatureMode(char, stat, mode) : mode;
+  const effMode = applyNextMark(gid, uid, stat ? applySignatureMode(char, stat, mode) : mode);
 
   let result;
   if (effMode === 'adv') result = rollAdvantage(notation);
