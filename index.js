@@ -558,6 +558,9 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_plan_books TEXT'); } ca
 try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_thread_forum TEXT'); } catch {}
 try { db.exec('ALTER TABLE quests ADD COLUMN index_thread_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE quests ADD COLUMN index_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN stage_msg_id TEXT'); } catch {}      // the one live status line in the plan thread
+try { db.exec('ALTER TABLE quests ADD COLUMN create_msg_id TEXT'); } catch {}     // the create card, swept when the board takes over
+try { db.exec('ALTER TABLE quests ADD COLUMN create_channel_id TEXT'); } catch {}
 db.exec(`CREATE TABLE IF NOT EXISTS quest_runs (
   guild_id TEXT NOT NULL,
   root_number INTEGER NOT NULL,
@@ -8456,7 +8459,7 @@ async function routeButton(interaction) {
       await interaction.update({ components: questStageRow(fresh) });
       await syncQuestPipeline(interaction.client, interaction.guild, gid, fresh);
       const S = QUEST_STAGES.find(([k]) => k === next);
-      await questAnnounce(interaction.client, fresh, `${S[1]} Stage → **${S[2]}** — <@${interaction.user.id}>.`, { board: false });
+      await announceStage(interaction.client, gid, fresh, `${S[1]} Stage → **${S[2]}** — <@${interaction.user.id}>.`);
       return;
     }
     if (interaction.customId.startsWith('questapply:') || interaction.customId.startsWith('questwithdraw:')) {
@@ -15070,6 +15073,33 @@ async function syncQuestBook(client, guild, gid, questRow) {
   } catch { /* the kanban is decoration — never fail the command over it */ }
 }
 
+// The one live status line in the planning thread: each stage push deletes
+// the previous line and posts the new — the thread never accumulates the
+// walk, only where the quest stands now. Decoration-grade: any failure is
+// swallowed and the command carries on.
+async function announceStage(client, gid, quest, line) {
+  if (!quest.plan_thread_id) return;
+  try {
+    const th = await client.channels.fetch(quest.plan_thread_id);
+    if (!th?.isThread?.()) return;
+    if (th.archived) await wakeThread(th);
+    if (quest.stage_msg_id) { try { await th.messages.delete(quest.stage_msg_id); } catch { /* already gone */ } }
+    const msg = await th.send(line);
+    updateQuest(gid, quest.number, { stage_msg_id: msg.id });
+  } catch { /* the status line is decoration */ }
+}
+
+// Sweep the create card out of its channel — called when the board takes
+// over (post) or the quest dies (delete). Best-effort.
+async function sweepCreateCard(client, gid, quest) {
+  if (!quest.create_channel_id || !quest.create_msg_id) return;
+  try {
+    const ch = await client.channels.fetch(quest.create_channel_id);
+    await ch.messages.delete(quest.create_msg_id);
+  } catch { /* already gone */ }
+  updateQuest(gid, quest.number, { create_msg_id: null, create_channel_id: null });
+}
+
 // Stage tag + book entry in one call — the single pipeline sync.
 async function syncQuestPipeline(client, guild, gid, quest) {
   await syncPlanStage(client, gid, quest);
@@ -15212,8 +15242,13 @@ async function finishQuestCreate(interaction, gid, uid, f) {
     }
   }
   await refreshDmRoster(interaction.client, interaction.guild, gid);
-  return interaction.editReply({ content: `✅ Created **${questTag(quest)}**.${planLine}\n\n${await renderQuest(interaction.guild, quest, { applyHint: false })}\n\n_Post it with_ \`/quest post number:${number}\` _— or walk the stages below._`,
+  await interaction.editReply({ content: `✅ Created **${questTag(quest)}**.${planLine}\n\n${await renderQuest(interaction.guild, quest, { applyHint: false })}\n\n_Post it with_ \`/quest post number:${number}\` _— or walk the stages below._`,
     components: questStageRow(quest) });
+  try { // remember the card so posting can sweep it — the board takes over then
+    const rep = await interaction.fetchReply();
+    updateQuest(gid, number, { create_msg_id: rep.id, create_channel_id: rep.channelId });
+  } catch { /* ephemeral-ish edge — the sweep just won't find it */ }
+  return;
 }
 
 async function handleQuest(interaction, forced) {
@@ -15391,7 +15426,8 @@ async function handleQuest(interaction, forced) {
         // needs nothing new.
         updateQuest(gid, number, { post_channel_id: thread.id, post_message_id: thread.id, stage: 'board' });
         await syncQuestPipeline(interaction.client, interaction.guild, gid, getQuest(gid, number));
-        await questAnnounce(interaction.client, getQuest(gid, number), `📌 Opened on the public board — <#${thread.id}>.`, { board: false });
+        await announceStage(interaction.client, gid, getQuest(gid, number), `📌 Opened on the public board — <#${thread.id}>.`);
+        await sweepCreateCard(interaction.client, gid, getQuest(gid, number));
         return interaction.reply({ content: `📌 **${questTag(quest)}** is on the board — <#${thread.id}>.`, ephemeral: true });
       } catch (err) {
         return interaction.reply({ content: `❌ Couldn't open the board thread — ${err?.message || err}. Check my **Create Posts** and **Send Messages in Posts** permissions in <#${forumId}>, or pass a \`channel:\` to post plainly.`, ephemeral: true });
@@ -15590,7 +15626,7 @@ async function handleQuest(interaction, forced) {
     const fresh = getQuest(gid, quest.number);
     await syncQuestPipeline(interaction.client, interaction.guild, gid, fresh);
     const S = QUEST_STAGES.find(([k]) => k === stage);
-    await questAnnounce(interaction.client, fresh, `${S[1]} Stage → **${S[2]}**.`, { board: false });
+    await announceStage(interaction.client, gid, fresh, `${S[1]} Stage → **${S[2]}**.`);
     return interaction.reply({ content: `${S[1]} **${questTag(quest)}** → **${S[2]}**.` });
   }
 
@@ -15780,6 +15816,10 @@ async function handleQuest(interaction, forced) {
           if (bk?.isThread?.()) { if (bk.archived) await wakeThread(bk); await bk.messages.delete(quest.index_msg_id); }
         } catch { /* already gone */ }
       }
+      if (quest.stage_msg_id && quest.plan_thread_id) {
+        try { const th = await interaction.client.channels.fetch(quest.plan_thread_id); await th.messages.delete(quest.stage_msg_id); } catch { /* gone */ }
+      }
+      await sweepCreateCard(interaction.client, gid, quest);
       deleteQuest(gid, number);
       return `🗑️ **${questTag(quest)}** deleted.`;
     });
