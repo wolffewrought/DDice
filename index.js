@@ -4724,6 +4724,10 @@ const slashCommands = [
       .addStringOption(o=>o.setName('flavour').setDescription('Flavour text').setRequired(false))
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'})))
+    .addSubcommand(s=>s.setName('reroll').setDescription('Reroll an NPC\'s last roll here — spends one of its LCK tokens')
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
+        .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'})))
     .addSubcommand(s=>s.setName('create').setDescription('Create an NPC')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
       .addIntegerOption(o=>o.setName('str').setDescription('Strength').setRequired(false))
@@ -13618,7 +13622,7 @@ const HELP_CATEGORIES = {
       '**6 · Duels** — `/duel opponent:@rival terms:first blood` raises one. A GM signs it off and starts the fight.',
       '**7 · Quests** — `/quest board` shows what\'s posted. Tap **Apply** on a quest post (or `/quest apply number:N`), a GM approves the party, and merits pay out when it completes.',
       '**8 · Activities** — minigames written for this server: branching scenes with rolls and rewards. `/activity list` to browse, `/activity run name:Fishing` to start one here. When a scene asks for a roll, just type the stat word — `wis`, or `wis steady does it` to add flavour — and the story moves.',
-      '**9 · Renown & merits** — renown is the coin quests, encounters and activities pay out; spend it as the server allows (`/standing renown view`). Merits are lifetime honour that only climbs, and ranks hang off them (`/standing merit view`, `/standing rank list`). You can offer merit to a friend with `/standing merit give` — a GM signs it off.',
+      '**9 · Renown & merits** — renown is the coin quests, encounters and activities pay out; spend it as the server allows (`/standing renown view`). Merits are lifetime honour that only climbs, and ranks hang off them (`/standing merit view`, `/standing rank list`). You can offer merit to a friend with `/standing merit give` — a GM signs it off. GMs move the coin with `/standing renown gain/loss`.',
       '**10 · Death** — characters can fall. That call belongs to a GM: a memorial is posted, the sheet locks, and the fallen keep their history. Revival is possible when the story allows it.',
       '',
       '_Lost mid-game? `/help category:X` for any group, `/char stat` for what each stat means, `/roll last:true` if you forgot what you just threw._',
@@ -13652,7 +13656,9 @@ const HELP_CATEGORIES = {
       '`/char create` — set up a full character at once (stats, order, class, weapons, weapon emojis)',
       '`/char set field:STR value:14` — set one field at a time (with approvals on, any change to your own sheet goes back to the GMs)',
       '`/char weaponemoji slot:Weapon 1 emoji:⚔️` — pick a weapon slot emoji',
-      '`/char view show [user]` — view a character sheet',
+      '`/char view show/summary/inventory/standing/rollhistory/showlore [user]` — read a character: the sheet · career summary · pack · merits, renown & rank · dice history · lore',
+      '`/char check` — what is left before your sheet can go to a GM',
+      '`/char prefer` — which stats the bot should use when it rolls for you on auto',
       '`/char lore` — write your character\'s story and send it to the GMs',
       'Players spend an exact stat allowance across STR/CON/DEX/WIS/LCK with a minimum in each — GMs aren\'t limited. Run `/config mechanics statallowance` to see or change this server\'s numbers',
       '`/char submit` — send your sheet back to the GMs after a rejection, unchanged',
@@ -13660,7 +13666,10 @@ const HELP_CATEGORIES = {
       '`/char import` — hand an exported sheet to this server, as the image or the pasted `[TTRPG SHEET]` summary (bare = a paste box opens); a GM approves it and you arrive ready to play',
       '`/char signature user:@a stat:str` — set a Hero\'s signature stat (GM)',
       '`/char profile on/off/show/save/load/saves` — manage profile display & snapshots',
-      '`/char weapon add/remove/list` — manage the server weapon list (GM)',
+      '`/char weapon add/remove/list/stats` — manage the server weapon list, and set what each weapon can fight with (GM)',
+      '`/char give/take user:@a item:X` — hand an item to a character, or take one back · `/char edit` rewords one they carry (GM)',
+      '`/char hero user:@a` — grant or remove Hero status (GM)',
+      '`/char page user:@a` — link a character to their forum page, or make one (GM)',
     ],
   },
   hp: {
@@ -13764,9 +13773,15 @@ const HELP_CATEGORIES = {
       '`/quest post number:N [channel]` — post it with an Apply button; with a quest forum set, this opens the quest\'s own board thread (GM)',
       '`/gm dc stat: dc: targets:@a @b` — call a check: each target gets a roll button; impose advantage/disadvantage, `flat:` strips the stat bonus, `modifier:` adjusts the total, `flavour:` sets the scene; `secret:true` hides the DC and `reveal:@a` whispers it to chosen eyes (GM)',
       '`/gm reroll target:@p [stat:] [mode:] [flat:true]` — correct a mistaken roll by decree: replaces their pending fight roll or their last roll here — no token spent, their own reroll right untouched (GM)',
+      '`/gm queue` — everything waiting on a GM, in one place',
+      '`/gm search` — find characters by order, class or status (GM)',
+      '`/gm kill user:@a` / `/gm revive user:@a` — mark a character fallen and post their memorial, or bring them back (GM)',
+      '`/gm test quest/npc/list/clean` — throwaway fixtures for trying things out, and the broom that clears them (GM)',
       '`/gm questwipe [runs:true]` — delete every quest on the server, confirm-gated; the run ledger and DM counters survive unless runs:true (GM)',
       '`/gm check` — the setup mirror: every channel-backed feature, unset first with the command that sets it, then the set ones with links — stored ids are verified live (GM)',
       '`/config channels questforum channel:#forum` — the board becomes a forum: one thread per quest, lifecycle mirrored in, archived on completion (Admin)',
+      '`/config channels charforum/memorial/questlog/docs` — a page per approved character · where fallen characters are remembered · where finished quest summaries post · publish the command PDFs to a GM channel (Admin)',
+      '`/config channels scrollarchive` — the scroll library; point it at a forum and each GM\'s scrolls file in their own 📜 thread, opened on first use (Admin)',
       '`/config channels questthreads channel:#forum` — optional split: per-quest planning threads (and their stage tags) open here, so the planning forum holds only the books (Admin)',
       '`/config channels questplanning channel:#gm-forum` — `/quest create` opens a private GM planning thread; every application and event mirrors there. Sets up the pipeline tags (🌱⏳✅📌🗄️🏁) and the 🎲 DM roster (Admin)',
       '`/quest stage number:N stage:` — move a quest through Concept / Awaiting Approval / Approved — or just press the **advance button** at the bottom of its planning thread; posting, archiving and completing re-tag automatically (GM)',
@@ -13777,6 +13792,8 @@ const HELP_CATEGORIES = {
       '`/quest approve number:N @user [force]` — approve an applicant; `force` overrides a hard cap (GM)',
       '`/quest kick number:N @user` — remove a member/applicant (GM)',
       '`/quest runchannel number:N [channel]` — set where the quest runs & rewards (GM)',
+      '`/quest run start/note/pause/resume/timeline/complete` — the running of a quest: start the clock · log a detail · pause and resume · read the full log so far · finish and reward (GM)',
+      '`/quest instance number:N` — run your own copy of a quest, separate from anyone else\'s (GM)',
       '`/quest run start number:N` — lock the party and mark in progress (GM)',
       '`/quest run complete number:N` — finish it; merits auto-awarded, other rewards listed (GM)',
       '`/quest delete number:N` — remove a quest (GM)',
@@ -13811,7 +13828,9 @@ const HELP_CATEGORIES = {
       '`/npc categorycreate/categorydelete/categorylist` — manage categories',
       '`/npc categoryassign/categoryremove` — sort NPCs into categories',
       '`/npc roll category:X name:Y notation:1d20 stat:STR` — roll as an NPC',
-      '`/npc reroll name:X` — reroll an NPC roll (costs a token)',
+      '`/npc reroll name:X` — reroll an NPC\'s last roll here (spends one of its LCK tokens)',
+      '`/npc sheet name:X` — an NPC\'s full record: stats, standing, inventory, rolls, lore',
+      '`/npc give/take name:X item:Y` — hand an item to an NPC, or take one from it · `/npc npclore` writes its lore',
       '💡 Upload an image to the NPC channel with the NPC name to set an avatar',
     ],
   },
