@@ -542,6 +542,7 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font BLOB'); } catch {
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font_name TEXT'); } catch {}
 // A shelf for the props: every /gm scroll's named PDF is also filed here.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_archive_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_threads TEXT'); } catch {} // forum mode: JSON map gmId → thread id
 // Grappling: which attack-phase roll is pending, and who holds whom.
 try { db.exec('ALTER TABLE fights ADD COLUMN atk_kind TEXT'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN grapples TEXT DEFAULT '{}'"); } catch {}
@@ -716,12 +717,23 @@ function rankProgress(gid, merits) {
 }
 
 // ── Quests ───────────────────────────────────────────────────────────────────
+// The lowest free number: a deleted quest's number returns to the pool, so
+// the board never grows gaps. When a number is RECYCLED, the dead quest's
+// leftovers are neutralised first — its run-ledger rows are tombstoned to
+// root 0 (unreachable by any live quest, but the gm_id credit inside them
+// still counts) and any stray events/summaries from pre-hygiene deletes are
+// purged — so the reborn number starts with a clean history.
 function nextQuestNumber(gid) {
-  const row = db.prepare('SELECT last FROM quest_counter WHERE guild_id=?').get(gid);
-  const next = (row?.last ?? 0) + 1;
-  if (row) db.prepare('UPDATE quest_counter SET last=? WHERE guild_id=?').run(next, gid);
-  else db.prepare('INSERT INTO quest_counter (guild_id, last) VALUES (?,?)').run(gid, next);
-  return next;
+  const taken = db.prepare('SELECT number FROM quests WHERE guild_id=? ORDER BY number').all(gid);
+  let n = 1;
+  for (const r of taken) { if (r.number === n) n++; else if (r.number > n) break; }
+  const maxN = taken.length ? taken[taken.length - 1].number : 0;
+  if (n <= maxN) { // recycling a gap — scrub what the dead quest left behind
+    db.prepare('UPDATE quest_runs SET root_number=0, number=0 WHERE guild_id=? AND (root_number=? OR number=?)').run(gid, n, n);
+    db.prepare('DELETE FROM quest_events WHERE guild_id=? AND number=?').run(gid, n);
+    db.prepare('DELETE FROM quest_summaries WHERE guild_id=? AND number=?').run(gid, n);
+  }
+  return n;
 }
 function createQuest(gid, fields) {
   const number = nextQuestNumber(gid);
@@ -743,6 +755,8 @@ function updateQuest(gid, number, fields) {
 }
 function deleteQuest(gid, number) {
   db.prepare('DELETE FROM quest_members WHERE guild_id=? AND number=?').run(gid, number);
+  db.prepare('DELETE FROM quest_events WHERE guild_id=? AND number=?').run(gid, number);
+  db.prepare('DELETE FROM quest_summaries WHERE guild_id=? AND number=?').run(gid, number);
   return db.prepare('DELETE FROM quests WHERE guild_id=? AND number=?').run(gid, number).changes;
 }
 function listQuests(gid, status) {
@@ -4482,8 +4496,8 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('rollauditforum').setDescription('Split the mirror into books — player rolls, GM rolls, NPC rolls, NPC say')
       .addChannelOption(o=>o.setName('forum').setDescription('The forum channel').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = back to the single audit channel').setRequired(false)));
-      g.addSubcommand(s=>s.setName('scrollarchive').setDescription('A library channel — every /gm scroll\'s named PDF is also filed there')
-      .addChannelOption(o=>o.setName('channel').setDescription('The archive channel').setRequired(false))
+      g.addSubcommand(s=>s.setName('scrollarchive').setDescription('A library channel or FORUM — a forum gives each GM their own 📜 thread')
+      .addChannelOption(o=>o.setName('channel').setDescription('The archive channel, or a forum for per-GM threads').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = stop archiving').setRequired(false)));
       return g;
     })
@@ -6300,7 +6314,11 @@ async function handleConfig(interaction, forced) {
           : '📚 No archive yet. Set the roll-audit forum and its 📜 Scrolls book archives automatically — or `/config channels scrollarchive channel:#library` for a plain channel.' });
     }
     setConfig(gid, { scroll_archive_id: ch.id });
-    return interaction.reply({ content: `📚 Scroll archive set: <#${ch.id}> — every \`/gm scroll\` now also files its named PDF there.` });
+    const { ChannelType: CT } = require('discord.js');
+    if (ch.type === CT.GuildForum) {
+      return interaction.reply({ content: `📚 Scroll archive is now the forum <#${ch.id}> — **each GM's scrolls file in their own 📜 thread**, opened automatically on first use.` });
+    }
+    return interaction.reply({ content: `📚 Scroll archive set: <#${ch.id}> — every \`/gm scroll\` now also files its named PDF there. _(Point at a forum instead for per-GM threads.)_` });
   }
   if (sub === 'rollauditforum') {
     if (interaction.options?.getBoolean?.('disable')) {
@@ -8056,7 +8074,7 @@ async function handleCheck(interaction) {
     ['📜 Quest log', cfg.quest_log_channel, '`/config channels questlog channel:#`', null, 'questlog'],
     ['🖼️ NPC image bank', cfg.npc_channel_id, '`/config channels npcchannel channel:#`', null, 'npcchannel'],
     ['📚 GM docs (the PDFs)', cfg.docs_channel, '`/config channels docs channel:# repo:owner/name`', null],
-    ['📜 Scroll library', cfg.scroll_archive_id, '`/config channels scrollarchive channel:#`', null, 'scrollarchive'],
+    ['📜 Scroll library', cfg.scroll_archive_id, '`/config channels scrollarchive channel:#` — a forum gives per-GM threads', null, 'scrollarchive'],
     ['💾 Backups', cfg.backup_channel_id, '`/gm backup auto channel:#`', null],
   ];
   const unset = [], set = [];
@@ -8082,7 +8100,8 @@ async function handleCheck(interaction) {
       const selects = missing.map(r => new ActionRowBuilder().addComponents(
         new ChannelSelectMenuBuilder().setCustomId(`checkset:${r[4]}`)
           .setPlaceholder(`${r[0].replace(/^\S+\s/, '').slice(0, 60)} — pick a ${FORUMS.has(r[4]) ? 'forum' : 'channel'}`)
-          .setChannelTypes(FORUMS.has(r[4]) ? [ChannelType.GuildForum] : [ChannelType.GuildText])));
+          .setChannelTypes(r[4] === 'scrollarchive' ? [ChannelType.GuildText, ChannelType.GuildForum]
+            : FORUMS.has(r[4]) ? [ChannelType.GuildForum] : [ChannelType.GuildText])));
       await interaction.followUp({ ephemeral: true, components: selects,
         content: `🔧 **Quick setup** — pick a channel to run each config right here${checks.filter(r => !r[1] && r[4]).length > 5 ? ' (more appear once these are set)' : ''}:` });
     }
@@ -9869,11 +9888,42 @@ const AUDIT_KINDS = {
 };
 // Where scroll records go: a manually configured channel overrides; else the
 // audit forum's 📜 Scrolls book; else nowhere. Threads are woken on the way.
-async function scrollArchiveChannel(client, gid) {
+// FORUM MODE: point the config at a forum and each GM gets their own 📜
+// thread, opened on first use — pass gmId so the scroll files under its GM.
+async function scrollArchiveChannel(client, gid, gmId = null) {
   const id = getConfig(gid)?.scroll_archive_id ?? auditRoutes(gid)?.scrolls ?? null;
   if (!id) return null;
   const ch = await client.channels.fetch(id);
+  const { ChannelType } = require('discord.js');
+  if (ch?.type === ChannelType.GuildForum) return ensureScrollThread(client, gid, ch, gmId);
   return ch?.isThread?.() ? wakeThread(ch) : ch;
+}
+
+// One thread per GM in the archive forum, keyed by id (names change), the
+// map self-healing: a stored thread that's gone — or living in some OTHER
+// forum after a config swap — is re-created here.
+async function ensureScrollThread(client, gid, forum, gmId) {
+  const key = gmId || '_shared';
+  let map = {};
+  try { map = JSON.parse(getConfig(gid)?.scroll_threads || '{}') || {}; } catch {}
+  const tid = map[key];
+  if (tid) {
+    const th = await client.channels.fetch(tid).catch(() => null);
+    if (th && th.parentId === forum.id) return wakeThread(th);
+  }
+  let label = '📜 Archive';
+  if (gmId) {
+    try { label = `📜 ${await getDisplayName(await client.guilds.fetch(gid), gmId)}`; } catch { label = `📜 GM ${gmId.slice(-4)}`; }
+  }
+  const thread = await forum.threads.create({
+    name: label.slice(0, 100), autoArchiveDuration: 10080,
+    message: { content: gmId
+      ? `📜 The scrolls of <@${gmId}> — every prop they unfurl or read back files here.`
+      : '📜 The shared archive — scrolls without a named hand file here.' },
+  });
+  map[key] = thread.id;
+  setConfig(gid, { scroll_threads: JSON.stringify(map) });
+  return thread;
 }
 
 function auditRoutes(gid) {
@@ -13956,17 +14006,25 @@ async function deliverScroll(interaction, gid, scroll) {
         new AttachmentBuilder(pdfBuf, { name: `${stem}-readable.pdf` }),
       ], ephemeral: true });
     // The archive shows imports as well as exports — same record shape.
+    // And it SAYS so, like the write path does: a silent archive is one the
+    // GM can't trust.
     try {
-      const arch = await scrollArchiveChannel(interaction.client, gid);
-      if (arch) await sendLong(arch, [
-        `📖 **${stem}** · read back by <@${interaction.user.id}> in <#${interactionChannelId(interaction)}>`,
-        '', ...(scroll.title ? [`**${scroll.title}**`, ''] : []), scroll.body,
-        ...(scroll.flavour ? ['', `_${scroll.flavour}_`] : []),
-      ], { files: [
-        new AttachmentBuilder(renderScroll({ family: 'standard', title: scroll.title, body: scroll.body }), { name: `${stem}-readable.png` }),
-        new AttachmentBuilder(pdfBuf, { name: `${stem}-readable.pdf` }),
-      ], allowedMentions: { parse: [] } });
-    } catch (err) { console.error('[scroll] read-back archive failed -', err?.message || err); }
+      const arch = await scrollArchiveChannel(interaction.client, gid, interaction.user.id);
+      if (arch) {
+        await sendLong(arch, [
+          `📖 **${stem}** · read back by <@${interaction.user.id}> in <#${interactionChannelId(interaction)}>`,
+          '', ...(scroll.title ? [`**${scroll.title}**`, ''] : []), scroll.body,
+          ...(scroll.flavour ? ['', `_${scroll.flavour}_`] : []),
+        ], { files: [
+          new AttachmentBuilder(renderScroll({ family: 'standard', title: scroll.title, body: scroll.body }), { name: `${stem}-readable.png` }),
+          new AttachmentBuilder(pdfBuf, { name: `${stem}-readable.pdf` }),
+        ], allowedMentions: { parse: [] } });
+        await interaction.followUp({ content: `📚 Archived to <#${arch.id}>.`, ephemeral: true }).catch(() => {});
+      }
+    } catch (err) {
+      console.error('[scroll] read-back archive failed -', err?.message || err);
+      await interaction.followUp({ content: '⚠️ The archive copy failed — check my access to the archive.', ephemeral: true }).catch(() => {});
+    }
     return out;
   } catch (err) {
     console.error('[scroll] remake failed -', err?.message || err);
@@ -14010,7 +14068,7 @@ async function handleScrollModal(interaction) {
     // Best-effort, and the ack says whether it made it.
     let archived = '';
     try {
-      const arch = await scrollArchiveChannel(interaction.client, gid);
+      const arch = await scrollArchiveChannel(interaction.client, gid, interaction.user.id);
       if (arch) {
         await sendLong(arch, [
           `📚 **${stem}** · unfurled by <@${interaction.user.id}> in <#${chan.id}>`,
@@ -15154,7 +15212,8 @@ async function finishQuestCreate(interaction, gid, uid, f) {
     }
   }
   await refreshDmRoster(interaction.client, interaction.guild, gid);
-  return interaction.editReply({ content: `✅ Created **${questTag(quest)}**.${planLine}\n\n${await renderQuest(interaction.guild, quest)}\n\n_Post it with_ \`/quest post number:${number}\`_._` });
+  return interaction.editReply({ content: `✅ Created **${questTag(quest)}**.${planLine}\n\n${await renderQuest(interaction.guild, quest, { applyHint: false })}\n\n_Post it with_ \`/quest post number:${number}\` _— or walk the stages below._`,
+    components: questStageRow(quest) });
 }
 
 async function handleQuest(interaction, forced) {
