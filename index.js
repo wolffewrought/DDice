@@ -516,10 +516,8 @@ db.exec(`
 // above (not with the migrations at the top of the file) because on a brand-new
 // database the top-of-file ALTERs run before the table exists and are swallowed,
 // leaving a fresh install without auto_npc / rr_state / log_state.
-try { db.exec('ALTER TABLE fights ADD COLUMN auto_npc INTEGER DEFAULT 0'); } catch {}
-try { db.exec("ALTER TABLE fights ADD COLUMN rr_state TEXT NOT NULL DEFAULT '{}'"); } catch {}
-try { db.exec("ALTER TABLE fights ADD COLUMN log_state TEXT NOT NULL DEFAULT '{}'"); } catch {}
-try { db.exec("ALTER TABLE fights ADD COLUMN effect_state TEXT NOT NULL DEFAULT '{}'"); } catch {}
+// (fights.auto_npc / rr_state / log_state / effect_state are added higher up —
+//  a second ALTER for the same column always throws, so these were never live.)
 // Practice bouts: HP at or below which a fighter bows out. 0 = a real fight.
 try { db.exec('ALTER TABLE fights ADD COLUMN floor_hp INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE fight_archive ADD COLUMN floor_hp INTEGER DEFAULT 0'); } catch {}
@@ -571,6 +569,11 @@ try { db.exec('ALTER TABLE quests ADD COLUMN index_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE quests ADD COLUMN stage_msg_id TEXT'); } catch {}      // the one live status line in the plan thread
 try { db.exec('ALTER TABLE quests ADD COLUMN create_msg_id TEXT'); } catch {}     // the create card, swept when the board takes over
 try { db.exec('ALTER TABLE quests ADD COLUMN create_channel_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN run_thread_id TEXT'); } catch {}     // the party's own room, opened at start
+try { db.exec('ALTER TABLE quests ADD COLUMN run_seq INTEGER'); } catch {}        // which run of the adventure this is — #002.2
+try { db.exec('ALTER TABLE quests ADD COLUMN run_label TEXT'); } catch {}         // and what the GM calls it
+try { db.exec('ALTER TABLE quests ADD COLUMN full_pinged INTEGER DEFAULT 0'); } catch {} // party-is-full nudge, once
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_instance_forum TEXT'); } catch {}
 db.exec(`CREATE TABLE IF NOT EXISTS quest_runs (
   guild_id TEXT NOT NULL,
   root_number INTEGER NOT NULL,
@@ -852,8 +855,15 @@ async function requireQuest(interaction, gid, forcedNumber = null) {
   return quest;
 }
 
+// An instance keeps the adventure's number and adds which run it is:
+// #002.2-Testing the waters · Blackfen party. The row still has its own
+// number underneath — that's what commands take — but nobody has to read
+// #014 and work out it's the same story.
 function questTag(quest) {
-  return `#${String(quest.number).padStart(3, '0')}-${quest.name}`;
+  const root = quest.instance_of ?? quest.number;
+  const seq = quest.instance_of ? `.${quest.run_seq ?? 2}` : '';
+  const label = quest.run_label ? ` · ${quest.run_label}` : '';
+  return `#${String(root).padStart(3, '0')}${seq}-${quest.name}${label}`;
 }
 // "12 Jan 2026" — for history timestamps (epoch ms)
 function formatHistDate(ms) {
@@ -2494,6 +2504,12 @@ function webhookHost(channel) {
     ? (channel.parent ?? null) : (channel ?? null);
 }
 
+// The name every NPC in a channel speaks through. One webhook, reused by
+// all of them — each message carries its own username and avatar, so a
+// hundred NPCs cost a single hook. (Discord caps a channel at fifteen; the
+// old one-per-NPC scheme hit that wall and dropped to plain bot messages.)
+const SHARED_HOOK = '\u0000shared';
+
 async function npcWebhookIn(channel, gid, npcName, imageUrl) {
   const { WebhookClient } = require('discord.js');
 
@@ -2506,45 +2522,55 @@ async function npcWebhookIn(channel, gid, npcName, imageUrl) {
   if (!host) return null;
   const threadId = inThread ? channel.id : null;
 
-  // Wrap the client so every send lands back in the thread it was called from.
-  const bind = (client) => threadId ? {
-    send: (payload) => client.send(
-      typeof payload === 'string' ? { content: payload, threadId } : { ...payload, threadId }),
-  } : client;
+  // Every send wears the NPC's own face, whichever hook carries it.
+  const bind = (client) => ({
+    send: (payload) => client.send({
+      ...(typeof payload === 'string' ? { content: payload } : payload),
+      username: npcName,
+      avatarURL: imageUrl ?? BLANK_AVATAR,
+      ...(threadId ? { threadId } : {}),
+    }),
+  });
 
-  const row = getNpcWebhookFor(gid, host.id, npcName);
-
-  if (row?.webhook_id && row?.webhook_token) {
-    // The NPC's avatar may have been set (or changed) after this webhook was
-    // created. A token-only WebhookClient can't edit the avatar, so recreate
-    // the webhook instead — cheap, and guaranteed to carry the right image.
-    if ((row.avatar_url ?? null) !== (imageUrl ?? null)) {
-      try {
-        const fresh = await host.createWebhook({
-          name: npcName,
-          avatar: imageUrl ?? BLANK_AVATAR,
-          reason: `NPC avatar refresh for ${npcName}`,
-        });
-        // Bin the stale one — a channel is capped at 15 webhooks.
-        try { await new WebhookClient({ id: row.webhook_id, token: row.webhook_token }).delete(); } catch {}
-        setNpcWebhookFor(gid, host.id, npcName, fresh.id, fresh.token, imageUrl ?? null);
-        return bind(new WebhookClient({ id: fresh.id, token: fresh.token }));
-      } catch (e) {
-        // Couldn't recreate (permissions, or the 15-webhook channel cap) —
-        // keep using the existing one rather than dropping to a plain post.
-        console.error('[npcwebhook] avatar refresh failed, reusing existing:', e?.message || e);
-      }
-    }
-    return bind(new WebhookClient({ id: row.webhook_id, token: row.webhook_token }));
+  // 1 · the channel's shared hook, if we've already got one.
+  const shared = getNpcWebhookFor(gid, host.id, SHARED_HOOK);
+  if (shared?.webhook_id && shared?.webhook_token) {
+    return bind(new WebhookClient({ id: shared.webhook_id, token: shared.webhook_token }));
   }
 
+  // 2 · an NPC-specific hook left over from the old scheme, or any other the
+  // bot owns here — adopting one un-jams a channel already at the cap.
+  const mine = getNpcWebhookFor(gid, host.id, npcName);
+  if (mine?.webhook_id && mine?.webhook_token) {
+    setNpcWebhookFor(gid, host.id, SHARED_HOOK, mine.webhook_id, mine.webhook_token, null);
+    return bind(new WebhookClient({ id: mine.webhook_id, token: mine.webhook_token }));
+  }
+  try {
+    const hooks = await host.fetchWebhooks();
+    const own = hooks.find(h => h.owner?.id === host.client.user.id && h.token);
+    if (own) {
+      setNpcWebhookFor(gid, host.id, SHARED_HOOK, own.id, own.token, null);
+      return bind(new WebhookClient({ id: own.id, token: own.token }));
+    }
+  } catch { /* no Manage Webhooks to read them — try creating below */ }
+
+  // 3 · nothing to adopt: mint the one this channel will use from now on.
   const webhook = await host.createWebhook({
-    name: npcName,
-    avatar: imageUrl ?? BLANK_AVATAR,
-    reason: `NPC webhook for ${npcName}`,
+    name: 'DDice',
+    avatar: BLANK_AVATAR,
+    reason: 'Shared NPC voice for this channel',
   });
-  setNpcWebhookFor(gid, host.id, npcName, webhook.id, webhook.token, imageUrl ?? null);
+  setNpcWebhookFor(gid, host.id, SHARED_HOOK, webhook.id, webhook.token, null);
   return bind(new WebhookClient({ id: webhook.id, token: webhook.token }));
+}
+
+// A stored hook can be deleted server-side; forget it so the next call
+// adopts or mints afresh. Threads share their parent's, so clear both.
+function forgetChannelWebhook(gid, channel) {
+  const ids = [channel?.id, channel?.parentId].filter(Boolean);
+  for (const id of ids) {
+    try { db.prepare('DELETE FROM npc_webhooks WHERE guild_id=? AND channel_id=?').run(gid, id); } catch {}
+  }
 }
 
 function setNpcWebhook(gid, name, webhookId, webhookToken) {
@@ -2607,6 +2633,58 @@ function removeNpcFromCategory(gid, npcName, category) {
 function getNpcsInCategory(gid, category) {
   return db.prepare('SELECT npc_name FROM npc_category_members WHERE guild_id=? AND category=? ORDER BY npc_name').all(gid, category).map(r=>r.npc_name);
 }
+// One page of the roster. Full pages carry the stat line every GM reads at
+// a glance; compact pages are a roll call — names, four to a row — for
+// servers with more NPCs than a screen can hold. Returns null when the
+// category named no longer exists, so the caller can say so.
+const NPC_PAGE_FULL = 15, NPC_PAGE_COMPACT = 60;
+function buildNpcPage(gid, { page = 0, compact = false, cat = '' } = {}) {
+  let npcs = getAllNpcs(gid);
+  let header = '**🎭 NPCs on this server';
+  if (cat) {
+    const real = getCategories(gid).find(c => c.toLowerCase() === cat.toLowerCase());
+    if (!real) return null;
+    const members = new Set(getNpcsInCategory(gid, real));
+    npcs = npcs.filter(n => members.has(n.name));
+    header = `**🎭 NPCs — 📁 ${real}`;
+  }
+  const total = npcs.length;
+  const per = compact ? NPC_PAGE_COMPACT : NPC_PAGE_FULL;
+  const pages = Math.max(1, Math.ceil(total / per));
+  const p = Math.min(Math.max(0, page), pages - 1);
+  const slice = npcs.slice(p * per, p * per + per);
+  const lines = [`${header} — ${total}${pages > 1 ? ` · page ${p + 1}/${pages}` : ''}:**`, ''];
+  if (!total) lines.push('_Nobody yet._');
+  else if (compact) {
+    for (let i = 0; i < slice.length; i += 4) {
+      lines.push(slice.slice(i, i + 4).map(n => '`' + n.name + '`').join(' · '));
+    }
+  } else {
+    for (const n of slice) {
+      const order = n.order_name ? ` ${KNIGHT_EMOJIS[n.order_name] ?? '⚪'} ${n.order_name}` : '';
+      const img = n.image_url ? ' 🖼️' : '';
+      lines.push(`• **${n.name}**${order}${img} — STR ${n.str} CON ${n.con} DEX ${n.dex} WIS ${n.wis} LCK ${n.lck} | ❤️ ${n.hp_current}/${maxHpFromCon(gid, n.con)}`);
+    }
+  }
+  return { content: lines.join('\n').slice(0, 1990), page: p, pages, total, compact, cat };
+}
+
+// ◀ ▶ and the view toggle. Everything the press needs is in the id:
+// npclist:<page>:<c|f>:<category, colons and all>.
+function npcPageRows(pg) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  if (pg.pages <= 1 && pg.total <= NPC_PAGE_FULL) return [];
+  const id = (page, compact) => `npclist:${page}:${compact ? 'c' : 'f'}:${pg.cat}`.slice(0, 100);
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(id(pg.page - 1, pg.compact)).setLabel('◀').setStyle(ButtonStyle.Secondary).setDisabled(pg.page === 0),
+    new ButtonBuilder().setCustomId('npcpage').setLabel(`${pg.page + 1} / ${pg.pages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId(id(pg.page + 1, pg.compact)).setLabel('▶').setStyle(ButtonStyle.Secondary).setDisabled(pg.page >= pg.pages - 1),
+    new ButtonBuilder().setCustomId(id(0, !pg.compact))
+      .setLabel(pg.compact ? '📖 Full sheets' : '🔤 Names only').setStyle(ButtonStyle.Primary),
+  );
+  return [row];
+}
+
 function getCategoriesForNpc(gid, npcName) {
   return db.prepare('SELECT category FROM npc_category_members WHERE guild_id=? AND npc_name=? ORDER BY category').all(gid, npcName).map(r=>r.category);
 }
@@ -4506,6 +4584,9 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('questplanning').setDescription('A private GM forum — /quest create opens a planning thread there')
       .addChannelOption(o=>o.setName('channel').setDescription('The GM-only forum channel').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = stop making planning threads').setRequired(false)));
+      g.addSubcommand(s=>s.setName('questinstances').setDescription('A forum where each STARTED quest opens a room for its party and DM')
+      .addChannelOption(o=>o.setName('channel').setDescription('The instance forum').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop opening rooms').setRequired(false)));
       g.addSubcommand(s=>s.setName('questthreads').setDescription('A secondary forum for per-quest planning threads — the books keep the planning forum to themselves')
       .addChannelOption(o=>o.setName('channel').setDescription('The forum channel for quest threads').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = quest threads open in the planning forum again').setRequired(false)));
@@ -4820,8 +4901,9 @@ const slashCommands = [
           {name:'🦉 Wisdom (WIS)',value:'wis'},
           {name:'🍀 Luck (LCK)',value:'lck'}))
       .addBooleanOption(o=>o.setName('remove').setDescription('true = strip Hero status from this NPC').setRequired(false)))
-    .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server')
-      .addStringOption(o=>o.setName('category').setDescription('Only show NPCs in this category').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server — paged, with a names-only view for big rosters')
+      .addStringOption(o=>o.setName('category').setDescription('Only show NPCs in this category').setRequired(false).setAutocomplete(true))
+      .addBooleanOption(o=>o.setName('compact').setDescription('true = names only, sixty to a page — for finding who exists').setRequired(false)))
     .addSubcommand(s=>s.setName('export').setDescription('An NPC as a woven parchment PDF — it survives Discord and imports anywhere')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('import').setDescription('Bring an exported NPC PDF onto this server — applied directly, you are the approver')
@@ -5028,6 +5110,7 @@ const slashCommands = [
                     {name:'🧩 Puzzle & investigation',value:'puzzle'},{name:'🗺️ Sandbox — led by the players',value:'sandbox'})))
     .addSubcommand(s=>s.setName('instance').setDescription('Run your own copy of a quest, separate from anyone else\'s (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest to copy').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('label').setDescription('What to call this run, e.g. Blackfen party — shown beside the number').setRequired(false))
       .addStringOption(o=>o.setName('gm_style').setDescription('How you run a table, so players know what to expect').setRequired(false)
         .addChoices({name:'⚙️ Mechanics-focused',value:'mechanics'},{name:'🎭 Roleplay-focused',value:'rp'},
                     {name:'⚖️ Mixed elements',value:'mixed'},{name:'⚔️ Combat-heavy',value:'combat'},
@@ -5075,6 +5158,13 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)));
       return g;
     })
+    .addSubcommand(s=>s.setName('handoff').setDescription('Hand this quest to another GM — they become its DM (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
+      .addUserOption(o=>o.setName('gm').setDescription('The GM taking it over').setRequired(true)))
+    .addSubcommand(s=>s.setName('rally').setDescription('Call the party together — pings everyone on this quest (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('message').setDescription('What to tell them — when, where, what to bring').setRequired(false))
+      .addBooleanOption(o=>o.setName('here').setDescription('true = rally in this channel instead of the party\'s room').setRequired(false)))
     .addSubcommand(s=>s.setName('runchannel').setDescription('Set where this quest is run and rewarded (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addChannelOption(o=>o.setName('channel').setDescription('Thread or channel (defaults to here)').setRequired(false)))
@@ -5927,7 +6017,7 @@ async function handleGmTest(interaction) {
       .all(gid, GMTEST_PREFIX + '%');
     if (!quests.length && !npcs.length) return interaction.reply({ content: '🧪 Nothing has been made by `/gm test`.', ephemeral: true });
     const lines = ['🧪 **Test data**', ''];
-    for (const q of quests) lines.push(`📜 #${String(q.number).padStart(3, '0')} ${q.name} — ${q.status}`);
+    for (const q of quests) lines.push(`📜 ${questTag(q)} — ${q.status}`);
     for (const npcRow of npcs) lines.push(`🎭 ${npcRow.name}`);
     return replyLong(interaction, lines, { ephemeral: true });
   }
@@ -6033,9 +6123,9 @@ async function handleStory(interaction) {
     const { ModalBuilder, ActionRowBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
     const modal = new ModalBuilder().setCustomId('activitycreate').setTitle('Write an activity').addComponents(
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('script')
-        .setLabel('Your [ACTIVITY] script')
+        .setLabel('Your script — over 4000? use file:')
         .setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(4000)
-        .setPlaceholder('[ACTIVITY] Fishing\nSCENE find\nSAY 🎣 You survey the water...\nROLL wis DC12\n  PASS -> cast\n  FAIL -> find\n\u2026over 4000 chars? attach a .txt via file: instead')),
+        .setPlaceholder('[ACTIVITY] Fishing\nSCENE find\nSAY 🎣 You survey the water...\nROLL wis DC12\n  PASS -> cast')),
     );
     return interaction.showModal(modal);
   }
@@ -6541,6 +6631,26 @@ async function handleConfig(interaction, forced) {
     ].join('\n') });
   }
 
+  if (sub === 'questinstances') {
+    if (interaction.options?.getBoolean?.('disable')) {
+      setConfig(gid, { quest_instance_forum: null });
+      return interaction.reply({ content: '⚔️ Started quests will no longer open a room. Existing rooms stay where they are.' });
+    }
+    const channel = (forced?.channel ?? interaction.options?.getChannel?.('channel'));
+    if (!channel) {
+      const cur = getConfig(gid)?.quest_instance_forum;
+      return interaction.reply({ ephemeral: true, content: cur
+        ? `⚔️ Each started quest opens its party's room in <#${cur}>.`
+        : '⚔️ No instance forum set — started quests use their run channel. `/config channels questinstances channel:#your-forum` gives every party its own room.' });
+    }
+    if (channel.type !== 15) {
+      return interaction.reply({ ephemeral: true, content:
+        `❌ <#${channel.id}> is not a forum channel. Make a **Forum** — each started quest opens a thread there for its party and DM.` });
+    }
+    setConfig(gid, { quest_instance_forum: channel.id });
+    return interaction.reply({ content: `⚔️ Started quests now open their party's room in <#${channel.id}> — the DM and every member pulled in, the clock and reminders following them there.` });
+  }
+
   if (sub === 'questthreads') {
     if (interaction.options?.getBoolean?.('disable')) {
       setConfig(gid, { quest_thread_forum: null });
@@ -6913,9 +7023,12 @@ async function handleConfig(interaction, forced) {
     await interaction.deferReply({ ephemeral: true });
     try {
       // Gather webhook IDs currently in use by NPCs
-      const activeWebhookIds = new Set(
-        db.prepare('SELECT webhook_id FROM npcs WHERE guild_id=? AND webhook_id IS NOT NULL').all(gid).map(r => r.webhook_id)
-      );
+      // In use = the channel voices DDice speaks through now. Everything
+      // else is a leftover from the old one-hook-per-NPC scheme and can go —
+      // which is what frees a channel sitting at Discord's cap of fifteen.
+      const activeWebhookIds = new Set([
+        ...db.prepare('SELECT webhook_id FROM npc_webhooks WHERE guild_id=? AND npc_name=?').all(gid, SHARED_HOOK).map(r => r.webhook_id),
+      ].filter(Boolean));
       let removed = 0, checked = 0;
       // Scan all text channels for webhooks created by this bot
       const channels = await interaction.guild.channels.fetch();
@@ -6932,7 +7045,9 @@ async function handleConfig(interaction, forced) {
           }
         }
       }
-      return interaction.editReply({ content: `🧹 Webhook cleanup complete. Checked ${checked} bot webhook(s), removed ${removed} orphaned one(s).` });
+      // Rows pointing at hooks we just deleted would send into the void.
+      try { db.prepare('DELETE FROM npc_webhooks WHERE guild_id=? AND npc_name<>?').run(gid, SHARED_HOOK); } catch {}
+      return interaction.editReply({ content: `🧹 Webhook cleanup complete. Checked ${checked} bot webhook(s), removed ${removed} spare one(s).\n_DDice now speaks through one shared webhook per channel, so NPCs no longer eat Discord's limit of fifteen._` });
     } catch (err) {
       console.error('Webhook cleanup error:', err);
       return interaction.editReply({ content: `❌ Cleanup failed: ${err.message}` });
@@ -8331,6 +8446,8 @@ async function handleCheck(interaction) {
     ['📌 Quest board forum', cfg.quest_forum, '`/config channels questforum channel:#forum`', null, 'questforum'],
     ['🗺️ GM quest planning forum', cfg.quest_plan_forum, '`/config channels questplanning channel:#gm-forum`',
       Object.keys(planBooks).length ? `${Object.keys(planBooks).length} books` : null, 'questplanning'],
+    ['⚔️ Quest instance forum', cfg.quest_instance_forum, '`/config channels questinstances channel:#` (optional — a room per running party)',
+      null, 'questinstances'],
     ['🧵 Quest threads forum', cfg.quest_thread_forum, '`/config channels questthreads channel:#` (optional — threads default into the planning forum)',
       cfg.quest_thread_forum ? 'per-quest threads + stage tags' : null, 'questthreads'],
     ['📜 Roll audit', auditR.forum ?? cfg.roll_audit_channel_id,
@@ -8675,6 +8792,16 @@ async function routeButton(interaction) {
     if (interaction.customId.startsWith('tradeok:') || interaction.customId.startsWith('tradeno:')) return handleMeritTradeButton(interaction);
     if (interaction.customId.startsWith('revive:')) return handleReviveButton(interaction);
     if (/^duel(join|out|send|cancel|ok|no):/.test(interaction.customId)) return handleDuelButton(interaction);
+    if (interaction.customId.startsWith('npclist:')) {
+      if (!(await isGm(interaction.guild, interaction.user.id))) {
+        return interaction.reply({ content: '❌ The NPC roster is a GM view.', ephemeral: true });
+      }
+      const parts = interaction.customId.split(':');
+      const pg = buildNpcPage(interaction.guild.id,
+        { page: parseInt(parts[1]) || 0, compact: parts[2] === 'c', cat: parts.slice(3).join(':') });
+      if (!pg) return interaction.reply({ content: '❌ That category is gone now.', ephemeral: true });
+      return interaction.update({ content: pg.content, components: npcPageRows(pg) });
+    }
     if (interaction.customId.startsWith('dcroll:')) return runDcRollPress(interaction);
     if (interaction.customId.startsWith('promoteok:')) {
       if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ Only GMs promote.', ephemeral: true });
@@ -8814,7 +8941,7 @@ client.on('interactionCreate', async interaction => {
         const choices = rows
           .filter(q => !typed || String(q.number).includes(typed) || (q.name || '').toLowerCase().includes(typed))
           .slice(0, 25)
-          .map(q => ({ name: `#${String(q.number).padStart(3, '0')} — ${q.name} (${q.status})`.slice(0, 100), value: q.number }));
+          .map(q => ({ name: `${questTag(q)} (${q.status})`.slice(0, 100), value: q.number }));
         // An honest empty state beats Discord's "No options match your search".
         if (!choices.length) return await interaction.respond([{
           name: rows.length ? '— nothing matches that — clear it to see every quest —'
@@ -10736,7 +10863,7 @@ async function postAsNpc(channel, gid, npcName, content) {
     // A stored webhook can be deleted server-side; drop it and retry once.
     console.error('postAsNpc webhook error:', err.message);
     try {
-      db.prepare('DELETE FROM npc_webhooks WHERE guild_id=? AND channel_id=? AND npc_name=?').run(gid, channel.id, npcName);
+      forgetChannelWebhook(gid, channel);
       const fresh = await npcWebhookIn(channel, gid, npcName, npc?.image_url);
       const sent2 = await fresh.send({ content, username: npcName, avatarURL: npc?.image_url ?? BLANK_AVATAR });
       return sent2 ?? true;
@@ -13472,25 +13599,14 @@ async function handleNpc(interaction) {
   }
 
   if (sub === 'list') {
-    let npcs = getAllNpcs(gid);
-    if (!npcs.length) return interaction.reply({ content: '❌ No NPCs created yet. Use `/npc create` to add one.', ephemeral: true });
     const wantCat = (interaction.options.getString('category') || '').trim();
-    let header = '**🎭 NPCs on this server:**';
-    if (wantCat) {
-      const cat = getCategories(gid).find(c => c.toLowerCase() === wantCat.toLowerCase());
-      if (!cat) return interaction.reply({ content: `❌ No category named **${wantCat}**. Categories: ${getCategories(gid).join(', ') || 'none'}.`, ephemeral: true });
-      const members = new Set(getNpcsInCategory(gid, cat));
-      npcs = npcs.filter(n => members.has(n.name));
-      if (!npcs.length) return interaction.reply({ content: `📁 Category **${cat}** has no NPCs.`, ephemeral: true });
-      header = `**🎭 NPCs — 📁 ${cat}:**`;
-    }
-    const lines = [header, ''];
-    npcs.forEach(n => {
-      const order = n.order_name ? ` ${KNIGHT_EMOJIS[n.order_name]??'⚪'} ${n.order_name}` : '';
-      const img = n.image_url ? ' 🖼️' : '';
-      lines.push(`• **${n.name}**${order}${img} — STR ${n.str} CON ${n.con} DEX ${n.dex} WIS ${n.wis} LCK ${n.lck} | ❤️ ${n.hp_current}/${maxHpFromCon(gid, n.con)}`);
-    });
-    return replyLong(interaction, lines);
+    const compact = interaction.options.getBoolean('compact') ?? false;
+    const pg = buildNpcPage(gid, { page: 0, compact, cat: wantCat });
+    if (!pg) return interaction.reply({ content: `❌ No category named **${wantCat}**. Categories: ${getCategories(gid).join(', ') || 'none'}.`, ephemeral: true });
+    if (!pg.total) return interaction.reply({ ephemeral: true, content: wantCat
+      ? `📁 Category **${wantCat}** has no NPCs.`
+      : '❌ No NPCs created yet. Use `/npc create` to add one.' });
+    return interaction.reply({ content: pg.content, components: npcPageRows(pg) });
   }
 
   if (sub === 'categorycreate') {
@@ -13603,17 +13719,10 @@ async function handlePr(interaction) {
     try {
       const { WebhookClient } = require('discord.js');
       await interaction.deferReply({ ephemeral: true });
-      let webhookClient;
-      if (npc.webhook_id && npc.webhook_token) {
-        webhookClient = new WebhookClient({ id: npc.webhook_id, token: npc.webhook_token });
-      } else {
-        const prChan = await interactionChannel(interaction);
-        if (!prChan) return interaction.editReply({ content: '❌ I can\'t access this channel.' }).catch(()=>{});
-        const webhook = await prChan.createWebhook({ name: npc.name, avatar: npc.image_url ?? BLANK_AVATAR, reason: `NPC webhook for ${npc.name}` });
-        setNpcWebhook(gid, npc.name, webhook.id, webhook.token);
-        webhookClient = new WebhookClient({ id: webhook.id, token: webhook.token });
-      }
-      await webhookClient.send({ content: content2, username: npc.name, avatarURL: npc.image_url ?? BLANK_AVATAR });
+      const prChan = await interactionChannel(interaction);
+      if (!prChan) return interaction.editReply({ content: '❌ I can\'t access this channel.' }).catch(()=>{});
+      const webhookClient = await npcWebhookIn(prChan, gid, npc.name, npc.image_url);
+      await webhookClient.send({ content: content2 });
       return interaction.editReply({ content: `✅ Rerolled as **${npc.name}**. Rerolls remaining: ${updatedNpc.lck}` });
     } catch (err) {
       console.error('Webhook error:', err);
@@ -14041,10 +14150,7 @@ const HELP_CATEGORIES = {
       '`/quest create` — bare, a five-field writing window opens (add `from:N` to seed it from an existing quest); with `name:` everything stays inline (GM)',
       '`/quest edit number:N` — the same window, prefilled — the natural editor; renames follow onto the board and planning threads. Numeric options (`merit_reward:` etc.) apply directly without the window (GM)',
       '`/quest post number:N [channel]` — post it with an Apply button; with a quest forum set, this opens the quest\'s own board thread (GM)',
-      '`/gm dc target:@a` (no `dc:`) — opens a writing window: the scene, the check line (`dex 14 hidden`), and an on-success and on-failure box that each take `[adv] [dis] [bare] [dex-1] [-3hp]` tags before the words (GM)',
-      '`/gm dc stat: dc: targets:@a @b` — call a check: each target gets a roll button; `mode:` sets how they roll it — advantage, disadvantage, or a bare d20 that strips stat and signature; `modifier:` adjusts the total, `flavour:` sets the scene; `success_flavour:`/`fail_flavour:` are revealed with each result; `success_sanction:`/`fail_sanction:` shift a stat by decree (e.g. `dex-1`); `fail_damage:`/`success_damage:` cost HP on that outcome; `on_success:`/`on_fail:` mark their next roll 🔼/🔽 anywhere — fight or free RP, spent by whatever they roll next (🎭 flat stays a fight mark); `secret:true` hides the DC and `reveal:@a` whispers it to chosen eyes (GM)',
-      '`/gm reroll target:@p [stat:] [mode:] [flat:true]` — correct a mistaken roll by decree: replaces their pending fight roll or their last roll here — no token spent, their own reroll right untouched (GM)',
-      '`/gm queue` — everything waiting on a GM, in one place',
+                              '`/gm queue` — everything waiting on a GM, in one place',
       '`/gm search` — find characters by order, class or status (GM)',
       '`/gm kill user:@a` / `/gm revive user:@a` — mark a character fallen and post their memorial, or bring them back (GM)',
       '`/gm test quest/npc/list/clean` — throwaway fixtures for trying things out, and the broom that clears them (GM)',
@@ -14063,8 +14169,12 @@ const HELP_CATEGORIES = {
       '`/quest approve number:N @user [force]` — approve an applicant; `force` overrides a hard cap (GM)',
       '`/quest kick number:N @user` — remove a member/applicant (GM)',
       '`/quest runchannel number:N [channel]` — set where the quest runs & rewards (GM)',
+      '`/quest rally number:N [message:] [here:true]` — call the party together: pings every member in their room, or in this channel with `here:true` (GM)',
+      '`/config channels questinstances channel:#forum` — every started quest opens a room for its party there, DM and members pulled in (Admin)',
+      '`/quest handoff number:N gm:@them` — pass a quest to another GM; they become its DM (GM)',
+      '_The first GM to approve an applicant becomes that quest\'s DM. When approvals reach the party size, that DM is pinged once._',
       '`/quest run start/note/pause/resume/timeline/complete` — the running of a quest: start the clock · log a detail · pause and resume · read the full log so far · finish and reward (GM)',
-      '`/quest instance number:N` — run your own copy of a quest, separate from anyone else\'s (GM)',
+      '`/quest instance number:N [label:]` — run your own copy: it keeps the original\'s number and adds which run it is — `#002.2-Testing the waters · Blackfen party` (GM)',
       '`/quest run start number:N` — lock the party and mark in progress (GM)',
       '`/quest run complete number:N` — finish it; merits auto-awarded, other rewards listed (GM)',
       '`/quest delete number:N` — remove a quest (GM)',
@@ -14101,6 +14211,7 @@ const HELP_CATEGORIES = {
       '`/npc roll category:X name:Y notation:1d20 stat:STR` — roll as an NPC',
       '`/npc reroll name:X` — reroll an NPC\'s last roll here (spends one of its LCK tokens)',
       '`/npc sheet name:X` — an NPC\'s full record: stats, standing, inventory, rolls, lore',
+      '`/npc list [category:] [compact:true]` — the roster, paged: ◀ ▶ turn the pages, and a button swaps between full stats and names only',
       '`/npc give/take name:X item:Y` — hand an item to an NPC, or take one from it · `/npc npclore` writes its lore',
       '💡 Upload an image to the NPC channel with the NPC name to set an avatar',
     ],
@@ -14110,6 +14221,14 @@ const HELP_CATEGORIES = {
     blurb: 'server wiring — roles, approvals, audits, backups',
     body: [
       '_Server wiring: roles, approvals, audits, rests, backups. Admins always count as GMs._',
+      '`/gm dc target:@a` (no `dc:`) — opens a writing window: the scene, the check line (`dex 14 hidden`), and an on-success and on-failure box that each take `[adv] [dis] [bare] [dex-1] [-3hp]` tags before the words (GM)',
+
+      '`/gm dc stat: dc: targets:@a @b` — call a check: each target gets a roll button, named NPCs roll at once. `mode:` advantage, disadvantage or a bare d20 that strips stat and signature; `modifier:` adjusts the total; `flavour:` sets the scene; `secret:true` hides the DC, `reveal:@a` whispers it to chosen eyes (GM)',
+
+      '↳ _Outcomes:_ `success_flavour:`/`fail_flavour:` are revealed with each result · `success_sanction:`/`fail_sanction:` shift a stat (`dex-1`) · `fail_damage:`/`success_damage:` cost HP · `on_success:`/`on_fail:` mark their next roll 🔼/🔽 anywhere, fight or free RP (🎭 flat stays a fight mark)',
+
+      '`/gm reroll target:@p [stat:] [mode:] [flat:true]` — correct a mistaken roll by decree: replaces their pending fight roll or their last roll here — no token spent, their own reroll right untouched (GM)',
+
       '`/config mechanics gmrole role:@Role` — add a GM role · `remove:true` · `replace:true` · omit to list',
       '_Server admins (Manage Server) always count as GMs._',
       '`/config mechanics heal charges:N` — set default heal charges',
@@ -14136,7 +14255,7 @@ const HELP_CATEGORIES = {
       '`/config mechanics npcstats enabled:true` — reveal NPC stat blocks on roll cards · hidden by default (Admin)',
       '`/config channels npcchannel #channel` — set the NPC avatar channel',
       '`/config mechanics rest type:Short Rest hp:50% rerolls:0%` — tune what a rest restores (use % of max or a flat number)',
-      '`/config mechanics cleanwebhooks` — remove orphaned NPC webhooks',
+      '`/config mechanics cleanwebhooks` — reclaim spare NPC webhooks; DDice speaks through one shared webhook per channel, so anything else it owns there can be freed',
       '`gmr` / `gmrs 1d20+5` — public / secret GM roll',
       '`/gm backup now` — export the database · `/gm backup auto` — daily backups',
       '`/char stat` — show stat descriptions · `/help` — this menu',
@@ -15416,6 +15535,48 @@ async function sweepCreateCard(client, gid, quest) {
   updateQuest(gid, quest.number, { create_msg_id: null, create_channel_id: null });
 }
 
+// Enough hands. Said once per quest, in the planning thread, to whoever
+// holds it — approving the sixth of five shouldn't nag twice.
+async function nudgeIfPartyFull(client, gid, quest) {
+  if (!quest?.party_size || quest.full_pinged) return;
+  const party = getQuestMembers(gid, quest.number, 'party');
+  if (party.length < quest.party_size) return;
+  updateQuest(gid, quest.number, { full_pinged: 1 });
+  const who = quest.gm_id ? `<@${quest.gm_id}>` : 'GMs';
+  await announceStage(client, gid, getQuest(gid, quest.number),
+    `👥 **Party full** — ${party.length}/${quest.party_size}. ${who}, start it with \`/quest run start number:${quest.number}\` when you're ready.`);
+}
+
+// The party's own room. One thread per started quest in the instance forum,
+// the DM and every member pulled in by mention so it lands in their sidebar.
+// Best-effort: no forum, no room, and the quest runs exactly as before.
+async function openRunThread(client, guild, gid, quest) {
+  const forumId = getConfig(gid)?.quest_instance_forum;
+  if (!forumId || quest.run_thread_id) return null;
+  try {
+    const forum = await client.channels.fetch(forumId);
+    if (!forum || forum.type !== 15) return null;
+    const party = getQuestMembers(gid, quest.number, 'party');
+    const roll = [];
+    for (const id of party) roll.push(`<@${id}>`);
+    const thread = await forum.threads.create({
+      name: questTag(quest).slice(0, 100),
+      autoArchiveDuration: 10080,
+      message: { content: [
+        `⚔️ **${questTag(quest)}** — the party assembles.`,
+        quest.gm_id ? `🎲 DM: <@${quest.gm_id}>` : '',
+        roll.length ? `👥 ${roll.join(' ')}` : '',
+        '', '_This is your room: rolls, planning and the run itself. `/quest rally` calls everyone back._',
+      ].filter(Boolean).join('\n'), allowedMentions: { users: [...party, ...(quest.gm_id ? [quest.gm_id] : [])] } },
+    });
+    updateQuest(gid, quest.number, { run_thread_id: thread.id, run_channel_id: thread.id });
+    return thread;
+  } catch (err) {
+    console.error('[quest] instance thread failed -', err?.message || err);
+    return null;
+  }
+}
+
 // Stage tag + book entry in one call — the single pipeline sync.
 async function syncQuestPipeline(client, guild, gid, quest) {
   await syncPlanStage(client, gid, quest);
@@ -15786,12 +15947,17 @@ async function handleQuest(interaction, forced) {
       return interaction.reply({ content: `❌ Party is at the hard cap (${quest.party_size}). Re-run with \`force:true\` to override.`, ephemeral: true });
     }
     setQuestMember(gid, number, target.id, 'party');
+    // Whoever opens the door runs the room — unless a GM already holds it.
+    let tookIt = false;
+    if (!quest.gm_id) { updateQuest(gid, number, { gm_id: uid }); tookIt = true; }
     await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, number));
     const nm = await getDisplayName(interaction.guild, target.id);
     const over = quest.party_size && party.length + 1 > quest.party_size ? ' (over suggested size)' : '';
     await questAnnounce(interaction.client, getQuest(gid, number), `✅ **${nm}** joins the party${over}.`);
     await syncQuestBook(interaction.client, interaction.guild, gid, getQuest(gid, number));
-    return interaction.reply({ content: `✅ **${nm}** added to **${questTag(quest)}**${over}.` });
+    await nudgeIfPartyFull(interaction.client, gid, getQuest(gid, number));
+    return interaction.reply({ content: `✅ **${nm}** added to **${questTag(quest)}**${over}.`
+      + (tookIt ? `\n🎲 You're the DM for this one now — \`/quest handoff\` passes it to another GM.` : '') });
   }
 
   if (sub === 'kick') {
@@ -15808,6 +15974,51 @@ async function handleQuest(interaction, forced) {
     return interaction.reply({ content: `👢 Removed **${nm}** from **${questTag(quest)}**.` });
   }
 
+  if (sub === 'handoff') {
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const target = interaction.options?.getUser?.('gm');
+    if (!(await isGm(interaction.guild, target.id))) {
+      return interaction.reply({ content: `❌ <@${target.id}> isn't a GM here — give them the GM role first.`, ephemeral: true });
+    }
+    if (quest.gm_id === target.id) return interaction.reply({ content: 'They already run it.', ephemeral: true });
+    updateQuest(gid, quest.number, { gm_id: target.id });
+    const fresh = getQuest(gid, quest.number);
+    await refreshQuestPost(interaction.client, interaction.guild, fresh);
+    await syncQuestBook(interaction.client, interaction.guild, gid, fresh);
+    const line = `🎲 **${questTag(quest)}** is now run by <@${target.id}>.`;
+    await announceStage(interaction.client, gid, fresh, line);
+    if (fresh.run_thread_id) {
+      try {
+        const th = await interaction.client.channels.fetch(fresh.run_thread_id);
+        if (th?.isThread?.()) { if (th.archived) await wakeThread(th); await th.send({ content: line, allowedMentions: { users: [target.id] } }); }
+      } catch { /* the room may be gone */ }
+    }
+    return interaction.reply({ content: line, allowedMentions: { users: [target.id] } });
+  }
+
+  if (sub === 'rally') {
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const party = getQuestMembers(gid, quest.number, 'party');
+    if (!party.length) return interaction.reply({ content: '❌ Nobody on the party yet.', ephemeral: true });
+    const note = interaction.options?.getString?.('message');
+    const here = interaction.options?.getBoolean?.('here') ?? false;
+    const lines = [`📣 **${questTag(quest)}** — ${party.map(id => `<@${id}>`).join(' ')}`];
+    if (quest.gm_id) lines.push(`🎲 Your DM: <@${quest.gm_id}>`);
+    lines.push(note ? `\n${note}` : '\n_Called to gather._');
+    const payload = { content: lines.join('\n'), allowedMentions: { users: party } };
+    let where = null;
+    if (!here && quest.run_thread_id) {
+      try {
+        const th = await interaction.client.channels.fetch(quest.run_thread_id);
+        if (th?.isThread?.()) { if (th.archived) await wakeThread(th); await th.send(payload); where = th.id; }
+      } catch { /* the room is gone — fall back to here */ }
+    }
+    if (where) return interaction.reply({ ephemeral: true, content: `📣 Rallied ${party.length} in <#${where}>.` });
+    return interaction.reply(payload);
+  }
+
   if (sub === 'start') {
     const quest = await requireQuest(interaction, gid);
     if (!quest) return;
@@ -15822,11 +16033,14 @@ async function handleQuest(interaction, forced) {
       // Whoever starts it is running it, unless one was already recorded.
       gm_id: quest.gm_id ?? uid });
     logQuestEvent(gid, number, 'start', `Quest begins — ${party.length} on the party`, uid);
-    await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, number));
-    await questAnnounce(interaction.client, getQuest(gid, number), `▶️ **Quest begins** — ${party.length} on the party. The clock is running.`);
+    const room = await openRunThread(interaction.client, interaction.guild, gid, getQuest(gid, number));
+    const fresh = getQuest(gid, number);
+    await refreshQuestPost(interaction.client, interaction.guild, fresh);
+    await questAnnounce(interaction.client, fresh, `▶️ **Quest begins** — ${party.length} on the party. The clock is running.${room ? ` The party gathers in <#${room.id}>.` : ''}`);
     return interaction.reply({ content:
       `🟡 **${questTag(quest)}** is now in progress with ${party.length} member${party.length === 1 ? '' : 's'}. Applications are closed.\n`
-      + `⏱️ The clock is running${quest.run_channel_id ? ` in <#${quest.run_channel_id}>` : ' — set a channel with `/quest runchannel` for reminders'}.` });
+      + (room ? `🚪 The party's room: <#${room.id}> — the clock and reminders run there. \`/quest rally\` calls them back.`
+              : `⏱️ The clock is running${fresh.run_channel_id ? ` in <#${fresh.run_channel_id}>` : ' — set a channel with `/quest runchannel` for reminders, or a forum with `/config channels questinstances` for a room per party'}.`) });
   }
 
   // A quest row carries one party, one clock and one status, so two GMs running
@@ -15841,10 +16055,17 @@ async function handleQuest(interaction, forced) {
       rewards: src.rewards, merit_reward: src.merit_reward,
       party_size: src.party_size, party_hard: src.party_hard, created_by: uid,
     });
+    // Which run of this adventure is this? The original is 1; every copy
+    // takes the next free seat, so deleting run 2 doesn't make two run 3s.
+    const root = src.instance_of ?? from;
+    const seqs = db.prepare('SELECT run_seq FROM quests WHERE guild_id=? AND instance_of=?').all(gid, root)
+      .map(r => r.run_seq).filter(Number.isFinite);
     updateQuest(gid, number, {
       gm_id: uid,
       gm_style: interaction.options?.getString?.('gm_style') ?? src.gm_style ?? null,
-      instance_of: src.instance_of ?? from,
+      instance_of: root,
+      run_seq: (seqs.length ? Math.max(...seqs) : 1) + 1,
+      run_label: (interaction.options?.getString?.('label') || '').trim() || null,
     });
     const quest = getQuest(gid, number);
     const siblings = db.prepare('SELECT COUNT(*) AS c FROM quests WHERE guild_id=? AND (number=? OR instance_of=?)')
