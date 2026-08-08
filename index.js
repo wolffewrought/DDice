@@ -10928,7 +10928,12 @@ function recordExchange(log, ensure, attackerId, defenderId, atkNat, defNat, hit
 // fighter, the damage ledger, and the full blow-by-blow of every exchange.
 // Pass { rolls: false } to omit the blow-by-blow.
 async function buildFightRecap(guild, gid, log, opts = {}) {
-  const entries = Object.entries(log?.f ?? {});
+  // Only the fighters who actually took part. Someone added to the roster
+  // who never swung, defended or took a scratch is not part of this story —
+  // they'd otherwise appear with a row of zeroes.
+  const entries = Object.entries(log?.f ?? {}).filter(([, st]) =>
+    (st.atk?.n ?? 0) || (st.def?.n ?? 0) || (st.dealt ?? 0) || (st.taken ?? 0)
+    || (st.crit ?? 0) || (st.fumble ?? 0));
   if (!entries.length) return [];
   const ex = log.exchanges ?? 0;
   const lines = ['', `📜 **Fight Recap** — ${ex} exchange${ex === 1 ? '' : 's'}`];
@@ -12521,6 +12526,7 @@ async function handleFight(interaction, forced) {
         def_roll: null, def_nat: null, def_stat: null,
         hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState),
         floor_hp: floor,
+        log_state: '{}',   // a new fight, a new recap — never the last one's
       });
       return interaction.reply({ content: lines.join('\n') });
     }
@@ -12565,6 +12571,7 @@ async function handleFight(interaction, forced) {
       def_roll: null, def_nat: null, def_stat: null,
       hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState),
       floor_hp: floor,
+      log_state: '{}',   // a new fight, a new recap
     });
 
     return interaction.reply({ content: lines.join('\n') });
@@ -12860,6 +12867,7 @@ async function handleFight(interaction, forced) {
         atk_roll: null, atk_nat: null, atk_stat: null,
         def_roll: null, def_nat: null, def_stat: null,
         hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState), auto_npc: 1,
+        log_state: '{}',   // a new fight, a new recap
         floor_hp: floor,
       });
       const lines = [`⚔️ **${W.started} (NPCs auto-piloted)**`, ...(banner ? [banner] : []), '', '**Initiative:**'];
