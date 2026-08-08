@@ -5,6 +5,13 @@
 
 require('dotenv').config();
 const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, MessageFlags, REST, Routes } = require('discord.js');
+
+// Refusals said often enough that they deserve one home.
+const MSG_NO_ACCESS_FULL = '❌ I can\'t access this channel. Check my View Channel and Send Messages permissions.';
+const MSG_NO_ACCESS = '❌ I can\'t access this channel.';
+const MSG_NO_ACCESS_HERE = '❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.';
+const MSG_PICK_TEXT = '❌ Pick a text channel or thread.';
+
 const Database = require('better-sqlite3');
 const path = require('path');
 
@@ -917,7 +924,7 @@ function getHealCharges(gid, uid, max) {
 function setHealCharges(gid, uid, cur) {
   db.prepare('INSERT OR REPLACE INTO heal_charges (guild_id,user_id,current) VALUES (?,?,?)').run(gid, uid, cur);
 }
-// The character card, in one place so /char view show and /char view summary agree.
+// The character card, in one place so every reader of it agrees.
 function buildCharCard(ch, displayName, healNow, maxCharges, gid) {
   const lines = [`⚔️  **${displayName}**`,
     ch.order_name ? `${KNIGHT_EMOJIS[ch.order_name] ?? '⚪'}  ${ch.order_name}` : 'No order set'];
@@ -2788,6 +2795,10 @@ const consumeFooled = (gid, cid, fid) => consumeEffectFlag(gid, cid, fid, 'foole
 // press. Consumed once, replacing the mode outright (signature already
 // folded — even a flat roll can be thrown at advantage). NPC ids pass
 // through untouched: the autopilot rolls its own weather.
+// A GM's mark outranks a situational penalty: if a fighter was knocked
+// off-balance (flat) AND carries a 🔼, they roll flat-stat at advantage.
+// Deliberate — a decree should beat a circumstance — and said out loud on
+// the card so nobody thinks the penalty was forgotten.
 function applyNextMark(gid, uid, mode) {
   if (!uid || String(uid).startsWith('npc_')) return mode;
   const ch = getChar(gid, uid);
@@ -4804,12 +4815,12 @@ const slashCommands = [
       .addStringOption(o=>o.setName('summary').setDescription('Or paste a [TTRPG SHEET] or [TTRPG SUMMARY] block from an export').setRequired(false)))
     .addSubcommandGroup(g => {
       g.setName('view').setDescription('Read a character — sheet, standing, history, lore, inventory, summary');
-      g.addSubcommand(s=>s.setName('show').setDescription('Display a character card').addUserOption(o=>o.setName('user').setDescription('User to show').setRequired(false)));
-      g.addSubcommand(s=>s.setName('summary').setDescription('Everything about a character on one page')
-      .addUserOption(o=>o.setName('user').setDescription('Whose character').setRequired(false)));
+      g.addSubcommand(s=>s.setName('show').setDescription('Display a character card').addUserOption(o=>o.setName('user').setDescription('User to show').setRequired(false))
+      .addBooleanOption(o=>o.setName('full').setDescription('true = the whole page — standing, items, lore and rolls too').setRequired(false)));
+
       g.addSubcommand(s=>s.setName('inventory').setDescription('Items a character is carrying')
       .addUserOption(o=>o.setName('user').setDescription('Whose inventory').setRequired(false)));
-      g.addSubcommand(s=>s.setName('standing').setDescription('Merit and renown, and where each came from')
+      g.addSubcommand(s=>s.setName('standing').setDescription('Merit, renown and rank in one place — the short version of /standing')
       .addUserOption(o=>o.setName('user').setDescription('Whose standing').setRequired(false)));
       g.addSubcommand(s=>s.setName('rollhistory').setDescription('Every natural die this character has ever rolled')
       .addUserOption(o=>o.setName('user').setDescription('Whose rolls').setRequired(false))
@@ -5183,7 +5194,7 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('roster').setDescription('Show a quest\'s applicants and party')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('log').setDescription('Completed quests a player was on')
+    .addSubcommand(s=>s.setName('record').setDescription('One player\'s finished quests — what they have been on')
       .addUserOption(o=>o.setName('user').setDescription('Player (defaults to you)').setRequired(false)))
     .addSubcommand(s=>s.setName('approve').setDescription('Approve an applicant onto the party (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
@@ -5233,7 +5244,7 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
       .addBooleanOption(o=>o.setName('remove').setDescription('true = detach instead').setRequired(false)))
-    .addSubcommand(s=>s.setName('history').setDescription('A quest\'s run ledger — completion count, GMs, parties, NPCs')
+    .addSubcommand(s=>s.setName('runs').setDescription('One adventure\'s ledger — every time it was run, by whom, with whom')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number (any instance)').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('stage').setDescription('Move a quest through the planning pipeline (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
@@ -6398,7 +6409,7 @@ async function handleConfig(interaction, forced) {
         ? `📋 New sheets await approval in <#${cur}>. Turn off with \`/config channels approvals disable:true\`.`
         : '📋 Sheet approval is **off**. Set a channel with `/config channels approvals channel:#x`.', ephemeral: true });
     }
-    if (!channel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
+    if (!channel.isTextBased?.()) return interaction.reply({ content: MSG_PICK_TEXT, ephemeral: true });
     setConfig(gid, { approval_channel_id: channel.id });
     return interaction.reply({ content: `📋 New character sheets will await GM approval in <#${channel.id}>.\n⚠️ Players can't roll or fight until approved, and stats become GM-only once a sheet exists.` });
   }
@@ -6613,7 +6624,7 @@ async function handleConfig(interaction, forced) {
       } catch (e) { reach = `❌ cannot access — ${e?.message || e}`; }
       return interaction.reply({ content: `🎲 Audit channel: <#${cur}>\nStored id: \`${cur}\`\nBot access: ${reach}\n\nSend a live test with \`/config channels rollaudit test:true\`.`, ephemeral: true });
     }
-    if (!channel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
+    if (!channel.isTextBased?.()) return interaction.reply({ content: MSG_PICK_TEXT, ephemeral: true });
     setConfig(gid, { roll_audit_channel_id: channel.id });
     return interaction.reply({ content: `🎲 Rolls will be mirrored to <#${channel.id}> — raw input, result, and a jump link.\nCovers player rolls **and GM rolls, including secret ones**, so GMs are accountable to each other.\n⚠️ Make sure that channel's permissions only let GMs view it; the bot can't set that for you.` });
   }
@@ -6679,7 +6690,7 @@ async function handleConfig(interaction, forced) {
     }
     if (hours !== null) fields.hours = hours;
     if (channel) {
-      if (!channel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
+      if (!channel.isTextBased?.()) return interaction.reply({ content: MSG_PICK_TEXT, ephemeral: true });
       fields.channel = channel.id;
     }
     if (!existing && !Object.keys(fields).length) {
@@ -6886,7 +6897,7 @@ async function handleConfig(interaction, forced) {
 
     const fields = {};
     if (channel) {
-      if (!channel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
+      if (!channel.isTextBased?.()) return interaction.reply({ content: MSG_PICK_TEXT, ephemeral: true });
       fields.docs_channel = channel.id;
       fields.docs_msg_id = null;   // a new home means a new standing post
     }
@@ -6955,7 +6966,7 @@ async function handleConfig(interaction, forced) {
         ? `📜 Quest summaries are posted in <#${cur}>.`
         : '📜 No quest log channel set. `/config channels questlog channel:#chronicle`' });
     }
-    if (!channel.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
+    if (!channel.isTextBased?.()) return interaction.reply({ content: MSG_PICK_TEXT, ephemeral: true });
     setConfig(gid, { quest_log_channel: channel.id });
     return interaction.reply({ content: `📜 Finished quests will be written up in <#${channel.id}>, and linked on each player's \`/char view standing\`.` });
   }
@@ -7084,7 +7095,7 @@ async function handleConfig(interaction, forced) {
     const on = interaction.options?.getBoolean?.('enabled');
     setConfig(gid, { quest_spinoff: on ? 1 : 0 });
     return interaction.reply({ content: on
-      ? '⚔️ **Spin-off on.** The first approval on a board quest births a numbered run — `#002.2` — carrying that player and anyone still waiting. The board entry clears for the next group, and the run recruits through the ➕ button in its own room.'
+      ? '⚔️ **Spin-off on.** The first approval on a board quest births a numbered run — `#002.2` — carrying that player and anyone still waiting. The board entry clears for the next group, and the run recruits through the ➕ button in its own room.\n_The "party full" ping now belongs to the runs, not the board — the board never fills, by design._'
       : '📋 **Spin-off off.** Approvals fill the board entry\'s own party, as before.' });
   }
 
@@ -7486,14 +7497,16 @@ async function handleChar(interaction) {
     };
 
     if (sub === 'inventory')   return replyLong(interaction, [`🎒 **${nm}**`, '', ...inventoryLines().slice(1)]);
-    if (sub === 'standing')    return replyLong(interaction, [`**${nm}**`, ...standingLines(), ...questSummaryLines()]);
+    if (sub === 'standing')    return replyLong(interaction, [`**${nm}**`, ...standingLines(), ...questSummaryLines(),
+      '', '_Where each point came from: `/standing renown history` · `/standing merit history`._']);
     if (sub === 'rollhistory') return replyLong(interaction, [`**${nm}**`, ...rollLines(interaction.options.getInteger('sides') ?? 20)]);
     if (sub === 'showlore')    return replyLong(interaction, [`**${nm}**`, ...loreLines()]);
 
-    // summary — the sheet, then every page under it
+    // The card alone, or — with full: — the card and every page under it.
     const cfg = getConfig(gid); const mc = cfg.heal_charges ?? 3;
     const hr = getHealCharges(gid, tid, mc);
     const card = buildCharCard(ch, nm, hr.current, mc, gid);
+    if (!interaction.options?.getBoolean?.('full')) return replyLong(interaction, card);
     const t = rollTally(gid, tid, 20);
     const nat20 = t.by[20] || 0, nat1 = t.by[1] || 0;
     return replyLong(interaction, [...card, '',
@@ -11533,7 +11546,7 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     : interaction.reply({ content, ephemeral: true });
 
   const chan = await interactionChannel(interaction);
-  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  if (!chan) return refuse(MSG_NO_ACCESS_HERE);
 
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
@@ -11701,7 +11714,7 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
   const uid = interaction.user.id;
   const refuse = (content) => interaction.reply({ content, ephemeral: true });
   const chan = await interactionChannel(interaction);
-  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  if (!chan) return refuse(MSG_NO_ACCESS_HERE);
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
   if (isNpcFighter(actorId) && !(await isGm(interaction.guild, uid))) return refuse('❌ Only GMs can act as an NPC.');
@@ -11810,7 +11823,7 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
   const uid = interaction.user.id;
   const refuse = (content) => interaction.reply({ content, ephemeral: true });
   const chan = await interactionChannel(interaction);
-  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  if (!chan) return refuse(MSG_NO_ACCESS_HERE);
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
   if (isNpcFighter(actorId) && !(await isGm(interaction.guild, uid))) return refuse('❌ Only GMs can act as an NPC.');
@@ -11910,7 +11923,7 @@ async function runFightInsight({ interaction, gid, cid, actorId, mode }) {
   const uid = interaction.user.id;
   const refuse = (content) => interaction.reply({ content, ephemeral: true });
   const chan = await interactionChannel(interaction);
-  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  if (!chan) return refuse(MSG_NO_ACCESS_HERE);
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
   if (fight.phase !== 'defend' || fight.atk_kind !== 'feint') return refuse('❌ No feint to see through.');
@@ -11950,7 +11963,7 @@ async function runFightGrappleSave({ interaction, gid, cid, actorId, mode }) {
   const uid = interaction.user.id;
   const refuse = (content) => interaction.reply({ content, ephemeral: true });
   const chan = await interactionChannel(interaction);
-  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  if (!chan) return refuse(MSG_NO_ACCESS_HERE);
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
   if (fight.phase !== 'defend' || fight.atk_kind !== 'grapple') return refuse('❌ No grapple to save against.');
@@ -11988,7 +12001,7 @@ async function runFightEscape({ interaction, gid, cid, actorId, mode }) {
   const uid = interaction.user.id;
   const refuse = (content) => interaction.reply({ content, ephemeral: true });
   const chan = await interactionChannel(interaction);
-  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  if (!chan) return refuse(MSG_NO_ACCESS_HERE);
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
   if (isNpcFighter(actorId) && !(await isGm(interaction.guild, uid))) return refuse('❌ Only GMs can act as an NPC.');
@@ -12126,7 +12139,7 @@ async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId
   const uid = interaction.user.id;
   const refuse = (content) => interaction.reply({ content, ephemeral: true });
   const chan = await interactionChannel(interaction);
-  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  if (!chan) return refuse(MSG_NO_ACCESS_HERE);
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
   if (fight.phase !== 'defend') return refuse('❌ No attack to deflect — nothing is pending.');
@@ -12274,7 +12287,7 @@ async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
   const uid = interaction.user.id;
   const refuse = (content) => interaction.reply({ content, ephemeral: true });
   const chan = await interactionChannel(interaction);
-  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  if (!chan) return refuse(MSG_NO_ACCESS_HERE);
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
   if (fight.phase !== 'defend') return refuse('❌ No attack to disarm — nothing is pending.');
@@ -12377,7 +12390,7 @@ async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
 async function runFightRelease({ interaction, gid, cid, actorId, forceTargetId = null }) {
   const refuse = (content) => interaction.reply({ content, ephemeral: true });
   const chan = await interactionChannel(interaction);
-  if (!chan) return refuse('❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.');
+  if (!chan) return refuse(MSG_NO_ACCESS_HERE);
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
   const gmap = fightGrapples(fight);
@@ -12436,7 +12449,7 @@ async function handleFight(interaction, forced) {
   // interaction.channel can be null (thread / uncached); fetch it lazily so the
   // fight flow can still post its cards and prompts.
   const chan = await interactionChannel(interaction);
-  if (!chan) return interaction.reply({ content: '❌ I can\'t access this channel. Check my View Channel and Send Messages permissions here.', ephemeral: true });
+  if (!chan) return interaction.reply({ content: MSG_NO_ACCESS_HERE, ephemeral: true });
 
   // ── START ──────────────────────────────────────────────────────────────────
   if (sub === 'start') {
@@ -13964,7 +13977,7 @@ async function handlePr(interaction) {
       const { WebhookClient } = require('discord.js');
       await interaction.deferReply({ ephemeral: true });
       const prChan = await interactionChannel(interaction);
-      if (!prChan) return interaction.editReply({ content: '❌ I can\'t access this channel.' }).catch(()=>{});
+      if (!prChan) return interaction.editReply({ content: MSG_NO_ACCESS }).catch(()=>{});
       const webhookClient = await npcWebhookIn(prChan, gid, npc.name, npcFace(gid, npc));
       await webhookClient.send({ content: content2 });
       return interaction.editReply({ content: `✅ Rerolled as **${npc.name}**. Rerolls remaining: ${updatedNpc.lck}` });
@@ -14016,7 +14029,7 @@ async function handlePr(interaction) {
     const body = text;
 
     const chan = await interactionChannel(interaction);
-    if (!chan) return interaction.reply({ content: '❌ I can\'t access this channel.', ephemeral: true });
+    if (!chan) return interaction.reply({ content: MSG_NO_ACCESS, ephemeral: true });
     const said = await postAsNpc(chan, gid, npc.name, body);
     if (!said) return interaction.reply({ content: `❌ I couldn't post in this channel — check my permissions here.`, ephemeral: true });
     mirrorNpcSay(gid, { gmId: interaction.user.id, npcName: npc.name, channelId: chan.id,
@@ -14113,7 +14126,7 @@ async function handlePr(interaction) {
     // Get or create webhook for this NPC
     try {
       const prChan2 = await interactionChannel(interaction);
-      if (!prChan2) return interaction.editReply({ content: '❌ I can\'t access this channel.' }).catch(()=>{});
+      if (!prChan2) return interaction.editReply({ content: MSG_NO_ACCESS }).catch(()=>{});
       // Webhook for THIS channel — otherwise the post lands wherever the NPC
       // first spoke, which looked like "nothing happened".
       const webhookClient = await npcWebhookIn(prChan2, gid, npc.name, npcFace(gid, npc));
@@ -14280,7 +14293,8 @@ const HELP_CATEGORIES = {
       '`/char create` — set up a full character at once (stats, order, class, weapons, weapon emojis)',
       '`/char set field:STR value:14` — set one field at a time (with approvals on, any change to your own sheet goes back to the GMs)',
       '`/char weaponemoji slot:Weapon 1 emoji:⚔️` — pick a weapon slot emoji',
-      '`/char view show/summary/inventory/standing/rollhistory/showlore [user]` — read a character: the sheet · career summary · pack · merits, renown & rank · dice history · lore',
+      '`/char view show [full:true] [user]` — the character card; `full:true` adds standing, items, rolls and lore below it',
+      '`/char view inventory/standing/rollhistory/showlore [user]` — read one part on its own: pack · merits, renown & rank · dice history · lore',
       '`/char check` — what is left before your sheet can go to a GM',
       '`/char prefer` — which stats the bot should use when it rolls for you on auto',
       '`/char lore` — write your character\'s story and send it to the GMs',
@@ -14390,7 +14404,7 @@ const HELP_CATEGORIES = {
       '`/quest show number:N` — full quest details · `/quest roster number:N` — applicants & party',
       '`/quest apply number:N` — apply to join (or tap **Apply** on the post)',
       '`/quest withdraw number:N` — leave or cancel your application',
-      '`/quest log [user]` — completed quests a player was on',
+      '`/quest record [user]` — one player\'s finished quests — what they have been on',
       '`/quest create name:Goblin Cave objectives:... merit_reward:2 party_size:4 hard_cap:true` — (GM)',
       '`/quest create` — bare, a five-field writing window opens (add `from:N` to seed it from an existing quest); with `name:` everything stays inline (GM)',
       '`/quest edit number:N` — the same window, prefilled — the natural editor; renames follow onto the board and planning threads. Numeric options (`merit_reward:` etc.) apply directly without the window (GM)',
@@ -14411,7 +14425,7 @@ const HELP_CATEGORIES = {
       '`/quest archive number:N` — pull a quest off the board: applications close, the board thread locks; `/quest post` re-lists it (GM)',
       '`/quest dm style:... brief:... [available:false]` — your card on the 🎲 DMs Available roster (GM)',
       '`/quest npc number:N name:Orc [remove]` — attach the NPCs a run involves; they land on the run record (GM)',
-      '`/quest history number:N` — the run ledger: how many completions, and each run\'s GM, party and NPCs',
+      '`/quest runs number:N` — one adventure\'s ledger: how many times it has been run, and each run\'s GM, party and NPCs',
       '`/quest approve number:N @user [force]` — approve an applicant; `force` overrides a hard cap (GM)',
       '`/quest kick number:N @user` — remove a member/applicant (GM)',
       '`/quest runchannel number:N [channel]` — set where the quest runs & rewards (GM)',
@@ -15785,6 +15799,19 @@ async function sweepQuestChannels(client, gid, quest) {
       if (th?.isThread?.()) await th.delete('quest deleted');
     } catch { /* already gone */ }
   }
+  // The party's room goes too — it belongs to this quest and nothing else.
+  // Any fight still running in it is stood down first: a fight row whose
+  // channel no longer exists can never be ended by anyone.
+  if (quest.run_thread_id) {
+    try {
+      const f = getFight(gid, quest.run_thread_id);
+      if (f && f.state !== 'idle') upsertFight(gid, quest.run_thread_id, { state: 'idle', turn_order: '[]' });
+    } catch { /* no fight, or none to stand down */ }
+    try {
+      const th = await client.channels.fetch(quest.run_thread_id);
+      if (th?.isThread?.()) await th.delete('quest deleted');
+    } catch { /* already gone */ }
+  }
   if (quest.index_thread_id && quest.index_msg_id) {
     try {
       const bk = await client.channels.fetch(quest.index_thread_id);
@@ -15913,6 +15940,9 @@ async function spinOffRun(interaction, gid, root, approvedId) {
 
 // Enough hands. Said once per quest, in the planning thread, to whoever
 // holds it — approving the sixth of five shouldn't nag twice.
+// With spin-off ON this never fires for a BOARD quest, and shouldn't: the
+// board empties on every approval, so it can't fill. It fires for the runs
+// instead, which is where filling actually means something.
 async function nudgeIfPartyFull(client, gid, quest) {
   if (!quest?.party_size || quest.full_pinged) return;
   const party = getQuestMembers(gid, quest.number, 'party');
@@ -15950,8 +15980,10 @@ async function openRunThread(client, guild, gid, quest) {
         '', '_This is your room: rolls, planning and the run itself. `/quest rally` calls everyone back._',
       ].filter(Boolean).join('\n'), allowedMentions: { users: mentionList(party, quest.gm_id) } },
     });
+    const hadChannel = quest.run_channel_id && quest.run_channel_id !== thread.id;
     updateQuest(gid, quest.number, { run_thread_id: thread.id, run_channel_id: thread.id });
-    return { thread, why: null };
+    return { thread, why: null,
+      moved: hadChannel ? `ℹ️ The clock and reminders have moved from <#${quest.run_channel_id}> into the room.` : null };
   } catch (err) {
     console.error('[quest] instance thread failed -', err?.message || err);
     const msg = String(err?.message || err);
@@ -16178,7 +16210,7 @@ async function handleQuest(interaction, forced) {
     return interaction.reply({ content: res.ok, ephemeral: true });
   }
 
-  if (sub === 'log') {
+  if (sub === 'record') {
     const target = interaction.options?.getUser?.('user') ?? interaction.user;
     const done = getPlayerCompletedQuests(gid, target.id);
     const nm = await getDisplayName(interaction.guild, target.id);
@@ -16307,7 +16339,7 @@ async function handleQuest(interaction, forced) {
     }
     const channel = explicit ?? await interactionChannel(interaction);
     if (!channel) return interaction.reply({ content: '❌ I can\'t access that channel. Pick one explicitly with `channel:`.', ephemeral: true });
-    if (!channel.isTextBased?.() && !channel.isThread?.()) return interaction.reply({ content: '❌ Pick a text channel or thread.', ephemeral: true });
+    if (!channel.isTextBased?.() && !channel.isThread?.()) return interaction.reply({ content: MSG_PICK_TEXT, ephemeral: true });
     const components = quest.status === 'open' ? [questApplyButton(number)] : [];
     const msg = await channel.send({ content: await renderQuest(interaction.guild, quest), components });
     updateQuest(gid, number, { post_channel_id: channel.id, post_message_id: msg.id });
@@ -16403,7 +16435,7 @@ async function handleQuest(interaction, forced) {
       if (q.run_thread_id) { skipped.push(`${questTag(q)} — already has <#${q.run_thread_id}>`); continue; }
       const opened = await openRunThread(interaction.client, interaction.guild, gid, q);
       if (opened.thread) {
-        done.push(`${questTag(q)} → <#${opened.thread.id}>`);
+        done.push(`${questTag(q)} → <#${opened.thread.id}>${opened.moved ? ' · _moved from its old run channel_' : ''}`);
         await syncQuestBook(interaction.client, interaction.guild, gid, getQuest(gid, q.number));
       } else { why = opened.why; skipped.push(questTag(q)); }
     }
@@ -16484,7 +16516,8 @@ async function handleQuest(interaction, forced) {
       `🟡 **${questTag(quest)}** is now in progress with ${party.length} member${party.length === 1 ? '' : 's'}. Applications are closed.\n`
       + (room ? `🚪 The party's room: <#${room.id}> — the clock and reminders run there. \`/quest rally\` calls them back.`
               : `⏱️ The clock is running${fresh.run_channel_id ? ` in <#${fresh.run_channel_id}>` : ''}.`)
-      + (opened.why ? `\n⚠️ **No room opened.** ${opened.why}` : '') });
+      + (opened.why ? `\n⚠️ **No room opened.** ${opened.why}` : '')
+      + (opened.moved ? `\n${opened.moved}` : '') });
   }
 
   // A quest row carries one party, one clock and one status, so two GMs running
@@ -16578,7 +16611,7 @@ async function handleQuest(interaction, forced) {
     return interaction.reply({ content: `🎭 **${npc.name}** attached to **${questTag(quest)}** — they'll be on the run record.` });
   }
 
-  if (sub === 'history') {
+  if (sub === 'runs') {
     const quest = await requireQuest(interaction, gid);
     if (!quest) return;
     const root = questRootNumber(quest);
@@ -16789,8 +16822,20 @@ async function handleQuest(interaction, forced) {
     if (!quest) return;
     const number = quest.number;
     const kids = db.prepare('SELECT number, name FROM quests WHERE guild_id=? AND instance_of=?').all(gid, number);
+    // Deleting something mid-adventure deserves a plainer warning than
+    // deleting a draft nobody has touched.
+    const liveBits = [];
+    for (const q of [quest, ...db.prepare("SELECT * FROM quests WHERE guild_id=? AND instance_of=?").all(gid, number)]) {
+      if (q.status === 'active' || q.status === 'paused') {
+        const heads = getQuestMembers(gid, q.number, 'party').length;
+        liveBits.push(`${questTag(q)} — ${q.paused ? 'paused' : 'running'} ${fmtElapsed(questElapsed(q))} with ${heads} on the party`);
+      }
+    }
+    const liveNote = liveBits.length
+      ? `\n\n⚠️ **This is happening right now:**\n${liveBits.map(b => `• ${b}`).join('\n')}\nThe clock stops, the party is released, and their room goes with it.`
+      : '';
     const kidNote = kids.length ? ` **Its ${kids.length} instance${kids.length > 1 ? 's' : ''}** (${kids.map(k => `#${k.number}`).join(', ')}) **go with it, threads and all.**` : '';
-    return requestConfirm(interaction, `Delete **${questTag(quest)}** permanently? This clears its roster and **deletes every trace in the related channels** — its board ${getConfig(gid)?.quest_forum ? 'thread' : 'post'}, its planning thread (applications and notes included), its book entry and its create card.${kidNote}`, async () => {
+    return requestConfirm(interaction, `Delete **${questTag(quest)}** permanently? This clears its roster and **deletes every trace in the related channels** — its board ${getConfig(gid)?.quest_forum ? 'thread' : 'post'}, its planning thread (applications and notes included), the party's room, its book entry and its create card.${kidNote}${liveNote}`, async () => {
       const doomed = [...db.prepare('SELECT * FROM quests WHERE guild_id=? AND instance_of=?').all(gid, number), quest];
       for (const q of doomed) {
         await sweepQuestChannels(interaction.client, gid, q);
@@ -16993,7 +17038,7 @@ async function handleNpcSayModal(interaction) {
   if (body.length > 1800) return interaction.reply({ content: '❌ Too long (max 1800 characters).', ephemeral: true });
 
   const chan = await interactionChannel(interaction);
-  if (!chan) return interaction.reply({ content: '❌ I can\'t access this channel.', ephemeral: true });
+  if (!chan) return interaction.reply({ content: MSG_NO_ACCESS, ephemeral: true });
   const said = await postAsNpc(chan, gid, npc.name, body);
   if (!said) return interaction.reply({ content: `❌ I couldn't post in this channel — check my permissions here.`, ephemeral: true });
   mirrorNpcSay(gid, { gmId: interaction.user.id, npcName: npc.name, channelId: chan.id,
