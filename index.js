@@ -572,6 +572,11 @@ try { db.exec('ALTER TABLE quests ADD COLUMN create_channel_id TEXT'); } catch {
 try { db.exec('ALTER TABLE quests ADD COLUMN run_thread_id TEXT'); } catch {}     // the party's own room, opened at start
 try { db.exec('ALTER TABLE quests ADD COLUMN run_seq INTEGER'); } catch {}        // which run of the adventure this is — #002.2
 try { db.exec('ALTER TABLE quests ADD COLUMN run_label TEXT'); } catch {}         // and what the GM calls it
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_spinoff INTEGER DEFAULT 0'); } catch {} // approval births a run
+try { db.exec(`CREATE TABLE IF NOT EXISTS npc_orders (
+  guild_id TEXT NOT NULL, prefix TEXT NOT NULL, image_url TEXT NOT NULL,
+  set_by TEXT, set_at INTEGER, PRIMARY KEY (guild_id, prefix)
+)`); } catch (e) { console.error('npc_orders schema', e); }
 try { db.exec('ALTER TABLE quests ADD COLUMN full_pinged INTEGER DEFAULT 0'); } catch {} // party-is-full nudge, once
 try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_instance_forum TEXT'); } catch {}
 db.exec(`CREATE TABLE IF NOT EXISTS quest_runs (
@@ -1480,7 +1485,7 @@ async function postScene(guild, cid, run, sc) {
     // no webhook the narration just stays in the bot's own voice.
     try {
       const npc = getNpc(gid, sc.npc);
-      const hook = await npcWebhookIn(channel, gid, sc.npc, npc?.image_url ?? null);
+      const hook = await npcWebhookIn(channel, gid, sc.npc, npcFace(gid, npc));
       if (hook) { await hook.send({ content: sc.say }); lines.length = 0; }
     } catch (err) { console.error('[activity] npc voice failed:', err?.message || err); }
   }
@@ -2477,6 +2482,44 @@ function deleteNpc(gid, name) {
   purgeSubjectRecords(gid, npcFighterId(name));
   db.prepare('DELETE FROM npcs WHERE guild_id=? AND name=?').run(gid, name);
 }
+// An NPC written "Black Knight | Lady Ciara Nightveil" belongs to the Black
+// Knight order — the pipe says so, and nothing is guessed from shared words,
+// so "The Horse" and "The Hollow Sister" never collide.
+function npcOrderOf(name) {
+  const i = String(name || '').indexOf('|');
+  if (i === -1) return null;
+  const p = name.slice(0, i).trim();
+  return p || null;
+}
+function getOrderImage(gid, prefix) {
+  if (!prefix) return null;
+  try {
+    const r = db.prepare('SELECT image_url FROM npc_orders WHERE guild_id=? AND prefix=? COLLATE NOCASE').get(gid, prefix);
+    return r?.image_url ?? null;
+  } catch { return null; }
+}
+function setOrderImage(gid, prefix, url, uid) {
+  db.prepare('INSERT INTO npc_orders (guild_id, prefix, image_url, set_by, set_at) VALUES (?,?,?,?,?) '
+    + 'ON CONFLICT(guild_id, prefix) DO UPDATE SET image_url=excluded.image_url, set_by=excluded.set_by, set_at=excluded.set_at')
+    .run(gid, prefix, url, uid ?? null, Date.now());
+}
+// Which orders actually have members, and how many — an image is only
+// accepted for an order somebody belongs to.
+function ordersWithMembers(gid) {
+  const seen = new Map();
+  for (const n of getAllNpcs(gid)) {
+    const p = npcOrderOf(n.name);
+    if (p) seen.set(p.toLowerCase(), (seen.get(p.toLowerCase()) ?? 0) + 1);
+  }
+  return seen;
+}
+// The face an NPC speaks with: their own portrait first, their order's
+// second, nothing third.
+function npcFace(gid, npc) {
+  if (!npc) return null;
+  return npc.image_url ?? getOrderImage(gid, npcOrderOf(npc.name)) ?? null;
+}
+
 function setNpcImage(gid, name, url) {
   db.prepare('UPDATE npcs SET image_url=? WHERE guild_id=? AND name=?').run(url, gid, name);
 }
@@ -2662,7 +2705,7 @@ function buildNpcPage(gid, { page = 0, compact = false, cat = '' } = {}) {
   } else {
     for (const n of slice) {
       const order = n.order_name ? ` ${KNIGHT_EMOJIS[n.order_name] ?? '⚪'} ${n.order_name}` : '';
-      const img = n.image_url ? ' 🖼️' : '';
+      const img = n.image_url ? ' 🖼️' : (getOrderImage(gid, npcOrderOf(n.name)) ? ' 🛡️' : '');
       lines.push(`• **${n.name}**${order}${img} — STR ${n.str} CON ${n.con} DEX ${n.dex} WIS ${n.wis} LCK ${n.lck} | ❤️ ${n.hp_current}/${maxHpFromCon(gid, n.con)}`);
     }
   }
@@ -4663,6 +4706,8 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('scrollfont').setDescription('The font /gm scroll props are written in — upload an .otf or .ttf')
       .addAttachmentOption(o=>o.setName('font').setDescription('The font file (.otf / .ttf, up to 2 MB)').setRequired(false))
       .addBooleanOption(o=>o.setName('remove').setDescription('true = forget the stored font').setRequired(false)));
+      g.addSubcommand(s=>s.setName('questspinoff').setDescription('Approving on the board births a numbered run and clears the entry')
+      .addBooleanOption(o=>o.setName('enabled').setDescription('true = board quests spin off runs on the first approval').setRequired(true)));
       g.addSubcommand(s=>s.setName('cleanwebhooks').setDescription('Remove orphaned NPC webhooks to free up Discord limits'));
       return g;
     }),
@@ -7019,6 +7064,14 @@ async function handleConfig(interaction, forced) {
     return interaction.reply({ content: `✅ **${restName}** now restores:\n❤️ HP: **${describe(cur.hp)}**\n🔄 Rerolls: **${describe(cur.rr)}**\n🛡️ Heal: **${describe(cur.heal)}**`, ephemeral: true });
   }
 
+  if (sub === 'questspinoff') {
+    const on = interaction.options?.getBoolean?.('enabled');
+    setConfig(gid, { quest_spinoff: on ? 1 : 0 });
+    return interaction.reply({ content: on
+      ? '⚔️ **Spin-off on.** The first approval on a board quest births a numbered run — `#002.2` — carrying that player and anyone still waiting. The board entry clears for the next group, and the run recruits through the ➕ button in its own room.'
+      : '📋 **Spin-off off.** Approvals fill the board entry\'s own party, as before.' });
+  }
+
   if (sub === 'cleanwebhooks') {
     await interaction.deferReply({ ephemeral: true });
     try {
@@ -8792,6 +8845,15 @@ async function routeButton(interaction) {
     if (interaction.customId.startsWith('tradeok:') || interaction.customId.startsWith('tradeno:')) return handleMeritTradeButton(interaction);
     if (interaction.customId.startsWith('revive:')) return handleReviveButton(interaction);
     if (/^duel(join|out|send|cancel|ok|no):/.test(interaction.customId)) return handleDuelButton(interaction);
+    if (interaction.customId.startsWith('qapply:') || interaction.customId.startsWith('qwithdraw:')) {
+      const [kind, numRaw] = interaction.customId.split(':');
+      const quest = getQuest(interaction.guild.id, parseInt(numRaw));
+      if (!quest) return interaction.reply({ content: '❌ That run is gone.', ephemeral: true });
+      const res = kind === 'qapply'
+        ? await questApply(interaction.guild, quest, interaction.user.id)
+        : await questWithdraw(interaction.guild, quest, interaction.user.id);
+      return interaction.reply({ content: res.error ?? res.ok, ephemeral: true });
+    }
     if (interaction.customId.startsWith('npclist:')) {
       if (!(await isGm(interaction.guild, interaction.user.id))) {
         return interaction.reply({ content: '❌ The NPC roster is a GM view.', ephemeral: true });
@@ -9248,8 +9310,23 @@ client.on('messageCreate', async message => {
       }
       const npc = getNpc(message.guild.id, npcName);
       if (!npc) {
+        // Not an NPC — but it may be an ORDER: everyone written
+        // "Black Knight | Someone" wears the face posted as "Black Knight".
+        const orders = ordersWithMembers(message.guild.id);
+        const members = orders.get(npcName.toLowerCase()) ?? 0;
+        if (members) {
+          setOrderImage(message.guild.id, npcName, message.attachments.first().url, message.author.id);
+          for (const n of getAllNpcs(message.guild.id)) {
+            if ((npcOrderOf(n.name) || '').toLowerCase() === npcName.toLowerCase() && !n.image_url) {
+              clearNpcWebhooks(message.guild.id, n.name);
+            }
+          }
+          message.react('✅').catch(()=>{});
+          await message.reply('✅ Order face set for **' + npcName + '** — worn by ' + members + ' NPC' + (members === 1 ? '' : 's') + ' written `' + npcName + ' | Name`. Any with a portrait of their own keep it.').catch(()=>{});
+          return;
+        }
         console.error(`[npcimg] no NPC named "${npcName}" in guild ${message.guild.id}`);
-        await message.reply(`⚠️ No NPC named **${npcName}** on this server. Create them first with \`/npc create name:${npcName}\`, then re-upload.`).catch(()=>{});
+        await message.reply('⚠️ No NPC named **' + npcName + '** on this server, and none is written `' + npcName + ' | Name` either. Create one with `/npc create name:' + npcName + '`, or name your knights `' + npcName + ' | Their Name` to make this an order face.').catch(()=>{});
         return;
       }
       const imageUrl = message.attachments.first().url;
@@ -10856,16 +10933,18 @@ async function postAsNpc(channel, gid, npcName, content) {
   noteNpcSpeech(gid, channel, npcName);
   const npc = getNpc(gid, npcName);
   try {
-    const webhookClient = await npcWebhookIn(channel, gid, npcName, npc?.image_url);
-    const sent = await webhookClient.send({ content, username: npcName, avatarURL: npc?.image_url ?? BLANK_AVATAR });
+    const face = npcFace(gid, npc);
+    const webhookClient = await npcWebhookIn(channel, gid, npcName, face);
+    const sent = await webhookClient.send({ content, username: npcName, avatarURL: face ?? BLANK_AVATAR });
     return sent ?? true;
   } catch (err) {
     // A stored webhook can be deleted server-side; drop it and retry once.
     console.error('postAsNpc webhook error:', err.message);
     try {
       forgetChannelWebhook(gid, channel);
-      const fresh = await npcWebhookIn(channel, gid, npcName, npc?.image_url);
-      const sent2 = await fresh.send({ content, username: npcName, avatarURL: npc?.image_url ?? BLANK_AVATAR });
+      const face2 = npcFace(gid, npc);
+      const fresh = await npcWebhookIn(channel, gid, npcName, face2);
+      const sent2 = await fresh.send({ content, username: npcName, avatarURL: face2 ?? BLANK_AVATAR });
       return sent2 ?? true;
     } catch (err2) {
       console.error('postAsNpc retry failed:', err2.message);
@@ -13592,7 +13671,7 @@ async function handleNpc(interaction) {
       `💪 STR ${npc.str}   🛡️ CON ${npc.con}   ⚡ DEX ${npc.dex}`,
       `🦉 WIS ${npc.wis}   🍀 LCK ${npc.lck}`,
       `❤️ HP **${npc.hp_current} / ${maxHpFromCon(gid, npc.con)}**   🔁 ${Math.max(0, npc.lck ?? 0)} reroll token${(npc.lck ?? 0) === 1 ? '' : 's'} per fight`,
-      `🖼️ Avatar: ${npc.image_url ? 'set' : '—'}${cats.length ? `   📁 ${cats.join(', ')}` : ''}`,
+      `🖼️ Avatar: ${npc.image_url ? 'set' : (getOrderImage(gid, npcOrderOf(npc.name)) ? 'inherited from the ' + npcOrderOf(npc.name) + ' order' : '—')}${cats.length ? `   📁 ${cats.join(', ')}` : ''}`,
       ...(isHero(npc) ? [`🦸 **Hero**${npc.signature_stat ? ` · ⭐ signature **${STAT_LABELS[npc.signature_stat]}**${hasSignatureAdvantage(npc, npc.signature_stat) ? ' (advantage active)' : ` (inactive — needs ${SIGNATURE_MIN}+)`}` : ''}`] : []),
     ];
     return interaction.reply({ content: lines.join('\n') });
@@ -13721,7 +13800,7 @@ async function handlePr(interaction) {
       await interaction.deferReply({ ephemeral: true });
       const prChan = await interactionChannel(interaction);
       if (!prChan) return interaction.editReply({ content: '❌ I can\'t access this channel.' }).catch(()=>{});
-      const webhookClient = await npcWebhookIn(prChan, gid, npc.name, npc.image_url);
+      const webhookClient = await npcWebhookIn(prChan, gid, npc.name, npcFace(gid, npc));
       await webhookClient.send({ content: content2 });
       return interaction.editReply({ content: `✅ Rerolled as **${npc.name}**. Rerolls remaining: ${updatedNpc.lck}` });
     } catch (err) {
@@ -13872,12 +13951,12 @@ async function handlePr(interaction) {
       if (!prChan2) return interaction.editReply({ content: '❌ I can\'t access this channel.' }).catch(()=>{});
       // Webhook for THIS channel — otherwise the post lands wherever the NPC
       // first spoke, which looked like "nothing happened".
-      const webhookClient = await npcWebhookIn(prChan2, gid, npc.name, npc.image_url);
+      const webhookClient = await npcWebhookIn(prChan2, gid, npc.name, npcFace(gid, npc));
 
       await webhookClient.send({
         content,
         username: npc.name,
-        avatarURL: npc.image_url ?? BLANK_AVATAR,
+        avatarURL: npcFace(gid, npc) ?? BLANK_AVATAR,
       });
       return interaction.editReply({ content: `✅ Posted as **${npc.name}**.` });
     } catch (err) {
@@ -13889,8 +13968,9 @@ async function handlePr(interaction) {
           const hostChan = webhookHost(fallbackChan);
           db.prepare('DELETE FROM npc_webhooks WHERE guild_id=? AND channel_id=? AND npc_name=?')
             .run(gid, hostChan?.id ?? fallbackChan.id, npc.name);
-          const fresh = await npcWebhookIn(fallbackChan, gid, npc.name, npc.image_url);
-          await fresh.send({ content, username: npc.name, avatarURL: npc.image_url ?? BLANK_AVATAR });
+          const face3 = npcFace(gid, npc);
+          const fresh = await npcWebhookIn(fallbackChan, gid, npc.name, face3);
+          await fresh.send({ content, username: npc.name, avatarURL: face3 ?? BLANK_AVATAR });
           return interaction.editReply({ content: `✅ Posted as **${npc.name}**.` }).catch(()=>{});
         } catch (err2) {
           console.error('Webhook retry failed:', err2.message);
@@ -14211,6 +14291,7 @@ const HELP_CATEGORIES = {
       '`/npc roll category:X name:Y notation:1d20 stat:STR` — roll as an NPC',
       '`/npc reroll name:X` — reroll an NPC\'s last roll here (spends one of its LCK tokens)',
       '`/npc sheet name:X` — an NPC\'s full record: stats, standing, inventory, rolls, lore',
+      '_Orders:_ an NPC named `Black Knight | Lady Ciara` belongs to the **Black Knight** order — upload one image captioned `Black Knight` and every NPC written that way wears it, each under their own name; a portrait of their own always wins',
       '`/npc list [category:] [compact:true]` — the roster, paged: ◀ ▶ turn the pages, and a button swaps between full stats and names only',
       '`/npc give/take name:X item:Y` — hand an item to an NPC, or take one from it · `/npc npclore` writes its lore',
       '💡 Upload an image to the NPC channel with the NPC name to set an avatar',
@@ -14255,6 +14336,7 @@ const HELP_CATEGORIES = {
       '`/config mechanics npcstats enabled:true` — reveal NPC stat blocks on roll cards · hidden by default (Admin)',
       '`/config channels npcchannel #channel` — set the NPC avatar channel',
       '`/config mechanics rest type:Short Rest hp:50% rerolls:0%` — tune what a rest restores (use % of max or a flat number)',
+      '`/config mechanics questspinoff enabled:true` — the board becomes a job wall: the first approval births a numbered run (`#002.2`) with that player and everyone still waiting, and clears the entry for the next group; the run recruits through ➕ in its own room (Admin)',
       '`/config mechanics cleanwebhooks` — reclaim spare NPC webhooks; DDice speaks through one shared webhook per channel, so anything else it owns there can be freed',
       '`gmr` / `gmrs 1d20+5` — public / secret GM roll',
       '`/gm backup now` — export the database · `/gm backup auto` — daily backups',
@@ -15535,6 +15617,60 @@ async function sweepCreateCard(client, gid, quest) {
   updateQuest(gid, quest.number, { create_msg_id: null, create_channel_id: null });
 }
 
+// ➕ / ↩️ on a run's own card — a player can ask to join THIS table, or
+// step back out, without going near the board.
+function questJoinRow(number) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`qapply:${number}`).setLabel('➕ Ask to join').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`qwithdraw:${number}`).setLabel('↩️ Withdraw').setStyle(ButtonStyle.Secondary))];
+}
+
+// The next free run seat for an adventure — the original is 1.
+function nextRunSeq(gid, root) {
+  const seqs = db.prepare('SELECT run_seq FROM quests WHERE guild_id=? AND instance_of=?').all(gid, root)
+    .map(r => r.run_seq).filter(Number.isFinite);
+  return (seqs.length ? Math.max(...seqs) : 1) + 1;
+}
+
+// Birth a run from a board quest: the writing is copied, the approved
+// player seated, everyone still waiting carried across so nobody loses
+// their place, and the board entry emptied for the next batch. Returns the
+// new quest, or null when the copy fails.
+async function spinOffRun(interaction, gid, root, approvedId) {
+  const number = createQuest(gid, {
+    name: root.name, objectives: root.objectives, lore: root.lore, details: root.details,
+    rewards: root.rewards, merit_reward: root.merit_reward,
+    party_size: root.party_size, party_hard: root.party_hard, created_by: interaction.user.id,
+  });
+  if (!number) return null;
+  const rootNum = root.instance_of ?? root.number;
+  updateQuest(gid, number, {
+    gm_id: interaction.user.id, gm_style: root.gm_style ?? null,
+    instance_of: rootNum, run_seq: nextRunSeq(gid, rootNum), stage: 'approved',
+  });
+  // The approved player takes their seat; everyone still waiting comes too.
+  setQuestMember(gid, number, approvedId, 'party');
+  const waiting = getQuestMembers(gid, root.number, 'applied').filter(id => id !== approvedId);
+  for (const id of waiting) setQuestMember(gid, number, id, 'applied');
+  // And the board is clean again — same entry, same number, no party.
+  for (const id of [...waiting, approvedId]) removeQuestMember(gid, root.number, id);
+  for (const id of getQuestMembers(gid, root.number)) removeQuestMember(gid, root.number, id);
+  updateQuest(gid, root.number, { full_pinged: 0 });
+
+  const quest = getQuest(gid, number);
+  const room = await openRunThread(interaction.client, interaction.guild, gid, quest);
+  const card = await renderQuest(interaction.guild, quest, { applyHint: false });
+  const body = [`⚔️ **${questTag(quest)}** — this run is forming.`, '', card, '',
+    '_Anyone may ask to join this run with the button; the DM decides._'].join('\n');
+  if (room) {
+    try { await room.send({ content: body, components: questJoinRow(number) }); } catch {}
+  }
+  await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, root.number));
+  await syncQuestBook(interaction.client, interaction.guild, gid, quest);
+  return { quest, room };
+}
+
 // Enough hands. Said once per quest, in the planning thread, to whoever
 // holds it — approving the sixth of five shouldn't nag twice.
 async function nudgeIfPartyFull(client, gid, quest) {
@@ -15623,7 +15759,7 @@ async function refreshDmRoster(client, guild, gid) {
 // A quest speaks in two places: its public board thread (when the board is a
 // forum) and its GM planning thread. One-line lifecycle mirrors go to both,
 // each woken first. Fire-safe — a missing or deleted thread is ignored.
-async function questAnnounce(client, quest, line, { board = true, plan = true, planComponents = null } = {}) {
+async function questAnnounce(client, quest, line, { board = true, plan = true, planComponents = null, room = true } = {}) {
   const targets = [];
   if (board && quest.post_channel_id) targets.push(quest.post_channel_id);
   if (plan && quest.plan_thread_id && quest.plan_thread_id !== quest.post_channel_id) targets.push(quest.plan_thread_id);
@@ -15635,6 +15771,17 @@ async function questAnnounce(client, quest, line, { board = true, plan = true, p
       await ch.send(id === quest.plan_thread_id && planComponents
         ? { content: line, components: planComponents } : line);
     } catch { /* thread gone or unreadable — the mirror is best-effort */ }
+  }
+  // A run with its own room hears everything there too — for an instance
+  // that's where the DM is reading, and the approve/kick buttons ride along.
+  if (room && quest.run_thread_id && quest.run_thread_id !== quest.plan_thread_id) {
+    try {
+      const th = await client.channels.fetch(quest.run_thread_id);
+      if (th?.isThread?.()) {
+        await wakeThread(th);
+        await th.send(planComponents ? { content: line, components: planComponents } : line);
+      }
+    } catch { /* the room is best-effort too */ }
   }
 }
 
@@ -15945,6 +16092,18 @@ async function handleQuest(interaction, forced) {
     }
     if (quest.party_size && quest.party_hard && party.length >= quest.party_size && !force) {
       return interaction.reply({ content: `❌ Party is at the hard cap (${quest.party_size}). Re-run with \`force:true\` to override.`, ephemeral: true });
+    }
+    // With spin-off on, approving on a BOARD quest births its run instead of
+    // filling the board entry — the entry stays open for the next group.
+    if ((getConfig(gid)?.quest_spinoff ?? 0) && !quest.instance_of) {
+      const born = await spinOffRun(interaction, gid, quest, target.id);
+      if (born) {
+        const nm2 = await getDisplayName(interaction.guild, target.id);
+        return interaction.reply({ content:
+          `⚔️ **${questTag(born.quest)}** begins forming with **${nm2}** — you're its DM.`
+          + (born.room ? `\n🚪 Their room: <#${born.room.id}> — others can ask to join with the button there.` : '')
+          + `\n📋 **${questTag(quest)}** is clear on the board for the next group.` });
+      }
     }
     setQuestMember(gid, number, target.id, 'party');
     // Whoever opens the door runs the room — unless a GM already holds it.
