@@ -5661,7 +5661,7 @@ async function handleDuelButton(interaction) {
   try {
     const ch = await interaction.client.channels.fetch(d.channel_id);
     await ch.send({ content: `⚔️ **Duel #${d.id} is allowed** — ${fighters.map(f => `<@${f}>`).join(' vs ')}. A GM will start it.`,
-      allowedMentions: { users: fighters } });
+      allowedMentions: { users: mentionList(fighters) } });
   } catch {}
 }
 
@@ -15841,6 +15841,11 @@ async function runSetupRepair(interaction) {
   return interaction.editReply({ content: lines.join('\n').slice(0, 1990) });
 }
 
+// Discord refuses a message whose allowed-mentions list repeats an id — and
+// a DM is very often on their own party. Every list built from more than one
+// place goes through here.
+const mentionList = (...ids) => [...new Set(ids.flat().filter(Boolean))];
+
 // Sweep the create card out of its channel — called when the board takes
 // over (post) or the quest dies (delete). Best-effort.
 async function sweepCreateCard(client, gid, quest) {
@@ -15943,7 +15948,7 @@ async function openRunThread(client, guild, gid, quest) {
         quest.gm_id ? `🎲 DM: <@${quest.gm_id}>` : '',
         roll.length ? `👥 ${roll.join(' ')}` : '',
         '', '_This is your room: rolls, planning and the run itself. `/quest rally` calls everyone back._',
-      ].filter(Boolean).join('\n'), allowedMentions: { users: [...party, ...(quest.gm_id ? [quest.gm_id] : [])] } },
+      ].filter(Boolean).join('\n'), allowedMentions: { users: mentionList(party, quest.gm_id) } },
     });
     updateQuest(gid, quest.number, { run_thread_id: thread.id, run_channel_id: thread.id });
     return { thread, why: null };
@@ -16443,7 +16448,7 @@ async function handleQuest(interaction, forced) {
     const lines = [`📣 **${questTag(quest)}** — ${party.map(id => `<@${id}>`).join(' ')}`];
     if (quest.gm_id) lines.push(`🎲 Your DM: <@${quest.gm_id}>`);
     lines.push(note ? `\n${note}` : '\n_Called to gather._');
-    const payload = { content: lines.join('\n'), allowedMentions: { users: party } };
+    const payload = { content: lines.join('\n'), allowedMentions: { users: mentionList(party) } };
     let where = null;
     if (!here && quest.run_thread_id) {
       try {
