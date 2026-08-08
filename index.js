@@ -5215,6 +5215,9 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('handoff').setDescription('Hand this quest to another GM — they become its DM (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addUserOption(o=>o.setName('gm').setDescription('The GM taking it over').setRequired(true)))
+    .addSubcommand(s=>s.setName('room').setDescription('Open a party room for a quest that hasn\'t got one yet (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(false).setAutocomplete(true))
+      .addBooleanOption(o=>o.setName('all').setDescription('true = give every running quest without a room one').setRequired(false)))
     .addSubcommand(s=>s.setName('rally').setDescription('Call the party together — pings everyone on this quest (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('message').setDescription('What to tell them — when, where, what to bring').setRequired(false))
@@ -14412,6 +14415,7 @@ const HELP_CATEGORIES = {
       '`/quest approve number:N @user [force]` — approve an applicant; `force` overrides a hard cap (GM)',
       '`/quest kick number:N @user` — remove a member/applicant (GM)',
       '`/quest runchannel number:N [channel]` — set where the quest runs & rewards (GM)',
+      '`/quest room number:N` or `/quest room all:true` — open a party room for a quest that has not got one. Use it for quests that began before you set the instance forum (GM)',
       '`/quest rally number:N [message:] [here:true]` — call the party together: pings every member in their room, or in this channel with `here:true` (GM)',
       '`/config channels questinstances channel:#forum` — every started quest opens a room for its party there, DM and members pulled in (Admin)',
       '`/quest handoff number:N gm:@them` — pass a quest to another GM; they become its DM (GM)',
@@ -16370,6 +16374,40 @@ async function handleQuest(interaction, forced) {
     await questAnnounce(interaction.client, getQuest(gid, number), `👢 **${nm}** was removed from the party.`);
     await syncQuestBook(interaction.client, interaction.guild, gid, getQuest(gid, number));
     return interaction.reply({ content: `👢 Removed **${nm}** from **${questTag(quest)}**.` });
+  }
+
+  if (sub === 'room') {
+    const doAll = interaction.options?.getBoolean?.('all') ?? false;
+    if (!doAll && interaction.options?.getInteger?.('number') === null) {
+      return interaction.reply({ content: '❌ Name a quest with `number:`, or use `all:true` to catch every running quest at once.', ephemeral: true });
+    }
+    await interaction.deferReply();
+    // Quests that started before the forum was set have no room — this is
+    // the catch-up. Anything that already has one is left exactly as it is.
+    const targets = doAll
+      ? db.prepare("SELECT * FROM quests WHERE guild_id=? AND status IN ('active','paused') AND (run_thread_id IS NULL OR run_thread_id='')").all(gid)
+      : [getQuest(gid, interaction.options.getInteger('number'))].filter(Boolean);
+    if (!targets.length) {
+      return interaction.editReply({ content: doAll
+        ? '✅ Every running quest already has its room.'
+        : '❌ No quest with that number.' });
+    }
+    const done = [], skipped = [];
+    let why = null;
+    for (const q of targets) {
+      if (q.run_thread_id) { skipped.push(`${questTag(q)} — already has <#${q.run_thread_id}>`); continue; }
+      const opened = await openRunThread(interaction.client, interaction.guild, gid, q);
+      if (opened.thread) {
+        done.push(`${questTag(q)} → <#${opened.thread.id}>`);
+        await syncQuestBook(interaction.client, interaction.guild, gid, getQuest(gid, q.number));
+      } else { why = opened.why; skipped.push(questTag(q)); }
+    }
+    const lines = [];
+    if (done.length) lines.push(`🚪 **Rooms opened (${done.length}):**`, ...done.map(d => `• ${d}`));
+    if (skipped.length) lines.push(`⚠️ **Not opened (${skipped.length}):**`, ...skipped.map(d => `• ${d}`));
+    if (why) lines.push('', why);
+    if (done.length) lines.push('', '_The party has been pulled in, and the clock and reminders now follow them there._');
+    return interaction.editReply({ content: lines.join('\n').slice(0, 1990) });
   }
 
   if (sub === 'handoff') {
