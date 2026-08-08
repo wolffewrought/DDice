@@ -15659,7 +15659,7 @@ async function spinOffRun(interaction, gid, root, approvedId) {
   updateQuest(gid, root.number, { full_pinged: 0 });
 
   const quest = getQuest(gid, number);
-  const room = await openRunThread(interaction.client, interaction.guild, gid, quest);
+  const room = (await openRunThread(interaction.client, interaction.guild, gid, quest)).thread;
   const card = await renderQuest(interaction.guild, quest, { applyHint: false });
   const body = [`⚔️ **${questTag(quest)}** — this run is forming.`, '', card, '',
     '_Anyone may ask to join this run with the button; the DM decides._'].join('\n');
@@ -15686,12 +15686,17 @@ async function nudgeIfPartyFull(client, gid, quest) {
 // The party's own room. One thread per started quest in the instance forum,
 // the DM and every member pulled in by mention so it lands in their sidebar.
 // Best-effort: no forum, no room, and the quest runs exactly as before.
+// Returns { thread, why } — `why` is a line the GM can act on when no room
+// opened. Silence was the bug here: an unset forum, a channel that isn't a
+// forum any more, and a missing permission all looked identical.
 async function openRunThread(client, guild, gid, quest) {
   const forumId = getConfig(gid)?.quest_instance_forum;
-  if (!forumId || quest.run_thread_id) return null;
+  if (!forumId) return { thread: null, why: 'No instance forum is set — `/config channels questinstances channel:#your-forum` gives every party its own room.' };
+  if (quest.run_thread_id) return { thread: null, why: null };
   try {
-    const forum = await client.channels.fetch(forumId);
-    if (!forum || forum.type !== 15) return null;
+    const forum = await client.channels.fetch(forumId).catch(() => null);
+    if (!forum) return { thread: null, why: `I can't see <#${forumId}> — check my access, or set the instance forum again.` };
+    if (forum.type !== 15) return { thread: null, why: `<#${forumId}> isn't a forum channel any more — point \`/config channels questinstances\` at a **Forum**.` };
     const party = getQuestMembers(gid, quest.number, 'party');
     const roll = [];
     for (const id of party) roll.push(`<@${id}>`);
@@ -15706,10 +15711,13 @@ async function openRunThread(client, guild, gid, quest) {
       ].filter(Boolean).join('\n'), allowedMentions: { users: [...party, ...(quest.gm_id ? [quest.gm_id] : [])] } },
     });
     updateQuest(gid, quest.number, { run_thread_id: thread.id, run_channel_id: thread.id });
-    return thread;
+    return { thread, why: null };
   } catch (err) {
     console.error('[quest] instance thread failed -', err?.message || err);
-    return null;
+    const msg = String(err?.message || err);
+    return { thread: null, why: /permission/i.test(msg)
+      ? `I need **Create Posts** (and **Send Messages**) in <#${forumId}> to open the party's room.`
+      : `Couldn't open the party's room in <#${forumId}> — ${msg}` };
   }
 }
 
@@ -16192,14 +16200,16 @@ async function handleQuest(interaction, forced) {
       // Whoever starts it is running it, unless one was already recorded.
       gm_id: quest.gm_id ?? uid });
     logQuestEvent(gid, number, 'start', `Quest begins — ${party.length} on the party`, uid);
-    const room = await openRunThread(interaction.client, interaction.guild, gid, getQuest(gid, number));
+    const opened = await openRunThread(interaction.client, interaction.guild, gid, getQuest(gid, number));
+    const room = opened.thread;
     const fresh = getQuest(gid, number);
     await refreshQuestPost(interaction.client, interaction.guild, fresh);
     await questAnnounce(interaction.client, fresh, `▶️ **Quest begins** — ${party.length} on the party. The clock is running.${room ? ` The party gathers in <#${room.id}>.` : ''}`);
     return interaction.reply({ content:
       `🟡 **${questTag(quest)}** is now in progress with ${party.length} member${party.length === 1 ? '' : 's'}. Applications are closed.\n`
       + (room ? `🚪 The party's room: <#${room.id}> — the clock and reminders run there. \`/quest rally\` calls them back.`
-              : `⏱️ The clock is running${fresh.run_channel_id ? ` in <#${fresh.run_channel_id}>` : ' — set a channel with `/quest runchannel` for reminders, or a forum with `/config channels questinstances` for a room per party'}.`) });
+              : `⏱️ The clock is running${fresh.run_channel_id ? ` in <#${fresh.run_channel_id}>` : ''}.`)
+      + (opened.why ? `\n⚠️ **No room opened.** ${opened.why}` : '') });
   }
 
   // A quest row carries one party, one clock and one status, so two GMs running
