@@ -572,6 +572,7 @@ try { db.exec('ALTER TABLE quests ADD COLUMN create_channel_id TEXT'); } catch {
 try { db.exec('ALTER TABLE quests ADD COLUMN run_thread_id TEXT'); } catch {}     // the party's own room, opened at start
 try { db.exec('ALTER TABLE quests ADD COLUMN run_seq INTEGER'); } catch {}        // which run of the adventure this is — #002.2
 try { db.exec('ALTER TABLE quests ADD COLUMN run_label TEXT'); } catch {}         // and what the GM calls it
+try { db.exec('ALTER TABLE quests ADD COLUMN stage_at INTEGER'); } catch {}       // when it entered the stage it's in
 try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_spinoff INTEGER DEFAULT 0'); } catch {} // approval births a run
 try { db.exec(`CREATE TABLE IF NOT EXISTS npc_orders (
   guild_id TEXT NOT NULL, prefix TEXT NOT NULL, image_url TEXT NOT NULL,
@@ -713,7 +714,9 @@ function adjustBalance(gid, id, column, delta, { allowNegative = false } = {}) {
 }
 
 function addMerits(gid, uid, delta) {
-  return adjustBalance(gid, uid, 'merits', delta, { allowNegative: true }) ?? 0;
+  const now = adjustBalance(gid, uid, 'merits', delta, { allowNegative: true }) ?? 0;
+  if (delta) bookLog(gid, 'ranks', `🎖️ <@${uid}> ${delta > 0 ? 'earned' : 'lost'} **${Math.abs(delta)}** merit${Math.abs(delta) === 1 ? '' : 's'} — now **${now}**.`);
+  return now;
 }
 function getRanks(gid) {
   return db.prepare('SELECT name, threshold, sort_order FROM ranks WHERE guild_id=? ORDER BY sort_order, threshold').all(gid);
@@ -965,6 +968,11 @@ function meritTradeButtons(id) {
 }
 
 function addItem(gid, uid, item, { note = null, source = null, by = null } = {}) {
+  // The ledger was always in the data — source, giver, timestamp. Now it
+  // reaches a shelf where somebody can read it.
+  try {
+    bookLog(gid, 'items', `🧳 <@${uid}> received **${item}**${note ? ` — _${note}_` : ''}${by ? ` · from <@${by}>` : ''}${source ? ` · ${source}` : ''}`);
+  } catch {}
   db.prepare('INSERT INTO inventory (guild_id,user_id,item,note,source,added_by,at) VALUES (?,?,?,?,?,?,?)')
     .run(gid, uid, item, note, source, by, Date.now());
 }
@@ -4463,13 +4471,13 @@ const slashCommands = [
       .addAttachmentOption(o=>o.setName('file').setDescription('An [ACTIVITY] script as a text file (for scripts over 4000 characters)').setRequired(false)))
     .addSubcommand(s=>s.setName('list').setDescription('Every activity on this server'))
     .addSubcommand(s=>s.setName('show').setDescription('Read an activity scene by scene')
-      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true)))
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('run').setDescription('Start an activity in this channel')
-      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true)))
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('demo').setDescription('Play the built-in fishing activity — awards nothing (GM)'))
     .addSubcommand(s=>s.setName('stop').setDescription('Stop the activity running in this channel'))
     .addSubcommand(s=>s.setName('delete').setDescription('Delete an activity (GM)')
-      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true)))
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('set').setDescription('Tweak one line of one scene without re-pasting (GM)')
       .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true))
       .addStringOption(o=>o.setName('scene').setDescription('Scene name').setRequired(true))
@@ -4510,11 +4518,11 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('queue').setDescription('Everything waiting on a GM, in one place'))
     .addSubcommand(s=>s.setName('kill').setDescription('Mark a character as fallen and post their memorial')
       .addUserOption(o=>o.setName('user').setDescription('The player whose character has fallen').setRequired(false))
-      .addStringOption(o=>o.setName('npc').setDescription('Or the NPC').setRequired(false))
+      .addStringOption(o=>o.setName('npc').setDescription('Or the NPC').setRequired(false).setAutocomplete(true))
       .addBooleanOption(o=>o.setName('anyway').setDescription('true = kill even though they are still standing').setRequired(false)))
     .addSubcommand(s=>s.setName('revive').setDescription('Bring a fallen character back')
       .addUserOption(o=>o.setName('user').setDescription('The player').setRequired(false))
-      .addStringOption(o=>o.setName('npc').setDescription('Or the NPC').setRequired(false)))
+      .addStringOption(o=>o.setName('npc').setDescription('Or the NPC').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('heal').setDescription('Restore HP, rerolls or heal charges — players or NPCs')
       .addUserOption(o=>o.setName('user').setDescription('Player to restore').setRequired(false))
       .addStringOption(o=>o.setName('npc').setDescription('NPC to restore — or "all" for every NPC').setRequired(false).setAutocomplete(true))
@@ -4539,7 +4547,8 @@ const slashCommands = [
           {name:'✨ Everything — HP, rerolls and charges',value:'all'})))
     .addSubcommand(s=>s.setName('questwipe').setDescription('Delete EVERY quest on this server — confirm-gated (GM)')
       .addBooleanOption(o=>o.setName('runs').setDescription('true = also erase the run ledger and DM guided-counters (default: history kept)').setRequired(false)))
-    .addSubcommand(s=>s.setName('check').setDescription('Which channels and forums are set up for the bot, and which await (GM)'))
+    .addSubcommand(s=>s.setName('check').setDescription('Which channels and forums are set up for the bot, and which await (GM)')
+      .addBooleanOption(o=>o.setName('run').setDescription('true = build anything missing — new books and tags after an update').setRequired(false)))
     .addSubcommand(s=>s.setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)')
       .addAttachmentOption(o=>o.setName('file').setDescription('A scroll PDF made by /gm scroll — I read it back as text and a fresh copy in this server\'s font').setRequired(false)))
     .addSubcommand(s=>s.setName('dicereport').setDescription('The server\'s dice health — who rolls, how the d20s run, the hot and cold hands (GM)'))
@@ -4552,11 +4561,11 @@ const slashCommands = [
       .addStringOption(o=>o.setName('npcs').setDescription('NPCs to test — names, comma-separated; they roll instantly on the card').setRequired(false).setAutocomplete(true))
       // ─ the check ─
       .addIntegerOption(o=>o.setName('dc').setDescription('The difficulty to beat — leave it out and a writing window opens instead').setRequired(false).setMinValue(1).setMaxValue(99))
-      .addStringOption(o=>o.setName('stat').setDescription('The stat this check tests (omit with dice: for a pure notation check)').setRequired(false)
+      .addStringOption(o=>o.setName('stat').setDescription('Which stat this check uses (leave out if you set dice: instead)').setRequired(false)
         .addChoices({name:'💪 Strength (STR)',value:'str'},{name:'🫀 Constitution (CON)',value:'con'},
                     {name:'⚡ Dexterity (DEX)',value:'dex'},{name:'🧠 Wisdom (WIS)',value:'wis'},{name:'🍀 Luck (LCK)',value:'lck'}))
-      .addStringOption(o=>o.setName('dice').setDescription('Custom notation instead of a stat roll, e.g. 2d6+1 (12 chars max)').setRequired(false))
-      .addBooleanOption(o=>o.setName('secret').setDescription('true = the DC stays hidden; you get it ephemerally').setRequired(false))
+      .addStringOption(o=>o.setName('dice').setDescription('Roll set dice instead of a stat, like 2d6+1').setRequired(false))
+      .addBooleanOption(o=>o.setName('secret').setDescription('true = players do not see the number; only you are told it').setRequired(false))
       .addStringOption(o=>o.setName('reveal').setDescription('With secret:true — @mention players who are told the DC privately when they roll').setRequired(false))
       .addStringOption(o=>o.setName('mode').setDescription('How they roll it — advantage, disadvantage, or a bare d20').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'🔼 Advantage',value:'adv'},
@@ -4655,9 +4664,9 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('approvalforum').setDescription('One forum, a thread per approval type — sheets, trades, duels, lore, exports')
       .addChannelOption(o=>o.setName('forum').setDescription('The forum channel').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = go back to the single approval channel').setRequired(false)));
-      g.addSubcommand(s=>s.setName('rollaudit').setDescription('Mirror every player roll to a GM-only channel')
-      .addChannelOption(o=>o.setName('channel').setDescription('Channel to mirror rolls into').setRequired(false))
-      .addBooleanOption(o=>o.setName('test').setDescription('true = send a test mirror and report any problem').setRequired(false))
+      g.addSubcommand(s=>s.setName('rollaudit').setDescription('Send a copy of every player roll to a GM-only channel')
+      .addChannelOption(o=>o.setName('channel').setDescription('Channel the copies go to').setRequired(false))
+      .addBooleanOption(o=>o.setName('test').setDescription('true = send a test copy and say what went wrong, if anything').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = turn the mirror off').setRequired(false)));
       g.addSubcommand(s=>s.setName('rollauditforum').setDescription('Split the mirror into books — player rolls, GM rolls, NPC rolls, NPC say')
       .addChannelOption(o=>o.setName('forum').setDescription('The forum channel').setRequired(false))
@@ -4684,7 +4693,7 @@ const slashCommands = [
       .addStringOption(o=>o.setName('action').setDescription('What to do').setRequired(false)
         .addChoices({name:'List',value:'list'},{name:'Add or update',value:'set'},{name:'Remove',value:'remove'},
                     {name:'Run now',value:'run'},{name:'Pause',value:'pause'},{name:'Resume',value:'resume'}))
-      .addStringOption(o=>o.setName('name').setDescription('Schedule name, e.g. Breather or Full Recovery').setRequired(false))
+      .addStringOption(o=>o.setName('name').setDescription('Schedule name, e.g. Breather or Full Recovery').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('hours').setDescription('How often, in hours (default 6)').setRequired(false).setMinValue(1).setMaxValue(720))
       .addStringOption(o=>o.setName('hp').setDescription('HP restored: 100%, 50%, a flat number, or 0% to skip').setRequired(false))
       .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored: 100%, 50%, a number, or 0%').setRequired(false))
@@ -4708,7 +4717,7 @@ const slashCommands = [
       .addBooleanOption(o=>o.setName('remove').setDescription('true = forget the stored font').setRequired(false)));
       g.addSubcommand(s=>s.setName('questspinoff').setDescription('Approving on the board births a numbered run and clears the entry')
       .addBooleanOption(o=>o.setName('enabled').setDescription('true = board quests spin off runs on the first approval').setRequired(true)));
-      g.addSubcommand(s=>s.setName('cleanwebhooks').setDescription('Remove orphaned NPC webhooks to free up Discord limits'));
+      g.addSubcommand(s=>s.setName('cleanwebhooks').setDescription('Free up spare NPC voices — Discord only allows so many per channel'));
       return g;
     }),
 
@@ -4775,12 +4784,12 @@ const slashCommands = [
                     {name:'🧠 Wisdom',value:'wis'},{name:'🍀 Luck',value:'lck'},{name:'✖️ Clear it',value:'none'})))
     .addSubcommand(s=>s.setName('give').setDescription('Give a character an item (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
-      .addStringOption(o=>o.setName('item').setDescription('What they receive').setRequired(true))
+      .addStringOption(o=>o.setName('item').setDescription('What they receive').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('note').setDescription('A detail about it').setRequired(false)))
     .addSubcommand(s=>s.setName('edit').setDescription('Reword an item a character is carrying (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Whose item').setRequired(true))
       .addIntegerOption(o=>o.setName('id').setDescription('Item number from /char view inventory').setRequired(true))
-      .addStringOption(o=>o.setName('item').setDescription('New name for it').setRequired(false))
+      .addStringOption(o=>o.setName('item').setDescription('New name for it').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('note').setDescription('New detail \u2014 or "none" to clear').setRequired(false)))
     .addSubcommand(s=>s.setName('take').setDescription('Remove an item from a character (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
@@ -4832,27 +4841,27 @@ const slashCommands = [
         .addStringOption(o=>o.setName('def').setDescription('Stats it can defend with. Blank = any').setRequired(false))
         .addStringOption(o=>o.setName('note').setDescription('How it handles, for the list').setRequired(false)))
       .addSubcommand(s=>s.setName('stats').setDescription('Set or clear what a weapon can fight with (GM)')
-        .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true))
+        .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true).setAutocomplete(true))
         .addStringOption(o=>o.setName('atk').setDescription('Attack stats — e.g. wis, or str|dex. "any" clears it').setRequired(false))
         .addStringOption(o=>o.setName('def').setDescription('Defence stats. "any" clears it').setRequired(false))
         .addStringOption(o=>o.setName('note').setDescription('How it handles').setRequired(false)))
       .addSubcommand(s=>s.setName('remove').setDescription('Remove a weapon from the server list')
-        .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true)))
+        .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true).setAutocomplete(true)))
       .addSubcommand(s=>s.setName('list').setDescription('List all server weapons')))
     .addSubcommandGroup(g=>g.setName('tag').setDescription('Player tags (GM)')
       .addSubcommand(s=>s.setName('assign').setDescription('Assign a tag to a player')
         .addUserOption(o=>o.setName('user').setDescription('Target player').setRequired(true))
-        .addStringOption(o=>o.setName('tag').setDescription('Tag name').setRequired(true)))
+        .addStringOption(o=>o.setName('tag').setDescription('Tag name').setRequired(true).setAutocomplete(true)))
       .addSubcommand(s=>s.setName('remove').setDescription('Remove a tag from a player')
         .addUserOption(o=>o.setName('user').setDescription('Target player').setRequired(true))
-        .addStringOption(o=>o.setName('tag').setDescription('Tag name').setRequired(true)))
+        .addStringOption(o=>o.setName('tag').setDescription('Tag name').setRequired(true).setAutocomplete(true)))
       .addSubcommand(s=>s.setName('list').setDescription('List tags for a player')
         .addUserOption(o=>o.setName('user').setDescription('Target player').setRequired(false)))
       .addSubcommand(s=>s.setName('custom').setDescription('Manage custom tags')
         .addStringOption(o=>o.setName('action').setDescription('Action').setRequired(true)
           .addChoices({name:'Create',value:'create'},{name:'Delete',value:'delete'},{name:'List',value:'list'}))
         .addStringOption(o=>o.setName('emoji').setDescription('Emoji for the tag (create only)').setRequired(false))
-        .addStringOption(o=>o.setName('name').setDescription('Tag name (create/delete)').setRequired(false)))),
+        .addStringOption(o=>o.setName('name').setDescription('Tag name (create/delete)').setRequired(false).setAutocomplete(true)))),
 
   new SlashCommandBuilder()
     .setName('help').setDescription('Show all commands by category')
@@ -4878,7 +4887,7 @@ const slashCommands = [
       .addStringOption(o=>o.setName('action').setDescription('What the NPC does — posted in italics').setRequired(false))
       .addStringOption(o=>o.setName('speech').setDescription('What the NPC says — wrapped in quote marks').setRequired(false))
       .addStringOption(o=>o.setName('raw').setDescription('Post exactly as typed — overrides action/speech').setRequired(false)))
-    .addSubcommand(s=>s.setName('roll').setDescription('Roll as an NPC via webhook')
+    .addSubcommand(s=>s.setName('roll').setDescription('Roll dice as an NPC — it posts under their name and face')
       .addStringOption(o=>o.setName('category').setDescription('Filter NPCs by category').setRequired(true)
         .addChoices({name:'All',value:'all'}))
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
@@ -4914,18 +4923,18 @@ const slashCommands = [
       .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
         .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'})))
     .addSubcommand(s=>s.setName('sheet').setDescription('An NPC\'s full record — stats, standing, inventory, rolls, lore')
-      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true)))
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('give').setDescription('Give an NPC an item')
-      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('item').setDescription('What they receive').setRequired(true))
       .addStringOption(o=>o.setName('note').setDescription('A detail about it').setRequired(false)))
     .addSubcommand(s=>s.setName('take').setDescription('Take an item from an NPC')
-      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('id').setDescription('Item number from /npc sheet').setRequired(true)))
     .addSubcommand(s=>s.setName('npclore').setDescription('Write an NPC\'s lore')
-      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('text').setDescription('Their story \u2014 or "none" to clear').setRequired(true)))
-    .addSubcommand(s=>s.setName('delete').setDescription('Delete an NPC').addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true)))
+    .addSubcommand(s=>s.setName('delete').setDescription('Delete an NPC').addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('hp').setDescription('Set or restore an NPC HP (omit value for a full heal)')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('value').setDescription('Exact HP to set (omit = full heal)').setRequired(false).setMinValue(-99).setMaxValue(99)))
@@ -4957,19 +4966,19 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('categorycreate').setDescription('Create a new NPC category')
       .addStringOption(o=>o.setName('name').setDescription('Category name').setRequired(true)))
     .addSubcommand(s=>s.setName('categorydelete').setDescription('Delete an NPC category')
-      .addStringOption(o=>o.setName('name').setDescription('Category name').setRequired(true)))
+      .addStringOption(o=>o.setName('name').setDescription('Category name').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('categoryassign').setDescription('Assign an NPC to a category')
-      .addStringOption(o=>o.setName('npc').setDescription('NPC name').setRequired(true))
-      .addStringOption(o=>o.setName('category').setDescription('Category name').setRequired(true)))
+      .addStringOption(o=>o.setName('npc').setDescription('NPC name').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('category').setDescription('Category name').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('categoryremove').setDescription('Remove an NPC from a category')
-      .addStringOption(o=>o.setName('npc').setDescription('NPC name').setRequired(true))
-      .addStringOption(o=>o.setName('category').setDescription('Category name').setRequired(true))),
+      .addStringOption(o=>o.setName('npc').setDescription('NPC name').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('category').setDescription('Category name').setRequired(true).setAutocomplete(true))),
 
   new SlashCommandBuilder()
     .setName('fight').setDescription('Manage a fight between players')
     .addSubcommand(s=>s.setName('start').setDescription('Start a fight')
       .addStringOption(o=>o.setName('players').setDescription('Players to include — @mention them, space-separated').setRequired(false))
-      .addStringOption(o=>o.setName('npcs').setDescription('GM NPCs to include — names, comma-separated').setRequired(false))
+      .addStringOption(o=>o.setName('npcs').setDescription('GM NPCs to include — names, comma-separated').setRequired(false).setAutocomplete(true))
       .addBooleanOption(o=>o.setName('manual').setDescription('Skip initiative roll and use the order you listed fighters in').setRequired(false))
       .addBooleanOption(o=>o.setName('practice').setDescription('Friendly bout — fighters yield at 2 HP and are never driven below it').setRequired(false)))
     .addSubcommand(s=>s.setName('addnpc').setDescription('Add GM NPCs to the current fight (GM only)')
@@ -4982,7 +4991,7 @@ const slashCommands = [
           {name:'Demo — example fighters, just a showcase',value:'demo'},
         ))
       .addStringOption(o=>o.setName('players').setDescription('Players to include — @mention them, space-separated (full mode)').setRequired(false))
-      .addStringOption(o=>o.setName('npcs').setDescription('GM NPCs to include — names, comma-separated').setRequired(false))
+      .addStringOption(o=>o.setName('npcs').setDescription('GM NPCs to include — names, comma-separated').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('teams').setDescription('Full mode sides: "@a @b vs Goblin, Orc" — overrides players/npcs').setRequired(false))
       .addBooleanOption(o=>o.setName('practice').setDescription('Friendly bout — fighters yield at 2 HP and are never driven below it').setRequired(false)))
     .addSubcommand(s=>s.setName('order').setDescription('Set the turn order (GM) — list fighters in the order you want')
@@ -5642,6 +5651,7 @@ async function handleDuelButton(interaction) {
   }
   const gmName = await getDisplayName(interaction.guild, uid);
   const updated = setDuel(gid, d.id, { state: 'approved', decided_by: uid, decided_at: Date.now() });
+  bookLog(gid, 'duels', `🤺 **Duel #${d.id} allowed** by <@${uid}> — ${fighters.map(f => `<@${f}>`).join(' vs ')}`);
   try { await interaction.message.edit({ content: `${interaction.message.content}\n\n✅ **Allowed** by ${gmName}`, components: [] }); } catch {}
   await refreshDuel(interaction.client, interaction.guild, updated);
   await interaction.reply({ content: `✅ Duel #${d.id} allowed. Start it with \`/fight start players:${fighters.map(f => `<@${f}>`).join(' ')}\`` });
@@ -5661,6 +5671,7 @@ async function handleDuelRejectModal(interaction) {
   const reason = cleanReason(interaction.fields.getTextInputValue('reason'));
   const gmName = await getDisplayName(interaction.guild, interaction.user.id);
   const updated = setDuel(gid, d.id, { state: 'declined', reason, decided_by: interaction.user.id, decided_at: Date.now() });
+  bookLog(gid, 'duels', `🤺 **Duel #${d.id} declined** by <@${interaction.user.id}>${reason ? ` — _${reason}_` : ''}`);
   try { await interaction.message?.edit({ content: `${interaction.message.content}\n\n🚫 **Declined** by ${gmName}${reason ? `\n💬 ${reason}` : ''}`, components: [] }); } catch {}
   await refreshDuel(interaction.client, interaction.guild, updated);
   await interaction.reply({ content: `🚫 Duel #${d.id} declined${reason ? ` — “${reason}”` : ''}.` });
@@ -5884,6 +5895,7 @@ async function handleGmKillModal(interaction) {
                             deeds,merits,renown,killed_by,at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(gid, id, name, subject.order_name ?? null, rank, cause, quote, flavour,
          JSON.stringify(deeds), subject.merits ?? 0, subject.renown ?? 0, interaction.user.id, at);
+  bookLog(gid, 'fallen', `🕯️ **${name}** fell${rank ? ` — ${rank}` : ''}${cause ? ` · ${cause}` : ''} · recorded by <@${interaction.user.id}>`);
 
   // Mark them fallen. Nothing is deleted — the sheet, deeds and standing all
   // remain, so a revival costs nothing and the memorial can be rebuilt.
@@ -5973,6 +5985,7 @@ async function handleReviveButton(interaction) {
   if (isNpc) db.prepare('UPDATE npcs SET died_at=NULL, hp_current=? WHERE guild_id=? AND name=?').run(max, gid, subject.name);
   else upsertChar(gid, rec.subject_id, { died_at: null, hp_current: max });
   db.prepare('UPDATE deaths SET revived_at=? WHERE guild_id=? AND id=?').run(Date.now(), gid, deathId);
+  bookLog(gid, 'fallen', `✨ ${isNpc ? '**' + subject.name + '**' : '<@' + rec.subject_id + '>'} returns — brought back by <@${interaction.user.id}>.`);
 
   await interaction.reply({ content: `✨ **${rec.name}** walks again — back on **${max}** HP. Both memorials cleared.` });
 
@@ -8050,6 +8063,7 @@ async function runGmReroll(interaction) {
       recordRoll(gid, { userId: tid, channelId: cid, interaction, nat, sides: 20,
         input: '/gm reroll', rollLine, context: `GM correction — fight ${isAtk ? 'attack' : 'defence'} (${termBits.join(', ')})` });
       const nm = await getDisplayName(interaction.guild, tid);
+      bookLog(gid, 'gmacts', `⚖️ <@${interaction.user.id}> corrected <@${tid}>'s fight ${isAtk ? 'attack' : 'defence'} — ${termBits.join(', ')}, no token spent.`, { channelId: cid });
       const lines = [`⚖️ **GM correction** — **${nm}**'s ${isAtk ? 'attack' : 'defence'} is rerolled: ${termBits.join(' · ')}. No token spent.`, rollLine];
       if (flavour) lines.push(`_${flavour}_`);
       lines.push('', fight.def_roll !== null || isDef ? '⚡ Use \`/fight resolve\` to resolve this exchange.' : '🛡️ The defence still stands to be rolled.');
@@ -8075,6 +8089,7 @@ async function runGmReroll(interaction) {
     input: '/gm reroll', rollLine, context: `GM correction (was ${last.notation}${last.label ? ` · ${last.label}` : ''})` });
   saveRoll(gid, cid, tid, notation, last.label);
   const nm = await getDisplayName(interaction.guild, tid);
+  bookLog(gid, 'gmacts', `⚖️ <@${interaction.user.id}> corrected <@${tid}>'s last roll (was \`${last.notation}\`) — ${termBits.join(', ')}, no token spent.`, { channelId: cid });
   const lines = [`⚖️ **GM correction** — **${nm}** rerolls (was \`${last.notation}\`): ${termBits.join(' · ')}. No token spent.`, rollLine];
   if (flavour) lines.push(`_${flavour}_`);
   return interaction.reply({ content: lines.join('\n') });
@@ -8168,6 +8183,7 @@ function sanctionLabel(sx) {
 // Apply a sanction to whoever rolled — sheet-live, floor 0, noted in lines.
 function applyDcSanction({ gid, id, isNpc, sanction, lines }) {
   if (!sanction) return;
+  bookLog(gid, 'gmacts', `⚖️ ${isNpc ? `**${npcNameFromFighter(id)}**` : `<@${id}>`} — ${sanctionLabel(sanction)} by a called check.`);
   if (isNpc) {
     const npc = getNpc(gid, npcNameFromFighter(id));
     if (!npc) return;
@@ -8396,6 +8412,10 @@ async function postDcCheck(interaction, { stat, notation, dc, gmMode, flat, modi
 
   await interaction.reply({ content: lines.join('\n'), components: rows,
     allowedMentions: { users: ids } });
+  bookLog(gid, 'checks', [`🎯 **Check called** by <@${interaction.user.id}> in <#${cid}>`,
+    `${face} vs DC ${dc}${secret ? ' (secret)' : ''}${terms.length ? ` · ${terms.join(' · ')}` : ''}`,
+    ids.length ? `👥 ${ids.map(id => `<@${id}>`).join(' ')}` : '',
+    npcNames.length ? `🎭 ${npcNames.join(', ')}` : ''].filter(Boolean).join('\n'));
   if (ids.length && (sF || fF || sS || fS)) {
     try { const rep = await interaction.fetchReply();
       saveDcCard(gid, rep.id, { sF, fF, sS: sS ? `${sS.stat}${sS.delta > 0 ? '+' : ''}${sS.delta}` : null,
@@ -8446,6 +8466,8 @@ async function runDcRollPress(interaction) {
   applyDcOutcome({ gid, cid, id: uid, isNpc: false,
     mark: passed ? onSucc : onFail, damage: passed ? sDmg : damage, lines: out });
   await interaction.followUp({ content: out.join('\n') });
+  bookLog(gid, 'checks', `🎯 <@${uid}> — ${faceLabel} vs DC ${secret ? '???' : dc} — ${band.replace(/\*\*/g, '')}`
+    + (out.length > 3 ? `\n${out.slice(3).join(' · ').replace(/\*\*/g, '')}` : ''), { channelId: cid });
   if (whisper) await interaction.followUp({ ephemeral: true,
     content: `🤫 Your eyes catch what others miss — the DC is **${dc}**. You ${passed ? 'cleared' : 'missed'} it by **${Math.abs(total - dc)}**.` }).catch(() => {});
   return;
@@ -8487,6 +8509,9 @@ async function runGmRollSlash(interaction) {
 // /gm check — the setup mirror. Unset first (with the command that sets each),
 // then the set ones with links, every stored id fetch-verified.
 async function handleCheck(interaction) {
+  // `run:true` builds whatever the code knows about and this server hasn't
+  // got yet — the one switch to pull after an update adds a book.
+  if (interaction.options?.getBoolean?.('run')) return runSetupRepair(interaction);
   const gid = interaction.guild.id;
   if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ The setup check is for GMs.', ephemeral: true });
   await interaction.deferReply({ ephemeral: true });
@@ -8874,6 +8899,7 @@ async function routeButton(interaction) {
       const ch2 = getChar(interaction.guild.id, uid2);
       if (ch2?.rank_name === current.name) return interaction.reply({ content: `✅ Already **${current.name}**.`, ephemeral: true });
       upsertChar(interaction.guild.id, uid2, { rank_name: current.name });
+      bookLog(interaction.guild.id, 'ranks', `🎖️ <@${uid2}> promoted to **${current.name}** by <@${interaction.user.id}> (${merits2} merits).`);
       const nm2 = await getDisplayName(interaction.guild, uid2);
       return interaction.reply({ content: `🎉 **${nm2}** is now **${current.name}**! _(pressed by <@${interaction.user.id}>)_` });
     }
@@ -8910,7 +8936,7 @@ async function routeButton(interaction) {
       if (!quest) return interaction.reply({ content: '❌ That quest no longer exists.', ephemeral: true });
       const next = quest.stage === 'concept' ? 'awaiting' : quest.stage === 'awaiting' ? 'approved' : null;
       if (!next) return interaction.reply({ content: '✅ Past the hand-set stages — `/quest post` opens the board from here.', ephemeral: true });
-      updateQuest(gid, number, { stage: next });
+      updateQuest(gid, number, { stage: next, stage_at: Date.now() });
       const fresh = getQuest(gid, number);
       // Answer the press by updating the button in place, then sync the rest.
       await interaction.update({ components: questStageRow(fresh) });
@@ -8988,6 +9014,59 @@ client.on('interactionCreate', async interaction => {
         return await interaction.respond(choices);
       }
 
+      // ─ Naming something that exists should always offer a list ─
+      const acPick = (items, v) => items
+        .filter(x => !v || String(x).toLowerCase().includes(v))
+        .slice(0, 25).map(x => ({ name: String(x).slice(0, 100), value: String(x).slice(0, 100) }));
+
+      // An activity by name — read, run or delete.
+      if (interaction.commandName === 'activity' && focusedOption.name === 'name') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        return await interaction.respond(acPick(listStories(interaction.guild.id).map(r => r.name), v));
+      }
+      // A category by name, wherever it's asked for — including the
+      // categorydelete sub, where the option is called 'name'.
+      if (interaction.commandName === 'npc' && focusedOption.name === 'name'
+          && interaction.options.getSubcommand(false) === 'categorydelete') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        return await interaction.respond(acPick(getCategories(interaction.guild.id), v));
+      }
+      // The NPC being filed into or out of a category.
+      if (interaction.commandName === 'npc' && focusedOption.name === 'npc') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        return await interaction.respond(acPick(getAllNpcs(interaction.guild.id).map(n => n.name), v));
+      }
+      // A weapon from the server list — stats and remove both ask by name.
+      if (interaction.commandName === 'char' && focusedOption.name === 'name'
+          && interaction.options.getSubcommandGroup(false) === 'weapon') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        return await interaction.respond(acPick(getWeapons(interaction.guild.id), v));
+      }
+      // A tag that exists on this server.
+      // Deleting a custom tag picks an existing one; creating invents a new
+      // name, so nothing is suggested there.
+      if (interaction.commandName === 'char' && focusedOption.name === 'name'
+          && interaction.options.getSubcommand(false) === 'custom') {
+        if (interaction.options.getString('action') !== 'delete') return await interaction.respond([]);
+        const v = String(focusedOption.value || '').toLowerCase();
+        return await interaction.respond(acPick(getCustomTags(interaction.guild.id).map(t => t.tag_name), v));
+      }
+      if (interaction.commandName === 'char' && focusedOption.name === 'tag') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        return await interaction.respond(acPick(getCustomTags(interaction.guild.id).map(t => t.tag_name), v));
+      }
+      // An item the player in the OTHER option is actually carrying.
+      if (interaction.commandName === 'char' && focusedOption.name === 'item') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        const who = interaction.options.getUser('user')?.id ?? interaction.user.id;
+        const names = [...new Set(listItems(interaction.guild.id, who).map(r => r.item))];
+        return await interaction.respond(acPick(names, v));
+      }
+      // A recovery schedule by name.
+      if (interaction.commandName === 'config' && focusedOption.name === 'name') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        return await interaction.respond(acPick(listSchedules(interaction.guild.id).map(r => r.name), v));
+      }
       if (interaction.commandName === 'npc' && focusedOption.name === 'category') {
         const v = String(focusedOption.value).toLowerCase();
         const choices = getCategories(interaction.guild.id)
@@ -10351,6 +10430,64 @@ function turnPing(gid, f) {
 // Count a roll toward the character's lifetime tally, then mirror it. Every
 // roll path already calls mirrorRoll, so this is the one place that sees them
 // all — auto rolls have no userId and are skipped, as they belong to no sheet.
+// Make sure every shelf the code knows about exists in the audit forum,
+// adopting any that already do. Returns what was made and what was found,
+// or null when there's no audit forum to mend.
+async function ensureAuditBooks(client, gid) {
+  const prev = auditRoutes(gid) || {};
+  if (!prev.forum) return null;
+  const forum = await client.channels.fetch(prev.forum).catch(() => null);
+  if (!forum || forum.type !== 15) return { error: `<#${prev.forum}> isn't a forum any more.` };
+  const routes = { forum: forum.id };
+  const made = [], kept = [];
+  for (const [key, t] of Object.entries(AUDIT_KINDS)) {
+    let thread = null;
+    if (prev[key]) {
+      try {
+        const old = await client.channels.fetch(prev[key]);
+        if (old?.isThread?.() && old.parentId === forum.id) { thread = await wakeThread(old); kept.push(t.name); }
+      } catch { /* stale — remade below */ }
+    }
+    if (!thread) {
+      thread = await forum.threads.create({ name: t.name, autoArchiveDuration: 10080,
+        message: { content: `${t.about}\n_I wake this thread whenever a new entry arrives — no need to keep it active._` } });
+      made.push(t.name);
+    }
+    routes[key] = thread.id;
+  }
+  setConfig(gid, { audit_routes: JSON.stringify(routes) });
+  return { made, kept };
+}
+
+// The same for the quest pipeline's books.
+async function ensureQuestBooks(client, guild, gid) {
+  const forumId = getConfig(gid)?.quest_plan_forum;
+  if (!forumId) return null;
+  const forum = await client.channels.fetch(forumId).catch(() => null);
+  if (!forum || forum.type !== 15) return { error: `<#${forumId}> isn't a forum any more.` };
+  const prev = questBooks(gid);
+  const map = {}, made = [], kept = [];
+  for (const [bkey, emoji, label, about] of QUEST_BOOKS) {
+    let thread = null;
+    if (prev[bkey]) {
+      try {
+        const old = await client.channels.fetch(prev[bkey]);
+        if (old?.isThread?.() && old.parentId === forum.id) { thread = await wakeThread(old); kept.push(label); }
+      } catch { /* stale — remade below */ }
+    }
+    if (!thread) {
+      thread = await forum.threads.create({ name: `${emoji} ${label}`, autoArchiveDuration: 10080,
+        message: { content: `${emoji} **${label}**\n${about}\n_I wake this book whenever something new arrives — no need to keep it active._` } });
+      await thread.pin().catch(() => {});
+      made.push(label);
+    }
+    map[bkey] = thread.id;
+  }
+  setConfig(gid, { quest_plan_books: JSON.stringify(map), quest_dm_thread: map.dms });
+  await refreshDmRoster(client, guild, gid);
+  return { made, kept };
+}
+
 // ── Audit routing ────────────────────────────────────────────────────────────
 // One forum, a thread per book — configured by /config channels rollauditforum, stored
 // as JSON in guild_config.audit_routes. The single audit channel remains the
@@ -10361,6 +10498,12 @@ const AUDIT_KINDS = {
   npcs:    { name: '🎭 NPC Rolls',    about: 'NPC dice — GM-driven and auto-pilot alike.' },
   say:     { name: '💬 NPC Say',      about: 'Who spoke as which NPC, with a jump to the line.' },
   scrolls: { name: '📜 Scrolls',      about: 'Every prop, both directions — the writing, the parchment, the woven PDF; unfurlings and read-backs alike.' },
+  checks:  { name: '🎯 Called Checks', about: 'Every `/gm dc`: the call, who rolled what against it, and what it cost them.' },
+  gmacts:  { name: '⚖️ GM Overrides', about: 'Corrections and decrees — rerolls granted, stats shifted, HP set, marks imposed.' },
+  duels:   { name: '🤺 Duels',         about: 'Challenges, who stood in, the GM\'s verdict and the reason given.' },
+  ranks:   { name: '🎖️ Advancement',   about: 'Merit awarded and rank earned — who granted it, and when.' },
+  fallen:  { name: '🕯️ The Fallen',    about: 'Deaths and returns, in the order they happened.' },
+  items:   { name: '🧳 Items',         about: 'Who gave what to whom — and who took it away again.' },
 };
 // Where scroll records go: a manually configured channel overrides; else the
 // audit forum's 📜 Scrolls book; else nowhere. Threads are woken on the way.
@@ -10408,6 +10551,25 @@ function auditRoutes(gid) {
   try { const o = JSON.parse(raw); return o && typeof o === 'object' ? o : null; }
   catch { return null; }
 }
+// Every ledger entry goes through here: resolve the shelf, wake it, write.
+// Decoration-grade throughout — a book that can't be reached must never
+// fail the command that fed it.
+function bookLog(gid, kind, line, { channelId = null, messageId = null } = {}) {
+  // Fire-and-forget by design, like mirrorRoll: a shelf that can't be
+  // reached must never delay or fail the command that fed it.
+  (async () => {
+    try {
+      const chId = auditDestination(gid, kind);
+      if (!chId) return;
+      const ch = await wakeThread(await client.channels.fetch(chId));
+      if (!ch) return;
+      const link = (channelId && messageId)
+        ? `\n[↗ Jump](https://discord.com/channels/${gid}/${channelId}/${messageId})` : '';
+      await ch.send({ content: `${line}${link}`.slice(0, 1990), allowedMentions: { parse: [] } });
+    } catch (err) { console.error(`[book:${kind}]`, err?.message || err); }
+  })();
+}
+
 function auditDestination(gid, kind) {
   const r = auditRoutes(gid);
   return (r && r[kind]) || getConfig(gid)?.roll_audit_channel_id || null;
@@ -14235,6 +14397,7 @@ const HELP_CATEGORIES = {
       '`/gm kill user:@a` / `/gm revive user:@a` — mark a character fallen and post their memorial, or bring them back (GM)',
       '`/gm test quest/npc/list/clean` — throwaway fixtures for trying things out, and the broom that clears them (GM)',
       '`/gm questwipe [runs:true]` — delete every quest on the server, confirm-gated; the run ledger and DM counters survive unless runs:true (GM)',
+      '`/gm check run:true` — build anything missing: audit shelves, pipeline books and tags. Adopts what exists, so it is safe to run any time — pull it after an update adds a book (GM)',
       '`/gm check` — the setup mirror: every channel-backed feature, unset first with the command that sets it, then the set ones with links — stored ids are verified live (GM)',
       '`/config channels questforum channel:#forum` — the board becomes a forum: one thread per quest, lifecycle mirrored in, archived on completion (Admin)',
       '`/config channels charforum/memorial/questlog/docs` — a page per approved character · where fallen characters are remembered · where finished quest summaries post · publish the command PDFs to a GM channel (Admin)',
@@ -14275,7 +14438,7 @@ const HELP_CATEGORIES = {
     title: '🎭 NPCs',
     blurb: 'the GM\'s cast — stat blocks, categories, voices',
     body: [
-      '_Everything for running the cast: stat blocks, categories, webhook voices and rolls._',
+      '_Everything for running the cast: stat blocks, categories, their voices and their dice._',
       '`/npc create name:X str:N ...` — create an NPC (GM)',
       '`/npc hp name:X value:N` — set an NPC\'s HP · omit value for a full heal (GM)',
       '`/npc heal names:all` · `/npc heal names:Goblin, Orc` — fully heal NPCs (GM)',
@@ -14291,7 +14454,8 @@ const HELP_CATEGORIES = {
       '`/npc roll category:X name:Y notation:1d20 stat:STR` — roll as an NPC',
       '`/npc reroll name:X` — reroll an NPC\'s last roll here (spends one of its LCK tokens)',
       '`/npc sheet name:X` — an NPC\'s full record: stats, standing, inventory, rolls, lore',
-      '_Orders:_ an NPC named `Black Knight | Lady Ciara` belongs to the **Black Knight** order — upload one image captioned `Black Knight` and every NPC written that way wears it, each under their own name; a portrait of their own always wins',
+      '_Orders:_ name an NPC `Black Knight | Lady Ciara` and they belong to the **Black Knight** order.',
+      '↳ Upload one picture captioned `Black Knight`. Every NPC named that way now uses it, while still speaking under their own name. Give one their own picture and theirs wins.',
       '`/npc list [category:] [compact:true]` — the roster, paged: ◀ ▶ turn the pages, and a button swaps between full stats and names only',
       '`/npc give/take name:X item:Y` — hand an item to an NPC, or take one from it · `/npc npclore` writes its lore',
       '💡 Upload an image to the NPC channel with the NPC name to set an avatar',
@@ -14323,20 +14487,22 @@ const HELP_CATEGORIES = {
       '`/config mechanics fightping enabled:true` — @-mention players on their turn · off by default (Admin)',
       '`/config channels rollaudit channel:#x` — mirror all rolls (players + GMs) to a GM-only channel (Admin)',
       '`/config channels rollaudit test:true` — send a test mirror and report any problem (Admin)',
+      '_The audit forum keeps one shelf per subject:_ 🎲 Player Rolls · 🛡️ GM Rolls · 🎭 NPC Rolls · 💬 NPC Say · 📜 Scrolls · 🎯 Called Checks · ⚖️ GM Overrides · 🤺 Duels · 🎖️ Advancement · 🕯️ The Fallen · 🧳 Items.',
       '`/config channels rollauditforum forum:#roll-audit` — split the mirror into books: player rolls, GM rolls, NPC rolls, NPC say (Admin)',
       'When NPC stats are hidden, fight cards mask the stat and modifier — the audit\'s NPC book gets the full card, every number revealed',
       '`/config mechanics scrollfont font:<file>` — store an .otf/.ttf; the reply renders a sample line so you see it works. `/gm scroll` then writes props in it (Admin)',
       '`/config channels scrollarchive` — the 📜 Scrolls book in the roll-audit forum archives every scroll automatically, both directions, text + image + PDF; `channel:#x` overrides with a plain channel (Admin)',
       '`/npc export name:<npc>` / `/npc import file:<pdf>` — a villain packed as a woven parchment PDF; import applies directly, GM-as-approver — stats, class, hero flag, auto-pilot preferences and lore travel, standing and webhooks stay local',
       '`/gm dicereport` — the table\'s dice health: top rollers, hot and cold d20 hands, nat leaders, the full d20 spread',
-      '`/gm scroll` — write a title and body in a modal; the bot posts the parchment as an image everyone can see plus a **PDF** with the writing woven invisibly inside — the PDF survives Discord, so scrolls travel between servers on their own. `file:` hands any scroll PDF back: plain text out, plus a readable edition in standard type as image and woven PDF (GM)',
+      '`/gm scroll` — write a title and body in a writing window; the bot posts the parchment as an image everyone can see plus a **PDF** with the writing woven invisibly inside — the PDF survives Discord, so scrolls travel between servers on their own. `file:` hands any scroll PDF back: plain text out, plus a readable edition in standard type as image and woven PDF (GM)',
       '`/config channels approvals channel:#x` — new sheets need GM approval before use (Admin)',
       '`/config channels approvals list:true` — every sheet still waiting, read from the database so nothing is lost if a post failed',
       '`/config channels approvalforum forum:#gm-approvals` — one forum, a thread per approval type: sheets, trades, duels, lore, exports (Admin)',
       '`/config mechanics npcstats enabled:true` — reveal NPC stat blocks on roll cards · hidden by default (Admin)',
       '`/config channels npcchannel #channel` — set the NPC avatar channel',
       '`/config mechanics rest type:Short Rest hp:50% rerolls:0%` — tune what a rest restores (use % of max or a flat number)',
-      '`/config mechanics questspinoff enabled:true` — the board becomes a job wall: the first approval births a numbered run (`#002.2`) with that player and everyone still waiting, and clears the entry for the next group; the run recruits through ➕ in its own room (Admin)',
+      '`/config mechanics questspinoff enabled:true` — turns the board into a job wall (Admin). The first approval starts a numbered run, like `#002.2`.',
+      '↳ That player and anyone still waiting move into the run. The board entry goes empty, ready for the next group. More players can ask to join the run with the ➕ button in its room.',
       '`/config mechanics cleanwebhooks` — reclaim spare NPC webhooks; DDice speaks through one shared webhook per channel, so anything else it owns there can be freed',
       '`gmr` / `gmrs 1d20+5` — public / secret GM roll',
       '`/gm backup now` — export the database · `/gm backup auto` — daily backups',
@@ -15514,12 +15680,20 @@ const QUEST_BOOKS = [
   ['concept',   '🌱', 'Concept',            'Quests being written. `/quest stage` moves them onward.'],
   ['awaiting',  '⏳', 'Awaiting Approval',   'Concepts waiting on a nod.'],
   ['approved',  '✅', 'Approved',            'Ready to run — `/quest post` opens them on the public board (marked 📌 here while listed).'],
+  ['running',   '⚔️', 'In Progress',         'Every run happening right now — its DM, its party, its room and how long the clock has been going.'],
   ['dms',       '🎲', 'DMs Available',       'Who can run for you, their style, and a short brief. GMs: `/quest dm`.'],
   ['archived',  '🗄️', 'Archived',            'Off the board. `/quest post` re-lists any of them.'],
   ['completed', '🏁', 'Completed',           'Every finished adventure, with its run counter.'],
 ];
 const questBooks = (gid) => { try { return JSON.parse(getConfig(gid)?.quest_plan_books || '{}'); } catch { return {}; } };
-const questBookKeyFor = (stage) => stage === 'board' ? 'approved' : stage;
+// A started quest lives in ⚔️ In Progress until it completes — its stage
+// still says where it came from, but the board is not where it IS.
+const questBookKeyFor = (quest) => {
+  const stage = typeof quest === 'string' ? quest : quest?.stage;
+  const status = typeof quest === 'string' ? null : quest?.status;
+  if (status === 'active' || status === 'paused') return 'running';
+  return stage === 'board' ? 'approved' : stage;
+};
 
 // One index entry per quest: name · GM · party · links, run counter when done.
 async function questIndexEntry(guild, gid, quest) {
@@ -15536,7 +15710,17 @@ async function questIndexEntry(guild, gid, quest) {
   const links = [];
   if (quest.plan_thread_id) links.push(`🗺️ <#${quest.plan_thread_id}>`);
   if (quest.post_channel_id) links.push(`📌 <#${quest.post_channel_id}>`);
+  if (quest.run_thread_id) links.push(`🚪 <#${quest.run_thread_id}>`);
   if (links.length) bits.push(links.join(' · '));
+  // A live run says how long it has been going; anything else says how long
+  // it has sat where it is, so a concept from June stops looking like one
+  // written this morning.
+  if (quest.status === 'active' || quest.status === 'paused') {
+    bits.push(`⏱️ running ${fmtElapsed(questElapsed(quest))}${quest.paused ? ' · ⏸️ paused' : ''}`);
+  } else if (quest.stage_at) {
+    const days = Math.floor((Date.now() - quest.stage_at) / 86400000);
+    if (days >= 3) bits.push(`📅 here ${days} day${days === 1 ? '' : 's'}`);
+  }
   return bits.join('\n');
 }
 
@@ -15545,7 +15729,7 @@ async function questIndexEntry(guild, gid, quest) {
 async function syncQuestBook(client, guild, gid, questRow) {
   const quest = getQuest(gid, questRow.number) ?? questRow;
   const books = questBooks(gid);
-  const key = questBookKeyFor(quest.stage);
+  const key = questBookKeyFor(quest);
   const bookId = key ? books[key] : null;
   // Clear the old entry wherever it sits.
   if (quest.index_thread_id && quest.index_msg_id) {
@@ -15606,6 +15790,53 @@ async function sweepQuestChannels(client, gid, quest) {
   await sweepCreateCard(client, gid, quest);
 }
 
+// Build anything missing, then say plainly what changed and what was
+// already there. Safe to run as often as you like: surviving threads are
+// adopted by id, never remade.
+async function runSetupRepair(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id))) {
+    return interaction.reply({ content: '❌ The setup check is for GMs.', ephemeral: true });
+  }
+  await interaction.deferReply({ ephemeral: true });
+  const lines = ['🔧 **Setup run**', ''];
+  let built = 0;
+
+  const audit = await ensureAuditBooks(interaction.client, gid).catch(err => ({ error: err?.message || String(err) }));
+  if (!audit) lines.push('🎲 Roll audit forum — _not set; `/config channels rollauditforum` first_');
+  else if (audit.error) lines.push(`🎲 Roll audit forum — ⚠️ ${audit.error}`);
+  else {
+    built += audit.made.length;
+    lines.push(audit.made.length
+      ? `🎲 Roll audit forum — **built ${audit.made.length}**: ${audit.made.join(', ')}`
+      : `🎲 Roll audit forum — all ${audit.kept.length} shelves already there`);
+  }
+
+  const quests = await ensureQuestBooks(interaction.client, interaction.guild, gid).catch(err => ({ error: err?.message || String(err) }));
+  if (!quests) lines.push('🗺️ Quest planning forum — _not set; `/config channels questplanning` first_');
+  else if (quests.error) lines.push(`🗺️ Quest planning forum — ⚠️ ${quests.error}`);
+  else {
+    built += quests.made.length;
+    lines.push(quests.made.length
+      ? `🗺️ Quest pipeline — **built ${quests.made.length}**: ${quests.made.join(', ')}`
+      : `🗺️ Quest pipeline — all ${quests.kept.length} books already there`);
+  }
+
+  // Tags follow the books — whichever forum the threads live in.
+  try {
+    const tagForumId = getConfig(gid)?.quest_thread_forum ?? getConfig(gid)?.quest_plan_forum;
+    if (tagForumId) {
+      const tagForum = await interaction.client.channels.fetch(tagForumId).catch(() => null);
+      if (tagForum) { await ensurePlanTags(tagForum, gid); lines.push('🏷️ Pipeline tags — checked'); }
+    }
+  } catch (err) { lines.push(`🏷️ Pipeline tags — ⚠️ ${err?.message || err}`); }
+
+  lines.push('', built ? `✅ Built **${built}** new thing${built === 1 ? '' : 's'}. Nothing existing was touched.`
+                       : '✅ Everything the code knows about is already here.');
+  lines.push('_Run this again after any update that adds a book._');
+  return interaction.editReply({ content: lines.join('\n').slice(0, 1990) });
+}
+
 // Sweep the create card out of its channel — called when the board takes
 // over (post) or the quest dies (delete). Best-effort.
 async function sweepCreateCard(client, gid, quest) {
@@ -15647,7 +15878,7 @@ async function spinOffRun(interaction, gid, root, approvedId) {
   const rootNum = root.instance_of ?? root.number;
   updateQuest(gid, number, {
     gm_id: interaction.user.id, gm_style: root.gm_style ?? null,
-    instance_of: rootNum, run_seq: nextRunSeq(gid, rootNum), stage: 'approved',
+    instance_of: rootNum, run_seq: nextRunSeq(gid, rootNum), stage: 'approved', stage_at: Date.now(),
   });
   // The approved player takes their seat; everyone still waiting comes too.
   setQuestMember(gid, number, approvedId, 'party');
@@ -15853,7 +16084,7 @@ async function finishQuestCreate(interaction, gid, uid, f) {
     party_hard: f.party_hard ?? false,
     created_by: uid,
   });
-  updateQuest(gid, number, { gm_id: uid, gm_style: f.gm_style ?? null, stage: 'concept' });
+  updateQuest(gid, number, { gm_id: uid, gm_style: f.gm_style ?? null, stage: 'concept', stage_at: Date.now() });
   let quest = getQuest(gid, number);
   let planLine = '';
   const planForumId = getConfig(gid)?.quest_thread_forum ?? getConfig(gid)?.quest_plan_forum;
@@ -16046,7 +16277,7 @@ async function handleQuest(interaction, forced) {
             await old.setLocked(false).catch(() => {});
             await wakeThread(old);
             await refreshQuestPost(interaction.client, interaction.guild, quest);
-            updateQuest(gid, number, { stage: 'board' });
+            updateQuest(gid, number, { stage: 'board', stage_at: Date.now() });
             await syncQuestPipeline(interaction.client, interaction.guild, gid, getQuest(gid, number));
             return interaction.reply({ content: `📌 **${questTag(quest)}** is ${quest.status === 'open' ? 'back on' : 'already on'} the board — <#${old.id}> (refreshed).`, ephemeral: true });
           }
@@ -16056,7 +16287,7 @@ async function handleQuest(interaction, forced) {
           message: { content: await renderQuest(interaction.guild, quest), components } });
         // A forum starter message shares its thread's id — the refresh plumbing
         // needs nothing new.
-        updateQuest(gid, number, { post_channel_id: thread.id, post_message_id: thread.id, stage: 'board' });
+        updateQuest(gid, number, { post_channel_id: thread.id, post_message_id: thread.id, stage: 'board', stage_at: Date.now() });
         await syncQuestPipeline(interaction.client, interaction.guild, gid, getQuest(gid, number));
         await announceStage(interaction.client, gid, getQuest(gid, number), `📌 Opened on the public board — <#${thread.id}>.`);
         await sweepCreateCard(interaction.client, gid, getQuest(gid, number));
@@ -16204,6 +16435,7 @@ async function handleQuest(interaction, forced) {
     const room = opened.thread;
     const fresh = getQuest(gid, number);
     await refreshQuestPost(interaction.client, interaction.guild, fresh);
+    await syncQuestBook(interaction.client, interaction.guild, gid, fresh);
     await questAnnounce(interaction.client, fresh, `▶️ **Quest begins** — ${party.length} on the party. The clock is running.${room ? ` The party gathers in <#${room.id}>.` : ''}`);
     return interaction.reply({ content:
       `🟡 **${questTag(quest)}** is now in progress with ${party.length} member${party.length === 1 ? '' : 's'}. Applications are closed.\n`
@@ -16255,12 +16487,14 @@ async function handleQuest(interaction, forced) {
       if (paused) return interaction.reply({ content: '❌ It is already paused.', ephemeral: true });
       // Bank the running stretch, then stop the clock.
       updateQuest(gid, number, { elapsed_ms: questElapsed(quest), paused: 1, started_at: null });
+      await syncQuestBook(interaction.client, interaction.guild, gid, getQuest(gid, number));
       logQuestEvent(gid, number, 'pause', 'Paused', uid);
       await questAnnounce(interaction.client, getQuest(gid, number), `⏸️ Paused at **${fmtElapsed(questElapsed(getQuest(gid, number)))}**.`);
       return interaction.reply({ content: `⏸️ **${questTag(quest)}** paused at **${fmtElapsed(questElapsed(getQuest(gid, number)))}**. The clock and the log are kept.` });
     }
     if (!paused) return interaction.reply({ content: '❌ It is already running.', ephemeral: true });
     updateQuest(gid, number, { paused: 0, started_at: Date.now() });
+    await syncQuestBook(interaction.client, interaction.guild, gid, getQuest(gid, number));
     logQuestEvent(gid, number, 'resume', 'Resumed', uid);
     await questAnnounce(interaction.client, getQuest(gid, number), `▶️ Resumed at **${fmtElapsed(questElapsed(getQuest(gid, number)))}**.`);
     return interaction.reply({ content: `▶️ **${questTag(quest)}** resumed at **${fmtElapsed(questElapsed(getQuest(gid, number)))}**.` });
@@ -16428,7 +16662,7 @@ async function handleQuest(interaction, forced) {
     }
     {
       const done = getQuest(gid, number);
-      updateQuest(gid, number, { stage: 'completed' });
+      updateQuest(gid, number, { stage: 'completed', stage_at: Date.now() });
       // The run record: who ran it, who was on it, which NPCs took part —
       // keyed to the ROOT quest so instances share one counter.
       const root = questRootNumber(done);
