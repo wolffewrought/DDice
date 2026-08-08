@@ -549,6 +549,7 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font_name TEXT'); } ca
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_archive_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_threads TEXT'); } catch {} // forum mode: JSON map gmId → thread id
 try { db.exec('ALTER TABLE chars ADD COLUMN next_mark TEXT'); } catch {} // 🔼/🔽 on their very next roll, anywhere
+try { db.exec('ALTER TABLE chars ADD COLUMN deception_spent INTEGER DEFAULT 0'); } catch {} // one trick per honest roll
 try { db.exec(`CREATE TABLE IF NOT EXISTS dc_drafts (
   guild_id TEXT NOT NULL, token TEXT NOT NULL, ids TEXT, npcs TEXT, reveal TEXT,
   created_at INTEGER NOT NULL, PRIMARY KEY (guild_id, token)
@@ -1777,6 +1778,7 @@ async function resolveActivityRoll(ctx, statWord, flavour, io, rerolled = false)
   const stat = resolveStatWord(statWord);
   const mod = stat ? (ch[stat] ?? 0) : 0;
   const mode = applyNextMark(gid, uid, stat ? applySignatureMode(ch, stat, 'normal') : 'normal');
+  if (stat) noteHonestRoll(gid, uid);   // an ordinary stat roll re-arms deception
   const result = mode === 'adv' ? rollAdvantage(`1d20+${mod}`)
                : mode === 'dis' ? rollDisadvantage(`1d20+${mod}`)
                : rollNotation(`1d20+${mod}`);
@@ -2803,8 +2805,37 @@ function applyNextMark(gid, uid, mode) {
   if (!uid || String(uid).startsWith('npc_')) return mode;
   const ch = getChar(gid, uid);
   if (!ch?.next_mark) return mode;
+  if (ch.next_mark !== 'adv' && ch.next_mark !== 'dis') return mode;  // flat is consumed elsewhere
   upsertChar(gid, uid, { next_mark: null });
-  return ch.next_mark === 'adv' ? 'adv' : ch.next_mark === 'dis' ? 'dis' : mode;
+  return ch.next_mark;
+}
+// Deception has a cooldown of one round: you cannot feint twice in a row.
+// Between two tricks you must make an ORDINARY stat roll — a real swing, a
+// real defence, a real check — which is what sells the next lie. NPCs carry
+// the same rule on the fight's own round flags, since they have no sheet.
+function deceptionSpent(gid, fid) {
+  if (String(fid).startsWith('npc_')) return false;   // NPC side uses the round flag
+  return !!(getChar(gid, fid)?.deception_spent);
+}
+function spendDeception(gid, fid) {
+  if (String(fid).startsWith('npc_')) return;
+  upsertChar(gid, fid, { deception_spent: 1 });
+}
+// Any honest stat roll clears it — called from every path where one happens.
+function noteHonestRoll(gid, fid) {
+  if (!fid || String(fid).startsWith('npc_')) return;
+  if (getChar(gid, fid)?.deception_spent) upsertChar(gid, fid, { deception_spent: 0 });
+}
+
+// A flat mark strips the stat from the next roll, wherever it happens. The
+// fight paths OR this into the penalties they already carry; the chat, slash
+// and activity rolls zero their own bonus when it fires.
+function consumeFlatMark(gid, uid) {
+  if (!uid || String(uid).startsWith('npc_')) return false;
+  const ch = getChar(gid, uid);
+  if (ch?.next_mark !== 'flat') return false;
+  upsertChar(gid, uid, { next_mark: null });
+  return true;
 }
 // Set a per-fighter effect flag (the mirror of consumeEffectFlag).
 function setEffectFlag(gid, cid, fid, key) {
@@ -2817,6 +2848,8 @@ function setEffectFlag(gid, cid, fid, key) {
 function clearRoundFlag(gid, cid, fid) {
   consumeEffectFlag(gid, cid, fid, 'deflected');
   consumeEffectFlag(gid, cid, fid, 'disarmUsed');
+  consumeEffectFlag(gid, cid, fid, 'feintUsed');   // an honest swing re-arms the trick
+  noteHonestRoll(gid, fid);
 }
 // One write for a round ability's after-effects: the used flag and the flat
 // penalty it trades for.
@@ -4873,6 +4906,12 @@ const slashCommands = [
           .addChoices({name:'Create',value:'create'},{name:'Delete',value:'delete'},{name:'List',value:'list'}))
         .addStringOption(o=>o.setName('emoji').setDescription('Emoji for the tag (create only)').setRequired(false))
         .addStringOption(o=>o.setName('name').setDescription('Tag name (create/delete)').setRequired(false).setAutocomplete(true)))),
+
+  new SlashCommandBuilder()
+    .setName('deception').setDescription('Try to deceive someone — anywhere, in a fight or not')
+    .addUserOption(o=>o.setName('target').setDescription('Who you are trying to fool').setRequired(true))
+    .addStringOption(o=>o.setName('claim').setDescription('What you pretend — shown to everyone').setRequired(false))
+    .addStringOption(o=>o.setName('flavour').setDescription('How you sell it').setRequired(false)),
 
   new SlashCommandBuilder()
     .setName('help').setDescription('Show all commands by category')
@@ -7783,8 +7822,15 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false) {
     // was given — so "str atk" silently lost the Hero's advantage. parsed.stat
     // is the stat actually rolled, whichever spelling was typed.
     if (parsed?.stat) {
-      mode = applySignatureMode(ch, parsed.stat, mode);
-      statRolled = parsed.stat;
+      // A deception landed on them: this roll is a straight d20.
+      if (consumeFlatMark(gid, uid)) {
+        parsed.notation = '1d20';
+        parsed.label = parsed.label ? `${parsed.label} · 🎭 fooled` : '🎭 fooled';
+      } else {
+        mode = applySignatureMode(ch, parsed.stat, mode);
+        statRolled = parsed.stat;
+        noteHonestRoll(gid, uid);   // an ordinary stat roll re-arms deception
+      }
     }
     if (!parsed) return message.reply('❌ Invalid notation. Try `r1d20+5 attack`, `r2d6`, or `r str`.');
     notation = parsed.notation;
@@ -8487,6 +8533,69 @@ async function runDcRollPress(interaction) {
   if (whisper) await interaction.followUp({ ephemeral: true,
     content: `🤫 Your eyes catch what others miss — the DC is **${dc}**. You ${passed ? 'cleared' : 'missed'} it by **${Math.abs(total - dc)}**.` }).catch(() => {});
   return;
+}
+
+// Deception, away from the sword. A straight WIS contest between two
+// characters that works anywhere — a market square, a throne room, a tavern
+// — and needs no fight to exist. Both roll at once, so it resolves in one
+// message; ties go to the target, exactly as the fight version words it.
+// Winning leaves them rolling flat on their very next action: inside a live
+// fight that is the fooled flag the combat engine already honours, and
+// outside one it is a mark on their sheet, spent by whatever they roll next.
+async function handleDeception(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id, cid = interactionChannelId(interaction);
+  const target = interaction.options.getUser('target');
+  if (target.id === uid) return interaction.reply({ content: '🎭 You cannot deceive yourself — not with dice, anyway.', ephemeral: true });
+  const me = getChar(gid, uid), them = getChar(gid, target.id);
+  const gate = sheetGate(gid, uid);
+  if (gate) return interaction.reply({ content: gate, ephemeral: true });
+  if (!me) return interaction.reply({ content: '❌ You need a character sheet — `/char create`.', ephemeral: true });
+  if (!them) return interaction.reply({ content: `❌ **${await getDisplayName(interaction.guild, target.id)}** has no character sheet yet.`, ephemeral: true });
+  if ((me.wis ?? 0) < 4) return interaction.reply({ content: '🎭 Deception takes **WIS 4+** — a poor liar only convinces themselves.', ephemeral: true });
+  if (deceptionSpent(gid, uid)) {
+    return interaction.reply({ ephemeral: true, content:
+      '🎭 That trick is spent — make an ordinary stat roll before trying another. A lie only sells once until you fight straight.' });
+  }
+
+  const claim = interaction.options.getString('claim');
+  const flavour = interaction.options.getString('flavour');
+  const myMode = applyNextMark(gid, uid, applySignatureMode(me, 'wis', 'normal'));
+  const theirMode = applyNextMark(gid, target.id, applySignatureMode(them, 'wis', 'normal'));
+  const roll = (row, mode) => {
+    const notation = `1d20+${row.wis ?? 0}`;
+    const r = mode === 'adv' ? rollAdvantage(notation) : mode === 'dis' ? rollDisadvantage(notation) : rollNotation(notation);
+    return { r, nat: mode === 'normal' ? r.rolls[0] : r.chosen };
+  };
+  const a = roll(me, myMode), d = roll(them, theirMode);
+  spendDeception(gid, uid);   // one trick per honest roll
+  noteHonestRoll(gid, target.id);   // answering honestly re-arms the target's own
+  const myName = await getDisplayName(interaction.guild, uid);
+  const theirName = await getDisplayName(interaction.guild, target.id);
+  const fooled = a.r.total > d.r.total;   // ties go to the target, as in a fight
+
+  const lines = ['─────────────────────────────',
+    `🎭  **Deception** — **${myName}** vs **${theirName}**`];
+  if (claim) lines.push(`_“${claim}”_`);
+  lines.push('',
+    `${myName} (**WIS** deception): ${fightTotalStr(a.r.total, a.nat, 20)}`,
+    `${theirName} (**WIS** insight): ${fightTotalStr(d.r.total, d.nat, 20)}`, '');
+  if (fooled) {
+    const f = getFight(gid, cid);
+    if (f?.state === 'active' && fightOrder(f).includes(target.id)) {
+      setEffectFlag(gid, cid, target.id, 'fooled');
+      lines.push(`🎭 **${theirName}** believes it — their next action in this fight is a straight d20.`);
+    } else {
+      upsertChar(gid, target.id, { next_mark: 'flat' });
+      lines.push(`🎭 **${theirName}** believes it — their very next roll, anywhere, is a straight d20.`);
+    }
+  } else {
+    lines.push(`👁️ **${theirName}** sees straight through it.`);
+  }
+  if (flavour) lines.push('', `_${flavour}_`);
+  const result = a.r;   // shorthand below, as every other roll site writes it
+  recordRoll(gid, { userId: uid, channelId: cid, interaction, result,
+    input: '/deception', rollLine: lines[3], context: `deception vs ${theirName}` });
+  return interaction.reply({ content: lines.join('\n'), allowedMentions: { parse: [] } });
 }
 
 // The slash twin of the gmr / gmrs chat shorthands — same roll, same audit
@@ -9283,6 +9392,7 @@ client.on('interactionCreate', async interaction => {
 
   if (!interaction.isChatInputCommand()) return;
   try {
+    if (interaction.commandName === 'deception') return await handleDeception(interaction);
     if (interaction.commandName === 'duel') return await handleDuel(interaction);
     if (interaction.commandName === 'gm') {
       const gmGroup = interaction.options.getSubcommandGroup(false);
@@ -11218,7 +11328,7 @@ async function autoNpcDefend(guild, gid, cid, channel) {
     return true;
   }
   const stat = chooseAutoStat(gid, fight.current_target, defender.stats, 'def');
-  const flat = consumeFlatDef(gid, cid, fight.current_target) || consumeFooled(gid, cid, fight.current_target);
+  const flat = consumeFlatDef(gid, cid, fight.current_target) || consumeFooled(gid, cid, fight.current_target) || consumeFlatMark(gid, fight.current_target);
   const defRow = defender.isNpc ? getNpc(gid, defender.name) : getChar(gid, fight.current_target);
   const d = autoRoll(flat ? 0 : (defender.stats[stat] ?? 0), !flat && hasSignatureAdvantage(defRow, stat));
   mirrorAutoRoll(gid, cid, defender.name, `1d20${d.adv ? ' (adv)' : ''}`, d.nat, d.total,
@@ -11365,6 +11475,17 @@ async function resolveExchange(guild, gid, cid, fight) {
     atk_rerolled: 0, def_rerolled: 0,   // a new exchange, a fresh second chance
   };
 
+  // A defence rolled as a feint: reading the blow leaves the attacker
+  // off-balance, and the defender pays the usual flat next defence.
+  if (consumeEffectFlag(gid, cid, defenderId, 'feintDef')) {
+    lines.push(`🎭 **${defName}** read the blow rather than blocking it.`);
+    setEffectFlag(gid, cid, defenderId, 'flatDef');
+    if (!hit) {
+      setEffectFlag(gid, cid, attackerId, 'flatAtk');
+      lines.push(`↳ **${atkName}** is left **off-balance** — their next attack rolls flat.`);
+    }
+  }
+
   if (hit) {
     const prevHp = hpState[defenderId] ?? 0;
     const newHp = applyFightDamage(prevHp, dmg, floor);
@@ -11473,10 +11594,19 @@ async function resolveFeintInsight(guild, gid, cid, fight, { nat, total, mode = 
   lines.push('');
   const fooled = fight.atk_roll > total;   // ties go to the target, as written
   if (fooled) {
+    // A feint that lands IS a blow. The insight roll becomes the defence roll
+    // and the ordinary exchange resolves it — same damage, same crit rules,
+    // same knockout and log handling, so a feint can finish a fight.
     setEffectFlag(gid, cid, targetId, 'fooled');
-    lines.push(`🎭 **${defName}** is **completely fooled** by the feint!`);
-    lines.push(`_Their very next rolled action — whatever it is — is a straight d20, no bonuses._`);
-  } else {
+    lines.push(`🎭 **${defName}** is **completely fooled** — the real blow follows!`);
+    lines.push(`_And their very next rolled action is a straight d20, no bonuses._`);
+    lines.push(`_🎭 Trade-off: **${atkName}**'s next defence roll is a flat d20._`);
+    setEffectFlag(gid, cid, attackerId, 'flatDef');
+    upsertFight(gid, cid, { def_roll: total, def_nat: nat, def_stat: 'wis', def_mode: mode, def_sides: 20 });
+    const res = await resolveExchange(guild, gid, cid, getFight(gid, cid));
+    return { lines: [...lines, ...res.lines], nextF: res.nextF, fooled: true, ended: res.ended };
+  }
+  {
     lines.push(`👁️ **${defName}** sees through the feint — combat continues normally.`);
   }
   lines.push(`_🎭 Trade-off: **${atkName}**'s next defence roll is a flat d20._`);
@@ -11600,7 +11730,7 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     const restrained = !!grappleHolderOf(fight, actorId);
     // A deflection's trade-off: the very next attack roll is a flat d20.
     const offBalance = !restrained && consumeFlatAtk(gid, cid, actorId);
-    const fooledA = consumeFooled(gid, cid, actorId);
+    const fooledA = consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
     const flatSwing = restrained || offBalance || fooledA;
     clearRoundFlag(gid, cid, actorId);
     if (await retrievalTurn(interaction.guild, gid, cid, actorId,
@@ -11753,7 +11883,7 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
 
   // A grapple attempt is an attack roll — the deflection and feint penalties
   // clamp it too.
-  const offBalance = consumeFlatAtk(gid, cid, actorId) || consumeFooled(gid, cid, actorId);
+  const offBalance = consumeFlatAtk(gid, cid, actorId) || consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
   clearRoundFlag(gid, cid, actorId);
   if (await retrievalTurn(interaction.guild, gid, cid, actorId,
       async (l) => interaction.reply({ content: l.join('\n') }))) {
@@ -11839,7 +11969,7 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
   const turnOrder = fightOrder(fight);
   if (turnOrder[fight.turn_index] !== actorId) {
     const cur = await resolveFighter(interaction.guild, gid, turnOrder[fight.turn_index]);
-    return refuse(`⚠️ It's **${cur.name}**'s turn to attack.`);
+    return refuse(`⚠️ It's **${cur.name}**'s turn to attack, or a strike must be pending on you to read one.`);
   }
   if (fight.phase !== 'attack') return refuse(fight.atk_kind === 'feint'
     ? '🎭 A feint is already pending — the target answers with `/fight act action:Insight`.'
@@ -11857,7 +11987,7 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
   if ((actor.stats.wis ?? 0) < 4) return refuse('🎭 Deception needs **WIS 4+** — the mind has to be sharp.');
   // A feint is an attack roll: the deflection trade-off and an earlier feint
   // that fooled YOU both clamp it flat.
-  const flatFeint = consumeFlatAtk(gid, cid, actorId) || consumeFooled(gid, cid, actorId);
+  const flatFeint = consumeFlatAtk(gid, cid, actorId) || consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
   const targetF = await resolveFighter(interaction.guild, gid, targetId);
 
   const hpState = fightHp(fight);
@@ -11897,6 +12027,8 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
     ? (autoOn ? `🤖 **${targetF.name}** checks its insight automatically...` : `🎭 A GM rolls insight for **${targetF.name}** with \`/fight act action:Insight npc:${targetF.name}\`.`)
     : `🎭 <@${targetId}> — \`/fight act action:Insight\` (WIS only) to see through it.`;
 
+  setEffectFlag(gid, cid, actorId, 'feintUsed');
+  spendDeception(gid, actorId);
   upsertFight(gid, cid, {
     phase: 'defend', current_target: targetId, atk_kind: 'feint',
     atk_roll: total, atk_nat: nat, atk_stat: 'wis', atk_mode: mode, atk_sides: 20,
@@ -11939,7 +12071,7 @@ async function runFightInsight({ interaction, gid, cid, actorId, mode }) {
   }
   const actor = await resolveFighter(interaction.guild, gid, actorId);
   // Already fooled from an earlier feint? Even the insight rolls flat.
-  const fooledI = consumeFooled(gid, cid, actorId);
+  const fooledI = consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
   const statVal = fooledI ? 0 : (actor.stats.wis ?? 0);
   const sigRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
   mode = fooledI ? 'normal' : applySignatureMode(sigRow, 'wis', mode);
@@ -11978,7 +12110,7 @@ async function runFightGrappleSave({ interaction, gid, cid, actorId, mode }) {
     return refuse(`⚠️ The grapple is on **${t.name}** — the save is theirs.`);
   }
   const actor = await resolveFighter(interaction.guild, gid, actorId);
-  const fooledR = consumeFooled(gid, cid, actorId);
+  const fooledR = consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
   const statVal = fooledR ? 0 : (actor.stats.str ?? 0);
   const sigRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
   mode = fooledR ? 'normal' : applySignatureMode(sigRow, 'str', mode);
@@ -12446,6 +12578,32 @@ async function handleFight(interaction, forced) {
   const gid = interaction.guild.id;
   const cid = interactionChannelId(interaction);
   const uid = interaction.user.id;
+  // A feint spends either half of a fight, and which half is decided by the
+  // state of play: with a plain strike pending on you it is a DEFENCE roll,
+  // WIS in place of your usual stat. Decided here, before dispatch, so the
+  // feint path never has to call back into this function.
+  if (sub === 'feint') {
+    const f0 = getFight(gid, cid);
+    const meId = interaction.options?.getString?.('npc') ? npcFighterId(interaction.options.getString('npc')) : uid;
+    // One trick per honest roll, either half of the fight.
+    const npcSpent = isNpcFighter(meId) && f0 && (JSON.parse(f0.effect_state || '{}')[meId]?.feintUsed);
+    if (deceptionSpent(gid, meId) || npcSpent) {
+      return interaction.reply({ ephemeral: true, content:
+        '🎭 That trick is spent — make an ordinary stat roll before trying another. A lie only sells once until you fight straight.' });
+    }
+    if (f0?.state === 'active' && f0.phase === 'defend' && f0.current_target === meId
+        && f0.atk_kind !== 'feint' && f0.atk_kind !== 'grapple') {
+      const meRow = isNpcFighter(meId) ? getNpc(gid, npcNameFromFighter(meId)) : getChar(gid, meId);
+      if ((meRow?.wis ?? 0) < 4) {
+        return interaction.reply({ content: '🎭 Reading a blow takes **WIS 4+** — you cannot feint on the back foot.', ephemeral: true });
+      }
+      setEffectFlag(gid, cid, meId, 'feintDef');
+      setEffectFlag(gid, cid, meId, 'feintUsed');
+      spendDeception(gid, meId);
+      forced = { sub: 'def', stat: 'wis' };
+      sub = 'def';
+    }
+  }
   // Unapproved sheets can't take fight actions. Read-only and GM subcommands pass.
   if (['atk','def','rr','forfeit','start'].includes(sub)) {
     const gateMsg = sheetGate(gid, uid);
@@ -14349,7 +14507,9 @@ const HELP_CATEGORIES = {
       '`/fight act action:Release` — the holder lets go freely (no action); a grappler can never strike their own captive. GMs may part any hold with `target:`',
       '`/fight act action:Deflect` — shield deflection vs a PvE strike (shield + STR 4+, once per round, crits undeflectable): roll STR or DEX (`stat:`) to beat the attack roll, optionally `redirect_npc:` into another enemy for 1 damage. Either way your next attack is a flat d20',
       '`/fight act action:Disarm` — disarm a PvE attacker (blade + DEX 4+, once per round): roll DEX to beat the attack roll — no damage, but they spend their next turn retrieving the weapon. Either way your next defence is a flat d20',
-      '`/fight act action:Feint feint:"..."` — deceive an opponent as your attack action (WIS 4+, PvE and PvP): they answer with `/fight act action:Insight` (WIS). Beat their roll — ties go to them — and their very next rolled action is a straight d20. Either way your next defence is a flat d20',
+      '`/fight act action:Feint feint:"..."` — a feint spends either half of a fight. On your turn it is an attack: WIS against their insight, and if they fall for it the blow lands with normal damage and their next action rolls flat.',
+      '↳ With a strike pending on you it is a defence roll instead — WIS in place of your usual stat — and reading the blow leaves the attacker off-balance. Either way your own next defence rolls flat. WIS 4+; ties go to the target. One trick per honest roll: after a feint or a deception you must make an ordinary stat roll before trying another.',
+      '`/deception target:@player claim:"..."` — the same contest away from the sword, usable anywhere. Win and their very next roll is a straight d20, be it a fight action, a chat roll or an activity.',
       '`/fight rr` — reroll (costs a token) · `/fight resolve` — resolve a clash',
       '`/fight status` — show current fight · `/fight forfeit` — drop out',
       '`/duel opponent:@rival terms:first blood` — raise a duel; a GM signs off, then starts the fight',
@@ -15228,6 +15388,7 @@ async function handleRollSlash(interaction) {
 
   // Hero signature advantage applies to stat rolls
   const effMode = applyNextMark(gid, uid, stat ? applySignatureMode(char, stat, mode) : mode);
+  if (stat) noteHonestRoll(gid, uid);   // an ordinary stat roll re-arms deception
 
   let result;
   if (effMode === 'adv') result = rollAdvantage(notation);
