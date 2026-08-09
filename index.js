@@ -550,6 +550,14 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_archive_id TEXT'); } c
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_threads TEXT'); } catch {} // forum mode: JSON map gmId → thread id
 try { db.exec('ALTER TABLE chars ADD COLUMN next_mark TEXT'); } catch {} // 🔼/🔽 on their very next roll, anywhere
 try { db.exec('ALTER TABLE chars ADD COLUMN deception_spent INTEGER DEFAULT 0'); } catch {} // one trick per honest roll
+try { db.exec('ALTER TABLE story_runs ADD COLUMN quiz_right INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE story_runs ADD COLUMN quiz_asked INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN ask INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN answers TEXT'); } catch {}
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN right_to TEXT'); } catch {}
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN wrong_to TEXT'); } catch {}
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN hint TEXT'); } catch {}
+try { db.exec('ALTER TABLE stories ADD COLUMN quiz_mode TEXT'); } catch {}   // 'retry' or 'tally'
 try { db.exec(`CREATE TABLE IF NOT EXISTS dc_drafts (
   guild_id TEXT NOT NULL, token TEXT NOT NULL, ids TEXT, npcs TEXT, reveal TEXT,
   created_at INTEGER NOT NULL, PRIMARY KEY (guild_id, token)
@@ -1211,6 +1219,63 @@ function storeActivityScript(gid, uid, text) {
     `Run it with \`/activity run name:${parsed.name}\`, or read it back with \`/activity show name:${parsed.name}\`.`].join('\n') };
 }
 
+// A five-question test of Kalidale lore, built in beside the fishing tale.
+// Tally mode: every answer carries on and the score is read out at the end.
+// Swap QUIZ tally for QUIZ retry and a wrong answer sends them round again.
+const DEMO_QUIZ = [
+'[ACTIVITY] Kalidale Lore (quiz)',
+'QUIZ tally',
+'',
+'SCENE q1',
+'SAY · **Question 1 of 5**',
+'SAY How many knight orders are there?',
+'CHOICE',
+'  A \u2014 5 -> q2',
+'  * B \u2014 7 -> q2',
+'  C \u2014 12 -> q2',
+'  D \u2014 15+ -> q2',
+'',
+'SCENE q2',
+'SAY · **Question 2 of 5**',
+'SAY In the RP, who can heal?',
+'CHOICE',
+'  A \u2014 Anyone -> q3',
+'  B \u2014 Black Knights -> q3',
+'  C \u2014 Someone with sufficient training -> q3',
+'  * D \u2014 Paladins & White -> q3',
+'',
+'SCENE q3',
+'SAY · **Question 3 of 5**',
+'SAY How long ago did the Dark Zone eruption happen?',
+'CHOICE',
+'  A \u2014 Last summer -> q4',
+'  B \u2014 237 years ago -> q4',
+'  * C \u2014 6 years ago -> q4',
+'  D \u2014 What eruption? -> q4',
+'',
+'SCENE q4',
+'SAY · **Question 4 of 5**',
+'SAY What is the name of the Knight King\u2019s blessing that grants some knights the ability to perform impossible feats?',
+'CHOICE',
+'  * A \u2014 A knight\u2019s calling -> q5',
+'  B \u2014 A knight\u2019s resolve -> q5',
+'  C \u2014 Absolution of fate -> q5',
+'  D \u2014 Stormsoul -> q5',
+'',
+'SCENE q5',
+'SAY · **Question 5 of 5**',
+'SAY What is the foundation of the current civilisation of Kalidale?',
+'CHOICE',
+'  A \u2014 Democracy -> done',
+'  B \u2014 Aristocracy -> done',
+'  C \u2014 Monarchy -> done',
+'  * D \u2014 Meritocracy -> done',
+'',
+'SCENE done',
+'SAY That is the lot. The archivist totals your answers\u2026',
+'END',
+].join('\n');
+
 function parseStoryScript(text) {
   const lines = String(text || '').split(/\r?\n/);
   const head = lines.findIndex(l => /^\s*\[(STORY|ACTIVITY)\]/i.test(l));
@@ -1219,7 +1284,7 @@ function parseStoryScript(text) {
   if (!name) return { error: 'Give it a name on the `[ACTIVITY]` line.' };
 
   const scenes = [];
-  let cur = null, tally = null, oneOfInto = null;
+  let cur = null, tally = null, oneOfInto = null, quizMode = null;
   const flush = () => { if (cur) { cur.say = (cur.say || '').trim(); scenes.push(cur); } cur = null; oneOfInto = null; };
 
   for (const raw of lines.slice(head + 1)) {
@@ -1228,15 +1293,30 @@ function parseStoryScript(text) {
     let m;
 
     if ((m = line.match(/^TALLY\s+(\w+)/i))) { tally = m[1].toLowerCase(); continue; }
+    // QUIZ retry — a wrong answer sends them back to the same question.
+    // QUIZ tally — wrong answers carry on, and the score is read out at the end.
+    if ((m = line.match(/^QUIZ\s+(retry|tally)/i))) { quizMode = m[1].toLowerCase(); continue; }
 
     if ((m = line.match(/^SCENE\s+(\S+)/i))) {
       flush();
       cur = { scene: m[1], say: '', npc: null, roll: null, dc: null, gauntlet: null,
               outcomes: {}, ranges: [], choices: [], gain: 0, nat20: null, nat1: null,
-              ending: 0, merits: 0, rewards: null, cashTally: 0 };
+              ending: 0, merits: 0, rewards: null, cashTally: 0,
+              ask: 0, answers: [], right: null, wrong: null, hint: null };
       continue;
     }
     if (!cur) continue;
+
+    // ─ a question the player types an answer to ─
+    if (/^ASK\b/i.test(line)) { cur.ask = 1; continue; }
+    if ((m = line.match(/^ANSWER\s+(.+)$/i))) {
+      cur.answers = m[1].split('|').map(x => x.trim()).filter(Boolean);
+      cur.ask = 1;
+      continue;
+    }
+    if ((m = line.match(/^HINT\s+(.+)$/i))) { cur.hint = m[1].trim(); continue; }
+    if ((m = line.match(/^RIGHT\s*->\s*(\S+)/i))) { cur.right = m[1]; continue; }
+    if ((m = line.match(/^WRONG\s*->\s*(\S+)/i))) { cur.wrong = m[1]; continue; }
 
     // A bare line while collecting a ONE OF block is another flavour variant.
     // A bare line inside a ONE OF block is another variant — but a band name
@@ -1280,7 +1360,11 @@ function parseStoryScript(text) {
     }
     if (/^CHOICE\s*$/i.test(line)) { cur.isChoice = true; continue; }
     if (cur.isChoice && (m = line.match(/^(.+?)\s*->\s*(\S+)\s*$/))) {
-      cur.choices.push({ label: m[1].trim(), next: m[2] }); continue;
+      // A leading star marks the right answer: "* B — 7 -> q2". It is the
+      // author's mark, never the player's — stripped before the button.
+      let label = m[1].trim(), correct = 0;
+      if (/^\*\s*/.test(label)) { correct = 1; label = label.replace(/^\*\s*/, ''); }
+      cur.choices.push({ label, next: m[2], correct }); continue;
     }
     if ((m = line.match(/^NAT20\s+(.*?)\s*->\s*(\S+)\s*$/i))) { cur.nat20 = { text: m[1].trim(), next: m[2] }; continue; }
     if ((m = line.match(/^NAT1\s+(.*?)\s*->\s*(\S+)\s*$/i)))  { cur.nat1  = { text: m[1].trim(), next: m[2] }; continue; }
@@ -1364,7 +1448,7 @@ function parseStoryScript(text) {
   if (scenes.some(sc => sc.cashTally || sc.gain) && !tally) {
     return { error: 'Add a `TALLY renown` line at the top — a scene gains or cashes out a tally that has no name.' };
   }
-  return { name, start: scenes[0].scene, tally, scenes };
+  return { name, start: scenes[0].scene, tally, quizMode, scenes };
 }
 
 // Change one part of one scene without re-pasting the whole activity. Values
@@ -1475,15 +1559,53 @@ function saveStory(gid, uid, parsed) {
   db.prepare(`INSERT INTO stories (guild_id, name, author_id, start_scene, tally, created_at) VALUES (?,?,?,?,?,?)
               ON CONFLICT(guild_id, name) DO UPDATE SET author_id=excluded.author_id, start_scene=excluded.start_scene, tally=excluded.tally`)
     .run(gid, parsed.name, uid, parsed.start, parsed.tally ?? null, Date.now());
+  try { db.prepare('UPDATE stories SET quiz_mode=? WHERE guild_id=? AND name=?').run(parsed.quizMode ?? null, gid, parsed.name); } catch {}
   const ins = db.prepare(`INSERT INTO story_scenes
-    (guild_id, story, scene, say, npc, roll, dc, outcomes, ranges, choices, gauntlet, nat20, nat1, gain, cash_tally, ending, merits, rewards, ord)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    (guild_id, story, scene, say, npc, roll, dc, outcomes, ranges, choices, gauntlet, nat20, nat1, gain, cash_tally, ending, merits, rewards, ord, ask, answers, right_to, wrong_to, hint)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   parsed.scenes.forEach((sc, i) => ins.run(gid, parsed.name, sc.scene, sc.say || null, sc.npc, sc.roll, sc.dc ?? null,
     JSON.stringify(sc.outcomes), JSON.stringify(sc.ranges || []), JSON.stringify(sc.choices || []),
     sc.gauntlet ? JSON.stringify(sc.gauntlet) : null,
     sc.nat20 ? JSON.stringify(sc.nat20) : null, sc.nat1 ? JSON.stringify(sc.nat1) : null,
-    sc.gain || 0, sc.cashTally || 0, sc.ending, sc.merits, sc.rewards, i));
+    sc.gain || 0, sc.cashTally || 0, sc.ending, sc.merits, sc.rewards, i,
+    sc.ask ? 1 : 0, sc.answers?.length ? JSON.stringify(sc.answers) : null,
+    sc.right || null, sc.wrong || null, sc.hint || null));
   return listScenes(gid, parsed.name).length;
+}
+
+// Two answers match when they say the same thing: case, accents, stray
+// punctuation, doubled spaces and a leading "the"/"a" are all noise. So
+// "The White Order!" answers "white order".
+// 'retry' sends a wrong answer back to the same question; anything else
+// carries on and lets the final score do the talking.
+// Who an activity is being started for. Yourself by default; a GM may name
+// someone else, and then the run is theirs — their card, their buttons,
+// their score. Returns { owner } or { error }.
+async function resolveRunOwner(interaction) {
+  const me = interaction.user.id;
+  const forPlayer = interaction.options?.getUser?.('player');
+  if (!forPlayer || forPlayer.id === me) return { owner: me };
+  if (!(await isGm(interaction.guild, me))) {
+    return { error: '❌ Only GMs can set an activity running for someone else.' };
+  }
+  if (forPlayer.bot) return { error: '❌ Bots do not sit quizzes.' };
+  return { owner: forPlayer.id };
+}
+
+function quizModeOf(gid, story) {
+  try { return db.prepare('SELECT quiz_mode FROM stories WHERE guild_id=? AND name=?').get(gid, story)?.quiz_mode || null; }
+  catch { return null; }
+}
+
+function sameAnswer(given, wanted) {
+  const tidy = (x) => String(x || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/^\s*(the|a|an)\s+/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return tidy(given) === tidy(wanted);
 }
 
 // Render one scene: narration, then whatever it asks for — a roll (with the
@@ -1533,12 +1655,28 @@ async function postScene(guild, cid, run, sc) {
       }
     }
     if (sc.rewards && !emptyHanded) lines.push(`🎁 **For the GM to hand out:** ${sc.rewards}`);
+    // A run that asked questions reads out its score.
+    if (run.quiz_asked) {
+      const r = run.quiz_right ?? 0, n = run.quiz_asked;
+      const pct = Math.round((r / n) * 100);
+      lines.push(`📝 **Score: ${r}/${n}** (${pct}%)${pct === 100 ? ' — not one wrong.' : pct >= 50 ? '' : ' — worth another go.'}`);
+    }
     endRun(gid, cid, owner);
     await sendLong(channel, [`🎮 **${ownerName}**`, ...lines]);
     return;
   }
 
   const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  // A question waits for a typed answer rather than a button of options.
+  if (sc.ask) {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`storyask:${run.user_id}:${sc.scene}`)
+        .setLabel('✍️ Answer').setStyle(ButtonStyle.Primary));
+    const q = [...lines];
+    if (sc.hint) q.push(`_💡 ${sc.hint}_`);
+    await postWithButtons(channel, [`🎮 **${ownerName}**`, ...q], row);
+    return;
+  }
   const choices = JSON.parse(sc.choices || '[]');
   if (choices.length) {
     const row = new ActionRowBuilder().addComponents(...choices.slice(0, 5).map((c, k) =>
@@ -1640,10 +1778,27 @@ async function handleStoryPickButton(interaction) {
   const pick = choices[Number(idx)];
   if (!pick) return interaction.reply({ content: '❌ That option has gone.', ephemeral: true });
   const name = await getDisplayName(interaction.guild, ctx.uid);
-  await interaction.reply({ content: `➡️ **${name}** — ${pick.label}` });
+
+  // A question is any CHOICE with a right answer marked. Score it, say so,
+  // and — in retry mode — send a wrong answer back to the same question.
+  const marked = choices.some(c => c.correct);
+  let next = pick.next, verdict = '';
+  if (marked) {
+    const right = !!pick.correct;
+    setRun(ctx.gid, ctx.cid, ctx.uid, {
+      quiz_asked: (ctx.run.quiz_asked ?? 0) + 1,
+      quiz_right: (ctx.run.quiz_right ?? 0) + (right ? 1 : 0),
+    });
+    verdict = right ? '  ✅' : '  ❌';
+    if (!right && quizModeOf(ctx.gid, ctx.run.story) === 'retry') {
+      next = sceneName;   // round again until they get it
+      verdict += ' — _try that one again._';
+    }
+  }
+  await interaction.reply({ content: `➡️ **${name}** — ${pick.label}${verdict}` });
   try { await interaction.message.edit({ components: [] }); } catch {}
   try {
-    await advance({ guild: interaction.guild }, ctx, pick.next, JSON.parse(ctx.run.tally_state || '{}'), 0);
+    await advance({ guild: interaction.guild }, ctx, next, JSON.parse(ctx.run.tally_state || '{}'), 0);
   } finally { releaseRun(ctx.gid, ctx.cid, ctx.uid); }
 }
 
@@ -4518,7 +4673,11 @@ const slashCommands = [
       .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('run').setDescription('Start an activity in this channel')
       .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('demo').setDescription('Play the built-in fishing activity — awards nothing (GM)'))
+    .addSubcommand(s=>s.setName('demo').setDescription('Play a built-in activity — the fishing tale or a lore quiz; awards nothing (GM)')
+      .addStringOption(o=>o.setName('which').setDescription('Which demo to try').setRequired(false)
+        .addChoices({name:'🎣 Fishing — rolls, choices and a tally',value:'fishing'},
+                    {name:'🏰 Kalidale Lore — a five-question quiz',value:'quiz'}))
+      .addUserOption(o=>o.setName('player').setDescription('Set it running for someone else — the buttons are theirs to press (GM)').setRequired(false)))
     .addSubcommand(s=>s.setName('stop').setDescription('Stop the activity running in this channel'))
     .addSubcommand(s=>s.setName('delete').setDescription('Delete an activity (GM)')
       .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true)))
@@ -6245,14 +6404,23 @@ async function handleStory(interaction) {
   // a reserved name with every reward stripped, so a demo run can't move
   // anyone's renown, merits or items.
   if (sub === 'demo') {
-    if (getRun(gid, cid, interaction.user.id)) return interaction.reply({ content: '❌ You already have something running here. `/activity stop` first.', ephemeral: true });
-    const parsed = parseStoryScript(DEMO_FISHING);
+    const who = await resolveRunOwner(interaction);
+    if (who.error) return interaction.reply({ content: who.error, ephemeral: true });
+    const owner = who.owner;
+    if (getRun(gid, cid, owner)) return interaction.reply({ content: owner === interaction.user.id
+      ? '❌ You already have something running here. `/activity stop` first.'
+      : `❌ <@${owner}> already has something running here.`, ephemeral: true });
+    const which = interaction.options?.getString?.('which') || 'fishing';
+    const parsed = parseStoryScript(which === 'quiz' ? DEMO_QUIZ : DEMO_FISHING);
     if (parsed.error) return interaction.reply({ content: `❌ The built-in demo failed to parse: ${parsed.error}`, ephemeral: true });
     saveStory(gid, interaction.user.id, parsed);
     const first = getScene(gid, parsed.name, parsed.start);
-    const run = setRun(gid, cid, interaction.user.id, { story: parsed.name, scene: first.scene,
+    const run = setRun(gid, cid, owner, { story: parsed.name, scene: first.scene,
       started_at: Date.now(), tally_state: '{}', gauntlet_at: 0, is_demo: 1 });
-    await interaction.reply({ content: '🎣 **Fishing (demo)** — a dry run. Nothing you catch will be awarded, and rerolls here are free.\nThis one is yours; others can start their own alongside it.' });
+    const handed = owner !== interaction.user.id ? `\n_Set going by <@${interaction.user.id}> — the buttons are yours, <@${owner}>._` : '';
+    await interaction.reply({ content: (which === 'quiz'
+      ? '🏰 **Kalidale Lore (demo)** — five questions, answered by button. The score is read out at the end; nothing is awarded.'
+      : '🎣 **Fishing (demo)** — a dry run. Nothing you catch will be awarded, and rerolls here are free.\nThis one is yours; others can start their own alongside it.') + handed });
     return postScene(interaction.guild, cid, run, first);
   }
 
@@ -6350,13 +6518,22 @@ async function handleStory(interaction) {
   }
 
   if (sub === 'run') {
-    if (getRun(gid, cid, interaction.user.id)) return interaction.reply({ content: '❌ You already have an activity running here. `/activity stop` first.', ephemeral: true });
+    // A GM can set an activity running FOR someone — handy for a quiz you
+    // want a particular player to sit. The run belongs to them: their name on
+    // it, their buttons, their score.
+    const who = await resolveRunOwner(interaction);
+    if (who.error) return interaction.reply({ content: who.error, ephemeral: true });
+    const owner = who.owner;
+    if (getRun(gid, cid, owner)) return interaction.reply({ content: owner === interaction.user.id
+      ? '❌ You already have an activity running here. `/activity stop` first.'
+      : `❌ <@${owner}> already has one running here.`, ephemeral: true });
     const first = getScene(gid, story.name, story.start_scene);
     if (!first) return interaction.reply({ content: `❌ **${story.name}** has no starting scene.`, ephemeral: true });
-    const run = setRun(gid, cid, interaction.user.id, { story: story.name, scene: first.scene,
+    const run = setRun(gid, cid, owner, { story: story.name, scene: first.scene,
       started_at: Date.now(), tally_state: '{}', gauntlet_at: 0 });
     const alongside = runsIn(gid, cid).length - 1;
-    await interaction.reply({ content: `🎮 **${story.name}** begins for <@${interaction.user.id}>…`
+    await interaction.reply({ content: `🎮 **${story.name}** begins for <@${owner}>…`
+      + (owner !== interaction.user.id ? ` _(set going by <@${interaction.user.id}> — the buttons are yours, <@${owner}>.)_` : '')
       + (alongside > 0 ? `\n_${alongside} other run${alongside === 1 ? ' is' : 's are'} going in here too — each is its own._` : '') });
     return postScene(interaction.guild, cid, run, first);
   }
@@ -8598,6 +8775,50 @@ async function handleDeception(interaction) {
   return interaction.reply({ content: lines.join('\n'), allowedMentions: { parse: [] } });
 }
 
+// ✍️ Answer — a writing box, so a quiz can want words rather than a pick
+// from four. Nothing may await before showModal.
+function handleStoryAskButton(interaction) {
+  const [, owner, sceneName] = interaction.customId.split(':');
+  if (interaction.user.id !== owner) {
+    return interaction.reply({ content: '🎮 That is someone else\'s run. Start your own with `/activity run`.', ephemeral: true });
+  }
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+  const modal = new ModalBuilder().setCustomId(`storyans:${sceneName}`).setTitle('Your answer');
+  modal.addComponents(new ActionRowBuilder().addComponents(
+    new TextInputBuilder().setCustomId('answer').setLabel('Answer').setStyle(TextInputStyle.Short)
+      .setRequired(true).setMaxLength(200).setPlaceholder('Type it as you would say it')));
+  return interaction.showModal(modal);
+}
+
+// The answer comes back: judge it, keep the score, and walk on.
+async function handleStoryAnswerModal(interaction) {
+  const gid = interaction.guild.id, cid = interactionChannelId(interaction), uid = interaction.user.id;
+  const sceneName = interaction.customId.split(':').slice(1).join(':');
+  const found = activeSceneFor(interaction, uid, sceneName);
+  if (found.error) return interaction.reply({ content: found.error, ephemeral: true });
+  const { run, sc } = found;
+  const given = interaction.fields.getTextInputValue('answer');
+  const wanted = JSON.parse(sc.answers || '[]');
+  const right = wanted.length ? wanted.some(w => sameAnswer(given, w)) : true;
+
+  setRun(gid, cid, uid, {
+    quiz_asked: (run.quiz_asked ?? 0) + 1,
+    quiz_right: (run.quiz_right ?? 0) + (right ? 1 : 0),
+  });
+  let next = right ? (sc.right_to || sc.wrong_to) : (sc.wrong_to || sc.right_to);
+  if (!right && quizModeOf(gid, run.story) === 'retry') next = sc.scene;   // round again
+  const head = right
+    ? `✅ **${given}** — correct.`
+    : `❌ **${given}** — not this time.${wanted.length ? ` _(wanted: ${wanted[0]})_` : ''}`;
+  await interaction.reply({ content: head });
+  if (!next) return;
+  const nextSc = getScene(gid, run.story, next);
+  if (!nextSc) return;
+  setRun(gid, cid, uid, { scene: next });
+  const channel = await interactionChannel(interaction);
+  if (channel) await postScene(interaction.guild, cid, getRun(gid, cid, uid), nextSc);
+}
+
 // The slash twin of the gmr / gmrs chat shorthands — same roll, same audit
 // mirror; ‘secret’ lands as an ephemeral reply instead of a DM.
 async function runGmRollSlash(interaction) {
@@ -8987,6 +9208,7 @@ async function routeButton(interaction) {
     if (interaction.customId.startsWith('confirm:') || interaction.customId.startsWith('cancel:')) {
       return handleConfirmButton(interaction);
     }
+    if (interaction.customId.startsWith('storyask:')) return handleStoryAskButton(interaction);
     if (interaction.customId.startsWith('storyroll:')) return handleStoryRollButton(interaction);
     if (interaction.customId.startsWith('storypick:')) return handleStoryPickButton(interaction);
     if (interaction.customId.startsWith('storyrr:')) return handleStoryRerollButton(interaction);
@@ -9332,6 +9554,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.customId.startsWith('gmkill:')) return handleGmKillModal(interaction);
     if (interaction.customId.startsWith('lorereject:')) return handleLoreRejectModal(interaction);
     if (interaction.customId.startsWith('traderej:')) return handleMeritTradeRejectModal(interaction);
+    if (interaction.customId.startsWith('storyans:')) return handleStoryAnswerModal(interaction);
     if (interaction.customId.startsWith('dcform:')) return handleDcFormSubmit(interaction);
     if (interaction.customId.startsWith('duelrej:')) return handleDuelRejectModal(interaction);
     if (interaction.customId.startsWith('sheetreject:')) return handleSheetRejectModal(interaction);
@@ -14532,12 +14755,15 @@ const HELP_CATEGORIES = {
     blurb: 'server-written minigames, and the coin they pay',
     body: [
       '_Activities are minigames written for this server — branching scenes, rolls, choices and rewards. Renown is the currency they and quests pay out._',
+      '`/activity run name:X player:@someone` — set an activity running for another player: their name on it, their buttons, their score. `/activity demo` takes `player:` too, so you can hand someone a quiz to sit (GM)',
       '`/activity list` — every activity on this server · `/activity show name:X` — read one scene by scene',
       '`/activity run name:X` — start one in this channel · `/activity stop` — stop the one running here',
       'When a scene asks for a roll, type the stat word — `wis`, or `wis steady does it` to add flavour',
       'A **Reroll** button sits on the scene card while a token remains — one second chance per roll',
       'Some scenes offer **choices** as buttons; some tally renown as you play and bank it at the end',
       '`/activity demo` — the built-in fishing tale, no stakes (GM)',
+      '_Quizzes:_ a scene with `ASK` waits for a typed answer, or put a `*` before the right option in a `CHOICE` block for multiple choice. `RIGHT ->` / `WRONG ->` route typed answers.',
+      '↳ `QUIZ tally` at the top lets every answer carry on and reads the score out at the end; `QUIZ retry` sends a wrong answer back to the same question. `/activity demo which:Kalidale Lore` is a five-question example.',
       '`/activity create` — write one: a paste window opens (or attach a `.txt` with `file:` for long scripts). Pasting an `[ACTIVITY]` script straight into chat works too — every route is validated before anything is stored (GM)',
       '`/activity set name:X scene:Y field:Z value:...` — tweak one line of one scene without re-pasting (GM)',
       '`/activity delete name:X` — remove an activity (GM)',
