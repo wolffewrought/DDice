@@ -558,6 +558,38 @@ try { db.exec('ALTER TABLE story_scenes ADD COLUMN right_to TEXT'); } catch {}
 try { db.exec('ALTER TABLE story_scenes ADD COLUMN wrong_to TEXT'); } catch {}
 try { db.exec('ALTER TABLE story_scenes ADD COLUMN hint TEXT'); } catch {}
 try { db.exec('ALTER TABLE stories ADD COLUMN quiz_mode TEXT'); } catch {}   // 'retry' or 'tally'
+try { db.exec('ALTER TABLE stories ADD COLUMN quiz_pass INTEGER'); } catch {}      // how many right counts as a pass
+try { db.exec('ALTER TABLE stories ADD COLUMN quiz_merit INTEGER'); } catch {}     // merits for passing
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN qid INTEGER'); } catch {}       // which banked question this is
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN explain TEXT'); } catch {}      // shown after the answer
+
+// The question bank. Questions live here because a draw, and the dropdown
+// that hand-picks them, must answer instantly; the forum copy is for reading.
+try { db.exec(`CREATE TABLE IF NOT EXISTS quiz_questions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL, category TEXT NOT NULL, tags TEXT,
+  question TEXT NOT NULL, answers TEXT NOT NULL,
+  difficulty TEXT NOT NULL DEFAULT 'normal',
+  explain TEXT, thread_id TEXT, message_id TEXT,
+  author_id TEXT, created_at INTEGER NOT NULL
+)`); } catch (e) { console.error('quiz_questions schema', e); }
+try { db.exec(`CREATE TABLE IF NOT EXISTS quiz_categories (
+  guild_id TEXT NOT NULL, name TEXT NOT NULL, thread_id TEXT,
+  PRIMARY KEY (guild_id, name)
+)`); } catch (e) { console.error('quiz_categories schema', e); }
+// What each player has already been asked, so a draw can prefer the new.
+try { db.exec(`CREATE TABLE IF NOT EXISTS quiz_seen (
+  guild_id TEXT NOT NULL, user_id TEXT NOT NULL, question_id INTEGER NOT NULL,
+  right_answer INTEGER NOT NULL DEFAULT 0, at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, user_id, question_id)
+)`); } catch (e) { console.error('quiz_seen schema', e); }
+// A set a GM saved: the same draw, repeatable.
+try { db.exec(`CREATE TABLE IF NOT EXISTS quiz_sets (
+  guild_id TEXT NOT NULL, name TEXT NOT NULL, spec TEXT NOT NULL,
+  author_id TEXT, created_at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, name)
+)`); } catch (e) { console.error('quiz_sets schema', e); }
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quiz_forum TEXT'); } catch {}
 try { db.exec(`CREATE TABLE IF NOT EXISTS dc_drafts (
   guild_id TEXT NOT NULL, token TEXT NOT NULL, ids TEXT, npcs TEXT, reveal TEXT,
   created_at INTEGER NOT NULL, PRIMARY KEY (guild_id, token)
@@ -1430,8 +1462,10 @@ function parseStoryScript(text) {
         return { error: `Scene \`${sc.scene}\` points at \`${t}\`, which doesn't exist.` };
       }
     }
-    const asks = sc.roll || sc.choices.length;
-    if (!sc.ending && !asks) return { error: `Scene \`${sc.scene}\` has no \`ROLL\`, \`CHOICE\` or \`END\` — a run would stop there.` };
+    // ASK counts as asking — a typed question is a stopping point too.
+    const asks = sc.roll || sc.choices.length || sc.ask;
+    if (!sc.ending && !asks) return { error: `Scene \`${sc.scene}\` has no \`ROLL\`, \`CHOICE\`, \`ASK\` or \`END\` — a run would stop there.` };
+    if (sc.ask && !sc.right && !sc.wrong) return { error: `Scene \`${sc.scene}\` asks a question but nothing follows it — add \`RIGHT ->\` or \`WRONG ->\`.` };
     if (sc.roll && !targets(sc).length) return { error: `Scene \`${sc.scene}\` asks for a roll but nothing follows it.` };
     if (sc.isChoice && !sc.choices.length) return { error: `Scene \`${sc.scene}\` has a \`CHOICE\` with no options.` };
     if (sc.gauntlet && sc.gauntlet.length > 8) return { error: `Scene \`${sc.scene}\` has a gauntlet of ${sc.gauntlet.length} rolls — 8 is the most.` };
@@ -1576,6 +1610,178 @@ function saveStory(gid, uid, parsed) {
 // Two answers match when they say the same thing: case, accents, stray
 // punctuation, doubled spaces and a leading "the"/"a" are all noise. So
 // "The White Order!" answers "white order".
+// Fisher-Yates, so a shuffle is honest rather than sort-ish.
+function shuffled(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// Draw `count` questions, preferring ones this player has never been asked.
+// Only when the unseen run out does it reach for the rest, so a small bank
+// still feels fresh rather than repeating on the second sitting.
+function drawQuizQuestions(gid, uid, { category = null, tag = null, difficulty = null, count = 5, pool = 'fresh' } = {}) {
+  let q = 'SELECT * FROM quiz_questions WHERE guild_id=?';
+  const args = [gid];
+  if (category) { q += ' AND category=? COLLATE NOCASE'; args.push(category); }
+  if (difficulty) { q += ' AND difficulty=?'; args.push(difficulty); }
+  if (tag) { q += " AND (',' || REPLACE(tags,', ',',') || ',') LIKE ?"; args.push(`%,${tag},%`); }
+  let rows = [];
+  try { rows = db.prepare(q).all(...args); } catch { return []; }
+  if (!rows.length) return [];
+  let seen = new Set();
+  try {
+    seen = new Set(db.prepare('SELECT question_id FROM quiz_seen WHERE guild_id=? AND user_id=?')
+      .all(gid, uid).map(r => r.question_id));
+  } catch {}
+  // Which questions are we willing to ask?
+  //   fresh — new ones first, old ones only if the bank runs dry (default)
+  //   new   — only ones they have never met; fewer is fine
+  //   any   — everything, seen or not; a straight random draw
+  //   wrong — only the ones they got wrong before: revision
+  let wrong = new Set();
+  try {
+    wrong = new Set(db.prepare('SELECT question_id FROM quiz_seen WHERE guild_id=? AND user_id=? AND right_answer=0')
+      .all(gid, uid).map(r => r.question_id));
+  } catch {}
+  const unseen = shuffled(rows.filter(r => !seen.has(r.id)));
+  const met = shuffled(rows.filter(r => seen.has(r.id)));
+  let ordered;
+  if (pool === 'new') ordered = unseen;
+  else if (pool === 'any') ordered = shuffled(rows);
+  else if (pool === 'wrong') ordered = shuffled(rows.filter(r => wrong.has(r.id)));
+  else ordered = [...unseen, ...met];
+  return ordered.slice(0, Math.max(1, count));
+}
+
+// Write an activity script from drawn questions. Answers are shuffled too,
+// so the right one doesn't sit where it was typed; a typed question (one
+// answer) becomes ASK/ANSWER instead of a row of buttons.
+function quizScript(name, questions, { mode = 'tally' } = {}) {
+  const L = [`[ACTIVITY] ${name}`, `QUIZ ${mode}`, ''];
+  questions.forEach((row, i) => {
+    const answers = JSON.parse(row.answers || '[]');
+    const scene = `q${row.id}`;
+    const next = i + 1 < questions.length ? `q${questions[i + 1].id}` : 'done';
+    L.push(`SCENE ${scene}`);
+    L.push(`SAY · **Question ${i + 1} of ${questions.length}**`);
+    for (const part of String(row.question).split('\n')) L.push(`SAY ${part}`);
+    if (answers.length <= 1) {
+      L.push('ASK');
+      if (answers[0]?.text) L.push(`ANSWER ${answers[0].text}`);
+      L.push(`RIGHT -> ${next}`);
+      L.push(`WRONG -> ${next}`);
+    } else {
+      L.push('CHOICE');
+      for (const a of shuffled(answers)) {
+        L.push(`  ${a.correct ? '* ' : ''}${String(a.text).replace(/\s*->\s*/g, ' → ')} -> ${next}`);
+      }
+    }
+    L.push('');
+  });
+  L.push('SCENE done', 'SAY That is the lot.', 'END');
+  return L.join('\n');
+}
+
+// ── The question bank ──────────────────────────────────────────
+function quizCategories(gid) {
+  try { return db.prepare('SELECT * FROM quiz_categories WHERE guild_id=? ORDER BY name').all(gid); }
+  catch { return []; }
+}
+function quizTags(gid) {
+  const out = new Set();
+  try {
+    for (const r of db.prepare('SELECT tags FROM quiz_questions WHERE guild_id=? AND tags IS NOT NULL').all(gid)) {
+      for (const t of String(r.tags).split(',')) { const x = t.trim(); if (x) out.add(x); }
+    }
+  } catch {}
+  return [...out].sort();
+}
+function addQuizQuestion(gid, row) {
+  const info = db.prepare(`INSERT INTO quiz_questions
+    (guild_id, category, tags, question, answers, difficulty, explain, author_id, created_at)
+    VALUES (?,?,?,?,?,?,?,?,?)`)
+    .run(gid, row.category, row.tags || null, row.question, JSON.stringify(row.answers),
+         row.difficulty || 'normal', row.explain || null, row.author_id || null, Date.now());
+  db.prepare('INSERT OR IGNORE INTO quiz_categories (guild_id, name) VALUES (?,?)').run(gid, row.category);
+  return info.lastInsertRowid;
+}
+function quizQuestion(gid, id) {
+  try { return db.prepare('SELECT * FROM quiz_questions WHERE guild_id=? AND id=?').get(gid, id) || null; }
+  catch { return null; }
+}
+function countQuizQuestions(gid, { category = null, tag = null, difficulty = null } = {}) {
+  let q = 'SELECT COUNT(*) AS c FROM quiz_questions WHERE guild_id=?';
+  const args = [gid];
+  if (category) { q += ' AND category=? COLLATE NOCASE'; args.push(category); }
+  if (difficulty) { q += ' AND difficulty=?'; args.push(difficulty); }
+  if (tag) { q += " AND (',' || REPLACE(tags,', ',',') || ',') LIKE ?"; args.push(`%,${tag},%`); }
+  try { return db.prepare(q).get(...args).c; } catch { return 0; }
+}
+
+// The category's thread in the quiz forum: adopted if it exists, made if it
+// doesn't, remade if it was deleted. The id is the truth, never the name.
+async function quizCategoryThread(client, gid, category) {
+  const forumId = getConfig(gid)?.quiz_forum;
+  if (!forumId) return null;
+  const forum = await client.channels.fetch(forumId).catch(() => null);
+  if (!forum || forum.type !== 15) return null;
+  const row = db.prepare('SELECT thread_id FROM quiz_categories WHERE guild_id=? AND name=?').get(gid, category);
+  if (row?.thread_id) {
+    const th = await client.channels.fetch(row.thread_id).catch(() => null);
+    if (th?.isThread?.() && th.parentId === forum.id) return wakeThread(th);
+  }
+  // Adopt a thread already named for this category before making a second.
+  try {
+    const active = await forum.threads.fetchActive();
+    const found = active.threads.find(t => t.name.toLowerCase() === category.toLowerCase());
+    if (found) {
+      db.prepare('UPDATE quiz_categories SET thread_id=? WHERE guild_id=? AND name=?').run(found.id, gid, category);
+      return wakeThread(found);
+    }
+  } catch { /* fall through to making one */ }
+  const thread = await forum.threads.create({
+    name: category.slice(0, 100), autoArchiveDuration: 10080,
+    message: { content: `📚 **${category}** — questions in this category are posted here as they are written.` },
+  });
+  db.prepare('INSERT OR IGNORE INTO quiz_categories (guild_id, name) VALUES (?,?)').run(gid, category);
+  db.prepare('UPDATE quiz_categories SET thread_id=? WHERE guild_id=? AND name=?').run(thread.id, gid, category);
+  return thread;
+}
+
+// The readable copy. Best-effort: a question is saved whether or not the
+// forum takes it, and the ack says which happened.
+async function mirrorQuizQuestion(client, gid, id) {
+  const q = quizQuestion(gid, id);
+  if (!q) return null;
+  const th = await quizCategoryThread(client, gid, q.category).catch(() => null);
+  if (!th) return null;
+  const answers = JSON.parse(q.answers || '[]');
+  const lines = [`**#${q.id} · ${q.question}**`];
+  answers.forEach((a, i) => lines.push(`${a.correct ? '✅' : '　'} ${'ABCD'[i] || '•'} — ${a.text}`));
+  if (q.explain) lines.push('', `_${q.explain}_`);
+  const foot = [q.difficulty !== 'normal' ? `⚖️ ${q.difficulty}` : '', q.tags ? `🏷️ ${q.tags}` : ''].filter(Boolean).join(' · ');
+  if (foot) lines.push(foot);
+  const msg = await th.send({ content: lines.join('\n').slice(0, 1990), allowedMentions: { parse: [] } });
+  db.prepare('UPDATE quiz_questions SET thread_id=?, message_id=? WHERE guild_id=? AND id=?')
+    .run(th.id, msg.id, gid, id);
+  return th;
+}
+
+// A banked question that has just been answered: remember it, so the next
+// draw for this player prefers what they have not met.
+function noteQuizSeen(gid, uid, sc, right) {
+  if (!sc?.qid) return;
+  try {
+    db.prepare(`INSERT INTO quiz_seen (guild_id, user_id, question_id, right_answer, at) VALUES (?,?,?,?,?)
+                ON CONFLICT(guild_id, user_id, question_id) DO UPDATE SET right_answer=excluded.right_answer, at=excluded.at`)
+      .run(gid, uid, sc.qid, right ? 1 : 0, Date.now());
+  } catch {}
+}
+
 // 'retry' sends a wrong answer back to the same question; anything else
 // carries on and lets the final score do the talking.
 // Who an activity is being started for. Yourself by default; a GM may name
@@ -1660,6 +1866,17 @@ async function postScene(guild, cid, run, sc) {
       const r = run.quiz_right ?? 0, n = run.quiz_asked;
       const pct = Math.round((r / n) * 100);
       lines.push(`📝 **Score: ${r}/${n}** (${pct}%)${pct === 100 ? ' — not one wrong.' : pct >= 50 ? '' : ' — worth another go.'}`);
+      // A pass mark, and what passing is worth.
+      let st = null;
+      try { st = db.prepare('SELECT quiz_pass, quiz_merit FROM stories WHERE guild_id=? AND name=?').get(gid, run.story); } catch {}
+      if (st?.quiz_pass) {
+        const passed = r >= st.quiz_pass;
+        lines.push(passed ? `✅ **Passed** — ${st.quiz_pass} were needed.` : `❌ **Not this time** — ${st.quiz_pass} were needed.`);
+        if (passed && st.quiz_merit) {
+          addMerits(gid, owner, st.quiz_merit);
+          lines.push(`🏅 **${st.quiz_merit} merit${st.quiz_merit === 1 ? '' : 's'}** to <@${owner}> for passing.`);
+        }
+      }
     }
     endRun(gid, cid, owner);
     await sendLong(channel, [`🎮 **${ownerName}**`, ...lines]);
@@ -1790,6 +2007,8 @@ async function handleStoryPickButton(interaction) {
       quiz_right: (ctx.run.quiz_right ?? 0) + (right ? 1 : 0),
     });
     verdict = right ? '  ✅' : '  ❌';
+    noteQuizSeen(ctx.gid, ctx.uid, ctx.sc, right);
+    if (ctx.sc.explain) verdict += `\n_${ctx.sc.explain}_`;
     if (!right && quizModeOf(ctx.gid, ctx.run.story) === 'retry') {
       next = sceneName;   // round again until they get it
       verdict += ' — _try that one again._';
@@ -4839,6 +5058,9 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('questplanning').setDescription('A private GM forum — /quest create opens a planning thread there')
       .addChannelOption(o=>o.setName('channel').setDescription('The GM-only forum channel').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = stop making planning threads').setRequired(false)));
+      g.addSubcommand(s=>s.setName('quizforum').setDescription('A forum where the question bank is posted, a thread per category')
+      .addChannelOption(o=>o.setName('channel').setDescription('The quiz forum').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop posting the readable copy').setRequired(false)));
       g.addSubcommand(s=>s.setName('questinstances').setDescription('A forum where each STARTED quest opens a room for its party and DM')
       .addChannelOption(o=>o.setName('channel').setDescription('The instance forum').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = stop opening rooms').setRequired(false)));
@@ -5065,6 +5287,41 @@ const slashCommands = [
           .addChoices({name:'Create',value:'create'},{name:'Delete',value:'delete'},{name:'List',value:'list'}))
         .addStringOption(o=>o.setName('emoji').setDescription('Emoji for the tag (create only)').setRequired(false))
         .addStringOption(o=>o.setName('name').setDescription('Tag name (create/delete)').setRequired(false).setAutocomplete(true)))),
+
+  new SlashCommandBuilder()
+    .setName('quiz').setDescription('The question bank — write questions, then set quizzes from them (GM)')
+    .addSubcommand(s=>s.setName('add').setDescription('Write a question — a window opens for the question and its answers')
+      .addStringOption(o=>o.setName('category').setDescription('Which category it belongs to, e.g. Orders').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('tags').setDescription('Finer sorting — comma-separated, e.g. heraldry, ranks').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('difficulty').setDescription('How hard it is').setRequired(false)
+        .addChoices({name:'🟢 Easy',value:'easy'},{name:'⚪ Normal',value:'normal'},{name:'🔴 Hard',value:'hard'}))
+      .addStringOption(o=>o.setName('explain').setDescription('A line shown after the answer — the why').setRequired(false)))
+    .addSubcommand(s=>s.setName('start').setDescription('Set a quiz drawn from the bank — for yourself, or a player you name')
+      .addStringOption(o=>o.setName('category').setDescription('Draw only from this category').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('tag').setDescription('Draw only questions with this tag').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('difficulty').setDescription('Draw only this difficulty').setRequired(false)
+        .addChoices({name:'🟢 Easy',value:'easy'},{name:'⚪ Normal',value:'normal'},{name:'🔴 Hard',value:'hard'}))
+      .addIntegerOption(o=>o.setName('count').setDescription('How many questions (default 5)').setRequired(false).setMinValue(1).setMaxValue(20))
+      .addStringOption(o=>o.setName('pool').setDescription('Which questions they may be asked').setRequired(false)
+        .addChoices({name:'✨ Fresh first — new ones, then old (default)',value:'fresh'},
+                    {name:'🆕 Only ones new to them',value:'new'},
+                    {name:'🎲 Any — seen or not',value:'any'},
+                    {name:'📖 Revision — only ones they got wrong',value:'wrong'}))
+      .addStringOption(o=>o.setName('mode').setDescription('What a wrong answer costs').setRequired(false)
+        .addChoices({name:'📝 Tally — carry on, score at the end',value:'tally'},
+                    {name:'🔁 Retry — the same question until it is right',value:'retry'}))
+      .addIntegerOption(o=>o.setName('pass').setDescription('How many right counts as a pass').setRequired(false).setMinValue(1).setMaxValue(20))
+      .addIntegerOption(o=>o.setName('merit').setDescription('Merits awarded for passing').setRequired(false).setMinValue(1).setMaxValue(10))
+      .addUserOption(o=>o.setName('player').setDescription('Set it for someone else — the buttons are theirs (GM)').setRequired(false))
+      .addStringOption(o=>o.setName('save').setDescription('Remember this draw under a name, to set again later').setRequired(false))
+      .addStringOption(o=>o.setName('set').setDescription('Use a draw you saved earlier').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('list').setDescription('What is in the bank, by category')
+      .addStringOption(o=>o.setName('category').setDescription('Only this category').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('tag').setDescription('Only this tag').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('show').setDescription('Read one question in full')
+      .addIntegerOption(o=>o.setName('id').setDescription('Question number').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('remove').setDescription('Delete a question from the bank')
+      .addIntegerOption(o=>o.setName('id').setDescription('Question number').setRequired(true).setAutocomplete(true))),
 
   new SlashCommandBuilder()
     .setName('deception').setDescription('Try to deceive someone — anywhere, in a fight or not')
@@ -6919,6 +7176,25 @@ async function handleConfig(interaction, forced) {
     ].join('\n') });
   }
 
+  if (sub === 'quizforum') {
+    if (interaction.options?.getBoolean?.('disable')) {
+      setConfig(gid, { quiz_forum: null });
+      return interaction.reply({ content: '📚 Questions will no longer be posted. The bank itself is untouched.' });
+    }
+    const channel = (forced?.channel ?? interaction.options?.getChannel?.('channel'));
+    if (!channel) {
+      const cur = getConfig(gid)?.quiz_forum;
+      return interaction.reply({ ephemeral: true, content: cur
+        ? `📚 The question bank is posted in <#${cur}> — a thread per category.`
+        : '📚 No quiz forum set. `/config channels quizforum channel:#your-forum` gives the bank a readable home.' });
+    }
+    if (channel.type !== 15) {
+      return interaction.reply({ ephemeral: true, content: `❌ <#${channel.id}> is not a forum channel. Make a **Forum** — each category gets a thread there.` });
+    }
+    setConfig(gid, { quiz_forum: channel.id });
+    return interaction.reply({ content: `📚 The question bank now reads in <#${channel.id}> — a thread per category, opened as questions are written.` });
+  }
+
   if (sub === 'questinstances') {
     if (interaction.options?.getBoolean?.('disable')) {
       setConfig(gid, { quest_instance_forum: null });
@@ -8712,6 +8988,202 @@ async function runDcRollPress(interaction) {
   return;
 }
 
+async function handleQuiz(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const sub = interaction.options.getSubcommand();
+  if (!(await isGm(interaction.guild, uid))) {
+    return interaction.reply({ content: '❌ The question bank is a GM tool.', ephemeral: true });
+  }
+
+  if (sub === 'add') {
+    // Five boxes is Discord's ceiling, so: the question, then four answers.
+    // Nothing may await before showModal — the settings ride the customId.
+    const category = interaction.options.getString('category').trim().slice(0, 60);
+    const tags = (interaction.options.getString('tags') || '').trim().slice(0, 120);
+    const difficulty = interaction.options.getString('difficulty') || 'normal';
+    const explain = (interaction.options.getString('explain') || '').trim().slice(0, 300);
+    const token = `${Date.now().toString(36)}`;
+    try {
+      db.prepare('INSERT OR REPLACE INTO quiz_sets (guild_id, name, spec, author_id, created_at) VALUES (?,?,?,?,?)')
+        .run(gid, `\u0000draft:${token}`, JSON.stringify({ category, tags, difficulty, explain }), uid, Date.now());
+    } catch {}
+    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+    const modal = new ModalBuilder().setCustomId(`quizadd:${token}`).setTitle(`New question · ${category}`.slice(0, 45));
+    const T = (id, label, style, ph, max, req = false) =>
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId(id).setLabel(label)
+        .setStyle(style).setRequired(req).setMaxLength(max).setPlaceholder(ph));
+    modal.addComponents(
+      T('q', 'The question', TextInputStyle.Paragraph, 'What are you asking them?', 400, true),
+      T('a1', 'Answer 1 — star the right one', TextInputStyle.Short, '* 7   (the star marks it correct)', 120, true),
+      T('a2', 'Answer 2 (leave blank if typed)', TextInputStyle.Short, '5', 120),
+      T('a3', 'Answer 3', TextInputStyle.Short, '12', 120),
+      T('a4', 'Answer 4', TextInputStyle.Short, '15+', 120),
+    );
+    return interaction.showModal(modal);
+  }
+
+  if (sub === 'start') {
+    const who = await resolveRunOwner(interaction);
+    if (who.error) return interaction.reply({ content: who.error, ephemeral: true });
+    const owner = who.owner;
+    const cid = interactionChannelId(interaction);
+    if (getRun(gid, cid, owner)) return interaction.reply({ ephemeral: true, content: owner === uid
+      ? '❌ You already have something running here. `/activity stop` first.'
+      : `❌ <@${owner}> already has something running here.` });
+
+    // A saved set is just a remembered set of options.
+    let spec = {
+      category: interaction.options.getString('category'),
+      tag: interaction.options.getString('tag'),
+      difficulty: interaction.options.getString('difficulty'),
+      count: interaction.options.getInteger('count') ?? 5,
+      pool: interaction.options.getString('pool') || 'fresh',
+      mode: interaction.options.getString('mode') || 'tally',
+      pass: interaction.options.getInteger('pass'),
+      merit: interaction.options.getInteger('merit'),
+    };
+    const setName = interaction.options.getString('set');
+    if (setName) {
+      let row = null;
+      try { row = db.prepare('SELECT spec FROM quiz_sets WHERE guild_id=? AND name=?').get(gid, setName); } catch {}
+      if (!row) return interaction.reply({ content: `❌ No saved set called **${setName}**.`, ephemeral: true });
+      spec = { ...JSON.parse(row.spec), ...Object.fromEntries(Object.entries(spec).filter(([, v]) => v != null && v !== 'tally' && v !== 5)) };
+    }
+
+    const drawn = drawQuizQuestions(gid, owner, spec);
+    if (!drawn.length) {
+      const why = spec.pool === 'wrong' ? ' — they have not got any of these wrong yet'
+                : spec.pool === 'new' ? ' — they have already met every one of these'
+                : '';
+      return interaction.reply({ ephemeral: true, content:
+        `❌ Nothing in the bank matches that${spec.category ? ` in **${spec.category}**` : ''}${spec.tag ? ` tagged \`${spec.tag}\`` : ''}${spec.difficulty ? ` at ${spec.difficulty}` : ''}${why}. \`/quiz list\` shows what there is.` });
+    }
+    const short = drawn.length < spec.count;
+    const title = `Quiz · ${spec.category || 'mixed'} · ${new Date().toISOString().slice(11, 16)}`;
+    const parsed = parseStoryScript(quizScript(title, drawn, { mode: spec.mode }));
+    if (parsed.error) return interaction.reply({ content: `❌ The quiz would not build: ${parsed.error}`, ephemeral: true });
+    saveStory(gid, uid, parsed);
+    // Remember which banked question each scene came from, and what to say
+    // after it — the engine reads both when the answer lands.
+    for (const row of drawn) {
+      try {
+        db.prepare('UPDATE story_scenes SET qid=?, explain=? WHERE guild_id=? AND story=? AND scene=?')
+          .run(row.id, row.explain || null, gid, parsed.name, `q${row.id}`);
+      } catch {}
+    }
+    try {
+      db.prepare('UPDATE stories SET quiz_pass=?, quiz_merit=? WHERE guild_id=? AND name=?')
+        .run(spec.pass ?? null, spec.merit ?? null, gid, parsed.name);
+    } catch {}
+    if (interaction.options.getString('save')) {
+      const nm = interaction.options.getString('save').trim().slice(0, 60);
+      try {
+        db.prepare('INSERT OR REPLACE INTO quiz_sets (guild_id, name, spec, author_id, created_at) VALUES (?,?,?,?,?)')
+          .run(gid, nm, JSON.stringify(spec), uid, Date.now());
+      } catch {}
+    }
+    const first = getScene(gid, parsed.name, parsed.start);
+    const run = setRun(gid, cid, owner, { story: parsed.name, scene: first.scene,
+      started_at: Date.now(), tally_state: '{}', gauntlet_at: 0 });
+    const bits = [`📚 **${drawn.length} question${drawn.length === 1 ? '' : 's'}** for <@${owner}>`];
+    if (spec.pass) bits.push(`— **${spec.pass}** to pass${spec.merit ? `, worth **${spec.merit}** merit${spec.merit === 1 ? '' : 's'}` : ''}`);
+    if (spec.mode === 'retry') bits.push('· wrong answers come round again');
+    if (short) bits.push(`· _(${spec.count} asked for; the pool held ${drawn.length})_`);
+    if (spec.pool === 'wrong') bits.push('· revision: only ones they got wrong before');
+    if (spec.pool === 'any') bits.push('· drawn from everything, seen or not');
+    if (owner !== uid) bits.push(`\n_Set going by <@${uid}> — the buttons are yours, <@${owner}>._`);
+    await interaction.reply({ content: bits.join(' ') });
+    return postScene(interaction.guild, cid, run, first);
+  }
+
+  if (sub === 'list') {
+    const cat = interaction.options.getString('category');
+    const tag = interaction.options.getString('tag');
+    const cats = quizCategories(gid);
+    if (!cats.length) return interaction.reply({ ephemeral: true, content: '📚 The bank is empty. `/quiz add category:Orders` writes the first question.' });
+    const lines = ['📚 **The question bank**', ''];
+    let total = 0;
+    for (const c of cats) {
+      if (cat && c.name.toLowerCase() !== cat.toLowerCase()) continue;
+      const n = countQuizQuestions(gid, { category: c.name, tag });
+      total += n;
+      lines.push(`• **${c.name}** — ${n} question${n === 1 ? '' : 's'}${c.thread_id ? ` · <#${c.thread_id}>` : ''}`);
+    }
+    lines.push('', `**${total}** in total${tag ? ` with the tag \`${tag}\`` : ''}.`);
+    const tags = quizTags(gid);
+    if (tags.length) lines.push(`🏷️ Tags in use: ${tags.slice(0, 25).join(' · ')}`);
+    return replyLong(interaction, lines, { ephemeral: true });
+  }
+
+  if (sub === 'show') {
+    const q = quizQuestion(gid, interaction.options.getInteger('id'));
+    if (!q) return interaction.reply({ content: '❌ No question with that number.', ephemeral: true });
+    const answers = JSON.parse(q.answers || '[]');
+    const lines = [`📚 **#${q.id}** · ${q.category}${q.tags ? ` · 🏷️ ${q.tags}` : ''} · ${q.difficulty}`, '',
+      `**${q.question}**`];
+    answers.forEach((a, i) => lines.push(`${a.correct ? '✅' : '　'} ${'ABCD'[i] || '•'} — ${a.text}`));
+    if (q.explain) lines.push('', `_${q.explain}_`);
+    if (q.thread_id && q.message_id) lines.push('', `📖 <#${q.thread_id}>`);
+    return replyLong(interaction, lines, { ephemeral: true });
+  }
+
+  if (sub === 'remove') {
+    const id = interaction.options.getInteger('id');
+    const q = quizQuestion(gid, id);
+    if (!q) return interaction.reply({ content: '❌ No question with that number.', ephemeral: true });
+    return requestConfirm(interaction, `Delete question **#${id}** — _${q.question.slice(0, 90)}_?`, async () => {
+      if (q.thread_id && q.message_id) {
+        try {
+          const th = await interaction.client.channels.fetch(q.thread_id);
+          await th.messages.delete(q.message_id);
+        } catch { /* the readable copy may already be gone */ }
+      }
+      db.prepare('DELETE FROM quiz_questions WHERE guild_id=? AND id=?').run(gid, id);
+      db.prepare('DELETE FROM quiz_seen WHERE guild_id=? AND question_id=?').run(gid, id);
+      return `🗑️ Question **#${id}** deleted.`;
+    });
+  }
+}
+
+// The window comes back: read the boxes, save the question, post the copy.
+async function handleQuizAddModal(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const token = interaction.customId.split(':')[1];
+  let spec = { category: 'General', tags: '', difficulty: 'normal', explain: '' };
+  try {
+    const row = db.prepare('SELECT spec FROM quiz_sets WHERE guild_id=? AND name=?').get(gid, `\u0000draft:${token}`);
+    if (row) spec = JSON.parse(row.spec);
+    db.prepare('DELETE FROM quiz_sets WHERE guild_id=? AND name=?').run(gid, `\u0000draft:${token}`);
+  } catch {}
+
+  const question = interaction.fields.getTextInputValue('q').trim();
+  const raw = ['a1', 'a2', 'a3', 'a4']
+    .map(k => { try { return interaction.fields.getTextInputValue(k); } catch { return ''; } })
+    .map(x => (x || '').trim()).filter(Boolean);
+  // A star in front marks the right answer — the same mark CHOICE blocks use.
+  const answers = raw.map(t => {
+    const correct = /^\*\s*/.test(t) ? 1 : 0;
+    return { text: t.replace(/^\*\s*/, '').slice(0, 100), correct };
+  });
+  if (!answers.length) return interaction.reply({ content: '❌ A question needs at least one answer.', ephemeral: true });
+  if (!answers.some(a => a.correct)) {
+    if (answers.length === 1) answers[0].correct = 1;   // a typed question: the one answer IS the answer
+    else return interaction.reply({ ephemeral: true, content: '❌ Star the right answer — put `*` in front of it, like `* 7`.' });
+  }
+  if (answers.filter(a => a.correct).length > 1) {
+    return interaction.reply({ content: '❌ Only one answer can be starred.', ephemeral: true });
+  }
+
+  const id = addQuizQuestion(gid, { ...spec, question, answers, author_id: uid });
+  await interaction.reply({ ephemeral: true, content:
+    `✅ Saved as **#${id}** in **${spec.category}** — ${answers.length === 1 ? 'a typed question' : `${answers.length} options`}${spec.tags ? ` · 🏷️ ${spec.tags}` : ''}.` });
+  const th = await mirrorQuizQuestion(interaction.client, gid, id).catch(() => null);
+  if (th) await interaction.followUp({ ephemeral: true, content: `📚 Posted to <#${th.id}>.` }).catch(() => {});
+  else if (!getConfig(gid)?.quiz_forum) {
+    await interaction.followUp({ ephemeral: true, content: '_📚 No quiz forum set, so there is no readable copy yet — `/config channels quizforum channel:#forum` makes one, and questions written before it can be posted later._' }).catch(() => {});
+  }
+}
+
 // Deception, away from the sword. A straight WIS contest between two
 // characters that works anywhere — a market square, a throne room, a tavern
 // — and needs no fight to exist. Both roll at once, so it resolves in one
@@ -8807,9 +9279,11 @@ async function handleStoryAnswerModal(interaction) {
   });
   let next = right ? (sc.right_to || sc.wrong_to) : (sc.wrong_to || sc.right_to);
   if (!right && quizModeOf(gid, run.story) === 'retry') next = sc.scene;   // round again
+  noteQuizSeen(gid, uid, sc, right);
   const head = right
     ? `✅ **${given}** — correct.`
-    : `❌ **${given}** — not this time.${wanted.length ? ` _(wanted: ${wanted[0]})_` : ''}`;
+    : `❌ **${given}** — not this time.${wanted.length ? ` _(wanted: ${wanted[0]})_` : ''}`
+    + (sc.explain ? `\n_${sc.explain}_` : '');
   await interaction.reply({ content: head });
   if (!next) return;
   const nextSc = getScene(gid, run.story, next);
@@ -9366,6 +9840,44 @@ client.on('interactionCreate', async interaction => {
         .filter(x => !v || String(x).toLowerCase().includes(v))
         .slice(0, 25).map(x => ({ name: String(x).slice(0, 100), value: String(x).slice(0, 100) }));
 
+      // The question bank: categories, tags in use, and questions themselves —
+      // typed words filter, which is the whole point of keeping them in a table.
+      if (interaction.commandName === 'quiz' && focusedOption.name === 'category') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        const known = quizCategories(interaction.guild.id).map(c => c.name);
+        const typed = String(focusedOption.value || '').trim();
+        const hits = known.filter(x => !v || x.toLowerCase().includes(v)).slice(0, 24);
+        // A new category is legal — offer what they typed as its own option.
+        if (typed && !known.some(x => x.toLowerCase() === v)) hits.unshift(`${typed}`);
+        return await interaction.respond(hits.slice(0, 25).map(x => ({ name: x.slice(0, 100), value: x.slice(0, 100) })));
+      }
+      if (interaction.commandName === 'quiz' && (focusedOption.name === 'tag' || focusedOption.name === 'tags')) {
+        const v = String(focusedOption.value || '').toLowerCase();
+        const last = v.split(',').pop().trim();
+        const done = v.includes(',') ? v.slice(0, v.lastIndexOf(',') + 1) : '';
+        const hits = quizTags(interaction.guild.id).filter(x => !last || x.toLowerCase().includes(last)).slice(0, 25);
+        return await interaction.respond(hits.map(x => ({ name: (done + ' ' + x).trim().slice(0, 100), value: (done + x).slice(0, 100) })));
+      }
+      if (interaction.commandName === 'quiz' && focusedOption.name === 'set') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        let rows = [];
+        try { rows = db.prepare("SELECT name, spec FROM quiz_sets WHERE guild_id=? AND name NOT LIKE '%draft:%' ORDER BY created_at DESC").all(interaction.guild.id); } catch {}
+        const hits = rows.filter(r => !v || r.name.toLowerCase().includes(v));
+        return await interaction.respond(hits.slice(0, 25).map(r => {
+          let bits = '';
+          try { const sp = JSON.parse(r.spec); bits = ` — ${sp.count ?? 5}${sp.category ? ' · ' + sp.category : ''}${sp.difficulty ? ' · ' + sp.difficulty : ''}`; } catch {}
+          return { name: `${r.name}${bits}`.slice(0, 100), value: r.name.slice(0, 100) };
+        }));
+      }
+      if (interaction.commandName === 'quiz' && focusedOption.name === 'id') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        let rows = [];
+        try { rows = db.prepare('SELECT id, category, question FROM quiz_questions WHERE guild_id=? ORDER BY id DESC').all(interaction.guild.id); } catch {}
+        const hits = rows.filter(r => !v || String(r.id) === v || r.question.toLowerCase().includes(v) || r.category.toLowerCase().includes(v));
+        return await interaction.respond(hits.slice(0, 25).map(r => ({
+          name: `#${r.id} · ${r.category} — ${r.question}`.slice(0, 100), value: r.id })));
+      }
+
       // An activity by name — read, run or delete.
       if (interaction.commandName === 'activity' && focusedOption.name === 'name') {
         const v = String(focusedOption.value || '').toLowerCase();
@@ -9554,6 +10066,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.customId.startsWith('gmkill:')) return handleGmKillModal(interaction);
     if (interaction.customId.startsWith('lorereject:')) return handleLoreRejectModal(interaction);
     if (interaction.customId.startsWith('traderej:')) return handleMeritTradeRejectModal(interaction);
+    if (interaction.customId.startsWith('quizadd:')) return handleQuizAddModal(interaction);
     if (interaction.customId.startsWith('storyans:')) return handleStoryAnswerModal(interaction);
     if (interaction.customId.startsWith('dcform:')) return handleDcFormSubmit(interaction);
     if (interaction.customId.startsWith('duelrej:')) return handleDuelRejectModal(interaction);
@@ -9615,6 +10128,7 @@ client.on('interactionCreate', async interaction => {
 
   if (!interaction.isChatInputCommand()) return;
   try {
+    if (interaction.commandName === 'quiz') return await handleQuiz(interaction);
     if (interaction.commandName === 'deception') return await handleDeception(interaction);
     if (interaction.commandName === 'duel') return await handleDuel(interaction);
     if (interaction.commandName === 'gm') {
@@ -14762,6 +15276,11 @@ const HELP_CATEGORIES = {
       'A **Reroll** button sits on the scene card while a token remains — one second chance per roll',
       'Some scenes offer **choices** as buttons; some tally renown as you play and bank it at the end',
       '`/activity demo` — the built-in fishing tale, no stakes (GM)',
+      '`/quiz add category:Orders [tags:] [difficulty:] [explain:]` — write a question: a window opens for the question and up to four answers. Star the right one with `*`; one answer alone makes it a typed question (GM)',
+      '`/quiz start [category:] [tag:] [count:] [mode:] [pass:] [merit:] [player:] [pool:] [save:] [set:]` — draw a quiz from the bank: it shuffles the questions and the answers, and can be handed to a player to sit (GM)',
+      '↳ `pool:` decides what they may be asked — fresh first (the default), only ones new to them, any at all, or revision: only the ones they got wrong before. `save:` remembers the draw; `set:` runs it again.',
+      '`/quiz list` · `/quiz show id:` · `/quiz remove id:` — read the bank, one question, or delete one (GM)',
+      '`/config channels quizforum channel:#forum` — where the bank is posted to read: a thread per category (Admin)',
       '_Quizzes:_ a scene with `ASK` waits for a typed answer, or put a `*` before the right option in a `CHOICE` block for multiple choice. `RIGHT ->` / `WRONG ->` route typed answers.',
       '↳ `QUIZ tally` at the top lets every answer carry on and reads the score out at the end; `QUIZ retry` sends a wrong answer back to the same question. `/activity demo which:Kalidale Lore` is a five-question example.',
       '`/activity create` — write one: a paste window opens (or attach a `.txt` with `file:` for long scripts). Pasting an `[ACTIVITY]` script straight into chat works too — every route is validated before anything is stored (GM)',
