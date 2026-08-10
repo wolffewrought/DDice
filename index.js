@@ -550,6 +550,58 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_archive_id TEXT'); } c
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_threads TEXT'); } catch {} // forum mode: JSON map gmId → thread id
 try { db.exec('ALTER TABLE chars ADD COLUMN next_mark TEXT'); } catch {} // 🔼/🔽 on their very next roll, anywhere
 try { db.exec('ALTER TABLE chars ADD COLUMN deception_spent INTEGER DEFAULT 0'); } catch {} // one trick per honest roll
+// A 5e sheet carries two more abilities and the numbers that hang off a class.
+// Added for every server; a Knightfall sheet simply never reads them.
+try { db.exec('ALTER TABLE chars ADD COLUMN int INTEGER DEFAULT 10'); } catch {}
+try { db.exec('ALTER TABLE chars ADD COLUMN cha INTEGER DEFAULT 10'); } catch {}
+try { db.exec('ALTER TABLE chars ADD COLUMN level INTEGER DEFAULT 1'); } catch {}
+try { db.exec('ALTER TABLE chars ADD COLUMN char_class TEXT'); } catch {}
+try { db.exec('ALTER TABLE chars ADD COLUMN hit_die INTEGER DEFAULT 8'); } catch {}
+try { db.exec('ALTER TABLE chars ADD COLUMN armour_class INTEGER'); } catch {}
+try { db.exec('ALTER TABLE chars ADD COLUMN proficient TEXT'); } catch {}   // JSON: saves and skills
+try { db.exec('ALTER TABLE chars ADD COLUMN hit_dice_left INTEGER'); } catch {}   // spent on a short rest
+try { db.exec('ALTER TABLE chars ADD COLUMN slots_used TEXT'); } catch {}         // JSON: spell level → how many spent
+try { db.exec('ALTER TABLE chars ADD COLUMN concentrating TEXT'); } catch {}      // what they are holding together
+try { db.exec('ALTER TABLE chars ADD COLUMN weapon1dice TEXT'); } catch {}        // e.g. 1d12 for a greataxe
+try { db.exec('ALTER TABLE chars ADD COLUMN weapon2dice TEXT'); } catch {}
+try { db.exec('ALTER TABLE chars ADD COLUMN prepared_spells TEXT'); } catch {}    // JSON list
+// A 5e character can be dying rather than dead: three saves either way.
+try { db.exec('ALTER TABLE chars ADD COLUMN death_success INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE chars ADD COLUMN death_fail INTEGER DEFAULT 0'); } catch {}
+// And a monster needs the four numbers a statblock leads with.
+try { db.exec('ALTER TABLE npcs ADD COLUMN armour_class INTEGER'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN attack_bonus INTEGER'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN damage_dice TEXT'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN max_hp INTEGER'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN int INTEGER DEFAULT 10'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN cha INTEGER DEFAULT 10'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN conditions TEXT'); } catch {}
+try { db.exec('ALTER TABLE chars ADD COLUMN conditions TEXT'); } catch {}          // JSON list
+try { db.exec('ALTER TABLE chars ADD COLUMN temp_hp INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN temp_hp INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE chars ADD COLUMN inspiration INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE chars ADD COLUMN damage_type TEXT'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN damage_type TEXT'); } catch {}
+try { db.exec('ALTER TABLE chars ADD COLUMN resist TEXT'); } catch {}              // comma list
+try { db.exec('ALTER TABLE npcs ADD COLUMN resist TEXT'); } catch {}
+try { db.exec('ALTER TABLE fights ADD COLUMN atk_used INTEGER DEFAULT 0'); } catch {}
+// The library. A monster or a spell written once and drawn on for ever —
+// either from the SRD set that ships here, or from whatever a GM imports.
+try { db.exec(`CREATE TABLE IF NOT EXISTS library_monsters (
+  guild_id TEXT NOT NULL, name TEXT NOT NULL,
+  ac INTEGER, hp INTEGER, attack INTEGER, damage TEXT,
+  str INTEGER, dex INTEGER, con INTEGER, int INTEGER, wis INTEGER, cha INTEGER,
+  kind TEXT, cr TEXT, notes TEXT, source TEXT, added_by TEXT, at INTEGER,
+  PRIMARY KEY (guild_id, name)
+)`); } catch (e) { console.error('library_monsters schema', e); }
+try { db.exec(`CREATE TABLE IF NOT EXISTS library_spells (
+  guild_id TEXT NOT NULL, name TEXT NOT NULL,
+  level INTEGER, school TEXT, casting_time TEXT, range_text TEXT,
+  components TEXT, duration TEXT, concentration INTEGER DEFAULT 0,
+  body TEXT, source TEXT, added_by TEXT, at INTEGER,
+  PRIMARY KEY (guild_id, name)
+)`); } catch (e) { console.error('library_spells schema', e); }
+try { db.exec('ALTER TABLE guild_config ADD COLUMN ruleset TEXT'); } catch {}
 try { db.exec('ALTER TABLE story_runs ADD COLUMN quiz_right INTEGER NOT NULL DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE story_runs ADD COLUMN quiz_asked INTEGER NOT NULL DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE story_scenes ADD COLUMN ask INTEGER NOT NULL DEFAULT 0'); } catch {}
@@ -700,6 +752,12 @@ function getPlayerCompletedQuests(gid, uid) {
 }
 
 function upsertChar(gid, uid, fields) {
+  // Any write that lifts someone above nought ends their dying, so a heal,
+  // a rest or a GM's hand all clear the tally without each remembering to.
+  if (fields && fields.hp_current != null && (Number(fields.hp_current) || 0) > 0
+      && fields.death_success == null && fields.death_fail == null) {
+    fields = { ...fields, death_success: 0, death_fail: 0 };
+  }
   const ex = getChar(gid, uid);
   if (!ex) {
     db.prepare(`INSERT INTO characters (guild_id,user_id,order_name,str,con,dex,wis,lck,hp_current,rerolls_current,profile_enabled) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
@@ -967,6 +1025,43 @@ function setHealCharges(gid, uid, cur) {
 }
 // The character card, in one place so every reader of it agrees.
 function buildCharCard(ch, displayName, healNow, maxCharges, gid) {
+  const rules = rulesFor(gid);
+  // A 5e sheet says different things, so it gets its own face: scores with
+  // their modifiers, AC and proficiency where a Knightfall card shows
+  // rerolls and an order.
+  if (rules.id === 'dnd5e') {
+    const mod = (st) => { const m = rules.statBonus(ch, st); return m >= 0 ? `+${m}` : `${m}`; };
+    const out = [`🗡️  **${displayName}**`,
+      ch.char_class ? `⚔️  Level ${ch.level ?? 1} ${ch.char_class}` : `⚔️  Level ${ch.level ?? 1}`,
+      `❤️  HP          ${ch.hp_current} / ${rules.maxHp(ch)}`,
+      `🛡️  AC          ${rules.targetNumber(ch)}`,
+      `➕  Proficiency  +${rules.profBonus(ch)}`, ''];
+    for (const st of rules.stats) out.push(`　 ${rules.labels[st]}  ${String(ch[st] ?? 10).padStart(2)}  (${mod(st)})`);
+    let prof = null;
+    try { prof = JSON.parse(ch.proficient || '{}'); } catch {}
+    if (prof?.saves?.length) out.push('', `💪 Saves: ${prof.saves.map(x => rules.labels[x] || x).join(', ')}`);
+    if (prof?.skills?.length) out.push(`🎯 Skills: ${prof.skills.join(', ')}`);
+    const cs = typeof rules.caster === 'function' ? rules.caster(ch) : null;
+    if (cs) {
+      out.push('', `✨ Spell save **DC ${rules.spellSaveDC(ch)}** · attack **+${rules.spellAttack(ch)}**`);
+      if (ch.concentrating) out.push(`🧠 Concentrating on **${ch.concentrating}**`);
+    }
+    const conds = conditionsOf(ch);
+    if (conds.length) out.push('', `🩹 ${conds.join(', ')}`);
+    const bits5 = [];
+    if (Number(ch.temp_hp)) bits5.push(`🛡️ ${ch.temp_hp} temp HP`);
+    if (Number(ch.inspiration)) bits5.push('✨ inspiration');
+    const pp = typeof rules.passive === 'function' ? rules.passive(ch, 'perception') : null;
+    if (pp) bits5.push(`👁️ passive Perception ${pp}`);
+    const atk5 = typeof rules.attacksPerAction === 'function' ? rules.attacksPerAction(ch) : 1;
+    if (atk5 > 1) bits5.push(`⚔️ ${atk5} attacks`);
+    if (bits5.length) out.push('', bits5.join(' · '));
+    if (ch.weapon1dice || ch.weapon2dice) {
+      out.push('', [ch.weapon1 && `${ch.weapon1} ${ch.weapon1dice || '1d8'}`,
+                    ch.weapon2 && `${ch.weapon2} ${ch.weapon2dice || '1d8'}`].filter(Boolean).join('  ·  '));
+    }
+    return out;
+  }
   const lines = [`⚔️  **${displayName}**`,
     ch.order_name ? `${KNIGHT_EMOJIS[ch.order_name] ?? '⚪'}  ${ch.order_name}` : 'No order set'];
   if (ch.class) lines.push(`🏅  ${ch.class}`);
@@ -2539,12 +2634,29 @@ function memorialButtons(gid, id, deathId) {
 // build lands, the old post is deleted and replaced rather than the channel
 // filling up with stale copies.
 const DOC_FILES = [
+  // Knightfall keeps the names it has always had; the 5e set is prefaced, so
+  // both can live in one folder. Each book is complete on its own — the
+  // shared half bound in with the rules that server plays by.
   'DDice-Commands-GameMaster.pdf',
   'DDice-Commands-Player.pdf',
   'DDice-Commands-Parchment.pdf',
+  'DnD5e-DDice-Commands-GameMaster.pdf',
+  'DnD5e-DDice-Commands-Player.pdf',
+  'DnD5e-DDice-Commands-Parchment.pdf',
 ];
+// A server is handed the books it plays by, and no others: the whole
+// editions, the Core module, and the module for its own rules. A Knightfall
+// table has no use for the 5e books, and would only have to explain them.
+function docFilesFor(gid) {
+  // Three books, for the rules this server plays by.
+  const is5e = rulesFor(gid).id === 'dnd5e';
+  return DOC_FILES.filter(f => f.startsWith('DnD5e-') === is5e);
+}
+
 const DOCS_POLL_MS = 15 * 60 * 1000;
 const DOC_PLAYER_FILE = 'DDice-Commands-Player.pdf';
+// The player's edition for a given server, under whichever name it wears.
+const docPlayerFileFor = (gid) => (rulesFor(gid).id === 'dnd5e' ? 'DnD5e-' : '') + DOC_PLAYER_FILE;
 
 function docsSettings(gid) {
   const cfg = getConfig(gid) || {};
@@ -2583,9 +2695,9 @@ function playerHandbookLink(gid) {
 // address with other tenants — so the budget is often already spent by someone
 // else and every check comes back 403. The raw CDN has no such limit, and a
 // HEAD gives us an ETag that changes exactly when the file does.
-async function fetchDocsFingerprint(st) {
+async function fetchDocsFingerprint(st, files = DOC_FILES) {
   const parts = [];
-  for (const file of DOC_FILES) {
+  for (const file of files) {
     const url = docFileUrl(st, file);
     const res = await fetch(url, { method: 'HEAD', headers: docsHeaders() });
     if (!res.ok) {
@@ -2631,10 +2743,13 @@ async function publishDocs(client, guild, { reason = 'a new build', force = fals
   const st = docsSettings(gid);
   if (!st.channel || !st.repo) return { skipped: 'not configured' };
 
-  const fingerprint = await fetchDocsFingerprint(st);
+  // Only the books this server plays by — so a Knightfall table is never
+  // handed 5e rules it does not use, and the reverse.
+  const wanted = docFilesFor(gid);
+  const fingerprint = await fetchDocsFingerprint(st, wanted);
   if (!force && fingerprint === st.sha) return { skipped: 'unchanged' };
 
-  const files = await fetchDocFiles(st);
+  const files = await fetchDocFiles(st, wanted);
   const channel = await client.channels.fetch(st.channel);
   const roles = getGmRoleIds(gid);
 
@@ -2657,7 +2772,7 @@ async function publishDocs(client, guild, { reason = 'a new build', force = fals
   if (st.playerChannel) {
     try {
       const pCh = await client.channels.fetch(st.playerChannel);
-      const [playerFile] = await fetchDocFiles(st, [DOC_PLAYER_FILE]);
+      const [playerFile] = await fetchDocFiles(st, [docPlayerFileFor(gid)]);
       const pMsg = await pCh.send({
         content: '📘 **Player command reference** — latest version.',
         files: [playerFile],
@@ -5033,7 +5148,11 @@ const slashCommands = [
     })
     .addSubcommand(s=>s.setName('roll').setDescription('A GM roll — public, or secret (visible only to you); the audit sees both')
       .addStringOption(o=>o.setName('notation').setDescription('Dice notation e.g. 1d20+5').setRequired(true))
-      .addStringOption(o=>o.setName('label').setDescription('Roll label e.g. perception').setRequired(false))
+      .addStringOption(o=>o.setName('save').setDescription('Roll a saving throw — proficiency added if your class has it (5e)').setRequired(false)
+      .addChoices({name:'💪 STR',value:'str'},{name:'⚡ DEX',value:'dex'},{name:'🫀 CON',value:'con'},
+                  {name:'📖 INT',value:'int'},{name:'🧠 WIS',value:'wis'},{name:'🗣️ CHA',value:'cha'}))
+    .addStringOption(o=>o.setName('skill').setDescription('Roll a skill check — proficiency added if you have it (5e)').setRequired(false).setAutocomplete(true))
+    .addStringOption(o=>o.setName('label').setDescription('Roll label e.g. perception').setRequired(false))
       .addBooleanOption(o=>o.setName('secret').setDescription('true = only you see the result (the roll audit still records it)').setRequired(false))
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
@@ -5063,6 +5182,10 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('questplanning').setDescription('A private GM forum — /quest create opens a planning thread there')
       .addChannelOption(o=>o.setName('channel').setDescription('The GM-only forum channel').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = stop making planning threads').setRequired(false)));
+      g.addSubcommand(s=>s.setName('ruleset').setDescription('Which rules this server plays by — set it before anyone makes a character')
+      .addStringOption(o=>o.setName('system').setDescription('The rules to use here').setRequired(false)
+        .addChoices({name:'⚔️ Knightfall — five stats, opposed rolls (default)',value:'knightfall'},
+                    {name:'🐉 D&D 5e (SRD) — six abilities, proficiency, AC',value:'dnd5e'})));
       g.addSubcommand(s=>s.setName('quizforum').setDescription('A forum where the question bank is posted, a thread per category')
       .addChannelOption(o=>o.setName('channel').setDescription('The quiz forum').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = stop posting the readable copy').setRequired(false)));
@@ -5294,6 +5417,84 @@ const slashCommands = [
         .addStringOption(o=>o.setName('name').setDescription('Tag name (create/delete)').setRequired(false).setAutocomplete(true)))),
 
   new SlashCommandBuilder()
+    .setName('dnd').setDescription('The 5e side of a character — levels, conditions, death saves and the rest')
+    .addSubcommand(s=>s.setName('condition').setDescription('What afflicts you — add one, lift one, or read the list (5e)')
+      .addStringOption(o=>o.setName('add').setDescription('A condition to take on').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('remove').setDescription('A condition to lift').setRequired(false).setAutocomplete(true))
+      .addUserOption(o=>o.setName('user').setDescription('Whose (GM only)').setRequired(false))
+      .addStringOption(o=>o.setName('npc').setDescription('Or an NPC (GM only)').setRequired(false).setAutocomplete(true))
+      .addBooleanOption(o=>o.setName('clear').setDescription('true = lift everything').setRequired(false)))
+    .addSubcommand(s=>s.setName('temphp').setDescription('Temporary hit points — spent before your own (5e)')
+      .addIntegerOption(o=>o.setName('amount').setDescription('How many — they do not stack, the larger wins').setRequired(true).setMinValue(0).setMaxValue(200))
+      .addUserOption(o=>o.setName('user').setDescription('Whose (GM only)').setRequired(false)))
+    .addSubcommand(s=>s.setName('inspiration').setDescription('Inspiration — hold it, or spend it (5e)')
+      .addBooleanOption(o=>o.setName('grant').setDescription('true = a GM granting it').setRequired(false))
+      .addBooleanOption(o=>o.setName('use').setDescription('true = use it now').setRequired(false))
+      .addUserOption(o=>o.setName('user').setDescription('Whose (GM only)').setRequired(false)))
+    .addSubcommand(s=>s.setName('deathsave').setDescription('Roll a death saving throw — for when you are at nought and dying (5e)'))
+    .addSubcommand(s=>s.setName('weapondice').setDescription('What your weapon rolls for damage — a greataxe is not a longsword (5e)')
+      .addIntegerOption(o=>o.setName('slot').setDescription('Which weapon').setRequired(true)
+        .addChoices({name:'First weapon',value:1},{name:'Second weapon',value:2}))
+      .addStringOption(o=>o.setName('dice').setDescription('Its damage dice, e.g. 1d12 — leave blank to clear').setRequired(false)))
+    .addSubcommand(s=>s.setName('levelup').setDescription('Gain a level — hit points, proficiency and a hit die follow (5e)')
+      .addUserOption(o=>o.setName('user').setDescription('Whose character (GM only)').setRequired(false))
+      .addIntegerOption(o=>o.setName('to').setDescription('Jump straight to this level instead of the next').setRequired(false).setMinValue(2).setMaxValue(20)))
+    .addSubcommand(s=>s.setName('create').setDescription('Make a D&D 5e character — six abilities, a class and a level')
+      .addStringOption(o=>o.setName('name').setDescription('Character name').setRequired(true))
+      .addIntegerOption(o=>o.setName('str').setDescription('Strength score (1–30)').setRequired(true).setMinValue(1).setMaxValue(30))
+      .addIntegerOption(o=>o.setName('dex').setDescription('Dexterity score').setRequired(true).setMinValue(1).setMaxValue(30))
+      .addIntegerOption(o=>o.setName('con').setDescription('Constitution score').setRequired(true).setMinValue(1).setMaxValue(30))
+      .addIntegerOption(o=>o.setName('int').setDescription('Intelligence score').setRequired(true).setMinValue(1).setMaxValue(30))
+      .addIntegerOption(o=>o.setName('wis').setDescription('Wisdom score').setRequired(true).setMinValue(1).setMaxValue(30))
+      .addIntegerOption(o=>o.setName('cha').setDescription('Charisma score').setRequired(true).setMinValue(1).setMaxValue(30))
+      .addStringOption(o=>o.setName('class').setDescription('Class — sets the hit die unless you give one').setRequired(false)
+        .addChoices({name:'Barbarian (d12)',value:'Barbarian'},{name:'Fighter (d10)',value:'Fighter'},
+                    {name:'Paladin (d10)',value:'Paladin'},{name:'Ranger (d10)',value:'Ranger'},
+                    {name:'Bard (d8)',value:'Bard'},{name:'Cleric (d8)',value:'Cleric'},
+                    {name:'Druid (d8)',value:'Druid'},{name:'Monk (d8)',value:'Monk'},
+                    {name:'Rogue (d8)',value:'Rogue'},{name:'Warlock (d8)',value:'Warlock'},
+                    {name:'Sorcerer (d6)',value:'Sorcerer'},{name:'Wizard (d6)',value:'Wizard'}))
+      .addIntegerOption(o=>o.setName('level').setDescription('Level (1–20, default 1)').setRequired(false).setMinValue(1).setMaxValue(20))
+      .addIntegerOption(o=>o.setName('ac').setDescription('Armour Class — left out, it is 10 + your DEX modifier').setRequired(false).setMinValue(1).setMaxValue(30))
+      .addStringOption(o=>o.setName('saves').setDescription('Saving throws you are proficient in, e.g. str, con').setRequired(false))
+      .addStringOption(o=>o.setName('skills').setDescription('Skills you are proficient in, e.g. athletics, perception').setRequired(false))),
+
+  new SlashCommandBuilder()
+    .setName('library').setDescription('Monsters and spells kept once and drawn on for ever (GM)')
+    .addSubcommand(s=>s.setName('import').setDescription('Read in monsters or spells — paste them, or attach a file')
+      .addAttachmentOption(o=>o.setName('file').setDescription('A .txt of entries, one a line').setRequired(false))
+      .addStringOption(o=>o.setName('paste').setDescription('Or paste entries here, separated by ;;').setRequired(false))
+      .addBooleanOption(o=>o.setName('replace').setDescription('true = overwrite anything already known by that name').setRequired(false)))
+    .addSubcommand(s=>s.setName('srd').setDescription('Load the SRD set that ships with the bot — monsters, spells, or both')
+      .addStringOption(o=>o.setName('what').setDescription('Which to load').setRequired(false)
+        .addChoices({name:'🐉 Monsters',value:'monsters'},{name:'✨ Spells',value:'spells'},{name:'📚 Both',value:'both'})))
+    .addSubcommand(s=>s.setName('list').setDescription('What the library holds')
+      .addStringOption(o=>o.setName('search').setDescription('Only those matching').setRequired(false)))
+    .addSubcommand(s=>s.setName('show').setDescription('Read one entry in full')
+      .addStringOption(o=>o.setName('name').setDescription('Its name').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('summon').setDescription('Bring a monster out of the library as an NPC, ready to fight')
+      .addStringOption(o=>o.setName('name').setDescription('Which monster').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('as').setDescription('Call it something else here, e.g. Goblin Scout').setRequired(false))
+      .addIntegerOption(o=>o.setName('count').setDescription('How many — they are numbered').setRequired(false).setMinValue(1).setMaxValue(10)))
+    .addSubcommand(s=>s.setName('forget').setDescription('Remove an entry from the library')
+      .addStringOption(o=>o.setName('name').setDescription('Its name').setRequired(true).setAutocomplete(true))),
+
+  new SlashCommandBuilder()
+    .setName('spell').setDescription('Your magic — slots, casting, and what you are concentrating on (5e)')
+    .addSubcommand(s=>s.setName('slots').setDescription('What magic you have left today')
+      .addUserOption(o=>o.setName('user').setDescription('Whose (defaults to you)').setRequired(false)))
+    .addSubcommand(s=>s.setName('cast').setDescription('Spend a slot')
+      .addIntegerOption(o=>o.setName('level').setDescription('Which spell level to spend').setRequired(true).setMinValue(0).setMaxValue(9))
+      .addStringOption(o=>o.setName('name').setDescription('What you are casting').setRequired(false))
+      .addBooleanOption(o=>o.setName('concentration').setDescription('true = it needs your concentration').setRequired(false)))
+    .addSubcommand(s=>s.setName('prepare').setDescription('The spells you have ready — add one, drop one, or read the list')
+      .addStringOption(o=>o.setName('add').setDescription('A spell to prepare').setRequired(false))
+      .addStringOption(o=>o.setName('drop').setDescription('A spell to let go').setRequired(false))
+      .addBooleanOption(o=>o.setName('clear').setDescription('true = forget them all and start again').setRequired(false)))
+    .addSubcommand(s=>s.setName('concentration').setDescription('What you are holding together — or let it go')
+      .addBooleanOption(o=>o.setName('drop').setDescription('true = stop concentrating').setRequired(false))),
+
+  new SlashCommandBuilder()
     .setName('quiz').setDescription('The question bank — write questions, then set quizzes from them (GM)')
     .addSubcommand(s=>s.setName('add').setDescription('Write a question — a window opens for the question and its answers')
       .addStringOption(o=>o.setName('category').setDescription('Which category it belongs to, e.g. Orders').setRequired(true).setAutocomplete(true))
@@ -5344,6 +5545,7 @@ const slashCommands = [
         {name:'HP, Healing & Rerolls',value:'hp'},
         {name:'Fights & Duels',value:'fight'},
         {name:'Activities & Renown',value:'activities'},
+        {name:'Quizzes & the Question Bank',value:'quizzes'},
         {name:'Merits & Ranks',value:'progression'},
         {name:'Quest Board',value:'quests'},
         {name:'Tags',value:'tags'},
@@ -5369,6 +5571,18 @@ const slashCommands = [
       .addStringOption(o=>o.setName('flavour').setDescription('Flavour text').setRequired(false))
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'})))
+    .addSubcommand(s=>s.setName('create5e').setDescription('Make a 5e monster — AC, hit points, attack and damage from its statblock (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('What it is called').setRequired(true))
+      .addIntegerOption(o=>o.setName('ac').setDescription('Armour Class').setRequired(true).setMinValue(1).setMaxValue(30))
+      .addIntegerOption(o=>o.setName('hp').setDescription('Hit points').setRequired(true).setMinValue(1).setMaxValue(999))
+      .addIntegerOption(o=>o.setName('attack').setDescription('Its attack bonus, e.g. 4').setRequired(true).setMinValue(-5).setMaxValue(20))
+      .addStringOption(o=>o.setName('damage').setDescription('Damage dice, e.g. 1d8+2').setRequired(true))
+      .addIntegerOption(o=>o.setName('str').setDescription('Strength score').setRequired(false).setMinValue(1).setMaxValue(30))
+      .addIntegerOption(o=>o.setName('dex').setDescription('Dexterity score').setRequired(false).setMinValue(1).setMaxValue(30))
+      .addIntegerOption(o=>o.setName('con').setDescription('Constitution score').setRequired(false).setMinValue(1).setMaxValue(30))
+      .addIntegerOption(o=>o.setName('int').setDescription('Intelligence score').setRequired(false).setMinValue(1).setMaxValue(30))
+      .addIntegerOption(o=>o.setName('wis').setDescription('Wisdom score').setRequired(false).setMinValue(1).setMaxValue(30))
+      .addIntegerOption(o=>o.setName('cha').setDescription('Charisma score').setRequired(false).setMinValue(1).setMaxValue(30)))
     .addSubcommand(s=>s.setName('reroll').setDescription('Reroll an NPC\'s last roll here — spends one of its LCK tokens')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
@@ -7181,6 +7395,34 @@ async function handleConfig(interaction, forced) {
     ].join('\n') });
   }
 
+  if (sub === 'ruleset') {
+    const want = interaction.options?.getString?.('system');
+    const now = rulesFor(gid);
+    if (!want) {
+      return interaction.reply({ ephemeral: true, content:
+        `📖 This server plays by **${now.name}** — ${now.stats.length} stats (${now.stats.map(x => now.labels[x]).join(', ')}), `
+        + `${now.defence === 'ac' ? 'attacks rolled against a target number' : 'blows decided by opposed rolls'}.` });
+    }
+    if (want === now.id) return interaction.reply({ content: `📖 Already **${now.name}**.`, ephemeral: true });
+    // Changing the rules under existing characters would strand every sheet:
+    // five stats do not become six by wishing. Set it before anyone plays.
+    let made = 0;
+    try { made = db.prepare('SELECT COUNT(*) AS c FROM chars WHERE guild_id=?').get(gid).c; } catch {}
+    if (made) {
+      return interaction.reply({ ephemeral: true, content:
+        `❌ **${made}** character${made === 1 ? ' has' : 's have'} already been made under **${now.name}**. `
+        + 'The rules are set before anyone plays, because a sheet written for one system cannot be read as another. '
+        + 'A fresh server for the other rules is the safe way — quests, NPCs and the question bank are per-server anyway.' });
+    }
+    setConfig(gid, { ruleset: want });
+    const r = RULESETS[want];
+    return interaction.reply({ content:
+      `📖 This server now plays by **${r.name}**.\n`
+      + `• Stats: ${r.stats.map(x => r.labels[x]).join(' · ')}\n`
+      + `• ${r.defence === 'ac' ? 'Attacks are rolled against Armour Class; a natural 20 always hits and crits.' : 'Blows are decided by opposed rolls; ties favour the attacker.'}\n`
+      + `• ${r.id === 'dnd5e' ? 'Scores become modifiers, and proficiency grows with level.' : 'Stats are added to the die whole.'}` });
+  }
+
   if (sub === 'quizforum') {
     if (interaction.options?.getBoolean?.('disable')) {
       setConfig(gid, { quiz_forum: null });
@@ -8015,6 +8257,64 @@ async function handleChar(interaction) {
 
   // Everything the gates check, shown as a checklist — so a new player sees the
   // whole list once instead of discovering it one refusal at a time.
+  if (sub === 'deathsave') {
+    const rules = rulesFor(gid);
+    if (rules.defence !== 'ac') {
+      return interaction.reply({ ephemeral: true, content: `❌ Death saves belong to 5e; **${rules.name}** decides a fall its own way.` });
+    }
+    const ch = getChar(gid, callerId);
+    if (!ch) return interaction.reply({ content: '❌ You need a character first.', ephemeral: true });
+    if ((Number(ch.hp_current) || 0) > 0) {
+      return interaction.reply({ ephemeral: true, content: `❌ You are on **${ch.hp_current}** hit points — death saves are for nought and dying.` });
+    }
+    let succ = Number(ch.death_success) || 0, fail = Number(ch.death_fail) || 0;
+    const nat = rollDie(20);
+    const nm = await getDisplayName(interaction.guild, callerId);
+    const lines = [`💀 **${nm}** — death saving throw: **[${nat}]**`];
+    if (nat === 20) {
+      // A natural twenty is not a save; it is a return, on one hit point.
+      upsertChar(gid, callerId, { hp_current: 1, death_success: 0, death_fail: 0 });
+      lines.push('🌟 **A natural twenty** — they come back on **1** hit point.');
+      return interaction.reply({ content: lines.join('\n') });
+    }
+    if (nat === 1) { fail += 2; lines.push('💀 **A natural one** — two failures.'); }
+    else if (nat >= 10) { succ += 1; lines.push('✅ A success.'); }
+    else { fail += 1; lines.push('❌ A failure.'); }
+    lines.push(`　 Successes **${Math.min(3, succ)}/3** · Failures **${Math.min(3, fail)}/3**`);
+    if (succ >= 3) {
+      upsertChar(gid, callerId, { death_success: 0, death_fail: 0 });
+      lines.push('', '🕊️ **Stable.** Still at nought, but no longer slipping away.');
+    } else if (fail >= 3) {
+      upsertChar(gid, callerId, { death_success: 0, death_fail: 0 });
+      lines.push('', '⚰️ **Three failures.** A GM records it with `/gm kill` — or a healer argues with it first.');
+    } else {
+      upsertChar(gid, callerId, { death_success: succ, death_fail: fail });
+    }
+    return interaction.reply({ content: lines.join('\n') });
+  }
+
+  if (sub === 'weapondice') {
+    const rules = rulesFor(gid);
+    if (rules.defence !== 'ac') {
+      return interaction.reply({ ephemeral: true, content: `❌ Weapon dice belong to 5e; **${rules.name}** decides damage another way.` });
+    }
+    const ch = getChar(gid, callerId);
+    if (!ch) return interaction.reply({ content: '❌ You need a character first.', ephemeral: true });
+    const slot = interaction.options.getInteger('slot');
+    const raw = (interaction.options.getString('dice') || '').trim();
+    if (raw && !/^\d*d\d+$/i.test(raw)) {
+      return interaction.reply({ ephemeral: true, content: '❌ Damage dice look like `1d8`, `2d6` or `1d12`.' });
+    }
+    upsertChar(gid, callerId, { [`weapon${slot}dice`]: raw || null });
+    const named = slot === 1 ? ch.weapon1 : ch.weapon2;
+    return interaction.reply({ ephemeral: true, content: raw
+      ? `⚔️ Your ${slot === 1 ? 'first' : 'second'} weapon${named ? ` (**${named}**)` : ''} now rolls **${raw}** for damage.`
+      : `⚔️ Cleared — that weapon falls back to **1d8**.` });
+  }
+
+  if (sub === 'levelup') return handleLevelUp(interaction);
+  if (sub === 'create5e') return handleCreate5e(interaction);
+
   if (sub === 'check') {
     const ch = getChar(gid, callerId);
     if (!ch) {
@@ -8460,6 +8760,41 @@ async function handleRest(message, rest, type) {
   const cfg = getConfig(gid); const mc = cfg.heal_charges??3;
   const hm = maxHp(ch, gid), rm = maxRerolls(ch);
   const tn = targetId === uid ? 'Your' : `<@${targetId}>'s`;
+
+  // 5e rests are their own thing: a short rest spends hit dice to heal, and
+  // a long rest fills you and hands half of them back. Knightfall's
+  // percentage tokens carry on below, untouched.
+  const rules5 = rulesFor(gid);
+  if (rules5.defence === 'ac' && (type === 'lrest' || type === 'srest')) {
+    const die = Number(ch.hit_die) || 8;
+    const conMod = rules5.statBonus(ch, 'con');
+    const total = rules5.hitDiceTotal(ch);
+    const left = Math.min(total, Number(ch.hit_dice_left) ?? total);
+    const casterR = rules5.caster(ch);
+    if (type === 'lrest') {
+      const back = Math.min(total - left, rules5.longRestDice(ch));
+      upsertChar(gid, targetId, { hp_current: hm, hit_dice_left: left + back, slots_used: '{}' });
+      const out = [`🌙 **Long rest** — ${tn} character wakes whole.`,
+        `❤️ HP **${hm} / ${hm}**`,
+        `🎲 Hit dice **${left + back} / ${total}** (d${die})${back ? ` — ${back} recovered` : ''}`];
+      if (casterR) out.push('✨ Every spell slot is back.');
+      return message.reply(out.join('\n'));
+    }
+    // A short rest: spend a die, roll it, add the CON modifier.
+    if (left < 1) return message.reply(`⚠️ ${tn} character has no hit dice left — only a long rest gives them back.`);
+    const roll = 1 + Math.floor(Math.random() * die);
+    const healed = Math.max(0, roll + conMod);
+    const nowHp = Math.min(hm, (Number(ch.hp_current) || 0) + healed);
+    // Pact magic is the exception: a warlock's slots return on a SHORT rest.
+    const patchS = { hp_current: nowHp, hit_dice_left: left - 1 };
+    if (casterR?.kind === 'pact') patchS.slots_used = '{}';
+    upsertChar(gid, targetId, patchS);
+    return message.reply([`⛺ **Short rest** — ${tn} character spends a hit die.`,
+      `🎲 d${die} → [${roll}]${conMod ? (conMod > 0 ? ` +${conMod}` : ` ${conMod}`) : ''} = **${healed}** healed`,
+      `❤️ HP **${nowHp} / ${hm}**`,
+      `🎲 Hit dice **${left - 1} / ${total}** left`,
+      ...(casterR?.kind === 'pact' ? ['✨ Pact magic returns — every slot is back.'] : [])].join('\n'));
+  }
 
   let label, hpTok, rTok, healTok;
   if (type==='lrest') {
@@ -9189,6 +9524,663 @@ async function handleQuizAddModal(interaction) {
   }
 }
 
+// A saving throw or a skill check: d20, the ability's modifier, and
+// proficiency when the class or the character has it. The card shows the
+// working so nobody has to trust a total.
+async function handle5eCheck(interaction, { saveOf, skillOf }) {
+  const gid = interaction.guild.id, uid = interaction.user.id, cid = interactionChannelId(interaction);
+  const rules = rulesFor(gid);
+  if (rules.id !== 'dnd5e') {
+    return interaction.reply({ ephemeral: true, content: `❌ Saves and skill checks belong to 5e; this server plays by **${rules.name}**.` });
+  }
+  const ch = getChar(gid, uid);
+  if (!ch) return interaction.reply({ content: '❌ You need a character — `/dnd create`.', ephemeral: true });
+  const gate = sheetGate(gid, uid);
+  if (gate) return interaction.reply({ content: gate, ephemeral: true });
+
+  let prof = {};
+  try { prof = JSON.parse(ch.proficient || '{}') || {}; } catch {}
+  const skill = skillOf ? String(skillOf).toLowerCase().trim() : null;
+  if (skill && !rules.skills[skill]) {
+    return interaction.reply({ ephemeral: true, content: `❌ I don't know the skill **${skill}**. The eighteen are: ${Object.keys(rules.skills).join(', ')}.` });
+  }
+  const ability = skill ? rules.skills[skill] : saveOf;
+  const trained = skill ? (prof.skills || []).includes(skill) : (prof.saves || []).includes(ability);
+  const mode = applyNextMark(gid, uid, applySignatureMode(ch, ability, interaction.options.getString('mode') || 'normal'));
+  noteHonestRoll(gid, uid);
+  const bonus = rules.statBonus(ch, ability) + (trained ? rules.profBonus(ch) : 0);
+  const notation = `1d20${bonus >= 0 ? '+' : ''}${bonus}`;
+  const result = mode === 'adv' ? rollAdvantage(notation) : mode === 'dis' ? rollDisadvantage(notation) : rollNotation(notation);
+  const nat = mode === 'normal' ? result.rolls[0] : result.chosen;
+  const critType = nat === 20 ? 'crit' : nat === 1 ? 'fail' : null;
+  const rollLine = buildRollLine(result, mode, critType, null);
+  const what = skill ? `${skill.replace(/\b\w/g, c => c.toUpperCase())} (${rules.labels[ability]})` : `${rules.labels[ability]} save`;
+  const nm = await getDisplayName(interaction.guild, uid);
+  recordRoll(gid, { userId: uid, channelId: cid, interaction, result,
+    input: skill ? `/roll skill:${skill}` : `/roll save:${ability}`, rollLine, context: what });
+  return interaction.reply({ content: [
+    `🎲 **${nm}** — ${what}${trained ? ` · _proficient (+${rules.profBonus(ch)})_` : ''}`,
+    rollLine].join('\n') });
+}
+
+// Conditions, temporary hit points and inspiration — three small ledgers
+// that behave the same way: yours by default, someone else's if you are a GM.
+// Everything on /dnd. The branches themselves still live in handleChar,
+// which is where the character surface has always been — this only decides
+// which of them a 5e verb means.
+async function handleDnd(interaction) {
+  const sub = interaction.options.getSubcommand();
+  if (sub === 'create') return handleCreate5e(interaction);
+  if (sub === 'levelup') return handleLevelUp(interaction);
+  if (sub === 'condition' || sub === 'temphp' || sub === 'inspiration') return handle5eStatus(interaction, sub);
+  return handleChar(interaction);   // deathsave and weapondice read the same way
+}
+
+async function handle5eStatus(interaction, kind) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const rules = rulesFor(gid);
+  if (rules.defence !== 'ac') {
+    return interaction.reply({ ephemeral: true, content: `❌ That belongs to 5e; this server plays by **${rules.name}**.` });
+  }
+  const npcName = interaction.options.getString?.('npc');
+  const who = interaction.options.getUser?.('user');
+  const forOther = !!npcName || (who && who.id !== uid);
+  if (forOther && !(await isGm(interaction.guild, uid))) {
+    return interaction.reply({ content: '❌ Only GMs change someone else\'s.', ephemeral: true });
+  }
+  const targetId = who?.id || uid;
+  const row = npcName ? getNpc(gid, npcName) : getChar(gid, targetId);
+  if (!row) return interaction.reply({ content: '❌ Nothing there to change.', ephemeral: true });
+  const label = npcName ? `**${npcName}**` : `<@${targetId}>`;
+  const write = (patch) => npcName ? upsertNpc(gid, npcName, patch) : upsertChar(gid, targetId, patch);
+
+  if (kind === 'condition') {
+    let list = conditionsOf(row);
+    if (interaction.options.getBoolean('clear')) {
+      write({ conditions: '[]' });
+      return interaction.reply({ content: `✨ Everything lifts from ${label}.` });
+    }
+    const add = (interaction.options.getString('add') || '').toLowerCase().trim();
+    const rem = (interaction.options.getString('remove') || '').toLowerCase().trim();
+    if (add && !rules.conditions[add]) {
+      return interaction.reply({ ephemeral: true, content: `❌ I don't know **${add}**. The conditions are: ${Object.keys(rules.conditions).join(', ')}.` });
+    }
+    if (add && !list.includes(add)) list.push(add);
+    if (rem) list = list.filter(x => x !== rem);
+    if (add || rem) write({ conditions: JSON.stringify(list) });
+    const detail = list.map(c => {
+      const e = rules.conditions[c];
+      const bits = [e?.self === 'dis' ? 'rolls at disadvantage' : e?.self === 'adv' ? 'rolls at advantage' : null,
+                    e?.against === 'adv' ? 'attacks against them have advantage' : e?.against === 'dis' ? 'attacks against them have disadvantage' : null].filter(Boolean);
+      return `　• **${c}**${bits.length ? ` — _${bits.join('; ')}_` : ''}`;
+    });
+    return interaction.reply({ content: [`🩹 ${label}`, ...(detail.length ? detail : ['　 _Nothing afflicts them._'])].join('\n') });
+  }
+
+  if (kind === 'temphp') {
+    const amount = interaction.options.getInteger('amount');
+    const had = Number(row.temp_hp) || 0;
+    // Temporary hit points never stack — the larger pool simply wins.
+    const now = Math.max(had, amount);
+    write({ temp_hp: now });
+    return interaction.reply({ content: amount === 0
+      ? `🛡️ Temporary hit points cleared from ${label}.`
+      : `🛡️ ${label} has **${now}** temporary hit points${had && amount <= had ? ` — the ${had} they already had is the larger, so it stands.` : '.'}` });
+  }
+
+  // inspiration
+  if (npcName) return interaction.reply({ content: '❌ Inspiration is for characters.', ephemeral: true });
+  if (interaction.options.getBoolean('use')) {
+    if (!Number(row.inspiration)) return interaction.reply({ content: '❌ You have no inspiration to spend.', ephemeral: true });
+    write({ inspiration: 0 });
+    return interaction.reply({ content: `✨ ${label} spends their inspiration — roll with advantage.` });
+  }
+  if (interaction.options.getBoolean('grant')) {
+    write({ inspiration: 1 });
+    return interaction.reply({ content: `✨ ${label} is granted **inspiration**.` });
+  }
+  return interaction.reply({ ephemeral: true, content: Number(row.inspiration)
+    ? '✨ You hold inspiration — `/dnd inspiration use:true` spends it.'
+    : '✨ You hold no inspiration.' });
+}
+
+// The conditions on a creature, as a list.
+function conditionsOf(row) {
+  try { return JSON.parse(row?.conditions || '[]') || []; } catch { return []; }
+}
+// What the conditions on both sides do to an attack roll: the attacker's own
+// afflictions, and what the target's grant. One of each cancels the other,
+// which is exactly how 5e reads it.
+function conditionMode(rules, attackerRow, defenderRow, mode) {
+  if (!rules.conditions) return mode;
+  let adv = 0, dis = 0;
+  for (const c of conditionsOf(attackerRow)) {
+    const e = rules.conditions[c]?.self;
+    if (e === 'adv') adv++; else if (e === 'dis') dis++;
+  }
+  for (const c of conditionsOf(defenderRow)) {
+    const e = rules.conditions[c]?.against;
+    if (e === 'adv') adv++; else if (e === 'dis') dis++;
+  }
+  if (adv && !dis) return 'adv';
+  if (dis && !adv) return 'dis';
+  return mode;   // both, or neither — straight roll
+}
+
+async function handleLibrary(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  if (!(await isGm(interaction.guild, uid))) {
+    return interaction.reply({ content: '❌ The library is a GM tool.', ephemeral: true });
+  }
+  const sub = interaction.options.getSubcommand();
+
+  if (sub === 'import' || sub === 'srd') {
+    await interaction.deferReply({ ephemeral: true });
+    let text = '';
+    if (sub === 'srd') {
+      const what = interaction.options.getString('what') || 'both';
+      if (what !== 'spells') text += SRD_MONSTERS + '\n';
+      if (what !== 'monsters') text += SRD_SPELLS + '\n';
+    } else {
+      const file = interaction.options.getAttachment('file');
+      if (file) {
+        if ((file.size || 0) > 400_000) return interaction.editReply({ content: '❌ That file is over 400 KB — split it and import in parts.' });
+        try { text = await (await fetch(file.url)).text(); }
+        catch { return interaction.editReply({ content: '❌ I could not read that file.' }); }
+      }
+      const paste = interaction.options.getString('paste');
+      if (paste) text += '\n' + paste.split(';;').join('\n');
+      if (!text.trim()) {
+        return interaction.editReply({ content: [
+          '❌ Nothing to read. Attach a `.txt` or paste entries. One a line, like this:',
+          '```', '[MONSTER] Goblin | ac 15 | hp 7 | attack +4 | damage 1d6+2 | str 8 dex 14 con 10 | cr 1/4',
+          '[SPELL] Fireball | level 3 | school evocation | range 150 ft | 8d6 fire, DEX save halves', '```',
+          'Everything after the name is optional and can come in any order.'].join('\n') });
+      }
+    }
+    const res = importLibrary(gid, uid, text, {
+      source: sub === 'srd' ? 'srd' : 'imported',
+      replace: interaction.options.getBoolean?.('replace') ?? (sub === 'srd'),
+    });
+    const lines = [`📚 **Read ${res.added.length}**${res.skipped.length ? ` · skipped ${res.skipped.length} already known` : ''}${res.bad.length ? ` · ${res.bad.length} refused` : ''}.`];
+    if (res.added.length) lines.push('', res.added.slice(0, 40).join(' · ') + (res.added.length > 40 ? ` …and ${res.added.length - 40} more` : ''));
+    if (res.skipped.length) lines.push('', `_Already known: ${res.skipped.slice(0, 15).join(', ')}${res.skipped.length > 15 ? '…' : ''}. Use \`replace:true\` to overwrite._`);
+    if (res.bad.length) lines.push('', '**Refused:**', ...res.bad.slice(0, 10).map(x => `• ${x}`));
+    return interaction.editReply({ content: lines.join('\n').slice(0, 1990) });
+  }
+
+  if (sub === 'list') {
+    const v = (interaction.options.getString('search') || '').toLowerCase();
+    const mons = db.prepare('SELECT name, cr, ac, hp FROM library_monsters WHERE guild_id=? ORDER BY name').all(gid)
+      .filter(r => !v || r.name.toLowerCase().includes(v));
+    const spells = db.prepare('SELECT name, level FROM library_spells WHERE guild_id=? ORDER BY level, name').all(gid)
+      .filter(r => !v || r.name.toLowerCase().includes(v));
+    if (!mons.length && !spells.length) {
+      return interaction.reply({ ephemeral: true, content: v
+        ? `📚 Nothing matching **${v}**.`
+        : '📚 The library is empty. `/library srd` loads the set that ships here, or `/library import` reads your own.' });
+    }
+    const lines = [`📚 **The library** — ${mons.length} monster${mons.length === 1 ? '' : 's'}, ${spells.length} spell${spells.length === 1 ? '' : 's'}${v ? ` matching \`${v}\`` : ''}`];
+    if (mons.length) lines.push('', '**🐉 Monsters**', mons.slice(0, 60).map(r => `• ${r.name}${r.cr ? ` (CR ${r.cr})` : ''} — AC ${r.ac}, ${r.hp} hp`).join('\n'));
+    if (spells.length) lines.push('', '**✨ Spells**', spells.slice(0, 60).map(r => `• ${r.name} — ${r.level ? `level ${r.level}` : 'cantrip'}`).join('\n'));
+    return replyLong(interaction, lines, { ephemeral: true });
+  }
+
+  const name = interaction.options.getString('name');
+  const mon = name && db.prepare('SELECT * FROM library_monsters WHERE guild_id=? AND name=? COLLATE NOCASE').get(gid, name);
+  const spl = name && db.prepare('SELECT * FROM library_spells WHERE guild_id=? AND name=? COLLATE NOCASE').get(gid, name);
+
+  if (sub === 'show') {
+    if (mon) {
+      const lines = [`🐉 **${mon.name}**${mon.kind ? ` — _${mon.kind}_` : ''}${mon.cr ? ` · CR ${mon.cr}` : ''}`,
+        `🛡️ AC **${mon.ac}** · ❤️ **${mon.hp}** hp${mon.attack != null ? ` · ⚔️ **+${mon.attack}**` : ''}${mon.damage ? ` · 🎲 ${mon.damage}` : ''}`,
+        ['str','dex','con','int','wis','cha'].map(k => `${k.toUpperCase()} ${mon[k]}`).join(' · ')];
+      if (mon.notes) lines.push('', mon.notes);
+      return replyLong(interaction, lines, { ephemeral: true });
+    }
+    if (spl) {
+      const lines = [`✨ **${spl.name}** — ${spl.level ? `level ${spl.level}` : 'cantrip'}${spl.school ? ` ${spl.school}` : ''}`,
+        [spl.casting_time && `⏱️ ${spl.casting_time}`, spl.range_text && `📏 ${spl.range_text}`,
+         spl.components && `✋ ${spl.components}`, spl.duration && `⏳ ${spl.duration}`].filter(Boolean).join(' · ')];
+      if (spl.body) lines.push('', spl.body);
+      return replyLong(interaction, lines, { ephemeral: true });
+    }
+    return interaction.reply({ content: `❌ Nothing called **${name}** in the library.`, ephemeral: true });
+  }
+
+  if (sub === 'forget') {
+    if (!mon && !spl) return interaction.reply({ content: `❌ Nothing called **${name}**.`, ephemeral: true });
+    db.prepare('DELETE FROM library_monsters WHERE guild_id=? AND name=? COLLATE NOCASE').run(gid, name);
+    db.prepare('DELETE FROM library_spells WHERE guild_id=? AND name=? COLLATE NOCASE').run(gid, name);
+    return interaction.reply({ content: `🗑️ **${name}** is forgotten.`, ephemeral: true });
+  }
+
+  if (sub === 'summon') {
+    if (!mon) return interaction.reply({ content: `❌ No monster called **${name}** in the library.`, ephemeral: true });
+    const count = interaction.options.getInteger('count') ?? 1;
+    const base = (interaction.options.getString('as') || mon.name).slice(0, 60);
+    const made = [];
+    for (let i = 1; i <= count; i++) {
+      const nm = count > 1 ? `${base} ${i}` : base;
+      if (getNpc(gid, nm)) continue;   // never trample an NPC already standing
+      upsertNpc(gid, nm, {
+        armour_class: mon.ac, attack_bonus: mon.attack, damage_dice: mon.damage,
+        max_hp: mon.hp, hp_current: mon.hp,
+        str: mon.str, dex: mon.dex, con: mon.con, int: mon.int, wis: mon.wis, cha: mon.cha,
+      });
+      made.push(nm);
+    }
+    if (!made.length) return interaction.reply({ content: `❌ **${base}** already stands here. Give a different \`as:\` name.`, ephemeral: true });
+    return interaction.reply({ content: [
+      `🐉 **${made.length}** × **${mon.name}** step${made.length === 1 ? 's' : ''} out of the library: ${made.join(', ')}.`,
+      `🛡️ AC ${mon.ac} · ❤️ ${mon.hp} hp${mon.attack != null ? ` · ⚔️ +${mon.attack}` : ''}${mon.damage ? ` · 🎲 ${mon.damage}` : ''}`,
+      `_\`/fight start npcs:${made[0]}\` puts them in._`].join('\n') });
+  }
+}
+
+// ── The SRD set that ships with the bot ────────────────────────────
+// Only what the System Reference Document releases under Creative Commons.
+// A core set rather than the whole document — what a table actually reaches
+// for — with `/library import` there for everything else.
+const SRD_MONSTERS = [
+  '[MONSTER] Bandit | ac 12 | hp 11 | attack +3 | damage 1d6+1 | str 11 dex 12 con 12 int 10 wis 10 cha 10 | type medium humanoid | cr 1/8',
+  '[MONSTER] Guard | ac 16 | hp 11 | attack +3 | damage 1d6+1 | str 13 dex 12 con 12 int 10 wis 11 cha 10 | type medium humanoid | cr 1/8',
+  '[MONSTER] Kobold | ac 12 | hp 5 | attack +4 | damage 1d4+2 | str 7 dex 15 con 9 int 8 wis 7 cha 8 | type small humanoid | cr 1/8',
+  '[MONSTER] Giant Rat | ac 12 | hp 7 | attack +4 | damage 1d4+2 | str 7 dex 15 con 11 int 2 wis 10 cha 4 | type small beast | cr 1/8',
+  '[MONSTER] Goblin | ac 15 | hp 7 | attack +4 | damage 1d6+2 | str 8 dex 14 con 10 int 10 wis 8 cha 8 | type small humanoid | cr 1/4',
+  '[MONSTER] Skeleton | ac 13 | hp 13 | attack +4 | damage 1d6+2 | str 10 dex 14 con 15 int 6 wis 8 cha 5 | type medium undead | cr 1/4',
+  '[MONSTER] Zombie | ac 8 | hp 22 | attack +3 | damage 1d6+1 | str 13 dex 6 con 16 int 3 wis 6 cha 5 | type medium undead | cr 1/4',
+  '[MONSTER] Wolf | ac 13 | hp 11 | attack +4 | damage 2d4+2 | str 12 dex 15 con 12 int 3 wis 12 cha 6 | type medium beast | cr 1/4',
+  '[MONSTER] Giant Spider | ac 14 | hp 26 | attack +5 | damage 1d8+3 | str 14 dex 16 con 12 int 2 wis 11 cha 4 | type large beast | cr 1',
+  '[MONSTER] Orc | ac 13 | hp 15 | attack +5 | damage 1d12+3 | str 16 dex 12 con 16 int 7 wis 11 cha 10 | type medium humanoid | cr 1/2',
+  '[MONSTER] Hobgoblin | ac 18 | hp 11 | attack +3 | damage 1d8+1 | str 13 dex 12 con 12 int 10 wis 10 cha 9 | type medium humanoid | cr 1/2',
+  '[MONSTER] Black Bear | ac 11 | hp 19 | attack +3 | damage 1d6+2 | str 15 dex 10 con 14 int 2 wis 12 cha 7 | type medium beast | cr 1/2',
+  '[MONSTER] Dire Wolf | ac 14 | hp 37 | attack +5 | damage 2d6+3 | str 17 dex 15 con 15 int 3 wis 12 cha 7 | type large beast | cr 1',
+  '[MONSTER] Brown Bear | ac 11 | hp 34 | attack +5 | damage 1d8+4 | str 19 dex 10 con 16 int 2 wis 13 cha 7 | type large beast | cr 1',
+  '[MONSTER] Ghoul | ac 12 | hp 22 | attack +4 | damage 2d6+2 | str 13 dex 15 con 10 int 7 wis 10 cha 6 | type medium undead | cr 1',
+  '[MONSTER] Ogre | ac 11 | hp 59 | attack +6 | damage 2d8+4 | str 19 dex 8 con 16 int 5 wis 7 cha 7 | type large giant | cr 2',
+  '[MONSTER] Bugbear | ac 16 | hp 27 | attack +4 | damage 2d8+2 | str 15 dex 14 con 13 int 8 wis 11 cha 9 | type medium humanoid | cr 1',
+  '[MONSTER] Owlbear | ac 13 | hp 59 | attack +7 | damage 1d10+5 | str 20 dex 12 con 17 int 3 wis 12 cha 7 | type large monstrosity | cr 3',
+  '[MONSTER] Wight | ac 14 | hp 45 | attack +4 | damage 1d8+2 | str 15 dex 14 con 16 int 10 wis 13 cha 15 | type medium undead | cr 3',
+  '[MONSTER] Werewolf | ac 12 | hp 58 | attack +4 | damage 2d4+2 | str 15 dex 13 con 14 int 10 wis 11 cha 10 | type medium humanoid | cr 3',
+  '[MONSTER] Basilisk | ac 15 | hp 52 | attack +5 | damage 2d6+3 | str 16 dex 8 con 15 int 2 wis 8 cha 7 | type medium monstrosity | cr 3',
+  '[MONSTER] Manticore | ac 14 | hp 68 | attack +5 | damage 1d8+3 | str 17 dex 16 con 17 int 7 wis 12 cha 8 | type large monstrosity | cr 3',
+  '[MONSTER] Troll | ac 15 | hp 84 | attack +7 | damage 2d6+4 | str 18 dex 13 con 20 int 7 wis 9 cha 7 | type large giant | cr 5',
+  '[MONSTER] Hill Giant | ac 13 | hp 105 | attack +8 | damage 3d8+5 | str 21 dex 8 con 19 int 5 wis 9 cha 6 | type huge giant | cr 5',
+  '[MONSTER] Wraith | ac 13 | hp 67 | attack +6 | damage 4d8+3 | str 6 dex 16 con 16 int 12 wis 14 cha 15 | type medium undead | cr 5',
+  '[MONSTER] Young Red Dragon | ac 18 | hp 178 | attack +10 | damage 2d10+6 | str 23 dex 10 con 21 int 14 wis 11 cha 19 | type large dragon | cr 10',
+  '[MONSTER] Stone Golem | ac 17 | hp 178 | attack +10 | damage 3d8+6 | str 22 dex 9 con 20 int 3 wis 11 cha 1 | type large construct | cr 10',
+  '[MONSTER] Adult Red Dragon | ac 19 | hp 256 | attack +14 | damage 2d10+8 | str 27 dex 10 con 25 int 16 wis 13 cha 21 | type huge dragon | cr 17',
+  '[MONSTER] Ancient Red Dragon | ac 22 | hp 546 | attack +17 | damage 2d10+10 | str 30 dex 10 con 29 int 18 wis 15 cha 23 | type gargantuan dragon | cr 24',
+  '[MONSTER] Lich | ac 17 | hp 135 | attack +12 | damage 3d6 | str 11 dex 16 con 16 int 20 wis 14 cha 16 | type medium undead | cr 21',
+].join('\n');
+
+const SRD_SPELLS = [
+  '[SPELL] Fire Bolt | level 0 | school evocation | time 1 action | range 120 ft | components V S | duration instant | A mote of fire: ranged spell attack, 1d10 fire. The dice grow at 5th, 11th and 17th level.',
+  '[SPELL] Sacred Flame | level 0 | school evocation | time 1 action | range 60 ft | components V S | duration instant | 1d8 radiant, DEX save for none. Cover does not help.',
+  '[SPELL] Mage Hand | level 0 | school conjuration | time 1 action | range 30 ft | components V S | duration 1 minute | A spectral hand that can carry up to 10 pounds.',
+  '[SPELL] Cure Wounds | level 1 | school evocation | time 1 action | range touch | components V S | duration instant | Heals 1d8 + your spellcasting modifier. A higher slot adds 1d8 each level.',
+  '[SPELL] Magic Missile | level 1 | school evocation | time 1 action | range 120 ft | components V S | duration instant | Three darts, 1d4+1 force each, never missing. A higher slot adds one dart each level.',
+  '[SPELL] Shield | level 1 | school abjuration | time 1 reaction | range self | components V S | duration 1 round | +5 AC until your next turn, and no damage from magic missile.',
+  '[SPELL] Bless | level 1 | school enchantment | time 1 action | range 30 ft | components V S M | duration concentration, up to 1 minute | Up to three creatures add 1d4 to attacks and saving throws.',
+  '[SPELL] Healing Word | level 1 | school evocation | time 1 bonus action | range 60 ft | components V | duration instant | Heals 1d4 + your spellcasting modifier at range.',
+  '[SPELL] Misty Step | level 2 | school conjuration | time 1 bonus action | range self | components V | duration instant | Teleport up to 30 feet to a space you can see.',
+  '[SPELL] Hold Person | level 2 | school enchantment | time 1 action | range 60 ft | components V S M | duration concentration, up to 1 minute | A humanoid is paralysed on a failed WIS save, repeated at the end of each of its turns.',
+  '[SPELL] Fireball | level 3 | school evocation | time 1 action | range 150 ft | components V S M | duration instant | 8d6 fire in a 20-foot radius, DEX save for half. A higher slot adds 1d6 each level.',
+  '[SPELL] Counterspell | level 3 | school abjuration | time 1 reaction | range 60 ft | components S | duration instant | Interrupts a spell of 3rd level or lower; higher needs a check.',
+  '[SPELL] Fly | level 3 | school transmutation | time 1 action | range touch | components V S M | duration concentration, up to 10 minutes | A flying speed of 60 feet.',
+  '[SPELL] Revivify | level 3 | school necromancy | time 1 action | range touch | components V S M | duration instant | Returns a creature dead less than a minute, with 1 hit point.',
+  '[SPELL] Polymorph | level 4 | school transmutation | time 1 action | range 60 ft | components V S M | duration concentration, up to 1 hour | A creature becomes a beast of equal or lower challenge rating.',
+  '[SPELL] Wall of Fire | level 4 | school evocation | time 1 action | range 120 ft | components V S M | duration concentration, up to 1 minute | 5d8 fire to those who enter, DEX save for half.',
+  '[SPELL] Cone of Cold | level 5 | school evocation | time 1 action | range self, 60-foot cone | components V S M | duration instant | 8d8 cold, CON save for half.',
+  '[SPELL] Raise Dead | level 5 | school necromancy | time 1 hour | range touch | components V S M | duration instant | Returns a creature dead up to ten days, with 1 hit point.',
+  '[SPELL] Chain Lightning | level 6 | school evocation | time 1 action | range 150 ft | components V S M | duration instant | 10d8 lightning to one target and up to three more, DEX save for half.',
+  '[SPELL] Wish | level 9 | school conjuration | time 1 action | range self | components V | duration instant | The mightiest spell: duplicate any spell of 8th level or lower, or ask for more and risk the cost.',
+].join('\n');
+
+// ── The library ───────────────────────────────────────────────
+// One entry a line. The name comes first; everything after it is a field
+// named in plain words, separated by pipes, in any order. Anything the
+// parser doesn't recognise is kept as a note rather than thrown away — a
+// GM's own wording is worth more than a tidy refusal.
+function parseLibraryLine(line) {
+  const raw = String(line || '').trim();
+  const m = /^\[(MONSTER|SPELL)\]\s*(.+)$/i.exec(raw);
+  if (!m) return null;
+  const kind = m[1].toLowerCase();
+  const parts = m[2].split('|').map(x => x.trim()).filter(Boolean);
+  if (!parts.length) return null;
+  const out = { kind, name: parts[0].slice(0, 80), notes: [] };
+  for (const p of parts.slice(1)) {
+    const f = /^([a-z_ ]+?)\s+(.+)$/i.exec(p);
+    if (!f) { out.notes.push(p); continue; }
+    const key = f[1].toLowerCase().trim().replace(/\s+/g, '_');
+    const val = f[2].trim();
+    switch (key) {
+      case 'ac': case 'armour_class': case 'armor_class': out.ac = parseInt(val); break;
+      case 'hp': case 'hit_points': out.hp = parseInt(val); break;
+      case 'attack': case 'to_hit': out.attack = parseInt(val.replace('+', '')); break;
+      case 'damage': case 'dmg': out.damage = val.slice(0, 40); break;
+      case 'cr': case 'challenge': out.cr = val.slice(0, 12); break;
+      case 'type': case 'kind': out.type = val.slice(0, 60); break;
+      case 'level': out.level = /cantrip/i.test(val) ? 0 : parseInt(val); break;
+      case 'school': out.school = val.slice(0, 30); break;
+      case 'time': case 'casting_time': out.casting_time = val.slice(0, 40); break;
+      case 'range': out.range_text = val.slice(0, 40); break;
+      case 'components': case 'comp': out.components = val.slice(0, 40); break;
+      case 'duration': out.duration = val.slice(0, 60);
+        if (/concentration/i.test(val)) out.concentration = 1; break;
+      case 'str': case 'dex': case 'con': case 'int': case 'wis': case 'cha': {
+        // A statblock usually gives all six in one breath — "str 8 dex 14
+        // con 10 …" — so read every pair in the field, not just the first.
+        const runs = [...p.matchAll(/\b(str|dex|con|int|wis|cha)\s+(\d{1,2})\b/gi)];
+        for (const r of runs) out[r[1].toLowerCase()] = parseInt(r[2]);
+        break;
+      }
+      default: out.notes.push(p);
+    }
+  }
+  // A statblock can also give its six abilities in one run: "str 8 dex 14 ..."
+  for (const n of [...out.notes]) {
+    const runs = [...n.matchAll(/\b(str|dex|con|int|wis|cha)\s+(\d{1,2})\b/gi)];
+    if (runs.length >= 3) {
+      for (const r of runs) out[r[1].toLowerCase()] = parseInt(r[2]);
+      out.notes = out.notes.filter(x => x !== n);
+    }
+  }
+  out.notes = out.notes.join(' · ').slice(0, 600) || null;
+  if (kind === 'monster' && (out.ac == null || out.hp == null)) return { ...out, error: 'needs at least `ac` and `hp`' };
+  if (kind === 'spell' && out.level == null) return { ...out, error: 'needs a `level` (0 for a cantrip)' };
+  return out;
+}
+
+// Read a whole paste: every line that looks like an entry, and a tally of
+// what could not be read, so nothing fails silently.
+function importLibrary(gid, uid, text, { source = 'imported', replace = false } = {}) {
+  const added = [], skipped = [], bad = [];
+  for (const line of String(text || '').split(/\r?\n/)) {
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const e = parseLibraryLine(line);
+    if (!e) { if (/^\[/.test(line.trim())) bad.push(`${line.trim().slice(0, 50)} — unreadable`); continue; }
+    if (e.error) { bad.push(`${e.name} — ${e.error}`); continue; }
+    try {
+      if (e.kind === 'monster') {
+        const exists = db.prepare('SELECT name FROM library_monsters WHERE guild_id=? AND name=? COLLATE NOCASE').get(gid, e.name);
+        if (exists && !replace) { skipped.push(e.name); continue; }
+        db.prepare(`INSERT INTO library_monsters
+          (guild_id,name,ac,hp,attack,damage,str,dex,con,int,wis,cha,kind,cr,notes,source,added_by,at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(guild_id,name) DO UPDATE SET ac=excluded.ac, hp=excluded.hp, attack=excluded.attack,
+            damage=excluded.damage, str=excluded.str, dex=excluded.dex, con=excluded.con, int=excluded.int,
+            wis=excluded.wis, cha=excluded.cha, kind=excluded.kind, cr=excluded.cr, notes=excluded.notes`)
+          .run(gid, e.name, e.ac ?? null, e.hp ?? null, e.attack ?? null, e.damage ?? null,
+               e.str ?? 10, e.dex ?? 10, e.con ?? 10, e.int ?? 10, e.wis ?? 10, e.cha ?? 10,
+               e.type ?? null, e.cr ?? null, e.notes, source, uid, Date.now());
+      } else {
+        const exists = db.prepare('SELECT name FROM library_spells WHERE guild_id=? AND name=? COLLATE NOCASE').get(gid, e.name);
+        if (exists && !replace) { skipped.push(e.name); continue; }
+        db.prepare(`INSERT INTO library_spells
+          (guild_id,name,level,school,casting_time,range_text,components,duration,concentration,body,source,added_by,at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(guild_id,name) DO UPDATE SET level=excluded.level, school=excluded.school,
+            casting_time=excluded.casting_time, range_text=excluded.range_text, components=excluded.components,
+            duration=excluded.duration, concentration=excluded.concentration, body=excluded.body`)
+          .run(gid, e.name, e.level ?? 0, e.school ?? null, e.casting_time ?? null, e.range_text ?? null,
+               e.components ?? null, e.duration ?? null, e.concentration ?? 0, e.notes, source, uid, Date.now());
+      }
+      added.push(e.name);
+    } catch (err) { bad.push(`${e.name} — ${err?.message || err}`); }
+  }
+  return { added, skipped, bad };
+}
+
+// What a caster has spent, as a map of spell level to count.
+function slotsSpent(ch) {
+  try { return JSON.parse(ch?.slots_used || '{}') || {}; } catch { return {}; }
+}
+// One line per spell level: ● for a slot in hand, ○ for one spent.
+function slotLines(rules, ch) {
+  // Self-guarding, like conditionMode: a ruleset without slots has nothing
+  // to draw, whoever asks. A helper should not depend on its caller's care.
+  if (typeof rules.slots !== 'function') return [];
+  const have = rules.slots(ch);
+  const spent = slotsSpent(ch);
+  const out = [];
+  have.forEach((n, i) => {
+    if (!n) return;
+    const lvl = i + 1, used = Math.min(n, Number(spent[lvl]) || 0);
+    out.push(`　 **${lvl}**  ${'●'.repeat(n - used)}${'○'.repeat(used)}   ${n - used} of ${n}`);
+  });
+  return out;
+}
+
+async function handleSpell(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const rules = rulesFor(gid);
+  if (rules.id !== 'dnd5e') {
+    return interaction.reply({ ephemeral: true, content: `❌ Spell slots belong to 5e; this server plays by **${rules.name}**.` });
+  }
+  const sub = interaction.options.getSubcommand();
+  const who = interaction.options.getUser?.('user');
+  const targetId = (sub === 'slots' && who) ? who.id : uid;
+  const ch = getChar(gid, targetId);
+  if (!ch) return interaction.reply({ content: '❌ No character there yet.', ephemeral: true });
+  const caster = rules.caster(ch);
+  const nm = await getDisplayName(interaction.guild, targetId);
+
+  if (sub === 'slots') {
+    if (!caster) return interaction.reply({ ephemeral: true, content: `📖 **${nm}** casts no spells${ch.char_class ? ` — a ${ch.char_class} works by other means` : ''}.` });
+    const lines = [`📖 **${nm}** · ${ch.char_class} ${ch.level ?? 1}`,
+      `✨ Spell save **DC ${rules.spellSaveDC(ch)}** · attack **+${rules.spellAttack(ch)}** · cast off **${rules.labels[caster.ability]}**`];
+    const prep = rules.prepareCount(ch);
+    if (prep) lines.push(`📜 Prepares **${prep}** spells`);
+    const rows = slotLines(rules, ch);
+    lines.push('', ...(rows.length ? rows : ['　 _No slots yet._']));
+    if (caster.kind === 'pact') lines.push('', '_Pact magic — these come back on a **short** rest._');
+    if (ch.concentrating) lines.push('', `🧠 Concentrating on **${ch.concentrating}**`);
+    return interaction.reply({ content: lines.join('\n'), ephemeral: sub === 'slots' && !!who });
+  }
+
+  if (sub === 'cast') {
+    if (!caster) return interaction.reply({ content: '❌ You cast no spells.', ephemeral: true });
+    const lvl = interaction.options.getInteger('level');
+    if (lvl === 0) {
+      // A cantrip costs nothing and grows on its own at 5th, 11th and 17th.
+      const name0 = (interaction.options.getString('name') || '').trim().slice(0, 80);
+      const tier = rules.cantripTier(ch);
+      return interaction.reply({ content: [
+        `✨ **${nm}** casts${name0 ? ` **${name0}**` : ' a cantrip'} — no slot spent.`,
+        `📐 At level ${ch.level ?? 1} its dice are at **tier ${tier}** of four.`,
+        `✨ Save **DC ${rules.spellSaveDC(ch)}** · attack **+${rules.spellAttack(ch)}**`].join('\n') });
+    }
+    const have = rules.slots(ch);
+    const there = Number(have[lvl - 1]) || 0;
+    if (!there) return interaction.reply({ ephemeral: true, content: `❌ You have no **level ${lvl}** slots at all${caster.kind === 'pact' ? ' — pact magic casts at one level only' : ''}.` });
+    const spent = slotsSpent(ch);
+    const used = Number(spent[lvl]) || 0;
+    if (used >= there) return interaction.reply({ ephemeral: true, content: `❌ Every **level ${lvl}** slot is spent. ${caster.kind === 'pact' ? 'A short rest brings them back.' : 'They return on a long rest.'}` });
+    spent[lvl] = used + 1;
+    const name = (interaction.options.getString('name') || '').trim().slice(0, 80);
+    const conc = interaction.options.getBoolean('concentration') ?? false;
+    const patch = { slots_used: JSON.stringify(spent) };
+    const lines = [`✨ **${nm}** casts${name ? ` **${name}**` : ''} at **level ${lvl}** — ${there - used - 1} of ${there} left.`];
+    if (conc) {
+      if (ch.concentrating) lines.push(`🧠 **${ch.concentrating}** slips away — only one spell at a time.`);
+      patch.concentrating = name || `a level ${lvl} spell`;
+      lines.push(`🧠 Concentrating on **${patch.concentrating}**.`);
+    }
+    upsertChar(gid, targetId, patch);
+    lines.push(`✨ Save **DC ${rules.spellSaveDC(ch)}** · attack **+${rules.spellAttack(ch)}**`);
+    return interaction.reply({ content: lines.join('\n') });
+  }
+
+  if (sub === 'prepare') {
+    const cap = rules.prepareCount(ch);
+    if (!cap) {
+      return interaction.reply({ ephemeral: true, content: caster
+        ? `❌ A ${ch.char_class} does not prepare spells — they know the ones they know.`
+        : '❌ You cast no spells.' });
+    }
+    let list = [];
+    try { list = JSON.parse(ch.prepared_spells || '[]') || []; } catch {}
+    if (interaction.options.getBoolean('clear')) {
+      upsertChar(gid, targetId, { prepared_spells: '[]' });
+      return interaction.reply({ content: `📜 **${nm}** clears their prepared spells — ${cap} may be readied.` });
+    }
+    const add = (interaction.options.getString('add') || '').trim().slice(0, 60);
+    const drop = (interaction.options.getString('drop') || '').trim().toLowerCase();
+    if (add) {
+      if (list.some(x => x.toLowerCase() === add.toLowerCase())) {
+        return interaction.reply({ content: `❌ **${add}** is already prepared.`, ephemeral: true });
+      }
+      if (list.length >= cap) {
+        return interaction.reply({ ephemeral: true, content:
+          `❌ You may hold **${cap}** ready and already have that many. Drop one first — \`/spell prepare drop:\`.` });
+      }
+      list.push(add);
+    }
+    if (drop) {
+      const before = list.length;
+      list = list.filter(x => x.toLowerCase() !== drop);
+      if (list.length === before) return interaction.reply({ content: `❌ **${drop}** was not prepared.`, ephemeral: true });
+    }
+    upsertChar(gid, targetId, { prepared_spells: JSON.stringify(list) });
+    const lines = [`📜 **${nm}** · ${list.length} of **${cap}** prepared`];
+    lines.push(list.length ? list.map(x => `　• ${x}`).join('\n') : '　 _Nothing readied yet._');
+    return interaction.reply({ content: lines.join('\n') });
+  }
+
+  if (sub === 'concentration') {
+    if (interaction.options.getBoolean('drop')) {
+      if (!ch.concentrating) return interaction.reply({ content: '🧠 You were not holding anything.', ephemeral: true });
+      upsertChar(gid, targetId, { concentrating: null });
+      return interaction.reply({ content: `🧠 **${nm}** lets **${ch.concentrating}** go.` });
+    }
+    return interaction.reply({ ephemeral: true, content: ch.concentrating
+      ? `🧠 Concentrating on **${ch.concentrating}**. A blow that lands asks for a CON save — DC 10, or half the damage, whichever is harder.`
+      : '🧠 You are not concentrating on anything.' });
+  }
+}
+
+// Gaining a level. The proficiency bonus, the hit points and the hit dice
+// all follow from it, so the only thing to decide is the number.
+async function handleLevelUp(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const r = rulesFor(gid);
+  if (r.id !== 'dnd5e') {
+    return interaction.reply({ ephemeral: true, content: `❌ Levels belong to 5e; this server plays by **${r.name}**.` });
+  }
+  const who = interaction.options.getUser('user');
+  let targetId = uid;
+  if (who && who.id !== uid) {
+    if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs level someone else up.', ephemeral: true });
+    targetId = who.id;
+  }
+  const ch = getChar(gid, targetId);
+  if (!ch) return interaction.reply({ content: '❌ No character there yet.', ephemeral: true });
+  const from = Math.max(1, Number(ch.level) || 1);
+  const to = interaction.options.getInteger('to') ?? from + 1;
+  if (to <= from) return interaction.reply({ content: `❌ They are already level **${from}**.`, ephemeral: true });
+  if (to > 20) return interaction.reply({ content: '❌ Twenty is the ceiling.', ephemeral: true });
+
+  const before = { hp: r.maxHp(ch), prof: r.profBonus(ch) };
+  const after = { ...ch, level: to };
+  const gainedHp = r.maxHp(after) - before.hp;
+  upsertChar(gid, targetId, {
+    level: to,
+    hp_current: (Number(ch.hp_current) || 0) + gainedHp,   // the new hit points arrive full
+    hit_dice_left: Math.min(r.hitDiceTotal(after), (Number(ch.hit_dice_left) ?? from) + (to - from)),
+  });
+  const fresh = getChar(gid, targetId);
+  const nm = await getDisplayName(interaction.guild, targetId);
+  const lines = [`⭐ **${nm}** reaches **level ${to}**${ch.char_class ? ` · ${ch.char_class}` : ''}.`,
+    `❤️ HP **${fresh.hp_current} / ${r.maxHp(fresh)}** _(+${gainedHp})_`,
+    `🎲 Hit dice **${fresh.hit_dice_left} / ${r.hitDiceTotal(fresh)}** (d${fresh.hit_die || 8})`];
+  const nowProf = r.profBonus(fresh);
+  if (nowProf !== before.prof) lines.push(`➕ Proficiency is now **+${nowProf}**.`);
+  if ([4, 8, 12, 16, 19].includes(to)) lines.push('🌟 An **ability score improvement** is due at this level — or a feat, if your table uses them.');
+  const atks = r.attacksPerAction(fresh);
+  if (atks > r.attacksPerAction({ ...fresh, level: from })) lines.push(`⚔️ **Extra attack** — ${atks} swings to an action now.`);
+  return interaction.reply({ content: lines.join('\n') });
+}
+
+// A monster, from its statblock. The four numbers at the top of any entry
+// — AC, hit points, attack bonus, damage — are what the table actually
+// needs; the six abilities are optional and default to average.
+async function handleNpcCreate5e(interaction) {
+  const gid = interaction.guild.id;
+  const rules = rulesFor(gid);
+  if (rules.id !== 'dnd5e') {
+    return interaction.reply({ ephemeral: true, content: `❌ This server plays by **${rules.name}**. \`/npc create\` makes one here.` });
+  }
+  const name = interaction.options.getString('name').trim().slice(0, 80);
+  if (getNpc(gid, name)) return interaction.reply({ content: `❌ **${name}** already exists.`, ephemeral: true });
+  const dmg = interaction.options.getString('damage').trim();
+  if (!/^\d*d\d+([+-]\d+)?$/i.test(dmg)) {
+    return interaction.reply({ ephemeral: true, content: '❌ Damage looks like `1d8`, `2d6+3` or `1d12+4`.' });
+  }
+  const hp = interaction.options.getInteger('hp');
+  const row = {
+    armour_class: interaction.options.getInteger('ac'),
+    attack_bonus: interaction.options.getInteger('attack'),
+    damage_dice: dmg, max_hp: hp, hp_current: hp,
+  };
+  for (const st of rules.stats) row[st] = interaction.options.getInteger(st) ?? 10;
+  upsertNpc(gid, name, row);
+  const npc = getNpc(gid, name);
+  const mod = (st) => { const m = rules.statBonus(npc, st); return m >= 0 ? `+${m}` : `${m}`; };
+  return interaction.reply({ content: [
+    `✅ **${name}** stands ready.`,
+    `🛡️ AC **${row.armour_class}** · ❤️ HP **${hp}** · ⚔️ attack **+${row.attack_bonus}** · 🎲 damage **${dmg}**`,
+    rules.stats.map(st => `${rules.labels[st]} ${npc[st]} (${mod(st)})`).join(' · '),
+  ].join('\n') });
+}
+
+// A 5e sheet in one command. Scores in, everything derived: modifiers,
+// proficiency from level, hit points from the class die and CON.
+async function handleCreate5e(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const r = rulesFor(gid);
+  if (r.id !== 'dnd5e') {
+    return interaction.reply({ ephemeral: true, content:
+      `❌ This server plays by **${r.name}**. \`/char create\` makes a character here — or an admin can set the rules with \`/config channels ruleset\` before anyone plays.` });
+  }
+  if (getChar(gid, uid)) {
+    return interaction.reply({ content: '❌ You already have a character. `/char edit` changes one field at a time.', ephemeral: true });
+  }
+  const name = interaction.options.getString('name').trim().slice(0, 60);
+  const cls = interaction.options.getString('class') || null;
+  const level = interaction.options.getInteger('level') ?? 1;
+  const die = cls ? (DND_HIT_DICE[cls] ?? 8) : 8;
+  const scores = {};
+  for (const st of r.stats) scores[st] = interaction.options.getInteger(st);
+
+  // Proficiencies are written as they are said: "str, con" or "athletics, stealth".
+  const listOf = (raw) => String(raw || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+  const saves = listOf(interaction.options.getString('saves')).filter(x => r.stats.includes(x));
+  const skills = listOf(interaction.options.getString('skills')).filter(x => r.skills[x]);
+  const badSkills = listOf(interaction.options.getString('skills')).filter(x => !r.skills[x]);
+  if (badSkills.length) {
+    return interaction.reply({ ephemeral: true, content:
+      `❌ I don't know the skill${badSkills.length > 1 ? 's' : ''} **${badSkills.join(', ')}**. The eighteen are: ${Object.keys(r.skills).join(', ')}.` });
+  }
+
+  const row = { name, level, char_class: cls, hit_die: die,
+    armour_class: interaction.options.getInteger('ac') ?? null,
+    proficient: JSON.stringify({ saves, skills }), ...scores };
+  row.hp_current = r.maxHp({ ...row });
+  row.hit_dice_left = r.hitDiceTotal(row);
+  upsertChar(gid, uid, row);
+  const ch = getChar(gid, uid);
+  const mod = (st) => { const m = r.statBonus(ch, st); return m >= 0 ? `+${m}` : `${m}`; };
+  const lines = [`✅ **${name}** is made — ${cls ? `level ${level} ${cls}` : `level ${level}`}.`, '',
+    r.stats.map(st => `${r.labels[st]} ${ch[st]} (${mod(st)})`).join(' · '), '',
+    `❤️ HP **${ch.hp_current}** · 🛡️ AC **${r.targetNumber(ch)}** · ➕ Proficiency **+${r.profBonus(ch)}**`];
+  if (saves.length) lines.push(`💪 Save proficiency: ${saves.map(x => r.labels[x]).join(', ')}`);
+  if (skills.length) lines.push(`🎯 Skills: ${skills.join(', ')}`);
+  return interaction.reply({ content: lines.join('\n') });
+}
+
 // Deception, away from the sword. A straight WIS contest between two
 // characters that works anywhere — a market square, a throne room, a tavern
 // — and needs no fight to exist. Both roll at once, so it resolves in one
@@ -9848,6 +10840,38 @@ client.on('interactionCreate', async interaction => {
 
       // The question bank: categories, tags in use, and questions themselves —
       // typed words filter, which is the whole point of keeping them in a table.
+      // The eighteen skills, filtered as you type.
+      if (focusedOption.name === 'add' || focusedOption.name === 'remove') {
+        const rules = rulesFor(interaction.guild.id);
+        if (rules.conditions) {
+          const v = String(focusedOption.value || '').toLowerCase();
+          const hits = Object.keys(rules.conditions).filter(x => !v || x.includes(v)).slice(0, 25);
+          return await interaction.respond(hits.map(x => ({ name: x, value: x })));
+        }
+      }
+      // Anything in the library, monsters and spells alike.
+      if (interaction.commandName === 'library' && focusedOption.name === 'name') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        const sub = interaction.options.getSubcommand(false);
+        let rows = [];
+        try {
+          const mons = db.prepare('SELECT name, cr FROM library_monsters WHERE guild_id=? ORDER BY name').all(interaction.guild.id)
+            .map(r => ({ name: `\u{1f409} ${r.name}${r.cr ? ` (CR ${r.cr})` : ''}`, value: r.name }));
+          const spells = sub === 'summon' ? [] :
+            db.prepare('SELECT name, level FROM library_spells WHERE guild_id=? ORDER BY name').all(interaction.guild.id)
+              .map(r => ({ name: `\u2728 ${r.name} (${r.level ? 'lvl ' + r.level : 'cantrip'})`, value: r.name }));
+          rows = [...mons, ...spells];
+        } catch {}
+        const hits = rows.filter(r => !v || r.value.toLowerCase().includes(v)).slice(0, 25);
+        return await interaction.respond(hits.map(r => ({ name: r.name.slice(0, 100), value: r.value.slice(0, 100) })));
+      }
+      if (focusedOption.name === 'skill') {
+        const rules = rulesFor(interaction.guild.id);
+        const v = String(focusedOption.value || '').toLowerCase();
+        const hits = Object.keys(rules.skills || {}).filter(x => !v || x.includes(v)).slice(0, 25);
+        return await interaction.respond(hits.map(x => ({
+          name: `${x.replace(/\b\w/g, c => c.toUpperCase())} (${rules.labels[rules.skills[x]]})`.slice(0, 100), value: x })));
+      }
       if (interaction.commandName === 'quiz' && focusedOption.name === 'category') {
         const v = String(focusedOption.value || '').toLowerCase();
         const known = quizCategories(interaction.guild.id).map(c => c.name);
@@ -10134,6 +11158,9 @@ client.on('interactionCreate', async interaction => {
 
   if (!interaction.isChatInputCommand()) return;
   try {
+    if (interaction.commandName === 'dnd') return await handleDnd(interaction);
+    if (interaction.commandName === 'library') return await handleLibrary(interaction);
+    if (interaction.commandName === 'spell') return await handleSpell(interaction);
     if (interaction.commandName === 'quiz') return await handleQuiz(interaction);
     if (interaction.commandName === 'deception') return await handleDeception(interaction);
     if (interaction.commandName === 'duel') return await handleDuel(interaction);
@@ -10498,13 +11525,228 @@ const RULES_KNIGHTFALL = {
     if (atkNat === atkSides && defNat === 1) dmg += 1;
     return { hit, dmg };
   },
+  // Two rolls decide a blow between them; nobody has a target number.
+  defence: 'opposed',
+  profBonus: () => 0,
   // What a stat must reach before an ability is available at all.
   gates: { deflect: ['str', 4], disarm: ['dex', 4], feint: ['wis', 4], insight: ['wis', 4], heal: ['wis', 5] },
   // What progress is called here.
   vocabulary: { currency: 'renown', standing: 'merits', rank: 'rank' },
 };
 
-const RULESETS = { knightfall: RULES_KNIGHTFALL };
+// ── Dungeons & Dragons, fifth edition (SRD) ──────────────────────────
+// Only what the SRD releases under Creative Commons is built in. Anything
+// from the Player's Handbook alone — most subclasses, backgrounds, feats —
+// is written by GMs through the same custom routes the bot already has.
+const DND_STATS = ['str', 'dex', 'con', 'int', 'wis', 'cha'];
+const DND_LABELS = { str: 'STR', dex: 'DEX', con: 'CON', int: 'INT', wis: 'WIS', cha: 'CHA' };
+// The eighteen SRD skills, and the ability each one leans on.
+const DND_SKILLS = {
+  acrobatics: 'dex', 'animal handling': 'wis', arcana: 'int', athletics: 'str',
+  deception: 'cha', history: 'int', insight: 'wis', intimidation: 'cha',
+  investigation: 'int', medicine: 'wis', nature: 'int', perception: 'wis',
+  performance: 'cha', persuasion: 'cha', religion: 'int',
+  'sleight of hand': 'dex', stealth: 'dex', survival: 'wis',
+};
+
+const RULES_DND5E = {
+  id: 'dnd5e',
+  name: 'D&D 5e (SRD)',
+  stats: DND_STATS,
+  labels: DND_LABELS,
+  skills: DND_SKILLS,
+  // A score of 10 is average and adds nothing; every two points either way
+  // is a point of modifier.
+  modifier: (score) => Math.floor(((Number(score) || 10) - 10) / 2),
+  statBonus: (row, stat) => Math.floor(((Number(row?.[stat]) || 10) - 10) / 2),
+  // +2 at levels 1–4, and another point every four levels after.
+  profBonus: (row) => 2 + Math.floor((Math.max(1, Number(row?.level) || 1) - 1) / 4),
+  // Hit die plus CON modifier at first level, then the die's average
+  // (rounded up) plus the modifier for every level after.
+  hpStat: 'con',
+  maxHp: (row) => {
+    const lvl = Math.max(1, Number(row?.level) || 1);
+    const die = Number(row?.hit_die) || 8;
+    const con = Math.floor(((Number(row?.con) || 10) - 10) / 2);
+    return die + con + (lvl - 1) * (Math.floor(die / 2) + 1 + con);
+  },
+  // An attack is rolled against a number, not against another roll.
+  defence: 'ac',
+  // A statblock states its Armour Class; a character's comes from armour or
+  // from DEX. Never guess it from a stat that was written for other rules.
+  targetNumber: (row) => Number(row?.armour_class) || (10 + Math.floor(((Number(row?.dex) || 10) - 10) / 2)),
+  // What a monster adds to hit, and rolls for damage — straight off its
+  // statblock rather than out of a class and a level it doesn't have.
+  monsterAttack: (row) => (row?.attack_bonus == null ? null : Number(row.attack_bonus)),
+  monsterDamage: (row) => String(row?.damage_dice || '').trim() || null,
+  // Natural 20 always hits and always crits; natural 1 always misses.
+  resolveAttack: ({ nat, total, ac }) => {
+    if (nat === 20) return { hit: true, crit: true };
+    if (nat === 1) return { hit: false, crit: false };
+    return { hit: total >= ac, crit: false };
+  },
+  // Weapon dice plus the modifier; a crit rolls the dice twice and leaves
+  // the modifier alone.
+  weaponDamage: ({ dice = '1d8', mod = 0, crit = false, roll }) => {
+    const m = /^(\d*)d(\d+)$/i.exec(String(dice).trim());
+    if (!m) return { total: Math.max(0, mod), detail: `${mod}` };
+    const n = (parseInt(m[1]) || 1) * (crit ? 2 : 1);
+    const sides = parseInt(m[2]);
+    const rolls = [];
+    for (let i = 0; i < n; i++) rolls.push(roll ? roll(sides) : 1 + Math.floor(Math.random() * sides));
+    const sum = rolls.reduce((a, b) => a + b, 0);
+    return { total: Math.max(0, sum + mod), rolls,
+      detail: `${n}d${sides}${crit ? ' (crit)' : ''} [${rolls.join(', ')}]${mod ? (mod > 0 ? ` +${mod}` : ` ${mod}`) : ''}` };
+  },
+  // The same question the exchange asks Knightfall, answered the 5e way:
+  // the "defence roll" is the target's AC, a natural 20 always hits and
+  // crits, and damage is the weapon's dice plus the modifier.
+  damage: (atkRoll, atkNat, atkSides, defRoll, defNat, defSides, ctx = {}) => {
+    const { hit, crit } = RULES_DND5E.resolveAttack({ nat: atkNat, total: atkRoll, ac: defRoll });
+    if (!hit) return { hit, dmg: 0, crit: false, detail: null };
+    const d = RULES_DND5E.weaponDamage({ dice: ctx.weaponDice || '1d8', mod: ctx.mod || 0, crit, roll: ctx.roll });
+    return { hit, dmg: d.total, crit, detail: d.detail };
+  },
+  // How this character's magic works, or null if it doesn't.
+  caster: (row) => DND_CASTERS[row?.char_class] || null,
+  // The slots they have, as an array indexed from spell level 1. A half
+  // caster reads the full table at half their level and has nothing at
+  // first; a warlock's pact magic is its own small, sharp thing.
+  slots: (row) => {
+    const c = DND_CASTERS[row?.char_class];
+    if (!c) return [];
+    const lvl = Math.max(1, Number(row?.level) || 1);
+    if (c.kind === 'full') return DND_SLOTS_FULL[lvl - 1] || [];
+    if (c.kind === 'half') {
+      const eff = Math.floor(lvl / 2);
+      return eff < 1 ? [] : (DND_SLOTS_FULL[eff - 1] || []);
+    }
+    // Pact magic: a handful of slots, all at the same level, back on a short rest.
+    const n = lvl >= 17 ? 4 : lvl >= 11 ? 3 : lvl >= 2 ? 2 : 1;
+    const slotLevel = Math.min(5, Math.ceil(lvl / 2));
+    const out = [];
+    for (let i = 1; i < slotLevel; i++) out.push(0);
+    out.push(n);
+    return out;
+  },
+  // 8 + proficiency + the casting ability's modifier.
+  spellSaveDC: (row) => {
+    const c = DND_CASTERS[row?.char_class];
+    if (!c) return null;
+    return 8 + RULES_DND5E.profBonus(row) + RULES_DND5E.statBonus(row, c.ability);
+  },
+  // Proficiency + the casting ability's modifier.
+  spellAttack: (row) => {
+    const c = DND_CASTERS[row?.char_class];
+    if (!c) return null;
+    return RULES_DND5E.profBonus(row) + RULES_DND5E.statBonus(row, c.ability);
+  },
+  // How many spells a preparing caster may have ready: the ability modifier
+  // plus their level, or half their level for a paladin. Never fewer than one.
+  prepareCount: (row) => {
+    const c = DND_CASTERS[row?.char_class];
+    if (!c?.prepares) return null;
+    if (!RULES_DND5E.slots(row).length) return null;   // a paladin at first level has no magic yet
+    const lvl = Math.max(1, Number(row?.level) || 1);
+    const base = c.kind === 'half' ? Math.floor(lvl / 2) : lvl;
+    return Math.max(1, base + RULES_DND5E.statBonus(row, c.ability));
+  },
+  // A blow that lands on a concentrating caster: DC 10, or half the damage
+  // taken, whichever is the harder.
+  concentrationDC: (damage) => Math.max(10, Math.floor((Number(damage) || 0) / 2)),
+  // The SRD conditions. Each says what it does to the creature carrying it
+  // and to anyone swinging at them — which is most of how they matter.
+  conditions: {
+    blinded:      { self: 'dis', against: 'adv' },
+    charmed:      { self: null,  against: null },
+    deafened:     { self: null,  against: null },
+    frightened:   { self: 'dis', against: null },
+    grappled:     { self: null,  against: null },
+    incapacitated:{ self: null,  against: null },
+    invisible:    { self: 'adv', against: 'dis' },
+    paralyzed:    { self: 'dis', against: 'adv' },
+    petrified:    { self: 'dis', against: 'adv' },
+    poisoned:     { self: 'dis', against: null },
+    prone:        { self: 'dis', against: 'adv' },
+    restrained:   { self: 'dis', against: 'adv' },
+    stunned:      { self: 'dis', against: 'adv' },
+    unconscious:  { self: 'dis', against: 'adv' },
+    exhaustion:   { self: 'dis', against: null },
+  },
+  // A second swing at fifth level for those who fight for a living, a third
+  // and fourth for the Fighter alone.
+  attacksPerAction: (row) => {
+    const lvl = Math.max(1, Number(row?.level) || 1);
+    const cls = row?.char_class;
+    if (cls === 'Fighter') return lvl >= 20 ? 4 : lvl >= 11 ? 3 : lvl >= 5 ? 2 : 1;
+    if (['Barbarian', 'Paladin', 'Ranger', 'Monk'].includes(cls)) return lvl >= 5 ? 2 : 1;
+    return 1;
+  },
+  // Half against resistance, double against vulnerability, none at all
+  // against immunity — written on the sheet as "fire, cold" or "x2 fire".
+  applyResistance: (row, type, dmg) => {
+    if (!type) return { dmg, note: null };
+    const raw = String(row?.resist || '').toLowerCase();
+    if (!raw) return { dmg, note: null };
+    const t = String(type).toLowerCase();
+    if (new RegExp(`(^|,)\\s*immune\\s+${t}\\s*(,|$)`).test(raw)) return { dmg: 0, note: `immune to ${t}` };
+    if (new RegExp(`(^|,)\\s*x2\\s+${t}\\s*(,|$)`).test(raw)) return { dmg: dmg * 2, note: `vulnerable to ${t}` };
+    if (new RegExp(`(^|,)\\s*${t}\\s*(,|$)`).test(raw)) return { dmg: Math.floor(dmg / 2), note: `resists ${t}` };
+    return { dmg, note: null };
+  },
+  // Ten plus the skill's modifier — what a GM checks against without asking.
+  passive: (row, skill) => {
+    const ab = RULES_DND5E.skills[skill];
+    if (!ab) return null;
+    let prof = {};
+    try { prof = JSON.parse(row?.proficient || '{}') || {}; } catch {}
+    const trained = (prof.skills || []).includes(skill);
+    return 10 + RULES_DND5E.statBonus(row, ab) + (trained ? RULES_DND5E.profBonus(row) : 0);
+  },
+  // A cantrip's dice grow at 5th, 11th and 17th level.
+  cantripTier: (row) => {
+    const lvl = Math.max(1, Number(row?.level) || 1);
+    return lvl >= 17 ? 4 : lvl >= 11 ? 3 : lvl >= 5 ? 2 : 1;
+  },
+  // A character carries one hit die per level, spent on a short rest.
+  hitDiceTotal: (row) => Math.max(1, Number(row?.level) || 1),
+  // A long rest fills you and returns half your dice, rounded down, never
+  // less than one.
+  longRestDice: (row) => Math.max(1, Math.floor((Math.max(1, Number(row?.level) || 1)) / 2)),
+  // Nothing here is gated on a raw score; proficiency is the currency.
+  gates: {},
+  vocabulary: { currency: 'gold', standing: 'experience', rank: 'level' },
+};
+
+// The full caster's slots, level 1 to 20 — the SRD table, read straight.
+// Each row is how many slots of spell level 1–9 that character level has.
+const DND_SLOTS_FULL = [
+  [2], [3], [4, 2], [4, 3], [4, 3, 2], [4, 3, 3], [4, 3, 3, 1], [4, 3, 3, 2],
+  [4, 3, 3, 3, 1], [4, 3, 3, 3, 2], [4, 3, 3, 3, 2, 1], [4, 3, 3, 3, 2, 1],
+  [4, 3, 3, 3, 2, 1, 1], [4, 3, 3, 3, 2, 1, 1], [4, 3, 3, 3, 2, 1, 1, 1],
+  [4, 3, 3, 3, 2, 1, 1, 1], [4, 3, 3, 3, 2, 1, 1, 1, 1], [4, 3, 3, 3, 3, 1, 1, 1, 1],
+  [4, 3, 3, 3, 3, 2, 1, 1, 1], [4, 3, 3, 3, 3, 2, 2, 1, 1],
+];
+// Who casts how, and off which ability.
+const DND_CASTERS = {
+  Bard:     { kind: 'full', ability: 'cha', prepares: false },
+  Cleric:   { kind: 'full', ability: 'wis', prepares: true },
+  Druid:    { kind: 'full', ability: 'wis', prepares: true },
+  Sorcerer: { kind: 'full', ability: 'cha', prepares: false },
+  Wizard:   { kind: 'full', ability: 'int', prepares: true },
+  Paladin:  { kind: 'half', ability: 'cha', prepares: true },
+  Ranger:   { kind: 'half', ability: 'wis', prepares: false },
+  Warlock:  { kind: 'pact', ability: 'cha', prepares: false },
+};
+
+// The SRD's twelve classes and the die each one rolls for hit points.
+const DND_HIT_DICE = {
+  Barbarian: 12, Fighter: 10, Paladin: 10, Ranger: 10,
+  Bard: 8, Cleric: 8, Druid: 8, Monk: 8, Rogue: 8, Warlock: 8,
+  Sorcerer: 6, Wizard: 6,
+};
+
+const RULESETS = { knightfall: RULES_KNIGHTFALL, dnd5e: RULES_DND5E };
 
 // Which rules a server plays by. One answer today; the hook is here so a
 // second ruleset is a lookup rather than a rewrite.
@@ -10537,8 +11779,23 @@ function fightTotalStr(total, nat, sides) {
 
 // The damage model belongs to the ruleset; this stays as the one door every
 // resolution comes through.
-function resolveDamage(atkRoll, atkNat, atkSides, defRoll, defNat, defSides, gid = null) {
-  return rulesFor(gid).damage(atkRoll, atkNat, atkSides, defRoll, defNat, defSides);
+function resolveDamage(atkRoll, atkNat, atkSides, defRoll, defNat, defSides, gid = null, ctx = {}) {
+  return rulesFor(gid).damage(atkRoll, atkNat, atkSides, defRoll, defNat, defSides, ctx);
+}
+
+// What a fighter swings with, in dice. Knightfall has no weapon dice — its
+// damage is a ladder — so this only ever matters under a ruleset that asks.
+function weaponDiceFor(gid, row) {
+  // A monster swings what its statblock says; a character swings their weapon.
+  const m = String(row?.damage_dice || '').trim();
+  if (/^\d*d\d+([+-]\d+)?$/i.test(m)) return m.replace(/[+-]\d+$/, '') || '1d8';
+  const d = String(row?.weapon1dice || '').trim();
+  return /^\d*d\d+$/i.test(d) ? d : '1d8';
+}
+// The flat bonus riding on a monster's damage, e.g. the +2 of 1d8+2.
+function damageBonusFor(row) {
+  const m = /([+-]\d+)$/.exec(String(row?.damage_dice || '').trim());
+  return m ? parseInt(m[1]) : null;
 }
 
 // ── Carry-over combat effects (nat-1 attack / nat-20 defence) ─────────────────
@@ -12223,9 +13480,19 @@ async function resolveExchange(guild, gid, cid, fight) {
   const floor = fightFloor(fight);
   const W = fightWords(floor);
 
-  const { hit, dmg } = resolveDamage(
+  // Under a target-number ruleset the attacker's own weapon and modifier
+  // decide the damage, so they travel with the question.
+  const rulesX = rulesFor(gid);
+  let dmgCtx = {};
+  if (rulesX.defence === 'ac') {
+    const atkRow = isNpcFighter(attackerId) ? getNpc(gid, npcNameFromFighter(attackerId)) : getChar(gid, attackerId);
+    const flat = damageBonusFor(atkRow);
+    dmgCtx = { weaponDice: weaponDiceFor(gid, atkRow),
+               mod: flat != null ? flat : rulesX.statBonus(atkRow, fight.atk_stat || 'str') };
+  }
+  const { hit, dmg, crit: atkCrit, detail: dmgDetail } = resolveDamage(
     fight.atk_roll, fight.atk_nat, 20,
-    fight.def_roll, fight.def_nat, 20
+    fight.def_roll, fight.def_nat, 20, gid, dmgCtx
   );
 
   // Carry-over effects from this exchange (nat-1 attack, nat-20 defence), and
@@ -12278,9 +13545,40 @@ async function resolveExchange(guild, gid, cid, fight) {
     }
   }
 
+  if (hit && dmgDetail) lines.push(`🎲 Damage: ${dmgDetail}${atkCrit ? ' — **critical!**' : ''}`);
+
+  // A caster who takes a blow must hold their spell together.
+  if (hit && dmg && rulesX.concentrationDC && !isNpcFighter(defenderId)) {
+    const defRow = getChar(gid, defenderId);
+    if (defRow?.concentrating) {
+      lines.push(`🧠 <@${defenderId}> is concentrating on **${defRow.concentrating}** — **CON save, DC ${rulesX.concentrationDC(dmg)}** or it is lost.`);
+    }
+  }
+
+  let dealt = dmg;
+  if (hit && rulesX.applyResistance) {
+    // Resistance halves, vulnerability doubles, immunity spares entirely —
+    // and temporary hit points are spent before real ones.
+    const defRowR = isNpcFighter(defenderId) ? getNpc(gid, npcNameFromFighter(defenderId)) : getChar(gid, defenderId);
+    const atkRowR = isNpcFighter(attackerId) ? getNpc(gid, npcNameFromFighter(attackerId)) : getChar(gid, attackerId);
+    const type = atkRowR?.damage_type || null;
+    const res = rulesX.applyResistance(defRowR, type, dealt);
+    if (res.note) lines.push(`🛡️ ${defName} ${res.note} — ${dealt} becomes ${res.dmg}.`);
+    dealt = res.dmg;
+    const temp = Number(defRowR?.temp_hp) || 0;
+    if (temp > 0 && dealt > 0) {
+      const soaked = Math.min(temp, dealt);
+      dealt -= soaked;
+      const patchT = { temp_hp: temp - soaked };
+      if (isNpcFighter(defenderId)) upsertNpc(gid, npcNameFromFighter(defenderId), patchT);
+      else upsertChar(gid, defenderId, patchT);
+      lines.push(`🛡️ ${soaked} soaked by temporary hit points — ${temp - soaked} left.`);
+    }
+  }
+
   if (hit) {
     const prevHp = hpState[defenderId] ?? 0;
-    const newHp = applyFightDamage(prevHp, dmg, floor);
+    const newHp = applyFightDamage(prevHp, dealt, floor);
     hpState[defenderId] = newHp;
     setFighterHp(gid, defenderId, newHp);           // persist to character or NPC
     lines.push(`💥 **${atkName}** hits **${defName}** for **${dmg}** damage!`);
@@ -12531,7 +13829,19 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     }
     const actor = await resolveFighter(interaction.guild, gid, actorId);
     const targetF = await resolveFighter(interaction.guild, gid, targetId);
-    const statVal = flatSwing ? 0 : (actor.stats[stat] ?? 0);
+    // Under 5e a monster adds the bonus off its statblock, and a character
+    // adds their ability modifier plus proficiency — never the raw score.
+    const rulesAtk = rulesFor(gid);
+    let statVal;
+    if (flatSwing) statVal = 0;
+    else if (rulesAtk.defence === 'ac') {
+      const rowA = actor.isNpc ? getNpc(gid, actor.name) : getChar(gid, actorId);
+      const rowD = targetF?.isNpc ? getNpc(gid, targetF.name) : (targetId ? getChar(gid, targetId) : null);
+      mode = conditionMode(rulesAtk, rowA, rowD, mode);
+      const monster = rulesAtk.monsterAttack(rowA);
+      statVal = monster != null ? monster
+              : rulesAtk.statBonus(rowA, stat) + rulesAtk.profBonus(rowA);
+    } else statVal = (actor.stats[stat] ?? 0);
     // Consume a pending riposte bonus from a previous nat-20 defence.
     const atkBonus = flatSwing ? 0 : consumeAtkBonus(gid, cid, actorId);
     // Hero signature advantage (players and Hero NPCs alike)
@@ -12581,6 +13891,37 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
       ? (autoOn ? `🤖 **${targetF.name}** defends automatically...` : `🛡️ A GM defends for **${targetF.name}** with \`/fight def npc:${targetF.name}\`.`)
       : `🛡️ <@${targetId}> — \`/fight def stat:dex\`, or \`/roll dice:2d6 fight:true\` for a custom roll.`;
 
+    // In 5e nobody rolls to defend: the blow is measured against Armour
+    // Class. The AC takes the defence slot and the exchange resolves at once.
+    const rulesA = rulesFor(gid);
+    if (rulesA.defence === 'ac') {
+      const defRow = targetF.isNpc ? getNpc(gid, npcNameFromFighter(targetId)) : getChar(gid, targetId);
+      const ac = rulesA.targetNumber(defRow);
+      upsertFight(gid, cid, {
+        phase: 'defend', current_target: targetId,
+        atk_roll: total, atk_nat: nat, atk_stat: stat, atk_mode: mode, atk_sides: 20,
+        def_roll: ac, def_nat: 0, def_stat: 'ac', def_mode: 'normal',
+        atk_rerolled: 0, def_rerolled: 0,
+      });
+      // Those who fight for a living swing more than once, so the turn is
+      // held until the action is spent.
+      const rowSelf = actor.isNpc ? getNpc(gid, actor.name) : getChar(gid, actorId);
+      const allowed = actor.isNpc ? 1 : rulesA.attacksPerAction(rowSelf);
+      const usedSoFar = (Number(fight.atk_used) || 0) + 1;
+      const heldIndex = fight.turn_index;
+      const res = await resolveExchange(interaction.guild, gid, cid, getFight(gid, cid));
+      const head = `⚔️  **${actor.name}** strikes at **${targetF.name}** — ${fightTotalStr(total, nat, 20)} vs **AC ${ac}**`;
+      const extra = [];
+      const after = getFight(gid, cid);
+      if (usedSoFar < allowed && after?.state === 'active' && !res.ended) {
+        upsertFight(gid, cid, { turn_index: heldIndex, phase: 'attack', current_target: null, atk_used: usedSoFar });
+        extra.push(`⚔️ **Attack ${usedSoFar} of ${allowed}** — swing again.`);
+      } else {
+        upsertFight(gid, cid, { atk_used: 0 });
+      }
+      await interaction.reply({ content: [head, ...res.lines, ...extra].join('\n') });
+      return kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
+    }
     upsertFight(gid, cid, {
       phase: 'defend', current_target: targetId,
       atk_roll: total, atk_nat: nat, atk_stat: stat, atk_mode: mode, atk_sides: 20,
@@ -13491,7 +14832,8 @@ async function handleFight(interaction, forced) {
     const rrState = {};
     for (const fid of fighters) {
       const f = await resolveFighter(interaction.guild, gid, fid);
-      const dex = f.stats.dex ?? 0;
+      // Knightfall adds the score; 5e adds the modifier. The ruleset knows which.
+      const dex = rulesFor(gid).statBonus(f.stats, 'dex');
       const roll = rollDie(20);
       const total = roll + dex;
       mirrorAutoRoll(gid, cid, f.name, '1d20', roll, total, 'initiative');
@@ -14885,6 +16227,8 @@ async function handlePr(interaction) {
     return handleNpc(interaction);
   }
 
+  if (sub === 'create5e') return handleNpcCreate5e(interaction);
+
   if (sub === 'reroll') {
     const name     = interaction.options.getString('name');
     const rollType = interaction.options.getString('roll') ?? 'normal';
@@ -15329,19 +16673,30 @@ const HELP_CATEGORIES = {
     body: [
       '_Activities are minigames written for this server — branching scenes, rolls, choices and rewards. Renown is the currency they and quests pay out._',
       '`/activity run name:X player:@someone` — set an activity running for another player: their name on it, their buttons, their score. `/activity demo` takes `player:` too, so you can hand someone a quiz to sit (GM)',
+      'When a scene asks for a roll, type the stat word — `wis`, or `wis steady does it` to add flavour',
       '`/activity list` — every activity on this server · `/activity show name:X` — read one scene by scene',
       '`/activity run name:X` — start one in this channel · `/activity stop` — stop the one running here',
-      'When a scene asks for a roll, type the stat word — `wis`, or `wis steady does it` to add flavour',
       'A **Reroll** button sits on the scene card while a token remains — one second chance per roll',
       'Some scenes offer **choices** as buttons; some tally renown as you play and bank it at the end',
       '`/activity demo` — the built-in fishing tale, no stakes (GM)',
-      '`/quiz add category:Orders [tags:] [difficulty:] [explain:]` — write a question: a window opens for the question and up to four answers. Star the right one with `*`; one answer alone makes it a typed question (GM)',
-      '`/quiz start [category:] [tag:] [count:] [mode:] [pass:] [merit:] [player:] [pool:] [save:] [set:]` — draw a quiz from the bank: it shuffles the questions and the answers, and can be handed to a player to sit (GM)',
-      '↳ `pool:` decides what they may be asked — fresh first (the default), only ones new to them, any at all, or revision: only the ones they got wrong before. `save:` remembers the draw; `set:` runs it again.',
-      '`/quiz list` · `/quiz show id:` · `/quiz remove id:` — read the bank, one question, or delete one (GM)',
-      '`/config channels quizforum channel:#forum` — where the bank is posted to read: a thread per category (Admin)',
-      '_Quizzes:_ a scene with `ASK` waits for a typed answer, or put a `*` before the right option in a `CHOICE` block for multiple choice. `RIGHT ->` / `WRONG ->` route typed answers.',
-      '↳ `QUIZ tally` at the top lets every answer carry on and reads the score out at the end; `QUIZ retry` sends a wrong answer back to the same question. `/activity demo which:Kalidale Lore` is a five-question example.',
+      '_In 5e, an attack is measured against the target\'s Armour Class — nobody rolls to defend, and the blow resolves at once. A natural 20 always hits and rolls the weapon dice twice; a natural 1 always misses._',
+      '`/library srd` · `/library summon name: [count:] [as:]` — keep monsters and spells once, then bring one out as an NPC ready to fight. The SRD set ships with the bot (GM)',
+      '`/library import file: | paste:` · `/library list` · `/library show` · `/library forget` — read in your own: one entry a line, `[MONSTER] Goblin | ac 15 | hp 7 | attack +4 | damage 1d6+2` (GM)',
+      '`/npc create5e name: ac: hp: attack: damage:` — a monster from its statblock; it then fights by its own numbers (GM, 5e)',
+      '`/npc create5e name: ac: hp: attack: damage:` — a monster from its statblock: it fights with its own attack bonus and damage dice (GM, 5e)',
+      '`/dnd condition [add:] [remove:] [clear:] [user:] [npc:]` — the fifteen SRD conditions; they bend the dice on their own, and one of each cancels out (5e)',
+      '`/dnd deathsave` · `/dnd temphp amount:` · `/dnd inspiration [grant:] [use:]` — dying, temporary hit points, and inspiration (5e)',
+      '_Damage types are honoured where a sheet declares them — write `fire, immune poison, x2 acid` and a blow is halved, spared or doubled. A Fighter swings twice from level 5, and the turn is held until the action is spent._',
+      '`/dnd deathsave` — at nought hit points: ten or better is a success, three either way decides it, and a natural twenty brings you back on one (5e)',
+      '`/roll save:dex` · `/roll skill:stealth` — a saving throw or a skill check: the ability modifier, plus proficiency when you have it. All eighteen skills offer a dropdown (5e)',
+      '`/dnd weapondice slot:1 dice:1d12` — what your weapon rolls for damage; without it an attack uses 1d8 (5e)',
+      '`/spell prepare [add:] [drop:] [clear:true]` — the spells you have ready, capped at what your class may hold (5e)',
+      '`/spell slots` · `/spell cast level:3 [name:] [concentration:true]` · `/spell concentration [drop:true]` — your magic: what is left, spending it, and what you are holding together (5e)',
+      '_Slots follow from your class and level. A long rest returns them all; a warlock\'s pact magic returns on a short one. A blow that lands on a caster asks for a CON save — DC 10, or half the damage, whichever is harder._',
+      '`/dnd levelup [user:] [to:]` — gain a level: hit points arrive full, a hit die is added, and proficiency rises when due (5e)',
+      '_In 5e you carry one hit die per level. `!srest` spends one — roll it, add your CON modifier, heal that much. `!lrest` fills you and hands back half your dice._',
+      '`/dnd create name: str: dex: con: int: wis: cha: [class:] [level:] [ac:] [saves:] [skills:]` — make a D&D 5e character. Modifiers, proficiency and hit points are all worked out for you (5e servers only)',
+      '`/config channels ruleset system:` — which rules this server plays by: Knightfall, or D&D 5e by the SRD. Set it before anyone makes a character — it refuses to change once sheets exist (Admin)',
       '`/activity create` — write one: a paste window opens (or attach a `.txt` with `file:` for long scripts). Pasting an `[ACTIVITY]` script straight into chat works too — every route is validated before anything is stored (GM)',
       '`/activity set name:X scene:Y field:Z value:...` — tweak one line of one scene without re-pasting (GM)',
       '`/activity delete name:X` — remove an activity (GM)',
@@ -15349,6 +16704,22 @@ const HELP_CATEGORIES = {
       '`/standing renown add/remove/set` — adjust a balance, with a reason (GM)',
     ],
   },
+
+  quizzes: {
+    title: '📝 Quizzes & the Question Bank',
+    blurb: 'a bank of questions, and quizzes drawn from it',
+    body: [
+      '_Ask questions and mark the answers — built on the activity engine, so buttons, scoring and handing a run to a player all come from there._',
+      '`/quiz add category:Orders [tags:] [difficulty:] [explain:]` — write a question: a window opens for the question and up to four answers. Star the right one with `*`; one answer alone makes it a typed question (GM)',
+      '`/quiz start [category:] [tag:] [count:] [mode:] [pass:] [merit:] [player:] [pool:] [save:] [set:]` — draw a quiz from the bank: it shuffles the questions and the answers, and can be handed to a player to sit (GM)',
+      '↳ `pool:` decides what they may be asked — fresh first (the default), only ones new to them, any at all, or revision: only the ones they got wrong before. `save:` remembers the draw; `set:` runs it again.',
+      '`/quiz list` · `/quiz show id:` · `/quiz remove id:` — read the bank, one question, or delete one (GM)',
+      '`/config channels quizforum channel:#forum` — where the bank is posted to read: a thread per category (Admin)',
+      '_Quizzes:_ a scene with `ASK` waits for a typed answer, or put a `*` before the right option in a `CHOICE` block for multiple choice. `RIGHT ->` / `WRONG ->` route typed answers.',
+      '↳ `QUIZ tally` at the top lets every answer carry on and reads the score out at the end; `QUIZ retry` sends a wrong answer back to the same question. `/activity demo which:Kalidale Lore` is a five-question example.',
+    ],
+  },
+
   progression: {
     title: '🎖️ Merits & Ranks',
     blurb: 'lifetime honour, trades, and the ranks above',
@@ -16158,6 +17529,10 @@ async function handleGmHeal(interaction) {
 async function handleRollSlash(interaction) {
   const gid = interaction.guild.id, uid = interaction.user.id;
   const cid = interactionChannelId(interaction);
+  // A saving throw or a skill check, under a ruleset that has them.
+  const saveOf = interaction.options.getString('save');
+  const skillOf = interaction.options.getString('skill');
+  if (saveOf || skillOf) return handle5eCheck(interaction, { saveOf, skillOf });
   // last:true is a pure read — show the most recent roll, touch nothing.
   if (interaction.options.getBoolean('last')) return handleLastRoll(interaction);
   // The fight bridge: an ability picked here rides the exact /fight machinery.
