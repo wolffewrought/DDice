@@ -664,6 +664,14 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS npc_category_threads (
 // thread names, so a GM looking for a face looks in the same place they look
 // for the statblock. Kept in its own table because a category has a thread in
 // each forum and they are not the same thread.
+// One row per migrated face: which message in which thread now hosts it.
+// The migration is idempotent by this record — a live post is kept, a
+// re-homed NPC's post is moved, a hand-deleted one is replaced.
+try { db.exec(`CREATE TABLE IF NOT EXISTS npc_portrait_posts (
+  guild_id TEXT NOT NULL, npc_name TEXT NOT NULL,
+  thread_id TEXT, message_id TEXT, at INTEGER,
+  PRIMARY KEY (guild_id, npc_name)
+)`); } catch (e) { console.error('npc_portrait_posts schema', e); }
 try { db.exec(`CREATE TABLE IF NOT EXISTS npc_portrait_threads (
   guild_id TEXT NOT NULL, category TEXT NOT NULL,
   thread_id TEXT, at INTEGER,
@@ -5202,7 +5210,8 @@ const slashCommands = [
       .addBooleanOption(o=>o.setName('run').setDescription('true = build anything missing — new books and tags after an update').setRequired(false))
       .addBooleanOption(o=>o.setName('build').setDescription('true = make every channel and forum the bot needs, then fill them').setRequired(false))
       .addBooleanOption(o=>o.setName('restart').setDescription('true = DELETE every channel the bot set up, then build fresh. Asks first.').setRequired(false))
-      .addBooleanOption(o=>o.setName('order').setDescription('true = re-apply the sidebar order and show the raw positions Discord kept').setRequired(false)))
+      .addBooleanOption(o=>o.setName('order').setDescription('true = re-apply the sidebar order and show the raw positions Discord kept').setRequired(false))
+      .addBooleanOption(o=>o.setName('portraits').setDescription('true = move every stored NPC face into its category thread in the portrait forum').setRequired(false)))
     .addSubcommand(s=>s.setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)')
       .addAttachmentOption(o=>o.setName('file').setDescription('A scroll PDF made by /gm scroll — I read it back as text and a fresh copy in this server\'s font').setRequired(false)))
     .addSubcommand(s=>s.setName('dicereport').setDescription('The server\'s dice health — who rolls, how the d20s run, the hot and cold hands (GM)'))
@@ -8008,8 +8017,20 @@ async function handleConfig(interaction, forced) {
   }
   if (sub === 'npcchannel') {
     const chan = (forced?.channel ?? interaction.options?.getChannel?.('channel'));
-    if (!chan?.isTextBased?.()) return interaction.reply({ content: '❌ Pick a text channel.', ephemeral: true });
+    // A forum is the intended shape now — a thread per category, mirroring
+    // the pages forum — but a plain text channel still works the old flat
+    // way. isTextBased() is false for forums, which is how the old guard
+    // ended up rejecting the very channel the rest of the code expects.
+    const isForum = chan?.type === 15;
+    if (!isForum && !chan?.isTextBased?.()) {
+      return interaction.reply({ content: '❌ Pick a forum (a thread per category) or a text channel (flat).', ephemeral: true });
+    }
     setConfig(gid, { npc_channel_id: chan.id });
+    if (isForum) {
+      await interaction.deferReply();
+      const made = await ensurePortraitThreads(interaction.client, gid).catch(() => 0);
+      return interaction.editReply({ content: `✅ NPC portrait forum set to <#${chan.id}> —${made ? ` **${made}** category thread${made === 1 ? '' : 's'} ready.` : ' threads will open as categories are made.'}\nPost a picture in a category's thread with the NPC's name as the caption to give them their face.` });
+    }
     return interaction.reply({ content: `✅ NPC image channel set to <#${chan.id}> (id \`${chan.id}\`).\nUpload an image there with the NPC's name as the message text to set their avatar.\n⚠️ I need **View Channel**, **Send Messages** and **Read Message History** there.`, ephemeral: true });
   }
 
@@ -10897,6 +10918,7 @@ async function runGmRollSlash(interaction) {
 async function handleCheck(interaction) {
   // `run:true` builds whatever the code knows about and this server hasn't
   // got yet — the one switch to pull after an update adds a book.
+  if (interaction.options?.getBoolean?.('portraits')) return runPortraitMigration(interaction);
   if (interaction.options?.getBoolean?.('order')) return runOrderReport(interaction);
   if (interaction.options?.getBoolean?.('restart')) return runFullRestart(interaction);
   if (interaction.options?.getBoolean?.('build')) return runFullSetup(interaction);
@@ -18880,6 +18902,142 @@ async function sweepQuestChannels(client, gid, quest) {
 // position sequences per channel type and merges them by raw value (every
 // edit lands, and the raw table shows text and forum numbering running
 // independently).
+// /gm check portraits:true — move every stored NPC face into its category
+// thread in the portrait forum, and make the forum the canonical host.
+//
+// The stored URLs point at attachments in whatever channel they were
+// uploaded to, and Discord signs attachment URLs with an expiry now — so a
+// face set months ago can 404 on a direct fetch while the message it rides
+// still exists. Recovery is therefore tiered: the stored URL first; failing
+// that, walk the source channel's history for the attachment id and take
+// the fresh signed URL the API hands back; only when both fail is the NPC
+// reported lost. Order faces are deliberately NOT migrated — they are the
+// shared portraits each coloured order wears, not gallery entries — but the
+// verdict accounts for them, because "safe to delete" would otherwise blank
+// every generic Knight the moment the old channel went.
+async function runPortraitMigration(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id))) {
+    return interaction.reply({ content: '\u274c The portrait migration is for GMs.', ephemeral: true });
+  }
+  const bankId = getConfig(gid)?.npc_channel_id;
+  const forum = bankId ? await interaction.client.channels.fetch(bankId).catch(() => null) : null;
+  if (!forum || forum.type !== 15) {
+    return interaction.reply({ ephemeral: true, content:
+      '\u274c The portrait bank is not a forum yet \u2014 `/config channels npcchannel channel:#npc-portraits` first.' });
+  }
+  await interaction.deferReply();
+  await ensurePortraitThreads(interaction.client, gid).catch(() => 0);
+
+  const { AttachmentBuilder } = require('discord.js');
+  const threadFor = (name) => {
+    try {
+      return db.prepare('SELECT thread_id FROM npc_portrait_threads WHERE guild_id=? AND category=?')
+        .get(gid, npcHomeCategory(gid, name))?.thread_id || null;
+    } catch { return null; }
+  };
+  const parseAttachment = (url) => {
+    const m = /\/attachments\/(\d+)\/(\d+)\/([^?]+)/.exec(url || '');
+    return m ? { channelId: m[1], attachmentId: m[2], filename: m[3] } : null;
+  };
+  const download = async (url) => {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      return Buffer.from(await res.arrayBuffer());
+    } catch { return null; }
+  };
+  // The stored link is dead but the message may not be: walk the source
+  // channel for the attachment id and take the freshly signed URL.
+  const recover = async (parsed) => {
+    if (!parsed) return null;
+    const src = await interaction.client.channels.fetch(parsed.channelId).catch(() => null);
+    if (!src?.messages?.fetch) return null;
+    let before;
+    for (let page = 0; page < 10; page++) {
+      const batch = await src.messages.fetch({ limit: 100, ...(before ? { before } : {}) }).catch(() => null);
+      if (!batch?.size) return null;
+      for (const msg of batch.values()) {
+        const att = msg.attachments.find(a => a.id === parsed.attachmentId);
+        if (att) return await download(att.url);
+      }
+      before = batch.last().id;
+    }
+    return null;
+  };
+
+  let migrated = 0, kept = 0, recovered = 0;
+  const lost = [];
+  const npcs = getAllNpcs(gid).filter(n => n.image_url);
+  let done = 0;
+  for (const npc of npcs) {
+    done++;
+    if (done % 10 === 0) await interaction.editReply({ content: `\ud83d\uddbc\ufe0f Migrating portraits\u2026 ${done}/${npcs.length}` }).catch(() => {});
+    const threadId = threadFor(npc.name);
+    const thread = threadId ? await interaction.client.channels.fetch(threadId).catch(() => null) : null;
+    if (!thread?.isThread?.()) { lost.push(npc.name); continue; }
+
+    let row = null;
+    try { row = db.prepare('SELECT * FROM npc_portrait_posts WHERE guild_id=? AND npc_name=?').get(gid, npc.name); } catch {}
+    if (row?.message_id) {
+      if (row.thread_id === thread.id && (npc.image_url || '').includes(`/${row.thread_id}/`)) {
+        const alive = await thread.messages.fetch(row.message_id).catch(() => null);
+        if (alive) { kept++; continue; }
+      } else if (row.thread_id !== thread.id) {
+        // Re-homed since the last run: the old entry comes down first.
+        const oldTh = await interaction.client.channels.fetch(row.thread_id).catch(() => null);
+        if (oldTh?.isThread?.()) {
+          const m = await oldTh.messages.fetch(row.message_id).catch(() => null);
+          if (m) await m.delete().catch(() => {});
+        }
+      }
+    }
+
+    const parsed = parseAttachment(npc.image_url);
+    let bytes = await download(npc.image_url);
+    let viaHistory = false;
+    if (!bytes) { bytes = await recover(parsed); viaHistory = !!bytes; }
+    if (!bytes) { lost.push(npc.name); continue; }
+
+    await wakeThread(thread);
+    const file = new AttachmentBuilder(bytes, { name: parsed?.filename || `${npc.name.replace(/[^\w.-]+/g, '_')}.png` });
+    const posted = await thread.send({ content: npc.name, files: [file], allowedMentions: { parse: [] } }).catch(() => null);
+    if (!posted) { lost.push(npc.name); continue; }
+    const newUrl = posted.attachments.first()?.url || null;
+    if (newUrl) {
+      setNpcImage(gid, npc.name, newUrl);
+      setNpcWebhook(gid, npc.name, null, null);
+      clearNpcWebhooks(gid, npc.name);
+    }
+    try {
+      db.prepare(`INSERT INTO npc_portrait_posts (guild_id, npc_name, thread_id, message_id, at) VALUES (?,?,?,?,?)
+                  ON CONFLICT(guild_id, npc_name) DO UPDATE SET thread_id=excluded.thread_id, message_id=excluded.message_id, at=excluded.at`)
+        .run(gid, npc.name, thread.id, posted.id, Date.now());
+    } catch {}
+    viaHistory ? recovered++ : migrated++;
+  }
+
+  // Order faces stay where they are, by design. Say whether they still lean
+  // on somewhere outside the forum, because that is what decides whether the
+  // old channel can go.
+  let leaning = [];
+  try {
+    const threads = new Set(db.prepare('SELECT thread_id FROM npc_portrait_threads WHERE guild_id=?').all(gid).map(r => r.thread_id));
+    leaning = db.prepare('SELECT prefix, image_url FROM npc_orders WHERE guild_id=?').all(gid)
+      .filter(r => { const pa = parseAttachment(r.image_url); return pa && !threads.has(pa.channelId); })
+      .map(r => r.prefix);
+  } catch {}
+
+  const lines = [`\ud83d\uddbc\ufe0f **Portrait migration** \u2014 ${npcs.length} face${npcs.length === 1 ? '' : 's'} checked`,
+    `\u2705 Moved **${migrated}** \u00b7 recovered from history **${recovered}** \u00b7 already in place **${kept}**`];
+  if (lost.length) lines.push(`\u274c Lost **${lost.length}**: ${lost.slice(0, 10).map(n => `**${n}**`).join(', ')}${lost.length > 10 ? ` and ${lost.length - 10} more` : ''} \u2014 re-upload each in their category thread, caption = their name.`);
+  if (leaning.length) lines.push(`\ud83d\udee1\ufe0f Order faces still point outside the forum: ${leaning.map(x => `**${x}**`).join(', ')} \u2014 re-upload each as \`Order | Name\` in the forum before deleting the old channel.`);
+  lines.push('', (!lost.length && !leaning.length)
+    ? '\ud83e\uddf9 Nothing points at the old channel any more \u2014 it is safe to delete.'
+    : '\u26a0\ufe0f The old channel is still load-bearing \u2014 keep it until the lines above are clear.');
+  return interaction.editReply({ content: lines.join('\n').slice(0, 1990) });
+}
+
 // /gm check order:true — the diagnostic. Re-applies the plan and prints the
 // evidence: wanted slot, type, raw position before and after, and each
 // category's raw sequences split by type. One screenshot of this settles

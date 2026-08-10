@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 642 assertions passed and no scanner found an ERROR.
+Green means 650 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 642 assertions covering structure, registration and ruleset
+now is 650 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -213,9 +213,13 @@ table — a category has a thread in each forum and they are not the same
 thread — and `ensureCategoryThread` picks between them on a `kind` argument
 resolved through the `NPC_THREAD_TABLES` whitelist, never from user input.
 
-`ensurePortraitThreads` runs on `/npc categorycreate`, so a category's thread
-exists in both forums before any NPC is in it, and again inside
-`rebuildNpcForum`.
+`ensurePortraitThreads` runs on `/npc categorycreate`, inside
+`rebuildNpcForum`, and on `/config channels npcchannel` when it is pointed at
+a forum — the manual set lays the threads out on the spot. That handler
+accepts a forum or a plain text channel; `isTextBased()` is false for forums,
+and the original text-only guard shipped a full day rejecting the intended
+channel while `build:true` wrote the same config without complaint. If a
+config subcommand's channel guard predates a type conversion, check it.
 
 Three things to know if you touch the upload path:
 
@@ -297,6 +301,28 @@ configured — the repo that ships all six books at its root — so the two PDF
 channels fill themselves within the half hour instead of sitting empty until
 someone finds `/config channels docs`. The watcher fires 30s after boot and
 every 15 minutes; a fork overrides with `/config channels docs repo:`.
+
+### Portrait migration — `/gm check portraits:true`
+
+Moves every stored NPC face into its category thread in the portrait forum
+and repoints the NPC row at the re-hosted copy, making the forum the
+canonical host. Discord signs attachment URLs with an expiry now, so
+recovery is tiered: stored URL first; failing that, walk the source
+channel's history for the attachment id and take the freshly signed URL;
+only when both fail is the NPC named on the lost list. Idempotent by
+`npc_portrait_posts` — live posts kept, re-homed NPCs moved, hand-deleted
+posts replaced. Reads the old channel, never writes to it.
+
+**Order faces are deliberately not migrated** — `npc_orders` holds the
+shared portrait each coloured order wears, not gallery entries. The verdict
+therefore checks them: "safe to delete the old channel" is only said when
+the lost list is empty AND no order face points outside the forum;
+otherwise the channel is called load-bearing and the leaning prefixes are
+named (re-upload each as `Order | Name` in the forum to free it).
+
+The `/gm` budget margin pin moved 5400 → 6000 when this option landed
+(5482/8000). Next trip of that line, fold `/gm check`'s options into a
+group instead of moving the line again.
 
 ### Live-fire: `/gm test forum`
 
