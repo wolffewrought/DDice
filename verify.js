@@ -1200,6 +1200,16 @@ function testPins(src) {
       /UPDATE \$\{table\} SET category=\? WHERE guild_id=\? AND category=\?/.test(src));
     ok('categoryrename refuses a name already in use',
       /merging categories is a different thing/.test(src));
+    // The sidebar is enforced, not suggested: one batched setPositions in
+    // plan order per category, re-parenting adopted strays as it goes.
+    // Without this, any channel adopted by name keeps its old position and
+    // the plan only governs fresh creates.
+    ok('setup orders the sidebar to the plan',
+      /const moves = sidebar\.filter\(x => x\.id\)\.map/.test(src) &&
+      /await guild\.channels\.setPositions\(moves\)/.test(src));
+    ok('re-parenting never rewrites channel overwrites',
+      /parent: x\.cat, lockPermissions: false/.test(src));
+
     // Restart is the most destructive thing the bot can do, so each of its
     // four guards is pinned: the confirm (no accidental press-through), the
     // doomed-channel refusal (or the report dies with its own channel), the

@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 637 assertions passed and no scanner found an ERROR.
+Green means 639 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 637 assertions covering structure, registration and ruleset
+now is 639 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -263,6 +263,17 @@ instead of adopting ghost ids; and it wipes the derived maps (`npc_pages`,
 both category-thread tables, `char_pages`, `npc_webhooks`) and nulls
 per-quest thread references so nothing edits deleted threads. Quests,
 sheets, rolls and history all stay.
+
+### Sidebar order is enforced
+
+`buildAllSetup` ends with one batched `setPositions`: every configured
+channel takes its plan-order slot within its category, and adopted strays
+are re-parented into the right category as they do. `lockPermissions` stays
+false — re-parenting must never rewrite a channel's own overwrites. This
+exists because adoption-by-name kept old positions, so on any server with
+history the plan order was a suggestion. `run:true` (the light repair)
+deliberately does not touch positions, so a hand-arranged sidebar survives
+it; `build:true` and `restart:true` both enforce.
 
 ### PDF source auto-seeded
 

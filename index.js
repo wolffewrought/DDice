@@ -18981,14 +18981,33 @@ async function buildAllSetup(interaction) {
   const open = { made: [], adopted: [], kept: [] };
   const gm = { made: [], adopted: [], kept: [] };
   const failed = [];
+  const sidebar = [];   // plan order IS the sidebar order, per category
   for (const plan of SETUP_PLAN) {
     try {
       const r = await setupOneChannel(guild, gid, plan, plan.gm ? gmCat : openCat);
       (plan.gm ? gm : open)[r.state].push(`<#${r.id}>`);
+      sidebar.push({ id: r.id, gm: plan.gm, cat: (plan.gm ? gmCat : openCat)?.id ?? null });
     } catch (err) {
       failed.push(`${plan.name} — ${err?.message || err}`);
     }
   }
+  // The sidebar follows the plan, adopted channels included. Creation order
+  // only ever covered channels made this run; anything adopted by name kept
+  // whatever position it already had, so on a server with history the plan
+  // was a suggestion. One batched call fixes both position and parent —
+  // adopted strays are pulled into their category as they take their slot.
+  // lockPermissions stays false: re-parenting must not rewrite a channel's
+  // own overwrites. run:true, the light repair, deliberately leaves
+  // positions alone so a hand-arranged sidebar survives it.
+  try {
+    let po = 0, pg = 0;
+    const moves = sidebar.filter(x => x.id).map(x => ({
+      channel: x.id, position: x.gm ? pg++ : po++,
+      ...(x.cat ? { parent: x.cat, lockPermissions: false } : {}),
+    }));
+    if (moves.length) await guild.channels.setPositions(moves);
+  } catch (err) { console.error('[setup] sidebar order -', err?.message || err); }
+
   const made = [...open.made, ...gm.made];
   const adopted = [...open.adopted, ...gm.adopted];
   const kept = [...open.kept, ...gm.kept];
