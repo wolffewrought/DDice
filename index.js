@@ -652,6 +652,14 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS npc_pages (
   thread_id TEXT, message_id TEXT, at INTEGER,
   PRIMARY KEY (guild_id, name)
 )`); } catch (e) { console.error('npc_pages schema', e); }
+// One thread per category, holding every NPC in it as a message. npc_pages
+// keeps its (guild_id, name) key: thread_id now points at the category
+// thread and message_id at that NPC's own message inside it.
+try { db.exec(`CREATE TABLE IF NOT EXISTS npc_category_threads (
+  guild_id TEXT NOT NULL, category TEXT NOT NULL,
+  thread_id TEXT, at INTEGER,
+  PRIMARY KEY (guild_id, category)
+)`); } catch (e) { console.error('npc_category_threads schema', e); }
 try { db.exec(`CREATE TABLE IF NOT EXISTS dc_drafts (
   guild_id TEXT NOT NULL, token TEXT NOT NULL, ids TEXT, npcs TEXT, reveal TEXT,
   created_at INTEGER NOT NULL, PRIMARY KEY (guild_id, token)
@@ -3027,14 +3035,17 @@ function upsertNpc(gid, name, fields) {
 }
 function deleteNpc(gid, name) {
   purgeSubjectRecords(gid, npcFighterId(name));
-  // Their page goes with them — an NPC that no longer exists should not
-  // still have a thread standing open in the forum.
+  // Their entry goes with them. The category thread stays: it belongs to the
+  // category, not to any one NPC, and other NPCs are still in it.
   (async () => {
     try {
-      const row = db.prepare('SELECT thread_id FROM npc_pages WHERE guild_id=? AND name=?').get(gid, name);
-      if (row?.thread_id) {
+      const row = db.prepare('SELECT thread_id, message_id FROM npc_pages WHERE guild_id=? AND name=?').get(gid, name);
+      if (row?.thread_id && row?.message_id) {
         const th = await client.channels.fetch(row.thread_id).catch(() => null);
-        if (th?.isThread?.()) await th.delete('NPC deleted');
+        if (th?.isThread?.()) {
+          const msg = await th.messages.fetch(row.message_id).catch(() => null);
+          if (msg) await msg.delete().catch(() => {});
+        }
       }
       db.prepare('DELETE FROM npc_pages WHERE guild_id=? AND name=?').run(gid, name);
     } catch (err) { console.error('[npcforum] page sweep -', err?.message || err); }
@@ -3291,6 +3302,17 @@ function npcPageRows(pg) {
 
 function getCategoriesForNpc(gid, npcName) {
   return db.prepare('SELECT category FROM npc_category_members WHERE guild_id=? AND npc_name=? ORDER BY category').all(gid, npcName).map(r=>r.category);
+}
+// Which thread an NPC lives in. A message can only sit in one place, so an
+// NPC in several categories folds into the one they were given first —
+// insertion order, not alphabetical, because "designate them an enemy" is a
+// decision and the others are additions to it. Every category they hold
+// still shows on their page.
+const NPC_NO_CATEGORY = 'Uncategorised';
+function npcHomeCategory(gid, npcName) {
+  const row = db.prepare('SELECT category FROM npc_category_members WHERE guild_id=? AND npc_name=? ORDER BY rowid LIMIT 1')
+    .get(gid, npcName);
+  return row?.category || NPC_NO_CATEGORY;
 }
 function getUncategorisedNpcs(gid) {
   const all = getAllNpcs(gid).map(n=>n.name);
@@ -3828,25 +3850,27 @@ function chunkLines(content, limit = 1900) {
   return chunks;
 }
 
-async function sendLong(channel, content) {
-  if (!channel) return;
-  for (const c of chunkLines(content)) await channel.send(c).catch(()=>{});
+// Chunked delivery to any channel or user — the career summary and long
+// sheets overflow one message. Files ride the last chunk so nothing arrives
+// after the attachment.
+//
+// Delivery is best-effort: a missing target is a no-op and a failed send is
+// logged, not thrown. Every caller is a broadcast — a quest board post, an
+// archive copy, a DM notice — and none of them should take down the
+// interaction that triggered them because one channel lost its permissions.
+async function sendLong(target, content, { files = null, ...opts } = {}) {
+  if (!target) return;
+  const chunks = chunkLines(content);
+  for (let i = 0; i < chunks.length; i++) {
+    await target.send({ content: chunks[i], ...(i === chunks.length - 1 && files ? { files } : {}), ...opts })
+      .catch(e => console.error('[sendLong] delivery failed -', e?.message || e));
+  }
 }
 
 // Reply with content that may exceed Discord's 2000-char hard limit. Splits on
 // line boundaries so long lists (quest board, npc list, recaps) never fail
 // silently. First chunk is the reply; the rest are follow-ups. Pass an array of
 // lines OR a pre-joined string.
-// Chunked delivery to any channel or user — the career summary and long
-// sheets overflow one message. Files ride the last chunk so nothing arrives
-// after the attachment.
-async function sendLong(target, content, { files = null, ...opts } = {}) {
-  const chunks = chunkLines(content);
-  for (let i = 0; i < chunks.length; i++) {
-    await target.send({ content: chunks[i], ...(i === chunks.length - 1 && files ? { files } : {}), ...opts });
-  }
-}
-
 async function replyLong(interaction, content, opts = {}) {
   const LIMIT = 1900; // headroom under 2000 for safety
   const text = Array.isArray(content) ? content.join('\n') : String(content);
@@ -7480,14 +7504,20 @@ async function handleConfig(interaction, forced) {
     if (!channel) {
       const cur = getConfig(gid)?.npc_forum;
       return interaction.reply({ ephemeral: true, content: cur
-        ? `🎭 Each NPC has a page in <#${cur}>, tagged with their categories.`
-        : '🎭 No NPC forum set. `/config channels npcforum channel:#your-forum` gives every NPC a page you can filter by category.' });
+        ? `🎭 NPCs live in <#${cur}> — one thread per category, an entry apiece inside it.`
+        : '🎭 No NPC forum set. `/config channels npcforum channel:#your-forum` gives every category a thread, with its NPCs inside.' });
     }
     if (channel.type !== 15) {
       return interaction.reply({ ephemeral: true, content: `❌ <#${channel.id}> is not a forum channel. Make a **Forum** — each NPC gets a thread there, tagged with their categories.` });
     }
     setConfig(gid, { npc_forum: channel.id });
-    await interaction.reply({ content: `🎭 NPC pages now live in <#${channel.id}> — a thread apiece, tagged by category. \`/npc sync\` writes up everyone already made.` });
+    await interaction.deferReply();
+    const laid = await rebuildNpcForum(client, gid).catch(() => ({ written: 0, closed: 0 }));
+    await interaction.editReply({ content:
+      `🎭 NPC pages now live in <#${channel.id}> — one thread per category, every NPC an entry inside it.`
+      + (laid.written ? `\nWrote up **${laid.written}** NPC${laid.written === 1 ? '' : 's'}.` : '')
+      + (laid.closed ? ` Closed **${laid.closed}** old per-NPC thread${laid.closed === 1 ? '' : 's'}.` : '')
+      + (laid.written ? '' : ' `/npc sync` writes them up once there are some.') });
     return;
   }
 
@@ -10071,7 +10101,36 @@ function npcPageBody(gid, npc) {
   return lines.join('\n').slice(0, 1990);
 }
 
-// Make the page, or bring it up to date. Best-effort throughout: an NPC is
+// The thread for one category, made if it is not there yet. The category is
+// the thread's name and its applied tag, so the forum's own filter and the
+// thread list say the same thing.
+async function ensureCategoryThread(client, forum, gid, category, tagMap) {
+  let row = null;
+  try { row = db.prepare('SELECT thread_id FROM npc_category_threads WHERE guild_id=? AND category=?').get(gid, category); } catch {}
+  if (row?.thread_id) {
+    const th = await client.channels.fetch(row.thread_id).catch(() => null);
+    if (th?.isThread?.() && th.parentId === forum.id) { await wakeThread(th); return th; }
+    // Deleted by hand — forget it and make another.
+    try { db.prepare('DELETE FROM npc_category_threads WHERE guild_id=? AND category=?').run(gid, category); } catch {}
+  }
+  const tag = tagMap[category.toLowerCase()];
+  const thread = await forum.threads.create({
+    name: category.slice(0, 100),
+    autoArchiveDuration: 10080,
+    appliedTags: tag ? [tag] : undefined,
+    message: { content: `📁 **${category}** — every NPC in this category, an entry apiece.`,
+      allowedMentions: { parse: [] } },
+  }).catch(() => null);
+  if (!thread) return null;
+  try {
+    db.prepare(`INSERT INTO npc_category_threads (guild_id, category, thread_id, at) VALUES (?,?,?,?)
+                ON CONFLICT(guild_id, category) DO UPDATE SET thread_id=excluded.thread_id, at=excluded.at`)
+      .run(gid, category, thread.id, Date.now());
+  } catch {}
+  return thread;
+}
+
+// Make the entry, or bring it up to date. Best-effort throughout: an NPC is
 // saved whether or not the forum takes them.
 async function mirrorNpcSheet(client, gid, name) {
   const forumId = getConfig(gid)?.npc_forum;
@@ -10082,40 +10141,82 @@ async function mirrorNpcSheet(client, gid, name) {
   if (!forum || forum.type !== 15) return null;
 
   const tagMap = await ensureNpcTags(forum, gid);
-  const tags = getCategoriesForNpc(gid, name)
-    .map(c => tagMap[c.toLowerCase()]).filter(Boolean).slice(0, 5);
+  const thread = await ensureCategoryThread(client, forum, gid, npcHomeCategory(gid, name), tagMap);
+  if (!thread) return null;
+
   const body = npcPageBody(gid, npc);
   let row = null;
   try { row = db.prepare('SELECT * FROM npc_pages WHERE guild_id=? AND name=?').get(gid, name); } catch {}
 
-  if (row?.thread_id) {
-    const th = await client.channels.fetch(row.thread_id).catch(() => null);
-    if (th?.isThread?.() && th.parentId === forum.id) {
-      await wakeThread(th);
-      try { if (tags.length) await th.setAppliedTags(tags); } catch {}
-      try {
-        const msg = row.message_id ? await th.messages.fetch(row.message_id).catch(() => null) : null;
-        if (msg) { await msg.edit({ content: body, allowedMentions: { parse: [] } }); return th; }
-      } catch { /* the starter is gone — post a fresh one below */ }
-      const m = await th.send({ content: body, allowedMentions: { parse: [] } });
-      db.prepare('UPDATE npc_pages SET message_id=?, at=? WHERE guild_id=? AND name=?').run(m.id, Date.now(), gid, name);
-      return th;
+  // Their home category changed. Take the old entry down first, or they
+  // stand in two threads at once and one of them is wrong.
+  if (row?.thread_id && row.thread_id !== thread.id) {
+    if (row.message_id) {
+      const old = await client.channels.fetch(row.thread_id).catch(() => null);
+      if (old?.isThread?.()) {
+        const msg = await old.messages.fetch(row.message_id).catch(() => null);
+        if (msg) await msg.delete().catch(() => {});
+      }
     }
-    // The thread was deleted — forget it and make another.
-    try { db.prepare('DELETE FROM npc_pages WHERE guild_id=? AND name=?').run(gid, name); } catch {}
+    row = null;
   }
 
-  const thread = await forum.threads.create({
-    name: name.slice(0, 100), autoArchiveDuration: 10080,
-    appliedTags: tags.length ? tags : undefined,
-    message: { content: body, allowedMentions: { parse: [] } },
-  });
-  const starter = await thread.fetchStarterMessage().catch(() => null);
+  if (row?.message_id) {
+    await wakeThread(thread);
+    const msg = await thread.messages.fetch(row.message_id).catch(() => null);
+    if (msg) {
+      await msg.edit({ content: body, allowedMentions: { parse: [] } }).catch(() => {});
+      return thread;
+    }
+    // The entry was deleted by hand — post a fresh one below.
+  }
+  const m = await thread.send({ content: body, allowedMentions: { parse: [] } }).catch(() => null);
+  if (!m) return thread;
   db.prepare(`INSERT INTO npc_pages (guild_id, name, thread_id, message_id, at) VALUES (?,?,?,?,?)
               ON CONFLICT(guild_id, name) DO UPDATE SET thread_id=excluded.thread_id,
                 message_id=excluded.message_id, at=excluded.at`)
-    .run(gid, name, thread.id, starter?.id ?? null, Date.now());
+    .run(gid, name, thread.id, m.id, Date.now());
   return thread;
+}
+
+// Lay the whole forum out again: every NPC into their category's thread,
+// then close whatever per-NPC threads the old layout left standing. Safe to
+// run twice — the second pass finds nothing to close.
+async function rebuildNpcForum(client, gid) {
+  const forumId = getConfig(gid)?.npc_forum;
+  if (!forumId) return { written: 0, closed: 0 };
+  const forum = await client.channels.fetch(forumId).catch(() => null);
+  if (!forum || forum.type !== 15) return { written: 0, closed: 0 };
+
+  const before = db.prepare('SELECT DISTINCT thread_id FROM npc_pages WHERE guild_id=? AND thread_id IS NOT NULL')
+    .all(gid).map(r => r.thread_id);
+
+  // The page map is deliberately NOT cleared first. mirrorNpcSheet already
+  // knows how to move an entry — it deletes the old message when the thread
+  // changes and edits in place when it has not. Wiping the map instead makes
+  // every NPC look new, so a second run posts a fresh entry beside the one
+  // already there and orphans it: the whole forum duplicated, quietly, on
+  // the second press.
+  let written = 0;
+  for (const npcRow of getAllNpcs(gid)) {
+    const th = await mirrorNpcSheet(client, gid, npcRow.name).catch(() => null);
+    if (th) written++;
+  }
+
+  // Only now is the keep-list knowable: the category threads are the ones
+  // the pass above just used.
+  const keep = new Set(db.prepare('SELECT thread_id FROM npc_category_threads WHERE guild_id=?')
+    .all(gid).map(r => r.thread_id));
+  let closed = 0;
+  for (const tid of before) {
+    if (keep.has(tid)) continue;
+    const th = await client.channels.fetch(tid).catch(() => null);
+    if (th?.isThread?.() && th.parentId === forum.id) {
+      await th.delete('NPC pages folded into category threads').catch(() => {});
+      closed++;
+    }
+  }
+  return { written, closed };
 }
 
 // Fire and forget: a page is never worth delaying a command for.
@@ -18567,6 +18668,11 @@ async function runFullSetup(interaction) {
 
   // Now fill them: the audit shelves, the quest books, the pipeline tags.
   const audit = await ensureAuditBooks(interaction.client, gid).catch(() => null);
+  // A server that already had an NPC forum keeps whatever layout it had, so
+  // adopting one here has to lay it out as well — otherwise setup reports
+  // success over a forum still holding a thread per NPC. Costs nothing on a
+  // new server: there are no NPCs to write yet.
+  const npcLaid = await rebuildNpcForum(interaction.client, gid).catch(() => null);
   const quests = await ensureQuestBooks(interaction.client, guild, gid).catch(() => null);
   const appr = await ensureApprovalThreads(interaction.client, gid).catch(() => null);
   let tags = false;
@@ -18590,6 +18696,10 @@ async function runFullSetup(interaction) {
   const lines = ['🏗️ **Setup complete.**', '',
     ...section('🌍 DDice — open to the table', open),
     ...section('🔒 DDice · Game Masters — GMs only', gm)];
+  if (npcLaid?.written) {
+    lines.push(`🎭 Wrote up **${npcLaid.written}** NPC${npcLaid.written === 1 ? '' : 's'} by category`
+      + (npcLaid.closed ? `, closing **${npcLaid.closed}** old per-NPC thread${npcLaid.closed === 1 ? '' : 's'}` : '') + '.', '');
+  }
   if (failed.length) lines.push('', '⚠️ **Could not make:**', ...failed.slice(0, 6).map(x => `• ${x}`));
   lines.push('');
   if (audit?.made?.length) lines.push(`🎲 Audit shelves built: ${audit.made.length}`);

@@ -1,18 +1,18 @@
 # DDice — Hard Limits Reference
 
 Every ceiling future development can run into, with where the bot stands today
-(2026-08-05, suite 2,581). **Bold** rows are at or within one step of the wall.
+(2026-08-10, suite 595 — rebuilt; see HANDOFF.md §7.4). **Bold** rows are at or within one step of the wall.
 
 ## 1 · Command surface (Discord application commands)
 
 | Limit | Value | DDice today |
 |---|---|---|
 | Global slash commands per app | 100 | 11 |
-| **Subcommands + groups per command** | **25** | nothing at the wall: config 2 · quest 20 · fight 17 · char 20 (view/profile/weapon/tag groups) · npc 21 · gm 12 (backup/test groups) · standing 3 groups |
+| **Subcommands + groups per command** | **25** | **measured 2026-08-10: npc 24 · quest 23** — both within two of the wall; the next leaf on either must join a group. config 2 · gm 14 · char 8 · fight 17 · standing 3 groups |
 | Subcommands per group | 25 | largest group: standing merit 9 |
 | Options per (sub)command | 25 | largest: /quest create ~10 |
 | Choices per option | 25 | largest: Knight order 9 |
-| **Combined chars per command** (all names + descriptions + choice values, serialized) | **~8000** | **measured 2026-08-06:** config 4321 · char 4068 · quest 3644 · fight 3087 · npc 2877 · gm 2241 — all roughly half the budget; re-measure via the stub's `__BUILDERS__` walk when adding prose-heavy descriptions |
+| **Combined chars per command** (all names + descriptions + choice values, serialized) | **~8000** | **measured 2026-08-10:** config 5266 · gm 5168 · char 4691 · quest 4176 · npc 3740 · fight 3087 — grown since 2026-08-06 but all still under two thirds. `verify.js` measures this every run and prints the table; count the text a human wrote, **not** `JSON.stringify` length, which reads roughly three times high |
 | Command / subcommand / option name | 32 chars, `a-z0-9-_`, no spaces | why `/gm test` is a group, not a name |
 | Option & choice descriptions | 100 chars | several sit near it |
 
@@ -31,7 +31,7 @@ New verbs join their group; the wall is history until a single group nears 25.
 | Modal title / input label | 45 chars | edit title sliced |
 | Modal placeholder | 100 chars | |
 | showModal rules | must be the FIRST response; cannot defer-then-show; cannot show from a modal submit | activity + quest modals comply |
-| customId | 100 chars | `questcreate:m:p:h:style` well under; values must never contain `:` (styleParts.join defends) — any future payload-in-id pattern must budget this |
+| **customId** | **100 chars** | **BREACHED by `/gm dc`:** `dcroll:` carries twelve fields including two free-text options, so a long `on_fail`/`on_success` overflows and the reply throws — and a colon inside either shifts every field in the `split(':')`. See HANDOFF.md §7.1. Elsewhere fine: `questcreate:m:p:h:style` well under, values never contain `:` (styleParts.join defends) |
 | Autocomplete | ≤25 suggestions · 3 s · name ≤100 · string value ≤100 | quest-number branch slices 25; suggestion source query LIMIT 100 |
 
 ## 3 · Messages, embeds, components
@@ -89,18 +89,24 @@ New verbs join their group; the wall is history until a single group nears 25.
 
 | Limit | Where | Note |
 |---|---|---|
-| Test stub validations | tests/node_modules/discord.js | throws on >25 options, missing descriptions, required-after-optional; **now supports subcommand groups** (SubGroup, type 2) — new Discord builder features must be taught to the stub first |
+| Test stub validations | verify.js §3 | throws on >25 options, missing descriptions, required-after-optional, over-long customIds and labels; supports subcommand groups — new Discord builder features must be taught to the stub first |
 | PDF table cells | make_pdfs.py table renderer | **no markup** — `<b>` renders literally (fixed once already); bold only in `p`/`note` |
 | PDF code-row widths | manual `\n` wraps ~52 chars | rows must be pre-wrapped or they overflow the column |
-| Duplicate-block scanner | tools/scan | fires at ~256 identical chars — shared helpers required (questTextRow exists for this reason) |
+| Duplicate-block scanner | verify.js §2.1 | fires at ~256 identical chars — shared helpers required (questTextRow exists for this reason) |
+| Scanners need node internals | verify.js | run with `node --expose-internals`; it parses with node's bundled acorn, and the sandbox has no network to fetch one |
+| Verify loop | verify.js | parse → 4 scanners → 3 harnesses, one file. ERROR fails; WARN needs a human. The twelve standing warnings are listed in HANDOFF.md §6 |
 | Patch discipline | house rule | exact-string anchors + count asserts + write-at-end; a failed assert persists nothing |
 
 ## At the ceiling right now
-1. **Quest modals — 5/5 rows.** Text fields are full; anything new rides options or customId.
-2. **Applied forum tags — 5/thread** with GM hand-tags competing.
-No command sits at the 25 wall any more: config folded into channels(13) + mechanics(12), quest holds 20 with the run group, fight 17 with the act menu (bridged onto /roll).
+1. **`/gm dc` customId — over 100 chars for long free text.** The one live
+   breach. HANDOFF.md §7.1 has the fix and the trade.
+2. **Quest modals — 5/5 rows.** Text fields are full; anything new rides options or customId.
+3. **Applied forum tags — 5/thread** with GM hand-tags competing.
+4. **`/npc` 24/25 and `/quest` 23/25 leaves.** The next subcommand on either
+   must join a group. config and gm are already folded.
 
 ## Sharp edges to remember
+- A `customId` built from user text must budget the 100-char ceiling *and* exclude `:`.
 - Modal edit **truncates** any text field longer than 4000 that was authored inline.
 - Thread renames are near-once-per-10-min; never automate them.
 - Forum pin behaviour across six books needs one live verification.
