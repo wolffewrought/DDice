@@ -687,7 +687,7 @@ try { db.exec('ALTER TABLE quests ADD COLUMN index_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE quests ADD COLUMN stage_msg_id TEXT'); } catch {}      // the one live status line in the plan thread
 try { db.exec('ALTER TABLE quests ADD COLUMN create_msg_id TEXT'); } catch {}     // the create card, swept when the board takes over
 try { db.exec('ALTER TABLE quests ADD COLUMN create_channel_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE quests ADD COLUMN run_thread_id TEXT'); } catch {}     // the party's own room, opened at start
+try { db.exec('ALTER TABLE quests ADD COLUMN run_thread_id TEXT'); } catch {}     // the quest's own thread, opened at start
 try { db.exec('ALTER TABLE quests ADD COLUMN run_seq INTEGER'); } catch {}        // which run of the adventure this is — #002.2
 try { db.exec('ALTER TABLE quests ADD COLUMN run_label TEXT'); } catch {}         // and what the GM calls it
 try { db.exec('ALTER TABLE quests ADD COLUMN stage_at INTEGER'); } catch {}       // when it entered the stage it's in
@@ -5272,9 +5272,9 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('quizforum').setDescription('A forum where the question bank is posted, a thread per category')
       .addChannelOption(o=>o.setName('channel').setDescription('The quiz forum').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = stop posting the readable copy').setRequired(false)));
-      g.addSubcommand(s=>s.setName('questinstances').setDescription('A forum where each STARTED quest opens a room for its party and DM')
+      g.addSubcommand(s=>s.setName('questinstances').setDescription('A forum where each STARTED quest opens its own thread for party and DM')
       .addChannelOption(o=>o.setName('channel').setDescription('The instance forum').setRequired(false))
-      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop opening rooms').setRequired(false)));
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop opening threads').setRequired(false)));
       g.addSubcommand(s=>s.setName('questthreads').setDescription('A secondary forum for per-quest planning threads — the books keep the planning forum to themselves')
       .addChannelOption(o=>o.setName('channel').setDescription('The forum channel for quest threads').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = quest threads open in the planning forum again').setRequired(false)));
@@ -5988,13 +5988,13 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('handoff').setDescription('Hand this quest to another GM — they become its DM (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addUserOption(o=>o.setName('gm').setDescription('The GM taking it over').setRequired(true)))
-    .addSubcommand(s=>s.setName('room').setDescription('Open a party room for a quest that hasn\'t got one yet (GM)')
+    .addSubcommand(s=>s.setName('thread').setDescription('Open a quest thread for one that hasn\'t got one yet (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(false).setAutocomplete(true))
-      .addBooleanOption(o=>o.setName('all').setDescription('true = give every running quest without a room one').setRequired(false)))
+      .addBooleanOption(o=>o.setName('all').setDescription('true = give every running quest without a thread one').setRequired(false)))
     .addSubcommand(s=>s.setName('rally').setDescription('Call the party together — pings everyone on this quest (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('message').setDescription('What to tell them — when, where, what to bring').setRequired(false))
-      .addBooleanOption(o=>o.setName('here').setDescription('true = rally in this channel instead of the party\'s room').setRequired(false)))
+      .addBooleanOption(o=>o.setName('here').setDescription('true = rally here instead of the quest\'s instance').setRequired(false)))
     .addSubcommand(s=>s.setName('runchannel').setDescription('Set where this quest is run and rewarded (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addChannelOption(o=>o.setName('channel').setDescription('Thread or channel (defaults to here)').setRequired(false)))
@@ -7543,13 +7543,13 @@ async function handleConfig(interaction, forced) {
   if (sub === 'questinstances') {
     if (interaction.options?.getBoolean?.('disable')) {
       setConfig(gid, { quest_instance_forum: null });
-      return interaction.reply({ content: '⚔️ Started quests will no longer open a room. Existing rooms stay where they are.' });
+      return interaction.reply({ content: '⚔️ Started quests will no longer open a thread. The ones already open stay where they are.' });
     }
     const channel = (forced?.channel ?? interaction.options?.getChannel?.('channel'));
     if (!channel) {
       const cur = getConfig(gid)?.quest_instance_forum;
       return interaction.reply({ ephemeral: true, content: cur
-        ? `⚔️ Each started quest opens its party's room in <#${cur}>.`
+        ? `⚔️ Each started quest opens its own thread in <#${cur}>.`
         : '⚔️ No instance forum set — started quests use their run channel. `/config channels questinstances channel:#your-forum` gives every party its own room.' });
     }
     if (channel.type !== 15) {
@@ -7557,7 +7557,7 @@ async function handleConfig(interaction, forced) {
         `❌ <#${channel.id}> is not a forum channel. Make a **Forum** — each started quest opens a thread there for its party and DM.` });
     }
     setConfig(gid, { quest_instance_forum: channel.id });
-    return interaction.reply({ content: `⚔️ Started quests now open their party's room in <#${channel.id}> — the DM and every member pulled in, the clock and reminders following them there.` });
+    return interaction.reply({ content: `⚔️ Started quests now open their own thread in <#${channel.id}> — the DM and every member pulled in, the clock and reminders following them there.` });
   }
 
   if (sub === 'questthreads') {
@@ -9943,19 +9943,19 @@ const SRD_SPELLS = [
 // are made too unless only the essentials were asked for.
 const SETUP_PLAN = [
   { key: 'npc_forum',             name: 'npc-pages',        forum: true,  gm: true,  essential: true,
-    about: 'A page per NPC, tagged with their categories — filter the sidebar to sort them.' },
-  { key: 'char_forum',            name: 'character-pages',  forum: true,  gm: false, essential: true,
-    about: 'A page for each approved character.' },
+    about: 'A thread per category, every NPC in it an entry inside — filter the sidebar to sort them.' },
+  { key: 'docs_player_channel',   name: 'player-pdf',       forum: false, gm: false, essential: false,
+    about: 'The player book alone, reposted whenever it changes.' },
   { key: 'quest_forum',           name: 'quest-board',      forum: true,  gm: false, essential: true,
     about: 'The board: a thread per posted quest.' },
-  { key: 'quest_instance_forum',  name: 'quest-rooms',      forum: true,  gm: false, essential: true,
-    about: 'Each started quest opens its party a room here.' },
+  { key: 'quest_instance_forum',  name: 'quest-instances',  forum: true,  gm: false, essential: true,
+    about: 'Each started quest opens its own instance here, for its party.' },
   { key: 'quest_log_channel',     name: 'quest-chronicle',  forum: false, gm: false, essential: true,
     about: 'Finished quests, written up for everyone.' },
   { key: 'memorial_public_channel', name: 'the-fallen',     forum: false, gm: false, essential: false,
     about: 'Those who did not come back, remembered by the table.' },
-  { key: 'docs_player_channel',   name: 'player-reference', forum: false, gm: false, essential: false,
-    about: 'The player book alone, reposted whenever it changes.' },
+  { key: 'char_forum',            name: 'character-pages',  forum: true,  gm: false, essential: true,
+    about: 'A page for each approved character.' },
   { key: 'npc_channel_id',        name: 'npc-images',       forum: false, gm: true,  essential: true,
     about: 'Upload a picture captioned with an NPC\'s name to give them a face.' },
   { key: 'approval_routes', json: 'forum', name: 'approvals', forum: true, gm: true, essential: true,
@@ -10737,7 +10737,7 @@ async function handleCheck(interaction) {
     ['📌 Quest board forum', cfg.quest_forum, '`/config channels questforum channel:#forum`', null, 'questforum'],
     ['🗺️ GM quest planning forum', cfg.quest_plan_forum, '`/config channels questplanning channel:#gm-forum`',
       Object.keys(planBooks).length ? `${Object.keys(planBooks).length} books` : null, 'questplanning'],
-    ['⚔️ Quest instance forum', cfg.quest_instance_forum, '`/config channels questinstances channel:#` (optional — a room per running party)',
+    ['⚔️ Quest instance forum', cfg.quest_instance_forum, '`/config channels questinstances channel:#` (optional — a thread per running party)',
       null, 'questinstances'],
     ['🧵 Quest threads forum', cfg.quest_thread_forum, '`/config channels questthreads channel:#` (optional — threads default into the planning forum)',
       cfg.quest_thread_forum ? 'per-quest threads + stage tags' : null, 'questthreads'],
@@ -17230,9 +17230,9 @@ const HELP_CATEGORIES = {
       '`/quest approve number:N @user [force]` — approve an applicant; `force` overrides a hard cap (GM)',
       '`/quest kick number:N @user` — remove a member/applicant (GM)',
       '`/quest runchannel number:N [channel]` — set where the quest runs & rewards (GM)',
-      '`/quest room number:N` or `/quest room all:true` — open a party room for a quest that has not got one. Use it for quests that began before you set the instance forum (GM)',
-      '`/quest rally number:N [message:] [here:true]` — call the party together: pings every member in their room, or in this channel with `here:true` (GM)',
-      '`/config channels questinstances channel:#forum` — every started quest opens a room for its party there, DM and members pulled in (Admin)',
+      '`/quest thread number:N` or `/quest thread all:true` — open a quest thread for one that has not got one. Use it for quests that began before you set the instance forum (GM)',
+      '`/quest rally number:N [message:] [here:true]` — call the party together: pings every member in the quest thread, or in this channel with `here:true` (GM)',
+      '`/config channels questinstances channel:#forum` — every started quest opens its own thread there, DM and members pulled in (Admin)',
       '`/quest handoff number:N gm:@them` — pass a quest to another GM; they become its DM (GM)',
       '_The first GM to approve an applicant becomes that quest\'s DM. When approvals reach the party size, that DM is pinged once._',
       '`/quest run start/note/pause/resume/timeline/complete` — the running of a quest: start the clock · log a detail · pause and resume · read the full log so far · finish and reward (GM)',
@@ -18504,7 +18504,7 @@ const QUEST_BOOKS = [
   ['concept',   '🌱', 'Concept',            'Quests being written. `/quest stage` moves them onward.'],
   ['awaiting',  '⏳', 'Awaiting Approval',   'Concepts waiting on a nod.'],
   ['approved',  '✅', 'Approved',            'Ready to run — `/quest post` opens them on the public board (marked 📌 here while listed).'],
-  ['running',   '⚔️', 'In Progress',         'Every run happening right now — its DM, its party, its room and how long the clock has been going.'],
+  ['running',   '⚔️', 'In Progress',         'Every run happening right now — its DM, its party, its thread and how long the clock has been going.'],
   ['dms',       '🎲', 'DMs Available',       'Who can run for you, their style, and a short brief. GMs: `/quest dm`.'],
   ['archived',  '🗄️', 'Archived',            'Off the board. `/quest post` re-lists any of them.'],
   ['completed', '🏁', 'Completed',           'Every finished adventure, with its run counter.'],
@@ -18881,19 +18881,19 @@ async function openRunThread(client, guild, gid, quest) {
         `⚔️ **${questTag(quest)}** — the party assembles.`,
         quest.gm_id ? `🎲 DM: <@${quest.gm_id}>` : '',
         roll.length ? `👥 ${roll.join(' ')}` : '',
-        '', '_This is your room: rolls, planning and the run itself. `/quest rally` calls everyone back._',
+        '', '_This is your quest thread: rolls, planning and the run itself. `/quest rally` calls everyone back._',
       ].filter(Boolean).join('\n'), allowedMentions: { users: mentionList(party, quest.gm_id) } },
     });
     const hadChannel = quest.run_channel_id && quest.run_channel_id !== thread.id;
     updateQuest(gid, quest.number, { run_thread_id: thread.id, run_channel_id: thread.id });
     return { thread, why: null,
-      moved: hadChannel ? `ℹ️ The clock and reminders have moved from <#${quest.run_channel_id}> into the room.` : null };
+      moved: hadChannel ? `ℹ️ The clock and reminders have moved from <#${quest.run_channel_id}> into the thread.` : null };
   } catch (err) {
     console.error('[quest] instance thread failed -', err?.message || err);
     const msg = String(err?.message || err);
     return { thread: null, why: /permission/i.test(msg)
-      ? `I need **Create Posts** (and **Send Messages**) in <#${forumId}> to open the party's room.`
-      : `Couldn't open the party's room in <#${forumId}> — ${msg}` };
+      ? `I need **Create Posts** (and **Send Messages**) in <#${forumId}> to open the quest's thread.`
+      : `Couldn't open the quest's thread in <#${forumId}> — ${msg}` };
   }
 }
 
@@ -19285,7 +19285,7 @@ async function handleQuest(interaction, forced) {
         const nm2 = await getDisplayName(interaction.guild, target.id);
         return interaction.reply({ content:
           `⚔️ **${questTag(born.quest)}** begins forming with **${nm2}** — you're its DM.`
-          + (born.room ? `\n🚪 Their room: <#${born.room.id}> — others can ask to join with the button there.` : '')
+          + (born.room ? `\n🚪 Their thread: <#${born.room.id}> — others can ask to join with the button there.` : '')
           + `\n📋 **${questTag(quest)}** is clear on the board for the next group.` });
       }
     }
@@ -19317,7 +19317,7 @@ async function handleQuest(interaction, forced) {
     return interaction.reply({ content: `👢 Removed **${nm}** from **${questTag(quest)}**.` });
   }
 
-  if (sub === 'room') {
+  if (sub === 'thread') {
     const doAll = interaction.options?.getBoolean?.('all') ?? false;
     if (!doAll && interaction.options?.getInteger?.('number') === null) {
       return interaction.reply({ content: '❌ Name a quest with `number:`, or use `all:true` to catch every running quest at once.', ephemeral: true });
@@ -19330,7 +19330,7 @@ async function handleQuest(interaction, forced) {
       : [getQuest(gid, interaction.options.getInteger('number'))].filter(Boolean);
     if (!targets.length) {
       return interaction.editReply({ content: doAll
-        ? '✅ Every running quest already has its room.'
+        ? '✅ Every running quest already has its thread.'
         : '❌ No quest with that number.' });
     }
     const done = [], skipped = [];
