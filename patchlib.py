@@ -17,7 +17,7 @@ def load(path):
     return io.open(path, encoding='utf-8').read()
 
 
-def save(path, text, min_bytes=1000):
+def save(path, text, min_bytes=1000, min_lines=None):
     # Encoding first, before the target is touched. A lone surrogate from a
     # mistyped \\uD83C escape dies here, with the original still on disk.
     try:
@@ -26,6 +26,21 @@ def save(path, text, min_bytes=1000):
         raise SystemExit(f'REFUSED: {path} not written — {e}')
     if len(data) < min_bytes:
         raise SystemExit(f'REFUSED: {path} would be {len(data)} bytes, expected at least {min_bytes}')
+    # Size alone does not prove structure. A join with a literal "\\n" instead
+    # of a newline leaves the byte count almost unchanged and collapses the
+    # whole file onto one line — still valid UTF-8, still large, still
+    # ruinous. min_lines defaults to whatever the file has now, so any patch
+    # that loses more than a tenth of its lines has to say so deliberately.
+    if min_lines is None and os.path.exists(path):
+        try:
+            with io.open(path, encoding='utf-8') as f:
+                min_lines = int(f.read().count('\n') * 0.9)
+        except Exception:
+            min_lines = None
+    if min_lines:
+        got = text.count('\n')
+        if got < min_lines:
+            raise SystemExit(f'REFUSED: {path} would have {got} lines, expected at least {min_lines}')
     tmp = path + '.tmp'
     with open(tmp, 'wb') as f:
         f.write(data)

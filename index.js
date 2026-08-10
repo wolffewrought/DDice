@@ -660,6 +660,15 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS npc_category_threads (
   thread_id TEXT, at INTEGER,
   PRIMARY KEY (guild_id, category)
 )`); } catch (e) { console.error('npc_category_threads schema', e); }
+// The portrait forum mirrors the page forum: the same categories, the same
+// thread names, so a GM looking for a face looks in the same place they look
+// for the statblock. Kept in its own table because a category has a thread in
+// each forum and they are not the same thread.
+try { db.exec(`CREATE TABLE IF NOT EXISTS npc_portrait_threads (
+  guild_id TEXT NOT NULL, category TEXT NOT NULL,
+  thread_id TEXT, at INTEGER,
+  PRIMARY KEY (guild_id, category)
+)`); } catch (e) { console.error('npc_portrait_threads schema', e); }
 try { db.exec(`CREATE TABLE IF NOT EXISTS dc_drafts (
   guild_id TEXT NOT NULL, token TEXT NOT NULL, ids TEXT, npcs TEXT, reveal TEXT,
   created_at INTEGER NOT NULL, PRIMARY KEY (guild_id, token)
@@ -5251,7 +5260,7 @@ const slashCommands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommandGroup(g => {
       g.setName('channels').setDescription('Where things live — forums, channels and publishing');
-      g.addSubcommand(s=>s.setName('npcchannel').setDescription('Set the NPC image bank channel')
+      g.addSubcommand(s=>s.setName('npcchannel').setDescription('A forum for NPC portraits, a thread per category')
       .addChannelOption(o=>o.setName('channel').setDescription('Channel to watch for NPC avatar uploads').setRequired(true)));
       g.addSubcommand(s=>s.setName('charforum').setDescription('A forum where each approved character gets a page')
       .addChannelOption(o=>o.setName('channel').setDescription('The forum channel').setRequired(false))
@@ -9942,8 +9951,6 @@ const SRD_SPELLS = [
 // see it. `essential` marks the ones a table notices immediately; the rest
 // are made too unless only the essentials were asked for.
 const SETUP_PLAN = [
-  { key: 'npc_forum',             name: 'npc-pages',        forum: true,  gm: true,  essential: true,
-    about: 'A thread per category, every NPC in it an entry inside — filter the sidebar to sort them.' },
   { key: 'docs_player_channel',   name: 'player-pdf',       forum: false, gm: false, essential: false,
     about: 'The player book alone, reposted whenever it changes.' },
   { key: 'quest_forum',           name: 'quest-board',      forum: true,  gm: false, essential: true,
@@ -9956,12 +9963,14 @@ const SETUP_PLAN = [
     about: 'Those who did not come back, remembered by the table.' },
   { key: 'char_forum',            name: 'character-pages',  forum: true,  gm: false, essential: true,
     about: 'A page for each approved character.' },
-  { key: 'npc_channel_id',        name: 'npc-images',       forum: false, gm: true,  essential: true,
-    about: 'Upload a picture captioned with an NPC\'s name to give them a face.' },
   { key: 'approval_routes', json: 'forum', name: 'approvals', forum: true, gm: true, essential: true,
     about: 'A thread apiece for sheets, trades, duels, lore and exports — each waiting on a GM.' },
   { key: 'audit_routes', json: 'forum', name: 'roll-audit',  forum: true,  gm: true,  essential: true,
     about: 'A shelf per subject: rolls, checks, duels, items and the rest.' },
+  { key: 'npc_forum',             name: 'npc-pages',        forum: true,  gm: true,  essential: true,
+    about: 'A thread per category, every NPC in it an entry inside — filter the sidebar to sort them.' },
+  { key: 'npc_channel_id',        name: 'npc-portraits',    forum: true,  gm: true,  essential: true,
+    about: 'A thread per category, mirroring npc-pages. Post a picture captioned with an NPC\'s name.' },
   { key: 'quest_plan_forum',      name: 'quest-planning',   forum: true,  gm: true,  essential: true,
     about: 'The pipeline books — concept, awaiting, approved, in progress, DMs, archived, completed.' },
   { key: 'quest_thread_forum',    name: 'quest-threads',    forum: true,  gm: true,  essential: true,
@@ -10104,26 +10113,31 @@ function npcPageBody(gid, npc) {
 // The thread for one category, made if it is not there yet. The category is
 // the thread's name and its applied tag, so the forum's own filter and the
 // thread list say the same thing.
-async function ensureCategoryThread(client, forum, gid, category, tagMap) {
+const NPC_THREAD_TABLES = { pages: 'npc_category_threads', portraits: 'npc_portrait_threads' };
+async function ensureCategoryThread(client, forum, gid, category, tagMap, kind = 'pages') {
+  // Whitelisted, never interpolated from anything a user typed.
+  const table = NPC_THREAD_TABLES[kind] || NPC_THREAD_TABLES.pages;
   let row = null;
-  try { row = db.prepare('SELECT thread_id FROM npc_category_threads WHERE guild_id=? AND category=?').get(gid, category); } catch {}
+  try { row = db.prepare(`SELECT thread_id FROM ${table} WHERE guild_id=? AND category=?`).get(gid, category); } catch {}
   if (row?.thread_id) {
     const th = await client.channels.fetch(row.thread_id).catch(() => null);
     if (th?.isThread?.() && th.parentId === forum.id) { await wakeThread(th); return th; }
     // Deleted by hand — forget it and make another.
-    try { db.prepare('DELETE FROM npc_category_threads WHERE guild_id=? AND category=?').run(gid, category); } catch {}
+    try { db.prepare(`DELETE FROM ${table} WHERE guild_id=? AND category=?`).run(gid, category); } catch {}
   }
   const tag = tagMap[category.toLowerCase()];
   const thread = await forum.threads.create({
     name: category.slice(0, 100),
     autoArchiveDuration: 10080,
     appliedTags: tag ? [tag] : undefined,
-    message: { content: `📁 **${category}** — every NPC in this category, an entry apiece.`,
+    message: { content: kind === 'portraits'
+      ? `🖼 **${category}** — post a picture here with the NPC's name as the caption, and they will wear it.`
+      : `📁 **${category}** — every NPC in this category, an entry apiece.`,
       allowedMentions: { parse: [] } },
   }).catch(() => null);
   if (!thread) return null;
   try {
-    db.prepare(`INSERT INTO npc_category_threads (guild_id, category, thread_id, at) VALUES (?,?,?,?)
+    db.prepare(`INSERT INTO ${table} (guild_id, category, thread_id, at) VALUES (?,?,?,?)
                 ON CONFLICT(guild_id, category) DO UPDATE SET thread_id=excluded.thread_id, at=excluded.at`)
       .run(gid, category, thread.id, Date.now());
   } catch {}
@@ -10179,6 +10193,27 @@ async function mirrorNpcSheet(client, gid, name) {
   return thread;
 }
 
+// The portrait forum, laid out to match the page forum: a thread per
+// category, same names, same tags. A GM hunting for a face looks where they
+// look for the statblock.
+//
+// A text channel is still accepted — servers set one before this was a forum
+// and captioned uploads there work exactly as they always did — so this is a
+// no-op unless the configured channel is a forum.
+async function ensurePortraitThreads(client, gid) {
+  const id = getConfig(gid)?.npc_channel_id;
+  if (!id) return 0;
+  const forum = await client.channels.fetch(id).catch(() => null);
+  if (!forum || forum.type !== 15) return 0;
+  const tagMap = await ensureNpcTags(forum, gid);
+  let made = 0;
+  for (const cat of [...getCategories(gid), NPC_NO_CATEGORY]) {
+    const th = await ensureCategoryThread(client, forum, gid, cat, tagMap, 'portraits').catch(() => null);
+    if (th) made++;
+  }
+  return made;
+}
+
 // Lay the whole forum out again: every NPC into their category's thread,
 // then close whatever per-NPC threads the old layout left standing. Safe to
 // run twice — the second pass finds nothing to close.
@@ -10205,6 +10240,8 @@ async function rebuildNpcForum(client, gid) {
 
   // Only now is the keep-list knowable: the category threads are the ones
   // the pass above just used.
+  await ensurePortraitThreads(client, gid).catch(() => 0);
+
   const keep = new Set(db.prepare('SELECT thread_id FROM npc_category_threads WHERE guild_id=?')
     .all(gid).map(r => r.thread_id));
   let closed = 0;
@@ -10751,7 +10788,7 @@ async function handleCheck(interaction) {
     ['🪶 Memorial — GM record', cfg.memorial_channel, '`/config channels memorial channel:#`', null, 'memorial'],
     ['🕯️ Memorial — public hall', cfg.memorial_public_channel, '`/config channels memorial public:#`', null],
     ['📜 Quest log', cfg.quest_log_channel, '`/config channels questlog channel:#`', null, 'questlog'],
-    ['🖼️ NPC image bank', cfg.npc_channel_id, '`/config channels npcchannel channel:#`', null, 'npcchannel'],
+    ['🖼️ NPC portrait bank', cfg.npc_channel_id, '`/config channels npcchannel channel:#`', null, 'npcchannel'],
     ['📚 GM docs (the PDFs)', cfg.docs_channel, '`/config channels docs channel:# repo:owner/name`', null],
     ['📜 Scroll library', cfg.scroll_archive_id, '`/config channels scrollarchive channel:#` — a forum gives per-GM threads', null, 'scrollarchive'],
     ['💾 Backups', cfg.backup_channel_id, '`/gm backup auto channel:#`', null],
@@ -11699,17 +11736,24 @@ client.on('messageCreate', async message => {
   const content = message.content.trim();
 
 
-  // NPC image bank — detect image uploads in the configured NPC channel
+  // NPC portrait bank — captioned uploads in the configured forum or channel
   if (message.guild && message.attachments.size > 0) {
     const cfg = getConfig(message.guild.id);
-    // Tracing: an avatar upload that does nothing is impossible to diagnose
-    // otherwise. These lines show in the Railway logs.
-    console.log(`[npcimg] attachment in ${message.channel.id}; configured=${cfg.npc_channel_id || 'NONE'}; text="${message.content}"`);
-    if (!cfg.npc_channel_id) {
-      await message.reply('⚠️ No NPC image channel is set. An admin needs to run `/config channels npcchannel`.').catch(()=>{});
-      return;
-    }
-    if (message.channel.id === cfg.npc_channel_id) {
+    // Only speak inside the portrait bank. This used to answer every image
+    // posted anywhere on the server with a warning that no bank was set — and
+    // then return, which swallowed the rest of messageCreate for any message
+    // carrying an attachment.
+    const bankId = cfg.npc_channel_id;
+    const inBank = !!bankId && (message.channel.id === bankId
+      // A forum bank holds a thread per category, so the upload lands in a
+      // child of the forum rather than in the forum itself. Which thread does
+      // not matter: the caption names the NPC, and being forgiving here beats
+      // refusing a portrait posted one thread over.
+      || message.channel.parentId === bankId);
+    if (inBank) {
+      // Tracing: an avatar upload that does nothing is impossible to diagnose
+      // otherwise. These lines show in the Railway logs.
+      console.log(`[npcimg] attachment in ${message.channel.id}; bank=${bankId}; text="${message.content}"`);
       const npcName = message.content.trim();
       if (!npcName) {
         console.error('[npcimg] message.content is EMPTY — if you did type a name, the Message Content Intent is disabled in the Developer Portal.');
@@ -16611,6 +16655,9 @@ async function handleNpc(interaction) {
   if (sub === 'categorycreate') {
     const name = interaction.options.getString('name');
     createCategory(gid, name);
+    // Both forums get a thread for it now, rather than on the first NPC —
+    // so a GM can post a portrait before the statblock exists.
+    ensurePortraitThreads(interaction.client, gid).catch(() => {});
     await interaction.reply({ content: `✅ Category **${name}** created. Menus updating...` });
     registerSlashCommands(gid).catch(console.error);
     return;
