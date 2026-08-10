@@ -5090,7 +5090,8 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('questwipe').setDescription('Delete EVERY quest on this server — confirm-gated (GM)')
       .addBooleanOption(o=>o.setName('runs').setDescription('true = also erase the run ledger and DM guided-counters (default: history kept)').setRequired(false)))
     .addSubcommand(s=>s.setName('check').setDescription('Which channels and forums are set up for the bot, and which await (GM)')
-      .addBooleanOption(o=>o.setName('run').setDescription('true = build anything missing — new books and tags after an update').setRequired(false)))
+      .addBooleanOption(o=>o.setName('run').setDescription('true = build anything missing — new books and tags after an update').setRequired(false))
+      .addBooleanOption(o=>o.setName('build').setDescription('true = make every channel and forum the bot needs, then fill them').setRequired(false)))
     .addSubcommand(s=>s.setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)')
       .addAttachmentOption(o=>o.setName('file').setDescription('A scroll PDF made by /gm scroll — I read it back as text and a fresh copy in this server\'s font').setRequired(false)))
     .addSubcommand(s=>s.setName('dicereport').setDescription('The server\'s dice health — who rolls, how the d20s run, the hot and cold hands (GM)'))
@@ -9838,6 +9839,82 @@ const SRD_SPELLS = [
   '[SPELL] Wish | level 9 | school conjuration | time 1 action | range self | components V | duration instant | The mightiest spell: duplicate any spell of 8th level or lower, or ask for more and risk the cost.',
 ].join('\n');
 
+// ── Setting a server up in one go ───────────────────────────────────
+// Everything the bot can be pointed at: the config key it fills, what to
+// call the channel, whether it must be a forum, and whether GMs alone should
+// see it. `essential` marks the ones a table notices immediately; the rest
+// are made too unless only the essentials were asked for.
+const SETUP_PLAN = [
+  { key: 'npc_channel_id',        name: 'npc-images',       forum: false, gm: true,  essential: true,
+    about: 'Upload a picture captioned with an NPC\'s name to give them a face.' },
+  { key: 'char_forum',            name: 'character-pages',  forum: true,  gm: false, essential: true,
+    about: 'A page for each approved character.' },
+  { key: 'approval_channel_id',   name: 'sheet-approvals',  forum: false, gm: true,  essential: true,
+    about: 'New character sheets wait here for a GM.' },
+  { key: 'quest_forum',           name: 'quest-board',      forum: true,  gm: false, essential: true,
+    about: 'The board: a thread per posted quest.' },
+  { key: 'quest_plan_forum',      name: 'quest-planning',   forum: true,  gm: true,  essential: true,
+    about: 'Where quests are written and the pipeline books live.' },
+  { key: 'quest_instance_forum',  name: 'quest-rooms',      forum: true,  gm: false, essential: true,
+    about: 'Each started quest opens its party a room here.' },
+  { key: 'quest_log_channel',     name: 'quest-chronicle',  forum: false, gm: false, essential: true,
+    about: 'Finished quests, written up for everyone.' },
+  { key: 'audit_routes', json: 'forum', name: 'roll-audit',  forum: true,  gm: true,  essential: true,
+    about: 'A shelf per subject: rolls, checks, duels, items and the rest.' },
+  { key: 'memorial_channel',      name: 'the-fallen',       forum: false, gm: false, essential: false,
+    about: 'Those who did not come back.' },
+  { key: 'scroll_archive_id',     name: 'scroll-archive',   forum: true,  gm: true,  essential: false,
+    about: 'Every prop written, kept.' },
+  { key: 'quiz_forum',            name: 'question-bank',    forum: true,  gm: true,  essential: false,
+    about: 'The quiz bank, a thread per category.' },
+  { key: 'docs_channel',          name: 'command-reference', forum: false, gm: true, essential: false,
+    about: 'The command books, reposted whenever they change.' },
+];
+
+// Make one channel, or adopt the one already there. Returns what happened so
+// the reply can be honest about it.
+async function setupOneChannel(guild, gid, plan, category) {
+  const { ChannelType, PermissionFlagsBits } = require('discord.js');
+  const cfg = getConfig(gid) || {};
+  // One config holds a whole map rather than a bare id — the audit forum
+  // keeps its shelves beside it — so read and write that one in its shape.
+  const readId = (v) => {
+    if (!plan.json) return v;
+    try { return JSON.parse(v || '{}')[plan.json] || null; } catch { return null; }
+  };
+  const writeId = (id) => setConfig(gid, plan.json
+    ? { [plan.key]: JSON.stringify({ ...(JSON.parse(cfg[plan.key] || '{}')), [plan.json]: id }) }
+    : { [plan.key]: id });
+  // Already pointed at something live? Leave it entirely alone.
+  const existingId = readId(cfg[plan.key]);
+  if (existingId) {
+    const ch = await guild.channels.fetch(existingId).catch(() => null);
+    if (ch) return { state: 'kept', id: ch.id, name: plan.name };
+  }
+  // A channel already named for this purpose is adopted rather than doubled.
+  const named = guild.channels.cache.find(c => c.name === plan.name
+    && c.type === (plan.forum ? ChannelType.GuildForum : ChannelType.GuildText));
+  if (named) {
+    writeId(named.id);
+    return { state: 'adopted', id: named.id, name: plan.name };
+  }
+  const overwrites = [];
+  if (plan.gm) {
+    // GM-only: hidden from everyone, opened to the GM roles.
+    overwrites.push({ id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] });
+    for (const rid of getGmRoleIds(gid)) overwrites.push({ id: rid, allow: [PermissionFlagsBits.ViewChannel] });
+  }
+  const made = await guild.channels.create({
+    name: plan.name,
+    type: plan.forum ? ChannelType.GuildForum : ChannelType.GuildText,
+    parent: category?.id ?? null,
+    topic: plan.about.slice(0, 1000),
+    permissionOverwrites: overwrites.length ? overwrites : undefined,
+  });
+  writeId(made.id);
+  return { state: 'made', id: made.id, name: plan.name };
+}
+
 // ── The library ───────────────────────────────────────────────
 // One entry a line. The name comes first; everything after it is a field
 // named in plain words, separated by pipes, in any order. Anything the
@@ -10329,6 +10406,7 @@ async function runGmRollSlash(interaction) {
 async function handleCheck(interaction) {
   // `run:true` builds whatever the code knows about and this server hasn't
   // got yet — the one switch to pull after an update adds a book.
+  if (interaction.options?.getBoolean?.('build')) return runFullSetup(interaction);
   if (interaction.options?.getBoolean?.('run')) return runSetupRepair(interaction);
   const gid = interaction.guild.id;
   if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ The setup check is for GMs.', ephemeral: true });
@@ -16757,6 +16835,7 @@ const HELP_CATEGORIES = {
       '`/gm kill user:@a` / `/gm revive user:@a` — mark a character fallen and post their memorial, or bring them back (GM)',
       '`/gm test quest/npc/list/clean` — throwaway fixtures for trying things out, and the broom that clears them (GM)',
       '`/gm questwipe [runs:true]` — delete every quest on the server, confirm-gated; the run ledger and DM counters survive unless runs:true (GM)',
+      '`/gm check build:true` — the one-command setup: makes every channel and forum the bot needs, points the config at each, and fills them. Adopts anything already there, so it is safe to run on a server set up by hand (Admin)',
       '`/gm check run:true` — build anything missing: audit shelves, pipeline books and tags. Adopts what exists, so it is safe to run any time — pull it after an update adds a book (GM)',
       '`/gm check` — the setup mirror: every channel-backed feature, unset first with the command that sets it, then the set ones with links — stored ids are verified live (GM)',
       '`/config channels questforum channel:#forum` — the board becomes a forum: one thread per quest, lifecycle mirrored in, archived on completion (Admin)',
@@ -18167,6 +18246,68 @@ async function sweepQuestChannels(client, gid, quest) {
     } catch { /* already gone */ }
   }
   await sweepCreateCard(client, gid, quest);
+}
+
+// The whole thing: make what's missing, wire it, then fill it. Safe to run
+// on a server already set up by hand — nothing pointed at a live channel is
+// touched, and a channel merely named for the job is adopted.
+async function runFullSetup(interaction) {
+  const gid = interaction.guild.id, guild = interaction.guild;
+  const { PermissionFlagsBits, ChannelType } = require('discord.js');
+  if (!interaction.member?.permissions?.has(PermissionFlagsBits.ManageChannels)) {
+    return interaction.reply({ content: '❌ Making channels needs **Manage Channels** — an admin has to run this one.', ephemeral: true });
+  }
+  if (!guild.members.me?.permissions?.has(PermissionFlagsBits.ManageChannels)) {
+    return interaction.reply({ content: '❌ I need **Manage Channels** myself before I can build anything.', ephemeral: true });
+  }
+  await interaction.deferReply();
+
+  // Everything lands in one category, so a server does not sprout a dozen
+  // loose channels.
+  let category = guild.channels.cache.find(c => c.type === ChannelType.GuildCategory && c.name === 'DDice');
+  if (!category) {
+    try { category = await guild.channels.create({ name: 'DDice', type: ChannelType.GuildCategory }); }
+    catch { category = null; }
+  }
+
+  const made = [], adopted = [], kept = [], failed = [];
+  for (const plan of SETUP_PLAN) {
+    try {
+      const r = await setupOneChannel(guild, gid, plan, category);
+      ({ made, adopted, kept })[r.state === 'made' ? 'made' : r.state === 'adopted' ? 'adopted' : 'kept']
+        .push(`<#${r.id}>`);
+    } catch (err) {
+      failed.push(`${plan.name} — ${err?.message || err}`);
+    }
+  }
+
+  // Now fill them: the audit shelves, the quest books, the pipeline tags.
+  const audit = await ensureAuditBooks(interaction.client, gid).catch(() => null);
+  const quests = await ensureQuestBooks(interaction.client, guild, gid).catch(() => null);
+  let tags = false;
+  try {
+    const tagForumId = getConfig(gid)?.quest_thread_forum ?? getConfig(gid)?.quest_plan_forum;
+    if (tagForumId) {
+      const tf = await interaction.client.channels.fetch(tagForumId).catch(() => null);
+      if (tf) { await ensurePlanTags(tf, gid); tags = true; }
+    }
+  } catch {}
+
+  const lines = ['🏗️ **Setup complete.**', ''];
+  if (made.length) lines.push(`✨ **Made ${made.length}:** ${made.join(' ')}`);
+  if (adopted.length) lines.push(`🤝 **Adopted ${adopted.length}** already named for the job: ${adopted.join(' ')}`);
+  if (kept.length) lines.push(`👍 **Left alone ${kept.length}** already set: ${kept.join(' ')}`);
+  if (failed.length) lines.push('', '⚠️ **Could not make:**', ...failed.slice(0, 6).map(x => `• ${x}`));
+  lines.push('');
+  if (audit?.made?.length) lines.push(`🎲 Audit shelves built: ${audit.made.length}`);
+  else if (audit) lines.push('🎲 Audit shelves already there');
+  if (quests?.made?.length) lines.push(`🗺️ Quest books built: ${quests.made.length}`);
+  else if (quests) lines.push('🗺️ Quest books already there');
+  if (tags) lines.push('🏷️ Pipeline tags checked');
+  lines.push('', '_What is left is yours to decide:_ `/config mechanics gmrole` names your GMs, '
+    + '`/config channels ruleset` picks the rules, and `/config channels docs` needs your repo. '
+    + 'Run `/gm check` any time to see what is set.');
+  return interaction.editReply({ content: lines.join('\n').slice(0, 1990) });
 }
 
 // Build anything missing, then say plainly what changed and what was
