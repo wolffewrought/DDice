@@ -244,6 +244,9 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN hp_base INTEGER DEFAULT 2'); 
 // Scheduled recovery: everyone not out on a quest is restored every N hours.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN autorest_enabled INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN autorest_hours INTEGER DEFAULT 6'); } catch {}
+// (autorest_channel: added once, never used — recovery announcements go to
+//  the channel the schedule was set in. Left in place so an old database
+//  does not have to change; nothing reads it.)
 try { db.exec('ALTER TABLE guild_config ADD COLUMN autorest_channel TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN autorest_last INTEGER'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_stats_visible INTEGER DEFAULT 0'); } catch {}
@@ -643,6 +646,12 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS quiz_sets (
   PRIMARY KEY (guild_id, name)
 )`); } catch (e) { console.error('quiz_sets schema', e); }
 try { db.exec('ALTER TABLE guild_config ADD COLUMN quiz_forum TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_forum TEXT'); } catch {}
+try { db.exec(`CREATE TABLE IF NOT EXISTS npc_pages (
+  guild_id TEXT NOT NULL, name TEXT NOT NULL,
+  thread_id TEXT, message_id TEXT, at INTEGER,
+  PRIMARY KEY (guild_id, name)
+)`); } catch (e) { console.error('npc_pages schema', e); }
 try { db.exec(`CREATE TABLE IF NOT EXISTS dc_drafts (
   guild_id TEXT NOT NULL, token TEXT NOT NULL, ids TEXT, npcs TEXT, reveal TEXT,
   created_at INTEGER NOT NULL, PRIMARY KEY (guild_id, token)
@@ -3018,6 +3027,18 @@ function upsertNpc(gid, name, fields) {
 }
 function deleteNpc(gid, name) {
   purgeSubjectRecords(gid, npcFighterId(name));
+  // Their page goes with them — an NPC that no longer exists should not
+  // still have a thread standing open in the forum.
+  (async () => {
+    try {
+      const row = db.prepare('SELECT thread_id FROM npc_pages WHERE guild_id=? AND name=?').get(gid, name);
+      if (row?.thread_id) {
+        const th = await client.channels.fetch(row.thread_id).catch(() => null);
+        if (th?.isThread?.()) await th.delete('NPC deleted');
+      }
+      db.prepare('DELETE FROM npc_pages WHERE guild_id=? AND name=?').run(gid, name);
+    } catch (err) { console.error('[npcforum] page sweep -', err?.message || err); }
+  })();
   db.prepare('DELETE FROM npcs WHERE guild_id=? AND name=?').run(gid, name);
 }
 // An NPC written "Black Knight | Lady Ciara Nightveil" belongs to the Black
@@ -3207,9 +3228,11 @@ function deleteCategory(gid, name) {
 }
 function assignNpcToCategory(gid, npcName, category) {
   db.prepare('INSERT OR IGNORE INTO npc_category_members (guild_id, category, npc_name) VALUES (?,?,?)').run(gid, category, npcName);
+  touchNpcPage(gid, npcName);   // the page wears its categories as tags
 }
 function removeNpcFromCategory(gid, npcName, category) {
   db.prepare('DELETE FROM npc_category_members WHERE guild_id=? AND category=? AND npc_name=?').run(gid, category, npcName);
+  touchNpcPage(gid, npcName);
 }
 function getNpcsInCategory(gid, category) {
   return db.prepare('SELECT npc_name FROM npc_category_members WHERE guild_id=? AND category=? ORDER BY npc_name').all(gid, category).map(r=>r.npc_name);
@@ -5219,6 +5242,9 @@ const slashCommands = [
       .addStringOption(o=>o.setName('system').setDescription('The rules to use here').setRequired(false)
         .addChoices({name:'⚔️ Knightfall — five stats, opposed rolls (default)',value:'knightfall'},
                     {name:'🐉 D&D 5e (SRD) — six abilities, proficiency, AC',value:'dnd5e'})));
+      g.addSubcommand(s=>s.setName('npcforum').setDescription('A forum where each NPC gets a page, tagged with their categories')
+      .addChannelOption(o=>o.setName('channel').setDescription('The NPC forum').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop keeping pages').setRequired(false)));
       g.addSubcommand(s=>s.setName('quizforum').setDescription('A forum where the question bank is posted, a thread per category')
       .addChannelOption(o=>o.setName('channel').setDescription('The quiz forum').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = stop posting the readable copy').setRequired(false)));
@@ -5605,12 +5631,15 @@ const slashCommands = [
       .addStringOption(o=>o.setName('flavour').setDescription('Flavour text').setRequired(false))
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'})))
+    .addSubcommand(s=>s.setName('sync').setDescription('Write up every NPC in the forum — or one of them (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('Just this one — leave out for all of them').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('create5e').setDescription('Make a 5e monster — AC, hit points, attack and damage from its statblock (GM)')
       .addStringOption(o=>o.setName('name').setDescription('What it is called').setRequired(true))
       .addIntegerOption(o=>o.setName('ac').setDescription('Armour Class').setRequired(true).setMinValue(1).setMaxValue(30))
       .addIntegerOption(o=>o.setName('hp').setDescription('Hit points').setRequired(true).setMinValue(1).setMaxValue(999))
       .addIntegerOption(o=>o.setName('attack').setDescription('Its attack bonus, e.g. 4').setRequired(true).setMinValue(-5).setMaxValue(20))
       .addStringOption(o=>o.setName('damage').setDescription('Damage dice, e.g. 1d8+2').setRequired(true))
+      .addStringOption(o=>o.setName('category').setDescription('What kind they are — Enemy, Ally, Vendor… a new one is made if it does not exist').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('str').setDescription('Strength score').setRequired(false).setMinValue(1).setMaxValue(30))
       .addIntegerOption(o=>o.setName('dex').setDescription('Dexterity score').setRequired(false).setMinValue(1).setMaxValue(30))
       .addIntegerOption(o=>o.setName('con').setDescription('Constitution score').setRequired(false).setMinValue(1).setMaxValue(30))
@@ -5623,6 +5652,7 @@ const slashCommands = [
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'})))
     .addSubcommand(s=>s.setName('create').setDescription('Create an NPC')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
+      .addStringOption(o=>o.setName('category').setDescription('What kind they are — Enemy, Ally, Vendor… a new one is made if it does not exist').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('str').setDescription('Strength').setRequired(false))
       .addIntegerOption(o=>o.setName('con').setDescription('Constitution').setRequired(false))
       .addIntegerOption(o=>o.setName('dex').setDescription('Dexterity').setRequired(false))
@@ -7158,37 +7188,21 @@ async function handleConfig(interaction, forced) {
         `❌ <#${forum.id}> is not a forum channel. Make a **Forum** and point me at that — each approval type gets its own thread in it.` });
     }
     await interaction.deferReply();
-    const prev = approvalRoutes(gid) || {};
-    const routes = { forum: forum.id };
-    const lines = [];
-    for (const [key, t] of Object.entries(APPROVAL_TYPES)) {
-      let thread = null;
-      // Re-running setup reuses a surviving thread in this same forum, so ids
-      // (and every link already pointing at them) stay stable.
-      if (prev[key]) {
-        try {
-          const old = await interaction.client.channels.fetch(prev[key]);
-          if (old?.isThread?.() && old.parentId === forum.id) thread = await wakeThread(old);
-        } catch (err) { console.error('[approvalforum] stale thread', key, '-', err?.message || err); }
-      }
-      if (!thread) {
-        try {
-          thread = await forum.threads.create({ name: t.name, autoArchiveDuration: 10080,
-            message: { content: `${t.about}\n_I wake this thread whenever something new arrives — no need to keep it active._` } });
-        } catch (err) {
-          console.error('[approvalforum] create failed', key, '-', err?.message || err);
-          return interaction.editReply({ content:
-            `❌ Couldn't create the **${t.name}** thread — ${err?.message || err}\nCheck I can **View Channel**, **Create Posts** and **Send Messages in Posts** there, then run this again. Nothing was saved.` });
-        }
-      }
-      routes[key] = thread.id;
-      lines.push(`${t.name} → <#${thread.id}>`);
+    // The threads themselves are built by the shared mender, so this command
+    // and `/gm check` cannot drift apart in how they make them.
+    setConfig(gid, { approval_routes: JSON.stringify({ forum: forum.id }) });
+    const res = await ensureApprovalThreads(interaction.client, gid).catch(err => ({ error: err?.message || String(err) }));
+    if (!res || res.error) {
+      return interaction.editReply({ content: `❌ ${res?.error || 'Could not build the approval threads.'}\nCheck I can **View Channel**, **Send Messages** and **Create Posts** in <#${forum.id}>.` });
     }
-    setConfig(gid, { approval_routes: JSON.stringify(routes) });
+    const routes = approvalRoutes(gid) || {};
+    const lines = Object.entries(APPROVAL_TYPES)
+      .filter(([key]) => routes[key])
+      .map(([key, t]) => `${t.name} → <#${routes[key]}>`);
     return interaction.editReply({ content: [
       `📋 **Approvals now route into <#${forum.id}>:**`, ...lines, '',
-      '_New requests land in their thread. Anything already pending stays where it was posted — its links and buttons keep working._',
-      approvalChannelId(gid) ? null : 'ℹ️ _No single approval channel is set — that\'s fine, the forum covers everything, and sheet approval now counts as **on**._',
+      '_New requests land in their thread. Anything already pending stays where it was posted — its links still work._',
+      approvalChannelId(gid) ? null : '_No single approval channel is set — that\'s fine, the forum is enough._',
     ].filter(Boolean).join('\n') });
   }
   if (sub === 'scrollfont') {
@@ -7455,6 +7469,26 @@ async function handleConfig(interaction, forced) {
       + `• Stats: ${r.stats.map(x => r.labels[x]).join(' · ')}\n`
       + `• ${r.defence === 'ac' ? 'Attacks are rolled against Armour Class; a natural 20 always hits and crits.' : 'Blows are decided by opposed rolls; ties favour the attacker.'}\n`
       + `• ${r.id === 'dnd5e' ? 'Scores become modifiers, and proficiency grows with level.' : 'Stats are added to the die whole.'}` });
+  }
+
+  if (sub === 'npcforum') {
+    if (interaction.options?.getBoolean?.('disable')) {
+      setConfig(gid, { npc_forum: null });
+      return interaction.reply({ content: '🎭 NPC pages will no longer be kept. The pages already there stay where they are.' });
+    }
+    const channel = (forced?.channel ?? interaction.options?.getChannel?.('channel'));
+    if (!channel) {
+      const cur = getConfig(gid)?.npc_forum;
+      return interaction.reply({ ephemeral: true, content: cur
+        ? `🎭 Each NPC has a page in <#${cur}>, tagged with their categories.`
+        : '🎭 No NPC forum set. `/config channels npcforum channel:#your-forum` gives every NPC a page you can filter by category.' });
+    }
+    if (channel.type !== 15) {
+      return interaction.reply({ ephemeral: true, content: `❌ <#${channel.id}> is not a forum channel. Make a **Forum** — each NPC gets a thread there, tagged with their categories.` });
+    }
+    setConfig(gid, { npc_forum: channel.id });
+    await interaction.reply({ content: `🎭 NPC pages now live in <#${channel.id}> — a thread apiece, tagged by category. \`/npc sync\` writes up everyone already made.` });
+    return;
   }
 
   if (sub === 'quizforum') {
@@ -9878,31 +9912,68 @@ const SRD_SPELLS = [
 // see it. `essential` marks the ones a table notices immediately; the rest
 // are made too unless only the essentials were asked for.
 const SETUP_PLAN = [
-  { key: 'npc_channel_id',        name: 'npc-images',       forum: false, gm: true,  essential: true,
-    about: 'Upload a picture captioned with an NPC\'s name to give them a face.' },
+  { key: 'npc_forum',             name: 'npc-pages',        forum: true,  gm: true,  essential: true,
+    about: 'A page per NPC, tagged with their categories — filter the sidebar to sort them.' },
   { key: 'char_forum',            name: 'character-pages',  forum: true,  gm: false, essential: true,
     about: 'A page for each approved character.' },
-  { key: 'approval_channel_id',   name: 'sheet-approvals',  forum: false, gm: true,  essential: true,
-    about: 'New character sheets wait here for a GM.' },
   { key: 'quest_forum',           name: 'quest-board',      forum: true,  gm: false, essential: true,
     about: 'The board: a thread per posted quest.' },
-  { key: 'quest_plan_forum',      name: 'quest-planning',   forum: true,  gm: true,  essential: true,
-    about: 'Where quests are written and the pipeline books live.' },
   { key: 'quest_instance_forum',  name: 'quest-rooms',      forum: true,  gm: false, essential: true,
     about: 'Each started quest opens its party a room here.' },
   { key: 'quest_log_channel',     name: 'quest-chronicle',  forum: false, gm: false, essential: true,
     about: 'Finished quests, written up for everyone.' },
+  { key: 'memorial_public_channel', name: 'the-fallen',     forum: false, gm: false, essential: false,
+    about: 'Those who did not come back, remembered by the table.' },
+  { key: 'docs_player_channel',   name: 'player-reference', forum: false, gm: false, essential: false,
+    about: 'The player book alone, reposted whenever it changes.' },
+  { key: 'npc_channel_id',        name: 'npc-images',       forum: false, gm: true,  essential: true,
+    about: 'Upload a picture captioned with an NPC\'s name to give them a face.' },
+  { key: 'approval_routes', json: 'forum', name: 'approvals', forum: true, gm: true, essential: true,
+    about: 'A thread apiece for sheets, trades, duels, lore and exports — each waiting on a GM.' },
   { key: 'audit_routes', json: 'forum', name: 'roll-audit',  forum: true,  gm: true,  essential: true,
     about: 'A shelf per subject: rolls, checks, duels, items and the rest.' },
-  { key: 'memorial_channel',      name: 'the-fallen',       forum: false, gm: false, essential: false,
-    about: 'Those who did not come back.' },
-  { key: 'scroll_archive_id',     name: 'scroll-archive',   forum: true,  gm: true,  essential: false,
-    about: 'Every prop written, kept.' },
+  { key: 'quest_plan_forum',      name: 'quest-planning',   forum: true,  gm: true,  essential: true,
+    about: 'The pipeline books — concept, awaiting, approved, in progress, DMs, archived, completed.' },
+  { key: 'quest_thread_forum',    name: 'quest-threads',    forum: true,  gm: true,  essential: true,
+    about: 'A planning thread per quest, so the books keep the planning forum to themselves.' },
   { key: 'quiz_forum',            name: 'question-bank',    forum: true,  gm: true,  essential: false,
     about: 'The quiz bank, a thread per category.' },
+  { key: 'scroll_archive_id',     name: 'scroll-archive',   forum: true,  gm: true,  essential: false,
+    about: 'Every prop written, kept.' },
+  { key: 'memorial_channel',      name: 'memorial',         forum: false, gm: true,  essential: false,
+    about: 'The full record of a death — cause, deeds and standing — for GMs.' },
+  { key: 'backup_channel_id',     name: 'backups',          forum: false, gm: true,  essential: false,
+    about: 'Where the nightly backup of everything is posted.' },
   { key: 'docs_channel',          name: 'command-reference', forum: false, gm: true, essential: false,
     about: 'The command books, reposted whenever they change.' },
 ];
+
+// One category for the table, one for the GMs. The permissions sit on the
+// CATEGORY, so every channel inside inherits them — and anything added later
+// is private by being put in the right place, rather than by remembering.
+async function ensureSetupCategory(guild, gid, name, gmOnly) {
+  const { ChannelType, PermissionFlagsBits } = require('discord.js');
+  let cat = guild.channels.cache.find(c => c.type === ChannelType.GuildCategory && c.name === name);
+  if (!cat) {
+    const overwrites = [];
+    if (gmOnly) {
+      overwrites.push({ id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] });
+      for (const rid of getGmRoleIds(gid)) overwrites.push({ id: rid, allow: [PermissionFlagsBits.ViewChannel] });
+      const me = guild.members.me?.id;
+      if (me) overwrites.push({ id: me, allow: [PermissionFlagsBits.ViewChannel] });
+    }
+    cat = await guild.channels.create({ name, type: ChannelType.GuildCategory,
+      permissionOverwrites: overwrites.length ? overwrites : undefined });
+  } else if (gmOnly) {
+    // It already exists — make sure it is actually shut, and that the GM
+    // roles named since can see in.
+    try {
+      await cat.permissionOverwrites.edit(guild.roles.everyone.id, { ViewChannel: false });
+      for (const rid of getGmRoleIds(gid)) await cat.permissionOverwrites.edit(rid, { ViewChannel: true });
+    } catch { /* no permission to adjust — the channels still land inside */ }
+  }
+  return cat;
+}
 
 // Make one channel, or adopt the one already there. Returns what happened so
 // the reply can be honest about it.
@@ -9931,21 +10002,126 @@ async function setupOneChannel(guild, gid, plan, category) {
     writeId(named.id);
     return { state: 'adopted', id: named.id, name: plan.name };
   }
-  const overwrites = [];
-  if (plan.gm) {
-    // GM-only: hidden from everyone, opened to the GM roles.
-    overwrites.push({ id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] });
-    for (const rid of getGmRoleIds(gid)) overwrites.push({ id: rid, allow: [PermissionFlagsBits.ViewChannel] });
-  }
+  // No overwrites of its own: it inherits from the category it is put in,
+  // which is what keeps the two sections honest.
   const made = await guild.channels.create({
     name: plan.name,
     type: plan.forum ? ChannelType.GuildForum : ChannelType.GuildText,
     parent: category?.id ?? null,
     topic: plan.about.slice(0, 1000),
-    permissionOverwrites: overwrites.length ? overwrites : undefined,
   });
   writeId(made.id);
   return { state: 'made', id: made.id, name: plan.name };
+}
+
+// A category named when an NPC is created is made if it is new — so the
+// first enemy you write brings "Enemy" into being, and everyone after joins
+// it. Matching is case-insensitive, so "enemy" does not become a second one.
+function fileNpcByCategory(interaction, gid, npcName) {
+  const raw = (interaction.options?.getString?.('category') || '').trim().slice(0, 60);
+  if (!raw) return null;
+  const known = getCategories(gid).find(c => c.toLowerCase() === raw.toLowerCase());
+  const cat = known || raw;
+  if (!known) createCategory(gid, cat);
+  assignNpcToCategory(gid, npcName, cat);
+  return { cat, made: !known };
+}
+
+// ── The NPC forum ────────────────────────────────────────────
+// A thread per NPC, tagged with the categories they belong to — so Discord's
+// own filter does the sorting, and an NPC in three categories is still one
+// page rather than three. The npcs table stays the truth; this is the copy.
+
+// Discord allows a forum twenty tags. Categories beyond that simply go
+// untagged rather than the whole thing failing.
+async function ensureNpcTags(forum, gid) {
+  const want = getCategories(gid).slice(0, 20);
+  const have = forum.availableTags || [];
+  const missing = want.filter(c => !have.some(t => t.name.toLowerCase() === c.toLowerCase()));
+  if (missing.length && have.length + missing.length <= 20) {
+    try {
+      await forum.setAvailableTags([...have.map(t => ({ name: t.name, emoji: t.emoji, moderated: t.moderated })),
+        ...missing.map(c => ({ name: c.slice(0, 20) }))]);
+    } catch (err) { console.error('[npcforum] tags -', err?.message || err); }
+  }
+  const map = {};
+  for (const t of (await forum.fetch().catch(() => forum)).availableTags || []) map[t.name.toLowerCase()] = t.id;
+  return map;
+}
+
+// What an NPC's page says. Their statblock the way this server's rules read
+// it, their categories, their face, and whatever lore has been written.
+function npcPageBody(gid, npc) {
+  const rules = rulesFor(gid);
+  const cats = getCategoriesForNpc(gid, npc.name);
+  const lines = [`🎭 **${npc.name}**${npc.order_name ? ` — ${KNIGHT_EMOJIS[npc.order_name] ?? '⚪'} ${npc.order_name}` : ''}`];
+  if (rules.defence === 'ac') {
+    const mod = (st) => { const m = rules.statBonus(npc, st); return m >= 0 ? `+${m}` : `${m}`; };
+    lines.push(`🛡️ AC **${rules.targetNumber(npc)}** · ❤️ **${npc.hp_current}${npc.max_hp ? ` / ${npc.max_hp}` : ''}**`
+      + `${npc.attack_bonus != null ? ` · ⚔️ **+${npc.attack_bonus}**` : ''}${npc.damage_dice ? ` · 🎲 ${npc.damage_dice}` : ''}`);
+    lines.push(rules.stats.map(st => `${rules.labels[st]} ${npc[st] ?? 10} (${mod(st)})`).join(' · '));
+  } else {
+    lines.push(rules.stats.map(st => `${rules.labels[st]} ${npc[st] ?? 0}`).join(' ')
+      + ` | ❤️ ${npc.hp_current}/${maxHpFromCon(gid, npc.con)}`);
+  }
+  if (cats.length) lines.push(`📁 ${cats.join(' · ')}`);
+  const face = npcFace(gid, npc);
+  if (face) lines.push(face);
+  if (npc.lore) lines.push('', String(npc.lore).slice(0, 900));
+  return lines.join('\n').slice(0, 1990);
+}
+
+// Make the page, or bring it up to date. Best-effort throughout: an NPC is
+// saved whether or not the forum takes them.
+async function mirrorNpcSheet(client, gid, name) {
+  const forumId = getConfig(gid)?.npc_forum;
+  if (!forumId) return null;
+  const npc = getNpc(gid, name);
+  if (!npc) return null;
+  const forum = await client.channels.fetch(forumId).catch(() => null);
+  if (!forum || forum.type !== 15) return null;
+
+  const tagMap = await ensureNpcTags(forum, gid);
+  const tags = getCategoriesForNpc(gid, name)
+    .map(c => tagMap[c.toLowerCase()]).filter(Boolean).slice(0, 5);
+  const body = npcPageBody(gid, npc);
+  let row = null;
+  try { row = db.prepare('SELECT * FROM npc_pages WHERE guild_id=? AND name=?').get(gid, name); } catch {}
+
+  if (row?.thread_id) {
+    const th = await client.channels.fetch(row.thread_id).catch(() => null);
+    if (th?.isThread?.() && th.parentId === forum.id) {
+      await wakeThread(th);
+      try { if (tags.length) await th.setAppliedTags(tags); } catch {}
+      try {
+        const msg = row.message_id ? await th.messages.fetch(row.message_id).catch(() => null) : null;
+        if (msg) { await msg.edit({ content: body, allowedMentions: { parse: [] } }); return th; }
+      } catch { /* the starter is gone — post a fresh one below */ }
+      const m = await th.send({ content: body, allowedMentions: { parse: [] } });
+      db.prepare('UPDATE npc_pages SET message_id=?, at=? WHERE guild_id=? AND name=?').run(m.id, Date.now(), gid, name);
+      return th;
+    }
+    // The thread was deleted — forget it and make another.
+    try { db.prepare('DELETE FROM npc_pages WHERE guild_id=? AND name=?').run(gid, name); } catch {}
+  }
+
+  const thread = await forum.threads.create({
+    name: name.slice(0, 100), autoArchiveDuration: 10080,
+    appliedTags: tags.length ? tags : undefined,
+    message: { content: body, allowedMentions: { parse: [] } },
+  });
+  const starter = await thread.fetchStarterMessage().catch(() => null);
+  db.prepare(`INSERT INTO npc_pages (guild_id, name, thread_id, message_id, at) VALUES (?,?,?,?,?)
+              ON CONFLICT(guild_id, name) DO UPDATE SET thread_id=excluded.thread_id,
+                message_id=excluded.message_id, at=excluded.at`)
+    .run(gid, name, thread.id, starter?.id ?? null, Date.now());
+  return thread;
+}
+
+// Fire and forget: a page is never worth delaying a command for.
+function touchNpcPage(gid, name) {
+  (async () => { try { await mirrorNpcSheet(client, gid, name); }
+    catch (err) { console.error('[npcforum]', err?.message || err); } })();
 }
 
 // ── The library ───────────────────────────────────────────────
@@ -10237,13 +10413,16 @@ async function handleNpcCreate5e(interaction) {
   };
   for (const st of rules.stats) row[st] = interaction.options.getInteger(st) ?? 10;
   upsertNpc(gid, name, row);
+  const filed5 = fileNpcByCategory(interaction, gid, name);
+  touchNpcPage(gid, name);
   const npc = getNpc(gid, name);
   const mod = (st) => { const m = rules.statBonus(npc, st); return m >= 0 ? `+${m}` : `${m}`; };
   return interaction.reply({ content: [
     `✅ **${name}** stands ready.`,
     `🛡️ AC **${row.armour_class}** · ❤️ HP **${hp}** · ⚔️ attack **+${row.attack_bonus}** · 🎲 damage **${dmg}**`,
     rules.stats.map(st => `${rules.labels[st]} ${npc[st]} (${mod(st)})`).join(' · '),
-  ].join('\n') });
+    filed5 ? `📁 Filed under **${filed5.cat}**${filed5.made ? ' — a new category' : ''}.` : null,
+  ].filter(Boolean).join('\n') });
 }
 
 // A 5e sheet in one command. Scores in, everything derived: modifiers,
@@ -11011,6 +11190,19 @@ client.on('interactionCreate', async interaction => {
         const hits = Object.keys(rules.skills || {}).filter(x => !v || x.includes(v)).slice(0, 25);
         return await interaction.respond(hits.map(x => ({
           name: `${x.replace(/\b\w/g, c => c.toUpperCase())} (${rules.labels[rules.skills[x]]})`.slice(0, 100), value: x })));
+      }
+      // NPC categories: the ones this server uses, plus whatever is typed —
+      // naming a new one here is how it comes into being.
+      if (interaction.commandName === 'npc' && focusedOption.name === 'category') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        const typed = String(focusedOption.value || '').trim();
+        const known = getCategories(interaction.guild.id);
+        const hits = known.filter(x => !v || x.toLowerCase().includes(v)).slice(0, 24);
+        if (typed && !known.some(x => x.toLowerCase() === v)) hits.unshift(typed);
+        // A server with none yet gets somewhere to start.
+        const seed = known.length ? [] : ['Enemy', 'Ally', 'Vendor', 'Quest'];
+        return await interaction.respond([...hits, ...seed].slice(0, 25)
+          .map(x => ({ name: x.slice(0, 100), value: x.slice(0, 100) })));
       }
       if (interaction.commandName === 'quiz' && focusedOption.name === 'category') {
         const v = String(focusedOption.value || '').toLowerCase();
@@ -12736,26 +12928,20 @@ function turnPing(gid, f) {
   if (!f || f.isNpc || !getConfig(gid)?.fight_ping) return '';
   return ` <@${f.id}>`;
 }
-// Mirror a roll to the GM audit channel (set with /config channels rollaudit).
-// Fire-and-forget: an unset, deleted, or unreadable channel must never break
-// the roll itself. Covers player rolls AND GM rolls (including secret ones, so
-// GMs are accountable to each other). NPC auto-rolls are not mirrored.
-// `messageId` links straight to the roll. For slash commands there's no user
-// message, so callers pass the interaction and we resolve its reply instead.
-// Count a roll toward the character's lifetime tally, then mirror it. Every
-// roll path already calls mirrorRoll, so this is the one place that sees them
-// all — auto rolls have no userId and are skipped, as they belong to no sheet.
-// Make sure every shelf the code knows about exists in the audit forum,
-// adopting any that already do. Returns what was made and what was found,
-// or null when there's no audit forum to mend.
-async function ensureAuditBooks(client, gid) {
-  const prev = auditRoutes(gid) || {};
+
+
+// One forum, a thread per kind. The audit shelves and the approval threads
+// are the same shape — adopt a surviving thread by id so every link already
+// pointing at one stays good, otherwise make it — so they share a builder
+// and cannot drift apart.
+async function ensureForumThreads(client, gid, { configKey, types, routesOf }) {
+  const prev = routesOf(gid) || {};
   if (!prev.forum) return null;
   const forum = await client.channels.fetch(prev.forum).catch(() => null);
   if (!forum || forum.type !== 15) return { error: `<#${prev.forum}> isn't a forum any more.` };
   const routes = { forum: forum.id };
   const made = [], kept = [];
-  for (const [key, t] of Object.entries(AUDIT_KINDS)) {
+  for (const [key, t] of Object.entries(types)) {
     let thread = null;
     if (prev[key]) {
       try {
@@ -12765,14 +12951,19 @@ async function ensureAuditBooks(client, gid) {
     }
     if (!thread) {
       thread = await forum.threads.create({ name: t.name, autoArchiveDuration: 10080,
-        message: { content: `${t.about}\n_I wake this thread whenever a new entry arrives — no need to keep it active._` } });
+        message: { content: `${t.about}\n_I wake this thread whenever something new arrives — no need to keep it active._` } });
       made.push(t.name);
     }
     routes[key] = thread.id;
   }
-  setConfig(gid, { audit_routes: JSON.stringify(routes) });
+  setConfig(gid, { [configKey]: JSON.stringify(routes) });
   return { made, kept };
 }
+
+const ensureAuditBooks = (client, gid) =>
+  ensureForumThreads(client, gid, { configKey: 'audit_routes', types: AUDIT_KINDS, routesOf: auditRoutes });
+const ensureApprovalThreads = (client, gid) =>
+  ensureForumThreads(client, gid, { configKey: 'approval_routes', types: APPROVAL_TYPES, routesOf: approvalRoutes });
 
 // The same for the quest pipeline's books.
 async function ensureQuestBooks(client, guild, gid) {
@@ -16176,6 +16367,8 @@ async function handleNpc(interaction) {
       upsertNpc(gid, name, { hp_current: maxHpFromCon(gid, made?.con) });
     }
 
+    const filed = fileNpcByCategory(interaction, gid, name);
+    touchNpcPage(gid, name);
     const madeNpc = getNpc(gid, name);
     const orderLine = (order ? ` | ${KNIGHT_EMOJIS[order]??'⚪'} ${order}` : '')
       + (madeNpc?.class ? ` | 🏅 ${madeNpc.class}` : '');
@@ -16191,6 +16384,10 @@ async function handleNpc(interaction) {
       ? `\n📝 ${unlisted.map(w => `**${w}**`).join(' and ')} ${unlisted.length === 1 ? 'is' : 'are'} not on the weapon list, so ${unlisted.length === 1 ? 'it restricts' : 'they restrict'} nothing. \`/char weapon add\` to give ${unlisted.length === 1 ? 'it' : 'them'} stat rules.`
       : '';
     await interaction.reply({ content: `✅ NPC **${name}** ${existed ? 'updated' : 'created'}.${orderLine}${statNote}${unlistedNote}\n💡 Upload an image to the NPC channel with \`${name}\` as the message text to set their avatar.` });
+    if (filed) {
+      await interaction.followUp({ ephemeral: true, content:
+        `\u{1f4c1} Filed under **${filed.cat}**${filed.made ? ' \u2014 a new category, made just now' : ''}.` }).catch(()=>{});
+    }
     registerSlashCommands(gid).catch(console.error);
   }
 
@@ -16365,6 +16562,22 @@ async function handlePr(interaction) {
   // Delegate create/delete/list to handleNpc
   if (sub === 'create' || sub === 'delete' || sub === 'list') {
     return handleNpc(interaction);
+  }
+
+  if (sub === 'sync') {
+    if (!getConfig(gid)?.npc_forum) {
+      return interaction.reply({ ephemeral: true, content: '❌ No NPC forum set — `/config channels npcforum channel:#your-forum` first.' });
+    }
+    const one = interaction.options.getString('name');
+    const list = one ? [getNpc(gid, one)].filter(Boolean) : getAllNpcs(gid);
+    if (!list.length) return interaction.reply({ content: one ? `❌ No NPC called **${one}**.` : '❌ No NPCs yet.', ephemeral: true });
+    await interaction.deferReply({ ephemeral: true });
+    let done = 0, failed = 0;
+    for (const n of list) {
+      try { await mirrorNpcSheet(interaction.client, gid, n.name); done++; }
+      catch { failed++; }
+    }
+    return interaction.editReply({ content: `🎭 Wrote up **${done}** NPC${done === 1 ? '' : 's'}${failed ? ` · ${failed} failed` : ''}.` });
   }
 
   if (sub === 'create5e') return handleNpcCreate5e(interaction);
@@ -16820,6 +17033,8 @@ const HELP_CATEGORIES = {
       'Some scenes offer **choices** as buttons; some tally renown as you play and bank it at the end',
       '`/activity demo` — the built-in fishing tale, no stakes (GM)',
       '_In 5e, an attack is measured against the target\'s Armour Class — nobody rolls to defend, and the blow resolves at once. A natural 20 always hits and rolls the weapon dice twice; a natural 1 always misses._',
+      '`/config channels npcforum channel:#forum` — every NPC gets a page there, tagged with their categories so the sidebar filter sorts them (Admin)',
+      '`/npc create name:X category:Enemy` · `/npc sync [name:]` — name a category as you make them and it is created if new; sync writes up everyone already made (GM)',
       '`/library srd` · `/library summon name: [count:] [as:]` — keep monsters and spells once, then bring one out as an NPC ready to fight. The SRD set ships with the bot (GM)',
       '`/library import file: | paste:` · `/library list` · `/library show` · `/library forget` — read in your own: one entry a line, `[MONSTER] Goblin | ac 15 | hp 7 | attack +4 | damage 1d6+2` (GM)',
       '`/npc create5e name: ac: hp: attack: damage:` — a monster from its statblock; it then fights by its own numbers (GM, 5e)',
@@ -16898,7 +17113,7 @@ const HELP_CATEGORIES = {
       '`/gm kill user:@a` / `/gm revive user:@a` — mark a character fallen and post their memorial, or bring them back (GM)',
       '`/gm test quest/npc/list/clean` — throwaway fixtures for trying things out, and the broom that clears them (GM)',
       '`/gm questwipe [runs:true]` — delete every quest on the server, confirm-gated; the run ledger and DM counters survive unless runs:true (GM)',
-      '`/gm check build:true` — the one-command setup: makes every channel and forum the bot needs, points the config at each, and fills them. Adopts anything already there, so it is safe to run on a server set up by hand (Admin)',
+      '`/gm check build:true` — the one-command setup: makes every channel and forum the bot needs in two sections — **DDice** open to the table, **DDice · Game Masters** shut to everyone else — wires the config and fills them. Adopts anything already there, so it is safe to run on a server set up by hand (Admin)',
       '`/gm check run:true` — build anything missing: audit shelves, pipeline books and tags. Adopts what exists, so it is safe to run any time — pull it after an update adds a book (GM)',
       '`/gm check` — the setup mirror: every channel-backed feature, unset first with the command that sets it, then the set ones with links — stored ids are verified live (GM)',
       '`/config channels questforum channel:#forum` — the board becomes a forum: one thread per quest, lifecycle mirrored in, archived on completion (Admin)',
@@ -18327,26 +18542,33 @@ async function runFullSetup(interaction) {
 
   // Everything lands in one category, so a server does not sprout a dozen
   // loose channels.
-  let category = guild.channels.cache.find(c => c.type === ChannelType.GuildCategory && c.name === 'DDice');
-  if (!category) {
-    try { category = await guild.channels.create({ name: 'DDice', type: ChannelType.GuildCategory }); }
-    catch { category = null; }
+  let openCat = null, gmCat = null;
+  try { openCat = await ensureSetupCategory(guild, gid, 'DDice', false); } catch {}
+  try { gmCat = await ensureSetupCategory(guild, gid, 'DDice · Game Masters', true); } catch {}
+  if (!getGmRoleIds(gid).length) {
+    await interaction.followUp({ ephemeral: true, content:
+      '⚠️ No GM role is set, so the Game Masters section is shut to everyone but me. Run `/config mechanics gmrole role:@GM`, then this command again to open it to them.' }).catch(() => {});
   }
 
-  const made = [], adopted = [], kept = [], failed = [];
+  const open = { made: [], adopted: [], kept: [] };
+  const gm = { made: [], adopted: [], kept: [] };
+  const failed = [];
   for (const plan of SETUP_PLAN) {
     try {
-      const r = await setupOneChannel(guild, gid, plan, category);
-      ({ made, adopted, kept })[r.state === 'made' ? 'made' : r.state === 'adopted' ? 'adopted' : 'kept']
-        .push(`<#${r.id}>`);
+      const r = await setupOneChannel(guild, gid, plan, plan.gm ? gmCat : openCat);
+      (plan.gm ? gm : open)[r.state].push(`<#${r.id}>`);
     } catch (err) {
       failed.push(`${plan.name} — ${err?.message || err}`);
     }
   }
+  const made = [...open.made, ...gm.made];
+  const adopted = [...open.adopted, ...gm.adopted];
+  const kept = [...open.kept, ...gm.kept];
 
   // Now fill them: the audit shelves, the quest books, the pipeline tags.
   const audit = await ensureAuditBooks(interaction.client, gid).catch(() => null);
   const quests = await ensureQuestBooks(interaction.client, guild, gid).catch(() => null);
+  const appr = await ensureApprovalThreads(interaction.client, gid).catch(() => null);
   let tags = false;
   try {
     const tagForumId = getConfig(gid)?.quest_thread_forum ?? getConfig(gid)?.quest_plan_forum;
@@ -18356,16 +18578,26 @@ async function runFullSetup(interaction) {
     }
   } catch {}
 
-  const lines = ['🏗️ **Setup complete.**', ''];
-  if (made.length) lines.push(`✨ **Made ${made.length}:** ${made.join(' ')}`);
-  if (adopted.length) lines.push(`🤝 **Adopted ${adopted.length}** already named for the job: ${adopted.join(' ')}`);
-  if (kept.length) lines.push(`👍 **Left alone ${kept.length}** already set: ${kept.join(' ')}`);
+  const section = (title, g) => {
+    const all = [...g.made, ...g.adopted, ...g.kept];
+    if (!all.length) return [];
+    const out = [`**${title}**`, all.join(' ')];
+    const notes = [g.made.length && `${g.made.length} made`, g.adopted.length && `${g.adopted.length} adopted`,
+                   g.kept.length && `${g.kept.length} already set`].filter(Boolean);
+    if (notes.length) out.push(`_${notes.join(' · ')}_`);
+    return [...out, ''];
+  };
+  const lines = ['🏗️ **Setup complete.**', '',
+    ...section('🌍 DDice — open to the table', open),
+    ...section('🔒 DDice · Game Masters — GMs only', gm)];
   if (failed.length) lines.push('', '⚠️ **Could not make:**', ...failed.slice(0, 6).map(x => `• ${x}`));
   lines.push('');
   if (audit?.made?.length) lines.push(`🎲 Audit shelves built: ${audit.made.length}`);
   else if (audit) lines.push('🎲 Audit shelves already there');
   if (quests?.made?.length) lines.push(`🗺️ Quest books built: ${quests.made.length}`);
   else if (quests) lines.push('🗺️ Quest books already there');
+  if (appr?.made?.length) lines.push(`📋 Approval threads built: ${appr.made.length}`);
+  else if (appr) lines.push('📋 Approval threads already there');
   if (tags) lines.push('🏷️ Pipeline tags checked');
   lines.push('', '_What is left is yours to decide:_ `/config mechanics gmrole` names your GMs, '
     + '`/config channels ruleset` picks the rules, and `/config channels docs` needs your repo. '
@@ -18396,6 +18628,7 @@ async function runSetupRepair(interaction) {
   }
 
   const quests = await ensureQuestBooks(interaction.client, interaction.guild, gid).catch(err => ({ error: err?.message || String(err) }));
+  const appr2 = await ensureApprovalThreads(interaction.client, gid).catch(err => ({ error: err?.message || String(err) }));
   if (!quests) lines.push('🗺️ Quest planning forum — _not set; `/config channels questplanning` first_');
   else if (quests.error) lines.push(`🗺️ Quest planning forum — ⚠️ ${quests.error}`);
   else {
@@ -18403,6 +18636,15 @@ async function runSetupRepair(interaction) {
     lines.push(quests.made.length
       ? `🗺️ Quest pipeline — **built ${quests.made.length}**: ${quests.made.join(', ')}`
       : `🗺️ Quest pipeline — all ${quests.kept.length} books already there`);
+  }
+
+  if (!appr2) lines.push('📋 Approval forum — _not set; `/config channels approvalforum` first_');
+  else if (appr2.error) lines.push(`📋 Approval forum — ⚠️ ${appr2.error}`);
+  else {
+    built += appr2.made.length;
+    lines.push(appr2.made.length
+      ? `📋 Approvals — **built ${appr2.made.length}**: ${appr2.made.join(', ')}`
+      : `📋 Approvals — all ${appr2.kept.length} threads already there`);
   }
 
   // Tags follow the books — whichever forum the threads live in.
