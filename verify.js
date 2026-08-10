@@ -1141,20 +1141,24 @@ function testPins(src) {
     ok('button routing is wrapped', /try \{\s*return await routeButton\(interaction\);/.test(src));
     ok('a thrown button is logged with its id', /console\.error\('\[button\]', interaction\.customId/.test(src));
 
-    // KNOWN SHARP EDGE, not fixed. /gm dc packs its payload into the button
-    // customId including two free-text options: long text overflows the
-    // 100-char ceiling and the reply throws, and a colon inside it shifts
-    // every field in the split. This does not demand a fix — it fails if the
-    // payload grows another field, which is what turns a latent bug into a
-    // constant one. HANDOFF.md §7.1.
+    // FIXED 2026-08-10: /gm dc used to pack two free-text options into the
+    // button customId — long text overflowed the 100-char ceiling and a
+    // colon shifted the whole split. The marks now ride the dc_cards row
+    // keyed by the card's message; the id carries numerics and short tokens
+    // only. These pin the fixed shape so the free text cannot creep back.
     const dcroll = src.match(/setCustomId\(`dcroll:[^`]*`\)/);
-    ok('the dcroll payload still exists to be measured', !!dcroll);
+    ok('the dcroll id still exists to be measured', !!dcroll);
     if (dcroll) {
       const holes = (dcroll[0].match(/\$\{/g) || []).length;
-      ok(`dcroll carries no more than twelve fields (has ${holes})`, holes <= 12);
-      ok('dcroll is still parsed by a plain split — colons in free text will shift it',
-        /const \[, uid, field, dcS, gmMode, flatS, modS, secS, onFailRaw, dmgS, onSuccRaw, sDmgS\] = interaction\.customId\.split\(':'\)/.test(src));
+      ok(`dcroll carries ten fields at most (has ${holes})`, holes <= 10);
+      ok('no free text rides the dcroll id', !/dcroll:[^`]*onFail/.test(dcroll[0]) && !/dcroll:[^`]*onSucc/.test(dcroll[0]));
     }
+    ok('the press reads its marks from the card row',
+      /const marks = getDcCard\(interaction\.guild\.id, interaction\.message\?\.id\)/.test(src));
+    ok('the card is saved whenever a press will need it',
+      /if \(ids\.length && \(sF \|\| fF \|\| sS \|\| fS \|\| onFail \|\| onSucc\)\)/.test(src));
+    ok('the mark columns exist',
+      /ALTER TABLE dc_cards ADD COLUMN s_mark TEXT/.test(src) && /ALTER TABLE dc_cards ADD COLUMN f_mark TEXT/.test(src));
 
     // The NPC forum folds by category: one thread per category, every NPC an
     // entry inside it. Three things make that work, and each fails silently
@@ -1164,7 +1168,64 @@ function testPins(src) {
       /function npcHomeCategory\([\s\S]{0,300}?ORDER BY rowid LIMIT 1/.test(src));
     ok('an NPC with no category still has a home', /const NPC_NO_CATEGORY = 'Uncategorised';/.test(src));
     ok('the category thread is made once and reused',
-      /async function ensureCategoryThread\([\s\S]{0,400}?SELECT thread_id FROM npc_category_threads/.test(src));
+      /async function ensureCategoryThread\([\s\S]{0,500}?SELECT thread_id FROM \$\{table\}/.test(src));
+    // The portrait forum mirrors the page forum. Three things carry it, and
+    // each is silent when it breaks: the table whitelist (a bad kind would
+    // otherwise write into the wrong forum's map), the parentId check (a
+    // forum bank receives uploads in threads, never in the forum itself),
+    // and the guard that stops the bot answering every image on the server.
+    ok('the two forums keep separate thread maps',
+      /const NPC_THREAD_TABLES = \{ pages: 'npc_category_threads', portraits: 'npc_portrait_threads' \};/.test(src));
+    ok('the thread table is whitelisted, never user input',
+      /NPC_THREAD_TABLES\[kind\] \|\| NPC_THREAD_TABLES\.pages/.test(src));
+    ok('a portrait posted in a category thread is still recognised',
+      /message\.channel\.parentId === bankId/.test(src));
+    ok('the bot only answers images inside the bank',
+      /const inBank = !!bankId &&/.test(src) &&
+      !/No NPC image channel is set/.test(src));
+    ok('a text-channel bank still works', /message\.channel\.id === bankId/.test(src));
+    // The creation reply points at the exact portrait thread, or the bank,
+    // or \u2014 with none set \u2014 at the config command. Without this line the
+    // portrait forum is invisible until stumbled on.
+    ok('creating an NPC points at where their face goes',
+      /function portraitHint\(gid, npcName\)/.test(src) && /\$\{portraitHint\(gid, name\)\}/.test(src));
+    // Rename works IN PLACE. Membership rowids decide every member's home
+    // category, so delete-and-recreate would re-home NPCs whose first
+    // category this is. The three UPDATEs are the feature.
+    ok('categoryrename updates rather than recreates',
+      /UPDATE npc_categories SET name=\? WHERE guild_id=\? AND name=\?/.test(src) &&
+      /UPDATE npc_category_members SET category=\? WHERE guild_id=\? AND category=\?/.test(src) &&
+      /UPDATE \$\{table\} SET category=\? WHERE guild_id=\? AND category=\?/.test(src));
+    ok('categoryrename refuses a name already in use',
+      /merging categories is a different thing/.test(src));
+    ok('the forum lifecycle can be exercised live',
+      /setName\('forum'\)\.setDescription\('Exercise the NPC forums end to end/.test(src) &&
+      /if \(sub === 'forum'\) \{/.test(src));
+
+    ok('a new category opens its portrait thread at once',
+      /createCategory\(gid, name\);[\s\S]{0,300}?ensurePortraitThreads\(interaction\.client, gid\)/.test(src));
+    ok('the rebuild mirrors the portrait forum too',
+      /async function rebuildNpcForum\([\s\S]{0,1800}?await ensurePortraitThreads\(client, gid\)/.test(src));
+    // Deleting a category must not strand its threads. The sweep closes the
+    // thread in BOTH forums, drops both mappings, and re-homes every NPC that
+    // lived there — reading the orphan list BEFORE the membership rows go,
+    // because afterwards there is nothing left to read.
+    ok('categorydelete reads its orphans before deleting',
+      /const orphans = getNpcsInCategory\(gid, name\);\s*\n\s*deleteCategory\(gid, name\);/.test(src));
+    ok('categorydelete sweeps both thread tables',
+      /for \(const table of Object\.values\(NPC_THREAD_TABLES\)\)[\s\S]{0,400}?DELETE FROM \$\{table\} WHERE guild_id=\? AND category=\?/.test(src));
+    ok('categorydelete re-homes the orphans',
+      /for \(const npcName of orphans\) await mirrorNpcSheet\(client, gid, npcName\)/.test(src));
+    // Re-homing on assign and remove rides touchNpcPage -> mirrorNpcSheet's
+    // move logic. If either drops the call, an NPC whose home category
+    // changes keeps a stale entry in the old thread.
+    ok('assigning a category refreshes the entry',
+      /function assignNpcToCategory\([\s\S]{0,220}?touchNpcPage\(gid, npcName\);/.test(src));
+    ok('removing a category refreshes the entry',
+      /function removeNpcFromCategory\([\s\S]{0,220}?touchNpcPage\(gid, npcName\);/.test(src));
+
+    ok('portrait mirroring skips a non-forum bank',
+      /async function ensurePortraitThreads\([\s\S]{0,400}?forum\.type !== 15\) return 0;/.test(src));
     ok('a moved NPC leaves their old thread first',
       /if \(row\?\.thread_id && row\.thread_id !== thread\.id\)[\s\S]{0,400}?msg\.delete\(\)/.test(src));
     ok('deleting an NPC removes their entry, not the thread',

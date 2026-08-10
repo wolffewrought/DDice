@@ -379,7 +379,7 @@ CONTENT = [
           ('/config mechanics autorest action:Add or update name:Breather \\\n  hours:6 hp:50% rerolls:0% heal:0%', 'a light top-up'),
           ('/config mechanics autorest action:Run now name:Breather', 'fire one immediately'),
           ('/config channels ruleset system:knightfall', 'which rules this server plays by \u2014 Knightfall\n(five stats, blows decided by opposed rolls) or\nD&D 5e by the SRD (six abilities as modifiers,\nproficiency growing with level, attacks rolled\nagainst Armour Class). Set it BEFORE anyone makes a\ncharacter: it refuses to change once sheets exist,\nbecause a sheet written for one system cannot be\nread as another. Run it bare to see which rules\nare in force'),
-          ('/config channels npcchannel #channel', 'set the NPC image bank channel'),
+          ('/config channels npcchannel #channel', 'set the NPC portrait forum \u2014 a thread per category'),
           ('/config mechanics npcreroll threshold:8', 'NPC auto-reroll on nat ≤ N — 0 disables'),
           ('/config mechanics fightping enabled:true', '@-mention players on their turn — off by default'),
           ('/config channels rollaudit channel:#gm-rolls', 'mirror every roll — raw input,\nresult and jump link'),
@@ -655,7 +655,7 @@ CONTENT = [
           ('/npc sync [name:]', 'write up everyone already made')]),
 ('note', 'Twenty tags is Discord\u2019s limit for a forum. Beyond that, NPCs are still given pages \u2014 they simply go untagged rather than the whole thing failing. Deleting an NPC takes their page with them.'),
 ('h2', 'Setting NPC Avatars'),
-('p', '1. Admin runs <b>/config channels npcchannel #channel</b> to set the image bank channel.<br/>'
+('p', '1. Admin runs <b>/config channels npcchannel #channel</b> to set the portrait forum.<br/>'
       '2. ' + GM + ' uploads an image to that channel with the NPC name as the message text.<br/>'
       '3. Bot adds a checkmark reaction to confirm.  4. Re-upload with the same name to update.'),
 ('h2', 'One Face for a Whole Order'),
@@ -1346,6 +1346,7 @@ CONTENT = [
 ('code', [('/gm test quest', 'a quest with you on the party, in this channel'),
           ('/gm test npc', 'an NPC with items, standing, rolls and lore already on it'),
           ('/gm test list', 'what it has made'),
+          ('/gm test forum', 'exercise the NPC forums live, tidying up after itself'),
           ('/gm test clean', 'delete all of it \u2014 asks first')]),
 ('p', 'The test quest arrives ready to start, so the clock, the reminders, the timeline and the summary can '
       'all be exercised in a few minutes. The test NPC arrives with a record already on it, so '

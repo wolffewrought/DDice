@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 613 assertions passed and no scanner found an ERROR.
+Green means 629 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -149,26 +149,12 @@ customId), then chat input commands.
 
 ## 7 · Open items
 
-**1. `/gm dc` packs its payload into the button customId.** Not fixed —
-awaiting a decision.
-
-```
-dcroll:uid:field:dc:mode:flat:mod:sec:onFail:damage:onSucc:sDamage
-```
-
-`on_fail` and `on_success` are free-text string options. Two failure modes:
-long text pushes the id past Discord's 100-char ceiling and
-`interaction.reply()` throws, killing the command; and a colon anywhere in
-that text shifts every field after it in `split(':')`. LIMITS.md §2 names
-this exact pattern. The comment above it still says "≈ 45 chars", accurate
-when the payload had six fields, before five more were added.
-
-A `dc_cards` table already exists, keyed by `(guild_id, message_id)` and
-holding flavour and sanction text. Moving the free-text fields there and
-keeping only numerics in the id fixes both modes and fits the existing
-pattern — but the card is deliberately stateless ("a restart forgets
-nothing, and a pressed button simply goes dark"), so it is a real trade.
-The `pins` harness fails if the payload grows a thirteenth field.
+**1. FIXED — `/gm dc` free text moved onto the card row.** The customId now
+carries ten numeric/short tokens; `on_fail` and `on_success` live in
+`dc_cards.s_mark` / `f_mark`, keyed by the card's message and read on press.
+A card older than the weekly prune loses its marks — the same graceful dark
+a pressed button always had after a restart. Pinned so the text cannot creep
+back into the id.
 
 **2. `/npc` is at 24 of 25 leaves, `/quest` at 23.** The next subcommand on
 either must join a group, as `/config` and `/gm` already do.
@@ -180,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 613 assertions covering structure, registration and ruleset
+now is 629 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -259,6 +245,34 @@ quest-copy feature would have died silently.
 User-facing wording follows the channel: "party room" is now "quest thread"
 throughout. Internal variable names (`const room = opened.thread`,
 `born.room`) still say room and are invisible to users.
+
+### Live-fire: `/gm test forum`
+
+The structural pins prove the code says the right things; only Discord
+proves it does them. `/gm test forum` runs the whole lifecycle against the
+real API with `[test]`-prefixed fixtures: two categories open threads in both
+forums, two NPCs land as entries, one moves home (the entry must change
+threads), one is deleted (entry gone, thread stays), a category is deleted
+(thread closes), then everything tears itself down. Each step reports ✅/❌
+inline. Run it on a test server after any forum-path change.
+
+### Category rename
+
+`/npc categoryrename name: to:` renames **in place** — three UPDATEs across
+`npc_categories`, `npc_category_members` and both thread tables. In place
+matters: membership **rowids decide every member's home category**, so
+delete-and-recreate would silently re-home NPCs whose first category this
+is. The Discord thread and the forum tag follow, best-effort — thread
+renames are rate-limited to ~2 per 10 minutes, so a second rename inside
+that window keeps the mapping and the name catches up on the next sweep.
+Renaming onto an existing category is refused; merging is `/npc
+categoryassign` plus deleting the empty one.
+
+### Portrait discoverability
+
+`portraitHint(gid, npcName)` closes the loop: every NPC creation reply ends
+with where to post their face — the exact category thread if the bank is a
+forum, the channel if not, the config command if nothing is set.
 
 ## 7c · Patching discipline
 

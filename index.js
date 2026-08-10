@@ -678,6 +678,11 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS dc_cards (
   s_flavour TEXT, f_flavour TEXT, s_sanction TEXT, f_sanction TEXT,
   created_at INTEGER NOT NULL, PRIMARY KEY (guild_id, message_id)
 )`); } catch (e) { console.error('dc_cards schema', e); }
+// The on_fail / on_success marks moved off the customId and onto the card:
+// free text in an id overflows Discord's 100-char ceiling, and a colon in it
+// shifts every field after it in the split.
+try { db.exec('ALTER TABLE dc_cards ADD COLUMN s_mark TEXT'); } catch {}
+try { db.exec('ALTER TABLE dc_cards ADD COLUMN f_mark TEXT'); } catch {}
 // Grappling: which attack-phase roll is pending, and who holds whom.
 try { db.exec('ALTER TABLE fights ADD COLUMN atk_kind TEXT'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN grapples TEXT DEFAULT '{}'"); } catch {}
@@ -3318,6 +3323,18 @@ function getCategoriesForNpc(gid, npcName) {
 // decision and the others are additions to it. Every category they hold
 // still shows on their page.
 const NPC_NO_CATEGORY = 'Uncategorised';
+// Where to post their face — the exact thread if the portrait bank is a
+// forum with one, the channel if not, and a nudge to set one up otherwise.
+function portraitHint(gid, npcName) {
+  const bankId = getConfig(gid)?.npc_channel_id;
+  if (!bankId) return '\n💡 Give them a face: `/config channels npcchannel channel:#a-forum`, then post a picture captioned `' + npcName + '`.';
+  let threadId = null;
+  try {
+    threadId = db.prepare('SELECT thread_id FROM npc_portrait_threads WHERE guild_id=? AND category=?')
+      .get(gid, npcHomeCategory(gid, npcName))?.thread_id || null;
+  } catch {}
+  return `\n💡 Give them a face: post a picture in <#${threadId || bankId}> captioned \`${npcName}\`.`;
+}
 function npcHomeCategory(gid, npcName) {
   const row = db.prepare('SELECT category FROM npc_category_members WHERE guild_id=? AND npc_name=? ORDER BY rowid LIMIT 1')
     .get(gid, npcName);
@@ -5252,6 +5269,7 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('npc').setDescription('An NPC with stats, items, standing and a roll history already on it'));
       g.addSubcommand(s=>s.setName('list').setDescription('Everything /gm test has created'));
       g.addSubcommand(s=>s.setName('clean').setDescription('Delete every test quest and NPC this made'));
+      g.addSubcommand(s=>s.setName('forum').setDescription('Exercise the NPC forums end to end, then clean up after itself'));
       return g;
     }),
 
@@ -5747,6 +5765,9 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('categorylist').setDescription('List all NPC categories'))
     .addSubcommand(s=>s.setName('categorycreate').setDescription('Create a new NPC category')
       .addStringOption(o=>o.setName('name').setDescription('Category name').setRequired(true)))
+    .addSubcommand(s=>s.setName('categoryrename').setDescription('Rename an NPC category \u2014 members, threads and home order all follow')
+      .addStringOption(o=>o.setName('name').setDescription('The category as it is now').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('to').setDescription('What to call it instead').setRequired(true)))
     .addSubcommand(s=>s.setName('categorydelete').setDescription('Delete an NPC category')
       .addStringOption(o=>o.setName('name').setDescription('Category name').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('categoryassign').setDescription('Assign an NPC to a category')
@@ -6863,6 +6884,105 @@ async function handleGmTest(interaction) {
     for (const q of quests) lines.push(`📜 ${questTag(q)} — ${q.status}`);
     for (const npcRow of npcs) lines.push(`🎭 ${npcRow.name}`);
     return replyLong(interaction, lines, { ephemeral: true });
+  }
+
+  if (sub === 'forum') {
+    // The forum lifecycle, run against real Discord, with fixtures that
+    // clean up after themselves. Structural checks in verify.js prove the
+    // code says the right things; only this proves Discord does them.
+    //
+    // Steps: two categories -> threads in both forums; two NPCs -> entries;
+    // move one (their entry must change threads); delete one (entry gone,
+    // thread stays); delete a category (thread closes, orphan re-homes to
+    // Uncategorised); then tear everything down.
+    if (!getConfig(gid)?.npc_forum) {
+      return interaction.reply({ ephemeral: true, content:
+        '\u274c No NPC forum is set \u2014 `/config channels npcforum channel:#your-forum` first, or `/gm check build:true`.' });
+    }
+    await interaction.deferReply();
+    const A = `${GMTEST_PREFIX}Red Company`, B = `${GMTEST_PREFIX}Blue Company`;
+    const N1 = `${GMTEST_PREFIX}Forum Warden`, N2 = `${GMTEST_PREFIX}Forum Herald`;
+    const lines = [];
+    const step = (name, okv, detail) => lines.push(`${okv ? '\u2705' : '\u274c'} ${name}${detail ? ` \u2014 ${detail}` : ''}`);
+    const threadOf = (table, cat) => {
+      try { return db.prepare(`SELECT thread_id FROM ${table} WHERE guild_id=? AND category=?`).get(gid, cat)?.thread_id || null; }
+      catch { return null; }
+    };
+    const entryOf = (name) => {
+      try { return db.prepare('SELECT thread_id, message_id FROM npc_pages WHERE guild_id=? AND name=?').get(gid, name) || null; }
+      catch { return null; }
+    };
+    try {
+      // 1 \u00b7 categories open threads in both forums
+      createCategory(gid, A); createCategory(gid, B);
+      await ensurePortraitThreads(interaction.client, gid).catch(() => 0);
+      const forum = await interaction.client.channels.fetch(getConfig(gid).npc_forum).catch(() => null);
+      const tagMap = forum ? await ensureNpcTags(forum, gid) : {};
+      if (forum) for (const cat of [A, B]) await ensureCategoryThread(interaction.client, forum, gid, cat, tagMap, 'pages').catch(() => null);
+      step('category threads open in the page forum', !!threadOf('npc_category_threads', A) && !!threadOf('npc_category_threads', B));
+      step('and in the portrait forum \u2014 if one is set', !getConfig(gid)?.npc_channel_id
+        || (!!threadOf('npc_portrait_threads', A) && !!threadOf('npc_portrait_threads', B)));
+
+      // 2 \u00b7 NPCs land as entries in their category's thread
+      for (const [nm, cat] of [[N1, A], [N2, B]]) {
+        if (!getNpc(gid, nm)) upsertNpc(gid, nm, { str: 2, con: 3, dex: 2, wis: 2, lck: 1, hp_current: maxHpFromCon(gid, 3) });
+        assignNpcToCategory(gid, nm, cat);
+        await mirrorNpcSheet(interaction.client, gid, nm).catch(() => null);
+      }
+      const e1 = entryOf(N1);
+      step('an NPC becomes an entry in their thread', !!e1?.message_id && e1.thread_id === threadOf('npc_category_threads', A));
+
+      // 3 \u00b7 moving their home moves the entry
+      removeNpcFromCategory(gid, N1, A); assignNpcToCategory(gid, N1, B);
+      await mirrorNpcSheet(interaction.client, gid, N1).catch(() => null);
+      const e1b = entryOf(N1);
+      step('changing their category moves the entry', e1b?.thread_id === threadOf('npc_category_threads', B),
+        e1b?.thread_id === e1?.thread_id ? 'entry did not move' : null);
+
+      // 4 \u00b7 deleting an NPC removes the entry, keeps the thread
+      deleteNpc(gid, N2);
+      await new Promise(r => setTimeout(r, 1500));   // the sweep is fire-and-forget
+      const bThread = threadOf('npc_category_threads', B);
+      const bLive = bThread ? await interaction.client.channels.fetch(bThread).catch(() => null) : null;
+      step('deleting an NPC keeps the category thread', !!bLive?.isThread?.());
+      step('and removes their entry from the map', !entryOf(N2));
+
+      // 5 \u00b7 deleting a category closes its threads and re-homes
+      const aThread = threadOf('npc_category_threads', A);
+      deleteCategory(gid, A);
+      for (const table of Object.values(NPC_THREAD_TABLES)) {
+        const row = db.prepare(`SELECT thread_id FROM ${table} WHERE guild_id=? AND category=?`).get(gid, A);
+        if (row?.thread_id) {
+          const th = await interaction.client.channels.fetch(row.thread_id).catch(() => null);
+          if (th?.isThread?.()) await th.delete('test category deleted').catch(() => {});
+        }
+        db.prepare(`DELETE FROM ${table} WHERE guild_id=? AND category=?`).run(gid, A);
+      }
+      const aGone = aThread ? !(await interaction.client.channels.fetch(aThread).catch(() => null)) : true;
+      step('deleting a category closes its thread', aGone);
+
+      // 6 \u00b7 tear-down: the fixture NPC, category and their threads
+      deleteNpc(gid, N1);
+      deleteCategory(gid, B);
+      for (const table of Object.values(NPC_THREAD_TABLES)) {
+        for (const cat of [A, B]) {
+          const row = db.prepare(`SELECT thread_id FROM ${table} WHERE guild_id=? AND category=?`).get(gid, cat);
+          if (row?.thread_id) {
+            const th = await interaction.client.channels.fetch(row.thread_id).catch(() => null);
+            if (th?.isThread?.()) await th.delete('test cleanup').catch(() => {});
+          }
+          db.prepare(`DELETE FROM ${table} WHERE guild_id=? AND category=?`).run(gid, cat);
+        }
+      }
+      await new Promise(r => setTimeout(r, 1000));
+      step('cleanup \u2014 fixtures and threads removed', !getNpc(gid, N1) && !getNpc(gid, N2)
+        && !getCategories(gid).includes(A) && !getCategories(gid).includes(B));
+    } catch (err) {
+      lines.push(`\u26a0\ufe0f Stopped early \u2014 ${err?.message || err}`);
+    }
+    const failed = lines.filter(l => l.startsWith('\u274c')).length;
+    return interaction.editReply({ content:
+      [`\ud83e\uddea **Forum lifecycle** \u2014 ${failed ? `**${failed} failed**` : 'all passed'}`, '', ...lines].join('\n') });
   }
 
   // clean
@@ -9057,9 +9177,11 @@ async function runGmReroll(interaction) {
   return interaction.reply({ content: lines.join('\n') });
 }
 
-// /gm dc — call a check. Everything a press needs rides the customId
-// (dcroll:uid:stat:dc:mode:flat:modifier ≈ 45 chars), so the card is
-// stateless: a restart forgets nothing and a pressed button simply goes dark.
+// /gm dc — call a check. The numbers a press needs ride the customId
+// (dcroll:uid:field:dc:mode:flat:mod:sec:dmg:sdmg — ten short tokens); the
+// free-text marks ride the dc_cards row keyed by the card's message. A
+// restart forgets nothing; a card older than the weekly prune loses its
+// marks, which is the same graceful dark a pressed button always had.
 // One check roll under the called conditions — shared by player presses and
 // the instant NPC rolls. `subject` carries stats; `sig` a signature row or null.
 function rollDcCheck({ stat, notation, dc, gmMode, flat, modifier, subject, sig }) {
@@ -9164,8 +9286,8 @@ function applyDcSanction({ gid, id, isNpc, sanction, lines }) {
 function saveDcCard(gid, msgId, o) {
   try {
     db.prepare('DELETE FROM dc_cards WHERE created_at < ?').run(Date.now() - 7 * 86400_000);
-    db.prepare(`INSERT OR REPLACE INTO dc_cards (guild_id, message_id, s_flavour, f_flavour, s_sanction, f_sanction, created_at)
-                VALUES (?,?,?,?,?,?,?)`).run(gid, msgId, o.sF ?? null, o.fF ?? null, o.sS ?? null, o.fS ?? null, Date.now());
+    db.prepare(`INSERT OR REPLACE INTO dc_cards (guild_id, message_id, s_flavour, f_flavour, s_sanction, f_sanction, s_mark, f_mark, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?)`).run(gid, msgId, o.sF ?? null, o.fF ?? null, o.sS ?? null, o.fS ?? null, o.sM ?? null, o.fM ?? null, Date.now());
   } catch { /* trimmings only */ }
 }
 function getDcCard(gid, msgId) {
@@ -9366,7 +9488,10 @@ async function postDcCheck(interaction, { stat, notation, dc, gmMode, flat, modi
   for (const uid of ids) {
     const nm = await getDisplayName(interaction.guild, uid);
     const secCode = !secret ? 0 : revealSet.has(uid) ? 2 : 1;
-    buttons.push(new ButtonBuilder().setCustomId(`dcroll:${uid}:${field}:${dc}:${gmMode}:${flat ? 1 : 0}:${modifier}:${secCode}:${onFail || '-'}:${damage}:${onSucc || '-'}:${sDamage}`)
+    // Numerics and short tokens only. The free-text marks ride the card row
+    // keyed by this message \u2014 an id built from what a GM typed overflows
+    // the 100-char ceiling and a colon in it shifts the whole split.
+    buttons.push(new ButtonBuilder().setCustomId(`dcroll:${uid}:${field}:${dc}:${gmMode}:${flat ? 1 : 0}:${modifier}:${secCode}:${damage}:${sDamage}`)
       .setLabel(`🎲 ${nm.slice(0, 70)}`).setStyle(ButtonStyle.Primary));
   }
   const rows = [];
@@ -9378,10 +9503,11 @@ async function postDcCheck(interaction, { stat, notation, dc, gmMode, flat, modi
     `${face} vs DC ${dc}${secret ? ' (secret)' : ''}${terms.length ? ` · ${terms.join(' · ')}` : ''}`,
     ids.length ? `👥 ${ids.map(id => `<@${id}>`).join(' ')}` : '',
     npcNames.length ? `🎭 ${npcNames.join(', ')}` : ''].filter(Boolean).join('\n'));
-  if (ids.length && (sF || fF || sS || fS)) {
+  if (ids.length && (sF || fF || sS || fS || onFail || onSucc)) {
     try { const rep = await interaction.fetchReply();
       saveDcCard(gid, rep.id, { sF, fF, sS: sS ? `${sS.stat}${sS.delta > 0 ? '+' : ''}${sS.delta}` : null,
-                                        fS: fS ? `${fS.stat}${fS.delta > 0 ? '+' : ''}${fS.delta}` : null });
+                                        fS: fS ? `${fS.stat}${fS.delta > 0 ? '+' : ''}${fS.delta}` : null,
+                                        sM: onSucc || null, fM: onFail || null });
     } catch { /* trimmings only */ }
   }
   if (secret) await interaction.followUp({ ephemeral: true, content: `🤫 The DC is **${dc}**.` }).catch(() => {});
@@ -9391,11 +9517,16 @@ async function postDcCheck(interaction, { stat, notation, dc, gmMode, flat, modi
 // mirrors to the audit, and darkens their button so nobody rolls twice.
 async function runDcRollPress(interaction) {
   const gid = interaction.guild.id, cid = interactionChannelId(interaction);
-  const [, uid, field, dcS, gmMode, flatS, modS, secS, onFailRaw, dmgS, onSuccRaw, sDmgS] = interaction.customId.split(':');
+  const [, uid, field, dcS, gmMode, flatS, modS, secS, dmgS, sDmgS] = interaction.customId.split(':');
+  // The marks live on the card row, keyed by the message this button sits
+  // on. A card older than the seven-day prune simply has no marks left,
+  // which is the same graceful dark a restart always gave these buttons.
+  const marks = getDcCard(interaction.guild.id, interaction.message?.id) || {};
+  const onFailRaw = marks.f_mark || '', onSuccRaw = marks.s_mark || '';
   if (interaction.user.id !== uid) return interaction.reply({ content: '🎯 That button belongs to someone else — yours has your name on it.', ephemeral: true });
   const dc = parseInt(dcS), flat = flatS === '1', modifier = parseInt(modS) || 0;
-  const secret = secS !== '0', whisper = secS === '2', onFail = onFailRaw === '-' ? '' : (onFailRaw || ''), damage = parseInt(dmgS) || 0;
-  const onSucc = onSuccRaw === '-' ? '' : (onSuccRaw || '');
+  const secret = secS !== '0', whisper = secS === '2', onFail = onFailRaw, damage = parseInt(dmgS) || 0;
+  const onSucc = onSuccRaw;
   const sDmg = parseInt(sDmgS) || 0;
   const notation = field.includes('d') ? field : null;
   const stat = notation ? null : (field === 'x' ? null : field);
@@ -11386,7 +11517,7 @@ client.on('interactionCreate', async interaction => {
       // A category by name, wherever it's asked for — including the
       // categorydelete sub, where the option is called 'name'.
       if (interaction.commandName === 'npc' && focusedOption.name === 'name'
-          && interaction.options.getSubcommand(false) === 'categorydelete') {
+          && ['categorydelete', 'categoryrename'].includes(interaction.options.getSubcommand(false))) {
         const v = String(focusedOption.value || '').toLowerCase();
         return await interaction.respond(acPick(getCategories(interaction.guild.id), v));
       }
@@ -16528,7 +16659,7 @@ async function handleNpc(interaction) {
     const unlistedNote = unlisted.length
       ? `\n📝 ${unlisted.map(w => `**${w}**`).join(' and ')} ${unlisted.length === 1 ? 'is' : 'are'} not on the weapon list, so ${unlisted.length === 1 ? 'it restricts' : 'they restrict'} nothing. \`/char weapon add\` to give ${unlisted.length === 1 ? 'it' : 'them'} stat rules.`
       : '';
-    await interaction.reply({ content: `✅ NPC **${name}** ${existed ? 'updated' : 'created'}.${orderLine}${statNote}${unlistedNote}\n💡 Upload an image to the NPC channel with \`${name}\` as the message text to set their avatar.` });
+    await interaction.reply({ content: `✅ NPC **${name}** ${existed ? 'updated' : 'created'}.${orderLine}${statNote}${unlistedNote}${portraitHint(gid, name)}` });
     if (filed) {
       await interaction.followUp({ ephemeral: true, content:
         `\u{1f4c1} Filed under **${filed.cat}**${filed.made ? ' \u2014 a new category, made just now' : ''}.` }).catch(()=>{});
@@ -16662,13 +16793,69 @@ async function handleNpc(interaction) {
     registerSlashCommands(gid).catch(console.error);
     return;
   }
+  if (sub === 'categoryrename') {
+    const name = interaction.options.getString('name');
+    const to = interaction.options.getString('to')?.trim();
+    if (!getCategories(gid).includes(name)) return interaction.reply({ content: `\u274c Category **${name}** not found.`, ephemeral: true });
+    if (!to) return interaction.reply({ content: '\u274c Give it a name.', ephemeral: true });
+    if (to.toLowerCase() !== name.toLowerCase() && getCategories(gid).some(c => c.toLowerCase() === to.toLowerCase())) {
+      return interaction.reply({ content: `\u274c **${to}** already exists \u2014 merging categories is a different thing. Move the NPCs with \`/npc categoryassign\` and delete the empty one.`, ephemeral: true });
+    }
+    await interaction.deferReply();
+    // In place, not delete-and-recreate: membership rows keep their rowids,
+    // and rowid order is what decides every member's HOME category \u2014 a
+    // recreate would re-home NPCs who hold this as their first category.
+    db.prepare('UPDATE npc_categories SET name=? WHERE guild_id=? AND name=?').run(to, gid, name);
+    db.prepare('UPDATE npc_category_members SET category=? WHERE guild_id=? AND category=?').run(to, gid, name);
+    for (const table of Object.values(NPC_THREAD_TABLES)) {
+      db.prepare(`UPDATE ${table} SET category=? WHERE guild_id=? AND category=?`).run(to, gid, name);
+      // The thread itself follows. Best-effort: renames are rate-limited to
+      // roughly two per ten minutes per thread, so a second rename inside
+      // that window keeps the mapping and catches up on the next sweep.
+      try {
+        const row = db.prepare(`SELECT thread_id FROM ${table} WHERE guild_id=? AND category=?`).get(gid, to);
+        if (row?.thread_id) {
+          const th = await interaction.client.channels.fetch(row.thread_id).catch(() => null);
+          if (th?.isThread?.()) await th.setName(to.slice(0, 100)).catch(() => {});
+        }
+      } catch {}
+    }
+    // The forum tag carries the category's name in the sidebar filter.
+    try {
+      const forum = await interaction.client.channels.fetch(getConfig(gid)?.npc_forum).catch(() => null);
+      if (forum?.availableTags?.some(t => t.name.toLowerCase() === name.toLowerCase())) {
+        await forum.setAvailableTags(forum.availableTags.map(t =>
+          t.name.toLowerCase() === name.toLowerCase() ? { ...t, name: to.slice(0, 20) } : t)).catch(() => {});
+      }
+    } catch {}
+    registerSlashCommands(gid).catch(console.error);
+    return interaction.editReply({ content: `\u270f\ufe0f **${name}** is now **${to}** \u2014 members, threads and tags followed. Menus updating...` });
+  }
   if (sub === 'categorydelete') {
     const name = interaction.options.getString('name');
     if (!getCategories(gid).includes(name)) return interaction.reply({ content: `❌ Category **${name}** not found.`, ephemeral: true });
     return requestConfirm(interaction, `Delete category **${name}**? NPCs in it won't be deleted — they'll just become uncategorised.`, async () => {
+      // Who is about to lose their home. Read before the membership rows go.
+      const orphans = getNpcsInCategory(gid, name);
       deleteCategory(gid, name);
       registerSlashCommands(gid).catch(console.error);
-      return `🗑️ Category **${name}** deleted.`;
+      // Close the category's thread in both forums and drop the mappings.
+      // The NPCs themselves re-home on the mirror pass below — their entries
+      // move to wherever they now belong, Uncategorised included.
+      (async () => {
+        try {
+          for (const table of Object.values(NPC_THREAD_TABLES)) {
+            const row = db.prepare(`SELECT thread_id FROM ${table} WHERE guild_id=? AND category=?`).get(gid, name);
+            if (row?.thread_id) {
+              const th = await client.channels.fetch(row.thread_id).catch(() => null);
+              if (th?.isThread?.()) await th.delete(`Category "${name}" deleted`).catch(() => {});
+            }
+            db.prepare(`DELETE FROM ${table} WHERE guild_id=? AND category=?`).run(gid, name);
+          }
+          for (const npcName of orphans) await mirrorNpcSheet(client, gid, npcName).catch(() => null);
+        } catch (err) { console.error('[npcforum] category sweep -', err?.message || err); }
+      })();
+      return `🗑️ Category **${name}** deleted. Its threads are closing; the NPCs in it are moving to their next category.`;
     });
   }
   if (sub === 'categorylist') {
@@ -17259,7 +17446,7 @@ const HELP_CATEGORIES = {
                               '`/gm queue` — everything waiting on a GM, in one place',
       '`/gm search` — find characters by order, class or status (GM)',
       '`/gm kill user:@a` / `/gm revive user:@a` — mark a character fallen and post their memorial, or bring them back (GM)',
-      '`/gm test quest/npc/list/clean` — throwaway fixtures for trying things out, and the broom that clears them (GM)',
+      '`/gm test quest/npc/list/forum/clean` — throwaway fixtures, a live forum exercise, and the broom that clears them (GM)',
       '`/gm questwipe [runs:true]` — delete every quest on the server, confirm-gated; the run ledger and DM counters survive unless runs:true (GM)',
       '`/gm check build:true` — the one-command setup: makes every channel and forum the bot needs in two sections — **DDice** open to the table, **DDice · Game Masters** shut to everyone else — wires the config and fills them. Adopts anything already there, so it is safe to run on a server set up by hand (Admin)',
       '`/gm check run:true` — build anything missing: audit shelves, pipeline books and tags. Adopts what exists, so it is safe to run any time — pull it after an update adds a book (GM)',
