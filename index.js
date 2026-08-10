@@ -19001,11 +19001,30 @@ async function buildAllSetup(interaction) {
   // positions alone so a hand-arranged sidebar survives it.
   try {
     let po = 0, pg = 0;
-    const moves = sidebar.filter(x => x.id).map(x => ({
-      channel: x.id, position: x.gm ? pg++ : po++,
-      ...(x.cat ? { parent: x.cat, lockPermissions: false } : {}),
+    const want = sidebar.filter(x => x.id).map(x => ({
+      id: x.id, pos: x.gm ? pg++ : po++, cat: x.cat,
     }));
-    if (moves.length) await guild.channels.setPositions(moves);
+    // One bulk call first — cheap when Discord honours it.
+    if (want.length) await guild.channels.setPositions(want.map(w => ({
+      channel: w.id, position: w.pos,
+      ...(w.cat ? { parent: w.cat, lockPermissions: false } : {}),
+    }))).catch(err => console.error('[setup] bulk order -', err?.message || err));
+    // It does not always honour it. Observed live 2026-08-10: the bulk
+    // endpoint interleaved text and forum channels by rules of its own —
+    // texts landed at every other slot regardless of the numbers sent. So
+    // the plan is then enforced the way the client's own drag does it: one
+    // position edit per channel, ascending, which does stick. Refetch first;
+    // raw positions are Discord's numbering, not ours, so the only reliable
+    // comparison is doing the walk.
+    for (const w of want) {
+      const ch = await guild.channels.fetch(w.id).catch(() => null);
+      if (!ch) continue;
+      if (w.cat && ch.parentId !== w.cat) {
+        await ch.edit({ parent: w.cat, lockPermissions: false }).catch(() => {});
+      }
+      await ch.edit({ position: w.pos }).catch(err =>
+        console.error(`[setup] order ${ch.name} -> ${w.pos} -`, err?.message || err));
+    }
   } catch (err) { console.error('[setup] sidebar order -', err?.message || err); }
 
   const made = [...open.made, ...gm.made];

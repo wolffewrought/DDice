@@ -1204,11 +1204,17 @@ function testPins(src) {
     // plan order per category, re-parenting adopted strays as it goes.
     // Without this, any channel adopted by name keeps its old position and
     // the plan only governs fresh creates.
-    ok('setup orders the sidebar to the plan',
-      /const moves = sidebar\.filter\(x => x\.id\)\.map/.test(src) &&
-      /await guild\.channels\.setPositions\(moves\)/.test(src));
+    // Bulk setPositions alone is NOT enough — observed live 2026-08-10, the
+    // endpoint interleaved text and forum channels by its own rules. The
+    // per-channel walk is the part that actually lands the order; if a
+    // refactor drops it in favour of the bulk call, the sidebar drifts on
+    // real servers while every sandbox check stays green.
+    ok('setup orders the sidebar to the plan (bulk first)',
+      /await guild\.channels\.setPositions\(want\.map/.test(src));
+    ok('then per channel — the walk that actually sticks',
+      /for \(const w of want\) \{[\s\S]{0,400}?await ch\.edit\(\{ position: w\.pos \}\)/.test(src));
     ok('re-parenting never rewrites channel overwrites',
-      /parent: x\.cat, lockPermissions: false/.test(src));
+      (src.match(/lockPermissions: false/g) || []).length >= 2);
 
     // Restart is the most destructive thing the bot can do, so each of its
     // four guards is pinned: the confirm (no accidental press-through), the

@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 639 assertions passed and no scanner found an ERROR.
+Green means 640 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 639 assertions covering structure, registration and ruleset
+now is 640 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -266,14 +266,21 @@ sheets, rolls and history all stay.
 
 ### Sidebar order is enforced
 
-`buildAllSetup` ends with one batched `setPositions`: every configured
-channel takes its plan-order slot within its category, and adopted strays
-are re-parented into the right category as they do. `lockPermissions` stays
-false — re-parenting must never rewrite a channel's own overwrites. This
-exists because adoption-by-name kept old positions, so on any server with
-history the plan order was a suggestion. `run:true` (the light repair)
-deliberately does not touch positions, so a hand-arranged sidebar survives
-it; `build:true` and `restart:true` both enforce.
+`buildAllSetup` orders the sidebar in two stages, and the second one is the
+one that works. A batched `setPositions` goes first because it is one call —
+but **the bulk endpoint does not reliably honour cross-type order**: observed
+live 2026-08-10, it interleaved text and forum channels by rules of its own,
+landing the texts at every other slot regardless of the numbers sent. So the
+plan is then enforced the way the client's own drag does it: one position
+edit per channel, ascending within each category, with strays re-parented as
+they take their slot. `lockPermissions` stays false throughout —
+re-parenting must never rewrite a channel's own overwrites. Failures log to
+Railway as `[setup] order <name> -> <pos>`.
+
+`run:true` (the light repair) deliberately does not touch positions, so a
+hand-arranged sidebar survives it; `build:true` and `restart:true` both
+enforce. Do not "simplify" this back to the bulk call alone — every sandbox
+check stays green while real servers drift.
 
 ### PDF source auto-seeded
 
