@@ -1263,7 +1263,7 @@ const DEMO_QUIZ = [
 'SAY How many knight orders are there?',
 'CHOICE',
 '  A \u2014 5 -> q2',
-'  * B \u2014 7 -> q2',
+'  * B \u2014 8 -> q2',
 '  C \u2014 12 -> q2',
 '  D \u2014 15+ -> q2',
 '',
