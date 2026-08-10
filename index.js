@@ -3283,8 +3283,13 @@ function hpBase(gid) {
   const v = Number(getConfig(gid)?.hp_base);
   return Number.isFinite(v) && v >= 0 ? v : HP_BASE_DEFAULT;
 }
-function maxHpFromCon(gid, con) { return (Number(con) || 0) + hpBase(gid); }
-function maxHp(ch, gid) { return maxHpFromCon(gid, ch?.con ?? 0); }
+// Kept by name and shape — every call site is unchanged — but the formula
+// itself now belongs to the ruleset.
+function maxHpFromCon(gid, con) {
+  const r = rulesFor(gid);
+  return r.maxHp({ [r.hpStat]: con }, hpBase(gid));
+}
+function maxHp(ch, gid) { return maxHpFromCon(gid, ch?.[rulesFor(gid).hpStat] ?? 0); }
 function maxRerolls(ch) { return ch?.lck ?? 0; }
 function isWhiteKnight(ch) { return ch?.order_name === 'White Knight' && ch?.wis >= 5; }
 
@@ -9200,7 +9205,8 @@ async function handleDeception(interaction) {
   if (gate) return interaction.reply({ content: gate, ephemeral: true });
   if (!me) return interaction.reply({ content: '❌ You need a character sheet — `/char create`.', ephemeral: true });
   if (!them) return interaction.reply({ content: `❌ **${await getDisplayName(interaction.guild, target.id)}** has no character sheet yet.`, ephemeral: true });
-  if ((me.wis ?? 0) < 4) return interaction.reply({ content: '🎭 Deception takes **WIS 4+** — a poor liar only convinces themselves.', ephemeral: true });
+  const barD = abilityNeeds(gid, 'feint');
+  if (belowBar(me, barD)) return interaction.reply({ content: `🎭 Deception takes **${barD.label} ${barD.need}+** — a poor liar only convinces themselves.`, ephemeral: true });
   if (deceptionSpent(gid, uid)) {
     return interaction.reply({ ephemeral: true, content:
       '🎭 That trick is spent — make an ordinary stat roll before trying another. A lie only sells once until you fight straight.' });
@@ -10463,6 +10469,61 @@ process.on('uncaughtException', (err) => {
 // ─────────────────────────────────────────────
 
 const STAT_LABELS = { str:'STR', con:'CON', dex:'DEX', wis:'WIS', lck:'LCK' };
+
+// ── The ruleset ────────────────────────────────────────────────────
+// What a system decides, in one place: its stats, how HP comes from them,
+// how a roll is built, what two rolls make, and what a stat must reach
+// before an ability opens. Everything else in this file — quests, NPCs,
+// scrolls, activities, quizzes, the audit shelves — is system-agnostic and
+// asks none of these questions.
+const RULES_KNIGHTFALL = {
+  id: 'knightfall',
+  name: 'Knightfall',
+  // The stats a sheet carries, in the order they are shown.
+  stats: STATS,
+  labels: STAT_LABELS,
+  // A stat is added to the die whole — no modifier arithmetic here.
+  statBonus: (row, stat) => Number(row?.[stat]) || 0,
+  // HP is CON plus whatever the server sets as everyone's floor.
+  hpStat: 'con',
+  maxHp: (row, base) => (Number(row?.con) || 0) + base,
+  // One damage for a hit, one more for a natural maximum, one more for the
+  // defender's natural 1 — four at the very worst.
+  damage: (atkRoll, atkNat, atkSides, defRoll, defNat, defSides) => {
+    const hit = atkRoll >= defRoll;
+    if (!hit) return { hit, dmg: 0 };
+    let dmg = 1;
+    if (atkNat === atkSides) dmg += 1;
+    if (defNat === 1) dmg += 1;
+    if (atkNat === atkSides && defNat === 1) dmg += 1;
+    return { hit, dmg };
+  },
+  // What a stat must reach before an ability is available at all.
+  gates: { deflect: ['str', 4], disarm: ['dex', 4], feint: ['wis', 4], insight: ['wis', 4], heal: ['wis', 5] },
+  // What progress is called here.
+  vocabulary: { currency: 'renown', standing: 'merits', rank: 'rank' },
+};
+
+const RULESETS = { knightfall: RULES_KNIGHTFALL };
+
+// Which rules a server plays by. One answer today; the hook is here so a
+// second ruleset is a lookup rather than a rewrite.
+// What an ability asks of a fighter: { stat, need, label } from the ruleset,
+// so the bar moves with the system while each refusal keeps its own voice.
+function abilityNeeds(gid, ability) {
+  const r = rulesFor(gid);
+  const [stat, need] = r.gates?.[ability] || ['wis', 0];
+  return { stat, need, label: r.labels[stat] || String(stat).toUpperCase() };
+}
+// True when they fall short of it.
+function belowBar(row, bar) { return (Number(row?.[bar.stat]) || 0) < bar.need; }
+
+function rulesFor(gid) {
+  let id = null;
+  try { id = getConfig(gid)?.ruleset || null; } catch { /* before config exists */ }
+  return RULESETS[id] || RULES_KNIGHTFALL;
+}
+
 const STAT_EMOJIS = { str:'💪', con:'🫀', dex:'⚡', wis:'🧠', lck:'🍀' };
 const STAT_NAMES  = { str:'Strength', con:'Constitution', dex:'Dexterity', wis:'Wisdom', lck:'Luck' };
 
@@ -10474,16 +10535,10 @@ function fightTotalStr(total, nat, sides) {
   return `**${total}**`;
 }
 
-function resolveDamage(atkRoll, atkNat, atkSides, defRoll, defNat, defSides) {
-  let dmg = 0;
-  const hit = atkRoll >= defRoll;
-  if (hit) {
-    dmg = 1;
-    if (atkNat === atkSides) dmg += 1; // attacker nat max
-    if (defNat === 1) dmg += 1;        // defender nat 1
-    if (atkNat === atkSides && defNat === 1) dmg += 1; // both — total 4
-  }
-  return { hit, dmg };
+// The damage model belongs to the ruleset; this stays as the one door every
+// resolution comes through.
+function resolveDamage(atkRoll, atkNat, atkSides, defRoll, defNat, defSides, gid = null) {
+  return rulesFor(gid).damage(atkRoll, atkNat, atkSides, defRoll, defNat, defSides);
 }
 
 // ── Carry-over combat effects (nat-1 attack / nat-20 defence) ─────────────────
@@ -12721,7 +12776,8 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
 
   const actor = await resolveFighter(interaction.guild, gid, actorId);
   const subjectRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
-  if ((actor.stats.wis ?? 0) < 4) return refuse('🎭 Deception needs **WIS 4+** — the mind has to be sharp.');
+  const barF = abilityNeeds(gid, 'feint');
+  if (belowBar(actor.stats, barF)) return refuse(`🎭 Deception needs **${barF.label} ${barF.need}+** — the mind has to be sharp.`);
   // A feint is an attack roll: the deflection trade-off and an earlier feint
   // that fooled YOU both clamp it flat.
   const flatFeint = consumeFlatAtk(gid, cid, actorId) || consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
@@ -13033,7 +13089,8 @@ async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId
   }
   const subject = getChar(gid, uid);
   if (!hasShieldEquipped(subject)) return refuse('🛡️ Deflection needs a **shield** equipped (any type).');
-  if ((subject?.str ?? 0) < 4) return refuse('🛡️ Deflection needs **STR 4+** to hold the shield — whichever stat rolls.');
+  const barDef = abilityNeeds(gid, 'deflect');
+  if (belowBar(subject, barDef)) return refuse(`🛡️ Deflection needs **${barDef.label} ${barDef.need}+** to hold the shield — whichever stat rolls.`);
   {
     const fx = JSON.parse(fight.effect_state || '{}');
     if (fx[uid]?.deflected) return refuse('🛡️ Already deflected this round — it clears when your turn comes.');
@@ -13180,7 +13237,8 @@ async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
   }
   const subject = getChar(gid, uid);
   if (!hasBladeEquipped(subject)) return refuse('⚔️ Disarming needs a **blade** equipped — maces, shields and firearms can\'t do it.');
-  if ((subject?.dex ?? 0) < 4) return refuse('⚔️ Disarming needs **DEX 4+** — the hands have to be quick.');
+  const barDis = abilityNeeds(gid, 'disarm');
+  if (belowBar(subject, barDis)) return refuse(`⚔️ Disarming needs **${barDis.label} ${barDis.need}+** — the hands have to be quick.`);
   {
     const fx = JSON.parse(fight.effect_state || '{}');
     if (fx[uid]?.disarmUsed) return refuse('⚔️ Already attempted a disarm this round — it clears when your turn comes.');
@@ -13331,8 +13389,9 @@ async function handleFight(interaction, forced) {
     if (f0?.state === 'active' && f0.phase === 'defend' && f0.current_target === meId
         && f0.atk_kind !== 'feint' && f0.atk_kind !== 'grapple') {
       const meRow = isNpcFighter(meId) ? getNpc(gid, npcNameFromFighter(meId)) : getChar(gid, meId);
-      if ((meRow?.wis ?? 0) < 4) {
-        return interaction.reply({ content: '🎭 Reading a blow takes **WIS 4+** — you cannot feint on the back foot.', ephemeral: true });
+      const barR = abilityNeeds(gid, 'feint');
+      if (belowBar(meRow, barR)) {
+        return interaction.reply({ content: `🎭 Reading a blow takes **${barR.label} ${barR.need}+** — you cannot feint on the back foot.`, ephemeral: true });
       }
       setEffectFlag(gid, cid, meId, 'feintDef');
       setEffectFlag(gid, cid, meId, 'feintUsed');
