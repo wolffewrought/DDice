@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 654 assertions passed and no scanner found an ERROR.
+Green means 658 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 654 assertions covering structure, registration and ruleset
+now is 658 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -182,7 +182,16 @@ points at the category thread and `message_id` at that NPC's own entry.
 
 Three rules hold it together, and each fails quietly if it goes:
 
-- **Home category is the first one assigned**, by `rowid`, not alphabetical —
+- **Home is: first assigned category, else the coloured order on the sheet,
+  else Uncategorised.** The order fallback means knights file under their
+  colour automatically; a deliberate category assignment always outranks
+  it, so splitting a shared pile like "Knights" into the coloured threads
+  is one `categorydelete` — the orphans re-home to their orders. Both
+  forums pre-create a thread per category AND per known order
+  (`knownOrders` = distinct `npcs.order_name` ∪ `npc_orders` prefixes —
+  data-driven, so a D&D server never grows knight threads and order threads
+  carry no forum tag, protecting the 20-tag ceiling).
+- **Within categories, home is the first one assigned**, by `rowid`, not alphabetical —
   "designate them an enemy" is a decision and later categories are additions
   to it. An NPC in several still lists them all on their entry.
 - **A moved NPC leaves the old thread before joining the new one.** Skip that

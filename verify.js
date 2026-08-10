@@ -1349,7 +1349,22 @@ function testPins(src) {
     ok('one-command setup lays the NPC forum out too',
       /const npcLaid = await rebuildNpcForum\(interaction\.client, gid\)/.test(src));
     ok('the rebuild computes its keep-list after the write pass',
-      /async function rebuildNpcForum\([\s\S]{0,1400}?const keep = new Set\(db\.prepare\('SELECT thread_id FROM npc_category_threads/.test(src));
+      /async function rebuildNpcForum\([\s\S]{0,2400}?const keep = new Set\(db\.prepare\('SELECT thread_id FROM npc_category_threads/.test(src));
+    // Coloured orders are automatic homes: an explicit category assignment
+    // always wins, then the order on the sheet, then Uncategorised. Both
+    // forums pre-create a thread for every category AND every known order,
+    // and knownOrders is data-driven — a D&D server never grows knight
+    // threads, and a new colour births its thread with its first NPC.
+    ok('an unassigned knight files under their coloured order',
+      /if \(npc\?\.order_name\) return npc\.order_name;/.test(src));
+    ok('a hand-assigned category still outranks the order',
+      /if \(row\?\.category\) return row\.category;[\s\S]{0,500}?order_name/.test(src));
+    ok('known orders come from the data, not a hardcoded list',
+      /SELECT DISTINCT order_name FROM npcs/.test(src) &&
+      /SELECT DISTINCT prefix FROM npc_orders/.test(src.slice(src.indexOf('function knownOrders'), src.indexOf('function npcHomeCategory'))));
+    ok('both forums pre-create category and order threads',
+      /\[\.\.\.new Set\(\[\.\.\.getCategories\(gid\), \.\.\.knownOrders\(gid\), NPC_NO_CATEGORY\]\)\]/.test(src) &&
+      (src.match(/knownOrders\(gid\)/g) || []).length >= 2);
     ok('setting the forum lays it out', /const laid = await rebuildNpcForum\(client, gid\)/.test(src));
     ok('the rebuild defers — it can outrun three seconds',
       /npc_forum: channel\.id \}\);\s*\n\s*await interaction\.deferReply\(\);/.test(src));

@@ -3340,6 +3340,20 @@ function getCategoriesForNpc(gid, npcName) {
 // decision and the others are additions to it. Every category they hold
 // still shows on their page.
 const NPC_NO_CATEGORY = 'Uncategorised';
+// Every order the server knows about — the colours on NPC sheets plus any
+// prefix wearing a face. Data-driven rather than a hardcoded list, so a
+// D&D server never grows knight threads and a new colour births its own
+// thread with its first NPC or face.
+function knownOrders(gid) {
+  const out = new Set();
+  try {
+    for (const r of db.prepare("SELECT DISTINCT order_name FROM npcs WHERE guild_id=? AND order_name IS NOT NULL AND order_name != ''").all(gid)) out.add(r.order_name);
+  } catch {}
+  try {
+    for (const r of db.prepare('SELECT DISTINCT prefix FROM npc_orders WHERE guild_id=?').all(gid)) out.add(r.prefix);
+  } catch {}
+  return [...out];
+}
 // Where to post their face — the exact thread if the portrait bank is a
 // forum with one, the channel if not, and a nudge to set one up otherwise.
 function portraitHint(gid, npcName) {
@@ -3355,7 +3369,16 @@ function portraitHint(gid, npcName) {
 function npcHomeCategory(gid, npcName) {
   const row = db.prepare('SELECT category FROM npc_category_members WHERE guild_id=? AND npc_name=? ORDER BY rowid LIMIT 1')
     .get(gid, npcName);
-  return row?.category || NPC_NO_CATEGORY;
+  if (row?.category) return row.category;
+  // No category assigned by hand: the coloured order on their sheet is the
+  // home. A deliberate assignment always outranks it — remove the category
+  // and they re-file under their colour, which is how a shared pile like
+  // "Knights" splits into the coloured threads in one categorydelete.
+  try {
+    const npc = db.prepare('SELECT order_name FROM npcs WHERE guild_id=? AND name=?').get(gid, npcName);
+    if (npc?.order_name) return npc.order_name;
+  } catch {}
+  return NPC_NO_CATEGORY;
 }
 function getUncategorisedNpcs(gid) {
   const all = getAllNpcs(gid).map(n=>n.name);
@@ -10370,7 +10393,10 @@ async function ensurePortraitThreads(client, gid) {
   if (!forum || forum.type !== 15) return 0;
   const tagMap = await ensureNpcTags(forum, gid);
   let made = 0;
-  for (const cat of [...getCategories(gid), NPC_NO_CATEGORY]) {
+  // Categories, then every known order, then the catch-all. Orders carry no
+  // forum tag — the 20-available-tags ceiling belongs to categories.
+  const wanted = [...new Set([...getCategories(gid), ...knownOrders(gid), NPC_NO_CATEGORY])];
+  for (const cat of wanted) {
     const th = await ensureCategoryThread(client, forum, gid, cat, tagMap, 'portraits').catch(() => null);
     if (th) made++;
   }
@@ -10388,6 +10414,15 @@ async function rebuildNpcForum(client, gid) {
 
   const before = db.prepare('SELECT DISTINCT thread_id FROM npc_pages WHERE guild_id=? AND thread_id IS NOT NULL')
     .all(gid).map(r => r.thread_id);
+
+  // Every category and order thread exists before the roster walk, so a
+  // colour with no NPCs yet still shows its (empty) thread in both forums.
+  try {
+    const tagMap = await ensureNpcTags(forum, gid);
+    for (const cat of [...new Set([...getCategories(gid), ...knownOrders(gid), NPC_NO_CATEGORY])]) {
+      await ensureCategoryThread(client, forum, gid, cat, tagMap, 'pages').catch(() => null);
+    }
+  } catch {}
 
   // The page map is deliberately NOT cleared first. mirrorNpcSheet already
   // knows how to move an entry — it deletes the old message when the thread
