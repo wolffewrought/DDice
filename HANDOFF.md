@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 605 assertions passed and no scanner found an ERROR.
+Green means 613 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -180,7 +180,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 605 assertions covering structure, registration and ruleset
+now is 613 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -217,6 +217,48 @@ orphaned it — the whole forum duplicated, silently. `mirrorNpcSheet` already
 moves entries correctly on its own; the rebuild just walks the roster.
 
 Uncategorised NPCs go to a single `Uncategorised` thread.
+
+### The portrait forum mirrors it
+
+`npc-portraits` (config key `npc_channel_id`) is laid out to match: the same
+categories, the same thread names, the same tags. A GM hunting for a face
+looks where they look for the statblock. `npc_portrait_threads` is its own
+table — a category has a thread in each forum and they are not the same
+thread — and `ensureCategoryThread` picks between them on a `kind` argument
+resolved through the `NPC_THREAD_TABLES` whitelist, never from user input.
+
+`ensurePortraitThreads` runs on `/npc categorycreate`, so a category's thread
+exists in both forums before any NPC is in it, and again inside
+`rebuildNpcForum`.
+
+Three things to know if you touch the upload path:
+
+- **Uploads land in threads, not the forum.** The handler accepts
+  `message.channel.parentId === bankId` as well as a direct channel match.
+  Only the parentId form fires for a forum bank.
+- **Which thread does not matter.** The caption names the NPC; being
+  forgiving beats refusing a portrait posted one thread over.
+- **A text channel is still a valid bank.** Servers set one before this was
+  a forum. `ensurePortraitThreads` returns 0 unless the channel is a forum
+  (type 15), and captioned uploads in a text channel work as they always did.
+
+Also fixed there: the handler used to answer *every* image posted anywhere on
+the server with a warning when no bank was set, and then `return` — which
+swallowed the rest of `messageCreate` for any message carrying an attachment.
+It now stays silent outside the bank.
+
+## 7d · Naming settled 2026-08-10
+
+`/quest instance` already meant "run your own copy of a quest". The
+subcommand that opens a thread for a started quest is therefore
+**`/quest thread`**, not `/quest instance` — the forum is `quest-instances`
+and this opens one thread inside it. The builders harness caught the clash;
+without it, `/quest` would have carried two subcommands with one name and the
+quest-copy feature would have died silently.
+
+User-facing wording follows the channel: "party room" is now "quest thread"
+throughout. Internal variable names (`const room = opened.thread`,
+`born.room`) still say room and are invisible to users.
 
 ## 7c · Patching discipline
 
