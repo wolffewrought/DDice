@@ -1148,7 +1148,7 @@ CONTENT = [
           ('HINT He is still with us.', 'shown under the question'),
           ('RIGHT -> q2', ''),
           ('WRONG -> q1', 'send them round again, or onward — your call')]),
-('p', 'Multiple choice works too: put a <b>*</b> in front of the right option in a CHOICE block and the engine marks it. <b>QUIZ tally</b> lets every answer carry on and reads the score out at the end; <b>QUIZ retry</b> sends a wrong answer back to the same question until they get it. Try it with <b>/activity demo which:Kalidale Lore</b> — five questions, built in.'),
+('p', 'Multiple choice works too: put a <b>*</b> in front of the right option in a CHOICE block and the engine marks it. <b>QUIZ tally</b> lets every answer carry on and reads the score out at the end; <b>QUIZ retry</b> sends a wrong answer back to the same question until they get it; <b>QUIZ silent</b> tells them nothing as they go \u2014 each answer is simply recorded \u2014 and marks the whole paper at the end, question by question, with your explanations under the ones they missed. Set it on the script, or pick it with <b>mode:</b> on /quiz start. Try it with <b>/activity demo which:Kalidale Lore</b> — five questions, built in.'),
 ('code', [('QUIZ tally', 'or QUIZ retry, at the top of the script'),
           ('SCENE q1', ''),
           ('SAY How many knight orders are there?', ''),

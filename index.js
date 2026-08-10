@@ -604,6 +604,7 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS library_spells (
 try { db.exec('ALTER TABLE guild_config ADD COLUMN ruleset TEXT'); } catch {}
 try { db.exec('ALTER TABLE story_runs ADD COLUMN quiz_right INTEGER NOT NULL DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE story_runs ADD COLUMN quiz_asked INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE story_runs ADD COLUMN quiz_log TEXT'); } catch {}   // for marking at the end
 try { db.exec('ALTER TABLE story_scenes ADD COLUMN ask INTEGER NOT NULL DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE story_scenes ADD COLUMN answers TEXT'); } catch {}
 try { db.exec('ALTER TABLE story_scenes ADD COLUMN right_to TEXT'); } catch {}
@@ -1422,7 +1423,8 @@ function parseStoryScript(text) {
     if ((m = line.match(/^TALLY\s+(\w+)/i))) { tally = m[1].toLowerCase(); continue; }
     // QUIZ retry — a wrong answer sends them back to the same question.
     // QUIZ tally — wrong answers carry on, and the score is read out at the end.
-    if ((m = line.match(/^QUIZ\s+(retry|tally)/i))) { quizMode = m[1].toLowerCase(); continue; }
+    // QUIZ silent — say nothing as they go; mark the whole thing at the end.
+    if ((m = line.match(/^QUIZ\s+(retry|tally|silent)/i))) { quizMode = m[1].toLowerCase(); continue; }
 
     if ((m = line.match(/^SCENE\s+(\S+)/i))) {
       flush();
@@ -1866,6 +1868,16 @@ async function mirrorQuizQuestion(client, gid, id) {
   return th;
 }
 
+// What they answered, kept for the marking at the end. Only a silent quiz
+// needs it, but it costs nothing to keep and makes a review possible.
+function noteQuizAnswer(gid, cid, uid, run, { question, given, right, explain }) {
+  let log = [];
+  try { log = JSON.parse(run?.quiz_log || '[]') || []; } catch {}
+  log.push({ q: String(question || '').slice(0, 120), a: String(given || '').slice(0, 80), r: right ? 1 : 0,
+             e: explain ? String(explain).slice(0, 200) : null });
+  setRun(gid, cid, uid, { quiz_log: JSON.stringify(log).slice(0, 3800) });
+}
+
 // A banked question that has just been answered: remember it, so the next
 // draw for this player prefers what they have not met.
 function noteQuizSeen(gid, uid, sc, right) {
@@ -1961,6 +1973,18 @@ async function postScene(guild, cid, run, sc) {
       const r = run.quiz_right ?? 0, n = run.quiz_asked;
       const pct = Math.round((r / n) * 100);
       lines.push(`📝 **Score: ${r}/${n}** (${pct}%)${pct === 100 ? ' — not one wrong.' : pct >= 50 ? '' : ' — worth another go.'}`);
+      // A silent quiz says nothing until now — so here is the whole paper,
+      // marked: what was asked, what they said, and why.
+      let log = [];
+      try { log = JSON.parse(run.quiz_log || '[]') || []; } catch {}
+      if (log.length && quizModeOf(gid, run.story) === 'silent') {
+        lines.push('', '📖 **The marking**');
+        log.forEach((e, i) => {
+          lines.push(`${e.r ? '✅' : '❌'} **${i + 1}.** ${e.q || ''}`);
+          lines.push(`　 _you said:_ ${e.a}`);
+          if (!e.r && e.e) lines.push(`　 _${e.e}_`);
+        });
+      }
       // A pass mark, and what passing is worth.
       let st = null;
       try { st = db.prepare('SELECT quiz_pass, quiz_merit FROM stories WHERE guild_id=? AND name=?').get(gid, run.story); } catch {}
@@ -2101,10 +2125,18 @@ async function handleStoryPickButton(interaction) {
       quiz_asked: (ctx.run.quiz_asked ?? 0) + 1,
       quiz_right: (ctx.run.quiz_right ?? 0) + (right ? 1 : 0),
     });
-    verdict = right ? '  ✅' : '  ❌';
+    const quizMode = quizModeOf(ctx.gid, ctx.run.story);
     noteQuizSeen(ctx.gid, ctx.uid, ctx.sc, right);
-    if (ctx.sc.explain) verdict += `\n_${ctx.sc.explain}_`;
-    if (!right && quizModeOf(ctx.gid, ctx.run.story) === 'retry') {
+    noteQuizAnswer(ctx.gid, ctx.cid, ctx.uid, ctx.run,
+      { question: ctx.sc.say, given: pick.label, right, explain: ctx.sc.explain });
+    if (quizMode === 'silent') {
+      // Nothing given away — not even by the shape of the reply.
+      verdict = '  · _answer recorded_';
+    } else {
+      verdict = right ? '  ✅' : '  ❌';
+      if (ctx.sc.explain) verdict += `\n_${ctx.sc.explain}_`;
+    }
+    if (!right && quizMode === 'retry') {
       next = sceneName;   // round again until they get it
       verdict += ' — _try that one again._';
     }
@@ -5514,9 +5546,10 @@ const slashCommands = [
                     {name:'🆕 Only ones new to them',value:'new'},
                     {name:'🎲 Any — seen or not',value:'any'},
                     {name:'📖 Revision — only ones they got wrong',value:'wrong'}))
-      .addStringOption(o=>o.setName('mode').setDescription('What a wrong answer costs').setRequired(false)
-        .addChoices({name:'📝 Tally — carry on, score at the end',value:'tally'},
-                    {name:'🔁 Retry — the same question until it is right',value:'retry'}))
+      .addStringOption(o=>o.setName('mode').setDescription('What a wrong answer costs, and when they learn of it').setRequired(false)
+        .addChoices({name:'📝 Tally — told as they go, score at the end',value:'tally'},
+                    {name:'🔁 Retry — the same question until it is right',value:'retry'},
+                    {name:'🤫 Silent — told nothing until the marking at the end',value:'silent'}))
       .addIntegerOption(o=>o.setName('pass').setDescription('How many right counts as a pass').setRequired(false).setMinValue(1).setMaxValue(20))
       .addIntegerOption(o=>o.setName('merit').setDescription('Merits awarded for passing').setRequired(false).setMinValue(1).setMaxValue(10))
       .addUserOption(o=>o.setName('player').setDescription('Set it for someone else — the buttons are theirs (GM)').setRequired(false))
@@ -10355,10 +10388,14 @@ async function handleStoryAnswerModal(interaction) {
   let next = right ? (sc.right_to || sc.wrong_to) : (sc.wrong_to || sc.right_to);
   if (!right && quizModeOf(gid, run.story) === 'retry') next = sc.scene;   // round again
   noteQuizSeen(gid, uid, sc, right);
-  const head = right
-    ? `✅ **${given}** — correct.`
-    : `❌ **${given}** — not this time.${wanted.length ? ` _(wanted: ${wanted[0]})_` : ''}`
-    + (sc.explain ? `\n_${sc.explain}_` : '');
+  noteQuizAnswer(gid, cid, uid, run, { question: sc.say, given, right, explain: sc.explain });
+  const silent = quizModeOf(gid, run.story) === 'silent';
+  const head = silent
+    ? `· **${given}** — _answer recorded._`
+    : right
+      ? `✅ **${given}** — correct.`
+      : `❌ **${given}** — not this time.${wanted.length ? ` _(wanted: ${wanted[0]})_` : ''}`
+        + (sc.explain ? `\n_${sc.explain}_` : '');
   await interaction.reply({ content: head });
   if (!next) return;
   const nextSc = getScene(gid, run.story, next);
@@ -10742,6 +10779,31 @@ async function handleStat(interaction) {
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers],
+});
+
+// A server that invites the bot AFTER it booted was getting no commands at
+// all, because registration only ever ran in the ready loop over servers it
+// was already in. Registering on arrival is the whole fix: a new table can
+// use the bot the moment it lands, without waiting for a restart.
+client.on('guildCreate', async (guild) => {
+  console.log(`➕ Joined ${guild.name} (${guild.id}) — registering commands`);
+  await registerSlashCommands(guild.id).catch(console.error);
+  // Say hello somewhere they will see it, with the two steps that follow.
+  try {
+    const where = guild.systemChannel
+      ?? guild.channels.cache.find(c => c.isTextBased?.() && c.permissionsFor(guild.members.me)?.has('SendMessages'));
+    if (where) {
+      await where.send({ content: [
+        '🎲 **DDice is here.** Two steps and this server is ready:',
+        '',
+        '**1.** Make a role for your GMs, then `/config mechanics gmrole role:@GM`',
+        '**2.** `/gm check build:true` — builds every channel and forum, wires them, and fills them',
+        '',
+        '_Playing 5e? `/config channels ruleset system:dnd5e` before anyone makes a character, then `/library srd`._',
+        '_`/help` lists everything, and `/gm check` shows what is still waiting._',
+      ].join('\n') });
+    }
+  } catch { /* no channel it may speak in — the commands are what matter */ }
 });
 
 client.on('ready', async () => {
@@ -16794,7 +16856,8 @@ const HELP_CATEGORIES = {
       '`/quiz list` · `/quiz show id:` · `/quiz remove id:` — read the bank, one question, or delete one (GM)',
       '`/config channels quizforum channel:#forum` — where the bank is posted to read: a thread per category (Admin)',
       '_Quizzes:_ a scene with `ASK` waits for a typed answer, or put a `*` before the right option in a `CHOICE` block for multiple choice. `RIGHT ->` / `WRONG ->` route typed answers.',
-      '↳ `QUIZ tally` at the top lets every answer carry on and reads the score out at the end; `QUIZ retry` sends a wrong answer back to the same question. `/activity demo which:Kalidale Lore` is a five-question example.',
+      '↳ `QUIZ tally` tells them as they go and scores at the end; `QUIZ retry` sends a wrong answer back to the same question; `QUIZ silent` tells them nothing until the marking at the end — the whole paper, with your explanations under what they missed.',
+      '↳ On `/quiz start` the same three are offered as `mode:`. `/activity demo which:Kalidale Lore` is a five-question example.',
     ],
   },
 
