@@ -1204,15 +1204,21 @@ function testPins(src) {
     // plan order per category, re-parenting adopted strays as it goes.
     // Without this, any channel adopted by name keeps its old position and
     // the plan only governs fresh creates.
-    // Bulk setPositions alone is NOT enough — observed live 2026-08-10, the
-    // endpoint interleaved text and forum channels by its own rules. The
-    // per-channel walk is the part that actually lands the order; if a
-    // refactor drops it in favour of the bulk call, the sidebar drifts on
-    // real servers while every sandbox check stays green.
-    ok('setup orders the sidebar to the plan (bulk first)',
-      /await guild\.channels\.setPositions\(want\.map/.test(src));
-    ok('then per channel — the walk that actually sticks',
-      /for \(const w of want\) \{[\s\S]{0,400}?await ch\.edit\(\{ position: w\.pos \}\)/.test(src));
+    // The sidebar order has failed to land twice, two different ways, so the
+    // ordering code is now built to produce EVIDENCE: forced before/after
+    // raw positions on every edit, and a diagnostic that prints each
+    // category's raw sequences split by type. These pin the evidence
+    // machinery itself — losing it means the next failure is a guess again.
+    ok('one order applier serves build, restart and the diagnostic',
+      /async function applySidebarOrder\(guild, entries\)/.test(src) &&
+      /await applySidebarOrder\(guild, sidebar\)/.test(src) &&
+      /await applySidebarOrder\(guild, entries\)/.test(src));
+    ok('every edit is verified against a forced refetch',
+      (src.match(/fetch\(w\.id, \{ force: true \}\)/g) || []).length === 2);
+    ok('refused edits are counted and surfaced, not swallowed',
+      /if \(ord\.refused\) lines\.push/.test(src));
+    ok('the diagnostic shows per-type raw sequences',
+      /forums: \$\{seq\(c => c\.type === 15\)/.test(src));
     ok('re-parenting never rewrites channel overwrites',
       (src.match(/lockPermissions: false/g) || []).length >= 2);
 

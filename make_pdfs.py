@@ -1449,6 +1449,7 @@ CONTENT = [
           ('/gm check', 'which channels are set, which await'),
           ('/gm check build:true', 'make every channel and forum, then fill them'),
           ('/gm check restart:true', 'DELETE the whole setup and build it fresh \u2014 asks first,\nand the threads inside do not come back'),
+          ('/gm check order:true', 're-apply the sidebar order and show what Discord kept'),
           ('/gm check run:true', 'builds anything the bot knows about that this\nserver hasn\u2019t got yet \u2014 audit shelves, quest\npipeline books, pipeline tags \u2014 and says what it\nmade. Surviving threads are adopted by id, never\nremade, so it is safe to run as often as you like.\nPull this switch after any update that adds a book'),
           ('/gm check build:true', 'the one-command setup: makes every channel and\nforum the bot needs, in TWO categories \u2014 <b>DDice</b>\nopen to the table, and <b>DDice \u00b7 Game Masters</b> shut to\neveryone else \u2014 points the config at each, then fills them with the audit shelves,\npipeline books and tags. Adopts before it makes:\nanything already set is left alone, and a channel\nmerely NAMED for the job is taken up rather than\ndoubled, so it is safe on a server set up by hand.\nNeeds Manage Channels, for you and for the bot'),
           ('(pickers)', 'the check report offers channel pickers for unset\nconfigs \u2014 up to five at a time; a pick runs the\nreal config branch, tags and books included\n(Manage Server required)'),

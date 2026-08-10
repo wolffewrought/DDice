@@ -5201,7 +5201,8 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('check').setDescription('Which channels and forums are set up for the bot, and which await (GM)')
       .addBooleanOption(o=>o.setName('run').setDescription('true = build anything missing — new books and tags after an update').setRequired(false))
       .addBooleanOption(o=>o.setName('build').setDescription('true = make every channel and forum the bot needs, then fill them').setRequired(false))
-      .addBooleanOption(o=>o.setName('restart').setDescription('true = DELETE every channel the bot set up, then build fresh. Asks first.').setRequired(false)))
+      .addBooleanOption(o=>o.setName('restart').setDescription('true = DELETE every channel the bot set up, then build fresh. Asks first.').setRequired(false))
+      .addBooleanOption(o=>o.setName('order').setDescription('true = re-apply the sidebar order and show the raw positions Discord kept').setRequired(false)))
     .addSubcommand(s=>s.setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)')
       .addAttachmentOption(o=>o.setName('file').setDescription('A scroll PDF made by /gm scroll — I read it back as text and a fresh copy in this server\'s font').setRequired(false)))
     .addSubcommand(s=>s.setName('dicereport').setDescription('The server\'s dice health — who rolls, how the d20s run, the hot and cold hands (GM)'))
@@ -10896,6 +10897,7 @@ async function runGmRollSlash(interaction) {
 async function handleCheck(interaction) {
   // `run:true` builds whatever the code knows about and this server hasn't
   // got yet — the one switch to pull after an update adds a book.
+  if (interaction.options?.getBoolean?.('order')) return runOrderReport(interaction);
   if (interaction.options?.getBoolean?.('restart')) return runFullRestart(interaction);
   if (interaction.options?.getBoolean?.('build')) return runFullSetup(interaction);
   if (interaction.options?.getBoolean?.('run')) return runSetupRepair(interaction);
@@ -18870,6 +18872,76 @@ async function sweepQuestChannels(client, gid, quest) {
 // The whole thing: make what's missing, wire it, then fill it. Safe to run
 // on a server already set up by hand — nothing pointed at a live channel is
 // touched, and a channel merely named for the job is adopted.
+// Apply the plan's sidebar order and say exactly what Discord did with it.
+// Force-fetched raw positions before and after each edit, because this
+// order has now failed to land twice in two different ways and the next
+// step has to be evidence, not another guess: either the edits are being
+// refused (the after value will not match) or Discord keeps separate
+// position sequences per channel type and merges them by raw value (every
+// edit lands, and the raw table shows text and forum numbering running
+// independently).
+// /gm check order:true — the diagnostic. Re-applies the plan and prints the
+// evidence: wanted slot, type, raw position before and after, and each
+// category's raw sequences split by type. One screenshot of this settles
+// which of the two failure stories is true.
+async function runOrderReport(interaction) {
+  const gid = interaction.guild.id, guild = interaction.guild;
+  const { ChannelType } = require('discord.js');
+  await interaction.deferReply({ ephemeral: true });
+  const cfg = getConfig(gid) || {};
+  const cats = Object.fromEntries(['DDice', 'DDice \u00b7 Game Masters'].map(n =>
+    [n, guild.channels.cache.find(c => c.type === ChannelType.GuildCategory && c.name === n)?.id ?? null]));
+  const entries = [];
+  for (const plan of SETUP_PLAN) {
+    let id = cfg[plan.key] || null;
+    if (plan.json) { try { id = JSON.parse(cfg[plan.key] || '{}')[plan.json] || null; } catch { id = null; } }
+    if (id) entries.push({ id, gm: plan.gm, cat: plan.gm ? cats['DDice \u00b7 Game Masters'] : cats['DDice'] });
+  }
+  if (!entries.length) return interaction.editReply({ content: '\u2699\ufe0f Nothing configured to order \u2014 `/gm check build:true` first.' });
+  const { lines, refused } = await applySidebarOrder(guild, entries);
+  // Discord's own view, per category, split by type: if the two sequences
+  // number independently, it is visible right here.
+  const view = [];
+  for (const [label, catId] of Object.entries(cats)) {
+    if (!catId) continue;
+    const kids = guild.channels.cache.filter(c => c.parentId === catId);
+    const seq = (pred) => kids.filter(pred).sort((a, b) => (a.rawPosition ?? a.position) - (b.rawPosition ?? b.position))
+      .map(c => `${c.name}:${c.rawPosition ?? c.position}`).join(' ');
+    view.push(`**${label}** \u00b7 forums: ${seq(c => c.type === 15) || '\u2014'}`);
+    view.push(`\u2003\u2003texts: ${seq(c => c.type !== 15) || '\u2014'}`);
+  }
+  return interaction.editReply({ content:
+    [`\ud83e\udded **Sidebar order** \u2014 ${refused ? `**${refused} refused**` : 'all edits accepted'}`, '',
+     ...lines, '', ...view].join('\n').slice(0, 1990) });
+}
+
+async function applySidebarOrder(guild, entries) {
+  let po = 0, pg = 0, refused = 0;
+  const lines = [];
+  const want = entries.filter(x => x.id).map(x => ({ ...x, pos: x.gm ? pg++ : po++ }));
+  // The one-call path first; harmless when ignored, cheap when honoured.
+  await guild.channels.setPositions(want.map(w => ({
+    channel: w.id, position: w.pos,
+    ...(w.cat ? { parent: w.cat, lockPermissions: false } : {}),
+  }))).catch(err => console.error('[setup] bulk order -', err?.message || err));
+  for (const w of want) {
+    const before = await guild.channels.fetch(w.id, { force: true }).catch(() => null);
+    if (!before) { lines.push(`?? <#${w.id}> \u2014 unfetchable`); continue; }
+    if (w.cat && before.parentId !== w.cat) {
+      await before.edit({ parent: w.cat, lockPermissions: false }).catch(() => {});
+    }
+    const ok = await before.edit({ position: w.pos }).then(() => true).catch(err => {
+      console.error(`[setup] order ${before.name} -> ${w.pos} -`, err?.message || err);
+      return false;
+    });
+    const after = await guild.channels.fetch(w.id, { force: true }).catch(() => null);
+    if (!ok || !after) refused++;
+    const t = before.type === 15 ? 'f' : 't';
+    lines.push(`${String(w.pos).padStart(2)} ${t} ${before.name} \u2014 raw ${before.rawPosition ?? before.position} \u2192 ${after ? (after.rawPosition ?? after.position) : '?'}${ok ? '' : ' \u274c refused'}`);
+  }
+  return { lines, refused };
+}
+
 // /gm check restart:true — tear down EVERYTHING the config points at, then
 // build fresh. The teardown list is read from config at the moment of the
 // confirm press, categories included, regardless of who made the channels or
@@ -19000,31 +19072,8 @@ async function buildAllSetup(interaction) {
   // own overwrites. run:true, the light repair, deliberately leaves
   // positions alone so a hand-arranged sidebar survives it.
   try {
-    let po = 0, pg = 0;
-    const want = sidebar.filter(x => x.id).map(x => ({
-      id: x.id, pos: x.gm ? pg++ : po++, cat: x.cat,
-    }));
-    // One bulk call first — cheap when Discord honours it.
-    if (want.length) await guild.channels.setPositions(want.map(w => ({
-      channel: w.id, position: w.pos,
-      ...(w.cat ? { parent: w.cat, lockPermissions: false } : {}),
-    }))).catch(err => console.error('[setup] bulk order -', err?.message || err));
-    // It does not always honour it. Observed live 2026-08-10: the bulk
-    // endpoint interleaved text and forum channels by rules of its own —
-    // texts landed at every other slot regardless of the numbers sent. So
-    // the plan is then enforced the way the client's own drag does it: one
-    // position edit per channel, ascending, which does stick. Refetch first;
-    // raw positions are Discord's numbering, not ours, so the only reliable
-    // comparison is doing the walk.
-    for (const w of want) {
-      const ch = await guild.channels.fetch(w.id).catch(() => null);
-      if (!ch) continue;
-      if (w.cat && ch.parentId !== w.cat) {
-        await ch.edit({ parent: w.cat, lockPermissions: false }).catch(() => {});
-      }
-      await ch.edit({ position: w.pos }).catch(err =>
-        console.error(`[setup] order ${ch.name} -> ${w.pos} -`, err?.message || err));
-    }
+    const ord = await applySidebarOrder(guild, sidebar);
+    if (ord.refused) lines.push(`\u26a0\ufe0f Sidebar: ${ord.refused} position edit${ord.refused === 1 ? '' : 's'} refused \u2014 \`/gm check order:true\` shows the raw table.`, '');
   } catch (err) { console.error('[setup] sidebar order -', err?.message || err); }
 
   const made = [...open.made, ...gm.made];
