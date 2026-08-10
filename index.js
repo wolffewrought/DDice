@@ -2717,6 +2717,10 @@ function docFilesFor(gid) {
 }
 
 const DOCS_POLL_MS = 15 * 60 * 1000;
+// Where the command books live when a server has not said otherwise: this
+// bot's own repository, which ships all six PDFs at its root. /config
+// channels docs overrides it for forks.
+const DOCS_DEFAULT_REPO = 'wolffewrought/DDice';
 const DOC_PLAYER_FILE = 'DDice-Commands-Player.pdf';
 // The player's edition for a given server, under whichever name it wears.
 const docPlayerFileFor = (gid) => (rulesFor(gid).id === 'dnd5e' ? 'DnD5e-' : '') + DOC_PLAYER_FILE;
@@ -5196,7 +5200,8 @@ const slashCommands = [
       .addBooleanOption(o=>o.setName('runs').setDescription('true = also erase the run ledger and DM guided-counters (default: history kept)').setRequired(false)))
     .addSubcommand(s=>s.setName('check').setDescription('Which channels and forums are set up for the bot, and which await (GM)')
       .addBooleanOption(o=>o.setName('run').setDescription('true = build anything missing — new books and tags after an update').setRequired(false))
-      .addBooleanOption(o=>o.setName('build').setDescription('true = make every channel and forum the bot needs, then fill them').setRequired(false)))
+      .addBooleanOption(o=>o.setName('build').setDescription('true = make every channel and forum the bot needs, then fill them').setRequired(false))
+      .addBooleanOption(o=>o.setName('restart').setDescription('true = DELETE every channel the bot set up, then build fresh. Asks first.').setRequired(false)))
     .addSubcommand(s=>s.setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)')
       .addAttachmentOption(o=>o.setName('file').setDescription('A scroll PDF made by /gm scroll — I read it back as text and a fresh copy in this server\'s font').setRequired(false)))
     .addSubcommand(s=>s.setName('dicereport').setDescription('The server\'s dice health — who rolls, how the d20s run, the hot and cold hands (GM)'))
@@ -10891,6 +10896,7 @@ async function runGmRollSlash(interaction) {
 async function handleCheck(interaction) {
   // `run:true` builds whatever the code knows about and this server hasn't
   // got yet — the one switch to pull after an update adds a book.
+  if (interaction.options?.getBoolean?.('restart')) return runFullRestart(interaction);
   if (interaction.options?.getBoolean?.('build')) return runFullSetup(interaction);
   if (interaction.options?.getBoolean?.('run')) return runSetupRepair(interaction);
   const gid = interaction.guild.id;
@@ -18864,6 +18870,83 @@ async function sweepQuestChannels(client, gid, quest) {
 // The whole thing: make what's missing, wire it, then fill it. Safe to run
 // on a server already set up by hand — nothing pointed at a live channel is
 // touched, and a channel merely named for the job is adopted.
+// /gm check restart:true — tear down EVERYTHING the config points at, then
+// build fresh. The teardown list is read from config at the moment of the
+// confirm press, categories included, regardless of who made the channels or
+// what has happened to them since: that is the deliberate scope. The reply
+// spells out the cost before the buttons, because the forums it removes hold
+// every thread anyone ever wrote in them and Discord has no undelete.
+async function runFullRestart(interaction) {
+  const gid = interaction.guild.id, guild = interaction.guild;
+  const { PermissionFlagsBits, ChannelType } = require('discord.js');
+  if (!interaction.member?.permissions?.has(PermissionFlagsBits.ManageChannels)) {
+    return interaction.reply({ content: '\u274c Restart deletes and remakes channels \u2014 it needs **Manage Channels**, so an admin has to run it.', ephemeral: true });
+  }
+  if (!guild.members.me?.permissions?.has(PermissionFlagsBits.ManageChannels)) {
+    return interaction.reply({ content: '\u274c I need **Manage Channels** myself before I can do this.', ephemeral: true });
+  }
+
+  // Everything the config points at, plain keys and JSON-mapped forums both.
+  const cfg = getConfig(gid) || {};
+  const doomed = new Map();   // id -> label
+  for (const plan of SETUP_PLAN) {
+    let id = cfg[plan.key] || null;
+    if (plan.json) { try { id = JSON.parse(cfg[plan.key] || '{}')[plan.json] || null; } catch { id = null; } }
+    if (id) doomed.set(id, plan.name);
+  }
+  const cats = ['DDice', 'DDice \u00b7 Game Masters']
+    .map(n => guild.channels.cache.find(c => c.type === ChannelType.GuildCategory && c.name === n))
+    .filter(Boolean);
+
+  if (!doomed.size && !cats.length) {
+    return interaction.reply({ ephemeral: true, content: '\u2699\ufe0f Nothing is set up yet \u2014 `/gm check build:true` is the one you want.' });
+  }
+  // The confirm card and the report both live in this channel. If it is on
+  // the list, they die mid-flight and the command can never say what it did.
+  if (doomed.has(interaction.channelId) || cats.some(c => c.id === interaction.channel?.parentId)) {
+    return interaction.reply({ ephemeral: true, content:
+      '\u26a0\ufe0f Run this from a channel that is not about to be deleted \u2014 anywhere outside the two DDice categories.' });
+  }
+
+  const names = [...doomed.values()];
+  return requestConfirm(interaction,
+    [`\ud83e\udde8 **Restart the whole setup?** This deletes **${doomed.size}** channel${doomed.size === 1 ? '' : 's'}`
+     + `${cats.length ? ` and **${cats.length}** categor${cats.length === 1 ? 'y' : 'ies'}` : ''}, then builds everything fresh.`,
+     '',
+     `\ud83d\uddd1\ufe0f ${names.map(n => '`' + n + '`').join(' ')}`,
+     '',
+     '**Every thread inside them goes too \u2014 quest history, character pages, portraits, the audit shelves. Discord has no undelete.**',
+     'Your data (sheets, quests, rolls) survives in the database; the channels do not.'].join('\n'),
+    async () => {
+      let deleted = 0, failedDel = 0;
+      for (const [id, label] of doomed) {
+        const ch = await interaction.client.channels.fetch(id).catch(() => null);
+        if (ch) { const ok = await ch.delete('gm check restart').then(() => true).catch(() => false); ok ? deleted++ : failedDel++; }
+      }
+      for (const cat of cats) await cat.delete('gm check restart').catch(() => {});
+
+      // Point at nothing: every plan key nulled, JSON maps and all, so the
+      // rebuild starts from a clean slate rather than adopting ghosts.
+      const wipe = {};
+      for (const plan of SETUP_PLAN) wipe[plan.key] = null;
+      for (const k of ['docs_msg_id', 'docs_sha', 'docs_player_msg_id', 'quest_plan_tags']) wipe[k] = null;
+      setConfig(gid, wipe);
+
+      // Derived thread maps die with their forums.
+      for (const t of ['npc_pages', 'npc_category_threads', 'npc_portrait_threads', 'char_pages', 'npc_webhooks']) {
+        try { db.prepare(`DELETE FROM ${t} WHERE guild_id=?`).run(gid); } catch {}
+      }
+      // Per-quest thread references now point at nothing; null them so the
+      // clock and the board stop trying to edit ghosts. The quests, their
+      // parties and their history all stay.
+      try { db.prepare('UPDATE quests SET plan_thread_id=NULL, run_thread_id=NULL, index_thread_id=NULL, index_msg_id=NULL, stage_msg_id=NULL WHERE guild_id=?').run(gid); } catch {}
+
+      const lines = await buildAllSetup(interaction);
+      return [`\ud83e\udde8 Torn down: **${deleted}** channel${deleted === 1 ? '' : 's'}${failedDel ? ` (${failedDel} refused)` : ''} and ${cats.length} categor${cats.length === 1 ? 'y' : 'ies'}.`,
+              '', ...lines].join('\n').slice(0, 1990);
+    });
+}
+
 async function runFullSetup(interaction) {
   const gid = interaction.guild.id, guild = interaction.guild;
   const { PermissionFlagsBits, ChannelType } = require('discord.js');
@@ -18874,6 +18957,16 @@ async function runFullSetup(interaction) {
     return interaction.reply({ content: '❌ I need **Manage Channels** myself before I can build anything.', ephemeral: true });
   }
   await interaction.deferReply();
+  const lines = await buildAllSetup(interaction);
+  return interaction.editReply({ content: lines.join('\n').slice(0, 1990) });
+}
+
+// The build itself, callable from /gm check build:true and from restart's
+// confirm press alike. Returns the report lines; the caller owns the
+// reply, because the two paths hold their interactions in different
+// acknowledged states and a second deferReply throws.
+async function buildAllSetup(interaction) {
+  const gid = interaction.guild.id, guild = interaction.guild;
 
   // Everything lands in one category, so a server does not sprout a dozen
   // loose channels.
@@ -18901,6 +18994,12 @@ async function runFullSetup(interaction) {
   const kept = [...open.kept, ...gm.kept];
 
   // Now fill them: the audit shelves, the quest books, the pipeline tags.
+  // The docs channels are pointless without a source. Default to the bot's
+  // own repo when none is set — the watcher fires thirty seconds after boot
+  // and every fifteen minutes, so the books post on their own from here.
+  let docsSeeded = false;
+  if (!getConfig(gid)?.docs_repo) { setConfig(gid, { docs_repo: DOCS_DEFAULT_REPO }); docsSeeded = true; }
+
   const audit = await ensureAuditBooks(interaction.client, gid).catch(() => null);
   // A server that already had an NPC forum keeps whatever layout it had, so
   // adopting one here has to lay it out as well — otherwise setup reports
@@ -18930,6 +19029,9 @@ async function runFullSetup(interaction) {
   const lines = ['🏗️ **Setup complete.**', '',
     ...section('🌍 DDice — open to the table', open),
     ...section('🔒 DDice · Game Masters — GMs only', gm)];
+  if (docsSeeded) {
+    lines.push(`\ud83d\udcda PDF source set to **${DOCS_DEFAULT_REPO}** \u2014 the books post within the half hour. \`/config channels docs repo:\` changes it.`, '');
+  }
   if (npcLaid?.written) {
     lines.push(`🎭 Wrote up **${npcLaid.written}** NPC${npcLaid.written === 1 ? '' : 's'} by category`
       + (npcLaid.closed ? `, closing **${npcLaid.closed}** old per-NPC thread${npcLaid.closed === 1 ? '' : 's'}` : '') + '.', '');
@@ -18946,7 +19048,7 @@ async function runFullSetup(interaction) {
   lines.push('', '_What is left is yours to decide:_ `/config mechanics gmrole` names your GMs, '
     + '`/config channels ruleset` picks the rules, and `/config channels docs` needs your repo. '
     + 'Run `/gm check` any time to see what is set.');
-  return interaction.editReply({ content: lines.join('\n').slice(0, 1990) });
+  return lines;
 }
 
 // Build anything missing, then say plainly what changed and what was

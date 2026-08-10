@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 629 assertions passed and no scanner found an ERROR.
+Green means 637 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 629 assertions covering structure, registration and ruleset
+now is 637 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -245,6 +245,32 @@ quest-copy feature would have died silently.
 User-facing wording follows the channel: "party room" is now "quest thread"
 throughout. Internal variable names (`const room = opened.thread`,
 `born.room`) still say room and are invisible to users.
+
+### `/gm check restart:true`
+
+Tears down **everything the config points at** — all seventeen channels,
+JSON-mapped forums included, plus the two DDice categories — then rebuilds
+through the same `buildAllSetup` body that `build:true` uses. Scope is
+deliberate and total: config at the moment of the confirm press decides the
+list, regardless of who made the channels or what happened to them since.
+
+Four guards, all pinned: it runs through `requestConfirm` with the cost
+spelled out (**threads are unrecoverable — Discord has no undelete**; the DB
+survives, the channels do not); it refuses to run from a channel on its own
+teardown list, or the report would die mid-flight; it nulls every plan key
+plus `docs_msg_id`/`docs_sha`/`quest_plan_tags` so the rebuild starts clean
+instead of adopting ghost ids; and it wipes the derived maps (`npc_pages`,
+both category-thread tables, `char_pages`, `npc_webhooks`) and nulls
+per-quest thread references so nothing edits deleted threads. Quests,
+sheets, rolls and history all stay.
+
+### PDF source auto-seeded
+
+`buildAllSetup` sets `docs_repo` to `wolffewrought/DDice` when nothing is
+configured — the repo that ships all six books at its root — so the two PDF
+channels fill themselves within the half hour instead of sitting empty until
+someone finds `/config channels docs`. The watcher fires 30s after boot and
+every 15 minutes; a fork overrides with `/config channels docs repo:`.
 
 ### Live-fire: `/gm test forum`
 

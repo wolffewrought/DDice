@@ -1022,7 +1022,9 @@ function testBuilders(src) {
     };
     const budget = cmds.map(c => [c.name, size(c)]).sort((a, b) => b[1] - a[1]);
     for (const [n, s] of budget) ok(`/${n} under the 8000-char budget (${s})`, s < 8000);
-    ok('/config is the largest command', budget[0][0] === 'config');
+    // Which command is largest is trivia; the ceiling is the invariant. The
+    // leader has swapped once already (/gm overtook /config when restart's
+    // descriptions landed) and pinning the ranking just made that churn.
     ok('the largest command has a third of its budget spare', budget[0][1] < 5400);
   });
 }
@@ -1198,6 +1200,33 @@ function testPins(src) {
       /UPDATE \$\{table\} SET category=\? WHERE guild_id=\? AND category=\?/.test(src));
     ok('categoryrename refuses a name already in use',
       /merging categories is a different thing/.test(src));
+    // Restart is the most destructive thing the bot can do, so each of its
+    // four guards is pinned: the confirm (no accidental press-through), the
+    // doomed-channel refusal (or the report dies with its own channel), the
+    // clean-slate config wipe (or the rebuild adopts ghost ids), and the
+    // derived-map wipe (or every NPC and character page points at deleted
+    // threads).
+    ok('restart goes through the confirm flow',
+      /async function runFullRestart\([\s\S]{0,2500}?return requestConfirm\(interaction,/.test(src));
+    ok('restart refuses from a doomed channel',
+      /doomed\.has\(interaction\.channelId\)/.test(src));
+    ok('restart nulls every plan key before rebuilding',
+      /for \(const plan of SETUP_PLAN\) wipe\[plan\.key\] = null;/.test(src));
+    ok('restart wipes the derived thread maps',
+      /for \(const t of \['npc_pages', 'npc_category_threads', 'npc_portrait_threads', 'char_pages', 'npc_webhooks'\]\)/.test(src));
+    ok('restart warns that threads are unrecoverable',
+      /Discord has no undelete/.test(src));
+    ok('restart rebuilds through the shared body',
+      /const lines = await buildAllSetup\(interaction\);[\s\S]{0,200}?Torn down/.test(src));
+    ok('build and restart share one setup body',
+      (src.match(/await buildAllSetup\(interaction\)/g) || []).length === 2);
+    // The docs seed: without it the two PDF channels sit empty until someone
+    // finds /config channels docs by accident.
+    ok('setup seeds the docs repo when unset',
+      /if \(!getConfig\(gid\)\?\.docs_repo\) \{ setConfig\(gid, \{ docs_repo: DOCS_DEFAULT_REPO \}\)/.test(src));
+    ok('the default repo is the one shipping the books',
+      /const DOCS_DEFAULT_REPO = 'wolffewrought\/DDice';/.test(src));
+
     ok('the forum lifecycle can be exercised live',
       /setName\('forum'\)\.setDescription\('Exercise the NPC forums end to end/.test(src) &&
       /if \(sub === 'forum'\) \{/.test(src));
