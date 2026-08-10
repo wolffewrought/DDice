@@ -1203,9 +1203,32 @@ function testPins(src) {
       /const recover = async \(parsed\)[\s\S]{0,900}?a\.id === parsed\.attachmentId/.test(src));
     ok('the NPC row is repointed at the re-hosted copy',
       /const newUrl = posted\.attachments\.first\(\)\?\.url[\s\S]{0,120}?setNpcImage\(gid, npc\.name, newUrl\)/.test(src));
-    ok('order faces are checked, never migrated',
-      /SELECT prefix, image_url FROM npc_orders WHERE guild_id=\?/.test(src) &&
-      !/npc_orders SET image_url/.test(src.slice(src.indexOf('runPortraitMigration'), src.indexOf('runOrderReport'))));
+    // Order faces are never re-hosted or repointed by the migration. The one
+    // write it may make is folding a stale case-variant into its fresh face:
+    // the wear-time lookup is COLLATE NOCASE, so "Black knight" beside
+    // "Black Knight" is one face with an arbitrary winner — observed live
+    // serving the dead URL after a fresh upload. The write path now
+    // collapses variants at set-time too, so the fold should become rare.
+    (() => {
+      // Slice between the function declarations — bare-name indexOf lands on
+      // the dispatch lines, which sit one line apart and slice to nothing.
+      const mig = src.slice(src.indexOf('async function runPortraitMigration'), src.indexOf('async function runOrderReport'));
+      ok('order faces are checked, never re-hosted',
+        /SELECT prefix, image_url, set_at FROM npc_orders WHERE guild_id=\?/.test(mig) &&
+        !/npc_orders SET image_url/.test(mig));
+      ok('stale case-variants fold into the healthy face',
+        /if \(healthy && r\.prefix !== healthy\.prefix\)/.test(mig));
+    })();
+    ok('setting an order face collapses its case-variants first',
+      /DELETE FROM npc_orders WHERE guild_id=\? AND prefix=\? COLLATE NOCASE/.test(src));
+    // The duplication bug: the kept-check sniffed the stored URL for the
+    // thread id and fell through to a fresh post when the sniff failed —
+    // live result, the same face posted again on every run. The record is
+    // the truth now; a live recorded message is kept and merely repointed.
+    ok('the kept-check trusts the record, not URL sniffing',
+      !/includes\(`\/\$\{row\.thread_id\}\/`\)/.test(src));
+    ok('a live migrated post is repointed, never reposted',
+      /const liveUrl = alive\.attachments\.first\(\)\?\.url[\s\S]{0,400}?kept\+\+; continue;/.test(src));
     ok('the verdict refuses "safe to delete" while anything leans',
       /still load-bearing/.test(src));
 

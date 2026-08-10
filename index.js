@@ -3095,6 +3095,11 @@ function getOrderImage(gid, prefix) {
   } catch { return null; }
 }
 function setOrderImage(gid, prefix, url, uid) {
+  // The PK is case-sensitive but the wear-time lookup is COLLATE NOCASE, so
+  // "Black knight" and "Black Knight" as separate rows are the same face
+  // with an arbitrary winner — observed live 2026-08-10 serving a stale URL
+  // after a fresh upload. Collapse the variants before writing.
+  db.prepare('DELETE FROM npc_orders WHERE guild_id=? AND prefix=? COLLATE NOCASE').run(gid, prefix);
   db.prepare('INSERT INTO npc_orders (guild_id, prefix, image_url, set_by, set_at) VALUES (?,?,?,?,?) '
     + 'ON CONFLICT(guild_id, prefix) DO UPDATE SET image_url=excluded.image_url, set_by=excluded.set_by, set_at=excluded.set_at')
     .run(gid, prefix, url, uid ?? null, Date.now());
@@ -18979,17 +18984,30 @@ async function runPortraitMigration(interaction) {
 
     let row = null;
     try { row = db.prepare('SELECT * FROM npc_portrait_posts WHERE guild_id=? AND npc_name=?').get(gid, npc.name); } catch {}
-    if (row?.message_id) {
-      if (row.thread_id === thread.id && (npc.image_url || '').includes(`/${row.thread_id}/`)) {
-        const alive = await thread.messages.fetch(row.message_id).catch(() => null);
-        if (alive) { kept++; continue; }
-      } else if (row.thread_id !== thread.id) {
-        // Re-homed since the last run: the old entry comes down first.
-        const oldTh = await interaction.client.channels.fetch(row.thread_id).catch(() => null);
-        if (oldTh?.isThread?.()) {
-          const m = await oldTh.messages.fetch(row.message_id).catch(() => null);
-          if (m) await m.delete().catch(() => {});
+    if (row?.message_id && row.thread_id === thread.id) {
+      // The record is the truth. The first version also sniffed the stored
+      // URL for the thread id and fell through to a fresh post when the
+      // sniff failed — which it did, live, duplicating the same face into
+      // the thread on every run. If the recorded message is alive, this NPC
+      // is migrated; the only work left is repointing the row at the live
+      // attachment's freshly signed URL.
+      const alive = await thread.messages.fetch(row.message_id).catch(() => null);
+      if (alive) {
+        const liveUrl = alive.attachments.first()?.url || null;
+        if (liveUrl && npc.image_url !== liveUrl) {
+          setNpcImage(gid, npc.name, liveUrl);
+          setNpcWebhook(gid, npc.name, null, null);
+          clearNpcWebhooks(gid, npc.name);
         }
+        kept++; continue;
+      }
+      // Recorded message hand-deleted: repost below.
+    } else if (row?.message_id && row.thread_id !== thread.id) {
+      // Re-homed since the last run: the old entry comes down first.
+      const oldTh = await interaction.client.channels.fetch(row.thread_id).catch(() => null);
+      if (oldTh?.isThread?.()) {
+        const m = await oldTh.messages.fetch(row.message_id).catch(() => null);
+        if (m) await m.delete().catch(() => {});
       }
     }
 
@@ -19020,17 +19038,38 @@ async function runPortraitMigration(interaction) {
   // Order faces stay where they are, by design. Say whether they still lean
   // on somewhere outside the forum, because that is what decides whether the
   // old channel can go.
-  let leaning = [];
+  let leaning = [], collapsed = [];
   try {
     const threads = new Set(db.prepare('SELECT thread_id FROM npc_portrait_threads WHERE guild_id=?').all(gid).map(r => r.thread_id));
-    leaning = db.prepare('SELECT prefix, image_url FROM npc_orders WHERE guild_id=?').all(gid)
-      .filter(r => { const pa = parseAttachment(r.image_url); return pa && !threads.has(pa.channelId); })
-      .map(r => r.prefix);
+    const rows = db.prepare('SELECT prefix, image_url, set_at FROM npc_orders WHERE guild_id=?').all(gid);
+    const inForum = (r) => { const pa = parseAttachment(r.image_url); return pa && threads.has(pa.channelId); };
+    // Wear-time lookup is COLLATE NOCASE, so case-variant rows are one face
+    // with an arbitrary winner. Where a variant already points into the
+    // forum, its stale siblings are unreachable intent — drop them here and
+    // say so, rather than telling the GM to re-upload a face they just set.
+    const byFold = new Map();
+    for (const r of rows) {
+      const f = r.prefix.toLowerCase();
+      if (!byFold.has(f)) byFold.set(f, []);
+      byFold.get(f).push(r);
+    }
+    for (const group of byFold.values()) {
+      const healthy = group.filter(inForum).sort((a, b) => (b.set_at || 0) - (a.set_at || 0))[0] || null;
+      for (const r of group) {
+        if (healthy && r.prefix !== healthy.prefix) {
+          db.prepare('DELETE FROM npc_orders WHERE guild_id=? AND prefix=?').run(gid, r.prefix);
+          collapsed.push(`${r.prefix} \u2192 ${healthy.prefix}`);
+        } else if (!healthy && !inForum(r)) {
+          leaning.push(r.prefix);
+        }
+      }
+    }
   } catch {}
 
   const lines = [`\ud83d\uddbc\ufe0f **Portrait migration** \u2014 ${npcs.length} face${npcs.length === 1 ? '' : 's'} checked`,
     `\u2705 Moved **${migrated}** \u00b7 recovered from history **${recovered}** \u00b7 already in place **${kept}**`];
   if (lost.length) lines.push(`\u274c Lost **${lost.length}**: ${lost.slice(0, 10).map(n => `**${n}**`).join(', ')}${lost.length > 10 ? ` and ${lost.length - 10} more` : ''} \u2014 re-upload each in their category thread, caption = their name.`);
+  if (collapsed.length) lines.push(`\ud83e\uddf9 Folded stale case-variants into their fresh face: ${collapsed.map(x => `\`${x}\``).join(', ')}.`);
   if (leaning.length) lines.push(`\ud83d\udee1\ufe0f Order faces still point outside the forum: ${leaning.map(x => `**${x}**`).join(', ')} \u2014 re-upload each as \`Order | Name\` in the forum before deleting the old channel.`);
   lines.push('', (!lost.length && !leaning.length)
     ? '\ud83e\uddf9 Nothing points at the old channel any more \u2014 it is safe to delete.'

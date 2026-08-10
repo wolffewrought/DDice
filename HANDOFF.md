@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 650 assertions passed and no scanner found an ERROR.
+Green means 654 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 650 assertions covering structure, registration and ruleset
+now is 654 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -312,6 +312,19 @@ channel's history for the attachment id and take the freshly signed URL;
 only when both fail is the NPC named on the lost list. Idempotent by
 `npc_portrait_posts` — live posts kept, re-homed NPCs moved, hand-deleted
 posts replaced. Reads the old channel, never writes to it.
+
+Two live faults found on first real run, both fixed and pinned. The
+kept-check originally sniffed the stored URL for the thread id and fell
+through to a fresh post when the sniff failed — duplicating the same face
+into the thread on every run. **The record is the truth now**: a live
+recorded message is kept and merely repointed at its freshly signed
+attachment URL; nothing is ever reposted while the recorded message stands.
+And `npc_orders` keys prefixes case-sensitively while the wear-time lookup
+is `COLLATE NOCASE`, so `Black knight` beside `Black Knight` was one face
+with an arbitrary winner — serving the stale dead URL after a fresh upload.
+`setOrderFace` now collapses case-variants before writing, and the
+migration's verdict folds stale variants into their healthy sibling instead
+of telling the GM to re-upload a face they just set.
 
 **Order faces are deliberately not migrated** — `npc_orders` holds the
 shared portrait each coloured order wears, not gallery entries. The verdict
