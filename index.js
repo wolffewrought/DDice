@@ -48,6 +48,11 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS job_failures (
   PRIMARY KEY (guild_id, job)
 )`); } catch (e) { console.error('job_failures schema', e); }
 try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
+// NPC rerolls existed as a column but were never written — the spend path
+// decremented the LCK stat itself instead ("temporarily", said the comment,
+// and nothing ever restored it). Backfill every pool to full once; from
+// here the column is the pool and rest refills it, mirroring characters.
+try { db.exec('UPDATE npcs SET rerolls_current = lck WHERE rerolls_current = 0 AND lck > 0'); } catch {}
 // Rest restore amounts. Stored as text tokens so GMs can use either form:
 //   "100%" = percentage of that resource's max   |   "3" = flat, set the value to exactly 3
 // Defaults: Long rest = full (100%). Short rest = HP only (50%), no rerolls/heal.
@@ -691,6 +696,12 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS dc_cards (
 // shifts every field after it in the split.
 try { db.exec('ALTER TABLE dc_cards ADD COLUMN s_mark TEXT'); } catch {}
 try { db.exec('ALTER TABLE dc_cards ADD COLUMN f_mark TEXT'); } catch {}
+// A card can bind the fight in its channel: the target's own fight buttons
+// wait until this card is pressed, and a failed bound check can skip their
+// turn. Cleared on resolution; a pruned card simply stops holding.
+try { db.exec('ALTER TABLE dc_cards ADD COLUMN bind_channel TEXT'); } catch {}
+try { db.exec('ALTER TABLE dc_cards ADD COLUMN bind_uid TEXT'); } catch {}
+try { db.exec('ALTER TABLE dc_cards ADD COLUMN bind_skip INTEGER DEFAULT 0'); } catch {}
 // Grappling: which attack-phase roll is pending, and who holds whom.
 try { db.exec('ALTER TABLE fights ADD COLUMN atk_kind TEXT'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN grapples TEXT DEFAULT '{}'"); } catch {}
@@ -836,7 +847,7 @@ function pageSubject(gid, id) {
     const npc = getNpc(gid, npcNameFromFighter(id));
     if (!npc) return null;
     return { ...npc, isNpc: true, user_id: id, displayName: npc.name,
-      hp_current: npc.hp_current, rerolls_current: npc.lck ?? 0 };
+      hp_current: npc.hp_current, rerolls_current: npc.rerolls_current ?? npc.lck ?? 0 };
   }
   const ch = getChar(gid, id);
   return ch ? { ...ch, isNpc: false, user_id: id } : null;
@@ -2542,15 +2553,28 @@ async function runAutoRest(guild, sc) {
   for (const npc of getAllNpcs(gid)) {
     if (npc.died_at) continue;
     if (npcFighting.has(npc.name)) { inFight.push(`${npc.name} 🎭`); continue; }
-    const max = maxHpFromCon(gid, npc.con);
+    const max = maxHpFromCon(gid, npc.con ?? 0);
+    // The same three resources characters rest back, under the same schedule
+    // settings. The old loop restored HP alone and skipped the NPC entirely
+    // when HP was already full — so a full-health healer never regained a
+    // charge and a lucky NPC never regained a token.
+    const upd = {};
     const hpR = resolveRestToken(sc.hp, max, '0%', npc.hp_current ?? 0);
-    if (!hpR.changed) continue;
-    upsertNpc(gid, npc.name, { hp_current: hpR.value });
-    setFighterHp(gid, npcFighterId(npc.name), hpR.value);
+    if (hpR.changed) upd.hp_current = hpR.value;
+    const rR = resolveRestToken(sc.rerolls, npc.lck ?? 0, '0%', npc.rerolls_current ?? 0);
+    if (rR.changed) upd.rerolls_current = rR.value;
+    let healed = false;
+    if (isWhiteKnight(npc)) {
+      const maxC = getConfig(gid)?.heal_charges ?? 3;
+      const fid = npcFighterId(npc.name);
+      const healR = resolveRestToken(sc.heal, maxC, '0%', getHealCharges(gid, fid, maxC).current ?? 0);
+      if (healR.changed) { setHealCharges(gid, fid, healR.value); healed = true; }
+    }
+    if (!Object.keys(upd).length && !healed) continue;
+    if (Object.keys(upd).length) upsertNpc(gid, npc.name, upd);
+    if (upd.hp_current !== undefined) setFighterHp(gid, npcFighterId(npc.name), upd.hp_current);
     restored.push(`${npc.name} 🎭`);
   }
-
-  upsertSchedule(gid, sc.name, { last_run: Date.now() });
   return { restored, skipped, inFight };
 }
 
@@ -5262,6 +5286,10 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)')
       .addAttachmentOption(o=>o.setName('file').setDescription('A scroll PDF made by /gm scroll — I read it back as text and a fresh copy in this server\'s font').setRequired(false)))
     .addSubcommand(s=>s.setName('dicereport').setDescription('The server\'s dice health — who rolls, how the d20s run, the hot and cold hands (GM)'))
+    .addSubcommandGroup(g => { g.setName('override').setDescription('Reach into guided mechanics — the ledgered hand of the GM');
+      g.addSubcommand(s=>s.setName('skip').setDescription('Pass the current turn in this channel\'s fight without them acting')
+        .addStringOption(o=>o.setName('reason').setDescription('Said aloud with the skip — optional').setRequired(false)));
+      return g; })
     .addSubcommand(s=>s.setName('dc').setDescription('Call a check — stat or dice vs DC, roll buttons for players, instant rolls for NPCs (GM)')
       // ─ the scene ─
       .addStringOption(o=>o.setName('flavour').setDescription('The scene — shown on the check card').setRequired(false))
@@ -5276,6 +5304,8 @@ const slashCommands = [
                     {name:'⚡ Dexterity (DEX)',value:'dex'},{name:'🧠 Wisdom (WIS)',value:'wis'},{name:'🍀 Luck (LCK)',value:'lck'}))
       .addStringOption(o=>o.setName('dice').setDescription('Roll set dice instead of a stat, like 2d6+1').setRequired(false))
       .addBooleanOption(o=>o.setName('secret').setDescription('true = players do not see the number; only you are told it').setRequired(false))
+      .addBooleanOption(o=>o.setName('hold').setDescription('true = the fight waits: the target\'s actions pause until this card is pressed').setRequired(false))
+      .addBooleanOption(o=>o.setName('skipfail').setDescription('true = a failed bound check also passes their turn').setRequired(false))
       .addStringOption(o=>o.setName('reveal').setDescription('With secret:true — @mention players who are told the DC privately when they roll').setRequired(false))
       .addStringOption(o=>o.setName('mode').setDescription('How they roll it — advantage, disadvantage, or a bare d20').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'🔼 Advantage',value:'adv'},
@@ -5759,11 +5789,37 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('int').setDescription('Intelligence score').setRequired(false).setMinValue(1).setMaxValue(30))
       .addIntegerOption(o=>o.setName('wis').setDescription('Wisdom score').setRequired(false).setMinValue(1).setMaxValue(30))
       .addIntegerOption(o=>o.setName('cha').setDescription('Charisma score').setRequired(false).setMinValue(1).setMaxValue(30)))
+    .addSubcommand(s=>s.setName('edit').setDescription('Change an existing NPC — only the options you pass; the rest stays')
+      .addStringOption(o=>o.setName('name').setDescription('Which NPC').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('category').setDescription('What kind they are — Enemy, Ally, Vendor… a new one is made if it does not exist').setRequired(false))
+      .addIntegerOption(o=>o.setName('str').setDescription('Strength').setRequired(false))
+      .addIntegerOption(o=>o.setName('con').setDescription('Constitution').setRequired(false))
+      .addIntegerOption(o=>o.setName('dex').setDescription('Dexterity').setRequired(false))
+      .addIntegerOption(o=>o.setName('wis').setDescription('Wisdom').setRequired(false))
+      .addIntegerOption(o=>o.setName('lck').setDescription('Luck').setRequired(false))
+      .addStringOption(o=>o.setName('class').setDescription('Their class — optional, and Hero gives a signature stat').setRequired(false)
+        .addChoices({name:'Vanguard',value:'Vanguard'},{name:'Defender',value:'Defender'},
+                    {name:'Siege Knight',value:'Siege Knight'},{name:'✖️ Clear it',value:'none'}))
+      .addStringOption(o=>o.setName('weapon1').setDescription('What they fight with — restricts their stats if the weapon does').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('weapon2').setDescription('A second weapon').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('atk_stat').setDescription('Which stat the bot should attack with on auto').setRequired(false)
+        .addChoices({name:'💪 Strength',value:'str'},{name:'🫀 Constitution',value:'con'},{name:'⚡ Dexterity',value:'dex'},
+                    {name:'🧠 Wisdom',value:'wis'},{name:'🍀 Luck',value:'lck'},{name:'✖️ Clear it',value:'none'}))
+      .addStringOption(o=>o.setName('def_stat').setDescription('Which stat the bot should defend with on auto').setRequired(false)
+        .addChoices({name:'💪 Strength',value:'str'},{name:'🫀 Constitution',value:'con'},{name:'⚡ Dexterity',value:'dex'},
+                    {name:'🧠 Wisdom',value:'wis'},{name:'🍀 Luck',value:'lck'},{name:'✖️ Clear it',value:'none'}))
+      .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
+        .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Red Knight',value:'Red Knight'},
+                    {name:'Blue Knight',value:'Blue Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Purple Knight',value:'Purple Knight'},
+                    {name:'Siege Knight',value:'Siege Knight'},{name:'✖️ Clear it',value:'none'})))
+    .addSubcommand(s=>s.setName('rename').setDescription('Rename an NPC — every record follows: pages, portrait, items, standing, history')
+      .addStringOption(o=>o.setName('name').setDescription('Who they are now').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('to').setDescription('Who they become').setRequired(true)))
     .addSubcommand(s=>s.setName('reroll').setDescription('Reroll an NPC\'s last roll here — spends one of its LCK tokens')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'})))
-    .addSubcommand(s=>s.setName('create').setDescription('Create an NPC')
+    .addSubcommand(s=>s.setName('create').setDescription('Create an NPC — a new one; /npc edit changes one that exists')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true))
       .addStringOption(o=>o.setName('category').setDescription('What kind they are — Enemy, Ally, Vendor… a new one is made if it does not exist').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('str').setDescription('Strength').setRequired(false))
@@ -5824,20 +5880,27 @@ const slashCommands = [
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('import').setDescription('Bring an exported NPC PDF onto this server — applied directly, you are the approver')
       .addAttachmentOption(o=>o.setName('file').setDescription('An NPC PDF made by /npc export').setRequired(true)))
-    .addSubcommand(s=>s.setName('categorylist').setDescription('List all NPC categories'))
-    .addSubcommand(s=>s.setName('categorycreate').setDescription('Create a new NPC category')
-      .addStringOption(o=>o.setName('name').setDescription('Category name').setRequired(true)))
-    .addSubcommand(s=>s.setName('categoryrename').setDescription('Rename an NPC category \u2014 members, threads and home order all follow')
-      .addStringOption(o=>o.setName('name').setDescription('The category as it is now').setRequired(true).setAutocomplete(true))
-      .addStringOption(o=>o.setName('to').setDescription('What to call it instead').setRequired(true)))
-    .addSubcommand(s=>s.setName('categorydelete').setDescription('Delete an NPC category')
-      .addStringOption(o=>o.setName('name').setDescription('Category name').setRequired(true).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('categoryassign').setDescription('Assign an NPC to a category')
-      .addStringOption(o=>o.setName('npc').setDescription('NPC name').setRequired(true).setAutocomplete(true))
-      .addStringOption(o=>o.setName('category').setDescription('Category name').setRequired(true).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('categoryremove').setDescription('Remove an NPC from a category')
-      .addStringOption(o=>o.setName('npc').setDescription('NPC name').setRequired(true).setAutocomplete(true))
-      .addStringOption(o=>o.setName('category').setDescription('Category name').setRequired(true).setAutocomplete(true))),
+    // The category family folded from six leaves into one group — freeing
+    // the room /npc edit needed against the 25-leaf wall. Leaf names inside
+    // deliberately reuse top-level ones (create, list, remove): dispatch
+    // reads the group first and prefixes it back, so the handlers below
+    // never changed.
+    .addSubcommandGroup(g => { g.setName('category').setDescription('Make, rename, assign and tidy NPC categories');
+      g.addSubcommand(s=>s.setName('list').setDescription('List all NPC categories'));
+      g.addSubcommand(s=>s.setName('create').setDescription('Create a new NPC category')
+        .addStringOption(o=>o.setName('name').setDescription('Category name').setRequired(true)));
+      g.addSubcommand(s=>s.setName('rename').setDescription('Rename an NPC category \u2014 members, threads and home order all follow')
+        .addStringOption(o=>o.setName('name').setDescription('The category as it is now').setRequired(true).setAutocomplete(true))
+        .addStringOption(o=>o.setName('to').setDescription('What to call it instead').setRequired(true)));
+      g.addSubcommand(s=>s.setName('delete').setDescription('Delete an NPC category')
+        .addStringOption(o=>o.setName('name').setDescription('Category name').setRequired(true).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('assign').setDescription('Assign an NPC to a category')
+        .addStringOption(o=>o.setName('npc').setDescription('NPC name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o=>o.setName('category').setDescription('Category name').setRequired(true).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('remove').setDescription('Remove an NPC from a category')
+        .addStringOption(o=>o.setName('npc').setDescription('NPC name').setRequired(true).setAutocomplete(true))
+        .addStringOption(o=>o.setName('category').setDescription('Category name').setRequired(true).setAutocomplete(true)));
+      return g; }),
 
   new SlashCommandBuilder()
     .setName('fight').setDescription('Manage a fight between players')
@@ -6352,6 +6415,14 @@ async function handleNpcPages(interaction, sub) {
   if (npc.preferred_atk || npc.preferred_def) {
     lines.push('', `🎯  Auto — ⚔️ ${npc.preferred_atk ? STAT_LABELS[npc.preferred_atk] : 'best allowed'}`
       + ` · 🛡️ ${npc.preferred_def ? STAT_LABELS[npc.preferred_def] : 'best allowed'}`);
+  }
+  {
+    // The two mirrored resources, right where a player sheet shows theirs.
+    lines.push(`🔄 **Rerolls** — **${npc.rerolls_current ?? 0}** / ${npc.lck ?? 0}`);
+    if (isWhiteKnight(npc)) {
+      const maxC = getConfig(gid)?.heal_charges ?? 3;
+      lines.push(`🛡 **Heal** — **${getHealCharges(gid, npcFighterId(npc.name), maxC).current ?? 0}** / ${maxC}`);
+    }
   }
   lines.push('', `🏅 **Standing** — **${npc.merits ?? 0}** merit${(npc.merits ?? 0) === 1 ? '' : 's'} · 💠 **${npc.renown ?? 0}** renown`);
   const ev = standingEvents(gid, id, 10);
@@ -7678,6 +7749,9 @@ async function handleConfig(interaction, forced) {
         + 'A fresh server for the other rules is the safe way — quests, NPCs and the question bank are per-server anyway.' });
     }
     setConfig(gid, { ruleset: want });
+    // The picker must flip with the setting, or the server keeps the other
+    // system's commands until the next category change happens to re-register.
+    registerSlashCommands(gid).catch(console.error);
     const r = RULESETS[want];
     return interaction.reply({ content:
       `📖 This server now plays by **${r.name}**.\n`
@@ -9362,6 +9436,8 @@ function saveDcCard(gid, msgId, o) {
     db.prepare('DELETE FROM dc_cards WHERE created_at < ?').run(Date.now() - 7 * 86400_000);
     db.prepare(`INSERT OR REPLACE INTO dc_cards (guild_id, message_id, s_flavour, f_flavour, s_sanction, f_sanction, s_mark, f_mark, created_at)
                 VALUES (?,?,?,?,?,?,?,?,?)`).run(gid, msgId, o.sF ?? null, o.fF ?? null, o.sS ?? null, o.fS ?? null, o.sM ?? null, o.fM ?? null, Date.now());
+    if (o.bindC) db.prepare('UPDATE dc_cards SET bind_channel=?, bind_uid=?, bind_skip=? WHERE guild_id=? AND message_id=?')
+      .run(o.bindC, o.bindU ?? null, o.bindSkip ? 1 : 0, gid, msgId);
   } catch { /* trimmings only */ }
 }
 function getDcCard(gid, msgId) {
@@ -9496,6 +9572,14 @@ async function runGmDcCheck(interaction) {
   const gmMode = flat ? 'normal' : modeRaw;
   const modifier = interaction.options.getInteger('modifier') ?? 0;
   const secret = interaction.options.getBoolean('secret') ?? false;
+  // hold:true binds the fight in this channel to this card — the target's
+  // fight actions wait until it is pressed. skipfail:true makes a failed
+  // bound check also pass their turn.
+  const hold = interaction.options.getBoolean('hold') ?? false;
+  const skipFail = interaction.options.getBoolean('skipfail') ?? false;
+  if (hold && !interaction.options.getUser('target')) {
+    return interaction.reply({ ephemeral: true, content: '❌ `hold:true` binds one fighter — name them with `target:`.' });
+  }
   const revealSet = new Set(parsePlayerMentions(interaction.options.getString('reveal') || ''));
   const onFail = interaction.options.getString('on_fail') || '';
   const onSucc = interaction.options.getString('on_success') || '';
@@ -9577,11 +9661,12 @@ async function postDcCheck(interaction, { stat, notation, dc, gmMode, flat, modi
     `${face} vs DC ${dc}${secret ? ' (secret)' : ''}${terms.length ? ` · ${terms.join(' · ')}` : ''}`,
     ids.length ? `👥 ${ids.map(id => `<@${id}>`).join(' ')}` : '',
     npcNames.length ? `🎭 ${npcNames.join(', ')}` : ''].filter(Boolean).join('\n'));
-  if (ids.length && (sF || fF || sS || fS || onFail || onSucc)) {
+  if (ids.length && (sF || fF || sS || fS || onFail || onSucc || hold)) {
     try { const rep = await interaction.fetchReply();
       saveDcCard(gid, rep.id, { sF, fF, sS: sS ? `${sS.stat}${sS.delta > 0 ? '+' : ''}${sS.delta}` : null,
                                         fS: fS ? `${fS.stat}${fS.delta > 0 ? '+' : ''}${fS.delta}` : null,
-                                        sM: onSucc || null, fM: onFail || null });
+                                        sM: onSucc || null, fM: onFail || null,
+                                        ...(hold ? { bindC: interaction.channelId, bindU: one?.id ?? null, bindSkip: skipFail } : {}) });
     } catch { /* trimmings only */ }
   }
   if (secret) await interaction.followUp({ ephemeral: true, content: `🤫 The DC is **${dc}**.` }).catch(() => {});
@@ -9632,6 +9717,18 @@ async function runDcRollPress(interaction) {
     sanction: parseSanction(card ? (passed ? card.s_sanction : card.f_sanction) : null), lines: out });
   applyDcOutcome({ gid, cid, id: uid, isNpc: false,
     mark: passed ? onSucc : onFail, damage: passed ? sDmg : damage, lines: out });
+  // A bound card releases on resolution either way; on failure with
+  // skipfail set, the turn passes too — but only if it is actually their
+  // turn, so a check resolved between turns never eats someone else's.
+  if (marks.bind_channel) {
+    clearDcBind(interaction.guild.id, interaction.message.id);
+    if (!passed && marks.bind_skip) {
+      const bf = getFight(interaction.guild.id, marks.bind_channel);
+      if (bf?.state === 'active' && fightOrder(bf)[bf.turn_index] === uid) {
+        await gmSkipTurn(interaction.guild, interaction.guild.id, marks.bind_channel, 'the check failed').catch(() => null);
+      }
+    }
+  }
   await interaction.followUp({ content: out.join('\n') });
   bookLog(gid, 'checks', `🎯 <@${uid}> — ${faceLabel} vs DC ${secret ? '???' : dc} — ${band.replace(/\*\*/g, '')}`
     + (out.length > 3 ? `\n${out.slice(3).join(' · ').replace(/\*\*/g, '')}` : ''), { channelId: cid });
@@ -11606,9 +11703,17 @@ client.on('interactionCreate', async interaction => {
       // A category by name, wherever it's asked for — including the
       // categorydelete sub, where the option is called 'name'.
       if (interaction.commandName === 'npc' && focusedOption.name === 'name'
-          && ['categorydelete', 'categoryrename'].includes(interaction.options.getSubcommand(false))) {
+          && interaction.options.getSubcommandGroup(false) === 'category'
+          && ['delete', 'rename'].includes(interaction.options.getSubcommand(false))) {
         const v = String(focusedOption.value || '').toLowerCase();
         return await interaction.respond(acPick(getCategories(interaction.guild.id), v));
+      }
+      // Which NPC /npc edit is changing.
+      if (interaction.commandName === 'npc' && focusedOption.name === 'name'
+          && !interaction.options.getSubcommandGroup(false)
+          && ['edit', 'rename'].includes(interaction.options.getSubcommand(false))) {
+        const v = String(focusedOption.value || '').toLowerCase();
+        return await interaction.respond(acPick(getAllNpcs(interaction.guild.id).map(n => n.name), v));
       }
       // The NPC being filed into or out of a category.
       if (interaction.commandName === 'npc' && focusedOption.name === 'npc') {
@@ -11868,6 +11973,21 @@ client.on('interactionCreate', async interaction => {
       if (gmSub === 'check') return await handleCheck(interaction);
       if (gmSub === 'scroll') return await handleScroll(interaction);
       if (gmSub === 'dicereport') return await handleDiceReport(interaction);
+      if (interaction.options.getSubcommandGroup(false) === 'override') {
+        if (!(await isGm(interaction.guild, interaction.user.id))) {
+          return interaction.reply({ content: '❌ Overrides are for GMs.', ephemeral: true });
+        }
+        if (gmSub === 'skip') {
+          const f = getFight(interaction.guild.id, interaction.channelId);
+          if (!f || f.state !== 'active') return interaction.reply({ ephemeral: true, content: '❌ No fight is running in this channel.' });
+          await interaction.deferReply();
+          const who = await gmSkipTurn(interaction.guild, interaction.guild.id, interaction.channelId,
+            interaction.options.getString('reason') || null);
+          return interaction.editReply({ content: who
+            ? `⏭ **${who}**'s turn passed by your hand.`
+            : '❌ The fight ended before the skip landed.' });
+        }
+      }
       if (gmSub === 'dc') return await runGmDcCheck(interaction);
       if (gmSub === 'reroll') return await runGmReroll(interaction);
       if (gmSub === 'roll') return await runGmRollSlash(interaction);
@@ -12095,17 +12215,31 @@ client.on('messageCreate', async message => {
 //  REGISTER SLASH COMMANDS + LOGIN
 // ─────────────────────────────────────────────
 
+// Whole commands that belong to one system only. A guild's picker carries
+// its own game: the filter runs per-guild at registration, and the runtime
+// gates stay as the backstop — subcommands (like /npc create5e) register
+// with their command and cannot be hidden per-ruleset, only refused.
+const DND5E_ONLY = ['dnd', 'spell', 'library'];
+const KNIGHTFALL_ONLY = ['duel', 'deception', 'standing'];
+
 async function registerSlashCommands(guildId) {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   try {
     let commands = slashCommands;
     if (guildId) {
+      // One system per picker. rulesFor defaults to Knightfall, so a brand
+      // new guild starts without the 5e three; setting the ruleset
+      // re-registers and the picker flips with it.
+      const system = rulesFor(guildId).id;
+      const hidden = system === 'dnd5e' ? KNIGHTFALL_ONLY : DND5E_ONLY;
+      commands = commands.filter(cmd => !hidden.includes(cmd.name));
+
       const npcList = getAllNpcs(guildId);
       const categories = getCategories(guildId);
       const uncategorised = getUncategorisedNpcs(guildId);
 
       if (npcList.length > 0 || categories.length > 0) {
-        commands = slashCommands.map(cmd => {
+        commands = commands.map(cmd => {
           if (cmd.name !== 'pr') return cmd;
           const json = JSON.parse(JSON.stringify(cmd.toJSON()));
 
@@ -12846,7 +12980,7 @@ function purgeSubjectRecords(gid, id) {
   for (const [table, col] of [['inventory', 'user_id'], ['roll_tally', 'user_id'],
                               ['renown_log', 'user_id'], ['lore', 'user_id'],
                               ['deaths', 'subject_id'], ['quest_members', 'user_id'],
-                              ['quest_summaries', 'user_id']]) {
+                              ['quest_summaries', 'user_id'], ['heal_charges', 'user_id']]) {
     try { counts[table] = db.prepare(`DELETE FROM ${table} WHERE guild_id=? AND ${col}=?`).run(gid, id).changes; }
     catch { counts[table] = 0; }
   }
@@ -13644,6 +13778,9 @@ async function applyAutoNpcRerolls(guild, gid, cid, channel) {
     mirrorAutoRoll(gid, cid, f.name, `1d20${roll.adv ? ' (adv)' : ''}`, roll.nat, roll.total,
       `fight ${kind === 'atk' ? 'attack' : 'defence'} reroll`);
     rr[fid] = (rr[fid] ?? 0) - 1;
+    // The pool is persistent now: the per-fight state mirrors it, and the
+    // spend writes back so rest is what refills, mirroring characters.
+    try { const nn = npcNameFromFighter(fid); if (nn) upsertNpc(gid, nn, { rerolls_current: rr[fid] }); } catch {}
     if (kind === 'atk') upsertFight(gid, cid, { atk_roll: roll.total, atk_nat: roll.nat, rr_state: JSON.stringify(rr) });
     else upsertFight(gid, cid, { def_roll: roll.total, def_nat: roll.nat, rr_state: JSON.stringify(rr) });
     bumpFightLog(gid, cid, (log, ensure) => { ensure(fid).rr++; });
@@ -14363,6 +14500,41 @@ async function resolveGrappleSave(guild, gid, cid, fight, { nat, total, mode = '
   const nextF = await announceNextTurn(guild, gid, cid, lines, turnOrder, nextIndex);
   upsertFight(gid, cid, { ...clear, turn_index: nextIndex });
   return { lines, nextF, grappled };
+}
+
+// A bound dc card holds its target's fight actions in that channel until
+// the card is pressed. The record is the card row itself; a pruned card
+// simply stops holding, the same graceful dark the marks already have.
+function boundDcHold(gid, cid, uid) {
+  try {
+    return db.prepare('SELECT message_id FROM dc_cards WHERE guild_id=? AND bind_channel=? AND bind_uid=? LIMIT 1')
+      .get(gid, cid, uid) || null;
+  } catch { return null; }
+}
+function clearDcBind(gid, msgId) {
+  try { db.prepare('UPDATE dc_cards SET bind_channel=NULL, bind_uid=NULL, bind_skip=0 WHERE guild_id=? AND message_id=?').run(gid, msgId); } catch {}
+}
+
+// The GM reaches in and the turn passes: same clear-and-advance the normal
+// resolution uses, announced plainly so the table knows it was a ruling,
+// not the machine. Used by /gm override skip and by a failed bound check.
+async function gmSkipTurn(guild, gid, cid, reason) {
+  const fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active') return null;
+  const order = fightOrder(fight);
+  const skippedId = order[fight.turn_index];
+  const skipped = await resolveFighter(gid, skippedId);
+  const hpState = fightHp(fight);
+  const floor = hpFloor(gid);
+  const clear = { phase: 'attack', current_target: null, atk_kind: null,
+    atk_roll: null, atk_nat: null, atk_stat: null,
+    def_roll: null, def_nat: null, def_stat: null,
+    atk_rerolled: 0, def_rerolled: 0 };
+  const lines = [`⏭ **${skipped?.displayName ?? 'Their'}**'s turn is skipped by the GM${reason ? ` — ${reason}` : ''}.`];
+  const nextIndex = nextStandingIndex(order, hpState, floor, fight.turn_index + 1);
+  await announceNextTurn(guild, gid, cid, lines, order, nextIndex);
+  upsertFight(gid, cid, { ...clear, turn_index: nextIndex });
+  return skipped?.displayName ?? skippedId;
 }
 
 // A feint's insight check resolves here, whoever rolled it. Ties go to the
@@ -15413,6 +15585,15 @@ async function handleFight(interaction, forced) {
     return interaction.reply({ content: '❌ A feint needs `feint:` — what you pretend to do.', ephemeral: true });
   }
   const gid = interaction.guild.id;
+  {
+    // A GM's bound check outranks the queue: until the card is pressed,
+    // the bound player's fight actions wait. Everyone else is untouched.
+    const holdGid = interaction.guild?.id, holdCid = interaction.channelId, holdUid = interaction.user?.id;
+    if (holdGid && holdUid && boundDcHold(holdGid, holdCid, holdUid)) {
+      return interaction.reply({ ephemeral: true, content:
+        '⏳ The GM has called a check on you — resolve that card first; your fight actions wait on it.' });
+    }
+  }
   const cid = interactionChannelId(interaction);
   const uid = interaction.user.id;
   // A feint spends either half of a fight, and which half is decided by the
@@ -15506,7 +15687,7 @@ async function handleFight(interaction, forced) {
       for (const fid of fighters) {
         const f = await resolveFighter(interaction.guild, gid, fid);
         hpState[fid] = f.isNpc ? (getNpc(gid, f.name)?.hp_current ?? 0) : (getChar(gid, fid)?.hp_current ?? 0);
-        if (f.isNpc) rrState[fid] = Math.max(0, f.stats.lck ?? 0);
+        if (f.isNpc) rrState[fid] = Math.max(0, getNpc(gid, f.name)?.rerolls_current ?? f.stats.lck ?? 0);
         ordered.push({ id: fid, name: f.name, isNpc: f.isNpc });
       }
       const turnOrder = ordered.map(o => o.id);
@@ -15539,7 +15720,7 @@ async function handleFight(interaction, forced) {
       const total = roll + dex;
       mirrorAutoRoll(gid, cid, f.name, '1d20', roll, total, 'initiative');
       hpState[fid] = f.isNpc ? (getNpc(gid, f.name)?.hp_current ?? 0) : (getChar(gid, fid)?.hp_current ?? 0);
-      if (f.isNpc) rrState[fid] = Math.max(0, f.stats.lck ?? 0);
+      if (f.isNpc) rrState[fid] = Math.max(0, getNpc(gid, f.name)?.rerolls_current ?? f.stats.lck ?? 0);
       initiatives.push({ id: fid, name: f.name, roll, dex, total, isNpc: f.isNpc });
     }
 
@@ -15598,7 +15779,7 @@ async function handleFight(interaction, forced) {
       const total = roll + (npc.dex ?? 0);
       mirrorAutoRoll(gid, cid, npc.name, '1d20', roll, total, 'initiative (joined mid-fight)');
       hpState[fid] = npc.hp_current;
-      rrState[fid] = Math.max(0, npc.lck ?? 0);
+      rrState[fid] = Math.max(0, npc.rerolls_current ?? npc.lck ?? 0);
       turnOrder.push(fid);
       added.push(`🎭 **${npc.name}** — 🎲 [${roll}] + ⚡ ${npc.dex} DEX = **${total} initiative**`);
     }
@@ -15711,7 +15892,7 @@ async function handleFight(interaction, forced) {
     }
     const lines = targets.map(npc => {
       const fid = npcFighterId(npc.name);
-      rrState[fid] = Math.max(0, npc.lck ?? 0);
+      rrState[fid] = Math.max(0, npc.rerolls_current ?? npc.lck ?? 0);
       return `🔁 **${npc.name}** 🎭 — **${rrState[fid]}** reroll token${rrState[fid] === 1 ? '' : 's'}`;
     });
     upsertFight(gid, cid, { rr_state: JSON.stringify(rrState) });
@@ -15848,7 +16029,9 @@ async function handleFight(interaction, forced) {
     const fxState = {};  // carry-over effects (nat-1 atk / nat-20 def) — full mode
     for (const fid of fighters) {
       hp[fid] = F[fid].isNpc ? (getNpc(gid, F[fid].name)?.hp_current ?? 0) : (getChar(gid, fid)?.hp_current ?? 0);
-      if (F[fid].isNpc) rrTokens[fid] = Math.max(0, F[fid].stats.lck ?? 0);
+      // Seeded from the persistent pool, and spends write back — mirroring
+      // players, whose rerolls survive a fight and come back on rest.
+      if (F[fid].isNpc) rrTokens[fid] = Math.max(0, getNpc(gid, F[fid].name)?.rerolls_current ?? F[fid].stats.lck ?? 0);
     }
 
     // ---- NPCONLY: set up a real, persisted fight where the bot will auto-take NPC turns ----
@@ -15950,6 +16133,7 @@ async function handleFight(interaction, forced) {
       const rrMax = getNpcRrThreshold(gid);
       if (hit && d.nat <= rrMax && defF.isNpc && (rrTokens[defenderId] ?? 0) > 0) {
         rrTokens[defenderId]--;
+        try { upsertNpc(gid, defF.name, { rerolls_current: rrTokens[defenderId] }); } catch {}
         d = autoRoll(defFlat ? 0 : (defF.stats[dStat] ?? 0), defAdv);
         mirrorAutoRoll(gid, cid, defF.name, `1d20${d.adv ? ' (adv)' : ''}`, d.nat, d.total, 'auto fight defence reroll');
         await sleep(800);
@@ -15961,6 +16145,7 @@ async function handleFight(interaction, forced) {
       }
       if (!hit && a.nat <= rrMax && atkF.isNpc && (rrTokens[attackerId] ?? 0) > 0) {
         rrTokens[attackerId]--;
+        try { upsertNpc(gid, atkF.name, { rerolls_current: rrTokens[attackerId] }); } catch {}
         a = autoRoll((atkF.stats[aStat] ?? 0) + atkBonus, atkAdv);
         mirrorAutoRoll(gid, cid, atkF.name, `1d20${a.adv ? ' (adv)' : ''}`, a.nat, a.total, 'auto fight attack reroll');
         await sleep(800);
@@ -16626,7 +16811,15 @@ async function handleNpc(interaction) {
     const sub0 = interaction.options.getSubcommand();
     if (['sheet', 'give', 'take', 'npclore'].includes(sub0)) return handleNpcPages(interaction, sub0);
   }
-  const sub = interaction.options.getSubcommand();
+  // The category group reuses top-level leaf names (create, list, remove),
+  // so the group is read FIRST and prefixed back onto the leaf — the six
+  // category branches below run unchanged, and /npc create still means an
+  // NPC. /npc edit is create's update half under its own name: same body,
+  // opposite existence guard.
+  let sub = interaction.options.getSubcommand();
+  if (interaction.options.getSubcommandGroup(false) === 'category') sub = 'category' + sub;
+  const wantsEdit = sub === 'edit';
+  if (wantsEdit) sub = 'create';
   const gid = interaction.guild.id;
   const uid = interaction.user.id;
 
@@ -16687,9 +16880,74 @@ async function handleNpc(interaction) {
       '', ...npcCardFooter(gid, getNpc(gid, imp.name), getNpc(gid, imp.name), true),
     ].join('\n') });
   }
+  if (sub === 'rename') {
+    if (!(await isGm(interaction.guild, uid))) {
+      return interaction.reply({ content: '❌ Renaming NPCs is for GMs.', ephemeral: true });
+    }
+    const from = interaction.options.getString('name');
+    const to = interaction.options.getString('to')?.trim();
+    const npc = getNpc(gid, from);
+    if (!npc) return interaction.reply({ content: `❌ No NPC named **${from}**.`, ephemeral: true });
+    if (!to) return interaction.reply({ content: '❌ Give them a name.', ephemeral: true });
+    if (to.length > 50) return interaction.reply({ content: '❌ NPC name is too long (max 50 characters).', ephemeral: true });
+    if (to === from) return interaction.reply({ content: '❌ That is already their name.', ephemeral: true });
+    // A case-variant of another NPC is refused outright: several lookups
+    // fold case (order faces, the portrait caption match), so "garrick"
+    // beside "Garrick" is two rows fighting over one identity. Changing
+    // only the CASE of this NPC's own name is fine and flows through.
+    const clash = getAllNpcs(gid).find(n => n.name.toLowerCase() === to.toLowerCase() && n.name.toLowerCase() !== from.toLowerCase());
+    if (clash) return interaction.reply({ content: `❌ **${clash.name}** already exists — that name is taken.`, ephemeral: true });
+    await interaction.deferReply();
+
+    // The rename mirrors deleteNpc's purge list as UPDATEs: everything the
+    // delete would destroy under the old identity, the rename carries to
+    // the new one. If purgeSubjectRecords gains a table, this list gains a
+    // row — the pin below holds the two in step.
+    const idOld = npcFighterId(from), idNew = npcFighterId(to);
+    const moved = {};
+    for (const [table, col] of [['inventory', 'user_id'], ['roll_tally', 'user_id'],
+                                ['renown_log', 'user_id'], ['lore', 'user_id'],
+                                ['deaths', 'subject_id'], ['quest_members', 'user_id'],
+                                ['quest_summaries', 'user_id'], ['heal_charges', 'user_id'], ['history', 'user_id']]) {
+      try { moved[table] = db.prepare(`UPDATE ${table} SET ${col}=? WHERE guild_id=? AND ${col}=?`).run(idNew, gid, idOld).changes; }
+      catch { moved[table] = 0; }
+    }
+    try { db.prepare('UPDATE npcs SET name=? WHERE guild_id=? AND name=?').run(to, gid, from); } catch {}
+    try { db.prepare('UPDATE npc_category_members SET npc_name=? WHERE guild_id=? AND npc_name=?').run(to, gid, from); } catch {}
+    try { db.prepare('UPDATE npc_pages SET name=? WHERE guild_id=? AND name=?').run(to, gid, from); } catch {}
+    try { db.prepare('UPDATE npc_portrait_posts SET npc_name=? WHERE guild_id=? AND npc_name=?').run(to, gid, from); } catch {}
+    // Webhooks carry the display name baked in — cleared, not migrated;
+    // the next /npc say makes fresh ones under the new name.
+    try { clearNpcWebhooks(gid, from); } catch {}
+    try { db.prepare('DELETE FROM npc_webhooks WHERE guild_id=? AND name=?').run(gid, from); } catch {}
+
+    // The visible layer follows: the page entry rewrites in place, and the
+    // portrait post's caption is edited so it still names its wearer.
+    await mirrorNpcSheet(interaction.client, gid, to).catch(() => null);
+    try {
+      const pr = db.prepare('SELECT thread_id, message_id FROM npc_portrait_posts WHERE guild_id=? AND npc_name=?').get(gid, to);
+      if (pr?.message_id) {
+        const th = await interaction.client.channels.fetch(pr.thread_id).catch(() => null);
+        const m = th?.isThread?.() ? await th.messages.fetch(pr.message_id).catch(() => null) : null;
+        if (m && m.editable) await m.edit({ content: to }).catch(() => {});
+      }
+    } catch {}
+
+    const carried = Object.values(moved).reduce((a, b) => a + b, 0);
+    return interaction.editReply({ content:
+      `📝 **${from}** is now **${to}** — page, portrait and ${carried} record${carried === 1 ? '' : 's'} followed. Their webhooks remake themselves on the next \`/npc say\`.` });
+  }
+
   if (sub === 'create' || sub === 'pr_create') {
     const name = interaction.options.getString('name');
     if (name.length > 50) return interaction.reply({ content: '❌ NPC name is too long (max 50 characters).', ephemeral: true });
+    const already = !!getNpc(gid, name);
+    if (!wantsEdit && already) {
+      return interaction.reply({ content: `❌ **${name}** already exists — \`/npc edit name:${name}\` changes them; \`/npc copy\` duplicates them.`, ephemeral: true });
+    }
+    if (wantsEdit && !already) {
+      return interaction.reply({ content: `❌ No NPC named **${name}** — \`/npc create\` makes a new one.`, ephemeral: true });
+    }
     const str  = interaction.options.getInteger('str');
     const con  = interaction.options.getInteger('con');
     const dex  = interaction.options.getInteger('dex');
@@ -16728,8 +16986,17 @@ async function handleNpc(interaction) {
     for (const [k, v] of [['str',str],['con',con],['dex',dex],['wis',wis],['lck',lck]]) {
       if (v !== null) fields[k] = v;
     }
+    // Mirrors the character rule: setting LCK sets the reroll pool.
+    if (lck !== null) fields.rerolls_current = lck;
     if (order) fields.order_name = order;
     upsertNpc(gid, name, fields);
+    // And the White Knight gate mirrors too: order + WIS >= 5 grants the
+    // server's heal charges under the fighter id; losing either zeroes them.
+    {
+      const after = getNpc(gid, name);
+      if (isWhiteKnight(after)) setHealCharges(gid, npcFighterId(name), getConfig(gid)?.heal_charges ?? 3);
+      else setHealCharges(gid, npcFighterId(name), 0);
+    }
 
     // A brand-new NPC with no CON has 0 max HP, which would exclude them from
     // fights — start them at full so they're usable straight away.
@@ -16747,9 +17014,9 @@ async function handleNpc(interaction) {
     // not a stat, and counting them would suppress the hint that stats are due.
     const statsSet = Object.keys(fields).filter(k => STATS.includes(k)).length;
     const statNote = statsSet === 0
-      ? '\n📋 No stats set yet — add them any time with `/npc create name:' + name + ' str:… con:…`.'
+      ? '\n📋 No stats set yet — add them any time with `/npc edit name:' + name + ' str:… con:…`.'
       : statsSet < 5
-        ? '\n📋 Some stats still unset (showing as 0) — fill them in later with `/npc create`.'
+        ? '\n📋 Some stats still unset (showing as 0) — fill them in later with `/npc edit`.'
         : '';
     const unlistedNote = unlisted.length
       ? `\n📝 ${unlisted.map(w => `**${w}**`).join(' and ')} ${unlisted.length === 1 ? 'is' : 'are'} not on the weapon list, so ${unlisted.length === 1 ? 'it restricts' : 'they restrict'} nothing. \`/char weapon add\` to give ${unlisted.length === 1 ? 'it' : 'them'} stat rules.`
@@ -16894,7 +17161,7 @@ async function handleNpc(interaction) {
     if (!getCategories(gid).includes(name)) return interaction.reply({ content: `\u274c Category **${name}** not found.`, ephemeral: true });
     if (!to) return interaction.reply({ content: '\u274c Give it a name.', ephemeral: true });
     if (to.toLowerCase() !== name.toLowerCase() && getCategories(gid).some(c => c.toLowerCase() === to.toLowerCase())) {
-      return interaction.reply({ content: `\u274c **${to}** already exists \u2014 merging categories is a different thing. Move the NPCs with \`/npc categoryassign\` and delete the empty one.`, ephemeral: true });
+      return interaction.reply({ content: `\u274c **${to}** already exists \u2014 merging categories is a different thing. Move the NPCs with \`/npc category assign\` and delete the empty one.`, ephemeral: true });
     }
     await interaction.deferReply();
     // In place, not delete-and-recreate: membership rows keep their rowids,
@@ -17021,16 +17288,17 @@ async function handlePr(interaction) {
     if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found.`, ephemeral: true });
 
     // Check NPC reroll tokens (based on LCK)
-    if (npc.lck <= 0) return interaction.reply({ content: `❌ **${name}** has no reroll tokens (LCK is 0).`, ephemeral: true });
+    if ((npc.rerolls_current ?? 0) <= 0) return interaction.reply({ content: `❌ **${name}** has no reroll tokens left (pool ${npc.lck ?? 0}, from LCK) — rest refills them.`, ephemeral: true });
 
     // Get last roll for this NPC in this channel
     const last = getLastRoll(gid, interactionChannelId(interaction), `npc_${name}`);
     if (!last) return interaction.reply({ content: `❌ No previous roll found for **${name}** in this channel.`, ephemeral: true });
 
     // Deduct reroll — track via hp_current field repurposed as reroll tracker
-    // Actually use a separate counter: store in npc rerolls_used field
-    // For simplicity track rerolls remaining as lck - used; decrement lck by 1 temporarily
-    upsertNpc(gid, name, { lck: npc.lck - 1 });
+    // The pool is rerolls_current, refilled by rest. The old line here
+    // decremented the LCK stat itself and nothing ever restored it — an NPC
+    // that rerolled lost real Luck, permanently.
+    upsertNpc(gid, name, { rerolls_current: (npc.rerolls_current ?? 0) - 1 });
 
     let result;
     if (mode === 'adv') result = rollAdvantage(last.notation);
@@ -17597,8 +17865,8 @@ const HELP_CATEGORIES = {
       '`/npc say name:X message:...` — speak or act as an NPC, no dice (GM)',
       '`/npc list category:Bandits` — list only one category\'s NPCs',
       '`/npc list` · `/npc delete name:X`',
-      '`/npc categorycreate/categorydelete/categorylist` — manage categories',
-      '`/npc categoryassign/categoryremove` — sort NPCs into categories',
+      '`/npc category create/rename/delete/list` — manage categories',
+      '`/npc category assign/remove` — sort NPCs into categories',
       '`/npc roll category:X name:Y notation:1d20 stat:STR` — roll as an NPC',
       '`/npc reroll name:X` — reroll an NPC\'s last roll here (spends one of its LCK tokens)',
       '`/npc sheet name:X` — an NPC\'s full record: stats, standing, inventory, rolls, lore',

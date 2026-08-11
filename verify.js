@@ -974,8 +974,72 @@ function testBuilders(src) {
       ok(`/${c.name} does something`, leaves(c) > 0 || c.options.length > 0);
       ok(`/${c.name} under the 25-leaf wall (${leaves(c)})`, leaves(c) <= 25);
     }
-    ok('/npc is the most crowded command', leaves(by.npc) === Math.max(...cmds.map(leaves)));
-    ok('/npc has at most one leaf spare', leaves(by.npc) >= 24);
+    // /npc stood at the 25-leaf wall until the category family folded into
+    // one group (2026-08-10): six leaves became one, /npc edit took a freed
+    // slot, and /quest inherited the most-crowded seat at 23. These hold the
+    // fold's arithmetic so it cannot silently unfold.
+    ok('/quest is now the most crowded command', leaves(by.quest) === Math.max(...cmds.map(leaves)));
+    ok('/npc holds at 22 = 19 top + category group + edit + rename', leaves(by.npc) === 22);
+    // The rename's contract: it mirrors deleteNpc's purge list as UPDATEs —
+    // everything delete destroys under the old identity, rename carries to
+    // the new. If purgeSubjectRecords gains a table, both lists gain it, or
+    // renamed NPCs quietly shed that record while deleted ones purge it.
+    (() => {
+      const purge = src.slice(src.indexOf('function purgeSubjectRecords'), src.indexOf('function purgeSubjectRecords') + 900);
+      const ren = src.slice(src.indexOf("if (sub === 'rename')"), src.indexOf("if (sub === 'rename')") + 4800);
+      const tables = ['inventory', 'roll_tally', 'renown_log', 'lore', 'deaths', 'quest_members', 'quest_summaries'];
+      // The resource mirror: NPCs hold rerolls (pool = LCK) and White Knight
+    // heal charges exactly as characters do, and rest refills all three
+    // under the same schedule. Each piece failed silently before: the old
+    // reroll spend ATE THE LCK STAT permanently, rest skipped a full-HP NPC
+    // entirely, and a WIS-5 White Knight NPC had a gate open onto nothing.
+    ok('the reroll spend touches the pool, never the stat',
+      /rerolls_current: \(npc\.rerolls_current \?\? 0\) - 1/.test(src) &&
+      !/upsertNpc\(gid, name, \{ lck: npc\.lck - 1 \}\)/.test(src));
+    ok('setting LCK sets the pool, mirroring characters',
+      /if \(lck !== null\) fields\.rerolls_current = lck;/.test(src));
+    ok('the White Knight gate grants NPC heal charges',
+      /if \(isWhiteKnight\(after\)\) setHealCharges\(gid, npcFighterId\(name\)/.test(src));
+    ok('NPC rest refills all three resources',
+      /const rR = resolveRestToken\(sc\.rerolls, npc\.lck \?\? 0/.test(src) &&
+      /const healR = resolveRestToken\(sc\.heal, maxC/.test(src));
+    ok('every fight seed reads the persistent pool',
+      !/rrState\[fid\] = Math\.max\(0, npc\.lck \?\? 0\);/.test(src) &&
+      !/rrState\[fid\] = Math\.max\(0, f\.stats\.lck \?\? 0\);/.test(src) &&
+      !/rrTokens\[fid\] = Math\.max\(0, F\[fid\]\.stats\.lck \?\? 0\);/.test(src));
+    ok('fight spends write back to the pool',
+      (src.match(/upsertNpc\(gid, (?:defF|atkF)\.name, \{ rerolls_current: rrTokens/g) || []).length === 2 &&
+      /upsertNpc\(gid, nn, \{ rerolls_current: rr\[fid\] \}\)/.test(src));
+    ok('the backfill heals the eaten-LCK era once',
+      /UPDATE npcs SET rerolls_current = lck WHERE rerolls_current = 0 AND lck > 0/.test(src));
+    // The override: a GM skip is the same clear-and-advance the machine
+    // uses, and a bound dc holds ONE named fighter until their card is
+    // pressed — released either way, skipping only when it is truly their
+    // turn, so a late resolution never eats someone else's.
+    ok('gm skip advances by the house idiom',
+      /async function gmSkipTurn\([\s\S]{0,900}?nextStandingIndex\(order, hpState, floor, fight\.turn_index \+ 1\)/.test(src));
+    ok('a hold names its fighter or refuses',
+      /if \(hold && !interaction\.options\.getUser\('target'\)\)/.test(src));
+    ok('the choke holds only the bound fighter',
+      /boundDcHold\(holdGid, holdCid, holdUid\)/.test(src));
+    ok('resolution releases the bind either way',
+      /if \(marks\.bind_channel\) \{\s*\n\s*clearDcBind\(/.test(src));
+    ok('a failed bound check skips only on their own turn',
+      /fightOrder\(bf\)\[bf\.turn_index\] === uid/.test(src));
+
+    ok('rename migrates every table the purge list names',
+        tables.every(t => purge.includes(`'${t}'`) && ren.includes(`'${t}'`)) &&
+        /UPDATE \$\{table\} SET \$\{col\}=\? WHERE guild_id=\? AND \$\{col\}=\?/.test(ren) &&
+        ren.includes("['history', 'user_id']"));   // folded into the loop, unlike purge's standalone
+      ok('rename refuses a case-variant of another NPC',
+        /n\.name\.toLowerCase\(\) === to\.toLowerCase\(\) && n\.name\.toLowerCase\(\) !== from\.toLowerCase\(\)/.test(ren));
+      ok('rename clears webhooks rather than migrating them',
+        /clearNpcWebhooks\(gid, from\)/.test(ren));
+      ok('the portrait caption follows the new name',
+        /m\.edit\(\{ content: to \}\)/.test(ren));
+    })();
+    ok('the category group holds all six family members',
+      (by.npc.groups || []).some(g => g.name === 'category' && (g.subcommands || g.subs || []).length === 6));
     ok('/quest is close behind', leaves(by.quest) >= 22);
 
     ok('/config folds into groups', by.config.groups.length >= 2);
@@ -1161,8 +1225,8 @@ function testPins(src) {
     }
     ok('the press reads its marks from the card row',
       /const marks = getDcCard\(interaction\.guild\.id, interaction\.message\?\.id\)/.test(src));
-    ok('the card is saved whenever a press will need it',
-      /if \(ids\.length && \(sF \|\| fF \|\| sS \|\| fS \|\| onFail \|\| onSucc\)\)/.test(src));
+    ok('the card is saved whenever a press will need it — a hold included',
+      /if \(ids\.length && \(sF \|\| fF \|\| sS \|\| fS \|\| onFail \|\| onSucc \|\| hold\)\)/.test(src));
     ok('the mark columns exist',
       /ALTER TABLE dc_cards ADD COLUMN s_mark TEXT/.test(src) && /ALTER TABLE dc_cards ADD COLUMN f_mark TEXT/.test(src));
 
@@ -1292,6 +1356,20 @@ function testPins(src) {
     // raw positions on every edit, and a diagnostic that prints each
     // category's raw sequences split by type. These pin the evidence
     // machinery itself — losing it means the next failure is a guess again.
+    // One system per picker: whole 5e commands never register on Knightfall
+    // guilds and vice versa, and changing the ruleset re-registers so the
+    // picker flips with the setting. Subcommands cannot be hidden this way
+    // — the runtime gates stay as the backstop for /npc create5e and kin.
+    ok('registration filters whole commands by ruleset',
+      /const DND5E_ONLY = \['dnd', 'spell', 'library'\];/.test(src) &&
+      /const KNIGHTFALL_ONLY = \['duel', 'deception', 'standing'\];/.test(src) &&
+      /commands = commands\.filter\(cmd => !hidden\.includes\(cmd\.name\)\);/.test(src));
+    ok('the choice-injection map chains after the filter, not around it',
+      /commands = commands\.map\(cmd => \{/.test(src) &&
+      !/commands = slashCommands\.map\(cmd => \{/.test(src));
+    ok('changing the ruleset re-registers the picker',
+      /setConfig\(gid, \{ ruleset: want \}\);[\s\S]{0,300}?registerSlashCommands\(gid\)\.catch/.test(src));
+
     ok('one order applier serves build, restart and the diagnostic',
       /async function applySidebarOrder\(guild, entries\)/.test(src) &&
       /await applySidebarOrder\(guild, sidebar\)/.test(src) &&

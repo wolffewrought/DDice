@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 665 assertions passed and no scanner found an ERROR.
+Green means 693 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 665 assertions covering structure, registration and ruleset
+now is 693 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -245,6 +245,65 @@ Also fixed there: the handler used to answer *every* image posted anywhere on
 the server with a warning when no bank was set, and then `return` — which
 swallowed the rest of `messageCreate` for any message carrying an attachment.
 It now stays silent outside the bank.
+
+## 7f · NPC resource mirror + GM overrides (2026-08-11)
+
+NPCs now mirror player sheets in full: **rerolls** (pool = LCK, stored in
+`npcs.rerolls_current`), **heal charges** for White Knights with WIS ≥ 5
+(same `heal_charges` table, keyed by fighter id, granted on create/edit),
+and **rest refills all three** under the same schedule settings as
+characters. Three silent faults died here: `/npc reroll` decremented the
+LCK **stat** itself ("temporarily", said the comment) and nothing restored
+it; the rest loop `continue`d past any full-HP NPC, so resources behind HP
+never refilled; and every fight seeded reroll tokens fresh from LCK, so
+spends evaporated at fight's end. A one-time startup backfill sets every
+pool to full (`rerolls_current = lck WHERE rerolls_current = 0`), which
+also quietly amnesties the eaten-LCK era. `heal_charges` joined the delete
+purge list and the rename migration in the same stroke.
+
+**Overrides.** `/gm override skip [reason]` passes the current turn by the
+same clear-and-advance idiom the machine uses, announced as a ruling.
+`/gm dc … hold:true` binds the check to the fight in that channel: the
+named target's fight actions wait (a choke at the top of `handleFight`)
+until the card is pressed; `skipfail:true` makes a failed bound check pass
+their turn too — but only if it is genuinely their turn at resolution.
+The bind lives on the `dc_cards` row and clears either way; a pruned card
+simply stops holding. The planned `/gm check` fold did NOT trigger: the
+batch landed at 5796/8000, under the 6000 margin, so the promise stays
+armed for the actual trip rather than breaking `build:true` syntax early.
+
+## 7e · /npc folded, /npc edit, ruleset-pure pickers (2026-08-10)
+
+The six `category*` leaves folded into one `category` group (25 leaves →
+20), and `/npc edit` took a freed slot (21). Leaf names inside the group
+deliberately reuse top-level ones — dispatch reads
+`getSubcommandGroup(false)` FIRST and prefixes it back onto the leaf, so
+the six category branches run unchanged. `/npc create` now refuses an
+existing name (pointing at edit and copy) and `/npc edit` refuses a missing
+one; both share one body via a `wantsEdit` alias. `/quest` (23) inherited
+the most-crowded seat; the fold arithmetic is pinned so it cannot silently
+unfold.
+
+`/npc rename name: to:` (leaf 22) migrates by mirroring deleteNpc's purge
+list as UPDATEs — inventory, roll_tally, renown_log, lore, deaths,
+quest_members, quest_summaries, history — under the fighter id, then the
+name-keyed layer: npcs, category members, page map, portrait record. The
+page entry rewrites in place, the portrait caption is edited to the new
+name, and webhooks are cleared (they bake the display name in) to remake on
+the next say. A case-variant of another NPC is refused; changing only this
+NPC's own casing is allowed. **If purgeSubjectRecords gains a table, the
+rename's list gains the row** — the pin holds the two in step. Note the
+earlier claim that export→import could rename was wrong: import applies the
+payload's embedded name.
+
+Registration is ruleset-pure per guild: `DND5E_ONLY` (`dnd`, `spell`,
+`library`) never registers on Knightfall guilds, `KNIGHTFALL_ONLY` (`duel`,
+`deception`, `standing`) never on 5e guilds, and `/config channels ruleset`
+re-registers so the picker flips with the setting. Subcommands register
+with their command and cannot be hidden this way — runtime gates remain the
+backstop for `/npc create5e` and kin. The per-guild choice-injection map
+chains off the filtered list (`commands.map`, not `slashCommands.map`) or
+the filter silently un-applies; pinned.
 
 ## 7d · Naming settled 2026-08-10
 
