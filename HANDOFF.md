@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 658 assertions passed and no scanner found an ERROR.
+Green means 665 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 658 assertions covering structure, registration and ruleset
+now is 665 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -334,6 +334,25 @@ with an arbitrary winner — serving the stale dead URL after a fresh upload.
 `setOrderFace` now collapses case-variants before writing, and the
 migration's verdict folds stale variants into their healthy sibling instead
 of telling the GM to re-upload a face they just set.
+
+An export/delete/import round trip exposed three linked faults, all fixed:
+`npcFace` read the order only from a pipe in the *name*, never from the
+sheet's `order_name` — so a plain-named White Knight never inherited the
+White Knight face, and pipe-named NPCs only appeared to inherit because
+their personal face masked the gap. The chain is now personal → sheet order
+→ name prefix → blank. The export payload never carried `image_url`, so
+import rebuilt NPCs faceless; it now travels as `image`, behind a validator
+that accepts only Discord CDN attachment URLs (imports are typed by hand —
+the field must not make the bot wear arbitrary links; old payloads without
+it import fine, faceless as before). And the migration filtered on
+`image_url` alone, skipping exactly the resurrection case — an NPC deleted
+and re-imported while their portrait still stands in the forum. It now
+includes record-holders and repoints them from the live post.
+
+Setting an order face is a bare-name caption (`White Knight`, no pipe) on an
+image in the portrait bank. The set path now agrees with the wear-chain:
+membership counts the sheet's `order_name` as well as pipe names, and a set
+refreshes the webhooks of every wearer without a personal face.
 
 **Order faces are deliberately not migrated** — `npc_orders` holds the
 shared portrait each coloured order wears, not gallery entries. The verdict

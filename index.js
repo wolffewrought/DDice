@@ -3108,17 +3108,28 @@ function setOrderImage(gid, prefix, url, uid) {
 // accepted for an order somebody belongs to.
 function ordersWithMembers(gid) {
   const seen = new Map();
+  const add = (p) => { if (p) seen.set(p.toLowerCase(), (seen.get(p.toLowerCase()) ?? 0) + 1); };
   for (const n of getAllNpcs(gid)) {
-    const p = npcOrderOf(n.name);
-    if (p) seen.set(p.toLowerCase(), (seen.get(p.toLowerCase()) ?? 0) + 1);
+    // A member is anyone the wear-chain would dress: the order on their
+    // sheet, or a pipe in their name. Counting the name alone meant an
+    // order of plain-named knights could never have its face set at all —
+    // the upload fell through to "no NPC named White Knight".
+    add(n.order_name || npcOrderOf(n.name));
   }
   return seen;
 }
 // The face an NPC speaks with: their own portrait first, their order's
-// second, nothing third.
+// second, nothing third. The order is read from the SHEET first — that is
+// what "a general portrait per coloured order" means — and only then from a
+// pipe in the name, which covers ad-hoc says that never had a sheet. The
+// original read the name alone, so a plain-named White Knight never
+// inherited the White Knight face at all.
 function npcFace(gid, npc) {
   if (!npc) return null;
-  return npc.image_url ?? getOrderImage(gid, npcOrderOf(npc.name)) ?? null;
+  return npc.image_url
+    ?? getOrderImage(gid, npc.order_name)
+    ?? getOrderImage(gid, npcOrderOf(npc.name))
+    ?? null;
 }
 
 function setNpcImage(gid, name, url) {
@@ -4469,12 +4480,20 @@ function npcPayloadObj(npc) {
     weapon1: npc.weapon1 || null, weapon2: npc.weapon2 || null,
     is_hero: npc.is_hero ? 1 : 0, signature: npc.signature_stat || null,
     atk: npc.preferred_atk || null, def: npc.preferred_def || null,
-    lore: npc.lore ? String(npc.lore).slice(0, 900) : null };
+    lore: npc.lore ? String(npc.lore).slice(0, 900) : null,
+    // Their own portrait travels with them. Without this, an export/import
+    // round trip silently stripped the face — v1 payloads without the field
+    // import fine and simply arrive faceless, as they always did.
+    image: npc.image_url || null };
 }
 function validateImportedNpc(o) {
   if (!o || o.v !== 1 || o.kind !== 'npc') return null;
   const stat = (n) => Number.isInteger(n) && n >= 0 && n <= 99;
   if (![o.str, o.con, o.dex, o.wis, o.lck].every(stat)) return null;
+  // The travelling face: only a Discord CDN attachment URL is accepted —
+  // an imported payload is typed by hand often enough that this field must
+  // not become a way to make the bot wear an arbitrary link.
+  if (o.image != null && !/^https:\/\/(cdn|media)\.discordapp\.(com|net)\/attachments\//.test(String(o.image))) o.image = null;
   const str_ = (v, cap) => (typeof v === 'string' && v.trim()) ? v.trim().slice(0, cap) : null;
   const st = (v) => ['str', 'con', 'dex', 'wis', 'lck'].includes(v) ? v : null;
   return { name: str_(o.name, 60) || 'Unnamed',
@@ -11970,12 +11989,17 @@ client.on('messageCreate', async message => {
         if (members) {
           setOrderImage(message.guild.id, npcName, message.attachments.first().url, message.author.id);
           for (const n of getAllNpcs(message.guild.id)) {
-            if ((npcOrderOf(n.name) || '').toLowerCase() === npcName.toLowerCase() && !n.image_url) {
+            // Everyone the wear-chain dresses in this face gets fresh
+            // webhooks — sheet order first, name prefix second, personal
+            // faces left alone — or the knights who already spoke somewhere
+            // keep their stale blank avatars there.
+            const worn = (n.order_name || npcOrderOf(n.name) || '').toLowerCase();
+            if (worn === npcName.toLowerCase() && !n.image_url) {
               clearNpcWebhooks(message.guild.id, n.name);
             }
           }
           message.react('✅').catch(()=>{});
-          await message.reply('✅ Order face set for **' + npcName + '** — worn by ' + members + ' NPC' + (members === 1 ? '' : 's') + ' written `' + npcName + ' | Name`. Any with a portrait of their own keep it.').catch(()=>{});
+          await message.reply('✅ Order face set for **' + npcName + '** — worn by ' + members + ' NPC' + (members === 1 ? '' : 's') + ' of that order without a face of their own.').catch(()=>{});
           return;
         }
         console.error(`[npcimg] no NPC named "${npcName}" in guild ${message.guild.id}`);
@@ -16654,6 +16678,7 @@ async function handleNpc(interaction) {
       is_hero: imp.is_hero, signature_stat: imp.signature,
       preferred_atk: imp.atk, preferred_def: imp.def,
       lore: imp.lore, died_at: null,
+      ...(imp.image ? { image_url: imp.image } : {}),
     });
     const fresh = getNpc(gid, imp.name);
     upsertNpc(gid, imp.name, { hp_current: maxHpFromCon(gid, fresh.con) });
@@ -19008,7 +19033,13 @@ async function runPortraitMigration(interaction) {
 
   let migrated = 0, kept = 0, recovered = 0;
   const lost = [];
-  const npcs = getAllNpcs(gid).filter(n => n.image_url);
+  // An NPC with no face but a live migration record is a resurrection case:
+  // deleted and re-imported, their portrait still standing in the forum.
+  // The kept-branch repoints them from the live post. Filtering on
+  // image_url alone skipped exactly the NPCs that needed healing.
+  const hasRecord = new Set();
+  try { for (const r of db.prepare('SELECT npc_name FROM npc_portrait_posts WHERE guild_id=?').all(gid)) hasRecord.add(r.npc_name); } catch {}
+  const npcs = getAllNpcs(gid).filter(n => n.image_url || hasRecord.has(n.name));
   let done = 0;
   for (const npc of npcs) {
     done++;
@@ -19046,6 +19077,7 @@ async function runPortraitMigration(interaction) {
       }
     }
 
+    if (!npc.image_url) { lost.push(npc.name); continue; }   // record died and no face to move
     const parsed = parseAttachment(npc.image_url);
     let bytes = await download(npc.image_url);
     let viaHistory = false;

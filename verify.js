@@ -1225,6 +1225,31 @@ function testPins(src) {
     // thread id and fell through to a fresh post when the sniff failed —
     // live result, the same face posted again on every run. The record is
     // the truth now; a live recorded message is kept and merely repointed.
+    // The face chain and the round trip, broken together by one export test:
+    // delete+import stripped the personal face (export never carried it) and
+    // the order fallback read only a pipe in the NAME, so a plain-named
+    // White Knight never inherited the White Knight face. Sheet first, name
+    // second; the face travels in the payload behind a CDN-only validator;
+    // and the migration resurrects a faceless NPC from their live forum post.
+    // Set-side and wear-side must agree on who belongs to an order, or an
+    // order of plain-named knights can never have its face set and knights
+    // who already spoke keep stale blank webhooks after one is.
+    ok('order membership counts the sheet, not just pipe names',
+      /add\(n\.order_name \|\| npcOrderOf\(n\.name\)\);/.test(src));
+    ok('setting an order face refreshes every wearer',
+      /const worn = \(n\.order_name \|\| npcOrderOf\(n\.name\) \|\| ''\)\.toLowerCase\(\);/.test(src));
+
+    ok('the order face is read from the sheet before the name',
+      /npc\.image_url\s*\n?\s*\?\? getOrderImage\(gid, npc\.order_name\)\s*\n?\s*\?\? getOrderImage\(gid, npcOrderOf\(npc\.name\)\)/.test(src));
+    ok('the face travels in the export payload',
+      /image: npc\.image_url \|\| null \};/.test(src) && /\.\.\.\(imp\.image \? \{ image_url: imp\.image \} : \{\}\)/.test(src));
+    ok('an imported face must be a Discord CDN attachment',
+      /o\.image != null && !\/\^https:/.test(src));
+    ok('the migration resurrects record-holders without a face',
+      /n\.image_url \|\| hasRecord\.has\(n\.name\)/.test(src));
+    ok('a dead record with no face lands on the lost list, not in fetch(null)',
+      /if \(!npc\.image_url\) \{ lost\.push\(npc\.name\); continue; \}/.test(src));
+
     ok('the kept-check trusts the record, not URL sniffing',
       !/includes\(`\/\$\{row\.thread_id\}\/`\)/.test(src));
     ok('a live migrated post is repointed, never reposted',
