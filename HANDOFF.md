@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 693 assertions passed and no scanner found an ERROR.
+Green means 702 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 693 assertions covering structure, registration and ruleset
+now is 702 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -245,6 +245,48 @@ Also fixed there: the handler used to answer *every* image posted anywhere on
 the server with a warning when no bank was set, and then `return` — which
 swallowed the rest of `messageCreate` for any message carrying an attachment.
 It now stays silent outside the bank.
+
+## 7h · Full cross-reference audit (2026-08-12)
+
+Mandated sweep after the phantom table: every reference must have a
+definition. Verify now carries four ERROR-class schema scans permanently —
+tables in any SQL verb (SQL-keyword-anchored, so log prose is not a table),
+literal INSERT column lists, literal UPDATE SET columns, and object keys
+into the two dynamic upserts. Dynamic `${}` SQL is skipped.
+
+Six conflicts found and fixed, in order of teeth: **npcs never had
+`rerolls_current`** — the resource mirror shipped writing to a phantom
+column, backfill swallowed, first live spend would have crashed exactly
+like the arena; the audit's first run caught its own author. One `FROM
+chars` survivor meant a character count read 0 since it shipped. The
+reroll backfill ran per-boot — spent pools would refill on every redeploy;
+now once, behind `meta.npc_rr_backfill_1` (spent-to-zero and never-filled
+are the same value, so the flag is the only honest guard). The heal grant
+fired on any edit — a stat tweak refilled a spent healer; now only when
+creation or the gate's own inputs (order/wis) move. And rename/delete
+refuse while the NPC stands in an active fight, because fight state keys
+by the name-derived fighter id and both would orphan it.
+
+All eleven standing warnings re-reviewed: known, documented, none stale.
+One is half-retired by side-effect: `library-ungated` (§7.3) no longer
+reaches Knightfall players, since `/library` never registers on Knightfall
+guilds — the runtime gate question remains open only for mixed edges.
+
+## 7g · The phantom table (2026-08-12, live outage)
+
+Twenty-one ALTERs targeted `chars`; the table is `characters`. "No such
+table" was swallowed by their catch on every boot since the day each
+shipped, so **none of those columns ever existed**: the entire 5e character
+layer (int/cha, level, class, hit die, AC, proficiencies, hit dice, spell
+slots, concentration, weapon dice, prepared spells, conditions, temp HP,
+inspiration, damage type, resistances) and two Knightfall fields
+(`next_mark`, `deception_spent`). Reads survived because `SELECT *` simply
+omits missing columns — undefined reads as 0 — so features half-worked;
+the first live WRITE to name one crashed the arena mid-exchange
+(`no such column: death_success`). All corrected, and verify now carries an
+ERROR-class scan: every `ALTER TABLE x` must name a table some
+`CREATE TABLE IF NOT EXISTS x` defines. Anything 5e-side written before
+this fix was never persisted — those fields silently stored nothing.
 
 ## 7f · NPC resource mirror + GM overrides (2026-08-11)
 

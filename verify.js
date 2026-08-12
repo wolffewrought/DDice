@@ -1010,6 +1010,21 @@ function testBuilders(src) {
     ok('fight spends write back to the pool',
       (src.match(/upsertNpc\(gid, (?:defF|atkF)\.name, \{ rerolls_current: rrTokens/g) || []).length === 2 &&
       /upsertNpc\(gid, nn, \{ rerolls_current: rr\[fid\] \}\)/.test(src));
+    // Today's audit fixes, each a conflict the sweep surfaced: the pool
+    // column now genuinely exists on npcs; the backfill runs ONCE behind a
+    // meta flag (per-boot would refill spent pools, which is rest's job);
+    // the heal grant only moves when the gate's own inputs do; and neither
+    // rename nor delete can orphan a live fight's state keys.
+    ok('npcs really has the reroll pool column',
+      /ALTER TABLE npcs ADD COLUMN rerolls_current INTEGER DEFAULT 0/.test(src));
+    ok('the backfill is one-time, behind the meta flag',
+      /npc_rr_backfill_1/.test(src) && /CREATE TABLE IF NOT EXISTS meta/.test(src));
+    ok('an unrelated edit cannot refill heal charges',
+      /if \(!already \|\| order !== null \|\| wis !== null\) \{/.test(src));
+    ok('rename refuses while they fight',
+      /if \(fightingNpcNames\(gid\)\.has\(from\)\)/.test(src));
+    ok('delete refuses while they fight',
+      /if \(fightingNpcNames\(gid\)\.has\(name\)\)/.test(src));
     ok('the backfill heals the eaten-LCK era once',
       /UPDATE npcs SET rerolls_current = lck WHERE rerolls_current = 0 AND lck > 0/.test(src));
     // The override: a GM skip is the same clear-and-advance the machine
@@ -1259,6 +1274,73 @@ function testPins(src) {
     // it the forum is a gallery and the old channel stays load-bearing),
     // the idempotency record, and the order-face verdict — order faces are
     // deliberately NOT migrated, so "safe to delete" must check them.
+    // Every ALTER must target a table some CREATE defines. Twenty-one
+    // ALTERs spent their whole lives targeting `chars` — no such table —
+    // with the catch swallowing the failure on every boot: the entire 5e
+    // character layer plus two Knightfall fields never existed as columns.
+    // Reads survived (SELECT * simply omits them); the first live write to
+    // name one killed a fight mid-exchange. This is an ERROR-class scan.
+    // Schema cross-reference, generalised from the chars incident and then
+    // proven the same day: the audit that added these caught npcs missing
+    // rerolls_current BEFORE a live spend found it. Every reference must
+    // have a definition — tables in any SQL verb, literal INSERT column
+    // lists, literal UPDATE SET columns, and object keys handed to the two
+    // dynamic upserts. Dynamic (${}) SQL is skipped; DO UPDATE SET is not a
+    // table named SET.
+    (() => {
+      const noComments = src.replace(/\/\/[^\n]*/g, '');
+      const tables = {};
+      for (const m of noComments.matchAll(/CREATE TABLE IF NOT EXISTS (\w+)\s*\(/g)) {
+        let i = m.index + m[0].length, depth = 1;
+        while (depth && i < noComments.length) { depth += noComments[i] === '('; depth -= noComments[i] === ')'; i++; }
+        const cols = new Set();
+        for (const line of noComments.slice(m.index + m[0].length, i - 1).split(',')) {
+          const w = line.trim().split(/\s+/)[0];
+          if (w && !['PRIMARY','UNIQUE','FOREIGN','CHECK'].includes(w) && /^\w+$/.test(w)) cols.add(w);
+        }
+        tables[m[1]] = new Set([...(tables[m[1]] || []), ...cols]);
+      }
+      for (const m of noComments.matchAll(/ALTER TABLE (\w+) ADD COLUMN (\w+)/g)) {
+        (tables[m[1]] = tables[m[1]] || new Set()).add(m[2]);
+      }
+      const phantoms = new Set();
+      // Only lines that carry a real SQL keyword — 'VACUUM INTO unavailable'
+      // in a log string is prose, not a table.
+      for (const line of noComments.split('\n')) {
+        if (!/\b(SELECT|INSERT|DELETE|UPDATE)\b/.test(line)) continue;
+        for (const m of line.matchAll(/(?<!DO )(?:FROM|INTO|UPDATE|DELETE FROM)\s+(\w+)/g)) {
+          const t = m[1];
+          if (!tables[t] && t !== 'sqlite_master' && !t.startsWith('$') && t !== 'SET') phantoms.add(t);
+        }
+      }
+      ok(`every SQL verb targets a created table${phantoms.size ? ` (phantoms: ${[...phantoms].join(', ')})` : ''}`,
+        phantoms.size === 0);
+      const badIns = [];
+      for (const m of noComments.matchAll(/INSERT (?:OR \w+ )?INTO (\w+)\s*\(([^)]+)\)/g)) {
+        if (!tables[m[1]] || m[2].includes('${')) continue;
+        const miss = m[2].split(',').map(c => c.trim()).filter(c => c && !tables[m[1]].has(c));
+        if (miss.length) badIns.push(`${m[1]}:${miss.join('/')}`);
+      }
+      ok(`every literal INSERT column is defined${badIns.length ? ` (${badIns.slice(0,3).join(' ')})` : ''}`, badIns.length === 0);
+      const badUpd = [];
+      for (const m of noComments.matchAll(/(?<!DO )UPDATE (\w+) SET ([^`'"]+?)(?:WHERE|['`"])/g)) {
+        if (!tables[m[1]] || m[0].includes('${')) continue;
+        const miss = [...m[2].matchAll(/(\w+)\s*=/g)].map(x => x[1]).filter(c => !tables[m[1]].has(c));
+        if (miss.length) badUpd.push(`${m[1]}:${[...new Set(miss)].join('/')}`);
+      }
+      ok(`every literal UPDATE column is defined${badUpd.length ? ` (${badUpd.slice(0,3).join(' ')})` : ''}`, badUpd.length === 0);
+      const badKeys = [];
+      for (const [fn, tbl] of [['upsertChar', 'characters'], ['upsertNpc', 'npcs']]) {
+        for (const m of noComments.matchAll(new RegExp(fn + "\\(\\s*\\w+,\\s*[^,{]+,\\s*\\{([\\s\\S]{0,500}?)\\}\\s*\\)", 'g'))) {
+          const body = ('{' + m[1]).replace(/\.\.\.[^,}]+/g, '');
+          for (const k of [...body.matchAll(/[{\s,](\w+)\s*:/g)].map(x => x[1])) {
+            if (!/^\d+$/.test(k) && !tables[tbl]?.has(k)) badKeys.push(`${fn}:${k}`);
+          }
+        }
+      }
+      ok(`every upsert key is a real column${badKeys.length ? ` (${[...new Set(badKeys)].slice(0,4).join(' ')})` : ''}`,
+        badKeys.length === 0);
+    })();
     ok('the migration record table exists',
       /CREATE TABLE IF NOT EXISTS npc_portrait_posts/.test(src));
     ok('portraits:true is routed',

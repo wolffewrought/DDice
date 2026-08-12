@@ -48,11 +48,20 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS job_failures (
   PRIMARY KEY (guild_id, job)
 )`); } catch (e) { console.error('job_failures schema', e); }
 try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
-// NPC rerolls existed as a column but were never written — the spend path
-// decremented the LCK stat itself instead ("temporarily", said the comment,
-// and nothing ever restored it). Backfill every pool to full once; from
-// here the column is the pool and rest refills it, mirroring characters.
-try { db.exec('UPDATE npcs SET rerolls_current = lck WHERE rerolls_current = 0 AND lck > 0'); } catch {}
+// The audit's own catch: this mirror shipped writing to a column npcs
+// never had — the same phantom class as the chars table, caught here
+// before a live spend found it. Column first, then a ONE-TIME backfill:
+// the flag matters because "spent to zero" and "never filled" are the
+// same value, and a per-boot backfill would quietly refill spent pools
+// on every redeploy, which is rest's job and nobody else's.
+try { db.exec('ALTER TABLE npcs ADD COLUMN rerolls_current INTEGER DEFAULT 0'); } catch {}
+try { db.exec('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)'); } catch {}
+try {
+  if (!db.prepare("SELECT 1 FROM meta WHERE k='npc_rr_backfill_1'").get()) {
+    db.exec('UPDATE npcs SET rerolls_current = lck WHERE rerolls_current = 0 AND lck > 0');
+    db.prepare("INSERT INTO meta (k, v) VALUES ('npc_rr_backfill_1', '1')").run();
+  }
+} catch {}
 // Rest restore amounts. Stored as text tokens so GMs can use either form:
 //   "100%" = percentage of that resource's max   |   "3" = flat, set the value to exactly 3
 // Defaults: Long rest = full (100%). Short rest = HP only (50%), no rerolls/heal.
@@ -556,26 +565,30 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font_name TEXT'); } ca
 // A shelf for the props: every /gm scroll's named PDF is also filed here.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_archive_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_threads TEXT'); } catch {} // forum mode: JSON map gmId → thread id
-try { db.exec('ALTER TABLE chars ADD COLUMN next_mark TEXT'); } catch {} // 🔼/🔽 on their very next roll, anywhere
-try { db.exec('ALTER TABLE chars ADD COLUMN deception_spent INTEGER DEFAULT 0'); } catch {} // one trick per honest roll
+try { db.exec('ALTER TABLE characters ADD COLUMN next_mark TEXT'); } catch {} // 🔼/🔽 on their very next roll, anywhere
+try { db.exec('ALTER TABLE characters ADD COLUMN deception_spent INTEGER DEFAULT 0'); } catch {} // one trick per honest roll
 // A 5e sheet carries two more abilities and the numbers that hang off a class.
 // Added for every server; a Knightfall sheet simply never reads them.
-try { db.exec('ALTER TABLE chars ADD COLUMN int INTEGER DEFAULT 10'); } catch {}
-try { db.exec('ALTER TABLE chars ADD COLUMN cha INTEGER DEFAULT 10'); } catch {}
-try { db.exec('ALTER TABLE chars ADD COLUMN level INTEGER DEFAULT 1'); } catch {}
-try { db.exec('ALTER TABLE chars ADD COLUMN char_class TEXT'); } catch {}
-try { db.exec('ALTER TABLE chars ADD COLUMN hit_die INTEGER DEFAULT 8'); } catch {}
-try { db.exec('ALTER TABLE chars ADD COLUMN armour_class INTEGER'); } catch {}
-try { db.exec('ALTER TABLE chars ADD COLUMN proficient TEXT'); } catch {}   // JSON: saves and skills
-try { db.exec('ALTER TABLE chars ADD COLUMN hit_dice_left INTEGER'); } catch {}   // spent on a short rest
-try { db.exec('ALTER TABLE chars ADD COLUMN slots_used TEXT'); } catch {}         // JSON: spell level → how many spent
-try { db.exec('ALTER TABLE chars ADD COLUMN concentrating TEXT'); } catch {}      // what they are holding together
-try { db.exec('ALTER TABLE chars ADD COLUMN weapon1dice TEXT'); } catch {}        // e.g. 1d12 for a greataxe
-try { db.exec('ALTER TABLE chars ADD COLUMN weapon2dice TEXT'); } catch {}
-try { db.exec('ALTER TABLE chars ADD COLUMN prepared_spells TEXT'); } catch {}    // JSON list
+try { db.exec('ALTER TABLE characters ADD COLUMN int INTEGER DEFAULT 10'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN cha INTEGER DEFAULT 10'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN level INTEGER DEFAULT 1'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN char_class TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN hit_die INTEGER DEFAULT 8'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN armour_class INTEGER'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN proficient TEXT'); } catch {}   // JSON: saves and skills
+try { db.exec('ALTER TABLE characters ADD COLUMN hit_dice_left INTEGER'); } catch {}   // spent on a short rest
+try { db.exec('ALTER TABLE characters ADD COLUMN slots_used TEXT'); } catch {}         // JSON: spell level → how many spent
+try { db.exec('ALTER TABLE characters ADD COLUMN concentrating TEXT'); } catch {}      // what they are holding together
+try { db.exec('ALTER TABLE characters ADD COLUMN weapon1dice TEXT'); } catch {}        // e.g. 1d12 for a greataxe
+try { db.exec('ALTER TABLE characters ADD COLUMN weapon2dice TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN prepared_spells TEXT'); } catch {}    // JSON list
 // A 5e character can be dying rather than dead: three saves either way.
-try { db.exec('ALTER TABLE chars ADD COLUMN death_success INTEGER DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE chars ADD COLUMN death_fail INTEGER DEFAULT 0'); } catch {}
+// These two spent their whole life failing: the table is `characters`,
+// there is no `chars`, and the catch swallowed "no such table" on every
+// boot — so the columns never existed while upsertChar injected defaults
+// for them. First live fight to trip the injection died on the write.
+try { db.exec('ALTER TABLE characters ADD COLUMN death_success INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN death_fail INTEGER DEFAULT 0'); } catch {}
 // And a monster needs the four numbers a statblock leads with.
 try { db.exec('ALTER TABLE npcs ADD COLUMN armour_class INTEGER'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN attack_bonus INTEGER'); } catch {}
@@ -584,13 +597,13 @@ try { db.exec('ALTER TABLE npcs ADD COLUMN max_hp INTEGER'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN int INTEGER DEFAULT 10'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN cha INTEGER DEFAULT 10'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN conditions TEXT'); } catch {}
-try { db.exec('ALTER TABLE chars ADD COLUMN conditions TEXT'); } catch {}          // JSON list
-try { db.exec('ALTER TABLE chars ADD COLUMN temp_hp INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN conditions TEXT'); } catch {}          // JSON list
+try { db.exec('ALTER TABLE characters ADD COLUMN temp_hp INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN temp_hp INTEGER DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE chars ADD COLUMN inspiration INTEGER DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE chars ADD COLUMN damage_type TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN inspiration INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN damage_type TEXT'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN damage_type TEXT'); } catch {}
-try { db.exec('ALTER TABLE chars ADD COLUMN resist TEXT'); } catch {}              // comma list
+try { db.exec('ALTER TABLE characters ADD COLUMN resist TEXT'); } catch {}              // comma list
 try { db.exec('ALTER TABLE npcs ADD COLUMN resist TEXT'); } catch {}
 try { db.exec('ALTER TABLE fights ADD COLUMN atk_used INTEGER DEFAULT 0'); } catch {}
 // The library. A monster or a spell written once and drawn on for ever —
@@ -7741,7 +7754,7 @@ async function handleConfig(interaction, forced) {
     // Changing the rules under existing characters would strand every sheet:
     // five stats do not become six by wishing. Set it before anyone plays.
     let made = 0;
-    try { made = db.prepare('SELECT COUNT(*) AS c FROM chars WHERE guild_id=?').get(gid).c; } catch {}
+    try { made = db.prepare('SELECT COUNT(*) AS c FROM characters WHERE guild_id=?').get(gid).c; } catch {}  // counted a phantom table (always 0) since it shipped
     if (made) {
       return interaction.reply({ ephemeral: true, content:
         `❌ **${made}** character${made === 1 ? ' has' : 's have'} already been made under **${now.name}**. `
@@ -16897,6 +16910,11 @@ async function handleNpc(interaction) {
     // only the CASE of this NPC's own name is fine and flows through.
     const clash = getAllNpcs(gid).find(n => n.name.toLowerCase() === to.toLowerCase() && n.name.toLowerCase() !== from.toLowerCase());
     if (clash) return interaction.reply({ content: `❌ **${clash.name}** already exists — that name is taken.`, ephemeral: true });
+    // Fight state (turn order, hp, reroll tokens) keys by the fighter id,
+    // which derives from the name — renaming mid-fight orphans all of it.
+    if (fightingNpcNames(gid).has(from)) {
+      return interaction.reply({ ephemeral: true, content: `❌ **${from}** is in an active fight — finish or end it first; renaming now would orphan their place in it.` });
+    }
     await interaction.deferReply();
 
     // The rename mirrors deleteNpc's purge list as UPDATEs: everything the
@@ -16991,8 +17009,10 @@ async function handleNpc(interaction) {
     if (order) fields.order_name = order;
     upsertNpc(gid, name, fields);
     // And the White Knight gate mirrors too: order + WIS >= 5 grants the
-    // server's heal charges under the fighter id; losing either zeroes them.
-    {
+    // server's heal charges under the fighter id; losing either zeroes
+    // them. Only when the gate's own inputs move (or on creation) — an
+    // unrelated stat edit must not hand a spent healer a full refill.
+    if (!already || order !== null || wis !== null) {
       const after = getNpc(gid, name);
       if (isWhiteKnight(after)) setHealCharges(gid, npcFighterId(name), getConfig(gid)?.heal_charges ?? 3);
       else setHealCharges(gid, npcFighterId(name), 0);
@@ -17041,6 +17061,11 @@ async function handleNpc(interaction) {
           const wh = new WebhookClient({ id: npc.webhook_id, token: npc.webhook_token });
           await wh.delete();
         } catch {}
+      }
+      // Same orphaning risk as rename: their fighter id anchors live fight
+      // state. The fight has to end before they can.
+      if (fightingNpcNames(gid).has(name)) {
+        return interaction.reply({ ephemeral: true, content: `❌ **${name}** is in an active fight — finish or end it before deleting them.` });
       }
       deleteNpc(gid, name);
       registerSlashCommands(gid).catch(console.error);
