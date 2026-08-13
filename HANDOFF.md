@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 752 assertions passed and no scanner found an ERROR.
+Green means 754 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 752 assertions covering structure, registration and ruleset
+now is 754 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -271,6 +271,17 @@ after the registration loop; pinned there. `startQuestClock`'s own odd home
 is pre-existing and untouched. Cleanup is deliberately reachable by hand
 too: `/gm check build:true` sweeps recorded pages-forum category threads
 and mirrors every NPC, so a hiccuped migration is never a dead end.
+
+Deploy postmortem (03:33, from T's Railway log): the "nothing happened"
+scare was Railway's 15-minute build/queue — the new code went live AFTER
+the screenshots (the `restored 49` autorest line is the resource mirror's
+signature). Two fixes fell out anyway: both migrations now LOG success
+("[run-rename] christened N", "[npc-threads] N built, M swept", "already
+done" on the flag) because silent success was indistinguishable from
+silent failure; and `buildFightRecap` no longer dies on a fighter who left
+the server ('reading username of undefined', live crash in the log) — a
+departed fighter is named "A departed adventurer". The ready handler is
+now `client.once('clientReady')` per the deprecation in the same log.
 
 ## 7k · Pages forum: one NPC, one thread, tags that filter (2026-08-12)
 

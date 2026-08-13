@@ -11515,7 +11515,7 @@ client.on('guildCreate', async (guild) => {
   } catch { /* no channel it may speak in — the commands are what matter */ }
 });
 
-client.on('ready', async () => {
+client.once('clientReady', async () => {  // 'ready' is deprecated in favour of clientReady
   console.log(`✅ Bot online as ${client.user.tag}`);
   // Re-register commands for each guild with current NPC list
   for (const guild of client.guilds.cache.values()) {
@@ -14069,9 +14069,12 @@ async function buildFightRecap(guild, gid, log, opts = {}) {
   const ids = [...new Set([...entries.map(e => e[0]), ...rolls.flatMap(r => [r.a, r.d])])];
   const nameOf = {}, isNpcOf = {};
   for (const fid of ids) {
-    const f = await resolveFighter(guild, gid, fid);
-    nameOf[fid] = `${f.name}${f.isNpc ? ' 🎭' : ''}`;
-    isNpcOf[fid] = f.isNpc;
+    // A fighter who left the server resolves to nothing — the recap names
+    // them anyway instead of dying with 'reading username of undefined'
+    // (live crash, 2026-08-13 03:35).
+    const f = await resolveFighter(guild, gid, fid).catch(() => null);
+    nameOf[fid] = f?.name ? `${f.name}${f.isNpc ? ' 🎭' : ''}` : 'A departed adventurer';
+    isNpcOf[fid] = f?.isNpc ?? false;
   }
   const hideNpc = !npcStatsVisible(gid);
   // NPC stat names stay hidden here exactly as they are on the roll cards.
@@ -20039,25 +20042,27 @@ async function spinOffRun(interaction, gid, root, approvedIds) {
 // thread (name, sheet, category tags), and the retired category/order
 // threads of the old shape are closed. Flagged — reruns touch nothing.
 async function npcThreadMigration(client) {
-  try { if (db.prepare("SELECT 1 FROM meta WHERE k='npc_threads_1'").get()) return; } catch {}
+  try { if (db.prepare("SELECT 1 FROM meta WHERE k='npc_threads_1'").get()) { console.log('[npc-threads] already done'); return; } } catch {}
+  let made = 0, swept = 0;
   for (const [gid] of client.guilds.cache) {
     if (!getConfig(gid)?.npc_forum) continue;
     for (const npc of getAllNpcs(gid)) {
       // Old rows point at category threads; the mirror would edit a message
       // there instead of building the NPC's own thread. Clear first.
       try { db.prepare('DELETE FROM npc_pages WHERE guild_id=? AND name=?').run(gid, npc.name); } catch {}
-      await mirrorNpcSheet(client, gid, npc.name).catch(() => null);
+      if (await mirrorNpcSheet(client, gid, npc.name).catch(() => null)) made++;
     }
     try {
       const forum = await client.channels.fetch(getConfig(gid).npc_forum).catch(() => null);
       for (const r of db.prepare('SELECT category, thread_id FROM npc_category_threads WHERE guild_id=?').all(gid)) {
         const th = await client.channels.fetch(r.thread_id).catch(() => null);
-        if (th?.isThread?.() && (!forum || th.parentId === forum.id)) await th.delete('Pages forum restructure').catch(() => {});
+        if (th?.isThread?.() && (!forum || th.parentId === forum.id)) { await th.delete('Pages forum restructure').catch(() => {}); swept++; }
         db.prepare('DELETE FROM npc_category_threads WHERE guild_id=? AND category=?').run(gid, r.category);
       }
     } catch {}
   }
   try { db.prepare("INSERT INTO meta (k, v) VALUES ('npc_threads_1', '1')").run(); } catch {}
+  console.log(`[npc-threads] ${made} thread(s) built, ${swept} old thread(s) swept`);
 }
 
 // One-time christening of every run that predates the naming convention:
@@ -20065,7 +20070,8 @@ async function npcThreadMigration(client) {
 // "<Quest> Run NNN <GM>", and their threads are renamed to match. Behind a
 // meta flag so redeploys never touch names a GM has since hand-edited.
 async function runRenameMigration(client) {
-  try { if (db.prepare("SELECT 1 FROM meta WHERE k='run_rename_1'").get()) return; } catch {}
+  try { if (db.prepare("SELECT 1 FROM meta WHERE k='run_rename_1'").get()) { console.log('[run-rename] already done'); return; } } catch {}
+  let christened = 0;
   for (const [gid, guild] of client.guilds.cache) {
     const runs = db.prepare('SELECT * FROM quests WHERE guild_id=? AND instance_of IS NOT NULL ORDER BY instance_of, rowid').all(gid);
     let seq = 0, lastRoot = null;
@@ -20085,10 +20091,12 @@ async function runRenameMigration(client) {
         const th = await client.channels.fetch(run.run_thread_id).catch(() => null);
         if (th?.isThread?.()) await th.setName(questTag(getQuest(gid, run.number)).slice(0, 100)).catch(() => {});
       }
+      christened++;
       await syncQuestBook(client, guild, gid, getQuest(gid, run.number)).catch(() => {});
     }
   }
   try { db.prepare("INSERT INTO meta (k, v) VALUES ('run_rename_1', '1')").run(); } catch {}
+  console.log(`[run-rename] christened ${christened} run(s)`);
 }
 
 // /instance is an address translator, nothing more: resolve a listing by
