@@ -259,7 +259,8 @@ CONTENT = [
 ('p', 'Point the bot at a <b>forum</b> and every approved character gets a post of their own \u2014 somewhere '
       'for lore, art and notes. The link then appears on <b>/char view show</b> and in search results.'),
 ('code', [('/config channels charforum channel:#character-sheets', 'the forum'),
-          ('(character forum)', 'one thread per character: the sheet on top, then living\nInventory \u00b7 Lore \u00b7 Dice blocks the bot keeps current (dice\nhourly: d2\u2013d20 with averages and nat extremes); tags = order \u00b7 class \u00b7 Fallen filter the roster'),
+          ('/config channels gmcharforum channel:#gm-character-sheets', 'GM-only forum for GM sheets \u2014 same five blocks and\ntags, behind the GM category\u2019s permissions'),
+          ('(character forum)', 'one thread per character: Sheet \u2192 Inventory \u2192 Lore \u2192\nStanding \u2192 Dice, all bot-kept (dice hourly: d2\u2013d20, averages,\nnat extremes); tags = order \u00b7 class \u00b7 Fallen \u00b7 Hero; threads are\nstaff-typed (players ask a Moderator/Expeditioner \u2014 a notice\nin every thread says so); GM sheets live in the GM-only forum,\nauto-created on update where the GM category exists'),
           ('/char page user:@a', 'make one now'),
           ('/char page user:@a thread:#their-thread', 'or link a post that already exists'),
           ('/char page user:@a unlink:true', 'forget it \u2014 the thread itself is untouched')]),

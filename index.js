@@ -182,6 +182,7 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN memorial_public_channel TEXT'
 // the character's; the bot only needs to know which thread belongs to whom so it
 // can link to it.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN char_forum TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_char_forum TEXT'); } catch {}
 // The character thread's block layout: starter = sheet, plus three
 // bot-owned blocks (inventory · lore · dice) edited in place. Hashes let
 // the hourly sweep skip blocks that haven't changed — near-zero traffic
@@ -189,6 +190,8 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN char_forum TEXT'); } catch {}
 try { db.exec('ALTER TABLE char_pages ADD COLUMN inv_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE char_pages ADD COLUMN lore_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE char_pages ADD COLUMN rolls_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE char_pages ADD COLUMN standing_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE char_pages ADD COLUMN notice_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE char_pages ADD COLUMN block_hashes TEXT'); } catch {}
 // A duel is a proposal until a GM signs it off. One open proposal per player,
 // so the board can't be papered with them.
@@ -5413,6 +5416,9 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('charforum').setDescription('A forum where each approved character gets a page')
       .addChannelOption(o=>o.setName('channel').setDescription('The forum channel').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = stop making pages').setRequired(false)));
+      g.addSubcommand(s=>s.setName('gmcharforum').setDescription('GM-only forum for GM character sheets — same blocks, GM eyes only')
+      .addChannelOption(o=>o.setName('channel').setDescription('The forum channel').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop making pages').setRequired(false)));
       g.addSubcommand(s=>s.setName('questforum').setDescription('A forum where each posted quest gets its own thread')
       .addChannelOption(o=>o.setName('channel').setDescription('The forum channel').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = post quests as plain messages again').setRequired(false)));
@@ -8028,6 +8034,30 @@ async function handleConfig(interaction, forced) {
       + '_`/char page` links an existing thread by hand, or makes one now._' });
   }
 
+  if (sub === 'gmcharforum') {
+    if (interaction.options?.getBoolean?.('disable')) {
+      setConfig(gid, { gm_char_forum: null });
+      return interaction.reply({ content: '📖 GM sheets return to private-by-absence.' });
+    }
+    const channel = (forced?.channel ?? interaction.options?.getChannel?.('channel'));
+    if (!channel) {
+      const cur = getConfig(gid)?.gm_char_forum;
+      const count = db.prepare('SELECT COUNT(*) AS c FROM char_pages WHERE guild_id=?').get(gid).c;
+      return interaction.reply({ ephemeral: true, content: cur
+        ? `📖 GM character pages live in <#${cur}> — ${count} linked so far.`
+        : '📖 No character forum set. `/config channels gmcharforum channel:#gm-character-sheets`' });
+    }
+    // A forum is channel type 15; anything else has no threads to create.
+    if (channel.type !== 15) {
+      return interaction.reply({ ephemeral: true, content:
+        `❌ <#${channel.id}> is not a forum channel. Make a **Forum** and point me at that — each character gets a post in it.` });
+    }
+    setConfig(gid, { gm_char_forum: channel.id });
+    return interaction.reply({ content:
+      `📖 Character pages will be made in <#${channel.id}> when a sheet is approved.\n`
+      + '_`/char page` links an existing thread by hand, or makes one now._' });
+  }
+
   if (sub === 'memorial') {
     const channel = (forced?.channel ?? interaction.options?.getChannel?.('channel'));
     const pub = interaction.options?.getChannel?.('public');
@@ -10359,6 +10389,8 @@ const SETUP_PLAN = [
     about: 'The full record of a death — cause, deeds and standing — for GMs.' },
   { key: 'backup_channel_id',     name: 'backups',          forum: false, gm: true,  essential: false,
     about: 'Where the nightly backup of everything is posted.' },
+  { key: 'gm_char_forum',         name: 'gm-character-sheets', forum: true, gm: true, essential: false,
+    about: 'GM characters live here — same five blocks and tags as the player forum, behind the GM category\'s eyes only.' },
   { key: 'docs_channel',          name: 'command-reference', forum: false, gm: true, essential: false,
     about: 'The command books, reposted whenever they change.' },
 ];
@@ -11528,6 +11560,19 @@ client.on('guildCreate', async (guild) => {
         '',
         '_Playing 5e? `/config channels ruleset system:dnd5e` before anyone makes a character, then `/library srd`._',
         '_`/help` lists everything, and `/gm check` shows what is still waiting._',
+        ...(() => {
+          // A bot cannot grant itself permissions — Discord's rule, not
+          // ours — so arrival names anything missing while an admin is
+          // still looking. Existing servers are never audited unprompted;
+          // /gm check build:true surfaces gaps there on demand.
+          const NEEDED = ['ManageChannels','ManageThreads','ManageRoles','ManageWebhooks','ManageMessages',
+            'SendMessages','SendMessagesInThreads','CreatePublicThreads','EmbedLinks','AttachFiles',
+            'AddReactions','ReadMessageHistory'];
+          const me = guild.members.me;
+          const missing = NEEDED.filter(p2 => !me?.permissions?.has?.(p2));
+          return missing.length ? ['',
+            `⚠️ **Missing permissions:** ${missing.join(', ')} — grant these to the DDice role or forums, sheets and portraits cannot be built.`] : [];
+        })(),
       ].join('\n') });
     }
   } catch { /* no channel it may speak in — the commands are what matter */ }
@@ -11543,6 +11588,7 @@ client.once('clientReady', async () => {  // 'ready' is deprecated in favour of 
   // riding registration, where they first landed by a bad anchor.
   runRenameMigration(client).catch(err => console.error('[run-rename]', err?.message || err));
   npcThreadMigration(client).catch(err => console.error('[npc-threads]', err?.message || err));
+  forumSetupMigration(client).catch(err => console.error('[gm-forum]', err?.message || err));
   charThreadMigration(client).catch(err => console.error('[char-threads]', err?.message || err));
   startCharBlockSweep(client);
   startBackupScheduler();
@@ -13513,6 +13559,9 @@ function charPageLink(gid, uid, label = 'Character page') {
 const CHAR_TAG_ORDERS = ['White Knight','Black Knight','Gold Knight','Grey Knight','Blue Knight','Purple Knight','Green Knight','Red Knight'];
 const CHAR_TAG_CLASSES = ['Vanguard','Defender','Siege Knight'];
 const CHAR_TAG_FALLEN = 'Fallen';
+const CHAR_TAG_HERO = 'Hero';
+// T's exact wording, posted after the blocks in every character thread.
+const CHAR_THREAD_NOTICE = 'If you would like to adjust your lore doc please contact a Moderator or Expeditioner. Thank you!';
 
 // Every filterable label the character forum carries: 8 + 3 + 1 = 12 of
 // Discord's 20. Additive — never removes a tag someone added by hand.
@@ -13529,6 +13578,15 @@ function charLoreBody(gid, uid) {
   if (!rows.length) return '📖 **Lore** — none approved yet.';
   return ['📖 **Lore**', ...rows.map(r => r.body)].join('\n\n').slice(0, 1900);
 }
+function charStandingBody(gid, uid) {
+  const merits = getMerits(gid, uid), renown = getRenown(gid, uid);
+  const lines = [`🏅 **Standing** — **${merits}** merit${merits === 1 ? '' : 's'} · **${renown}** renown`];
+  const rows = db.prepare('SELECT delta, reason FROM renown_log WHERE guild_id=? AND user_id=? ORDER BY at DESC LIMIT 8').all(gid, uid);
+  for (const r of rows) lines.push(`${r.delta > 0 ? '+' : ''}${r.delta}${r.reason ? ` — ${r.reason}` : ''}`);
+  if (rows.length) lines.splice(1, 0, '');
+  return lines.join('\n').slice(0, 1900);
+}
+
 function charRollsBody(gid, uid) {
   const rows = db.prepare('SELECT sides, nat, count FROM roll_tally WHERE guild_id=? AND user_id=?').all(gid, uid);
   const per = {};
@@ -13562,7 +13620,7 @@ function charRollsBody(gid, uid) {
 async function ensureCharTags(forum) {
   const fresh = await forum.fetch().catch(() => forum);
   const have = fresh.availableTags || [];
-  const wanted = [...CHAR_TAG_ORDERS, ...CHAR_TAG_CLASSES, CHAR_TAG_FALLEN];
+  const wanted = [...CHAR_TAG_ORDERS, ...CHAR_TAG_CLASSES, CHAR_TAG_FALLEN, CHAR_TAG_HERO];
   const missing = wanted.filter(w => !have.some(t => t.name.toLowerCase() === w.toLowerCase()));
   if (missing.length && have.length + missing.length <= 20) {
     await forum.setAvailableTags([...have, ...missing.map(name => ({ name: name.slice(0, 20) }))]).catch(() => {});
@@ -13592,11 +13650,26 @@ function charPageBody(gid, ch, displayName) {
 
 async function ensureCharPage(client, guild, uid, displayName, scope = 'sheet') {
   const gid = guild.id;
-  const forumId = getConfig(gid)?.char_forum;
-  if (!forumId) return { skipped: 'no forum set' };
+  // GMs route to their own GM-only forum when one is set; with none set,
+  // their privacy is absence, exactly as before.
+  const gmUser = await isGm(guild, uid).catch(() => false);
+  const forumId = gmUser ? (getConfig(gid)?.gm_char_forum ?? null) : getConfig(gid)?.char_forum;
+  if (!forumId) {
+    if (gmUser) {
+      const ex0 = getCharPage(gid, uid);
+      if (ex0?.thread_id) {
+        const th0 = await client.channels.fetch(ex0.thread_id).catch(() => null);
+        if (th0?.isThread?.()) await th0.delete('GM sheets are private').catch(() => {});
+        clearCharPage(gid, uid);
+      }
+      return { skipped: 'gm-private' };
+    }
+    return { skipped: 'no forum set' };
+  }
   const forum = await client.channels.fetch(forumId);
   if (!forum?.threads?.create) throw new Error('that channel is not a forum');
   displayName = displayName || await getDisplayName(guild, uid).catch(() => null) || 'Adventurer';
+
 
   // Mirror-grade now, the NPC forum's twin: the starter message IS the
   // sheet, edited in place; tags are order + class + Fallen; the thread
@@ -13611,11 +13684,19 @@ async function ensureCharPage(client, guild, uid, displayName, scope = 'sheet') 
     const id = tagMap[ch.char_class.toLowerCase()]; if (id) applied.push(id);
   }
   if (isFallen(gid, uid)) { const id = tagMap[CHAR_TAG_FALLEN.toLowerCase()]; if (id) applied.push(id); }
+  if (ch?.is_hero) { const id = tagMap[CHAR_TAG_HERO.toLowerCase()]; if (id) applied.push(id); }
   const body = ch ? charPageBody(gid, ch, displayName) : `\u{1F4DC} **${displayName}** \u2014 no sheet yet.`;
 
   const existing = getCharPage(gid, uid);
   let thread = existing?.thread_id ? await client.channels.fetch(existing.thread_id).catch(() => null) : null;
   if (thread && !thread.isThread?.()) thread = null;
+  // Promotion or demotion moved them between forums: a thread in the wrong
+  // one is deleted and rebuilt where they now belong.
+  if (thread && thread.parentId !== forum.id) {
+    await thread.delete('Sheet moved between forums').catch(() => {});
+    clearCharPage(gid, uid);
+    thread = null;
+  }
   if (!thread) {
     if (existing?.thread_id) clearCharPage(gid, uid);
     thread = await forum.threads.create({
@@ -13643,14 +13724,15 @@ async function ensureCharBlocks(client, guild, uid, thread) {
   const gid = guild.id;
   const row = getCharPage(gid, uid);
   if (!row) return;
-  const bodies = { inv: charInvBody(gid, uid), lore: charLoreBody(gid, uid), rolls: charRollsBody(gid, uid) };
+  const bodies = { inv: charInvBody(gid, uid), lore: charLoreBody(gid, uid), standing: charStandingBody(gid, uid), rolls: charRollsBody(gid, uid), notice: CHAR_THREAD_NOTICE };
   let hashes = {};
   try { hashes = JSON.parse(row.block_hashes || '{}'); } catch {}
   const crypto = require('crypto');
   const h = (t) => crypto.createHash('sha1').update(t).digest('hex').slice(0, 12);
   let dirtyIds = false;
-  const ids = { inv: row.inv_msg_id, lore: row.lore_msg_id, rolls: row.rolls_msg_id };
-  for (const key of ['inv', 'lore', 'rolls']) {
+  const ids = { inv: row.inv_msg_id, lore: row.lore_msg_id, standing: row.standing_msg_id, rolls: row.rolls_msg_id, notice: row.notice_msg_id };
+  // T's order, enforced at creation: Sheet (starter) · Inventory · Lore · Standing · Dice.
+  for (const key of ['inv', 'lore', 'standing', 'rolls', 'notice']) {
     const want = bodies[key], hw = h(want);
     if (ids[key] && hashes[key] === hw) continue;           // unchanged — zero traffic
     let msg = ids[key] ? await thread.messages.fetch(ids[key]).catch(() => null) : null;
@@ -13661,8 +13743,8 @@ async function ensureCharBlocks(client, guild, uid, thread) {
     }
     hashes[key] = hw;
   }
-  db.prepare('UPDATE char_pages SET inv_msg_id=?, lore_msg_id=?, rolls_msg_id=?, block_hashes=? WHERE guild_id=? AND user_id=?')
-    .run(ids.inv, ids.lore, ids.rolls, JSON.stringify(hashes), gid, uid);
+  db.prepare('UPDATE char_pages SET inv_msg_id=?, lore_msg_id=?, standing_msg_id=?, rolls_msg_id=?, notice_msg_id=?, block_hashes=? WHERE guild_id=? AND user_id=?')
+    .run(ids.inv, ids.lore, ids.standing, ids.rolls, ids.notice, JSON.stringify(hashes), gid, uid);
 }
 
 // The hourly sweep: every character's blocks reconciled, hash-skipped.
@@ -18013,7 +18095,7 @@ const HELP_CATEGORIES = {
     title: '📜 Character Sheet',
     blurb: 'sheets, approval, lore, profiles, weapons',
     body: [
-      '🏷️ Your character has their own thread in the character forum: the sheet on top plus living **Inventory**, **Lore** and **Dice** blocks the bot keeps current (dice refresh hourly). Tags (order · class · ⚰ Fallen) filter the roster. Your own posts go below.',
+      '🏷️ Your character has their own thread in the character forum: **Sheet → Inventory → Lore → Standing → Dice**, all kept current by the bot (dice hourly). Tags (order · class · ⚰ Fallen · 🌟 Hero) filter the roster. GM sheets live in their own GM-only forum. Threads are staff-typed — to adjust your lore, ask a Moderator or Expeditioner (the thread says so).',
       '_Your sheet is the one source of truth — stats, class, order and weapons — and fights, activities and heals all read from it._',
       '`/char create` — set up a full character at once (stats, order, class, weapons, weapon emojis)',
       '`/char set field:STR value:14` — set one field at a time (with approvals on, any change to your own sheet goes back to the GMs)',
@@ -20030,8 +20112,11 @@ async function buildAllSetup(interaction) {
   // success over a forum still holding a thread per NPC. Costs nothing on a
   // new server: there are no NPCs to write yet.
   const npcLaid = await rebuildNpcForum(interaction.client, gid).catch(() => null);
-  // The character forum rebuilds beside it — same manual twin promise.
+  // The character forum rebuilds beside it — same manual twin promise —
+  // and the staff-only lock reapplies.
   try { const g2 = interaction.guild;
+    const pf2 = getConfig(gid)?.char_forum ? await interaction.client.channels.fetch(getConfig(gid).char_forum).catch(() => null) : null;
+    if (pf2?.type === 15) await lockCharForum(g2, pf2);
     for (const c2 of db.prepare('SELECT user_id FROM characters WHERE guild_id=?').all(gid)) {
       await ensureCharPage(interaction.client, g2, c2.user_id, null, 'all').catch(() => null);
     }
@@ -20221,11 +20306,58 @@ async function spinOffRun(interaction, gid, root, approvedIds) {
 
 // Enough hands. Said once per quest, in the planning thread, to whoever
 // holds it — approving the sixth of five shouldn't nag twice.
+// Staff type, players read: the character forum's threads are adjusted by
+// GMs only — players ask a Moderator or Expeditioner (the notice block says
+// so). Needs the gm role configured and Manage Roles; skipped with a log
+// line otherwise, and /gm check build:true reapplies it on demand.
+async function lockCharForum(guild, forum) {
+  const gid = guild.id;
+  const gmRole = getConfig(gid)?.gm_role_id;
+  if (!gmRole) { console.log(`[char-lock] ${gid}: no gm role set — forum left open`); return false; }
+  try {
+    await forum.permissionOverwrites.edit(guild.roles.everyone, {
+      SendMessagesInThreads: false, CreatePublicThreads: false, CreatePrivateThreads: false,
+    });
+    await forum.permissionOverwrites.edit(gmRole, {
+      SendMessagesInThreads: true, CreatePublicThreads: true,
+    });
+    return true;
+  } catch (e) { console.log(`[char-lock] ${gid}: ${e?.message || e}`); return false; }
+}
+
 // Every character dragged into their tagged thread — the char forum's
 // twin of the NPC migration, born with the v2 discipline: counts logged,
 // flag only on real work, first error named, and the mirror upgrades
 // existing lore threads in place (starter becomes the sheet; posts below
 // are never touched).
+// On push, automatically: the GM sheet forum is created under the GM
+// category wherever that category exists and no forum is set yet; the
+// player forum is locked staff-only. Both one-time, both v2-honest.
+async function forumSetupMigration(client) {
+  try { if (db.prepare("SELECT 1 FROM meta WHERE k='gm_forum_lock_1'").get()) { console.log('[gm-forum] already done'); return; } } catch {}
+  let madeForums = 0, locked = 0, firstErr = null;
+  for (const [gid, guild] of client.guilds.cache) {
+    try {
+      if (!getConfig(gid)?.gm_char_forum) {
+        const cat = guild.channels.cache.find(c => c.type === 4 && c.name === 'DDice · Game Masters');
+        if (cat) {
+          const f = await guild.channels.create({ name: 'gm-character-sheets', type: 15, parent: cat.id,
+            topic: 'GM characters — same five blocks and tags, GM eyes only.' }).catch(e => { firstErr ??= e?.message; return null; });
+          if (f) { setConfig(gid, { gm_char_forum: f.id }); madeForums++; }
+        }
+      }
+      const pf = getConfig(gid)?.char_forum ? await client.channels.fetch(getConfig(gid).char_forum).catch(() => null) : null;
+      if (pf?.type === 15 && await lockCharForum(guild, pf)) locked++;
+    } catch (e) { firstErr ??= e?.message || String(e); }
+  }
+  if (madeForums > 0 || locked > 0) {
+    try { db.prepare("INSERT INTO meta (k, v) VALUES ('gm_forum_lock_1', '1')").run(); } catch {}
+    console.log(`[gm-forum] ${madeForums} forum(s) created, ${locked} player forum(s) locked`);
+  } else {
+    console.log(`[gm-forum] VACUOUS — nothing created or locked${firstErr ? ` · ${firstErr}` : ''}`);
+  }
+}
+
 async function charThreadMigration(client) {
   try { if (db.prepare("SELECT 1 FROM meta WHERE k='char_threads_1'").get()) { console.log('[char-threads] already done'); return; } } catch {}
   let made = 0, total = 0, firstErr = null;

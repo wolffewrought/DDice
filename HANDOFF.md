@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 767 assertions passed and no scanner found an ERROR.
+Green means 775 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 767 assertions covering structure, registration and ruleset
+now is 775 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -281,6 +281,28 @@ and re-announced forever. Fixed: `upsertSchedule({ last_run })` immediately
 after `runAutoRest`, BEFORE the announcement so a failed announce can't
 refire; pinned with the ordering. Live mitigation until deploy:
 `/gm autorest action:pause` (or `resume`, which resets the clock).
+
+Five-block order (T): Sheet (starter) · Inventory · Lore · **Standing**
+(merits/renown totals + last 8 renown_log lines) · Dice; standing_msg_id
+joined char_pages. **GM sheets are private by absence** — forums cannot
+hide a thread, so a GM's character simply has none (existing thread deleted
+on next touch; demotion/promotion self-heals). **Hero** joined the tag
+canon (13/20), applied from characters.is_hero. GM privacy upgraded from
+absence to LOCATION: `gm_char_forum` (config `gmcharforum`, SETUP_PLAN
+`gm-character-sheets` #18 under the GM category, inheriting its perms).
+ensureCharPage routes by role; a thread in the wrong forum after
+promotion/demotion is deleted and rebuilt where they belong. No GM forum
+set → absence, exactly as before.
+
+All-automatic on push (T): `forumSetupMigration` (`gm_forum_lock_1`) births
+gm-character-sheets under the GM category wherever it exists and locks the
+player forum staff-only (deny @everyone SendMessagesInThreads/Create*,
+allow gm_role_id; skipped with a log if no gm role — Discord cannot let a
+bot grant itself permissions). A sixth **notice** block ends every thread
+with T's exact wording ("…contact a Moderator or Expeditioner. Thank
+you!"); notice_msg_id joined char_pages. New-server arrival now audits the
+bot's own permissions and names anything missing in the greeting; existing
+servers are never audited unprompted — build:true remains their lever.
 
 ## 7l · Faces come from tags; the pipe retires (2026-08-12)
 

@@ -1075,9 +1075,27 @@ function testBuilders(src) {
     // The four-block thread: sheet event-live, the other three hourly and
     // hash-skipped so an unchanged block costs nothing — dice, the chatty
     // source, only ever lands on the sweep.
-    ok('the thread carries four bot blocks',
-      /charInvBody\(gid, uid\)/.test(src) && /charLoreBody\(gid, uid\)/.test(src) &&
-      /charRollsBody\(gid, uid\)/.test(src) && /ALTER TABLE char_pages ADD COLUMN rolls_msg_id/.test(src));
+ok('the thread carries six bot blocks — five living, one notice — in T\'s order',
+      /charStandingBody\(gid, uid\)/.test(src) &&
+      /for \(const key of \['inv', 'lore', 'standing', 'rolls', 'notice'\]\)/.test(src) &&
+      /contact a Moderator or Expeditioner\. Thank you!/.test(src) &&
+      /ALTER TABLE char_pages ADD COLUMN notice_msg_id/.test(src));
+    ok('the player forum is staff-typed, and the lock is honest about its needs',
+      /SendMessagesInThreads: false, CreatePublicThreads: false/.test(src) &&
+      /no gm role set/.test(src));
+    ok('arrival names any missing permissions — existing servers are never audited unprompted',
+      /const NEEDED = \['ManageChannels','ManageThreads','ManageRoles'/.test(src) &&
+      /Missing permissions:/.test(src));
+    ok('the GM forum births itself on push where the category exists',
+      /gm_forum_lock_1/.test(src) && /name: 'gm-character-sheets', type: 15, parent: cat\.id/.test(src) &&
+      /\[gm-forum\] VACUOUS/.test(src));
+    ok('GM sheets route to the GM forum, or stay private by absence',
+      /const forumId = gmUser \? \(getConfig\(gid\)\?\.gm_char_forum \?\? null\) : getConfig\(gid\)\?\.char_forum;/.test(src) &&
+      /gm-private/.test(src));
+    ok('a sheet in the wrong forum rebuilds where they now belong',
+      /if \(thread && thread\.parentId !== forum\.id\)[\s\S]{0,200}?Sheet moved between forums/.test(src));
+    ok('heroes wear the Hero tag',
+      /CHAR_TAG_HERO = 'Hero'/.test(src) && /if \(ch\?\.is_hero\)/.test(src));
     // The autorest clock advances IN the fired branch, before the announce.
     // Losing this line is a 10-minute announcement storm once any schedule
     // falls due — it already happened live.
