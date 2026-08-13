@@ -1039,8 +1039,10 @@ async function requireQuest(interaction, gid, forcedNumber = null) {
 // #014 and work out it's the same story.
 function questTag(quest) {
   const root = quest.instance_of ?? quest.number;
-  const seq = quest.instance_of ? `.${quest.run_seq ?? 2}` : '';
-  const label = quest.run_label ? ` · ${quest.run_label}` : '';
+  // A run's NAME already carries the whole convention — "<Quest> Run 001
+  // <GM>" — composed at launch, so no dot-suffix rides on top of it.
+  const seq = '';
+  const label = quest.run_label ? ` • ${quest.run_label}` : '';
   return `#${String(root).padStart(3, '0')}${seq}-${quest.name}${label}`;
 }
 // "12 Jan 2026" — for history timestamps (epoch ms)
@@ -5992,7 +5994,8 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('status').setDescription('Show current fight status'))
     .addSubcommand(s=>s.setName('log').setDescription('Re-post the recap of the last finished fight in this channel'))
     .addSubcommand(s=>s.setName('skip').setDescription('Skip the current turn without removing anyone (GM)'))
-    .addSubcommand(s=>s.setName('end').setDescription('End the fight (GM only)')),
+    .addSubcommand(s=>s.setName('end').setDescription('End the fight (GM only)')
+      .addBooleanOption(o=>o.setName('all').setDescription('true = end every active fight on the server').setRequired(false))),
 
   new SlashCommandBuilder()
     .setName('roll').setDescription('Roll dice — bare /roll is a flat 1d20; add a stat, notation, advantage or flavour')
@@ -6078,6 +6081,41 @@ const slashCommands = [
         .addStringOption(o=>o.setName('rank').setDescription('Rank to assign').setRequired(true).setAutocomplete(true)))
       .addSubcommand(s=>s.setName('eligible').setDescription('List players who meet a rank\'s threshold but don\'t hold it (GM)'))),
 
+  new SlashCommandBuilder()
+    .setName('instance').setDescription('Speak to one run of a quest by name \u2014 add, rally, note, pause, complete')
+    .addSubcommand(s=>s.setName('add').setDescription('Seat a player on this run')
+      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
+      .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+      .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true))
+      .addBooleanOption(o=>o.setName('force').setDescription('true = past a hard cap or the fallen').setRequired(false)))
+    .addSubcommand(s=>s.setName('kick').setDescription('Remove a member or applicant from this run')
+      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
+      .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+      .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('rally').setDescription('Ping this run\'s party in its thread')
+      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('message').setDescription('Said with the ping').setRequired(false))
+      .addBooleanOption(o=>o.setName('here').setDescription('true = rally here instead of the quest\'s thread').setRequired(false)))
+    .addSubcommand(s=>s.setName('note').setDescription("Mark something on this run's log")
+      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('text').setDescription('The note').setRequired(true))
+      .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('pause').setDescription('Stop this run\'s clock')
+      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('resume').setDescription('Start this run\'s clock again')
+      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('complete').setDescription('Complete this run \u2014 merits to its party')
+      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('show').setDescription('This run in full')
+      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('thread').setDescription('Open this run\'s thread if it lacks one')
+      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true))),
   new SlashCommandBuilder()
     .setName('quest').setDescription('Quest board — create, post, join and complete quests')
     .addSubcommand(s=>s.setName('create').setDescription('Create a quest — leave name blank for a writing window (GM)')
@@ -11551,6 +11589,23 @@ async function routeButton(interaction) {
       await announceStage(interaction.client, gid, fresh, `${S[1]} Stage → **${S[2]}** — <@${interaction.user.id}>.`);
       return;
     }
+    if (interaction.customId.startsWith('questlaunch:')) {
+      const gidL = interaction.guild.id;
+      if (!(await isGm(interaction.guild, interaction.user.id))) {
+        return interaction.reply({ ephemeral: true, content: '❌ Launching is the GM\'s hand.' });
+      }
+      const num = parseInt(interaction.customId.split(':')[1], 10);
+      const listing = getQuest(gidL, num);
+      if (!listing || listing.instance_of || !(getConfig(gidL)?.quest_spinoff ?? 0)) {
+        return interaction.reply({ ephemeral: true, content: '❌ This is not a launchable listing.' });
+      }
+      await interaction.deferReply();
+      const r = await launchListing(interaction, gidL, listing);
+      if (r.err) return interaction.editReply({ content: r.err });
+      return interaction.editReply({ content:
+        `🚀 **${questTag(r.born)}** launched — **${r.staged}** aboard.`
+        + (r.room ? ` ⚔ <#${r.room.id}>` : '') });
+    }
     if (interaction.customId.startsWith('questapply:') || interaction.customId.startsWith('questwithdraw:')) {
       return handleQuestButton(interaction);
     }
@@ -11587,6 +11642,24 @@ client.on('interactionCreate', async interaction => {
         })).catch(()=>{});
       }
 
+      // /instance name: the listings, shown as "Name · #012" with the
+      // NUMBER as the value, so twins can never ambiguate. run: that
+      // listing's runs newest-first, values are run_seq.
+      if (interaction.commandName === 'instance' && focusedOption.name === 'name') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        const ls = db.prepare('SELECT number, name FROM quests WHERE guild_id=? AND instance_of IS NULL').all(interaction.guild.id)
+          .filter(q => (q.name || '').toLowerCase().includes(v)).slice(0, 25)
+          .map(q => ({ name: `${q.name} · #${String(q.number).padStart(3, '0')}`.slice(0, 100), value: String(q.number) }));
+        return await interaction.respond(ls);
+      }
+      if (interaction.commandName === 'instance' && focusedOption.name === 'run') {
+        const picked = resolveListingByName(interaction.guild.id, interaction.options.getString('name') || '');
+        if (picked.err) return await interaction.respond([]);
+        const runs = db.prepare('SELECT number, run_seq, name, status FROM quests WHERE guild_id=? AND instance_of=? ORDER BY run_seq DESC')
+          .all(interaction.guild.id, picked.listing.number).slice(0, 25)
+          .map(r => ({ name: `Run ${String(r.run_seq).padStart(3, '0')} · #${String(r.number).padStart(3, '0')}${r.status === 'active' ? ' · active' : ''}`.slice(0, 100), value: r.run_seq }));
+        return await interaction.respond(runs);
+      }
       if (interaction.commandName === 'quest' && focusedOption.name === 'number') {
         const sub = interaction.options.getSubcommand(false);
         let quests = listQuests(interaction.guild.id);
@@ -12029,6 +12102,7 @@ client.on('interactionCreate', async interaction => {
       if (sg === 'merit') return await handleMerit(interaction);
       if (sg === 'rank') return await handleRank(interaction);
     }
+    if (interaction.commandName === 'instance') return await handleInstance(interaction);
     if (interaction.commandName === 'quest') return await handleQuest(interaction);
   } catch (err) {
     console.error(`[${interaction.commandName}] error:`, err);
@@ -12328,6 +12402,7 @@ async function clearGlobalCommands() {
   await clearGlobalCommands();
   startAutoRest(client);
   startQuestClock(client);
+  runRenameMigration(client).catch(err => console.error('[run-rename]', err?.message || err));
   startDocsWatch(client);
   client.login(process.env.DISCORD_TOKEN);
 })();
@@ -16793,24 +16868,44 @@ async function handleFight(interaction, forced) {
   // ── END (GM only) ──────────────────────────────────────────────────────────
   if (sub === 'end') {
     if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can end a fight.', ephemeral: true });
-    const fight = getFight(gid, cid);
-    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight to end.', ephemeral: true });
-    return requestConfirm(interaction, 'End the current fight? Turn order clears but HP states are preserved.', async () => {
-      const endRow = getFight(gid, cid);
+    // One closer serves both hands: archive, idle the row, release any dc
+    // binds still holding fighters in that channel, and post the recap
+    // where that fight lived.
+    const endOne = async (cid2, channel2, gmName) => {
+      const endRow = getFight(gid, cid2);
+      if (!endRow || endRow.state !== 'active') return false;
       const endLog = JSON.parse(endRow?.log_state || '{}');
       const endFloor = fightFloor(endRow);
       const endRoster = JSON.parse(endRow?.turn_order || '[]');
       const endHp = JSON.parse(endRow?.hp_state || '{}');
-      archiveFight(gid, cid, endLog, endRoster, endFloor);
-      upsertFight(gid, cid, { state: 'idle', turn_order: '[]' });
-      // The confirm reply is ephemeral — only the GM who pressed the button can
-      // see it. Post the real result to the channel so the table sees it too.
-      const gmName = await getDisplayName(interaction.guild, interaction.user.id);
-      await announceFightEnd(interaction.guild, gid, cid, chan, {
-        headline: `🛑 Called by **${gmName}** — no victor. HP states are preserved.`,
+      archiveFight(gid, cid2, endLog, endRoster, endFloor);
+      upsertFight(gid, cid2, { state: 'idle', turn_order: '[]' });
+      try { db.prepare('UPDATE dc_cards SET bind_channel=NULL, bind_uid=NULL, bind_skip=0 WHERE guild_id=? AND bind_channel=?').run(gid, cid2); } catch {}
+      await announceFightEnd(interaction.guild, gid, cid2, channel2, {
+        headline: `🏁 Called by **${gmName}** — no victor. HP states are preserved.`,
         log: endLog, roster: endRoster, hpState: endHp, floor: endFloor,
+      }).catch(() => {});
+      return true;
+    };
+    if (interaction.options?.getBoolean?.('all')) {
+      const rows = db.prepare("SELECT channel_id FROM fights WHERE guild_id=? AND state='active'").all(gid);
+      if (!rows.length) return interaction.reply({ content: '❌ No active fights anywhere on the server.', ephemeral: true });
+      return requestConfirm(interaction, `End **${rows.length}** active fight${rows.length === 1 ? '' : 's'} across the server? Turn orders clear; HP states are preserved.`, async () => {
+        const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+        let ended = 0;
+        for (const r of rows) {
+          const ch2 = await interaction.client.channels.fetch(r.channel_id).catch(() => null);
+          if (await endOne(r.channel_id, ch2, gmName)) ended++;
+        }
+        return `🏁 **${ended}** fight${ended === 1 ? '' : 's'} ended — recaps posted in their channels.`;
       });
-      return '✅ Fight ended — the result and recap have been posted in the channel.';
+    }
+    const fight = getFight(gid, cid);
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight to end.', ephemeral: true });
+    return requestConfirm(interaction, 'End the current fight? Turn order clears but HP states are preserved.', async () => {
+      const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+      await endOne(cid, chan, gmName);
+      return '🏁 Fight ended — the result and recap have been posted in the channel.';
     });
   }
 }
@@ -18999,6 +19094,13 @@ async function renderQuest(guild, quest, { applyHint = true } = {}) {
       .get(gid, quest.instance_of, quest.instance_of).c;
     lines.push(`_One of ${runs} separate runs of this adventure._`);
   }
+  // The listing's own ledger: how many runs it has birthed, how many stand
+  // staged for the next launch. A listing carries no clock — runs do.
+  if (!quest.instance_of && (getConfig(gid)?.quest_spinoff ?? 0)) {
+    const runsK = db.prepare('SELECT COUNT(*) AS c FROM quests WHERE guild_id=? AND instance_of=?').get(gid, quest.number).c;
+    const stagedN = getQuestMembers(gid, quest.number, 'party').length;
+    lines.push(`🚀 _Runs so far: **${runsK}** · Staged for next launch: **${stagedN}**_`);
+  }
   lines.push('─────────────────────────────');
   if (quest.lore) lines.push(`📖 *${quest.lore}*\n`);
   if (quest.objectives) lines.push(`🎯 **Objectives**\n${quest.objectives}\n`);
@@ -19031,11 +19133,18 @@ async function renderQuest(guild, quest, { applyHint = true } = {}) {
   return lines.join('\n');
 }
 
-function questApplyButton(number) {
+function questApplyButton(number, gid = null) {
+  // On a spin-off LISTING the GM's launch sits beside Apply, wearing the
+  // staged count. Instances and classic quests keep the plain pair.
   const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`questapply:${number}`).setLabel('Apply to Quest').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`questwithdraw:${number}`).setLabel('Withdraw').setStyle(ButtonStyle.Secondary),
+    ...(gid && (getConfig(gid)?.quest_spinoff ?? 0) && !(getQuest(gid, number)?.instance_of)
+      ? [new ButtonBuilder().setCustomId(`questlaunch:${number}`)
+          .setLabel(`🚀 Launch (${getQuestMembers(gid, number, 'party').length} staged)`)
+          .setStyle(ButtonStyle.Primary)]
+      : []),
   );
 }
 
@@ -19781,16 +19890,26 @@ function questJoinRow(number) {
 function nextRunSeq(gid, root) {
   const seqs = db.prepare('SELECT run_seq FROM quests WHERE guild_id=? AND instance_of=?').all(gid, root)
     .map(r => r.run_seq).filter(Number.isFinite);
-  return (seqs.length ? Math.max(...seqs) : 1) + 1;
+  // Under the staging model the listing is not a run, so the first launch
+  // is Run 001, not 002-with-an-invisible-first.
+  return (seqs.length ? Math.max(...seqs) : 0) + 1;
 }
 
 // Birth a run from a board quest: the writing is copied, the approved
 // player seated, everyone still waiting carried across so nobody loses
 // their place, and the board entry emptied for the next batch. Returns the
 // new quest, or null when the copy fails.
-async function spinOffRun(interaction, gid, root, approvedId) {
+async function spinOffRun(interaction, gid, root, approvedIds) {
+  // Once per-approval; now once per LAUNCH, carrying the whole staged
+  // group. The old trigger birthed a run for every approve press — two
+  // approvals, two half-empty instances, live on 2026-08-12.
+  const seats = Array.isArray(approvedIds) ? approvedIds : [approvedIds];
+  // The confirmed naming convention: "<Quest name> Run NNN <GM running>".
+  const seqNo = nextRunSeq(gid, root.instance_of ?? root.number);
+  const gmName = (interaction.member?.displayName ?? interaction.user.username ?? '').trim();
+  const runName = `${root.name} Run ${String(seqNo).padStart(3, '0')}${gmName ? ` ${gmName}` : ''}`.slice(0, 90);
   const number = createQuest(gid, {
-    name: root.name, objectives: root.objectives, lore: root.lore, details: root.details,
+    name: runName, objectives: root.objectives, lore: root.lore, details: root.details,
     rewards: root.rewards, merit_reward: root.merit_reward,
     party_size: root.party_size, party_hard: root.party_hard, created_by: interaction.user.id,
   });
@@ -19798,14 +19917,15 @@ async function spinOffRun(interaction, gid, root, approvedId) {
   const rootNum = root.instance_of ?? root.number;
   updateQuest(gid, number, {
     gm_id: interaction.user.id, gm_style: root.gm_style ?? null,
-    instance_of: rootNum, run_seq: nextRunSeq(gid, rootNum), stage: 'approved', stage_at: Date.now(),
+    instance_of: rootNum, run_seq: seqNo, stage: 'approved', stage_at: Date.now(),
   });
-  // The approved player takes their seat; everyone still waiting comes too.
-  setQuestMember(gid, number, approvedId, 'party');
-  const waiting = getQuestMembers(gid, root.number, 'applied').filter(id => id !== approvedId);
+  // The staged group takes its seats; anyone still merely applied comes
+  // along as an applicant of the run, so the DM can pull them in later.
+  for (const id of seats) setQuestMember(gid, number, id, 'party');
+  const waiting = getQuestMembers(gid, root.number, 'applied').filter(id => !seats.includes(id));
   for (const id of waiting) setQuestMember(gid, number, id, 'applied');
   // And the board is clean again — same entry, same number, no party.
-  for (const id of [...waiting, approvedId]) removeQuestMember(gid, root.number, id);
+  for (const id of [...waiting, ...seats]) removeQuestMember(gid, root.number, id);
   for (const id of getQuestMembers(gid, root.number)) removeQuestMember(gid, root.number, id);
   updateQuest(gid, root.number, { full_pinged: 0 });
 
@@ -19824,6 +19944,93 @@ async function spinOffRun(interaction, gid, root, approvedId) {
 
 // Enough hands. Said once per quest, in the planning thread, to whoever
 // holds it — approving the sixth of five shouldn't nag twice.
+// One-time christening of every run that predates the naming convention:
+// per adventure, runs renumber 001-up in birth order, names recompose as
+// "<Quest> Run NNN <GM>", and their threads are renamed to match. Behind a
+// meta flag so redeploys never touch names a GM has since hand-edited.
+async function runRenameMigration(client) {
+  try { if (db.prepare("SELECT 1 FROM meta WHERE k='run_rename_1'").get()) return; } catch {}
+  for (const [gid, guild] of client.guilds.cache) {
+    const runs = db.prepare('SELECT * FROM quests WHERE guild_id=? AND instance_of IS NOT NULL ORDER BY instance_of, rowid').all(gid);
+    let seq = 0, lastRoot = null;
+    for (const run of runs) {
+      if (run.instance_of !== lastRoot) { lastRoot = run.instance_of; seq = 0; }
+      seq += 1;
+      const root = getQuest(gid, run.instance_of);
+      if (!root) continue;
+      let gmName = '';
+      if (run.gm_id) {
+        const m = await guild.members.fetch(run.gm_id).catch(() => null);
+        gmName = m?.displayName ?? '';
+      }
+      const name = `${root.name} Run ${String(seq).padStart(3, '0')}${gmName ? ` ${gmName}` : ''}`.slice(0, 90);
+      db.prepare('UPDATE quests SET run_seq=?, name=? WHERE guild_id=? AND number=?').run(seq, name, gid, run.number);
+      if (run.run_thread_id) {
+        const th = await client.channels.fetch(run.run_thread_id).catch(() => null);
+        if (th?.isThread?.()) await th.setName(questTag(getQuest(gid, run.number)).slice(0, 100)).catch(() => {});
+      }
+      await syncQuestBook(client, guild, gid, getQuest(gid, run.number)).catch(() => {});
+    }
+  }
+  try { db.prepare("INSERT INTO meta (k, v) VALUES ('run_rename_1', '1')").run(); } catch {}
+}
+
+// /instance is an address translator, nothing more: resolve a listing by
+// name and a run by seq, then hand the interaction to handleQuest with the
+// run's number forced — the option names mirror /quest's own, so every
+// native read inside the real handlers keeps working. One brain, two ways
+// to address it; instance behaviour can never drift from quest behaviour.
+function resolveListingByName(gid, raw) {
+  const asNum = parseInt(raw, 10);
+  if (Number.isFinite(asNum) && String(asNum) === String(raw).trim()) {
+    const q = getQuest(gid, asNum);
+    if (q && !q.instance_of) return { listing: q };
+  }
+  const all = db.prepare('SELECT * FROM quests WHERE guild_id=? AND instance_of IS NULL').all(gid)
+    .filter(q => (q.name || '').toLowerCase() === String(raw).trim().toLowerCase());
+  if (all.length === 1) return { listing: all[0] };
+  if (all.length > 1) return { err: `❌ ${all.length} listings share that name — pick from the autocomplete.` };
+  return { err: `❌ No listing named **${raw}**.` };
+}
+function resolveRun(gid, listing, runSeq) {
+  if (runSeq != null) {
+    const q = db.prepare('SELECT * FROM quests WHERE guild_id=? AND instance_of=? AND run_seq=?')
+      .get(gid, listing.number, runSeq);
+    return q ? { run: q } : { err: `❌ **${listing.name}** has no Run ${String(runSeq).padStart(3, '0')}.` };
+  }
+  const runs = db.prepare('SELECT * FROM quests WHERE guild_id=? AND instance_of=? ORDER BY run_seq DESC').all(gid, listing.number);
+  if (!runs.length) return { err: `❌ **${listing.name}** has no runs yet — launch first.` };
+  return { run: runs.find(r => r.status === 'active') ?? runs[0] };
+}
+async function handleInstance(interaction) {
+  const gid = interaction.guild.id;
+  const sub = interaction.options.getSubcommand();
+  const L = resolveListingByName(gid, interaction.options.getString('name'));
+  if (L.err) return interaction.reply({ ephemeral: true, content: L.err });
+  const R = resolveRun(gid, L.listing, interaction.options.getInteger('run'));
+  if (R.err) return interaction.reply({ ephemeral: true, content: R.err });
+  const map = { add: 'approve' };
+  return handleQuest(interaction, { sub: map[sub] ?? sub, number: R.run.number });
+}
+
+// Launch: the GM's hand on a listing. Consumes the staged group into ONE
+// run — clone, seats, thread, clock — then the listing stands clean and
+// recruiting. Shared by /quest start on a listing and the 🚀 button.
+async function launchListing(interaction, gid, listing) {
+  const staged = getQuestMembers(gid, listing.number, 'party');
+  if (!staged.length) {
+    return { err: '❌ Nobody is staged yet — approve applicants first, then launch.' };
+  }
+  const born = await spinOffRun(interaction, gid, listing, staged);
+  if (!born) return { err: '❌ The run could not be created.' };
+  updateQuest(gid, born.quest.number, { status: 'active', started_at: Date.now(), elapsed_ms: 0 });
+  logQuestEvent(gid, born.quest.number, 'start', `Run launched — ${staged.length} on the party`, interaction.user.id);
+  const fresh = getQuest(gid, born.quest.number);
+  await questAnnounce(interaction.client, fresh, `⚔ **${questTag(fresh)} begins** — ${staged.length} on the party. The clock is running.`).catch(() => {});
+  await syncQuestBook(interaction.client, interaction.guild, gid, fresh).catch(() => {});
+  return { born: fresh, room: born.room, staged: staged.length };
+}
+
 // With spin-off ON this never fires for a BOARD quest, and shouldn't: the
 // board empties on every approval, so it can't fill. It fires for the runs
 // instead, which is where filling actually means something.
@@ -19956,7 +20163,7 @@ async function refreshQuestPost(client, guild, quest) {
     const ch = await client.channels.fetch(quest.post_channel_id);
     if (ch?.isThread?.() && ch.archived) await wakeThread(ch);
     const msg = await ch.messages.fetch(quest.post_message_id);
-    const components = quest.status === 'open' ? [questApplyButton(quest.number)] : [];
+    const components = quest.status === 'open' ? [questApplyButton(quest.number, guild.id)] : [];
     await msg.edit({ content: await renderQuest(guild, quest), components });
   } catch { /* message deleted or inaccessible — ignore */ }
 }
@@ -20207,7 +20414,7 @@ async function handleQuest(interaction, forced) {
             return interaction.reply({ content: `📌 **${questTag(quest)}** is ${quest.status === 'open' ? 'back on' : 'already on'} the board — <#${old.id}> (refreshed).`, ephemeral: true });
           }
         }
-        const components = quest.status === 'open' ? [questApplyButton(number)] : [];
+        const components = quest.status === 'open' ? [questApplyButton(number, gid)] : [];
         const thread = await forum.threads.create({ name: `#${number} — ${quest.name}`.slice(0, 100), autoArchiveDuration: 10080,
           message: { content: await renderQuest(interaction.guild, quest), components } });
         // A forum starter message shares its thread's id — the refresh plumbing
@@ -20224,7 +20431,7 @@ async function handleQuest(interaction, forced) {
     const channel = explicit ?? await interactionChannel(interaction);
     if (!channel) return interaction.reply({ content: '❌ I can\'t access that channel. Pick one explicitly with `channel:`.', ephemeral: true });
     if (!channel.isTextBased?.() && !channel.isThread?.()) return interaction.reply({ content: MSG_PICK_TEXT, ephemeral: true });
-    const components = quest.status === 'open' ? [questApplyButton(number)] : [];
+    const components = quest.status === 'open' ? [questApplyButton(number, gid)] : [];
     const msg = await channel.send({ content: await renderQuest(interaction.guild, quest), components });
     updateQuest(gid, number, { post_channel_id: channel.id, post_message_id: msg.id });
     return interaction.reply({ content: `📌 Posted **${questTag(quest)}** to <#${channel.id}>.`, ephemeral: true });
@@ -20255,21 +20462,19 @@ async function handleQuest(interaction, forced) {
         `🕯️ **${await getDisplayName(interaction.guild, target.id)}** has fallen. Bring them back with \`/gm revive\`, or re-run with \`force:true\` if they are joining as a ghost.` });
     }
     if (quest.party_size && quest.party_hard && party.length >= quest.party_size && !force) {
-      return interaction.reply({ content: `❌ Party is at the hard cap (${quest.party_size}). Re-run with \`force:true\` to override.`, ephemeral: true });
+      return interaction.reply({ content: `❌ Party is at the hard cap (${quest.party_size}). Re-run with \`force:true\` to seat them anyway.` });
     }
-    // With spin-off on, approving on a BOARD quest births its run instead of
-    // filling the board entry — the entry stays open for the next group.
-    if ((getConfig(gid)?.quest_spinoff ?? 0) && !quest.instance_of) {
-      const born = await spinOffRun(interaction, gid, quest, target.id);
-      if (born) {
-        const nm2 = await getDisplayName(interaction.guild, target.id);
-        return interaction.reply({ content:
-          `⚔️ **${questTag(born.quest)}** begins forming with **${nm2}** — you're its DM.`
-          + (born.room ? `\n🚪 Their thread: <#${born.room.id}> — others can ask to join with the button there.` : '')
-          + `\n📋 **${questTag(quest)}** is clear on the board for the next group.` });
-      }
-    }
+    // Approval STAGES, never births. The old block spun a run per approve
+    // press; the group now waits on the listing until the GM launches, and
+    // one launch carries them all.
     setQuestMember(gid, number, target.id, 'party');
+    if ((getConfig(gid)?.quest_spinoff ?? 0) && !quest.instance_of) {
+      const staged = getQuestMembers(gid, number, 'party').length;
+      const nm2 = await getDisplayName(interaction.guild, target.id);
+      await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, number));
+      return interaction.reply({ content:
+        `✅ **${nm2}** staged on **${questTag(quest)}** — **${staged}** waiting. 🚀 Launch when ready (button on the post, or \`/quest start number:${number}\`).` });
+    }
     // Whoever opens the door runs the room — unless a GM already holds it.
     let tookIt = false;
     if (!quest.gm_id) { updateQuest(gid, number, { gm_id: uid }); tookIt = true; }
@@ -20380,6 +20585,18 @@ async function handleQuest(interaction, forced) {
     const quest = await requireQuest(interaction, gid);
     if (!quest) return;
     const number = quest.number;
+    // Under spin-off, a board listing never starts ITSELF — starting it IS
+    // the launch: the staged group becomes one run with its own thread and
+    // clock, and the listing stands clean for the next wave.
+    if ((getConfig(gid)?.quest_spinoff ?? 0) && !quest.instance_of) {
+      await interaction.deferReply();
+      const r = await launchListing(interaction, gid, quest);
+      if (r.err) return interaction.editReply({ content: r.err });
+      return interaction.editReply({ content:
+        `🚀 **${questTag(r.born)}** launched — **${r.staged}** aboard.`
+        + (r.room ? ` ⚔ <#${r.room.id}>` : '')
+        + ` The listing is clear for the next wave.` });
+    }
     if (quest.status === 'completed') return interaction.reply({ content: '❌ That quest is already completed.', ephemeral: true });
     const party = getQuestMembers(gid, number, 'party');
     if (!party.length) return interaction.reply({ content: '❌ No party members yet — approve applicants first.', ephemeral: true });

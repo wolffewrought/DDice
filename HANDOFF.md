@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 702 assertions passed and no scanner found an ERROR.
+Green means 742 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 702 assertions covering structure, registration and ruleset
+now is 742 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -245,6 +245,44 @@ Also fixed there: the handler used to answer *every* image posted anywhere on
 the server with a warning when no bank was set, and then `return` — which
 swallowed the rest of `messageCreate` for any message carrying an attachment.
 It now stays silent outside the bank.
+
+## 7j · /instance — one brain, two addresses (2026-08-12)
+
+`/instance <verb> name: [run:] …` is a pure address translator: resolve the
+listing by name (autocomplete shows "Name · #012", value IS the number, so
+twins can't ambiguate; free-typed exact names accepted, ambiguity refused),
+resolve the run by `run_seq` (blank = latest ACTIVE, else latest, else
+"launch first"), then FORWARD into handleQuest with the run's number forced
+— option names mirror /quest's own (`user`, `text`, `message`, `here`,
+`force`) so the native reads inside the real handlers keep working. Verbs:
+add(→approve)/kick/rally/note/pause/resume/complete/show/thread; every GM
+gate is inherited, none reimplemented. Seventeen commands now; /instance
+registers under both rulesets. Run naming locked at launch:
+`<Quest name> Run 001 <GM display name>` (padded seq, first launch = 001,
+questTag drops its dot-suffix — the name carries the convention, and the
+thread wears it). A one-time christening (`meta.run_rename_1`, on ready)
+sweeps every pre-existing instance: per adventure, runs renumber 001-up in
+birth order, names recompose with the GM's display name, threads rename to
+match, and the quest book resyncs. `/fight end all:true` (GM, confirm-gated)
+ends every active fight on the server through the SAME closer as
+single-end; every ended channel also releases any dc binds still holding
+fighters there. Discord ordering rule bit once: required options must
+precede optional `run` in add/kick/note.
+
+## 7i · Listings stage; launches birth (confirmed revision, 2026-08-12)
+
+Under `questspinoff`, approving used to birth a run PER APPROVAL — two
+presses made two half-empty instances, live. The confirmed model:
+**apply → hands up · approve → staged on the listing · launch → one run.**
+`spinOffRun` now carries an array of seats; `launchListing` (shared by
+`/quest start` on a listing and the 🚀 button on its post, GM-gated,
+label wearing the staged count) clones once, seats the whole group, opens
+the thread with everyone mentioned in, starts the clone's clock, announces,
+and leaves the listing clean and recruiting — launch CONSUMES the stage.
+Un-approved applicants ride along as the run's applicants. Listings carry
+no clock and render their ledger: `Runs so far: K · Staged: N`. Spin-off
+OFF is untouched. `questApplyButton(number, gid)` grew the gid so the
+button can know what it sits on; all three callers pass it.
 
 ## 7h · Full cross-reference audit (2026-08-12)
 

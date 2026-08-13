@@ -965,7 +965,7 @@ function testBuilders(src) {
                      'help', 'library', 'npc', 'quest', 'quiz', 'roll', 'spell', 'standing']) {
       ok(`/${n} is registered`, !!by[n]);
     }
-    ok('sixteen commands registered', cmds.length === 16);
+    ok('seventeen commands registered — /instance joined 2026-08-12', cmds.length === 17);
     ok('no command registered twice', new Set(cmds.map(c => c.name)).size === cmds.length);
     ok('under the 100-command ceiling', cmds.length <= 100);
 
@@ -1015,6 +1015,58 @@ function testBuilders(src) {
     // meta flag (per-boot would refill spent pools, which is rest's job);
     // the heal grant only moves when the gate's own inputs do; and neither
     // rename nor delete can orphan a live fight's state keys.
+    // The staging revision (confirmed 2026-08-12): approval never births a
+    // run — the old per-approve spin made two half-empty instances from two
+    // presses, live. One launch consumes the whole staged group; both the
+    // typed and the button hand go through the same launchListing; and the
+    // listing wears its ledger. Losing any of these quietly reverts to
+    // instance-per-press.
+    // /instance: one brain, two addresses. The translator must FORWARD into
+    // handleQuest (never reimplement), value listings by NUMBER so name
+    // twins can't ambiguate, default to the latest ACTIVE run, and the run
+    // name must carry the whole convention — losing any of these forks the
+    // quest logic or misaddresses a GM's hand mid-play.
+    // The sweep hand and the christening: end-all runs through the SAME
+    // closer as single-end (a forked closer would archive differently),
+    // ended channels release their dc binds, and the migration renumbers
+    // 001-up behind its one-time flag with threads renamed to match.
+    ok('end-all and end share one closer',
+      /const endOne = async \(cid2, channel2, gmName\)/.test(src) &&
+      (src.match(/await endOne\(/g) || []).length === 2);
+    ok('an ended channel releases its dc binds',
+      /UPDATE dc_cards SET bind_channel=NULL, bind_uid=NULL, bind_skip=0 WHERE guild_id=\? AND bind_channel=\?/.test(src));
+    ok('the christening is one-time and renumbers from 001',
+      /run_rename_1/.test(src) && /if \(run\.instance_of !== lastRoot\) \{ lastRoot = run\.instance_of; seq = 0; \}/.test(src));
+    ok('christened threads wear the new tag',
+      /th\.setName\(questTag\(getQuest\(gid, run\.number\)\)\.slice\(0, 100\)\)/.test(src));
+
+    ok('/instance forwards into the quest brain',
+      /return handleQuest\(interaction, \{ sub: map\[sub\] \?\? sub, number: R\.run\.number \}\);/.test(src));
+    ok('add is approve wearing instance clothes', /const map = \{ add: 'approve' \};/.test(src));
+    ok('listing autocomplete values are numbers', /value: String\(q\.number\)/.test(src));
+    ok('a bare run means the latest active one',
+      /runs\.find\(r => r\.status === 'active'\) \?\? runs\[0\]/.test(src));
+    ok('runs are named by the full convention',
+      /const runName = `\$\{root\.name\} Run \$\{String\(seqNo\)\.padStart\(3, '0'\)\}/.test(src));
+    ok('the tag carries no dot-suffix on top of the name', /const seq = '';/.test(src));
+    ok('the first launch is Run 001', /return \(seqs\.length \? Math\.max\(\.\.\.seqs\) : 0\) \+ 1;/.test(src));
+
+    ok('approving never calls spinOffRun',
+      !/births its run instead of/.test(src) &&
+      /Approval STAGES, never births/.test(src));
+    ok('one launch carries the whole staged group',
+      /const born = await spinOffRun\(interaction, gid, listing, staged\);/.test(src) &&
+      /for \(const id of seats\) setQuestMember\(gid, number, id, 'party'\);/.test(src));
+    ok('start on a listing is the launch',
+      /quest_spinoff \?\? 0\) && !quest\.instance_of\) \{[\s\S]{0,220}?launchListing\(interaction, gid, quest\)/.test(src));
+    ok('the button and the command share one hand',
+      (src.match(/await launchListing\(/g) || []).length === 2 &&
+      /startsWith\('questlaunch:'\)/.test(src));
+    ok('the launch button wears the staged count',
+      /questlaunch:\$\{number\}/.test(src) && /Launch \(\$\{getQuestMembers\(gid, number, 'party'\)\.length\} staged\)/.test(src));
+    ok('the listing shows its ledger, never a clock',
+      /Runs so far: \*\*\$\{runsK\}\*\*/.test(src));
+
     ok('npcs really has the reroll pool column',
       /ALTER TABLE npcs ADD COLUMN rerolls_current INTEGER DEFAULT 0/.test(src));
     ok('the backfill is one-time, behind the meta flag',
