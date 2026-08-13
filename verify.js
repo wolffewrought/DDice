@@ -1049,9 +1049,15 @@ function testBuilders(src) {
       (src.match(/mirrorNpcSheet\(interaction\.client, gid, npcName\)\.catch/g) || []).length === 2);
     ok('a category rename renames the tag in place, keeping its id',
       /\? \{ \.\.\.t, name: to\.slice\(0, 20\) \} : t/.test(src));
-    ok('migrations announce success — silence was indistinguishable from failure',
-      /\[run-rename\] christened/.test(src) && /\[npc-threads\] \$\{made\} thread/.test(src) &&
-      /already done/.test(src));
+    ok('migrations announce success or confess vacuity, never sit silent',
+      /christened \$\{christened\}\/\$\{runsSeen\}/.test(src) &&
+      /\$\{made\}\/\$\{total\} thread/.test(src) &&
+      (src.match(/VACUOUS/g) || []).length >= 2 && /flag NOT set/.test(src));
+    ok('a vacuous run never sets its flag',
+      /if \(made > 0 \|\| total === 0\) \{/.test(src) &&
+      /if \(christened > 0 \|\| runsSeen === 0\) \{/.test(src));
+    ok('the mirror never edits a foreign thread',
+      /if \(thread && thread\.name !== name\.slice\(0, 100\)\) thread = null;/.test(src));
     ok('the recap survives departed fighters',
       /resolveFighter\(guild, gid, fid\)\.catch\(\(\) => null\)/.test(src) &&
       /A departed adventurer/.test(src));
@@ -1059,7 +1065,7 @@ function testBuilders(src) {
       /client\.once\('clientReady'[\s\S]{0,700}?runRenameMigration\(client\)[\s\S]{0,200}?npcThreadMigration\(client\)/.test(src) &&
       !/registerSlashCommands\(guildId\) \{[\s\S]{0,4000}?npcThreadMigration/.test(src));
     ok('the restructure migration is one-time',
-      /npc_threads_1/.test(src) && /DELETE FROM npc_pages WHERE guild_id=\? AND name=\?'\)\.run\(gid, npc\.name\)/.test(src));
+      /npc_threads_2/.test(src));
 
     ok('order:true prompts instead of applying',
       /gmorder:apply:\$\{interaction\.user\.id\}/.test(src) &&
@@ -1076,7 +1082,7 @@ function testBuilders(src) {
     ok('an ended channel releases its dc binds',
       /UPDATE dc_cards SET bind_channel=NULL, bind_uid=NULL, bind_skip=0 WHERE guild_id=\? AND bind_channel=\?/.test(src));
     ok('the christening is one-time and renumbers from 001',
-      /run_rename_1/.test(src) && /if \(run\.instance_of !== lastRoot\) \{ lastRoot = run\.instance_of; seq = 0; \}/.test(src));
+      /run_rename_2/.test(src) && /if \(run\.instance_of !== lastRoot\) \{ lastRoot = run\.instance_of; seq = 0; \}/.test(src));
     ok('christened threads wear the new tag',
       /th\.setName\(questTag\(getQuest\(gid, run\.number\)\)\.slice\(0, 100\)\)/.test(src));
 
