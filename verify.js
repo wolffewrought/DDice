@@ -1049,6 +1049,9 @@ function testBuilders(src) {
       (src.match(/mirrorNpcSheet\(interaction\.client, gid, npcName\)\.catch/g) || []).length === 2);
     ok('a category rename renames the tag in place, keeping its id',
       /\? \{ \.\.\.t, name: to\.slice\(0, 20\) \} : t/.test(src));
+    ok('both migrations live in the ready handler, not in registration',
+      /client\.on\('ready'[\s\S]{0,600}?runRenameMigration\(client\)[\s\S]{0,200}?npcThreadMigration\(client\)/.test(src) &&
+      !/registerSlashCommands\(guildId\) \{[\s\S]{0,4000}?npcThreadMigration/.test(src));
     ok('the restructure migration is one-time',
       /npc_threads_1/.test(src) && /DELETE FROM npc_pages WHERE guild_id=\? AND name=\?'\)\.run\(gid, npc\.name\)/.test(src));
 

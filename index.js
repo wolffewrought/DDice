@@ -11521,6 +11521,10 @@ client.on('ready', async () => {
   for (const guild of client.guilds.cache.values()) {
     await registerSlashCommands(guild.id).catch(console.error);
   }
+  // One-time reshapes run here, in the room actually named ready — not
+  // riding registration, where they first landed by a bad anchor.
+  runRenameMigration(client).catch(err => console.error('[run-rename]', err?.message || err));
+  npcThreadMigration(client).catch(err => console.error('[npc-threads]', err?.message || err));
   startBackupScheduler();
   console.log('✅ Backup scheduler started');
 });
@@ -12440,8 +12444,6 @@ async function clearGlobalCommands() {
   await clearGlobalCommands();
   startAutoRest(client);
   startQuestClock(client);
-  runRenameMigration(client).catch(err => console.error('[run-rename]', err?.message || err));
-  npcThreadMigration(client).catch(err => console.error('[npc-threads]', err?.message || err));
   startDocsWatch(client);
   client.login(process.env.DISCORD_TOKEN);
 })();

@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 751 assertions passed and no scanner found an ERROR.
+Green means 752 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 751 assertions covering structure, registration and ruleset
+now is 752 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -262,6 +262,15 @@ in BOTH places per T: /help npc section gained a Faces block; the PDF
 'One Face for a Whole Order' section rewrote to tags-first. Deprecation
 note: an NPC whose only shared-face claim was their pipe-name goes blank
 until tagged or ordered.
+
+Placement postmortem: both one-time migrations were first hooked beside
+`startQuestClock(client)` on the assumption it sat in the ready handler —
+it sits inside `registerSlashCommands`, so they rode registration
+(flag-guarded, harmless, wrong). Rehomed into the real `client.on('ready')`
+after the registration loop; pinned there. `startQuestClock`'s own odd home
+is pre-existing and untouched. Cleanup is deliberately reachable by hand
+too: `/gm check build:true` sweeps recorded pages-forum category threads
+and mirrors every NPC, so a hiccuped migration is never a dead end.
 
 ## 7k · Pages forum: one NPC, one thread, tags that filter (2026-08-12)
 
