@@ -1030,6 +1030,37 @@ function testBuilders(src) {
     // closer as single-end (a forked closer would archive differently),
     // ended channels release their dc binds, and the migration renumbers
     // 001-up behind its one-time flag with threads renamed to match.
+    // The order diagnostic asks before it sorts: apply is a button press
+    // away, keep-mode goes through the observer twin that never edits, and
+    // only the prompt's owner (a GM) can choose. Losing the prompt returns
+    // us to silently stomping hand-arranged servers.
+    // The pages forum restructure: one NPC = one thread, categories ride as
+    // that thread's tags (Discord's filter needs tags ON threads — the old
+    // NPC-as-message shape could never be filtered). The mirror creates,
+    // renames, retags and edits in place; the migration is one-time; rename
+    // keeps the tag id so wearers follow free.
+    ok('the mirror builds one thread per NPC with category tags',
+      /forum\.threads\.create\(\{\s*\n\s*name: name\.slice\(0, 100\),[\s\S]{0,200}?appliedTags: applied,/.test(src));
+    ok('applied tags cap at five, categories at twenty',
+      /\.slice\(0, 5\);/.test(src) && /getCategories\(gid\)\.slice\(0, 20\)/.test(src));
+    ok('the mirror keeps thread name and tags in step',
+      /thread\.setName\(name\.slice\(0, 100\)\)/.test(src) && /thread\.setAppliedTags\(applied\)/.test(src));
+    ok('assign and remove resync on the spot',
+      (src.match(/mirrorNpcSheet\(interaction\.client, gid, npcName\)\.catch/g) || []).length === 2);
+    ok('a category rename renames the tag in place, keeping its id',
+      /\? \{ \.\.\.t, name: to\.slice\(0, 20\) \} : t/.test(src));
+    ok('the restructure migration is one-time',
+      /npc_threads_1/.test(src) && /DELETE FROM npc_pages WHERE guild_id=\? AND name=\?'\)\.run\(gid, npc\.name\)/.test(src));
+
+    ok('order:true prompts instead of applying',
+      /gmorder:apply:\$\{interaction\.user\.id\}/.test(src) &&
+      !/getBoolean\?\.\('order'\)\) return runOrderReport/.test(src));
+    ok('keep-mode observes and never edits',
+      /async function observeSidebarOrder\(guild, entries\)/.test(src) &&
+      !/observeSidebarOrder[\s\S]{0,600}?\.edit\(/.test(src.slice(src.indexOf('function observeSidebarOrder'), src.indexOf('async function applySidebarOrder'))));
+    ok('the prompt belongs to its GM alone',
+      /interaction\.user\.id !== owner/.test(src));
+
     ok('end-all and end share one closer',
       /const endOne = async \(cid2, channel2, gmName\)/.test(src) &&
       (src.match(/await endOne\(/g) || []).length === 2);
@@ -1434,11 +1465,18 @@ function testPins(src) {
     // who already spoke keep stale blank webhooks after one is.
     ok('order membership counts the sheet, not just pipe names',
       /add\(n\.order_name \|\| npcOrderOf\(n\.name\)\);/.test(src));
-    ok('setting an order face refreshes every wearer',
-      /const worn = \(n\.order_name \|\| npcOrderOf\(n\.name\) \|\| ''\)\.toLowerCase\(\);/.test(src));
+    // (superseded: one wearer-refresh serves orders AND categories — pinned above)/.test(src));
 
-    ok('the order face is read from the sheet before the name',
-      /npc\.image_url\s*\n?\s*\?\? getOrderImage\(gid, npc\.order_name\)\s*\n?\s*\?\? getOrderImage\(gid, npcOrderOf\(npc\.name\)\)/.test(src));
+    // (superseded 2026-08-12: the pipe tier is gone — see the shared-face pins)
+    ok('the shared-face chain is order, then categories, never the name',
+      /if \(npc\.order_name && getOrderImage\(gid, npc\.order_name\)\) return npc\.order_name;/.test(src) &&
+      /for \(const cat of getCategoriesForNpc\(gid, npc\.name\)\)/.test(src) &&
+      !/getOrderImage\(gid, npcOrderOf\(npc\.name\)\)/.test(src));
+    ok('a bare category caption sets a shared face through the same store',
+      /const catMatch = getCategories\(gidF\)\.find\(c => c\.toLowerCase\(\) === npcName\.toLowerCase\(\)\)/.test(src) &&
+      /setOrderImage\(gidF, label,/.test(src));
+    ok('setting a shared face refreshes exactly its wearers',
+      /sharedFaceLabelFor\(gidF, n\) === label/.test(src));
     ok('the face travels in the export payload',
       /image: npc\.image_url \|\| null \};/.test(src) && /\.\.\.\(imp\.image \? \{ image_url: imp\.image \} : \{\}\)/.test(src));
     ok('an imported face must be a Discord CDN attachment',
@@ -1508,8 +1546,8 @@ function testPins(src) {
       /async function applySidebarOrder\(guild, entries\)/.test(src) &&
       /await applySidebarOrder\(guild, sidebar\)/.test(src) &&
       /await applySidebarOrder\(guild, entries\)/.test(src));
-    ok('every edit is verified against a forced refetch',
-      (src.match(/fetch\(w\.id, \{ force: true \}\)/g) || []).length === 2);
+    ok('every edit is verified against a forced refetch — and the observer force-fetches too',
+      (src.match(/fetch\(w\.id, \{ force: true \}\)/g) || []).length === 3);
     ok('refused edits are counted and surfaced, not swallowed',
       /if \(ord\.refused\) lines\.push/.test(src));
     ok('the diagnostic shows per-type raw sequences',
@@ -1551,7 +1589,7 @@ function testPins(src) {
     ok('a new category opens its portrait thread at once',
       /createCategory\(gid, name\);[\s\S]{0,300}?ensurePortraitThreads\(interaction\.client, gid\)/.test(src));
     ok('the rebuild mirrors the portrait forum too',
-      /async function rebuildNpcForum\([\s\S]{0,1800}?await ensurePortraitThreads\(client, gid\)/.test(src));
+      /async function rebuildNpcForum\([\s\S]{0,2600}?await ensurePortraitThreads\(client, gid\)/.test(src));
     // Deleting a category must not strand its threads. The sweep closes the
     // thread in BOTH forums, drops both mappings, and re-homes every NPC that
     // lived there — reading the orphan list BEFORE the membership rows go,
@@ -1572,11 +1610,11 @@ function testPins(src) {
 
     ok('portrait mirroring skips a non-forum bank',
       /async function ensurePortraitThreads\([\s\S]{0,400}?forum\.type !== 15\) return 0;/.test(src));
-    ok('a moved NPC leaves their old thread first',
-      /if \(row\?\.thread_id && row\.thread_id !== thread\.id\)[\s\S]{0,400}?msg\.delete\(\)/.test(src));
-    ok('deleting an NPC removes their entry, not the thread',
-      /function deleteNpc\([\s\S]{0,700}?msg\.delete\(\)/.test(src) &&
-      !/function deleteNpc\([\s\S]{0,700}?th\.delete\('NPC deleted'\)/.test(src));
+// (retired 2026-08-12: NPCs no longer move between threads — the thread is
+    // theirs for life, renamed and retagged in place by the mirror.)
+// (inverted 2026-08-12: the thread IS the page now — see the per-NPC pins)
+    ok('deleting an NPC deletes their thread',
+      /Their thread IS their page now/.test(src) && /await th\.delete\(\)\.catch/.test(src));
     // The rebuild must not clear npc_pages before rewriting. It did once:
     // every NPC then looked new, so a second run posted a fresh entry beside
     // the existing one and orphaned it — the whole forum duplicated on the

@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 742 assertions passed and no scanner found an ERROR.
+Green means 751 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 742 assertions covering structure, registration and ruleset
+now is 751 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -246,6 +246,42 @@ the server with a warning when no bank was set, and then `return` — which
 swallowed the rest of `messageCreate` for any message carrying an attachment.
 It now stays silent outside the bank.
 
+## 7l · Faces come from tags; the pipe retires (2026-08-12)
+
+`sharedFaceLabelFor(gid, npc)`: sheet ORDER first (if it has a face), then
+their assigned CATEGORIES in assignment order, first with a face wins;
+`npcFace` = personal ?? that label's image. The `Order | Name` pipe tier is
+deleted from the chain, the membership counters, the wearer-refresh loops
+and the show line — a pipe in a name is just a name. Bare-caption uploads
+now set CATEGORY faces through the same store (`npc_orders`, label-keyed):
+order-membership checked first (the nine colours outrank a same-named
+category), category members gate otherwise, and the refresh loop is
+unified: everyone whose resolved label matches, personal faces untouched.
+Unmatched captions refuse plainly without teaching the pipe. Docs updated
+in BOTH places per T: /help npc section gained a Faces block; the PDF
+'One Face for a Whole Order' section rewrote to tags-first. Deprecation
+note: an NPC whose only shared-face claim was their pipe-name goes blank
+until tagged or ordered.
+
+## 7k · Pages forum: one NPC, one thread, tags that filter (2026-08-12)
+
+Discord tags stick to THREADS, so the old shape (thread per category, NPC
+as a message) could never be tag-filtered. Restructure: the pages forum
+holds one thread per NPC — thread name = NPC name, starter message = the
+sheet (a forum starter shares its thread's id), appliedTags = their
+categories (∩ forum tags, ≤5; forum carries ≤20 category tags via
+ensureNpcTags, orders deliberately untagged). mirrorNpcSheet is the single
+choke: creates the thread, edits the sheet in place, keeps name and tags in
+step; assign/remove re-mirror on the spot; delete deletes the thread;
+category rename renames the TAG in place (id kept — wearers follow free);
+category delete retires the tag (Discord strips it from threads).
+`npc_threads_1` migration on ready: per NPC, clear the stale npc_pages row
+(it points into a category thread) then mirror; then the old pages-forum
+category/order threads are deleted and npc_category_threads cleared. The
+PORTRAIT forum is untouched — categories, coloured orders, captions all as
+before. npc_category_threads lives on portrait-side only. Retired pin:
+"a moved NPC leaves their old thread first" — nobody moves any more.
+
 ## 7j · /instance — one brain, two addresses (2026-08-12)
 
 `/instance <verb> name: [run:] …` is a pure address translator: resolve the
@@ -266,7 +302,15 @@ birth order, names recompose with the GM's display name, threads rename to
 match, and the quest book resyncs. `/fight end all:true` (GM, confirm-gated)
 ends every active fight on the server through the SAME closer as
 single-end; every ended channel also releases any dc binds still holding
-fighters there. Discord ordering rule bit once: required options must
+fighters there.
+
+`/gm check order:true` now ASKS before it sorts: two buttons, owner-locked
+to the GM who ran it — Apply plan order (the old behaviour, then report) or
+Keep my layout (report only, via `observeSidebarOrder`, the applier's
+observer twin that force-fetches the same entries and speaks the same
+report language but never edits a channel). Hand-arranged servers are a
+choice the bot respects; `build:true`/`restart:true` still position by
+design. Discord ordering rule bit once: required options must
 precede optional `run` in add/kick/note.
 
 ## 7i · Listings stage; launches birth (confirmed revision, 2026-08-12)

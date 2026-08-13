@@ -3104,13 +3104,11 @@ function deleteNpc(gid, name) {
   // category, not to any one NPC, and other NPCs are still in it.
   (async () => {
     try {
-      const row = db.prepare('SELECT thread_id, message_id FROM npc_pages WHERE guild_id=? AND name=?').get(gid, name);
-      if (row?.thread_id && row?.message_id) {
-        const th = await client.channels.fetch(row.thread_id).catch(() => null);
-        if (th?.isThread?.()) {
-          const msg = await th.messages.fetch(row.message_id).catch(() => null);
-          if (msg) await msg.delete().catch(() => {});
-        }
+      // Their thread IS their page now — it goes with them.
+      const row = db.prepare('SELECT thread_id FROM npc_pages WHERE guild_id=? AND name=?').get(gid, name);
+      if (row?.thread_id) {
+        const th = await interaction.client.channels.fetch(row.thread_id).catch(() => null);
+        if (th?.isThread?.()) await th.delete().catch(() => {});
       }
       db.prepare('DELETE FROM npc_pages WHERE guild_id=? AND name=?').run(gid, name);
     } catch (err) { console.error('[npcforum] page sweep -', err?.message || err); }
@@ -3163,12 +3161,23 @@ function ordersWithMembers(gid) {
 // pipe in the name, which covers ad-hoc says that never had a sheet. The
 // original read the name alone, so a plain-named White Knight never
 // inherited the White Knight face at all.
+// Which shared-face label this NPC wears, if any: their sheet ORDER
+// first, then their assigned CATEGORIES in assignment order, first one
+// with a face wins. The name-pipe tier is gone — "Merchant | Garrick" is
+// just a name now; tags are the truth the pipe used to fake.
+function sharedFaceLabelFor(gid, npc) {
+  if (!npc) return null;
+  if (npc.order_name && getOrderImage(gid, npc.order_name)) return npc.order_name;
+  for (const cat of getCategoriesForNpc(gid, npc.name)) {
+    if (getOrderImage(gid, cat)) return cat;
+  }
+  return null;
+}
 function npcFace(gid, npc) {
   if (!npc) return null;
-  return npc.image_url
-    ?? getOrderImage(gid, npc.order_name)
-    ?? getOrderImage(gid, npcOrderOf(npc.name))
-    ?? null;
+  if (npc.image_url) return npc.image_url;
+  const label = sharedFaceLabelFor(gid, npc);
+  return label ? getOrderImage(gid, label) : null;
 }
 
 function setNpcImage(gid, name, url) {
@@ -7102,8 +7111,8 @@ async function handleGmTest(interaction) {
       await ensurePortraitThreads(interaction.client, gid).catch(() => 0);
       const forum = await interaction.client.channels.fetch(getConfig(gid).npc_forum).catch(() => null);
       const tagMap = forum ? await ensureNpcTags(forum, gid) : {};
-      if (forum) for (const cat of [A, B]) await ensureCategoryThread(interaction.client, forum, gid, cat, tagMap, 'pages').catch(() => null);
-      step('category threads open in the page forum', !!threadOf('npc_category_threads', A) && !!threadOf('npc_category_threads', B));
+      if (forum) await ensureNpcTags(forum, gid);
+      step('categories exist as page-forum tags', !forum || (forum.availableTags || (await forum.fetch().catch(() => forum)).availableTags || []).some(t => t.name === A.slice(0, 20)));
       step('and in the portrait forum \u2014 if one is set', !getConfig(gid)?.npc_channel_id
         || (!!threadOf('npc_portrait_threads', A) && !!threadOf('npc_portrait_threads', B)));
 
@@ -10323,7 +10332,7 @@ const SETUP_PLAN = [
   { key: 'npc_forum',             name: 'npc-pages',        forum: true,  gm: true,  essential: true,
     about: 'A thread per category, every NPC in it an entry inside — filter the sidebar to sort them.' },
   { key: 'npc_channel_id',        name: 'npc-portraits',    forum: true,  gm: true,  essential: true,
-    about: 'A thread per category, mirroring npc-pages. Post a picture captioned with an NPC\'s name.' },
+    about: 'A thread per category, mirroring npc-pages. Caption an NPC\'s exact name for their face, or a bare order/category name for a shared one.' },
   { key: 'quest_plan_forum',      name: 'quest-planning',   forum: true,  gm: true,  essential: true,
     about: 'The pipeline books — concept, awaiting, approved, in progress, DMs, archived, completed.' },
   { key: 'quest_thread_forum',    name: 'quest-threads',    forum: true,  gm: true,  essential: true,
@@ -10507,42 +10516,43 @@ async function mirrorNpcSheet(client, gid, name) {
   const forum = await client.channels.fetch(forumId).catch(() => null);
   if (!forum || forum.type !== 15) return null;
 
+  // One NPC, one thread: the thread IS the page, its tags ARE the
+  // categories, and Discord's own tag filter does the searching. The old
+  // shape (thread per category, NPC as a message) could never be filtered
+  // — tags stick to threads, never to messages.
   const tagMap = await ensureNpcTags(forum, gid);
-  const thread = await ensureCategoryThread(client, forum, gid, npcHomeCategory(gid, name), tagMap);
-  if (!thread) return null;
-
+  const cats = getCategoriesForNpc(gid, name);
+  const applied = cats.map(c => tagMap[c.toLowerCase()]).filter(Boolean).slice(0, 5);
   const body = npcPageBody(gid, npc);
+
   let row = null;
   try { row = db.prepare('SELECT * FROM npc_pages WHERE guild_id=? AND name=?').get(gid, name); } catch {}
+  let thread = row?.thread_id ? await client.channels.fetch(row.thread_id).catch(() => null) : null;
+  if (thread && !thread.isThread?.()) thread = null;
 
-  // Their home category changed. Take the old entry down first, or they
-  // stand in two threads at once and one of them is wrong.
-  if (row?.thread_id && row.thread_id !== thread.id) {
-    if (row.message_id) {
-      const old = await client.channels.fetch(row.thread_id).catch(() => null);
-      if (old?.isThread?.()) {
-        const msg = await old.messages.fetch(row.message_id).catch(() => null);
-        if (msg) await msg.delete().catch(() => {});
-      }
-    }
-    row = null;
+  if (!thread) {
+    thread = await forum.threads.create({
+      name: name.slice(0, 100),
+      message: { content: body, allowedMentions: { parse: [] } },
+      appliedTags: applied,
+    }).catch(() => null);
+    if (!thread) return null;
+    // A forum starter message shares its thread's id.
+    db.prepare(`INSERT INTO npc_pages (guild_id, name, thread_id, message_id, at) VALUES (?,?,?,?,?)
+                ON CONFLICT(guild_id, name) DO UPDATE SET thread_id=excluded.thread_id,
+                  message_id=excluded.message_id, at=excluded.at`)
+      .run(gid, name, thread.id, thread.id, Date.now());
+    return thread;
   }
 
-  if (row?.message_id) {
-    await wakeThread(thread);
-    const msg = await thread.messages.fetch(row.message_id).catch(() => null);
-    if (msg) {
-      await msg.edit({ content: body, allowedMentions: { parse: [] } }).catch(() => {});
-      return thread;
-    }
-    // The entry was deleted by hand — post a fresh one below.
-  }
+  await wakeThread(thread);
+  if (thread.name !== name.slice(0, 100)) await thread.setName(name.slice(0, 100)).catch(() => {});
+  const haveTags = [...(thread.appliedTags || [])].sort().join(',');
+  if (haveTags !== [...applied].sort().join(',')) await thread.setAppliedTags(applied).catch(() => {});
+  const msg = await thread.messages.fetch(row.message_id || thread.id).catch(() => null);
+  if (msg) { await msg.edit({ content: body, allowedMentions: { parse: [] } }).catch(() => {}); return thread; }
   const m = await thread.send({ content: body, allowedMentions: { parse: [] } }).catch(() => null);
-  if (!m) return thread;
-  db.prepare(`INSERT INTO npc_pages (guild_id, name, thread_id, message_id, at) VALUES (?,?,?,?,?)
-              ON CONFLICT(guild_id, name) DO UPDATE SET thread_id=excluded.thread_id,
-                message_id=excluded.message_id, at=excluded.at`)
-    .run(gid, name, thread.id, m.id, Date.now());
+  if (m) db.prepare('UPDATE npc_pages SET message_id=?, at=? WHERE guild_id=? AND name=?').run(m.id, Date.now(), gid, name);
   return thread;
 }
 
@@ -10582,12 +10592,16 @@ async function rebuildNpcForum(client, gid) {
   const before = db.prepare('SELECT DISTINCT thread_id FROM npc_pages WHERE guild_id=? AND thread_id IS NOT NULL')
     .all(gid).map(r => r.thread_id);
 
-  // Every category and order thread exists before the roster walk, so a
-  // colour with no NPCs yet still shows its (empty) thread in both forums.
+  // Per-NPC threads now: tags exist for every category, then the roster
+  // walk gives each NPC their thread. Category threads in THIS forum are a
+  // retired shape — any still recorded are closed below; the portrait
+  // forum keeps its category/order threads untouched.
+  try { await ensureNpcTags(forum, gid); } catch {}
   try {
-    const tagMap = await ensureNpcTags(forum, gid);
-    for (const cat of [...new Set([...getCategories(gid), ...knownOrders(gid), NPC_NO_CATEGORY])]) {
-      await ensureCategoryThread(client, forum, gid, cat, tagMap, 'pages').catch(() => null);
+    for (const r of db.prepare('SELECT category, thread_id FROM npc_category_threads WHERE guild_id=?').all(gid)) {
+      const th = await client.channels.fetch(r.thread_id).catch(() => null);
+      if (th?.isThread?.() && th.parentId === forum.id) await th.delete().catch(() => {});
+      if (th?.parentId === forum.id || !th) db.prepare('DELETE FROM npc_category_threads WHERE guild_id=? AND category=?').run(gid, r.category);
     }
   } catch {}
 
@@ -11126,7 +11140,17 @@ async function handleCheck(interaction) {
   // `run:true` builds whatever the code knows about and this server hasn't
   // got yet — the one switch to pull after an update adds a book.
   if (interaction.options?.getBoolean?.('portraits')) return runPortraitMigration(interaction);
-  if (interaction.options?.getBoolean?.('order')) return runOrderReport(interaction);
+  if (interaction.options?.getBoolean?.('order')) {
+    // A hand-arranged server is a choice the bot must respect: the
+    // diagnostic ASKS before it sorts. Keep = report only, touch nothing.
+    const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+    return interaction.reply({ ephemeral: true,
+      content: '⚙️ Sidebar diagnostic — how should it run?\n• **Apply plan order** repositions the DDice channels to the setup plan, then reports.\n• **Keep my layout** touches nothing and just reports the current sequences.',
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`gmorder:apply:${interaction.user.id}`).setLabel('Apply plan order').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`gmorder:keep:${interaction.user.id}`).setLabel('Keep my layout — report only').setStyle(ButtonStyle.Secondary),
+      )] });
+  }
   if (interaction.options?.getBoolean?.('restart')) return runFullRestart(interaction);
   if (interaction.options?.getBoolean?.('build')) return runFullSetup(interaction);
   if (interaction.options?.getBoolean?.('run')) return runSetupRepair(interaction);
@@ -11588,6 +11612,16 @@ async function routeButton(interaction) {
       const S = QUEST_STAGES.find(([k]) => k === next);
       await announceStage(interaction.client, gid, fresh, `${S[1]} Stage → **${S[2]}** — <@${interaction.user.id}>.`);
       return;
+    }
+    if (interaction.customId.startsWith('gmorder:')) {
+      const [, choice, owner] = interaction.customId.split(':');
+      if (interaction.user.id !== owner) {
+        return interaction.reply({ ephemeral: true, content: '❌ This prompt belongs to whoever ran the check.' });
+      }
+      if (!(await isGm(interaction.guild, interaction.user.id))) {
+        return interaction.reply({ ephemeral: true, content: '❌ GMs only.' });
+      }
+      return runOrderReport(interaction, choice === 'keep' ? 'keep' : 'apply');
     }
     if (interaction.customId.startsWith('questlaunch:')) {
       const gidL = interaction.guild.id;
@@ -12189,28 +12223,32 @@ client.on('messageCreate', async message => {
       }
       const npc = getNpc(message.guild.id, npcName);
       if (!npc) {
-        // Not an NPC — but it may be an ORDER: everyone written
-        // "Black Knight | Someone" wears the face posted as "Black Knight".
-        const orders = ordersWithMembers(message.guild.id);
-        const members = orders.get(npcName.toLowerCase()) ?? 0;
-        if (members) {
-          setOrderImage(message.guild.id, npcName, message.attachments.first().url, message.author.id);
-          for (const n of getAllNpcs(message.guild.id)) {
-            // Everyone the wear-chain dresses in this face gets fresh
-            // webhooks — sheet order first, name prefix second, personal
-            // faces left alone — or the knights who already spoke somewhere
-            // keep their stale blank avatars there.
-            const worn = (n.order_name || npcOrderOf(n.name) || '').toLowerCase();
-            if (worn === npcName.toLowerCase() && !n.image_url) {
-              clearNpcWebhooks(message.guild.id, n.name);
+        // Not an NPC's exact name — a bare ORDER or CATEGORY label sets the
+        // shared face every wearer without a portrait of their own puts on.
+        // Orders checked first (the nine colours outrank a category that
+        // happens to share a name); membership gates the set either way.
+        const gidF = message.guild.id;
+        const orderMembers = ordersWithMembers(gidF).get(npcName.toLowerCase()) ?? 0;
+        const catMatch = getCategories(gidF).find(c => c.toLowerCase() === npcName.toLowerCase());
+        const catMembers = catMatch
+          ? db.prepare('SELECT COUNT(*) AS c FROM npc_category_members WHERE guild_id=? AND category=?').get(gidF, catMatch).c
+          : 0;
+        const label = orderMembers ? npcName : (catMembers ? catMatch : null);
+        if (label) {
+          setOrderImage(gidF, label, message.attachments.first().url, message.author.id);
+          // Everyone the chain now dresses in this face gets fresh
+          // webhooks; personal faces are never touched.
+          let worn = 0;
+          for (const n of getAllNpcs(gidF)) {
+            if (!n.image_url && sharedFaceLabelFor(gidF, n) === label) {
+              clearNpcWebhooks(gidF, n.name); worn++;
             }
           }
-          message.react('✅').catch(()=>{});
-          await message.reply('✅ Order face set for **' + npcName + '** — worn by ' + members + ' NPC' + (members === 1 ? '' : 's') + ' of that order without a face of their own.').catch(()=>{});
+          await message.reply(`✅ ${orderMembers ? 'Order' : 'Category'} face set for **${label}** — worn by ${worn} NPC${worn === 1 ? '' : 's'} without a face of their own.`).catch(() => {});
           return;
         }
-        console.error(`[npcimg] no NPC named "${npcName}" in guild ${message.guild.id}`);
-        await message.reply('⚠️ No NPC named **' + npcName + '** on this server, and none is written `' + npcName + ' | Name` either. Create one with `/npc create name:' + npcName + '`, or name your knights `' + npcName + ' | Their Name` to make this an order face.').catch(()=>{});
+        console.error(`[npcimg] no match for caption "${npcName}" in guild ${message.guild.id}`);
+        await message.reply('❌ No NPC, order, or category named **' + npcName + '** — caption an NPC\'s exact name for a personal face, or a bare order/category name for a shared one.').catch(() => {});
         return;
       }
       const imageUrl = message.attachments.first().url;
@@ -12403,6 +12441,7 @@ async function clearGlobalCommands() {
   startAutoRest(client);
   startQuestClock(client);
   runRenameMigration(client).catch(err => console.error('[run-rename]', err?.message || err));
+  npcThreadMigration(client).catch(err => console.error('[npc-threads]', err?.message || err));
   startDocsWatch(client);
   client.login(process.env.DISCORD_TOKEN);
 })();
@@ -17248,7 +17287,7 @@ async function handleNpc(interaction) {
       `💪 STR ${npc.str}   🛡️ CON ${npc.con}   ⚡ DEX ${npc.dex}`,
       `🦉 WIS ${npc.wis}   🍀 LCK ${npc.lck}`,
       `❤️ HP **${npc.hp_current} / ${maxHpFromCon(gid, npc.con)}**   🔁 ${Math.max(0, npc.lck ?? 0)} reroll token${(npc.lck ?? 0) === 1 ? '' : 's'} per fight`,
-      `🖼️ Avatar: ${npc.image_url ? 'set' : (getOrderImage(gid, npcOrderOf(npc.name)) ? 'inherited from the ' + npcOrderOf(npc.name) + ' order' : '—')}${cats.length ? `   📁 ${cats.join(', ')}` : ''}`,
+      `🖼️ Avatar: ${npc.image_url ? 'set' : (sharedFaceLabelFor(gid, npc) ? `shared (${sharedFaceLabelFor(gid, npc)})` : 'none')}`,
       ...(isHero(npc) ? [`🦸 **Hero**${npc.signature_stat ? ` · ⭐ signature **${STAT_LABELS[npc.signature_stat]}**${hasSignatureAdvantage(npc, npc.signature_stat) ? ' (advantage active)' : ` (inactive — needs ${SIGNATURE_MIN}+)`}` : ''}`] : []),
     ];
     return interaction.reply({ content: lines.join('\n') });
@@ -17288,6 +17327,19 @@ async function handleNpc(interaction) {
     // and rowid order is what decides every member's HOME category \u2014 a
     // recreate would re-home NPCs who hold this as their first category.
     db.prepare('UPDATE npc_categories SET name=? WHERE guild_id=? AND name=?').run(to, gid, name);
+    // The pages-forum TAG renames with it — the tag keeps its id, so every
+    // NPC thread wearing it follows for free.
+    try {
+      const forumId = getConfig(gid)?.npc_forum;
+      const forum = forumId ? await interaction.client.channels.fetch(forumId).catch(() => null) : null;
+      if (forum?.type === 15) {
+        const tags = (await forum.fetch().catch(() => forum)).availableTags || [];
+        if (tags.some(t => t.name.toLowerCase() === name.toLowerCase())) {
+          await forum.setAvailableTags(tags.map(t => t.name.toLowerCase() === name.toLowerCase()
+            ? { ...t, name: to.slice(0, 20) } : t)).catch(() => {});
+        }
+      }
+    } catch {}
     db.prepare('UPDATE npc_category_members SET category=? WHERE guild_id=? AND category=?').run(to, gid, name);
     for (const table of Object.values(NPC_THREAD_TABLES)) {
       db.prepare(`UPDATE ${table} SET category=? WHERE guild_id=? AND category=?`).run(to, gid, name);
@@ -17320,6 +17372,18 @@ async function handleNpc(interaction) {
       // Who is about to lose their home. Read before the membership rows go.
       const orphans = getNpcsInCategory(gid, name);
       deleteCategory(gid, name);
+      // The pages-forum tag retires with the category; Discord strips a
+      // removed tag from every thread wearing it.
+      try {
+        const forumId = getConfig(gid)?.npc_forum;
+        const forum = forumId ? await client.channels.fetch(forumId).catch(() => null) : null;
+        if (forum?.type === 15) {
+          const tags = (await forum.fetch().catch(() => forum)).availableTags || [];
+          if (tags.some(t => t.name.toLowerCase() === name.toLowerCase())) {
+            await forum.setAvailableTags(tags.filter(t => t.name.toLowerCase() !== name.toLowerCase())).catch(() => {});
+          }
+        }
+      } catch {}
       registerSlashCommands(gid).catch(console.error);
       // Close the category's thread in both forums and drop the mappings.
       // The NPCs themselves re-home on the mirror pass below — their entries
@@ -17355,6 +17419,7 @@ async function handleNpc(interaction) {
     if (!getCategories(gid).includes(category)) return interaction.reply({ content: `❌ Category **${category}** not found.`, ephemeral: true });
     assignNpcToCategory(gid, npcName, category);
     await interaction.reply({ content: `✅ **${npcName}** added to **${category}**. Menus updating...` });
+    mirrorNpcSheet(interaction.client, gid, npcName).catch(() => {});  // tags follow on the spot
     registerSlashCommands(gid).catch(console.error);
     return;
   }
@@ -17363,6 +17428,7 @@ async function handleNpc(interaction) {
     const category = interaction.options.getString('category');
     removeNpcFromCategory(gid, npcName, category);
     await interaction.reply({ content: `✅ **${npcName}** removed from **${category}**. Menus updating...` });
+    mirrorNpcSheet(interaction.client, gid, npcName).catch(() => {});  // tags follow on the spot
     registerSlashCommands(gid).catch(console.error);
     return;
   }
@@ -17984,6 +18050,11 @@ const HELP_CATEGORIES = {
       '`/npc hero name:X stat:str` — make an NPC a Hero with a signature stat (GM)',
       '`/npc say name:X message:...` — speak or act as an NPC, no dice (GM)',
       '`/npc list category:Bandits` — list only one category\'s NPCs',
+      '',
+      '**Faces** — post a picture in the portrait forum:',
+      '• captioned with an NPC\'s **exact name** → their personal face',
+      '• captioned with a bare **order or category name** → a shared face for every member without one',
+      '_Who wears what: personal first, then their order\'s face, then their first category with one. Tags decide — the old `Order | Name` pipe convention is retired._',
       '`/npc list` · `/npc delete name:X`',
       '`/npc category create/rename/delete/list` — manage categories',
       '`/npc category assign/remove` — sort NPCs into categories',
@@ -19550,7 +19621,7 @@ async function runPortraitMigration(interaction) {
 // evidence: wanted slot, type, raw position before and after, and each
 // category's raw sequences split by type. One screenshot of this settles
 // which of the two failure stories is true.
-async function runOrderReport(interaction) {
+async function runOrderReport(interaction, mode = 'apply') {
   const gid = interaction.guild.id, guild = interaction.guild;
   const { ChannelType } = require('discord.js');
   await interaction.deferReply({ ephemeral: true });
@@ -19564,7 +19635,10 @@ async function runOrderReport(interaction) {
     if (id) entries.push({ id, gm: plan.gm, cat: plan.gm ? cats['DDice \u00b7 Game Masters'] : cats['DDice'] });
   }
   if (!entries.length) return interaction.editReply({ content: '\u2699\ufe0f Nothing configured to order \u2014 `/gm check build:true` first.' });
-  const { lines, refused } = await applySidebarOrder(guild, entries);
+  // Keep-mode swaps the applier for a pure observer over the same entries.
+  const { lines, refused } = mode === 'keep'
+    ? await observeSidebarOrder(guild, entries)
+    : await applySidebarOrder(guild, entries);
   // Discord's own view, per category, split by type: if the two sequences
   // number independently, it is visible right here.
   const view = [];
@@ -19579,6 +19653,21 @@ async function runOrderReport(interaction) {
   return interaction.editReply({ content:
     [`\ud83e\udded **Sidebar order** \u2014 ${refused ? `**${refused} refused**` : 'all edits accepted'}`, '',
      ...lines, '', ...view].join('\n').slice(0, 1990) });
+}
+
+// The observer twin: fetches force-fresh positions and speaks the same
+// report language as the applier, but never edits a channel. This is what
+// a hand-arranged server gets when the GM chooses to keep their layout.
+async function observeSidebarOrder(guild, entries) {
+  let pg = 0, po = 0;
+  const want = entries.filter(x => x.id).map(x => ({ ...x, pos: x.gm ? pg++ : po++ }));
+  const lines = [];
+  for (const w of want) {
+    const now = await guild.channels.fetch(w.id, { force: true }).catch(() => null);
+    if (!now) { lines.push(`⚠️ <#${w.id}> — unfetchable`); continue; }
+    lines.push(`👁️ <#${w.id}> — at ${now.rawPosition ?? now.position} (plan wants slot ${w.pos})`);
+  }
+  return { lines, refused: [] };
 }
 
 async function applySidebarOrder(guild, entries) {
@@ -19944,6 +20033,31 @@ async function spinOffRun(interaction, gid, root, approvedIds) {
 
 // Enough hands. Said once per quest, in the planning thread, to whoever
 // holds it — approving the sixth of five shouldn't nag twice.
+// One-time restructure of the pages forum: every NPC gets their own
+// thread (name, sheet, category tags), and the retired category/order
+// threads of the old shape are closed. Flagged — reruns touch nothing.
+async function npcThreadMigration(client) {
+  try { if (db.prepare("SELECT 1 FROM meta WHERE k='npc_threads_1'").get()) return; } catch {}
+  for (const [gid] of client.guilds.cache) {
+    if (!getConfig(gid)?.npc_forum) continue;
+    for (const npc of getAllNpcs(gid)) {
+      // Old rows point at category threads; the mirror would edit a message
+      // there instead of building the NPC's own thread. Clear first.
+      try { db.prepare('DELETE FROM npc_pages WHERE guild_id=? AND name=?').run(gid, npc.name); } catch {}
+      await mirrorNpcSheet(client, gid, npc.name).catch(() => null);
+    }
+    try {
+      const forum = await client.channels.fetch(getConfig(gid).npc_forum).catch(() => null);
+      for (const r of db.prepare('SELECT category, thread_id FROM npc_category_threads WHERE guild_id=?').all(gid)) {
+        const th = await client.channels.fetch(r.thread_id).catch(() => null);
+        if (th?.isThread?.() && (!forum || th.parentId === forum.id)) await th.delete('Pages forum restructure').catch(() => {});
+        db.prepare('DELETE FROM npc_category_threads WHERE guild_id=? AND category=?').run(gid, r.category);
+      }
+    } catch {}
+  }
+  try { db.prepare("INSERT INTO meta (k, v) VALUES ('npc_threads_1', '1')").run(); } catch {}
+}
+
 // One-time christening of every run that predates the naming convention:
 // per adventure, runs renumber 001-up in birth order, names recompose as
 // "<Quest> Run NNN <GM>", and their threads are renamed to match. Behind a
