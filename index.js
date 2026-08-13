@@ -182,6 +182,14 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN memorial_public_channel TEXT'
 // the character's; the bot only needs to know which thread belongs to whom so it
 // can link to it.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN char_forum TEXT'); } catch {}
+// The character thread's block layout: starter = sheet, plus three
+// bot-owned blocks (inventory · lore · dice) edited in place. Hashes let
+// the hourly sweep skip blocks that haven't changed — near-zero traffic
+// at rest, per T's strain question.
+try { db.exec('ALTER TABLE char_pages ADD COLUMN inv_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE char_pages ADD COLUMN lore_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE char_pages ADD COLUMN rolls_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE char_pages ADD COLUMN block_hashes TEXT'); } catch {}
 // A duel is a proposal until a GM signs it off. One open proposal per player,
 // so the board can't be papered with them.
 try { db.exec(`CREATE TABLE IF NOT EXISTS duels (
@@ -2625,6 +2633,12 @@ function startAutoRest(client) {
           if (!last) { upsertSchedule(guild.id, sc.name, { last_run: Date.now() }); continue; }
           if (Date.now() < last + hours * 3600 * 1000) continue;
           const result = await runAutoRest(guild, sc);
+          // The clock advances the moment the rest fires — before the
+          // announcement, so even a failed announce can't refire it. Its
+          // absence (excised by the resource-mirror rewrite's span) made
+          // every 10-minute tick refire forever once due: the live
+          // announcement spam of 2026-08-13.
+          upsertSchedule(guild.id, sc.name, { last_run: Date.now() });
           await announceAutoRest(guild, sc, result);
           await reportJobRecovered(client, guild.id, sc?.channel || null, `Scheduled recovery (${sc?.name ?? '?'})`);
           console.log(`[autorest] ${guild.id}/${sc.name}: restored ${result.restored.length}, skipped ${result.skipped.length}`);
@@ -8516,10 +8530,10 @@ async function handleChar(interaction) {
     }
     // Every edit below is a player-writable field, so route the reply through
     // finishSheetEdit — it re-queues the sheet for approval when it needs to be.
-    const done = (content) => finishSheetEdit({
+    const done = (content) => { ensureCharPage(interaction.client, interaction.guild, targetId, null).catch(() => {}); return finishSheetEdit({
       src: interaction, gid, callerId, targetId, isGmCaller: isGmUser, content,
       reply: replyThenFetch(interaction),
-    });
+    }); };
     if (field === 'order') {
       const knight = KNIGHTS.find(k=>k.toLowerCase()===value.toLowerCase());
       if (!knight) return interaction.reply({ content: `❌ Choose from: ${KNIGHTS.join(', ')}`, ephemeral: true });
@@ -11529,6 +11543,8 @@ client.once('clientReady', async () => {  // 'ready' is deprecated in favour of 
   // riding registration, where they first landed by a bad anchor.
   runRenameMigration(client).catch(err => console.error('[run-rename]', err?.message || err));
   npcThreadMigration(client).catch(err => console.error('[npc-threads]', err?.message || err));
+  charThreadMigration(client).catch(err => console.error('[char-threads]', err?.message || err));
+  startCharBlockSweep(client);
   startBackupScheduler();
   console.log('✅ Backup scheduler started');
 });
@@ -12094,8 +12110,12 @@ client.on('interactionCreate', async interaction => {
       const gmSub = interaction.options.getSubcommand();
       if (gmSub === 'search') return await handleGmSearch(interaction);
       if (gmSub === 'queue') return await handleGmQueue(interaction);
-      if (gmSub === 'kill') return await handleGmKill(interaction);
-      if (gmSub === 'revive') return await handleGmRevive(interaction);
+      if (gmSub === 'kill') { const r = await handleGmKill(interaction);
+        ensureCharPage(interaction.client, interaction.guild, interaction.options?.getUser?.('user')?.id ?? interaction.user.id, null).catch(() => {});
+        return r; }  // the Fallen tag follows the deed
+      if (gmSub === 'revive') { const r = await handleGmRevive(interaction);
+        ensureCharPage(interaction.client, interaction.guild, interaction.options?.getUser?.('user')?.id ?? interaction.user.id, null).catch(() => {});
+        return r; }
       if (gmSub === 'heal') return await handleGmHeal(interaction);
       if (gmSub === 'questwipe') return await runGmQuestWipe(interaction);
       if (gmSub === 'check') return await handleCheck(interaction);
@@ -13488,25 +13508,177 @@ function charPageLink(gid, uid, label = 'Character page') {
 // Create the forum post for a character, or move an existing one's link along.
 // Best-effort by design: a missing forum, a lost permission or a locked channel
 // should never stop a sheet being approved.
-async function ensureCharPage(client, guild, uid, displayName) {
+// The eight knight orders — Kalidale Guard is a force, not an order, and
+// Siege Knight is a class; neither wears an order tag.
+const CHAR_TAG_ORDERS = ['White Knight','Black Knight','Gold Knight','Grey Knight','Blue Knight','Purple Knight','Green Knight','Red Knight'];
+const CHAR_TAG_CLASSES = ['Vanguard','Defender','Siege Knight'];
+const CHAR_TAG_FALLEN = 'Fallen';
+
+// Every filterable label the character forum carries: 8 + 3 + 1 = 12 of
+// Discord's 20. Additive — never removes a tag someone added by hand.
+// The three living blocks below the sheet. Same voice as /char show, so a
+// thread reads like the sheet command frozen in amber and kept honest.
+function charInvBody(gid, uid) {
+  const items = listItems(gid, uid);
+  if (!items.length) return '🎒 **Inventory** — empty.';
+  return ['🎒 **Inventory**', ...items.map(i =>
+    `\`#${i.id}\` **${i.item}**${i.note ? ` — ${i.note}` : ''}${i.source ? `  _(${i.source})_` : ''}`)].join('\n').slice(0, 1900);
+}
+function charLoreBody(gid, uid) {
+  const rows = db.prepare("SELECT body FROM lore WHERE guild_id=? AND user_id=? AND state='approved' ORDER BY submitted_at").all(gid, uid);
+  if (!rows.length) return '📖 **Lore** — none approved yet.';
+  return ['📖 **Lore**', ...rows.map(r => r.body)].join('\n\n').slice(0, 1900);
+}
+function charRollsBody(gid, uid) {
+  const rows = db.prepare('SELECT sides, nat, count FROM roll_tally WHERE guild_id=? AND user_id=?').all(gid, uid);
+  const per = {};
+  for (const r of rows) {
+    const p = per[r.sides] ??= { total: 0, sum: 0, low: 0, high: 0 };
+    p.total += r.count;
+    p.sum += r.nat * r.count;
+    if (r.nat === 1) p.low += r.count;
+    if (r.nat === r.sides) p.high += r.count;
+  }
+  // The standard ladder always shows, in T's order, rolled or not; any
+  // exotic die that has actually been rolled joins below it.
+  const LADDER = [2, 4, 6, 8, 10, 12, 20];
+  const extras = Object.keys(per).map(Number).filter(x => !LADDER.includes(x)).sort((a, b) => a - b);
+  // Die as a heading, its line beneath, a blank between — the stanza
+  // layout T asked for rather than one row per die.
+  const lines = ['\u{1F3B2} **Dice**', ''];
+  for (const sides of [...LADDER, ...extras]) {
+    const p = per[sides];
+    lines.push(`**d${sides}**`);
+    if (!p) lines.push('no rolls yet');
+    else {
+      const avg = (p.sum / p.total).toFixed(1);
+      lines.push(`**${p.total}** rolled \u00b7 avg **${avg}** \u00b7 nat 1 \u00d7${p.low} \u00b7 nat ${sides} \u00d7${p.high}`);
+    }
+    lines.push('');
+  }
+  return lines.join('\n').trimEnd().slice(0, 1900);
+}
+
+async function ensureCharTags(forum) {
+  const fresh = await forum.fetch().catch(() => forum);
+  const have = fresh.availableTags || [];
+  const wanted = [...CHAR_TAG_ORDERS, ...CHAR_TAG_CLASSES, CHAR_TAG_FALLEN];
+  const missing = wanted.filter(w => !have.some(t => t.name.toLowerCase() === w.toLowerCase()));
+  if (missing.length && have.length + missing.length <= 20) {
+    await forum.setAvailableTags([...have, ...missing.map(name => ({ name: name.slice(0, 20) }))]).catch(() => {});
+  }
+  const map = {};
+  for (const t of (await forum.fetch().catch(() => forum)).availableTags || []) map[t.name.toLowerCase()] = t.id;
+  return map;
+}
+
+// The sheet a character's thread starts with — the character-side twin of
+// npcPageBody, edited in place forever after.
+function charPageBody(gid, ch, displayName) {
+  const rules = rulesFor(gid);
+  const lines = [`📜 **${displayName}**${ch.order_name ? ` — ${KNIGHT_EMOJIS[ch.order_name] ?? ''} ${ch.order_name}` : ''}${ch.char_class ? ` · ${ch.char_class}` : ''}`];
+  if (isFallen(gid, ch.user_id)) lines.push(`⚰ **Fallen** — awaiting \`/gm revive\``);
+  lines.push(`❤ HP **${ch.hp_current ?? 0}${ch.max_hp ? ` / ${ch.max_hp}` : ''}**`);
+  const st = ['str','con','dex','wis','lck'].map(k => `${k.toUpperCase()} **${ch[k] ?? 0}**`).join(' · ');
+  lines.push(st);
+  lines.push(`🔄 Rerolls **${ch.rerolls_current ?? 0}** / ${maxRerolls(ch)}`);
+  if (isWhiteKnight(ch)) {
+    const maxC = getConfig(gid)?.heal_charges ?? 3;
+    lines.push(`🛡 Heal **${getHealCharges(gid, ch.user_id, maxC).current ?? 0}** / ${maxC}`);
+  }
+  lines.push(`_Sheet lives here and updates itself; lore, art and notes go below._`);
+  return lines.join('\n');
+}
+
+async function ensureCharPage(client, guild, uid, displayName, scope = 'sheet') {
   const gid = guild.id;
   const forumId = getConfig(gid)?.char_forum;
   if (!forumId) return { skipped: 'no forum set' };
-  const existing = getCharPage(gid, uid);
-  if (existing?.thread_id) {
-    // Confirm it still exists; if a GM deleted the thread, make a fresh one.
-    try { await client.channels.fetch(existing.thread_id); return { existing: true, url: existing.url }; }
-    catch { clearCharPage(gid, uid); }
-  }
   const forum = await client.channels.fetch(forumId);
   if (!forum?.threads?.create) throw new Error('that channel is not a forum');
-  const thread = await forum.threads.create({
-    name: displayName.slice(0, 90),
-    message: { content: `📖 **${displayName}** — this thread is theirs. Lore, art and notes go here.\n_Linked from \`/char view show\`._` },
-  });
-  const url = `https://discord.com/channels/${gid}/${thread.id}`;
-  setCharPage(gid, uid, thread.id, url, displayName);
-  return { created: true, url };
+  displayName = displayName || await getDisplayName(guild, uid).catch(() => null) || 'Adventurer';
+
+  // Mirror-grade now, the NPC forum's twin: the starter message IS the
+  // sheet, edited in place; tags are order + class + Fallen; the thread
+  // renames with them. Lore and art posted below are never touched.
+  const ch = getChar(gid, uid);
+  const tagMap = await ensureCharTags(forum);
+  const applied = [];
+  if (ch?.order_name && CHAR_TAG_ORDERS.some(o => o.toLowerCase() === ch.order_name.toLowerCase())) {
+    const id = tagMap[ch.order_name.toLowerCase()]; if (id) applied.push(id);
+  }
+  if (ch?.char_class && CHAR_TAG_CLASSES.some(c => c.toLowerCase() === ch.char_class.toLowerCase())) {
+    const id = tagMap[ch.char_class.toLowerCase()]; if (id) applied.push(id);
+  }
+  if (isFallen(gid, uid)) { const id = tagMap[CHAR_TAG_FALLEN.toLowerCase()]; if (id) applied.push(id); }
+  const body = ch ? charPageBody(gid, ch, displayName) : `\u{1F4DC} **${displayName}** \u2014 no sheet yet.`;
+
+  const existing = getCharPage(gid, uid);
+  let thread = existing?.thread_id ? await client.channels.fetch(existing.thread_id).catch(() => null) : null;
+  if (thread && !thread.isThread?.()) thread = null;
+  if (!thread) {
+    if (existing?.thread_id) clearCharPage(gid, uid);
+    thread = await forum.threads.create({
+      name: displayName.slice(0, 90),
+      message: { content: body, allowedMentions: { parse: [] } },
+      appliedTags: applied,
+    });
+    const url = `https://discord.com/channels/${gid}/${thread.id}`;
+    setCharPage(gid, uid, thread.id, url, displayName);
+    return { created: true, url };
+  }
+  await wakeThread(thread);
+  if (thread.name !== displayName.slice(0, 90)) await thread.setName(displayName.slice(0, 90)).catch(() => {});
+  const haveTags = [...(thread.appliedTags || [])].sort().join(',');
+  if (haveTags !== [...applied].sort().join(',')) await thread.setAppliedTags(applied).catch(() => {});
+  const starter = await thread.messages.fetch(thread.id).catch(() => null);
+  if (starter?.editable) await starter.edit({ content: body, allowedMentions: { parse: [] } }).catch(() => {});
+  if (scope === 'all') await ensureCharBlocks(client, guild, uid, thread).catch(() => {});
+  return { existing: true, url: existing.url };
+}
+
+// The three blocks below the sheet: created once, then edited only when
+// their content hash moves — the hourly sweep's whole economy lives here.
+async function ensureCharBlocks(client, guild, uid, thread) {
+  const gid = guild.id;
+  const row = getCharPage(gid, uid);
+  if (!row) return;
+  const bodies = { inv: charInvBody(gid, uid), lore: charLoreBody(gid, uid), rolls: charRollsBody(gid, uid) };
+  let hashes = {};
+  try { hashes = JSON.parse(row.block_hashes || '{}'); } catch {}
+  const crypto = require('crypto');
+  const h = (t) => crypto.createHash('sha1').update(t).digest('hex').slice(0, 12);
+  let dirtyIds = false;
+  const ids = { inv: row.inv_msg_id, lore: row.lore_msg_id, rolls: row.rolls_msg_id };
+  for (const key of ['inv', 'lore', 'rolls']) {
+    const want = bodies[key], hw = h(want);
+    if (ids[key] && hashes[key] === hw) continue;           // unchanged — zero traffic
+    let msg = ids[key] ? await thread.messages.fetch(ids[key]).catch(() => null) : null;
+    if (msg?.editable) { await msg.edit({ content: want, allowedMentions: { parse: [] } }).catch(() => {}); }
+    else {
+      msg = await thread.send({ content: want, allowedMentions: { parse: [] } }).catch(() => null);
+      if (msg) { ids[key] = msg.id; dirtyIds = true; }
+    }
+    hashes[key] = hw;
+  }
+  db.prepare('UPDATE char_pages SET inv_msg_id=?, lore_msg_id=?, rolls_msg_id=?, block_hashes=? WHERE guild_id=? AND user_id=?')
+    .run(ids.inv, ids.lore, ids.rolls, JSON.stringify(hashes), gid, uid);
+}
+
+// The hourly sweep: every character's blocks reconciled, hash-skipped.
+// Sheet edits stay event-live (rare, and players expect to see them);
+// dice — the chatty source — only ever lands here.
+function startCharBlockSweep(client) {
+  const run = async () => {
+    for (const [gid, guild] of client.guilds.cache) {
+      if (!getConfig(gid)?.char_forum) continue;
+      for (const ch of db.prepare('SELECT user_id FROM characters WHERE guild_id=?').all(gid)) {
+        await ensureCharPage(client, guild, ch.user_id, null, 'all').catch(() => null);
+      }
+    }
+  };
+  setInterval(() => run().catch(() => {}), 60 * 60 * 1000);
+  setTimeout(() => run().catch(() => {}), 90 * 1000);  // first pass shortly after boot
 }
 
 // ── Roster ordering ──────────────────────────────────────────────────────────
@@ -17841,6 +18013,7 @@ const HELP_CATEGORIES = {
     title: '📜 Character Sheet',
     blurb: 'sheets, approval, lore, profiles, weapons',
     body: [
+      '🏷️ Your character has their own thread in the character forum: the sheet on top plus living **Inventory**, **Lore** and **Dice** blocks the bot keeps current (dice refresh hourly). Tags (order · class · ⚰ Fallen) filter the roster. Your own posts go below.',
       '_Your sheet is the one source of truth — stats, class, order and weapons — and fights, activities and heals all read from it._',
       '`/char create` — set up a full character at once (stats, order, class, weapons, weapon emojis)',
       '`/char set field:STR value:14` — set one field at a time (with approvals on, any change to your own sheet goes back to the GMs)',
@@ -19857,6 +20030,12 @@ async function buildAllSetup(interaction) {
   // success over a forum still holding a thread per NPC. Costs nothing on a
   // new server: there are no NPCs to write yet.
   const npcLaid = await rebuildNpcForum(interaction.client, gid).catch(() => null);
+  // The character forum rebuilds beside it — same manual twin promise.
+  try { const g2 = interaction.guild;
+    for (const c2 of db.prepare('SELECT user_id FROM characters WHERE guild_id=?').all(gid)) {
+      await ensureCharPage(interaction.client, g2, c2.user_id, null, 'all').catch(() => null);
+    }
+  } catch {}
   const quests = await ensureQuestBooks(interaction.client, guild, gid).catch(() => null);
   const appr = await ensureApprovalThreads(interaction.client, gid).catch(() => null);
   let tags = false;
@@ -20042,6 +20221,30 @@ async function spinOffRun(interaction, gid, root, approvedIds) {
 
 // Enough hands. Said once per quest, in the planning thread, to whoever
 // holds it — approving the sixth of five shouldn't nag twice.
+// Every character dragged into their tagged thread — the char forum's
+// twin of the NPC migration, born with the v2 discipline: counts logged,
+// flag only on real work, first error named, and the mirror upgrades
+// existing lore threads in place (starter becomes the sheet; posts below
+// are never touched).
+async function charThreadMigration(client) {
+  try { if (db.prepare("SELECT 1 FROM meta WHERE k='char_threads_1'").get()) { console.log('[char-threads] already done'); return; } } catch {}
+  let made = 0, total = 0, firstErr = null;
+  for (const [gid, guild] of client.guilds.cache) {
+    if (!getConfig(gid)?.char_forum) continue;
+    for (const ch of db.prepare('SELECT user_id FROM characters WHERE guild_id=?').all(gid)) {
+      total++;
+      const r = await ensureCharPage(client, guild, ch.user_id, null, 'all').catch(e => { firstErr ??= e?.message || String(e); return null; });
+      if (r && !r.skipped) made++;
+    }
+  }
+  if (made > 0 || total === 0) {
+    try { db.prepare("INSERT INTO meta (k, v) VALUES ('char_threads_1', '1')").run(); } catch {}
+    console.log(`[char-threads] ${made}/${total} sheet thread(s) in place`);
+  } else {
+    console.log(`[char-threads] VACUOUS — 0/${total} built, flag NOT set${firstErr ? ` · ${firstErr}` : ''}`);
+  }
+}
+
 // One-time restructure of the pages forum: every NPC gets their own
 // thread (name, sheet, category tags), and the retired category/order
 // threads of the old shape are closed. Flagged — reruns touch nothing.

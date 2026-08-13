@@ -259,6 +259,7 @@ CONTENT = [
 ('p', 'Point the bot at a <b>forum</b> and every approved character gets a post of their own \u2014 somewhere '
       'for lore, art and notes. The link then appears on <b>/char view show</b> and in search results.'),
 ('code', [('/config channels charforum channel:#character-sheets', 'the forum'),
+          ('(character forum)', 'one thread per character: the sheet on top, then living\nInventory \u00b7 Lore \u00b7 Dice blocks the bot keeps current (dice\nhourly: d2\u2013d20 with averages and nat extremes); tags = order \u00b7 class \u00b7 Fallen filter the roster'),
           ('/char page user:@a', 'make one now'),
           ('/char page user:@a thread:#their-thread', 'or link a post that already exists'),
           ('/char page user:@a unlink:true', 'forget it \u2014 the thread itself is untouched')]),

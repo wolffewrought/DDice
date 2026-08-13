@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 756 assertions passed and no scanner found an ERROR.
+Green means 767 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 756 assertions covering structure, registration and ruleset
+now is 767 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -245,6 +245,42 @@ Also fixed there: the handler used to answer *every* image posted anywhere on
 the server with a warning when no bank was set, and then `return` — which
 swallowed the rest of `messageCreate` for any message carrying an attachment.
 It now stays silent outside the bank.
+
+## 7m · Character forum mirrors the NPC forum (2026-08-13)
+
+`ensureCharPage` upgraded to mirror-grade: one thread per character
+(existing lore threads upgraded IN PLACE — starter becomes the living
+sheet via `charPageBody`, posts below never touched), tags = the eight
+colour orders + three classes + `Fallen` (12/20; Kalidale is a force and
+Siege Knight a class, per T — neither is an order tag), thread renames
+with the player. Every sheet edit re-mirrors through the stats handler's
+`done()`; kill/revive re-mirror at dispatch so the Fallen tag follows the
+deed; `/gm check build:true` sweeps every character as the manual twin.
+`charThreadMigration` (`char_threads_1`) drags all existing characters in
+on first boot, born with the v2 discipline: counts, honest flag, first
+error named on a vacuous run.
+
+Four-block threads (T-directed): starter = sheet (event-live via done()/
+kill/revive), then bot-owned **Inventory · Lore (approved) · Dice** blocks,
+ids in char_pages (inv/lore/rolls_msg_id), contents hash-compared
+(block_hashes JSON) so unchanged blocks cost zero API traffic. The hourly
+sweep (`startCharBlockSweep`, first pass 90s after boot) is the only thing
+that touches Dice — the chatty source — answering T's strain question with
+a hybrid: rare things live, frequent things batched. ensureCharPage grew a
+scope param ('sheet' default for hooks, 'all' for migration/build/sweep). The Dice block
+walks the fixed ladder d2/4/6/8/10/12/20 in T's order (unrolled dice say
+so; exotic sides append), each row: rolls · average · nat 1 × / nat MAX ×.
+
+## 7n · The rest storm (2026-08-13, live)
+
+The autorest tick's fired branch ran the rest, announced, logged — and
+never wrote `last_run`. The advance almost certainly lived inside the old
+rest block the resource-mirror rewrite replaced; the excision span
+swallowed it. Once the 12h schedule fell due, every 10-minute tick refired
+and re-announced forever. Fixed: `upsertSchedule({ last_run })` immediately
+after `runAutoRest`, BEFORE the announcement so a failed announce can't
+refire; pinned with the ordering. Live mitigation until deploy:
+`/gm autorest action:pause` (or `resume`, which resets the clock).
 
 ## 7l · Faces come from tags; the pipe retires (2026-08-12)
 

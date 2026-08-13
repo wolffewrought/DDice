@@ -1056,6 +1056,49 @@ function testBuilders(src) {
     ok('a vacuous run never sets its flag',
       /if \(made > 0 \|\| total === 0\) \{/.test(src) &&
       /if \(christened > 0 \|\| runsSeen === 0\) \{/.test(src));
+    // The character forum is the NPC forum's twin: 8+3+1 fixed tags (the
+    // eight colour orders — Kalidale is a force, Siege Knight a class),
+    // the starter message is the live sheet, Fallen toggles with the deed,
+    // every sheet edit re-mirrors through done(), and the migration wears
+    // the v2 discipline from birth.
+    ok('the char tag canon is 8 orders + 3 classes + Fallen',
+      /CHAR_TAG_ORDERS = \['White Knight','Black Knight','Gold Knight','Grey Knight','Blue Knight','Purple Knight','Green Knight','Red Knight'\]/.test(src) &&
+      /CHAR_TAG_CLASSES = \['Vanguard','Defender','Siege Knight'\]/.test(src) &&
+      /CHAR_TAG_FALLEN = 'Fallen'/.test(src));
+    ok('the char starter is the living sheet',
+      /const starter = await thread\.messages\.fetch\(thread\.id\)/.test(src) &&
+      /function charPageBody\(gid, ch, displayName\)/.test(src));
+    ok('every sheet edit re-mirrors through done',
+      /const done = \(content\) => \{ ensureCharPage\(interaction\.client/.test(src));
+    ok('the Fallen tag follows kill and revive',
+      (src.match(/gmSub === '(?:kill|revive)'\) \{ const r = await handleGm(?:Kill|Revive)\(interaction\);\s*\n\s*ensureCharPage\(/g) || []).length === 2);
+    // The four-block thread: sheet event-live, the other three hourly and
+    // hash-skipped so an unchanged block costs nothing — dice, the chatty
+    // source, only ever lands on the sweep.
+    ok('the thread carries four bot blocks',
+      /charInvBody\(gid, uid\)/.test(src) && /charLoreBody\(gid, uid\)/.test(src) &&
+      /charRollsBody\(gid, uid\)/.test(src) && /ALTER TABLE char_pages ADD COLUMN rolls_msg_id/.test(src));
+    // The autorest clock advances IN the fired branch, before the announce.
+    // Losing this line is a 10-minute announcement storm once any schedule
+    // falls due — it already happened live.
+    ok('a fired rest advances its own clock first',
+      /const result = await runAutoRest\(guild, sc\);[\s\S]{0,420}?upsertSchedule\(guild\.id, sc\.name, \{ last_run: Date\.now\(\) \}\);[\s\S]{0,80}?await announceAutoRest/.test(src));
+    ok('the dice block walks the full ladder with averages and extremes',
+      /const LADDER = \[2, 4, 6, 8, 10, 12, 20\];/.test(src) &&
+      /avg \*\*\$\{avg\}\*\*/.test(src) && /nat 1 \\u00d7\$\{p\.low\}/.test(src) &&
+      /lines\.push\(`\*\*d\$\{sides\}\*\*`\);/.test(src) &&   // stanza heading per die
+      /no rolls yet/.test(src));
+    ok('unchanged blocks cost zero traffic',
+      /if \(ids\[key\] && hashes\[key\] === hw\) continue;/.test(src));
+    ok('the sweep is hourly with one early pass',
+      /setInterval\(\(\) => run\(\)\.catch\(\(\) => \{\}\), 60 \* 60 \* 1000\);/.test(src) &&
+      /setTimeout\(\(\) => run\(\)\.catch\(\(\) => \{\}\), 90 \* 1000\);/.test(src));
+    ok('sheet hooks stay narrow — blocks only on the sweep or full passes',
+      /scope = 'sheet'/.test(src) && (src.match(/, 'all'\)/g) || []).length >= 3);
+    ok('the char migration wears the v2 discipline',
+      /char_threads_1/.test(src) && /\[char-threads\] VACUOUS/.test(src) &&
+      /if \(made > 0 \|\| total === 0\)[\s\S]{0,300}?char_threads_1/.test(src));
+
     ok('the mirror never edits a foreign thread',
       /if \(thread && thread\.name !== name\.slice\(0, 100\)\) thread = null;/.test(src));
     ok('the recap survives departed fighters',
