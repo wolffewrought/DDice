@@ -5038,10 +5038,16 @@ async function handleImportRequestButton(interaction) {
   if (!(await isGm(interaction.guild, interaction.user.id)))
     return interaction.reply({ content: '❌ Only GMs can decide sheet imports.', ephemeral: true });
   const [action, uid] = interaction.customId.split(':');
+  // The ok path builds threads, edits cards and DMs before it speaks —
+  // far past Discord's 3-second window (live 10062, 2026-08-14). Defer
+  // first; respond() then lands wherever the ack state allows. The
+  // reject path stays un-acked so its reason modal can still open.
+  if (action === 'impok') { try { await interaction.deferReply({ ephemeral: true }); } catch {} }
+  const respond = (o) => (interaction.deferred || interaction.replied) ? interaction.editReply(o) : interaction.reply(o);
   const req = getImportRequest(gid, uid);
   if (!req) {
     await interaction.message.edit({ components: [] }).catch(()=>{});
-    return interaction.reply({ content: '⏰ That import is no longer pending — it was already handled or superseded.', ephemeral: true });
+    return respond({ content: '⏰ That import is no longer pending — it was already handled or superseded.', ephemeral: true });
   }
   if (action === 'impno') {
     return showRejectReasonModal(interaction, `importreject:${uid}`,
@@ -5145,10 +5151,16 @@ async function handleExportRequestButton(interaction) {
   if (!(await isGm(interaction.guild, interaction.user.id)))
     return interaction.reply({ content: '❌ Only GMs can release sheet exports.', ephemeral: true });
   const [action, uid] = interaction.customId.split(':');
+  // The ok path builds threads, edits cards and DMs before it speaks —
+  // far past Discord's 3-second window (live 10062, 2026-08-14). Defer
+  // first; respond() then lands wherever the ack state allows. The
+  // reject path stays un-acked so its reason modal can still open.
+  if (action === 'exportok') { try { await interaction.deferReply({ ephemeral: true }); } catch {} }
+  const respond = (o) => (interaction.deferred || interaction.replied) ? interaction.editReply(o) : interaction.reply(o);
   const req = getExportRequest(gid, uid);
   if (!req) {
     await interaction.message.edit({ components: [] }).catch(()=>{});
-    return interaction.reply({ content: '⏰ That export request is no longer pending — it was already handled or superseded.', ephemeral: true });
+    return respond({ content: '⏰ That export request is no longer pending — it was already handled or superseded.', ephemeral: true });
   }
   if (action === 'exportno') {
     return showRejectReasonModal(interaction, `exportreject:${uid}`,
@@ -11756,6 +11768,50 @@ async function routeButton(interaction) {
     if (interaction.customId.startsWith('exportok:') || interaction.customId.startsWith('exportno:')) {
       return handleExportRequestButton(interaction);
     }
+    // The lore-doc BUTTONS live here in the button lane — they were first
+    // filed under modal traffic, so presses timed out unacknowledged
+    // ("didn't respond in time", live 2026-08-14). Their modals
+    // (loredocm/loredonm) stay in the modal lane where they belong.
+    if (interaction.customId.startsWith('loredoc:')) {
+      const owner = interaction.customId.split(':')[1];
+      if (interaction.user.id !== owner) {
+        return interaction.reply({ ephemeral: true, content: '❌ This button belongs to the page\'s owner.' });
+      }
+      const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+      const m = new ModalBuilder().setCustomId(`loredocm:${owner}`).setTitle('Request a lore doc update');
+      m.addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('link').setLabel('Link to your doc')
+          .setPlaceholder('https://docs.google.com/… — any shareable link').setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel('Anything the GM should know')
+          .setStyle(TextInputStyle.Paragraph).setRequired(false)),
+      );
+      return interaction.showModal(m);
+    }
+    if (interaction.customId.startsWith('loredocok:') || interaction.customId.startsWith('loredocno:')) {
+      const owner = interaction.customId.split(':')[1];
+      // Deny must stay un-acked for its modal; approve acks instantly and
+      // does its slow work (name fetch, card edit, DM) behind the defer.
+      if (interaction.customId.startsWith('loredocok:')) {
+        try { await interaction.deferUpdate(); } catch {}
+      }
+      if (!(await isGm(interaction.guild, interaction.user.id))) {
+        const msg = { ephemeral: true, content: '❌ GM hands only.' };
+        return (interaction.deferred || interaction.replied) ? interaction.followUp(msg) : interaction.reply(msg);
+      }
+      if (interaction.customId.startsWith('loredocno:')) {
+        const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+        const m = new ModalBuilder().setCustomId(`loredonm:${owner}:${interaction.message.id}`).setTitle('Deny — tell them why');
+        m.addComponents(new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('reason').setLabel('Reason (sent to the player)').setStyle(TextInputStyle.Paragraph).setRequired(true)));
+        return interaction.showModal(m);
+      }
+      const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+      await interaction.editReply({ content: interaction.message.content + `\n✅ **Approved** by ${gmName}`, components: [] }).catch(() => {});
+      const u = await interaction.client.users.fetch(owner).catch(() => null);
+      const dmOk = u ? await u.send(`✅ Your lore doc request was approved by **${gmName}** — they\'ll fold it into your page.`).then(() => true).catch(() => false) : false;
+      if (!dmOk) await interaction.followUp({ ephemeral: true, content: '⚠️ Could not DM them — their DMs are closed.' }).catch(() => {});
+      return;
+    }
     return;
 }
 
@@ -12142,42 +12198,8 @@ client.on('interactionCreate', async interaction => {
       if (u) await u.send(`❌ Your lore doc request in **${interaction.guild.name}** was denied by ${gmName}: ${reason}`).catch(() => {});
       return interaction.reply({ ephemeral: true, content: '✅ Denied and the player has been told.' });
     }
-    if (interaction.customId.startsWith('loredoc:')) {
-      const owner = interaction.customId.split(':')[1];
-      if (interaction.user.id !== owner) {
-        return interaction.reply({ ephemeral: true, content: '❌ This button belongs to the page\'s owner.' });
-      }
-      const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
-      const m = new ModalBuilder().setCustomId(`loredocm:${owner}`).setTitle('Request a lore doc update');
-      m.addComponents(
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('link').setLabel('Link to your doc')
-          .setPlaceholder('https://docs.google.com/… — any shareable link').setStyle(TextInputStyle.Short).setRequired(true)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel('Anything the GM should know')
-          .setStyle(TextInputStyle.Paragraph).setRequired(false)),
-      );
-      return interaction.showModal(m);
-    }
-    if (interaction.customId.startsWith('loredocok:') || interaction.customId.startsWith('loredocno:')) {
-      if (!(await isGm(interaction.guild, interaction.user.id))) {
-        return interaction.reply({ ephemeral: true, content: '❌ GM hands only.' });
-      }
-      const owner = interaction.customId.split(':')[1];
-      if (interaction.customId.startsWith('loredocno:')) {
-        const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
-        const m = new ModalBuilder().setCustomId(`loredonm:${owner}:${interaction.message.id}`).setTitle('Deny — tell them why');
-        m.addComponents(new ActionRowBuilder().addComponents(
-          new TextInputBuilder().setCustomId('reason').setLabel('Reason (sent to the player)').setStyle(TextInputStyle.Paragraph).setRequired(true)));
-        return interaction.showModal(m);
-      }
-      const gmName = await getDisplayName(interaction.guild, interaction.user.id);
-      await interaction.update({ content: interaction.message.content + `\n✅ **Approved** by ${gmName}`, components: [] }).catch(() => {});
-      const u = await interaction.client.users.fetch(owner).catch(() => null);
-      const dmOk = u ? await u.send(`✅ Your lore doc request was approved by **${gmName}** — they\'ll fold it into your page.`).then(() => true).catch(() => false) : false;
-      if (!dmOk) await interaction.followUp({ ephemeral: true, content: '⚠️ Could not DM them — their DMs are closed.' }).catch(() => {});
-      return;
-    }
     if (interaction.customId.startsWith('loredonm:')) {
-      if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ ephemeral: true, content: '❌ GM hands only.' });
+      if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.followUp({ ephemeral: true, content: '❌ GM hands only.' });
       const [, owner, msgId] = interaction.customId.split(':');
       const reason = interaction.fields.getTextInputValue('reason').trim();
       const gmName = await getDisplayName(interaction.guild, interaction.user.id);
@@ -13876,6 +13898,27 @@ async function ensureCharBlocks(client, guild, uid, thread, sheetBody = null) {
   const bodies = { ...(sheetBody ? { sheet: sheetBody } : {}), inv: charInvBody(gid, uid), lore: charLoreBody(gid, uid), standing: charStandingBody(gid, uid), rolls: charRollsBody(gid, uid), notice: CHAR_THREAD_NOTICE };
   let hashes = {};
   try { hashes = JSON.parse(row.block_hashes || '{}'); } catch {}
+  // Order is a contract: Inventory · Lore · Standing · Dice · Notice.
+  // Snowflake ids ascend with time, so a thread whose block ids don't
+  // ascend in that order (a block deleted and re-sent, or one added by a
+  // later build — the mixed-era threads of 2026-08-14) is rebuilt: the
+  // bot's block messages are cleared and re-sent in sequence. Player
+  // messages and the starter are never touched.
+  {
+    const seq = ['inv', 'lore', 'standing', 'rolls', 'notice']
+      .map(k => (k === 'inv' ? row.inv_msg_id : k === 'lore' ? row.lore_msg_id : k === 'standing' ? row.standing_msg_id : k === 'rolls' ? row.rolls_msg_id : row.notice_msg_id))
+      .filter(Boolean);
+    const ordered = seq.every((v, i, a) => i === 0 || BigInt(a[i - 1]) < BigInt(v));
+    if (!ordered) {
+      for (const mid of new Set(seq)) {
+        const m = await thread.messages.fetch(mid).catch(() => null);
+        if (m?.author?.id === client.user.id) await m.delete().catch(() => {});
+        await pace(150);
+      }
+      row.inv_msg_id = row.lore_msg_id = row.standing_msg_id = row.rolls_msg_id = row.notice_msg_id = null;
+      hashes = {};
+    }
+  }
   const crypto = require('crypto');
   const h = (t) => crypto.createHash('sha1').update(t).digest('hex').slice(0, 12);
   let dirtyIds = false;
@@ -21670,8 +21713,14 @@ async function handleSheetApprovalButton(interaction) {
   if (!(await isGm(interaction.guild, interaction.user.id)))
     return interaction.reply({ content: '❌ Only GMs can approve sheets.', ephemeral: true });
   const [action, uid] = interaction.customId.split(':');
+  // The ok path builds threads, edits cards and DMs before it speaks —
+  // far past Discord's 3-second window (live 10062, 2026-08-14). Defer
+  // first; respond() then lands wherever the ack state allows. The
+  // reject path stays un-acked so its reason modal can still open.
+  if (action === 'sheetok') { try { await interaction.deferReply({ ephemeral: true }); } catch {} }
+  const respond = (o) => (interaction.deferred || interaction.replied) ? interaction.editReply(o) : interaction.reply(o);
   const ch = getChar(gid, uid);
-  if (!ch) return interaction.reply({ content: '❌ That character sheet no longer exists.', ephemeral: true });
+  if (!ch) return respond({ content: '❌ That character sheet no longer exists.', ephemeral: true });
   // Turning a sheet down asks for a reason first; the decision is applied when
   // the modal comes back.
   if (action === 'sheetno') {
@@ -21705,7 +21754,7 @@ async function handleSheetApprovalButton(interaction) {
 
   const notice = `✅ **Your character sheet was approved** by ${gmName} in **${interaction.guild.name}** — you can roll and fight now.`;
   const told = await notifyPlayer(interaction, gid, uid, notice);
-  return interaction.reply({
+  return respond({
     content: `✅ <@${uid}> (**${nm}**) approved — they can roll and fight now.` + deliveryNote(told),
     allowedMentions: { parse: [] } });
 }

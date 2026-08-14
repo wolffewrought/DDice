@@ -1068,6 +1068,14 @@ function testBuilders(src) {
     ok('help teaches the party forms, not the flat ones',
       src.includes('/quest party apply number:N') && src.includes('/quest party kick number:N') &&
       !src.includes("'`/quest apply number:N`"));
+    // Approval buttons ack before they work: the ok paths build threads,
+    // edit cards and DM — past Discord's 3s window (live 10062, 2026-08-14).
+    // Reject paths stay un-acked so their reason modals can open.
+    ok('the three approval button handlers defer their ok paths',
+      (src.match(/if \(action === '(?:sheetok|impok|exportok)'\) \{ try \{ await interaction\.deferReply\(\{ ephemeral: true \}\); \} catch \{\} \}/g) || []).length === 3 &&
+      (src.match(/const respond = \(o\) => \(interaction\.deferred \|\| interaction\.replied\)/g) || []).length === 3);
+    ok('loredoc approve acks first, deny stays un-acked for its modal',
+      /startsWith\('loredocok:'\)\) \{\s*\n\s*try \{ await interaction\.deferUpdate\(\); \} catch \{\}/.test(src));
     ok('Lore Docs is an approval type the mender builds',
       /loredoc: \{ name: '📄 Lore Docs'/.test(src));
     ok('the notice wears the request button and self-heals it',
@@ -1096,7 +1104,12 @@ function testBuilders(src) {
     // The four-block thread: sheet event-live, the other three hourly and
     // hash-skipped so an unchanged block costs nothing — dice, the chatty
     // source, only ever lands on the sweep.
-ok('the thread carries six bot blocks — five living, one notice — in T\'s order',
+ok('block order is a contract — a disordered thread rebuilds in sequence',
+      /const ordered = seq\.every\(\(v, i, a\) => i === 0 \|\| BigInt\(a\[i - 1\]\) < BigInt\(v\)\);/.test(src) &&
+      /m\?\.author\?\.id === client\.user\.id/.test(src));
+    ok('the lore-doc buttons live in the button lane',
+      /async function routeButton\(interaction\) \{[\s\S]*?startsWith\('loredoc:'\)[\s\S]*?startsWith\('loredocok:'\)[\s\S]*?\n    return;\n\}/.test(src));
+    ok('the thread carries six bot blocks — five living, one notice — in T\'s order',
       /charStandingBody\(gid, uid\)/.test(src) &&
       /for \(const key of \['sheet', 'inv', 'lore', 'standing', 'rolls', 'notice'\]\)/.test(src) &&
       /contact a Moderator or Expeditioner\. Thank you!/.test(src) &&

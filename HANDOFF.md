@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 783 assertions passed and no scanner found an ERROR.
+Green means 787 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 783 assertions covering structure, registration and ruleset
+now is 787 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -303,6 +303,22 @@ with T's exact wording ("…contact a Moderator or Expeditioner. Thank
 you!"); notice_msg_id joined char_pages. New-server arrival now audits the
 bot's own permissions and names anything missing in the greeting; existing
 servers are never audited unprompted — build:true remains their lever.
+
+## 7r · Button lane and block order (2026-08-14, live)
+
+Two live defects. (1) 10062 "Unknown interaction" on sheetok: the approval
+ok-paths (sheet/import/export) do thread builds, card edits and DMs before
+speaking — past the 3s window. All three now defer-first with a respond()
+helper (editReply-or-reply by ack state); reject paths stay un-acked for
+their reason modals; loredocok defers via deferUpdate. NOTE: the failed
+press had fully applied — only the final ephemeral confirmation died.
+(2) "didn't respond in time" on Request lore update: the loredoc BUTTON
+routes were filed under isModalSubmit, so presses never reached a handler.
+Relocated into routeButton (modals stay in the modal lane), pinned.
+Plus the order contract: block snowflake ids must ascend in
+inv·lore·standing·rolls·notice order; a disordered thread (the mixed-era
+births) has its BOT block messages cleared (author-checked) and re-sent in
+sequence on the next sweep. Starter and player posts untouched.
 
 ## 7q · The seven-improvement batch (2026-08-13/14)
 
