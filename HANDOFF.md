@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 791 assertions passed and no scanner found an ERROR.
+Green means 793 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 791 assertions covering structure, registration and ruleset
+now is 793 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -303,6 +303,17 @@ with T's exact wording ("…contact a Moderator or Expeditioner. Thank
 you!"); notice_msg_id joined char_pages. New-server arrival now audits the
 bot's own permissions and names anything missing in the greeting; existing
 servers are never audited unprompted — build:true remains their lever.
+
+## 7u · Approved docs land on the page (2026-08-14)
+
+The Approve button stamped and DMed but wrote nothing — a player watched
+the ✅ land and their page stayed "none approved yet" (Imigun). Now
+approval parses the card's 🔗 line into characters.lore_doc_url and
+re-mirrors scope 'all' immediately. Per T's shape: /char lore text stays a
+SHORT INTRO; the doc gets its own titled "📄 Lore doc" section beneath,
+inside the Lore block (no new message, order contract untouched). Newer
+approvals replace the link; re-pressing an old card is idempotent — so
+Imigun's existing approved card just needs one more press after deploy.
 
 ## 7t · Stale approval routes heal (2026-08-14, live)
 

@@ -1083,6 +1083,12 @@ function testBuilders(src) {
     ok('the request is owner-gated at press and at submit',
       /startsWith\('loredoc:'\)[\s\S]{0,220}?interaction\.user\.id !== owner/.test(src) &&
       /startsWith\('loredocm:'\)[\s\S]{0,220}?interaction\.user\.id !== owner/.test(src));
+    ok('an approved doc becomes a titled Lore doc section, not lore text',
+      /ALTER TABLE characters ADD COLUMN lore_doc_url/.test(src) &&
+      /upsertChar\(interaction\.guild\.id, owner, \{ lore_doc_url: docUrl \}\)/.test(src) &&
+      /\*\*Lore doc\*\*/.test(src));
+    ok('approval refreshes the page on the spot',
+      /lore_doc_url: docUrl \}\);\s*\n\s*ensureCharPage\(interaction\.client, interaction\.guild, owner, null, 'all'\)/.test(src));
     ok('a stale lore-doc route heals like an absent one',
       /delete r0\.loredoc/.test(src) &&
       /can\\'t be reached even after a rebuild/.test(src));

@@ -343,6 +343,7 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS renown_log (
   reason TEXT, at INTEGER NOT NULL
 )`); } catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN rank_name TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN lore_doc_url TEXT'); } catch {}
 try {
   db.exec(`CREATE TABLE IF NOT EXISTS ranks (
     guild_id TEXT NOT NULL,
@@ -11807,6 +11808,15 @@ async function routeButton(interaction) {
           new TextInputBuilder().setCustomId('reason').setLabel('Reason (sent to the player)').setStyle(TextInputStyle.Paragraph).setRequired(true)));
         return interaction.showModal(m);
       }
+      // Approval now WRITES: the card's link becomes their lore doc, and
+      // the page refreshes on the spot — a player who watched the ✅ land
+      // shouldn't wait an hour to see it (Imigun, 2026-08-14). A newer
+      // approval simply replaces the link; re-pressing is idempotent.
+      const docUrl = (interaction.message.content.match(/🔗 (\S+)/) || [])[1] || null;
+      if (docUrl) {
+        upsertChar(interaction.guild.id, owner, { lore_doc_url: docUrl });
+        ensureCharPage(interaction.client, interaction.guild, owner, null, 'all').catch(() => {});
+      }
       const gmName = await getDisplayName(interaction.guild, interaction.user.id);
       await interaction.editReply({ content: interaction.message.content + `\n✅ **Approved** by ${gmName}`, components: [] }).catch(() => {});
       const u = await interaction.client.users.fetch(owner).catch(() => null);
@@ -13752,8 +13762,14 @@ function charInvBody(gid, uid) {
 }
 function charLoreBody(gid, uid) {
   const rows = db.prepare("SELECT body FROM lore WHERE guild_id=? AND user_id=? AND state='approved' ORDER BY submitted_at").all(gid, uid);
-  if (!rows.length) return '📖 **Lore** — none approved yet.';
-  return ['📖 **Lore**', ...rows.map(r => r.body)].join('\n\n').slice(0, 1900);
+  // The in-bot lore stays a SHORT INTRO; the full story lives in the doc,
+  // which gets its own titled section beneath (T's shape).
+  const parts = rows.length
+    ? ['📖 **Lore**', ...rows.map(r => r.body)]
+    : ['📖 **Lore** — none approved yet.'];
+  const doc = getChar(gid, uid)?.lore_doc_url;
+  if (doc) parts.push('📄 **Lore doc**\n' + doc);
+  return parts.join('\n\n').slice(0, 1900);
 }
 function charStandingBody(gid, uid) {
   const merits = getMerits(gid, uid), renown = getRenown(gid, uid);
