@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 787 assertions passed and no scanner found an ERROR.
+Green means 791 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 787 assertions covering structure, registration and ruleset
+now is 791 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -303,6 +303,26 @@ with T's exact wording ("…contact a Moderator or Expeditioner. Thank
 you!"); notice_msg_id joined char_pages. New-server arrival now audits the
 bot's own permissions and names anything missing in the greeting; existing
 servers are never audited unprompted — build:true remains their lever.
+
+## 7t · Stale approval routes heal (2026-08-14, live)
+
+"The Lore Docs thread is unreachable": approval_routes held a loredoc id
+whose thread had since died — my handler only mended ABSENT keys, not dead
+ones. Now absence and death heal identically: drop the stale key, run the
+shared mender, re-resolve, retry once; only then error, and the error
+names the GM lever (build:true). NOTE: other approval types share the
+fetch-without-liveness pattern at their send sites; GM-facing, lower
+stakes, left as-is — same recipe applies if one ever surfaces.
+
+## 7s · Rank strip (2026-08-14)
+
+rank_name had one writer (the claim button) and no eraser — a claimed rank
+was permanent (Skol vs "Bingus"). `/standing rank strip user:` (GM) clears
+the held title only; merits/renown untouched so re-claiming stays open;
+sheet re-mirrors on the spot. Player-side self-unclaim deliberately not
+added — offered, unconfirmed. NOTE for T: the 🏅 sheet line
+is the merit RANK, not hero regalia — the two look alike and confused a
+player; a distinct emoji for one of them is a one-line change if wanted.
 
 ## 7r · Button lane and block order (2026-08-14, live)
 

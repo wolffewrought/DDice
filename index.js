@@ -6123,6 +6123,8 @@ const slashCommands = [
       .addSubcommand(s=>s.setName('promote').setDescription('Set a player\'s rank (GM)')
         .addUserOption(o=>o.setName('user').setDescription('Player').setRequired(true))
         .addStringOption(o=>o.setName('rank').setDescription('Rank to assign').setRequired(true).setAutocomplete(true)))
+      .addSubcommand(s=>s.setName('strip').setDescription('Clear a player\'s held rank (GM)')
+        .addUserOption(o=>o.setName('user').setDescription('Whose rank to clear').setRequired(true)))
       .addSubcommand(s=>s.setName('eligible').setDescription('List players who meet a rank\'s threshold but don\'t hold it (GM)'))),
 
   new SlashCommandBuilder()
@@ -12219,8 +12221,20 @@ client.on('interactionCreate', async interaction => {
         dest = approvalDestination(gidL, 'loredoc');
       }
       if (!dest) return interaction.reply({ ephemeral: true, content: '❌ No approvals home is set — a GM needs `/config channels approvalforum` first.' });
-      const ch = await interaction.client.channels.fetch(dest).catch(() => null);
-      if (!ch) return interaction.reply({ ephemeral: true, content: '❌ The Lore Docs thread is unreachable.' });
+      let ch = await interaction.client.channels.fetch(dest).catch(() => null);
+      if (!ch) {
+        // A route can go STALE — the thread it names deleted after being
+        // recorded (live "unreachable", 2026-08-14). Absence and death heal
+        // the same way: drop the dead key, let the mender rebuild, retry.
+        try {
+          const r0 = approvalRoutes(gidL) || {};
+          if (r0.loredoc) { delete r0.loredoc; setConfig(gidL, { approval_routes: JSON.stringify(r0) }); }
+        } catch {}
+        await ensureApprovalThreads(interaction.client, gidL).catch(() => null);
+        dest = approvalDestination(gidL, 'loredoc');
+        ch = dest ? await interaction.client.channels.fetch(dest).catch(() => null) : null;
+      }
+      if (!ch) return interaction.reply({ ephemeral: true, content: '❌ The Lore Docs home can\'t be reached even after a rebuild — ask a GM to check the approvals forum (`/gm check build:true`).' });
       const link = interaction.fields.getTextInputValue('link').trim();
       const notes = (interaction.fields.getTextInputValue('notes') || '').trim();
       const pg = getCharPage(gidL, owner);
@@ -19599,6 +19613,22 @@ async function handleRank(interaction) {
     return interaction.reply({ content: `🗑️ Rank **${name}** removed. (Players keeping this rank label aren't changed.)` });
   }
 
+  if (sub === 'strip') {
+    // The claim button was the only writer and nothing could unwrite it —
+    // a claimed rank was permanent (Skol vs "Bingus", 2026-08-14). This is
+    // the eraser: GM clears the held title; merits and renown untouched,
+    // so the player can re-claim whatever they still qualify for.
+    if (!(await isGm(interaction.guild, interaction.user.id)))
+      return interaction.reply({ content: '❌ Only GMs can strip ranks.', ephemeral: true });
+    const target = interaction.options.getUser('user');
+    const ch = getChar(gid, target.id);
+    if (!ch?.rank_name)
+      return interaction.reply({ content: `❌ **${await getDisplayName(interaction.guild, target.id)}** holds no rank.`, ephemeral: true });
+    const held = ch.rank_name;
+    upsertChar(gid, target.id, { rank_name: null });
+    ensureCharPage(interaction.client, interaction.guild, target.id, null).catch(() => {});
+    return interaction.reply({ content: `🏅 **${await getDisplayName(interaction.guild, target.id)}** no longer holds **${held}**.` });
+  }
   if (sub === 'promote') {
     const target = interaction.options.getUser('user');
     const rankName = interaction.options.getString('rank');

@@ -1083,6 +1083,9 @@ function testBuilders(src) {
     ok('the request is owner-gated at press and at submit',
       /startsWith\('loredoc:'\)[\s\S]{0,220}?interaction\.user\.id !== owner/.test(src) &&
       /startsWith\('loredocm:'\)[\s\S]{0,220}?interaction\.user\.id !== owner/.test(src));
+    ok('a stale lore-doc route heals like an absent one',
+      /delete r0\.loredoc/.test(src) &&
+      /can\\'t be reached even after a rebuild/.test(src));
     ok('the card routes through approvalDestination like every approval',
       /approvalDestination\(gidL, 'loredoc'\)/.test(src) &&
       /ensureApprovalThreads\(interaction\.client, gidL\)/.test(src));
@@ -1104,6 +1107,9 @@ function testBuilders(src) {
     // The four-block thread: sheet event-live, the other three hourly and
     // hash-skipped so an unchanged block costs nothing — dice, the chatty
     // source, only ever lands on the sweep.
+    ok('a claimed rank can be unwritten — strip clears the title only',
+      /sub === 'strip'/.test(src) && /upsertChar\(gid, target\.id, \{ rank_name: null \}\)/.test(src) &&
+      /no longer holds \*\*\$\{held\}\*\*/.test(src));
 ok('block order is a contract — a disordered thread rebuilds in sequence',
       /const ordered = seq\.every\(\(v, i, a\) => i === 0 \|\| BigInt\(a\[i - 1\]\) < BigInt\(v\)\);/.test(src) &&
       /m\?\.author\?\.id === client\.user\.id/.test(src));
