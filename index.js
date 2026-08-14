@@ -1007,6 +1007,7 @@ const APPROVAL_TYPES = {
   trades:  { name: '🤝 Merit Trades',     about: 'Player-to-player merit offers wait here for a GM to sign off.' },
   duels:   { name: '⚔️ Duels',            about: 'Challenges sent up for a GM to allow or decline.' },
   lore:    { name: '📜 Lore',             about: 'Character lore submitted for a GM to read.' },
+  loredoc: { name: '📄 Lore Docs',      about: 'Requests to update a lore document — links for a GM to look over.' },
   exports: { name: '📤 Sheet Exports',    about: 'Sheets a player asked to take away, released by a GM.' },
 };
 function approvalRoutes(gid) {
@@ -5323,6 +5324,7 @@ const slashCommands = [
       .addBooleanOption(o=>o.setName('build').setDescription('true = make every channel and forum the bot needs, then fill them').setRequired(false))
       .addBooleanOption(o=>o.setName('restart').setDescription('true = DELETE every channel the bot set up, then build fresh. Asks first.').setRequired(false))
       .addBooleanOption(o=>o.setName('order').setDescription('true = re-apply the sidebar order and show the raw positions Discord kept').setRequired(false))
+      .addBooleanOption(o=>o.setName('migrations').setDescription('List every one-time reshape and the counts it stamped').setRequired(false))
       .addBooleanOption(o=>o.setName('portraits').setDescription('true = move every stored NPC face into its category thread in the portrait forum').setRequired(false)))
     .addSubcommand(s=>s.setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)')
       .addAttachmentOption(o=>o.setName('file').setDescription('A scroll PDF made by /gm scroll — I read it back as text and a fresh copy in this server\'s font').setRequired(false)))
@@ -5379,7 +5381,8 @@ const slashCommands = [
       .addStringOption(o=>o.setName('flavour').setDescription('Why — shown on the correction card').setRequired(false)))
     .addSubcommandGroup(g => {
       g.setName('backup').setDescription('Database backup');
-      g.addSubcommand(s=>s.setName('now').setDescription('Export the database to this channel'));
+      g.addSubcommand(s=>s.setName('now').setDescription('Export the database to this channel')
+      .addBooleanOption(o=>o.setName('verify').setDescription('Open the snapshot read-only: integrity check + row counts vs live').setRequired(false)));
       g.addSubcommand(s=>s.setName('auto').setDescription('Toggle daily automatic backups')
         .addStringOption(o=>o.setName('channel').setDescription('Channel for backups (or type off to disable)').setRequired(true))
         .addIntegerOption(o=>o.setName('hours').setDescription('How often, in hours (default 24)').setRequired(false).setMinValue(1).setMaxValue(720)));
@@ -6185,21 +6188,23 @@ const slashCommands = [
         .addChoices({name:'Open',value:'open'},{name:'In progress',value:'active'},{name:'Completed',value:'completed'},{name:'All',value:'all'})))
     .addSubcommand(s=>s.setName('show').setDescription('Show one quest in full')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('apply').setDescription('Apply to join a quest')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('withdraw').setDescription('Withdraw your application or leave a quest')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
+    .addSubcommandGroup(g => { g.setName('party').setDescription('Hands up, seats, and the door — apply, approve, withdraw, kick');
+      g.addSubcommand(s=>s.setName('apply').setDescription('Raise your hand for a quest')
+        .addIntegerOption(o=>o.setName('number').setDescription('Quest number (or use it inside the quest)').setRequired(false).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('withdraw').setDescription('Take your hand back down')
+        .addIntegerOption(o=>o.setName('number').setDescription('Quest number (or use it inside the quest)').setRequired(false).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('approve').setDescription('Seat an applicant in the party (GM)')
+        .addUserOption(o=>o.setName('user').setDescription('The applicant').setRequired(true))
+        .addIntegerOption(o=>o.setName('number').setDescription('Quest number (or use it inside the quest)').setRequired(false).setAutocomplete(true))
+        .addBooleanOption(o=>o.setName('force').setDescription('Seat them even past the party cap').setRequired(false)));
+      g.addSubcommand(s=>s.setName('kick').setDescription('Remove someone from the quest (GM)')
+        .addUserOption(o=>o.setName('user').setDescription('Who to remove').setRequired(true))
+        .addIntegerOption(o=>o.setName('number').setDescription('Quest number (or use it inside the quest)').setRequired(false).setAutocomplete(true)));
+      return g; })
     .addSubcommand(s=>s.setName('roster').setDescription('Show a quest\'s applicants and party')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('record').setDescription('One player\'s finished quests — what they have been on')
       .addUserOption(o=>o.setName('user').setDescription('Player (defaults to you)').setRequired(false)))
-    .addSubcommand(s=>s.setName('approve').setDescription('Approve an applicant onto the party (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
-      .addUserOption(o=>o.setName('user').setDescription('Applicant to approve').setRequired(true))
-      .addBooleanOption(o=>o.setName('force').setDescription('Add even if it exceeds a hard cap').setRequired(false)))
-    .addSubcommand(s=>s.setName('kick').setDescription('Remove a member or applicant from a quest (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
-      .addUserOption(o=>o.setName('user').setDescription('Player to remove').setRequired(true)))
     .addSubcommandGroup(g => {
       g.setName('run').setDescription('Running a quest — start to completion');
       g.addSubcommand(s=>s.setName('start').setDescription('Mark a quest in progress, locking the party (GM)')
@@ -8943,7 +8948,23 @@ async function handleChar(interaction) {
       if (char.weapon1) lines.push(`${char.weapon1emoji??'⚔️'}  ${char.weapon1}`);
       if (char.weapon2) lines.push(`${char.weapon2emoji??'🗡️'}  ${char.weapon2}`);
     }
-    return interaction.reply({ content: lines.join('\n') });
+    // Every aspect the forum thread carries, on demand and instantly — the
+    // same renderers, so this can never disagree with the thread. Blocks
+    // pack into as few follow-ups as 2000 chars allow.
+    await interaction.reply({ content: lines.join('\n') });
+    const blocks = [charInvBody(gid, tid), charLoreBody(gid, tid), charStandingBody(gid, tid), charRollsBody(gid, tid)];
+    let pack = [];
+    const flush = async () => { if (pack.length) { await interaction.followUp({ content: pack.join('\n\n'), allowedMentions: { parse: [] } }).catch(() => {}); pack = []; } };
+    for (const b of blocks) {
+      if (pack.join('\n\n').length + b.length + 2 > 1900) await flush();
+      pack.push(b);
+    }
+    // Their thread, linked at the foot of the last aspect message — GMs
+    // have none by design, so the link only appears when a page exists.
+    const pg = getCharPage(gid, tid);
+    if (pg?.thread_id) pack.push(`🏷️ Their page: <#${pg.thread_id}>`);
+    await flush();
+    return;
   }
 }
 
@@ -9771,6 +9792,7 @@ async function postDcCheck(interaction, { stat, notation, dc, gmMode, flat, modi
                                         fS: fS ? `${fS.stat}${fS.delta > 0 ? '+' : ''}${fS.delta}` : null,
                                         sM: onSucc || null, fM: onFail || null,
                                         ...(hold ? { bindC: interaction.channelId, bindU: one?.id ?? null, bindSkip: skipFail } : {}) });
+      if (hold) sendRollAudit(interaction.client, gid, `⏳ Override — <@${one?.id}> bound to a DC check by the GM${skipFail ? ' (turn skips on fail)' : ''} in <#${interaction.channelId}>.`);
     } catch { /* trimmings only */ }
   }
   if (secret) await interaction.followUp({ ephemeral: true, content: `🤫 The DC is **${dc}**.` }).catch(() => {});
@@ -11190,6 +11212,18 @@ async function handleCheck(interaction) {
   // `run:true` builds whatever the code knows about and this server hasn't
   // got yet — the one switch to pull after an update adds a book.
   if (interaction.options?.getBoolean?.('portraits')) return runPortraitMigration(interaction);
+  if (interaction.options?.getBoolean?.('migrations')) {
+    // The deploy ledger, in Discord instead of Railway screenshots: every
+    // one-time reshape with the counts it stamped when it ran.
+    const FLAGS = [['npc_rr_backfill_1', 'NPC reroll backfill'], ['run_rename_2', 'Run christening'],
+      ['npc_threads_2', 'NPC threads'], ['char_threads_1', 'Character threads'], ['gm_forum_lock_1', 'GM forum + lock']];
+    const rows = FLAGS.map(([k, label]) => {
+      let v = null; try { v = db.prepare('SELECT v FROM meta WHERE k=?').get(k)?.v; } catch {}
+      return v ? `✅ **${label}** — ${v === '1' ? 'done' : v}` : `❌ **${label}** — pending (runs next boot)`;
+    });
+    return interaction.reply({ ephemeral: true, content: ['📋 **Migration ledger**', ...rows,
+      '_v1 flags (run_rename_1, npc_threads_1) are retired and ignored._'].join('\n') });
+  }
   if (interaction.options?.getBoolean?.('order')) {
     // A hand-arranged server is a choice the bot must respect: the
     // diagnostic ASKS before it sorts. Keep = report only, touch nothing.
@@ -12077,6 +12111,113 @@ client.on('interactionCreate', async interaction => {
     if (interaction.customId.startsWith('npcsay:')) return handleNpcSayModal(interaction);
     if (interaction.customId === 'scrollwrite') return handleScrollModal(interaction);
     if (interaction.customId === 'importpaste') return handleImportPasteModal(interaction);
+    if (interaction.customId.startsWith('loreda:') || interaction.customId.startsWith('loredx:')) {
+      const owner = interaction.customId.split(':')[1];
+      if (!await isGm(interaction.guild, interaction.user.id)) {
+        return interaction.reply({ ephemeral: true, content: '❌ Only GMs decide lore doc requests.' });
+      }
+      const gmName = interaction.member?.displayName ?? interaction.user.username;
+      if (interaction.customId.startsWith('loreda:')) {
+        await interaction.update({ content: interaction.message.content + `\n✅ **Approved** by ${gmName}`, components: [] }).catch(() => {});
+        const u = await interaction.client.users.fetch(owner).catch(() => null);
+        if (u) await u.send(`✅ Your lore doc request in **${interaction.guild.name}** was approved by ${gmName}.`).catch(() => {});
+        return;
+      }
+      const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+      const m = new ModalBuilder().setCustomId(`loredxm:${owner}:${interaction.message.id}`).setTitle('Deny lore doc request');
+      m.addComponents(new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('reason').setLabel('Why? (sent to the player)').setStyle(TextInputStyle.Paragraph).setRequired(true)));
+      return interaction.showModal(m);
+    }
+    if (interaction.customId.startsWith('loredxm:')) {
+      const [, owner, msgId] = interaction.customId.split(':');
+      if (!await isGm(interaction.guild, interaction.user.id)) {
+        return interaction.reply({ ephemeral: true, content: '❌ Only GMs decide lore doc requests.' });
+      }
+      const gmName = interaction.member?.displayName ?? interaction.user.username;
+      const reason = interaction.fields.getTextInputValue('reason').trim();
+      const card = await interaction.channel?.messages?.fetch(msgId).catch(() => null);
+      if (card?.editable) await card.edit({ content: card.content + `\n❌ **Denied** by ${gmName} — ${reason}`, components: [] }).catch(() => {});
+      const u = await interaction.client.users.fetch(owner).catch(() => null);
+      if (u) await u.send(`❌ Your lore doc request in **${interaction.guild.name}** was denied by ${gmName}: ${reason}`).catch(() => {});
+      return interaction.reply({ ephemeral: true, content: '✅ Denied and the player has been told.' });
+    }
+    if (interaction.customId.startsWith('loredoc:')) {
+      const owner = interaction.customId.split(':')[1];
+      if (interaction.user.id !== owner) {
+        return interaction.reply({ ephemeral: true, content: '❌ This button belongs to the page\'s owner.' });
+      }
+      const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+      const m = new ModalBuilder().setCustomId(`loredocm:${owner}`).setTitle('Request a lore doc update');
+      m.addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('link').setLabel('Link to your doc')
+          .setPlaceholder('https://docs.google.com/… — any shareable link').setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel('Anything the GM should know')
+          .setStyle(TextInputStyle.Paragraph).setRequired(false)),
+      );
+      return interaction.showModal(m);
+    }
+    if (interaction.customId.startsWith('loredocok:') || interaction.customId.startsWith('loredocno:')) {
+      if (!(await isGm(interaction.guild, interaction.user.id))) {
+        return interaction.reply({ ephemeral: true, content: '❌ GM hands only.' });
+      }
+      const owner = interaction.customId.split(':')[1];
+      if (interaction.customId.startsWith('loredocno:')) {
+        const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+        const m = new ModalBuilder().setCustomId(`loredonm:${owner}:${interaction.message.id}`).setTitle('Deny — tell them why');
+        m.addComponents(new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('reason').setLabel('Reason (sent to the player)').setStyle(TextInputStyle.Paragraph).setRequired(true)));
+        return interaction.showModal(m);
+      }
+      const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+      await interaction.update({ content: interaction.message.content + `\n✅ **Approved** by ${gmName}`, components: [] }).catch(() => {});
+      const u = await interaction.client.users.fetch(owner).catch(() => null);
+      const dmOk = u ? await u.send(`✅ Your lore doc request was approved by **${gmName}** — they\'ll fold it into your page.`).then(() => true).catch(() => false) : false;
+      if (!dmOk) await interaction.followUp({ ephemeral: true, content: '⚠️ Could not DM them — their DMs are closed.' }).catch(() => {});
+      return;
+    }
+    if (interaction.customId.startsWith('loredonm:')) {
+      if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ ephemeral: true, content: '❌ GM hands only.' });
+      const [, owner, msgId] = interaction.customId.split(':');
+      const reason = interaction.fields.getTextInputValue('reason').trim();
+      const gmName = await getDisplayName(interaction.guild, interaction.user.id);
+      const card = await interaction.channel?.messages?.fetch(msgId).catch(() => null);
+      if (card) await card.edit({ content: card.content + `\n❌ **Denied** by ${gmName} — ${reason}`, components: [] }).catch(() => {});
+      const u = await interaction.client.users.fetch(owner).catch(() => null);
+      const dmOk = u ? await u.send(`❌ Your lore doc request was denied by **${gmName}**: ${reason}`).then(() => true).catch(() => false) : false;
+      return interaction.reply({ ephemeral: true, content: dmOk ? '✅ Denied and the player has been told.' : '✅ Denied — their DMs are closed, so tell them yourself.' });
+    }
+    if (interaction.customId.startsWith('loredocm:')) {
+      const owner = interaction.customId.split(':')[1];
+      if (interaction.user.id !== owner) return interaction.reply({ ephemeral: true, content: '❌ Not yours.' });
+      const gidL = interaction.guild.id;
+      let dest = approvalDestination(gidL, 'loredoc');
+      if (!dest && approvalRoutes(gidL)?.forum) {
+        await ensureApprovalThreads(interaction.client, gidL).catch(() => null);
+        dest = approvalDestination(gidL, 'loredoc');
+      }
+      if (!dest) return interaction.reply({ ephemeral: true, content: '❌ No approvals home is set — a GM needs `/config channels approvalforum` first.' });
+      const ch = await interaction.client.channels.fetch(dest).catch(() => null);
+      if (!ch) return interaction.reply({ ephemeral: true, content: '❌ The Lore Docs thread is unreachable.' });
+      const link = interaction.fields.getTextInputValue('link').trim();
+      const notes = (interaction.fields.getTextInputValue('notes') || '').trim();
+      const pg = getCharPage(gidL, owner);
+      const gmRole = getConfig(gidL)?.gm_role_id;
+      await ch.send({ content: [
+          `📄 **Lore doc request** — <@${owner}>${gmRole ? ` <@&${gmRole}>` : ''}`,
+          `🔗 ${link}`,
+          notes ? `📝 ${notes}` : '',
+          pg?.thread_id ? `🏷️ Their page: <#${pg.thread_id}>` : '',
+        ].filter(Boolean).join('\n'),
+        allowedMentions: { users: [owner], roles: gmRole ? [gmRole] : [] },
+        components: [(() => {
+          const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+          return new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`loredocok:${owner}`).setLabel('✅ Approve').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`loredocno:${owner}`).setLabel('❌ Deny').setStyle(ButtonStyle.Danger));
+        })()] }).catch(() => null);
+      return interaction.reply({ ephemeral: true, content: '✅ Sent to the GMs — they\'ll look it over in the Lore Docs approvals.' });
+    }
     if (interaction.customId === 'loresubmit') return handleLoreSubmit(interaction);
     if (interaction.customId.startsWith('gmkill:')) return handleGmKillModal(interaction);
     if (interaction.customId.startsWith('lorereject:')) return handleLoreRejectModal(interaction);
@@ -13610,7 +13751,7 @@ function charRollsBody(gid, uid) {
     if (!p) lines.push('no rolls yet');
     else {
       const avg = (p.sum / p.total).toFixed(1);
-      lines.push(`**${p.total}** rolled \u00b7 avg **${avg}** \u00b7 nat 1 \u00d7${p.low} \u00b7 nat ${sides} \u00d7${p.high}`);
+      lines.push(`**${p.total}** rolled \u00b7 avg **${avg}** \u00b7 🔴 nat 1 \u00d7${p.low} \u00b7 🟡 nat ${sides} \u00d7${p.high}`);
     }
     lines.push('');
   }
@@ -13644,7 +13785,7 @@ function charPageBody(gid, ch, displayName) {
     const maxC = getConfig(gid)?.heal_charges ?? 3;
     lines.push(`🛡 Heal **${getHealCharges(gid, ch.user_id, maxC).current ?? 0}** / ${maxC}`);
   }
-  lines.push(`_Sheet lives here and updates itself; lore, art and notes go below._`);
+  lines.push(`_This sheet updates itself. To adjust your lore, ask a Moderator or Expeditioner._`);
   return lines.join('\n');
 }
 
@@ -13712,39 +13853,69 @@ async function ensureCharPage(client, guild, uid, displayName, scope = 'sheet') 
   if (thread.name !== displayName.slice(0, 90)) await thread.setName(displayName.slice(0, 90)).catch(() => {});
   const haveTags = [...(thread.appliedTags || [])].sort().join(',');
   if (haveTags !== [...applied].sort().join(',')) await thread.setAppliedTags(applied).catch(() => {});
-  const starter = await thread.messages.fetch(thread.id).catch(() => null);
+  if (scope === 'all') {
+    // The sheet rides the same hash economy as the blocks on sweep passes —
+    // an unchanged sheet costs nothing. Event edits below stay immediate.
+    const r = await ensureCharBlocks(client, guild, uid, thread, body).catch(() => null);
+    return { existing: true, url: existing.url, blocks: r || { edited: 0, failed: 1 } };
+  }
+  const starter = await thread.messages.fetch(row.message_id || thread.id).catch(() => null);
   if (starter?.editable) await starter.edit({ content: body, allowedMentions: { parse: [] } }).catch(() => {});
-  if (scope === 'all') await ensureCharBlocks(client, guild, uid, thread).catch(() => {});
   return { existing: true, url: existing.url };
 }
 
 // The three blocks below the sheet: created once, then edited only when
 // their content hash moves — the hourly sweep's whole economy lives here.
-async function ensureCharBlocks(client, guild, uid, thread) {
+const PACE_MS = 300;
+const pace = () => new Promise(r => setTimeout(r, PACE_MS));
+
+async function ensureCharBlocks(client, guild, uid, thread, sheetBody = null) {
   const gid = guild.id;
   const row = getCharPage(gid, uid);
   if (!row) return;
-  const bodies = { inv: charInvBody(gid, uid), lore: charLoreBody(gid, uid), standing: charStandingBody(gid, uid), rolls: charRollsBody(gid, uid), notice: CHAR_THREAD_NOTICE };
+  const bodies = { ...(sheetBody ? { sheet: sheetBody } : {}), inv: charInvBody(gid, uid), lore: charLoreBody(gid, uid), standing: charStandingBody(gid, uid), rolls: charRollsBody(gid, uid), notice: CHAR_THREAD_NOTICE };
   let hashes = {};
   try { hashes = JSON.parse(row.block_hashes || '{}'); } catch {}
   const crypto = require('crypto');
   const h = (t) => crypto.createHash('sha1').update(t).digest('hex').slice(0, 12);
   let dirtyIds = false;
-  const ids = { inv: row.inv_msg_id, lore: row.lore_msg_id, standing: row.standing_msg_id, rolls: row.rolls_msg_id, notice: row.notice_msg_id };
+  const ids = { sheet: row.message_id || thread.id, inv: row.inv_msg_id, lore: row.lore_msg_id, standing: row.standing_msg_id, rolls: row.rolls_msg_id, notice: row.notice_msg_id };
   // T's order, enforced at creation: Sheet (starter) · Inventory · Lore · Standing · Dice.
-  for (const key of ['inv', 'lore', 'standing', 'rolls', 'notice']) {
+  let edited = 0, failed = 0;
+  for (const key of ['sheet', 'inv', 'lore', 'standing', 'rolls', 'notice']) {
+    if (!(key in bodies)) continue;
     const want = bodies[key], hw = h(want);
-    if (ids[key] && hashes[key] === hw) continue;           // unchanged — zero traffic
+    // Unchanged blocks cost zero traffic — except the notice, which is
+    // fetched each pass so a hand-stripped button genuinely heals. (The
+    // audit caught the old claim: the skip fired before the heal could.)
+    if (ids[key] && hashes[key] === hw && key !== 'notice') continue;
     let msg = ids[key] ? await thread.messages.fetch(ids[key]).catch(() => null) : null;
-    if (msg?.editable) { await msg.edit({ content: want, allowedMentions: { parse: [] } }).catch(() => {}); }
-    else {
-      msg = await thread.send({ content: want, allowedMentions: { parse: [] } }).catch(() => null);
-      if (msg) { ids[key] = msg.id; dirtyIds = true; }
+    // The notice carries the lore-doc request button — pressable even in a
+    // locked thread, since buttons ignore SendMessages. Self-heals if a
+    // hand-edit ever strips it.
+    const comp = key === 'notice' ? [(() => {
+      const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+      return new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`loredoc:${uid}`).setLabel('📄 Request lore update').setStyle(ButtonStyle.Primary));
+    })()] : undefined;
+    if (msg?.editable) {
+      const needsComp = key === 'notice' && !(msg.components?.length);
+      if (hashes[key] !== hw || needsComp) {
+        const ok = await msg.edit({ content: want, allowedMentions: { parse: [] }, ...(comp ? { components: comp } : {}) }).then(() => true).catch(() => false);
+        ok ? edited++ : failed++;
+        await pace();
+      }
+    }
+    else if (key !== 'sheet') {   // a missing starter cannot be re-sent; the thread path rebuilds it
+      msg = await thread.send({ content: want, allowedMentions: { parse: [] }, ...(comp ? { components: comp } : {}) }).catch(() => null);
+      if (msg) { ids[key] = msg.id; dirtyIds = true; edited++; } else failed++;
+      await pace();
     }
     hashes[key] = hw;
   }
   db.prepare('UPDATE char_pages SET inv_msg_id=?, lore_msg_id=?, standing_msg_id=?, rolls_msg_id=?, notice_msg_id=?, block_hashes=? WHERE guild_id=? AND user_id=?')
     .run(ids.inv, ids.lore, ids.standing, ids.rolls, ids.notice, JSON.stringify(hashes), gid, uid);
+  return { edited, failed };
 }
 
 // The hourly sweep: every character's blocks reconciled, hash-skipped.
@@ -13752,12 +13923,15 @@ async function ensureCharBlocks(client, guild, uid, thread) {
 // dice — the chatty source — only ever lands here.
 function startCharBlockSweep(client) {
   const run = async () => {
+    let edited = 0, failed = 0;
     for (const [gid, guild] of client.guilds.cache) {
       if (!getConfig(gid)?.char_forum) continue;
       for (const ch of db.prepare('SELECT user_id FROM characters WHERE guild_id=?').all(gid)) {
-        await ensureCharPage(client, guild, ch.user_id, null, 'all').catch(() => null);
+        const r = await ensureCharPage(client, guild, ch.user_id, null, 'all').catch(() => null);
+        edited += r?.blocks?.edited ?? 0; failed += r?.blocks?.failed ?? 0;
       }
     }
+    if (edited || failed) console.log(`[char-sweep] ${edited} edit(s) · ${failed} failed`);
   };
   setInterval(() => run().catch(() => {}), 60 * 60 * 1000);
   setTimeout(() => run().catch(() => {}), 90 * 1000);  // first pass shortly after boot
@@ -14892,6 +15066,14 @@ async function resolveGrappleSave(guild, gid, cid, fight, { nat, total, mode = '
   return { lines, nextF, grappled };
 }
 
+// The ledger's voice for GM overrides: one line to the roll-audit channel
+// when a GM reaches into the machine, so the record shows the hand.
+function sendRollAudit(client, gid, text) {
+  const chId = getConfig(gid)?.roll_audit_channel_id;
+  if (!chId) return;
+  client.channels.fetch(chId).then(ch => ch?.send({ content: text, allowedMentions: { parse: [] } })).catch(() => {});
+}
+
 // A bound dc card holds its target's fight actions in that channel until
 // the card is pressed. The record is the card row itself; a pruned card
 // simply stops holding, the same graceful dark the marks already have.
@@ -14924,6 +15106,7 @@ async function gmSkipTurn(guild, gid, cid, reason) {
   const nextIndex = nextStandingIndex(order, hpState, floor, fight.turn_index + 1);
   await announceNextTurn(guild, gid, cid, lines, order, nextIndex);
   upsertFight(gid, cid, { ...clear, turn_index: nextIndex });
+  sendRollAudit(guild.client, gid, `⏭ Override — **${skipped?.displayName ?? skippedId}**'s turn skipped${reason ? ` (${reason})` : ''} in <#${cid}>.`);
   return skipped?.displayName ?? skippedId;
 }
 
@@ -18249,8 +18432,8 @@ const HELP_CATEGORIES = {
       '_The board is the server\'s job wall — GMs post, players apply, the party locks, and merits pay out at the end._',
       '`/quest board [filter]` — list quests (open / active / completed / all)',
       '`/quest show number:N` — full quest details · `/quest roster number:N` — applicants & party',
-      '`/quest apply number:N` — apply to join (or tap **Apply** on the post)',
-      '`/quest withdraw number:N` — leave or cancel your application',
+      '`/quest party apply number:N` — apply to join (or tap **Apply** on the post)',
+      '`/quest party withdraw number:N` — leave or cancel your application',
       '`/quest record [user]` — one player\'s finished quests — what they have been on',
       '`/quest create name:Goblin Cave objectives:... merit_reward:2 party_size:4 hard_cap:true` — (GM)',
       '`/quest create` — bare, a five-field writing window opens (add `from:N` to seed it from an existing quest); with `name:` everything stays inline (GM)',
@@ -18274,8 +18457,8 @@ const HELP_CATEGORIES = {
       '`/quest dm style:... brief:... [available:false]` — your card on the 🎲 DMs Available roster (GM)',
       '`/quest npc number:N name:Orc [remove]` — attach the NPCs a run involves; they land on the run record (GM)',
       '`/quest runs number:N` — one adventure\'s ledger: how many times it has been run, and each run\'s GM, party and NPCs',
-      '`/quest approve number:N @user [force]` — approve an applicant; `force` overrides a hard cap (GM)',
-      '`/quest kick number:N @user` — remove a member/applicant (GM)',
+      '`/quest party approve number:N @user [force]` — approve an applicant; `force` overrides a hard cap (GM)',
+      '`/quest party kick number:N @user` — remove a member/applicant (GM)',
       '`/quest runchannel number:N [channel]` — set where the quest runs & rewards (GM)',
       '`/quest thread number:N` or `/quest thread all:true` — open a quest thread for one that has not got one. Use it for quests that began before you set the instance forum (GM)',
       '`/quest rally number:N [message:] [here:true]` — call the party together: pings every member in the quest thread, or in this channel with `here:true` (GM)',
@@ -18719,7 +18902,31 @@ async function handleBackup(interaction) {
     return interaction.reply({ content: '❌ Only GMs can manage backups.', ephemeral: true });
 
   if (sub === 'now') {
+    if (interaction.options?.getBoolean?.('verify')) {
+      // Prove the backup restores: snapshot, open read-only, integrity
+      // check, and row counts against the live tables. Hope becomes
+      // evidence, or the reply names exactly where it does not.
+      await interaction.deferReply({ ephemeral: true });
+      const snap = snapshotDb();
+      try {
+        const BSQL = require('better-sqlite3');
+        const bdb = new BSQL(snap, { readonly: true });
+        const integ = bdb.prepare('PRAGMA integrity_check').get();
+        const TBLS = ['characters', 'npcs', 'quests', 'inventory', 'heal_charges', 'char_pages', 'npc_pages', 'renown_log'];
+        const lines = [`\u{1F9EA} **Backup verify** \u2014 integrity: **${integ?.integrity_check ?? 'unknown'}**`];
+        for (const t of TBLS) {
+          let b = -1, l = -1;
+          try { b = bdb.prepare(`SELECT COUNT(*) AS c FROM ${t}`).get().c; } catch {}
+          try { l = db.prepare(`SELECT COUNT(*) AS c FROM ${t}`).get().c; } catch {}
+          lines.push(`${b === l ? '\u2705' : '\u26A0\uFE0F'} ${t} \u2014 ${b} / ${l}`);
+        }
+        bdb.close();
+        return interaction.editReply({ content: lines.join('\n') });
+      } catch (e) {
+        return interaction.editReply({ content: `\u274C Verify failed \u2014 ${e?.message || e}` });
+      } finally { try { require('fs').unlinkSync(snap); } catch {} }
     await interaction.deferReply({ ephemeral: true });
+    }
     if (!fs.existsSync(DB_PATH)) return interaction.editReply({ content: '❌ Database file not found.' });
     const channelId = getConfig(gid)?.backup_channel_id;
     try {
@@ -20351,7 +20558,7 @@ async function forumSetupMigration(client) {
     } catch (e) { firstErr ??= e?.message || String(e); }
   }
   if (madeForums > 0 || locked > 0) {
-    try { db.prepare("INSERT INTO meta (k, v) VALUES ('gm_forum_lock_1', '1')").run(); } catch {}
+    try { db.prepare("INSERT INTO meta (k, v) VALUES ('gm_forum_lock_1', ?)").run(`${madeForums} forum(s) · ${locked} locked`); } catch {}
     console.log(`[gm-forum] ${madeForums} forum(s) created, ${locked} player forum(s) locked`);
   } else {
     console.log(`[gm-forum] VACUOUS — nothing created or locked${firstErr ? ` · ${firstErr}` : ''}`);
@@ -20367,10 +20574,11 @@ async function charThreadMigration(client) {
       total++;
       const r = await ensureCharPage(client, guild, ch.user_id, null, 'all').catch(e => { firstErr ??= e?.message || String(e); return null; });
       if (r && !r.skipped) made++;
+      await pace();
     }
   }
   if (made > 0 || total === 0) {
-    try { db.prepare("INSERT INTO meta (k, v) VALUES ('char_threads_1', '1')").run(); } catch {}
+    try { db.prepare("INSERT INTO meta (k, v) VALUES ('char_threads_1', ?)").run(`${made}/${total} in place`); } catch {}
     console.log(`[char-threads] ${made}/${total} sheet thread(s) in place`);
   } else {
     console.log(`[char-threads] VACUOUS — 0/${total} built, flag NOT set${firstErr ? ` · ${firstErr}` : ''}`);
@@ -20394,6 +20602,7 @@ async function npcThreadMigration(client) {
       total++;
       const th = await mirrorNpcSheet(client, gid, npc.name).catch(e => { firstErr ??= e?.message || String(e); return null; });
       if (th) made++;
+      await pace();
     }
     try {
       const forum = await client.channels.fetch(getConfig(gid).npc_forum).catch(() => null);
@@ -20405,7 +20614,7 @@ async function npcThreadMigration(client) {
     } catch {}
   }
   if (made > 0 || total === 0) {
-    try { db.prepare("INSERT INTO meta (k, v) VALUES ('npc_threads_2', '1')").run(); } catch {}
+    try { db.prepare("INSERT INTO meta (k, v) VALUES ('npc_threads_2', ?)").run(`${made}/${total} built · ${swept} swept`); } catch {}
     console.log(`[npc-threads] ${made}/${total} thread(s) built, ${swept} old swept`);
   } else {
     console.log(`[npc-threads] VACUOUS — 0/${total} built, flag NOT set${firstErr ? ` · first error: ${firstErr}` : ''}`);
@@ -20442,10 +20651,11 @@ async function runRenameMigration(client) {
       }
       christened++;
       await syncQuestBook(client, guild, gid, getQuest(gid, run.number)).catch(() => {});
+      await pace();
     }
   }
   if (christened > 0 || runsSeen === 0) {
-    try { db.prepare("INSERT INTO meta (k, v) VALUES ('run_rename_2', '1')").run(); } catch {}
+    try { db.prepare("INSERT INTO meta (k, v) VALUES ('run_rename_2', ?)").run(`${christened}/${runsSeen} christened`); } catch {}
     console.log(`[run-rename] christened ${christened}/${runsSeen} run(s)`);
   } else {
     console.log(`[run-rename] VACUOUS — 0/${runsSeen} christened, flag NOT set${renameErr ? ` · ${renameErr}` : ''}`);

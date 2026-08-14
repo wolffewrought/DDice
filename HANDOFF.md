@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 775 assertions passed and no scanner found an ERROR.
+Green means 783 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 775 assertions covering structure, registration and ruleset
+now is 783 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -303,6 +303,39 @@ with T's exact wording ("…contact a Moderator or Expeditioner. Thank
 you!"); notice_msg_id joined char_pages. New-server arrival now audits the
 bot's own permissions and names anything missing in the greeting; existing
 servers are never audited unprompted — build:true remains their lever.
+
+## 7q · The seven-improvement batch (2026-08-13/14)
+
+All landed workspace-only. (1) `/gm backup now verify:true`: snapshot →
+read-only open → PRAGMA integrity_check → row counts vs live for eight
+core tables. (2) `/gm check migrations:true`: the FLAGS ledger reads every
+meta flag; each migration now stamps its counts INTO meta.v at set-time
+(e.g. run_rename_2 = "3/3"), dead v1 flags shown retired. (3) PACE_MS=300
+`pace()` between write-loop iterations in all three migrations + christen
+loop; 150ms per block edit in the sweep. (4) `[char-sweep] N edit(s) · F
+failed`, non-zero passes only. (5) Lore Docs cards carry GM-gated
+✅ Approve / ❌ Deny (deny takes a reasoned modal `loredonm:uid:msgId`);
+both stamp the card and DM the player, DM-closed noted on the card.
+(7a) `/gm override skip` and `/gm dc hold` write roll-audit lines — the
+standing debt is cleared. (6) The party fold: `/quest party
+apply|withdraw|approve|kick` under one group ("Hands up, seats, and the
+door"), quest 23→20 leaves, npc (22) now the most crowded; dispatch
+unchanged because getSubcommand() returns the leaf and buttons + /instance
+force sub names, both pinned. The quest near-wall warning retired:
+warnings 11→10. Debt remaining: T's order:true → Keep screenshot (7b).
+
+## 7p · Post-run audit (2026-08-13)
+
+Sweep over everything since §7h: four permanent schema scans green, config
+key cross-reference clean, warnings steady at 11 (all documented). New
+features reconciled pairwise — sweep×GM-privacy (no churn after first
+clear), lock×button (interactions bypass SendMessages, by design),
+migration ordering, ruleset edges on charPageBody. ONE conflict found and
+fixed: the notice's button "self-heal" was unreachable — the hash-skip
+fired before the components check — so the notice is now exempt from the
+early skip (one fetch per character per hour) and heals for real. /char
+show gained all five aspects + page link; the Lore Docs approval tab and
+request button shipped owner-gated through approvalDestination.
 
 ## 7l · Faces come from tags; the pipe retires (2026-08-12)
 

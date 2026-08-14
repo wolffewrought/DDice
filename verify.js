@@ -978,7 +978,8 @@ function testBuilders(src) {
     // one group (2026-08-10): six leaves became one, /npc edit took a freed
     // slot, and /quest inherited the most-crowded seat at 23. These hold the
     // fold's arithmetic so it cannot silently unfold.
-    ok('/quest is now the most crowded command', leaves(by.quest) === Math.max(...cmds.map(leaves)));
+// (party fold, 2026-08-13: quest dropped 23→20; npc leads at 22.)
+    ok('/npc is now the most crowded command', leaves(by.npc) === Math.max(...cmds.map(leaves)));
     ok('/npc holds at 22 = 19 top + category group + edit + rename', leaves(by.npc) === 22);
     // The rename's contract: it mirrors deleteNpc's purge list as UPDATEs —
     // everything delete destroys under the old identity, rename carries to
@@ -1061,12 +1062,32 @@ function testBuilders(src) {
     // the starter message is the live sheet, Fallen toggles with the deed,
     // every sheet edit re-mirrors through done(), and the migration wears
     // the v2 discipline from birth.
+    // The lore-doc pipeline: a tab of its own in approvals, requested by a
+    // button that works inside the locked thread, owner-gated twice, and
+    // the card lands via the same per-type router every approval uses.
+    ok('help teaches the party forms, not the flat ones',
+      src.includes('/quest party apply number:N') && src.includes('/quest party kick number:N') &&
+      !src.includes("'`/quest apply number:N`"));
+    ok('Lore Docs is an approval type the mender builds',
+      /loredoc: \{ name: '📄 Lore Docs'/.test(src));
+    ok('the notice wears the request button and self-heals it',
+      /loredoc:\$\{uid\}/.test(src) && /needsComp/.test(src));
+    ok('the request is owner-gated at press and at submit',
+      /startsWith\('loredoc:'\)[\s\S]{0,220}?interaction\.user\.id !== owner/.test(src) &&
+      /startsWith\('loredocm:'\)[\s\S]{0,220}?interaction\.user\.id !== owner/.test(src));
+    ok('the card routes through approvalDestination like every approval',
+      /approvalDestination\(gidL, 'loredoc'\)/.test(src) &&
+      /ensureApprovalThreads\(interaction\.client, gidL\)/.test(src));
+    ok('/char show speaks with the forum renderers, never a second voice',
+      /const blocks = \[charInvBody\(gid, tid\), charLoreBody\(gid, tid\), charStandingBody\(gid, tid\), charRollsBody\(gid, tid\)\];/.test(src) &&
+      /Their page: <#\$\{pg\.thread_id\}>/.test(src));
     ok('the char tag canon is 8 orders + 3 classes + Fallen',
       /CHAR_TAG_ORDERS = \['White Knight','Black Knight','Gold Knight','Grey Knight','Blue Knight','Purple Knight','Green Knight','Red Knight'\]/.test(src) &&
       /CHAR_TAG_CLASSES = \['Vanguard','Defender','Siege Knight'\]/.test(src) &&
       /CHAR_TAG_FALLEN = 'Fallen'/.test(src));
-    ok('the char starter is the living sheet',
-      /const starter = await thread\.messages\.fetch\(thread\.id\)/.test(src) &&
+    ok('the char starter is the living sheet — hash-skipped on sweeps, immediate on events',
+      /const starter = await thread\.messages\.fetch\(row\.message_id \|\| thread\.id\)/.test(src) &&
+      /ensureCharBlocks\(client, guild, uid, thread, body\)/.test(src) &&
       /function charPageBody\(gid, ch, displayName\)/.test(src));
     ok('every sheet edit re-mirrors through done',
       /const done = \(content\) => \{ ensureCharPage\(interaction\.client/.test(src));
@@ -1077,7 +1098,7 @@ function testBuilders(src) {
     // source, only ever lands on the sweep.
 ok('the thread carries six bot blocks — five living, one notice — in T\'s order',
       /charStandingBody\(gid, uid\)/.test(src) &&
-      /for \(const key of \['inv', 'lore', 'standing', 'rolls', 'notice'\]\)/.test(src) &&
+      /for \(const key of \['sheet', 'inv', 'lore', 'standing', 'rolls', 'notice'\]\)/.test(src) &&
       /contact a Moderator or Expeditioner\. Thank you!/.test(src) &&
       /ALTER TABLE char_pages ADD COLUMN notice_msg_id/.test(src));
     ok('the player forum is staff-typed, and the lock is honest about its needs',
@@ -1103,11 +1124,11 @@ ok('the thread carries six bot blocks — five living, one notice — in T\'s or
       /const result = await runAutoRest\(guild, sc\);[\s\S]{0,420}?upsertSchedule\(guild\.id, sc\.name, \{ last_run: Date\.now\(\) \}\);[\s\S]{0,80}?await announceAutoRest/.test(src));
     ok('the dice block walks the full ladder with averages and extremes',
       /const LADDER = \[2, 4, 6, 8, 10, 12, 20\];/.test(src) &&
-      /avg \*\*\$\{avg\}\*\*/.test(src) && /nat 1 \\u00d7\$\{p\.low\}/.test(src) &&
+      /avg \*\*\$\{avg\}\*\*/.test(src) && /nat 1 \\u00d7\$\{p\.low\}/.test(src) && src.includes('🔴 nat 1') && src.includes('🟡 nat') &&
       /lines\.push\(`\*\*d\$\{sides\}\*\*`\);/.test(src) &&   // stanza heading per die
       /no rolls yet/.test(src));
     ok('unchanged blocks cost zero traffic',
-      /if \(ids\[key\] && hashes\[key\] === hw\) continue;/.test(src));
+      /if \(ids\[key\] && hashes\[key\] === hw && key !== 'notice'\) continue;/.test(src));
     ok('the sweep is hourly with one early pass',
       /setInterval\(\(\) => run\(\)\.catch\(\(\) => \{\}\), 60 \* 60 \* 1000\);/.test(src) &&
       /setTimeout\(\(\) => run\(\)\.catch\(\(\) => \{\}\), 90 \* 1000\);/.test(src));
@@ -1214,7 +1235,10 @@ ok('the thread carries six bot blocks — five living, one notice — in T\'s or
     })();
     ok('the category group holds all six family members',
       (by.npc.groups || []).some(g => g.name === 'category' && (g.subcommands || g.subs || []).length === 6));
-    ok('/quest is close behind', leaves(by.quest) >= 22);
+    ok('/quest folded its party family: 20 leaves, 4 of them under the group',
+      leaves(by.quest) === 20 && by.quest.groups.some(g => g.name === 'party' && (g.subcommands || g.subs || []).length === 4));
+    ok('button and /instance forced names still route after the fold',
+      /const sub = \(forced && typeof forced === 'object'\) \? forced\.sub : interaction\.options\.getSubcommand\(\)/.test(src));
 
     ok('/config folds into groups', by.config.groups.length >= 2);
     ok('/config groups are channels and mechanics',
