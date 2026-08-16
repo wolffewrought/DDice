@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 793 assertions passed and no scanner found an ERROR.
+Green means 826 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 793 assertions covering structure, registration and ruleset
+now is 826 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -303,6 +303,96 @@ with T's exact wording ("…contact a Moderator or Expeditioner. Thank
 you!"); notice_msg_id joined char_pages. New-server arrival now audits the
 bot's own permissions and names anything missing in the greeting; existing
 servers are never audited unprompted — build:true remains their lever.
+
+## 7z · Post-batch audit (2026-08-15)
+
+Clean. 826 assertions, 102 pins, four schema scans, config keys, 13
+warnings (3 = check-fold artifacts, documented in 7x). Cross-checks:
+healChannelPerms proven position-safe by scan (no setPosition/setParent/
+position:, writes me.id only — T's explicit worry, now machine-enforced);
+channelCreate watcher carries both guards; interject's three consumption
+seams verified (stat in runFightAttack covering slash AND button replay,
+plus the def handler; mode via next_mark; die guarded to cast rolls only);
+new columns all defined before use. ONE open question left with T, not
+changed: /gm reroll rewrites atk_nat/def_nat, so a rerolled roll discards
+a GM's `interject die:` declaration — reroll currently wins.
+
+## 7y · Channel permission sweep (2026-08-15)
+
+`healChannelPerms(guild)` walks every non-category channel, computes the
+bot's missing CHANNEL_PERMS, and writes its OWN overwrite where it holds
+ManageRoles in that channel — granting only what it already holds
+guild-wide (Discord's rule). Called by `/gm check run` and `/gm check
+build`; `channelCreate` heals new channels at birth; `/gm check status`
+audits read-only and names the gaps. 150ms paced. **Pinned: permissions
+only — the heal never touches position or parent** (T asked explicitly
+whether this would reorganise anything; it cannot). What code cannot do is
+grant the bot permissions it lacks: blocked channels are named for T to
+fix on the role. Recommended to T: hold the working set guild-wide on the
+DDice role so new channels inherit and nothing needs healing.
+
+## 7x · The /gm check fold (2026-08-15)
+
+The prophesied fold, executed: check is a GROUP of seven leaves (status ·
+run · build · restart · order · migrations · portraits). handleCheck gains
+a two-line shim — `opt(name)` returns leaf===name when the group routed,
+else the old boolean — so registrations still propagating keep working and
+the handler bodies moved zero lines. Route: gmSub==='check' OR
+group==='check'. Every taught string regrammared (14 in index, 6 PDF rows;
+bare `/gm check` references now say `check status`). gm budget 6147/6200 —
+breathing again. Warnings 10→13: three `unrouted-subcommand` on
+build/restart/migrations are fold artifacts — they route through the
+dynamic `opt()` comparison the scanner can't see; the warn class exists
+exactly for human-confirmed fall-throughs, confirmed here.
+
+## 7w · /gm override interject (2026-08-15)
+
+T's ask: interrupt auto paths and bend a player's current-or-next roll.
+One mechanism, no timing option: the adjustment (±10, sums, note joins)
+is stored in effect_state as gmAdj and CONSUMED AT THE RESOLVER — the one
+choke every path (manual, NPCs-only, full auto, feint) flows through — so
+"current" and "next" collapse into "earliest unresolved roll". Applied to
+atk_roll/def_roll by role, announced on the exchange card ("⚖️ GM
+interjection: +2 to @X's roll — reason"), publicly announced at apply
+time, roll-audited, cleared with the other effects on leaving. Budget pin
+raised 6000→6200 for the leaf's legible prose (Discord wall is 8000);
+pin's variable corrected to the local `budget` after two timeout scares
+that were actually a ReferenceError plus sandbox slowness.
+
+Extended same day per T: interject now wields THREE levers in any
+combination — amount (as before), mode (adv/dis/flat, written to
+characters.next_mark so the existing mark machinery consumes and speaks
+it), and a FORCED STAT (effect_state.gmStat). The stat force is consumed
+inside runFightAttack (covering the slash command AND the target-picker
+button replay with one seam) and in-handler on the defence side; the roll
+label says "⚖️ stat set to DEX by the GM". Honest boundary, documented:
+amount can bend a pending roll; mode and stat bind the NEXT roll made — a
+cast die keeps its shape. gm budget 6198/6200 after option prose — the fold of /gm check's options
+into a group is now MANDATORY before the next /gm tenant.
+
+Same day again: option order set to T's sequence (user · stat · amount ·
+mode · die · note), and the **die declaration** added — `die:1-20` rewrites
+a roll already on the table: fights keep natural and total apart until
+resolve, so `delta = die - was` recomputes the total around the standing
+modifier and the automatics (parry/fumble/crit damage) honor the declared
+face. Refuses plainly when nothing is cast. This is the only lever that
+touches a cast die; mode and stat still bind the next roll made.
+
+## 7v · Combat automatics per T's rules doc (2026-08-15)
+
+T's canonical doc (Atk Fumble / Crit Def) layered onto the original damage
+table, superseding one interim turn: (1) nat-1 ATTACK fails automatically
+(new — was totals-only) and still carries the flat-d20 next defence;
+(2) nat-20 DEFENCE auto-parries UNLESS the attack was also a 20 (then
+totals decide — the "unless" belongs to the PARRY, not the carry), and the
++2 riposte now banks on EVERY defending 20; (3) damage numbers untouched
+(1 / +1 atk-20 / +1 def-1 / 4 both). The interim symmetric attacker-side
+next-roll carry (built from T's earlier sentence, before the doc arrived)
+was removed — an attacking 20 pays out as damage, not tempo. Carry key
+renamed rollBonus with legacy atkBonus honoured mid-fight; consumption
+stays at the two attack sites. New card voices: "turns the blow aside — a
+perfect parry!" / "fumbles the attack — it fails outright!". Books' Fights
+table rewritten to match.
 
 ## 7u · Approved docs land on the page (2026-08-14)
 

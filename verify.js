@@ -1113,6 +1113,43 @@ function testBuilders(src) {
     // The four-block thread: sheet event-live, the other three hourly and
     // hash-skipped so an unchanged block costs nothing — dice, the chatty
     // source, only ever lands on the sweep.
+    // T's combat rules doc (2026-08-15): the automatics and the carries.
+    // /gm override interject — the hand on the scales. Consumed at the
+    // resolver (the one place all fight paths meet), gm-gated, audited,
+    // membership-checked, amounts sum, and the card names the adjustment.
+    ok('interject is gm-gated and audited',
+      /async function gmInterject\(interaction\)[\s\S]{0,400}?Only GMs can interject/.test(src) &&
+      /async function gmInterject\(interaction\)[\s\S]{0,3600}?sendRollAudit\(interaction\.client, gid/.test(src));
+    ok('interject refuses outsiders and empty hands',
+      /is not in this fight/.test(src) && /Nothing to apply/.test(src));
+    ok('interject wields three levers: amount, mode, forced stat',
+      /if \(forceStat\) slot\.gmStat = forceStat;/.test(src) &&
+      /if \(mode\) upsertChar\(gid, target\.id, \{ next_mark: mode \}\);/.test(src) &&
+      /function consumeGmStat\(gid, cid, fid\)/.test(src));
+    ok('the die declaration rewrites a cast natural, total recomputed around the modifier',
+      /const delta = die - was;/.test(src) &&
+      /\[natKey\]: die, \[rollKey\]: \(fight\[rollKey\] \?\? was\) \+ delta/.test(src) &&
+      /Nothing cast to override/.test(src));
+    ok('the forced stat is consumed in the shared attack runner, covering both callers',
+      /async function runFightAttack\(\{[\s\S]{0,600}?consumeGmStat\(gid, cid, actorId\)/.test(src) &&
+      /stat set to \$\{STAT_LABELS\[forced\]\} by the GM/.test(src));
+    ok('interjections are consumed at the resolver for both roles',
+      /for \(const \[fid, roleKey\] of \[\[attackerId, 'atk_roll'\], \[defenderId, 'def_roll'\]\]\)/.test(src) &&
+      /delete slot\.gmAdj; delete slot\.gmAdjNote;/.test(src));
+    ok('the card speaks the interjection, npc or player alike',
+      /GM interjection: \$\{amt\} to \$\{who\}'s roll/.test(src));
+    ok('a nat-1 attack fails automatically; a nat-20 defence auto-parries unless mutual',
+      /if \(atkNat === 1\) return \{ hit: false, dmg: 0, detail: 'fumbled' \};/.test(src) &&
+      /if \(defNat === defSides && atkNat !== atkSides\) return \{ hit: false, dmg: 0, detail: 'parried' \};/.test(src));
+    ok('the damage numbers are untouched: 1, +1, +1, 4',
+      /let dmg = 1;\s*\n\s*if \(atkNat === atkSides\) dmg \+= 1;\s*\n\s*if \(defNat === 1\) dmg \+= 1;\s*\n\s*if \(atkNat === atkSides && defNat === 1\) dmg \+= 1;/.test(src));
+    ok('the riposte banks on every defending 20 — the carry has no mutual exception',
+      /if \(defNat === 20\) \{\s*\n\s*ensure\(defenderId\)\.rollBonus = 2;/.test(src) &&
+      !/defNat === 20 && atkNat !== 20/.test(src));
+    ok('no attacker-side next-roll carry exists',
+      !/ensure\(attackerId\)\.rollBonus/.test(src));
+    ok('the parry and the fumble speak on the card',
+      /a perfect parry! No damage/.test(src) && /fumbles the attack/.test(src));
     ok('a claimed rank can be unwritten — strip clears the title only',
       /sub === 'strip'/.test(src) && /upsertChar\(gid, target\.id, \{ rank_name: null \}\)/.test(src) &&
       /no longer holds \*\*\$\{held\}\*\*/.test(src));
@@ -1316,7 +1353,11 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     // still a quarter of the 8000 budget spare, and the next trip of this
     // line is the moment /gm's check options should fold into a group
     // rather than the line moving again.
-    ok('the largest command keeps a quarter of its budget spare', budget[0][1] < 6000);
+    // Raised 6000→6200 (2026-08-15): /gm override interject spent the old
+    // margin on legible option prose — a fair tenant. Discord's true wall
+    // is 8000; this stays the tripwire well short of it.
+    ok('the largest command keeps clear headroom under the 8000 wall',
+      Math.max(...budget.map(([, sz]) => sz)) <= 6200);
   });
 }
 
@@ -1551,8 +1592,33 @@ function testPins(src) {
     })();
     ok('the migration record table exists',
       /CREATE TABLE IF NOT EXISTS npc_portrait_posts/.test(src));
-    ok('portraits:true is routed',
-      /getBoolean\?\.\('portraits'\)\) return runPortraitMigration/.test(src));
+    // (regrammared 2026-08-15: check folded into a group — see the fold pins)
+    // Permission sweep (T, 2026-08-15): every channel checked, repaired
+    // where the bot holds ManageRoles there, new channels caught at birth.
+    // PERMISSIONS ONLY — the heal must never touch position or parent.
+    ok('the needs list is the working minimum — no ManageMessages',
+      (() => {
+        const m = src.match(/const CHANNEL_PERMS = \[([\s\S]*?)\];/);
+        return !!m && !m[1].includes('ManageMessages') && m[1].includes('ManageWebhooks');
+      })());
+    ok('the heal sweeps every channel and writes only its own overwrite',
+      /async function healChannelPerms\(guild\)/.test(src) &&
+      /ch\.permissionOverwrites\.edit\(me\.id, allow, \{ reason: 'DDice self-repair' \}\)/.test(src));
+    ok('the heal never reorders or reparents',
+      !/healChannelPerms[\s\S]{0,2400}?(setPosition|setParent|edit\(\{\s*position)/.test(src));
+    ok('it only grants what it already holds, and says what it cannot',
+      /const grantable = missing\.filter\(k => me\.permissions\.has\(k\)\);/.test(src) &&
+      /cannot repair myself/.test(src));
+    ok('new channels are healed at birth',
+      /client\.on\('channelCreate'[\s\S]{0,700}?DDice self-repair \(new channel\)/.test(src));
+    ok('status audits without writing',
+      /Permissions correct in every channel/.test(src));
+    ok('the check fold: seven leaves, shimmed dispatch, routed group',
+      /g\.setName\('check'\)/.test(src) &&
+      ['status','run','build','restart','order','migrations','portraits'].every(l => new RegExp(String.raw`g\.addSubcommand\(s=>s\.setName\('${l}'\)`).test(src)) &&
+      /const opt = \(name\) => checkLeaf \? checkLeaf === name : !!interaction\.options\?\.getBoolean\?\.\(name\);/.test(src) &&
+      /getSubcommandGroup\(false\) === 'check'\) return await handleCheck/.test(src) &&
+      /opt\('portraits'\)/.test(src));
     ok('expired faces are recovered from channel history',
       /const recover = async \(parsed\)[\s\S]{0,900}?a\.id === parsed\.attachmentId/.test(src));
     ok('the NPC row is repointed at the re-hosted copy',

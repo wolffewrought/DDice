@@ -5332,19 +5332,30 @@ const slashCommands = [
           {name:'✨ Everything — HP, rerolls and charges',value:'all'})))
     .addSubcommand(s=>s.setName('questwipe').setDescription('Delete EVERY quest on this server — confirm-gated (GM)')
       .addBooleanOption(o=>o.setName('runs').setDescription('true = also erase the run ledger and DM guided-counters (default: history kept)').setRequired(false)))
-    .addSubcommand(s=>s.setName('check').setDescription('Which channels and forums are set up for the bot, and which await (GM)')
-      .addBooleanOption(o=>o.setName('run').setDescription('true = build anything missing — new books and tags after an update').setRequired(false))
-      .addBooleanOption(o=>o.setName('build').setDescription('true = make every channel and forum the bot needs, then fill them').setRequired(false))
-      .addBooleanOption(o=>o.setName('restart').setDescription('true = DELETE every channel the bot set up, then build fresh. Asks first.').setRequired(false))
-      .addBooleanOption(o=>o.setName('order').setDescription('true = re-apply the sidebar order and show the raw positions Discord kept').setRequired(false))
-      .addBooleanOption(o=>o.setName('migrations').setDescription('List every one-time reshape and the counts it stamped').setRequired(false))
-      .addBooleanOption(o=>o.setName('portraits').setDescription('true = move every stored NPC face into its category thread in the portrait forum').setRequired(false)))
+    .addSubcommandGroup(g => { g.setName('check').setDescription('Setup health \u2014 inspect, repair, rebuild');
+      g.addSubcommand(s=>s.setName('status').setDescription('Which channels and forums are set up, and what is missing'));
+      g.addSubcommand(s=>s.setName('run').setDescription('Build anything missing \u2014 new books and tags, nothing destroyed'));
+      g.addSubcommand(s=>s.setName('build').setDescription('Make every channel and forum the bot needs, wire and fill them'));
+      g.addSubcommand(s=>s.setName('restart').setDescription('DELETE every channel the bot set up, then build fresh'));
+      g.addSubcommand(s=>s.setName('order').setDescription('The sidebar order \u2014 prompts to re-apply or keep yours'));
+      g.addSubcommand(s=>s.setName('migrations').setDescription('Every one-time reshape and the counts it stamped'));
+      g.addSubcommand(s=>s.setName('portraits').setDescription('Move stored NPC faces into their category threads'));
+      return g; })
     .addSubcommand(s=>s.setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)')
       .addAttachmentOption(o=>o.setName('file').setDescription('A scroll PDF made by /gm scroll — I read it back as text and a fresh copy in this server\'s font').setRequired(false)))
     .addSubcommand(s=>s.setName('dicereport').setDescription('The server\'s dice health — who rolls, how the d20s run, the hot and cold hands (GM)'))
     .addSubcommandGroup(g => { g.setName('override').setDescription('Reach into guided mechanics — the ledgered hand of the GM');
       g.addSubcommand(s=>s.setName('skip').setDescription('Pass the current turn in this channel\'s fight without them acting')
         .addStringOption(o=>o.setName('reason').setDescription('Said aloud with the skip — optional').setRequired(false)));
+      g.addSubcommand(x=>x.setName('interject').setDescription('Bend a player\'s pending/next fight roll (GM)')
+        .addUserOption(o=>o.setName('user').setDescription('Whose roll').setRequired(true))
+        .addStringOption(o=>o.setName('stat').setDescription('Force their next roll\'s stat').setRequired(false)
+          .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
+        .addIntegerOption(o=>o.setName('amount').setDescription('2 or -3').setRequired(false).setMinValue(-10).setMaxValue(10))
+        .addStringOption(o=>o.setName('mode').setDescription('Shape their next roll').setRequired(false)
+          .addChoices({name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'},{name:'Flat (no stat)',value:'flat'}))
+        .addIntegerOption(o=>o.setName('die').setDescription('Declare their pending die (1-20)').setRequired(false).setMinValue(1).setMaxValue(20))
+        .addStringOption(o=>o.setName('note').setDescription('Announced with it').setRequired(false)));
       return g; })
     .addSubcommand(s=>s.setName('dc').setDescription('Call a check — stat or dice vs DC, roll buttons for players, instant rolls for NPCs (GM)')
       // ─ the scene ─
@@ -5598,7 +5609,7 @@ const slashCommands = [
         .addChoices({name:'💪 Strength',value:'str'},{name:'🫀 Constitution',value:'con'},{name:'⚡ Dexterity',value:'dex'},
                     {name:'🧠 Wisdom',value:'wis'},{name:'🍀 Luck',value:'lck'},{name:'✖️ Clear it',value:'none'})))
     .addSubcommand(s=>s.setName('give').setDescription('Give a character an item (GM)')
-      .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+      .addUserOption(o=>o.setName('user').setDescription('Whose roll').setRequired(true))
       .addStringOption(o=>o.setName('item').setDescription('What they receive').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('note').setDescription('A detail about it').setRequired(false)))
     .addSubcommand(s=>s.setName('edit').setDescription('Reword an item a character is carrying (GM)')
@@ -5607,7 +5618,7 @@ const slashCommands = [
       .addStringOption(o=>o.setName('item').setDescription('New name for it').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('note').setDescription('New detail \u2014 or "none" to clear').setRequired(false)))
     .addSubcommand(s=>s.setName('take').setDescription('Remove an item from a character (GM)')
-      .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+      .addUserOption(o=>o.setName('user').setDescription('Whose roll').setRequired(true))
       .addIntegerOption(o=>o.setName('id').setDescription('Item number from /char view inventory').setRequired(true)))
     .addSubcommand(s=>s.setName('lore').setDescription('Write your character\'s lore and send it to the GMs'))
     .addSubcommand(s=>s.setName('export').setDescription('Export your character sheet')
@@ -6081,15 +6092,15 @@ const slashCommands = [
       .addSubcommand(s=>s.setName('history').setDescription('Where a player\'s renown came from and went')
         .addUserOption(o=>o.setName('user').setDescription('Whose history').setRequired(false)))
       .addSubcommand(s=>s.setName('gain').setDescription('A character\'s standing rises (GM)')
-        .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+        .addUserOption(o=>o.setName('user').setDescription('Whose roll').setRequired(true))
         .addIntegerOption(o=>o.setName('amount').setDescription('How much').setRequired(true).setMinValue(1))
         .addStringOption(o=>o.setName('reason').setDescription('What earned it').setRequired(false)))
       .addSubcommand(s=>s.setName('loss').setDescription('A character\'s standing falls (GM)')
-        .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+        .addUserOption(o=>o.setName('user').setDescription('Whose roll').setRequired(true))
         .addIntegerOption(o=>o.setName('amount').setDescription('How much').setRequired(true).setMinValue(1))
         .addStringOption(o=>o.setName('reason').setDescription('What cost them').setRequired(false)))
       .addSubcommand(s=>s.setName('set').setDescription('Set an exact balance (GM)')
-        .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+        .addUserOption(o=>o.setName('user').setDescription('Whose roll').setRequired(true))
         .addIntegerOption(o=>o.setName('amount').setDescription('New balance').setRequired(true).setMinValue(0))))
     .addSubcommandGroup(g=>g.setName('merit').setDescription('Merit / experience — earning, trading and totals')
       .addSubcommand(s=>s.setName('give').setDescription('Offer some of your merit to another character — a GM signs it off')
@@ -6132,12 +6143,12 @@ const slashCommands = [
     .setName('instance').setDescription('Speak to one run of a quest by name \u2014 add, rally, note, pause, complete')
     .addSubcommand(s=>s.setName('add').setDescription('Seat a player on this run')
       .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
-      .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+      .addUserOption(o=>o.setName('user').setDescription('Whose roll').setRequired(true))
       .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true))
       .addBooleanOption(o=>o.setName('force').setDescription('true = past a hard cap or the fallen').setRequired(false)))
     .addSubcommand(s=>s.setName('kick').setDescription('Remove a member or applicant from this run')
       .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
-      .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true))
+      .addUserOption(o=>o.setName('user').setDescription('Whose roll').setRequired(true))
       .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('rally').setDescription('Ping this run\'s party in its thread')
       .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
@@ -7130,7 +7141,7 @@ async function handleGmTest(interaction) {
     // Uncategorised); then tear everything down.
     if (!getConfig(gid)?.npc_forum) {
       return interaction.reply({ ephemeral: true, content:
-        '\u274c No NPC forum is set \u2014 `/config channels npcforum channel:#your-forum` first, or `/gm check build:true`.' });
+        '\u274c No NPC forum is set \u2014 `/config channels npcforum channel:#your-forum` first, or `/gm check build`.' });
     }
     await interaction.deferReply();
     const A = `${GMTEST_PREFIX}Red Company`, B = `${GMTEST_PREFIX}Blue Company`;
@@ -11224,10 +11235,16 @@ async function runGmRollSlash(interaction) {
 // /gm check — the setup mirror. Unset first (with the command that sets each),
 // then the set ones with links, every stored id fetch-verified.
 async function handleCheck(interaction) {
+  // The fold (2026-08-15): check is a GROUP of leaves. The shim keeps the
+  // old boolean grammar alive for registrations still propagating — a leaf
+  // outranks a boolean, `status` (or bare) falls through to the report.
+  const checkLeaf = interaction.options?.getSubcommandGroup?.(false) === 'check'
+    ? interaction.options.getSubcommand() : null;
+  const opt = (name) => checkLeaf ? checkLeaf === name : !!interaction.options?.getBoolean?.(name);
   // `run:true` builds whatever the code knows about and this server hasn't
   // got yet — the one switch to pull after an update adds a book.
-  if (interaction.options?.getBoolean?.('portraits')) return runPortraitMigration(interaction);
-  if (interaction.options?.getBoolean?.('migrations')) {
+  if (opt('portraits')) return runPortraitMigration(interaction);
+  if (opt('migrations')) {
     // The deploy ledger, in Discord instead of Railway screenshots: every
     // one-time reshape with the counts it stamped when it ran.
     const FLAGS = [['npc_rr_backfill_1', 'NPC reroll backfill'], ['run_rename_2', 'Run christening'],
@@ -11239,7 +11256,7 @@ async function handleCheck(interaction) {
     return interaction.reply({ ephemeral: true, content: ['📋 **Migration ledger**', ...rows,
       '_v1 flags (run_rename_1, npc_threads_1) are retired and ignored._'].join('\n') });
   }
-  if (interaction.options?.getBoolean?.('order')) {
+  if (opt('order')) {
     // A hand-arranged server is a choice the bot must respect: the
     // diagnostic ASKS before it sorts. Keep = report only, touch nothing.
     const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
@@ -11250,9 +11267,9 @@ async function handleCheck(interaction) {
         new ButtonBuilder().setCustomId(`gmorder:keep:${interaction.user.id}`).setLabel('Keep my layout — report only').setStyle(ButtonStyle.Secondary),
       )] });
   }
-  if (interaction.options?.getBoolean?.('restart')) return runFullRestart(interaction);
-  if (interaction.options?.getBoolean?.('build')) return runFullSetup(interaction);
-  if (interaction.options?.getBoolean?.('run')) return runSetupRepair(interaction);
+  if (opt('restart')) return runFullRestart(interaction);
+  if (opt('build')) return runFullSetup(interaction);
+  if (opt('run')) return runSetupRepair(interaction);
   const gid = interaction.guild.id;
   if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ The setup check is for GMs.', ephemeral: true });
   await interaction.deferReply({ ephemeral: true });
@@ -11293,6 +11310,21 @@ async function handleCheck(interaction) {
     else set.push(`⚠️ ${label} — set but unreachable (deleted, or hidden from me) — re-run ${cmd}`);
   }
   const lines = ['🧭 **Channel & forum check**', ''];
+  // Permission audit — read-only, names what `run` would repair.
+  try {
+    const meS = interaction.guild.members.me;
+    const chansS = await interaction.guild.channels.fetch();
+    const badS = [];
+    for (const ch of chansS.values()) {
+      if (!ch || ch.type === 4) continue;
+      const permsS = ch.permissionsFor(meS);
+      const miss = CHANNEL_PERMS.filter(k2 => { try { return !permsS?.has(k2); } catch { return false; } });
+      if (miss.length) badS.push(`${ch.name} (${miss.slice(0, 3).join(', ')})`);
+    }
+    lines.push(badS.length
+      ? `\u26A0\uFE0F Permissions missing in **${badS.length}** channel(s): ${badS.slice(0, 8).join(' \u00B7 ')}${badS.length > 8 ? ' \u2026' : ''} \u2014 \`/gm check run\` repairs what it can`
+      : '\u2705 Permissions correct in every channel.', '');
+  } catch {}
   if (unset.length) { lines.push(`❌ **Not set** (${unset.length})`, ...unset, ''); }
   else lines.push('✅ Everything channel-backed is configured.', '');
   if (set.length) { lines.push(`✅ **Set** (${set.length})`, ...set); }
@@ -11605,15 +11637,15 @@ client.on('guildCreate', async (guild) => {
         '🎲 **DDice is here.** Two steps and this server is ready:',
         '',
         '**1.** Make a role for your GMs, then `/config mechanics gmrole role:@GM`',
-        '**2.** `/gm check build:true` — builds every channel and forum, wires them, and fills them',
+        '**2.** `/gm check build` — builds every channel and forum, wires them, and fills them',
         '',
         '_Playing 5e? `/config channels ruleset system:dnd5e` before anyone makes a character, then `/library srd`._',
-        '_`/help` lists everything, and `/gm check` shows what is still waiting._',
+        '_`/help` lists everything, and `/gm check status` shows what is still waiting._',
         ...(() => {
           // A bot cannot grant itself permissions — Discord's rule, not
           // ours — so arrival names anything missing while an admin is
           // still looking. Existing servers are never audited unprompted;
-          // /gm check build:true surfaces gaps there on demand.
+          // /gm check build surfaces gaps there on demand.
           const NEEDED = ['ManageChannels','ManageThreads','ManageRoles','ManageWebhooks','ManageMessages',
             'SendMessages','SendMessagesInThreads','CreatePublicThreads','EmbedLinks','AttachFiles',
             'AddReactions','ReadMessageHistory'];
@@ -11625,6 +11657,21 @@ client.on('guildCreate', async (guild) => {
       ].join('\n') });
     }
   } catch { /* no channel it may speak in — the commands are what matter */ }
+});
+
+// A channel born after setup gets the same permissions as the rest —
+// PERMISSIONS ONLY, never position (T, 2026-08-15).
+client.on('channelCreate', async (channel) => {
+  try {
+    const guild = channel.guild; if (!guild) return;
+    const me = guild.members.me; if (!me) return;
+    const perms = channel.permissionsFor(me);
+    const missing = CHANNEL_PERMS.filter(k => { try { return !perms?.has(k); } catch { return false; } });
+    const grantable = missing.filter(k => me.permissions.has(k));
+    if (!grantable.length || !perms?.has('ManageRoles')) return;
+    const allow = {}; for (const k of grantable) allow[k] = true;
+    await channel.permissionOverwrites.edit(me.id, allow, { reason: 'DDice self-repair (new channel)' }).catch(() => {});
+  } catch {}
 });
 
 client.once('clientReady', async () => {  // 'ready' is deprecated in favour of clientReady
@@ -12244,7 +12291,7 @@ client.on('interactionCreate', async interaction => {
         dest = approvalDestination(gidL, 'loredoc');
         ch = dest ? await interaction.client.channels.fetch(dest).catch(() => null) : null;
       }
-      if (!ch) return interaction.reply({ ephemeral: true, content: '❌ The Lore Docs home can\'t be reached even after a rebuild — ask a GM to check the approvals forum (`/gm check build:true`).' });
+      if (!ch) return interaction.reply({ ephemeral: true, content: '❌ The Lore Docs home can\'t be reached even after a rebuild — ask a GM to check the approvals forum (`/gm check build`).' });
       const link = interaction.fields.getTextInputValue('link').trim();
       const notes = (interaction.fields.getTextInputValue('notes') || '').trim();
       const pg = getCharPage(gidL, owner);
@@ -12351,13 +12398,14 @@ client.on('interactionCreate', async interaction => {
         return r; }
       if (gmSub === 'heal') return await handleGmHeal(interaction);
       if (gmSub === 'questwipe') return await runGmQuestWipe(interaction);
-      if (gmSub === 'check') return await handleCheck(interaction);
+      if (gmSub === 'check' || interaction.options.getSubcommandGroup(false) === 'check') return await handleCheck(interaction);
       if (gmSub === 'scroll') return await handleScroll(interaction);
       if (gmSub === 'dicereport') return await handleDiceReport(interaction);
       if (interaction.options.getSubcommandGroup(false) === 'override') {
         if (!(await isGm(interaction.guild, interaction.user.id))) {
           return interaction.reply({ content: '❌ Overrides are for GMs.', ephemeral: true });
         }
+        if (gmSub === 'interject') return await gmInterject(interaction);
         if (gmSub === 'skip') {
           const f = getFight(interaction.guild.id, interaction.channelId);
           if (!f || f.state !== 'active') return interaction.reply({ ephemeral: true, content: '❌ No fight is running in this channel.' });
@@ -12739,6 +12787,15 @@ const RULES_KNIGHTFALL = {
   // One damage for a hit, one more for a natural maximum, one more for the
   // defender's natural 1 — four at the very worst.
   damage: (atkRoll, atkNat, atkSides, defRoll, defNat, defSides) => {
+    // T's rules doc (Atk Fumble / Crit Def, 2026-08-15), layered on the
+    // original damage table:
+    //   nat-1 attack  -> fails automatically, whatever the totals say.
+    //   nat-20 defence -> parries automatically — UNLESS the attack was
+    //     also a nat 20, in which case the totals decide as ever.
+    //   Damage when a hit lands: 1, +1 for an attacking 20, +1 for a
+    //     defending 1, 4 when both — unchanged.
+    if (atkNat === 1) return { hit: false, dmg: 0, detail: 'fumbled' };
+    if (defNat === defSides && atkNat !== atkSides) return { hit: false, dmg: 0, detail: 'parried' };
     const hit = atkRoll >= defRoll;
     if (!hit) return { hit, dmg: 0 };
     let dmg = 1;
@@ -13030,15 +13087,31 @@ function damageBonusFor(row) {
 //     UNLESS the incoming attack was itself a nat 20.
 // Pull and clear an attacker's pending +N bonus. Returns the bonus (0 if none).
 function consumeAtkBonus(gid, cid, fid) {
+  // Unified carry: rollBonus applies to the fighter's next roll of EITHER
+  // kind. A fight already in flight may hold the pre-rule atkBonus key —
+  // honoured once, then gone.
   const fight = getFight(gid, cid);
+  if (!fight) return 0;
   const all = JSON.parse(fight.effect_state || '{}');
-  const bonus = all[fid]?.atkBonus ?? 0;
-  if (bonus && all[fid]) {
-    delete all[fid].atkBonus;
-    if (!Object.keys(all[fid]).length) delete all[fid];
+  const bonus = all[fid]?.rollBonus ?? all[fid]?.atkBonus ?? 0;
+  if (bonus) {
+    delete all[fid].rollBonus; delete all[fid].atkBonus;
     upsertFight(gid, cid, { effect_state: JSON.stringify(all) });
   }
   return bonus;
+}
+// Pull and clear a GM-forced stat for a fighter's next roll (set by
+// /gm override interject stat:). Returns the stat name or null.
+function consumeGmStat(gid, cid, fid) {
+  const fight = getFight(gid, cid);
+  if (!fight) return null;
+  const all = JSON.parse(fight.effect_state || '{}');
+  const st = all[fid]?.gmStat ?? null;
+  if (st) {
+    delete all[fid].gmStat;
+    upsertFight(gid, cid, { effect_state: JSON.stringify(all) });
+  }
+  return st;
 }
 // Pull and clear a defender's pending flat-d20 penalty. Returns true if it applied.
 function consumeFlatDef(gid, cid, fid) {
@@ -13064,10 +13137,12 @@ function applyExchangeEffects(gid, cid, attackerId, defenderId, atkNat, defNat) 
     ensure(attackerId).flatDef = true;
     notes.push('flat_def');
   }
-  // Nat-20 defence that blocks: defender's next attack gets +2, unless the
-  // attack was also a nat 20 (a perfect strike negates the riposte bonus).
-  if (defNat === 20 && atkNat !== 20) {
-    ensure(defenderId).atkBonus = 2;
+  // T's rules doc (2026-08-15): a defending 20 ALWAYS banks the +2
+  // riposte on the next attack — the old mutual-20 exception applied to
+  // the PARRY (handled in damage), never to this carry. No attacker-side
+  // next-roll carry exists; an attacking 20 pays out as damage instead.
+  if (defNat === 20) {
+    ensure(defenderId).rollBonus = 2;
     notes.push('atk_bonus');
   }
   upsertFight(gid, cid, { effect_state: JSON.stringify(all) });
@@ -14965,6 +15040,25 @@ async function resolveExchange(guild, gid, cid, fight) {
     dmgCtx = { weaponDice: weaponDiceFor(gid, atkRow),
                mod: flat != null ? flat : rulesX.statBonus(atkRow, fight.atk_stat || 'str') };
   }
+  // GM interjections land here — the one place every path converges. Each
+  // fighter's pending adjustment applies to the roll they made THIS
+  // exchange, then clears; the card says so out loud.
+  const interjectLines = [];
+  {
+    const eff = JSON.parse(fight.effect_state || '{}');
+    let effDirty = false;
+    for (const [fid, roleKey] of [[attackerId, 'atk_roll'], [defenderId, 'def_roll']]) {
+      const slot = eff[fid];
+      if (!slot?.gmAdj) continue;
+      fight[roleKey] = (fight[roleKey] ?? 0) + slot.gmAdj;
+      const who = isNpcFighter(fid) ? `**${npcNameFromFighter(fid)}**` : `<@${fid}>`;
+      const amt = `${slot.gmAdj > 0 ? '+' : ''}${slot.gmAdj}`;
+      interjectLines.push(`\u2696\uFE0F GM interjection: ${amt} to ${who}'s roll${slot.gmAdjNote ? ` \u2014 ${slot.gmAdjNote}` : ''}`);
+      delete slot.gmAdj; delete slot.gmAdjNote;
+      effDirty = true;
+    }
+    if (effDirty) upsertFight(gid, cid, { effect_state: JSON.stringify(eff) });
+  }
   const { hit, dmg, crit: atkCrit, detail: dmgDetail } = resolveDamage(
     fight.atk_roll, fight.atk_nat, 20,
     fight.def_roll, fight.def_nat, 20, gid, dmgCtx
@@ -14985,6 +15079,7 @@ async function resolveExchange(guild, gid, cid, fight) {
   const lines = ['─────────────────────────────', '⚔️  **Exchange Resolved**', ''];
   lines.push(`${atkName} (**${STAT_LABELS[fight.atk_stat]}**): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
   lines.push(`${defName} (**${STAT_LABELS[fight.def_stat]}**): ${fightTotalStr(fight.def_roll, fight.def_nat, 20)}`);
+  for (const l of interjectLines) lines.push(l);
   lines.push('');
 
   // The grapple layer: purge holds on any knockout, and a held attacker
@@ -15084,7 +15179,11 @@ async function resolveExchange(guild, gid, cid, fight) {
       return { lines, ended: false, nextF, announce: null };
     }
   } else {
-    lines.push(`🛡️ **${defName}** blocks the attack! No damage.`);
+    // The doc's automatics get their own voices — a parry and a fumble are
+    // stories, not mere arithmetic misses.
+    if (dmgDetail === 'parried') lines.push(`🛡 **${defName}** turns the blow aside — a perfect parry! No damage.`);
+    else if (dmgDetail === 'fumbled') lines.push(`💥 **${atkName}** fumbles the attack — it fails outright! No damage.`);
+    else lines.push(`🛡 **${defName}** blocks the attack! No damage.`);
     for (const l of effectNoteLines(effNotes, atkName, defName)) lines.push(l);
   }
 
@@ -15163,6 +15262,69 @@ function clearDcBind(gid, msgId) {
 // The GM reaches in and the turn passes: same clear-and-advance the normal
 // resolution uses, announced plainly so the table knows it was a ruling,
 // not the machine. Used by /gm override skip and by a failed bound check.
+// /gm override interject \u2014 a hand on the scales, mid-fight. Works in every
+// path (manual, NPCs-only, full auto) because it is CONSUMED at the one
+// place all of them meet: the resolver. If the player's roll for this
+// exchange is already on the table, the adjustment lands on it (current);
+// otherwise it waits for their next roll \u2014 no timing option needed, the
+// earliest unresolved roll is simply what it hits. Amounts sum if stacked;
+// leaving the fight clears it with the other effects.
+async function gmInterject(interaction) {
+  const gid = interaction.guild.id, cid = interaction.channel.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '\u274C Only GMs can interject.', ephemeral: true });
+  const fight = getFight(gid, cid);
+  if (!fight) return interaction.reply({ content: '\u274C No fight in this channel.', ephemeral: true });
+  const target = interaction.options.getUser('user');
+  const amount = interaction.options.getInteger('amount') ?? 0;
+  const mode = interaction.options.getString('mode');
+  const forceStat = interaction.options.getString('stat');
+  const die = interaction.options.getInteger('die');
+  if (!amount && !mode && !forceStat && !die)
+    return interaction.reply({ content: '\u274C Nothing to apply \u2014 give an amount, a mode, a stat, or a die.', ephemeral: true });
+  const order = JSON.parse(fight.turn_order || '[]');
+  if (!order.includes(target.id))
+    return interaction.reply({ content: `\u274C <@${target.id}> is not in this fight.`, ephemeral: true });
+  const note = (interaction.options.getString('note') || '').trim();
+  const all = JSON.parse(fight.effect_state || '{}');
+  const slot = all[target.id] ??= {};
+  if (amount) {
+    slot.gmAdj = (slot.gmAdj || 0) + amount;
+    if (note) slot.gmAdjNote = slot.gmAdjNote ? `${slot.gmAdjNote}; ${note}` : note;
+  }
+  if (forceStat) slot.gmStat = forceStat;
+  upsertFight(gid, cid, { effect_state: JSON.stringify(all) });
+  // Advantage / disadvantage / flat rides the same mark the /gm mark tool
+  // uses — consumed by their next roll, spoken on it as ever.
+  if (mode) upsertChar(gid, target.id, { next_mark: mode });
+  // The die declaration — the one lever that CAN rewrite a cast die. The
+  // fight keeps natural and total apart until resolve, so the total
+  // recomputes around their existing modifier, and every automatic (parry,
+  // fumble, crit damage) honors the declared face.
+  let dieLine = '';
+  if (die) {
+    const isAtk = JSON.parse(fight.turn_order || '[]')[fight.turn_index] === target.id && fight.atk_nat != null;
+    const isDef = fight.current_target === target.id && fight.def_nat != null;
+    if (!isAtk && !isDef)
+      return interaction.reply({ content: '\u274C Nothing cast to override \u2014 `die:` only rewrites a roll already on the table.', ephemeral: true });
+    const natKey = isAtk ? 'atk_nat' : 'def_nat', rollKey = isAtk ? 'atk_roll' : 'def_roll';
+    const was = fight[natKey];
+    const delta = die - was;
+    upsertFight(gid, cid, { [natKey]: die, [rollKey]: (fight[rollKey] ?? was) + delta });
+    dieLine = `; die declared **${die}** (was ${was})`;
+  }
+  const nm = await getDisplayName(interaction.guild, target.id);
+  const parts = [];
+  if (amount) parts.push(slot.gmAdj > 0 ? `+${slot.gmAdj}` : `${slot.gmAdj}`);
+  if (mode) parts.push(mode === 'adv' ? 'advantage' : mode === 'dis' ? 'disadvantage' : 'a flat d20');
+  if (forceStat) parts.push(`stat forced to ${STAT_LABELS[forceStat]}`);
+  if (die) parts.push(`die declared ${die}`);
+  const sign = parts.join(' \u00B7 ');
+  await interaction.channel.send({ content: `\u2696\uFE0F **GM interjects:** **${nm}**'s pending or next roll: ${sign}${note ? ` \u2014 ${note}` : ''}`, allowedMentions: { parse: [] } }).catch(() => {});
+  sendRollAudit(interaction.client, gid, `\u2696\uFE0F Interject \u2014 **${nm}** ${sign}${note ? ` \u00B7 ${note}` : ''} \u00B7 by ${interaction.user.tag}`);
+  return interaction.reply({ content: `\u2705 Interjection recorded \u2014 ${sign} \u2014 on **${nm}**'s earliest unresolved roll (mode and stat bind the next roll made).`, ephemeral: true });
+}
+
 async function gmSkipTurn(guild, gid, cid, reason) {
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active') return null;
@@ -15283,6 +15445,15 @@ async function runAutoNpcChain(guild, gid, cid, channel) {
 // `refuse` adapts to the surface: ephemeral reply for the command, an in-place
 // update that also strips the stale menu for the picker.
 async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, mode, flavour }) {
+  // A GM interjection can force the stat — consumed HERE so every caller
+  // (slash command and the target-picker button replay) obeys it.
+  let gmStatNote = '';
+  {
+    const forced = consumeGmStat(gid, cid, actorId);
+    if (forced && forced !== stat) { gmStatNote = ` \u2696\uFE0F stat set to ${STAT_LABELS[forced]} by the GM`; stat = forced; }
+    else if (forced) { gmStatNote = ` \u2696\uFE0F GM confirmed ${STAT_LABELS[forced]}`; }
+  }
+
   const uid = interaction.user.id;
   const fromMenu = !!interaction.isStringSelectMenu?.();
   const refuse = (content) => fromMenu
@@ -15393,7 +15564,7 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     const critType = nat === 20 ? 'crit' : (nat === 1 ? 'fail' : null);
     const actorCard = await fighterCharCard(interaction.guild, gid, actorId);
 
-    const headerLabel = `⚔️ Attacks ${targetName} with ${STAT_LABELS[stat]}`;
+    const headerLabel = `⚔️ Attacks ${targetName} with ${STAT_LABELS[stat]}${gmStatNote}`;
     const card = styledFightCard(gid, actorId, {
       rollLine: publicLine, label: headerLabel, isReroll: false,
       char: actorCard, healCharges: 0, maxCharges: 0,
@@ -17014,7 +17185,11 @@ async function handleFight(interaction, forced) {
       }
     }
 
-    const stat = forcedStat ?? interaction.options?.getString?.('stat');
+    let stat = forcedStat ?? interaction.options?.getString?.('stat');
+    const gmStatD = consumeGmStat(gid, cid, defenderId);
+    let gmStatNoteD = '';
+    if (gmStatD && gmStatD !== stat) { gmStatNoteD = ` \u2696\uFE0F stat set to ${STAT_LABELS[gmStatD]} by the GM`; stat = gmStatD; }
+    else if (gmStatD) { gmStatNoteD = ` \u2696\uFE0F GM confirmed ${STAT_LABELS[gmStatD]}`; }
     const flavour = interaction.options?.getString?.('flavour') ?? null;
     let mode = interaction.options?.getString?.('roll') ?? 'normal';
 
@@ -18517,9 +18692,9 @@ const HELP_CATEGORIES = {
       '`/gm kill user:@a` / `/gm revive user:@a` — mark a character fallen and post their memorial, or bring them back (GM)',
       '`/gm test quest/npc/list/forum/clean` — throwaway fixtures, a live forum exercise, and the broom that clears them (GM)',
       '`/gm questwipe [runs:true]` — delete every quest on the server, confirm-gated; the run ledger and DM counters survive unless runs:true (GM)',
-      '`/gm check build:true` — the one-command setup: makes every channel and forum the bot needs in two sections — **DDice** open to the table, **DDice · Game Masters** shut to everyone else — wires the config and fills them. Adopts anything already there, so it is safe to run on a server set up by hand (Admin)',
-      '`/gm check run:true` — build anything missing: audit shelves, pipeline books and tags. Adopts what exists, so it is safe to run any time — pull it after an update adds a book (GM)',
-      '`/gm check` — the setup mirror: every channel-backed feature, unset first with the command that sets it, then the set ones with links — stored ids are verified live (GM)',
+      '`/gm check build` — the one-command setup: makes every channel and forum the bot needs in two sections — **DDice** open to the table, **DDice · Game Masters** shut to everyone else — wires the config and fills them. Adopts anything already there, so it is safe to run on a server set up by hand (Admin)',
+      '`/gm check run` — build anything missing: audit shelves, pipeline books and tags. Adopts what exists, so it is safe to run any time — pull it after an update adds a book (GM)',
+      '`/gm check status` — the setup mirror: every channel-backed feature, unset first with the command that sets it, then the set ones with links — stored ids are verified live (GM)',
       '`/config channels questforum channel:#forum` — the board becomes a forum: one thread per quest, lifecycle mirrored in, archived on completion (Admin)',
       '`/config channels charforum/memorial/questlog/docs` — a page per approved character · where fallen characters are remembered · where finished quest summaries post · publish the command PDFs to a GM channel (Admin)',
       '`/config channels scrollarchive` — the scroll library; point it at a forum and each GM\'s scrolls file in their own 📜 thread, opened on first use (Admin)',
@@ -20000,7 +20175,7 @@ async function sweepQuestChannels(client, gid, quest) {
 // position sequences per channel type and merges them by raw value (every
 // edit lands, and the raw table shows text and forum numbering running
 // independently).
-// /gm check portraits:true — move every stored NPC face into its category
+// /gm check portraits — move every stored NPC face into its category
 // thread in the portrait forum, and make the forum the canonical host.
 //
 // The stored URLs point at attachments in whatever channel they were
@@ -20177,7 +20352,7 @@ async function runPortraitMigration(interaction) {
   return interaction.editReply({ content: lines.join('\n').slice(0, 1990) });
 }
 
-// /gm check order:true — the diagnostic. Re-applies the plan and prints the
+// /gm check order — the diagnostic. Re-applies the plan and prints the
 // evidence: wanted slot, type, raw position before and after, and each
 // category's raw sequences split by type. One screenshot of this settles
 // which of the two failure stories is true.
@@ -20194,7 +20369,7 @@ async function runOrderReport(interaction, mode = 'apply') {
     if (plan.json) { try { id = JSON.parse(cfg[plan.key] || '{}')[plan.json] || null; } catch { id = null; } }
     if (id) entries.push({ id, gm: plan.gm, cat: plan.gm ? cats['DDice \u00b7 Game Masters'] : cats['DDice'] });
   }
-  if (!entries.length) return interaction.editReply({ content: '\u2699\ufe0f Nothing configured to order \u2014 `/gm check build:true` first.' });
+  if (!entries.length) return interaction.editReply({ content: '\u2699\ufe0f Nothing configured to order \u2014 `/gm check build` first.' });
   // Keep-mode swaps the applier for a pure observer over the same entries.
   const { lines, refused } = mode === 'keep'
     ? await observeSidebarOrder(guild, entries)
@@ -20257,7 +20432,7 @@ async function applySidebarOrder(guild, entries) {
   return { lines, refused };
 }
 
-// /gm check restart:true — tear down EVERYTHING the config points at, then
+// /gm check restart — tear down EVERYTHING the config points at, then
 // build fresh. The teardown list is read from config at the moment of the
 // confirm press, categories included, regardless of who made the channels or
 // what has happened to them since: that is the deliberate scope. The reply
@@ -20286,7 +20461,7 @@ async function runFullRestart(interaction) {
     .filter(Boolean);
 
   if (!doomed.size && !cats.length) {
-    return interaction.reply({ ephemeral: true, content: '\u2699\ufe0f Nothing is set up yet \u2014 `/gm check build:true` is the one you want.' });
+    return interaction.reply({ ephemeral: true, content: '\u2699\ufe0f Nothing is set up yet \u2014 `/gm check build` is the one you want.' });
   }
   // The confirm card and the report both live in this channel. If it is on
   // the list, they die mid-flight and the command can never say what it did.
@@ -20345,10 +20520,16 @@ async function runFullSetup(interaction) {
   }
   await interaction.deferReply();
   const lines = await buildAllSetup(interaction);
+  // Sweep permissions as part of the build — every channel, old and new.
+  try {
+    const hp = await healChannelPerms(interaction.guild);
+    if (hp.fixed) lines.push(`\u{1F527} Permissions repaired in **${hp.fixed}** channel(s)`);
+    if (hp.blocked) lines.push(`\u26A0\uFE0F **${hp.blocked}** channel(s) need the DDice role granted directly: ${hp.blockedNames.join(' \u00B7 ')}`);
+  } catch {}
   return interaction.editReply({ content: lines.join('\n').slice(0, 1990) });
 }
 
-// The build itself, callable from /gm check build:true and from restart's
+// The build itself, callable from /gm check build and from restart's
 // confirm press alike. Returns the report lines; the caller owns the
 // reply, because the two paths hold their interactions in different
 // acknowledged states and a second deferReply throws.
@@ -20388,7 +20569,7 @@ async function buildAllSetup(interaction) {
   // positions alone so a hand-arranged sidebar survives it.
   try {
     const ord = await applySidebarOrder(guild, sidebar);
-    if (ord.refused) lines.push(`\u26a0\ufe0f Sidebar: ${ord.refused} position edit${ord.refused === 1 ? '' : 's'} refused \u2014 \`/gm check order:true\` shows the raw table.`, '');
+    if (ord.refused) lines.push(`\u26a0\ufe0f Sidebar: ${ord.refused} position edit${ord.refused === 1 ? '' : 's'} refused \u2014 \`/gm check order\` shows the raw table.`, '');
   } catch (err) { console.error('[setup] sidebar order -', err?.message || err); }
 
   const made = [...open.made, ...gm.made];
@@ -20458,13 +20639,61 @@ async function buildAllSetup(interaction) {
   if (tags) lines.push('🏷️ Pipeline tags checked');
   lines.push('', '_What is left is yours to decide:_ `/config mechanics gmrole` names your GMs, '
     + '`/config channels ruleset` picks the rules, and `/config channels docs` needs your repo. '
-    + 'Run `/gm check` any time to see what is set.');
+    + 'Run `/gm check status` any time to see what is set.');
   return lines;
 }
 
 // Build anything missing, then say plainly what changed and what was
 // already there. Safe to run as often as you like: surviving threads are
 // adopted by id, never remade.
+// The permissions the bot needs in every channel it works in. Guild-wide
+// grants normally cover this; these are the per-channel repairs for
+// anywhere an explicit DENY has been written over the top.
+const CHANNEL_PERMS = ['ViewChannel','SendMessages','SendMessagesInThreads','CreatePublicThreads',
+  'ManageThreads','ManageWebhooks','EmbedLinks','AttachFiles','AddReactions','ReadMessageHistory'];
+// ManageMessages deliberately absent (T, 2026-08-15): editing and deleting
+// its OWN messages needs no permission, and no DDice feature deletes or
+// pins anyone else's. If one ever does, the audit names the channel.
+
+// Sweep every channel and repair the bot's own overwrite where it can.
+// PERMISSIONS ONLY — this never moves, renames, reparents or reorders
+// anything (T, 2026-08-15). Returns { fixed, blocked, already, names }.
+async function healChannelPerms(guild) {
+  const me = guild.members.me;
+  const out = { fixed: 0, blocked: 0, already: 0, names: [], blockedNames: [] };
+  if (!me) return out;
+  let channels;
+  try { channels = await guild.channels.fetch(); } catch { return out; }
+  for (const ch of channels.values()) {
+    if (!ch || ch.type === 4) continue;                       // categories inherit down
+    const perms = ch.permissionsFor(me);
+    const missing = CHANNEL_PERMS.filter(k => {
+      try { return !perms?.has(k); } catch { return false; }
+    });
+    if (!missing.length) { out.already++; continue; }
+    // Can only write an overwrite where it holds ManageRoles in THAT
+    // channel, and can only grant what it already holds guild-wide.
+    const grantable = missing.filter(k => me.permissions.has(k));
+    if (!perms?.has('ManageRoles') || !grantable.length) {
+      out.blocked++;
+      if (out.blockedNames.length < 12) out.blockedNames.push(`${ch.name} (${missing.slice(0, 3).join(', ')})`);
+      continue;
+    }
+    const allow = {};
+    for (const k of grantable) allow[k] = true;
+    try {
+      await ch.permissionOverwrites.edit(me.id, allow, { reason: 'DDice self-repair' });
+      out.fixed++;
+      if (out.names.length < 12) out.names.push(ch.name);
+      await pace(150);
+    } catch {
+      out.blocked++;
+      if (out.blockedNames.length < 12) out.blockedNames.push(ch.name);
+    }
+  }
+  return out;
+}
+
 async function runSetupRepair(interaction) {
   const gid = interaction.guild.id;
   if (!(await isGm(interaction.guild, interaction.user.id))) {
@@ -20472,6 +20701,14 @@ async function runSetupRepair(interaction) {
   }
   await interaction.deferReply({ ephemeral: true });
   const lines = ['🔧 **Setup run**', ''];
+  // Every channel checked and repaired where possible — permissions only.
+  {
+    const h = await healChannelPerms(interaction.guild);
+    lines.push(h.fixed ? `\u{1F527} Permissions repaired in **${h.fixed}** channel(s)${h.names.length ? `: ${h.names.join(', ')}` : ''}`
+                       : `\u2705 Permissions already correct in **${h.already}** channel(s)`);
+    if (h.blocked) lines.push(`\u26A0\uFE0F **${h.blocked}** channel(s) I cannot repair myself \u2014 grant the DDice role the missing permissions: ${h.blockedNames.join(' \u00B7 ')}`);
+    lines.push('');
+  }
   let built = 0;
 
   const audit = await ensureAuditBooks(interaction.client, gid).catch(err => ({ error: err?.message || String(err) }));
@@ -20605,7 +20842,7 @@ async function spinOffRun(interaction, gid, root, approvedIds) {
 // Staff type, players read: the character forum's threads are adjusted by
 // GMs only — players ask a Moderator or Expeditioner (the notice block says
 // so). Needs the gm role configured and Manage Roles; skipped with a log
-// line otherwise, and /gm check build:true reapplies it on demand.
+// line otherwise, and /gm check build reapplies it on demand.
 async function lockCharForum(guild, forum) {
   const gid = guild.id;
   const gmRole = getConfig(gid)?.gm_role_id;
