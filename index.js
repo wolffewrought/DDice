@@ -20787,6 +20787,10 @@ async function buildAllSetup(interaction) {
   } catch {}
   const quests = await ensureQuestBooks(interaction.client, guild, gid).catch(() => null);
   const appr = await ensureApprovalThreads(interaction.client, gid).catch(() => null);
+  // The feedback rooms mend beside the approval rooms — omitting this was
+  // why the forum appeared empty (live, 2026-08-16).
+  const fbk = await ensureFeedbackThreads(interaction.client, gid).catch(() => null);
+  if (fbk?.error) console.log('[feedback-threads]', fbk.error);
   let tags = false;
   try {
     const tagForumId = getConfig(gid)?.quest_thread_forum ?? getConfig(gid)?.quest_plan_forum;
@@ -20910,6 +20914,10 @@ async function runSetupRepair(interaction) {
 
   const quests = await ensureQuestBooks(interaction.client, interaction.guild, gid).catch(err => ({ error: err?.message || String(err) }));
   const appr2 = await ensureApprovalThreads(interaction.client, gid).catch(err => ({ error: err?.message || String(err) }));
+  const fbk2 = await ensureFeedbackThreads(interaction.client, gid).catch(err => ({ error: err?.message || String(err) }));
+  if (fbk2?.error) lines.push(`\u26A0\uFE0F Feedback rooms \u2014 ${fbk2.error}`);
+  else if (fbk2?.made?.length) lines.push(`\u{1F4DD} Feedback rooms opened: ${fbk2.made.length}`);
+  else if (fbk2) lines.push('\u2705 Feedback rooms in place');
   if (!quests) lines.push('🗺️ Quest planning forum — _not set; `/config channels questplanning` first_');
   else if (quests.error) lines.push(`🗺️ Quest planning forum — ⚠️ ${quests.error}`);
   else {

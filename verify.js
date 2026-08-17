@@ -969,6 +969,9 @@ function testBuilders(src) {
       cmds.length === 18 && cmds.some(c => c.name === 'feedback'));
     // Feedback: GM-only forum, per-room threads, every player step
     // ephemeral so no one sees who spoke (T). GMs see the author.
+    ok('both setup paths mend the feedback rooms — the empty-forum bug',
+      /const fbk = await ensureFeedbackThreads\(interaction\.client, gid\)/.test(src) &&
+      /const fbk2 = await ensureFeedbackThreads\(interaction\.client, gid\)/.test(src));
     ok('feedback rooms are seven, extensible, and thread-mended',
       /FEEDBACK_TYPES_BASE = \{[\s\S]{0,900}?gms:/.test(src) &&
       /function feedbackTypes\(gid\)/.test(src) &&
