@@ -183,6 +183,9 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN memorial_public_channel TEXT'
 // can link to it.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN char_forum TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_char_forum TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_forum TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_routes TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_cats TEXT'); } catch {}
 // The character thread's block layout: starter = sheet, plus three
 // bot-owned blocks (inventory · lore · dice) edited in place. Hashes let
 // the hourly sweep skip blocks that haven't changed — near-zero traffic
@@ -1003,6 +1006,47 @@ const approvalChannelId = (gid) => getConfig(gid)?.approval_channel_id || null;
 // stored as JSON in guild_config.approval_routes. Every producer asks for its
 // own type's destination; the single approval channel remains the fallback, so
 // a server that never touches the forum behaves exactly as it always has.
+// Where players' feedback lands: one thread per category in a GM-only
+// forum. Seven to begin with; `/feedback category add` grows the list and
+// the new thread appears at once (T, 2026-08-16).
+const FEEDBACK_TYPES_BASE = {
+  general:    { name: '\u{1F4AC} General',    about: 'Anything that does not fit the other rooms.' },
+  quests:     { name: '\u{1F5FA}\uFE0F Quests',     about: 'Runs, pacing, rewards, the board itself.' },
+  encounters: { name: '\u2694\uFE0F Encounters', about: 'Fights, foes, difficulty, the shape of a scene.' },
+  system:     { name: '\u{1F3DB}\uFE0F System',     about: 'The world, its rules of play, how it hangs together.' },
+  mechanics:  { name: '\u{1F3B2} Mechanics',  about: 'Dice, stats, crits, carries \u2014 the maths of it.' },
+  ddice:      { name: '\u{1F916} DDice bot',  about: 'The bot itself \u2014 bugs, papercuts, wishes.' },
+  gms:        { name: '\u{1F451} GMs',        about: 'How the game is run, and by whom.' },
+};
+// Custom categories live in config, keyed by a slug so their thread ids
+// survive a rename.
+function feedbackCats(gid) {
+  try { const o = JSON.parse(getConfig(gid)?.feedback_cats || '[]'); return Array.isArray(o) ? o : []; }
+  catch { return []; }
+}
+function feedbackTypes(gid) {
+  const out = { ...FEEDBACK_TYPES_BASE };
+  for (const c of feedbackCats(gid)) out[c.key] = { name: `\u{1F4CC} ${c.name}`, about: 'Added by a GM.' };
+  return out;
+}
+function feedbackRoutes(gid) {
+  try { const o = JSON.parse(getConfig(gid)?.feedback_routes || 'null'); return (o && typeof o === 'object') ? o : null; }
+  catch { return null; }
+}
+// SETUP_PLAN records the forum as `feedback_forum`; the shared mender
+// reads `feedback_routes.forum`. Seed the bridge, then mend.
+async function ensureFeedbackThreads(client, gid) {
+  const cfg = getConfig(gid);
+  if (!feedbackRoutes(gid)?.forum && cfg?.feedback_forum) {
+    setConfig(gid, { feedback_routes: JSON.stringify({ forum: cfg.feedback_forum }) });
+  }
+  return ensureForumThreads(client, gid, { configKey: 'feedback_routes', types: feedbackTypes(gid), routesOf: feedbackRoutes });
+}
+function feedbackDestination(gid, type) {
+  const r = feedbackRoutes(gid);
+  return (r && r[type]) || null;
+}
+
 const APPROVAL_TYPES = {
   sheets:  { name: '📋 Character Sheets', about: 'New and edited sheets, budget refusals and resubmissions land here.' },
   trades:  { name: '🤝 Merit Trades',     about: 'Player-to-player merit offers wait here for a GM to sign off.' },
@@ -6282,6 +6326,17 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('delete').setDescription('Delete a quest permanently (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))),
+
+  new SlashCommandBuilder()
+    .setName('feedback').setDescription('Tell the GMs what you think \u2014 privately')
+    .addSubcommand(s=>s.setName('send').setDescription('Send feedback to the GMs \u2014 pick a room, score it, say your piece'))
+    .addSubcommandGroup(g => { g.setName('category').setDescription('The rooms feedback lands in (GM)');
+      g.addSubcommand(s=>s.setName('add').setDescription('Add a feedback room (GM)')
+        .addStringOption(o=>o.setName('name').setDescription('What to call it').setRequired(true)));
+      g.addSubcommand(s=>s.setName('remove').setDescription('Retire a feedback room \u2014 its thread stays (GM)')
+        .addStringOption(o=>o.setName('name').setDescription('Which room').setRequired(true).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('list').setDescription('Every feedback room and its thread'));
+      return g; }),
 ];
 
 // ─────────────────────────────────────────────
@@ -10437,6 +10492,8 @@ const SETUP_PLAN = [
     about: 'The full record of a death — cause, deeds and standing — for GMs.' },
   { key: 'backup_channel_id',     name: 'backups',          forum: false, gm: true,  essential: false,
     about: 'Where the nightly backup of everything is posted.' },
+  { key: 'feedback_forum',        name: 'gm-feedback', forum: true, gm: true, essential: false,
+    about: 'Player feedback, one thread per category \u2014 GM eyes only; players post with `/feedback send`.' },
   { key: 'gm_char_forum',         name: 'gm-character-sheets', forum: true, gm: true, essential: false,
     about: 'GM characters live here — same five blocks and tags as the player forum, behind the GM category\'s eyes only.' },
   { key: 'docs_channel',          name: 'command-reference', forum: false, gm: true, essential: false,
@@ -11822,6 +11879,19 @@ async function routeButton(interaction) {
     // filed under modal traffic, so presses timed out unacknowledged
     // ("didn't respond in time", live 2026-08-14). Their modals
     // (loredocm/loredonm) stay in the modal lane where they belong.
+    if (interaction.customId.startsWith('fbq:')) {
+      // Anyone in the run may speak; the press and everything after is
+      // ephemeral, so the party never sees who did.
+      const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+      const m = new ModalBuilder().setCustomId(interaction.customId).setTitle('Feedback on this quest');
+      m.addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('scale')
+          .setLabel('Score the quest 1-10').setPlaceholder('8').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(2)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('body')
+          .setLabel('How did it play?').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1500)),
+      );
+      return interaction.showModal(m);
+    }
     if (interaction.customId.startsWith('loredoc:')) {
       const owner = interaction.customId.split(':')[1];
       if (interaction.user.id !== owner) {
@@ -11927,6 +11997,15 @@ client.on('interactionCreate', async interaction => {
         return await interaction.respond(choices);
       }
 
+      // Which feedback rooms a GM may retire — the seven built-ins never
+      // appear, since they cannot be removed.
+      if (interaction.commandName === 'feedback') {
+        const q = String(focusedOption.value || '').toLowerCase();
+        const opts = feedbackCats(interaction.guild.id)
+          .filter(c => !q || c.name.toLowerCase().includes(q))
+          .slice(0, 25).map(c => ({ name: c.name, value: c.name }));
+        return interaction.respond(opts).catch(() => {});
+      }
       // Rank name autocomplete (/standing rank remove, /standing rank promote)
       if ((interaction.commandName === 'standing' && focusedOption.name === 'rank') ||
           (interaction.commandName === 'standing' && focusedOption.name === 'name' && interaction.options.getSubcommand(false) === 'remove')) {
@@ -12311,6 +12390,20 @@ client.on('interactionCreate', async interaction => {
         })()] }).catch(() => null);
       return interaction.reply({ ephemeral: true, content: '✅ Sent to the GMs — they\'ll look it over in the Lore Docs approvals.' });
     }
+    if (interaction.customId.startsWith('fbm:') || interaction.customId.startsWith('fbq:')) {
+      const isQuest = interaction.customId.startsWith('fbq:');
+      const key = isQuest ? 'quests' : interaction.customId.slice(4);
+      const raw = interaction.fields.getTextInputValue('scale').replace(/[^0-9]/g, '');
+      const scale = parseInt(raw || '0', 10);
+      if (!scale || scale < 1 || scale > 10)
+        return interaction.reply({ ephemeral: true, content: '\u274C The score needs to be a number from 1 to 10.' });
+      const body = interaction.fields.getTextInputValue('body').trim();
+      const extra = isQuest ? `\u{1F5FA}\uFE0F On quest **${decodeURIComponent(interaction.customId.slice(4))}**` : '';
+      const posted = await postFeedbackCard(interaction, interaction.guild.id, key, scale, body, extra);
+      return interaction.reply({ ephemeral: true, content: posted
+        ? '\u2705 Sent to the GMs \u2014 thank you. No one else can see it.'
+        : '\u274C The feedback room could not be reached \u2014 ask a GM to run `/gm check build`.' });
+    }
     if (interaction.customId === 'loresubmit') return handleLoreSubmit(interaction);
     if (interaction.customId.startsWith('gmkill:')) return handleGmKillModal(interaction);
     if (interaction.customId.startsWith('lorereject:')) return handleLoreRejectModal(interaction);
@@ -12338,6 +12431,18 @@ client.on('interactionCreate', async interaction => {
     const channel = await interaction.guild.channels.fetch(interaction.values[0]).catch(() => null);
     if (!channel) return interaction.reply({ content: '❌ Couldn\'t read that channel.', ephemeral: true });
     return handleConfig(interaction, { sub: key, channel });
+  }
+  if (interaction.isStringSelectMenu?.() && interaction.customId === 'fbcat') {
+    const key = interaction.values[0];
+    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+    const m = new ModalBuilder().setCustomId(`fbm:${key}`).setTitle('Feedback for the GMs');
+    m.addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('scale')
+        .setLabel('Score it 1-10').setPlaceholder('7').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(2)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('body')
+        .setLabel('Your feedback').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1500)),
+    );
+    return interaction.showModal(m);
   }
   if (interaction.isStringSelectMenu?.() && interaction.customId.startsWith('fighttarget:')) {
     try {
@@ -12446,6 +12551,7 @@ client.on('interactionCreate', async interaction => {
       if (sg === 'rank') return await handleRank(interaction);
     }
     if (interaction.commandName === 'instance') return await handleInstance(interaction);
+    if (interaction.commandName === 'feedback') return await handleFeedback(interaction);
     if (interaction.commandName === 'quest') return await handleQuest(interaction);
   } catch (err) {
     console.error(`[${interaction.commandName}] error:`, err);
@@ -15269,6 +15375,87 @@ function clearDcBind(gid, msgId) {
 // otherwise it waits for their next roll \u2014 no timing option needed, the
 // earliest unresolved roll is simply what it hits. Amounts sum if stacked;
 // leaving the fight clears it with the other effects.
+// Player feedback: a GM-only forum, one thread per room, and every
+// player-facing step ephemeral so nobody sees who said what (T,
+// 2026-08-16). GMs see the author on the card; other players see nothing
+// at all — not the command, not the reply, not the entry.
+async function handleFeedback(interaction) {
+  const gid = interaction.guild.id;
+  const group = interaction.options.getSubcommandGroup(false);
+  const sub = interaction.options.getSubcommand();
+
+  if (group === 'category') {
+    if (sub === 'list') {
+      const types = feedbackTypes(gid), routes = feedbackRoutes(gid) || {};
+      const rows = Object.entries(types).map(([k, t]) =>
+        `${t.name} \u2014 ${routes[k] ? `<#${routes[k]}>` : '_no thread yet_'}`);
+      return interaction.reply({ ephemeral: true, content: ['\u{1F4DD} **Feedback rooms**', ...rows].join('\n') });
+    }
+    if (!(await isGm(interaction.guild, interaction.user.id)))
+      return interaction.reply({ content: '\u274C Only GMs can change the feedback rooms.', ephemeral: true });
+    const name = interaction.options.getString('name').trim();
+    const key = name.toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 20);
+    const cats = feedbackCats(gid);
+    if (sub === 'add') {
+      if (!key) return interaction.reply({ content: '\u274C That name has no letters in it.', ephemeral: true });
+      if (FEEDBACK_TYPES_BASE[key] || cats.some(c => c.key === key))
+        return interaction.reply({ content: `\u274C **${name}** already exists.`, ephemeral: true });
+      cats.push({ key, name });
+      setConfig(gid, { feedback_cats: JSON.stringify(cats) });
+      await interaction.deferReply({ ephemeral: true });
+      const res = await ensureFeedbackThreads(interaction.client, gid).catch(e => ({ error: e?.message }));
+      return interaction.editReply({ content: res?.error
+        ? `\u2705 **${name}** added \u2014 but its thread could not be made: ${res.error}`
+        : `\u2705 **${name}** added \u2014 its thread is open and the room appears in \`/feedback send\` at once.` });
+    }
+    if (sub === 'remove') {
+      const found = cats.find(c => c.key === key || c.name.toLowerCase() === name.toLowerCase());
+      if (!found) return interaction.reply({ content: `\u274C No custom room named **${name}** \u2014 the seven built-in rooms cannot be retired.`, ephemeral: true });
+      setConfig(gid, { feedback_cats: JSON.stringify(cats.filter(c => c !== found)) });
+      return interaction.reply({ ephemeral: true, content: `\u2705 **${found.name}** retired \u2014 its thread and everything in it stays put.` });
+    }
+  }
+
+  // `send` — the picker. Ephemeral, so no one else sees it happen.
+  const types = feedbackTypes(gid);
+  const routes = feedbackRoutes(gid);
+  if (!routes?.forum) {
+    const cfg = getConfig(gid);
+    if (!cfg?.feedback_forum)
+      return interaction.reply({ ephemeral: true, content: '\u274C No feedback forum is set up yet \u2014 a GM needs `/gm check build`.' });
+  }
+  const { ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
+  const menu = new StringSelectMenuBuilder().setCustomId('fbcat').setPlaceholder('Which room?')
+    .addOptions(Object.entries(types).slice(0, 25).map(([k, t]) => ({ label: t.name.slice(0, 100), value: k, description: t.about?.slice(0, 100) })));
+  return interaction.reply({ ephemeral: true, content: '\u{1F4DD} **Feedback** \u2014 pick a room, then score it and say your piece. Only the GMs will see it.',
+    components: [new ActionRowBuilder().addComponents(menu)] });
+}
+
+// The card every route shares — GMs see who wrote it.
+async function postFeedbackCard(interaction, gid, key, scale, body, extra = '') {
+  let dest = feedbackDestination(gid, key);
+  if (!dest) {
+    await ensureFeedbackThreads(interaction.client, gid).catch(() => null);
+    dest = feedbackDestination(gid, key);
+  }
+  if (!dest) return null;
+  const ch = await interaction.client.channels.fetch(dest).catch(() => null);
+  if (!ch) return null;
+  const n = Math.max(1, Math.min(10, scale || 0));
+  const bar = '\u2B50'.repeat(n) + '\u00B7'.repeat(10 - n);
+  const nm = await getDisplayName(interaction.guild, interaction.user.id).catch(() => null);
+  const pg = getCharPage(gid, interaction.user.id);
+  const out = [
+    `\u{1F4DD} **Feedback** \u2014 <@${interaction.user.id}>${nm ? ` (${nm})` : ''}`,
+    `${bar}  **${n}/10**`,
+    extra || '',
+    '',
+    body.slice(0, 1600),
+    pg?.thread_id ? `\n\u{1F3F7}\uFE0F Their page: <#${pg.thread_id}>` : '',
+  ].filter(Boolean).join('\n');
+  return ch.send({ content: out, allowedMentions: { parse: [] } }).catch(() => null);
+}
+
 async function gmInterject(interaction) {
   const gid = interaction.guild.id, cid = interaction.channel.id;
   if (!(await isGm(interaction.guild, interaction.user.id)))
@@ -21924,11 +22111,17 @@ async function handleQuest(interaction, forced) {
 
     // Announce in the designated run channel if set and different from here
     const announce = lines.join('\n');
+    // The party gets a door to feedback the moment the run closes — the
+    // press is private, the card lands in the GMs' Quests room.
+    const { ActionRowBuilder: FbRow, ButtonBuilder: FbBtn, ButtonStyle: FbStyle } = require('discord.js');
+    const fbRow = new FbRow().addComponents(new FbBtn()
+      .setCustomId(`fbq:${encodeURIComponent(questTag(quest)).slice(0, 80)}`)
+      .setLabel('\u{1F4DD} Feedback on this quest').setStyle(FbStyle.Secondary));
     if (quest.run_channel_id && quest.run_channel_id !== interactionChannelId(interaction)) {
-      try { const rc = await interaction.client.channels.fetch(quest.run_channel_id); await rc.send(announce); } catch {}
+      try { const rc = await interaction.client.channels.fetch(quest.run_channel_id); await rc.send({ content: announce, components: [fbRow] }); } catch {}
       return interaction.editReply({ content: `${announce}\n\n_(Also posted in <#${quest.run_channel_id}>.)_` });
     }
-    return interaction.editReply({ content: announce });
+    return interaction.editReply({ content: announce, components: [fbRow] });
   }
 
   if (sub === 'delete') {

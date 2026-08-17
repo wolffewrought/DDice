@@ -965,8 +965,34 @@ function testBuilders(src) {
                      'help', 'library', 'npc', 'quest', 'quiz', 'roll', 'spell', 'standing']) {
       ok(`/${n} is registered`, !!by[n]);
     }
-    ok('seventeen commands registered — /instance joined 2026-08-12', cmds.length === 17);
-    ok('no command registered twice', new Set(cmds.map(c => c.name)).size === cmds.length);
+    ok('eighteen commands registered \u2014 /feedback joined 2026-08-16',
+      cmds.length === 18 && cmds.some(c => c.name === 'feedback'));
+    // Feedback: GM-only forum, per-room threads, every player step
+    // ephemeral so no one sees who spoke (T). GMs see the author.
+    ok('feedback rooms are seven, extensible, and thread-mended',
+      /FEEDBACK_TYPES_BASE = \{[\s\S]{0,900}?gms:/.test(src) &&
+      /function feedbackTypes\(gid\)/.test(src) &&
+      /configKey: 'feedback_routes'/.test(src));
+    ok('every player-facing feedback step is ephemeral \u2014 no one sees who spoke',
+      (() => {
+        const fn = src.slice(src.indexOf('async function handleFeedback'), src.indexOf('async function postFeedbackCard'));
+        // Whole statements, not up-to-first-brace — template holes like
+        // ${name} sit inside these calls and truncated the old match.
+        const replies = (fn.match(/interaction\.(?:reply|editReply)\([\s\S]*?\);/g) || [])
+          .filter(r => !/deferReply/.test(r));
+        const modalOut = src.match(/return interaction\.reply\(\{ ephemeral: true, content: posted/);
+        // editReply inherits the defer's ephemerality — the defer above it
+        // is checked instead.
+        const deferEph = /deferReply\(\{ ephemeral: true \}\)/.test(fn);
+        return replies.length > 0
+          && replies.every(r => /ephemeral: true/.test(r) || (/editReply/.test(r) && deferEph))
+          && !!modalOut;
+      })());
+    ok('the card names the author for GMs',
+      /\\u\{1F4DD\} \*\*Feedback\*\* \\u2014 <@\$\{interaction\.user\.id\}>/.test(src));
+    ok('a finished quest offers its own feedback door',
+      /setCustomId\(`fbq:\$\{encodeURIComponent\(questTag\(quest\)\)/.test(src) &&
+      /startsWith\('fbq:'\)/.test(src));
     ok('under the 100-command ceiling', cmds.length <= 100);
 
     for (const c of cmds) {
