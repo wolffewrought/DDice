@@ -969,6 +969,23 @@ function testBuilders(src) {
       cmds.length === 18 && cmds.some(c => c.name === 'feedback'));
     // Feedback: GM-only forum, per-room threads, every player step
     // ephemeral so no one sees who spoke (T). GMs see the author.
+    ok('stacked interject notes are bounded',
+      /\)\.slice\(0, 200\);/.test(src));
+    ok('feedback leaves are named, never fallen-through',
+      /if \(sub !== 'send'\)/.test(src));
+    ok('the feedback buttons sit in the button lane, selects in the select lane',
+      (() => {
+        const rb = src.indexOf('async function routeButton');
+        const end = src.indexOf('\n    return;\n}', rb);
+        // The property that matters is WHICH LANE each handler lives in,
+        // not where the lanes sit in the file: fbq inside routeButton,
+        // fbcat guarded by isStringSelectMenu, fbm after isModalSubmit.
+        return src.slice(rb, end).includes("startsWith('fbq:')")
+          && /isStringSelectMenu\?\.\(\) && interaction\.customId === 'fbcat'/.test(src)
+          && src.indexOf("startsWith('fbm:')") > src.indexOf('isModalSubmit');
+      })());
+    ok('the feedback forum uses the plan\'s json idiom, like approvals',
+      /\{ key: 'feedback_routes', json: 'forum', name: 'gm-feedback'/.test(src));
     ok('both setup paths mend the feedback rooms — the empty-forum bug',
       /const fbk = await ensureFeedbackThreads\(interaction\.client, gid\)/.test(src) &&
       /const fbk2 = await ensureFeedbackThreads\(interaction\.client, gid\)/.test(src));

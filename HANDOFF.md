@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 826 assertions passed and no scanner found an ERROR.
+Green means 848 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 826 assertions covering structure, registration and ruleset
+now is 848 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -303,6 +303,64 @@ with T's exact wording ("…contact a Moderator or Expeditioner. Thank
 you!"); notice_msg_id joined char_pages. New-server arrival now audits the
 bot's own permissions and names anything missing in the greeting; existing
 servers are never audited unprompted — build:true remains their lever.
+
+## 8d · Third-pass audit (2026-08-16)
+
+Structural angles this time. No duplicate function or top-level const
+declarations anywhere in 1.36MB (the silent-override class). 32 sites build
+SQL with interpolated COLUMN names; every dynamic key traced to either an
+internal constant or a Discord choice-constrained option (Discord validates
+choices server-side), so no arbitrary column can reach a statement — and an
+unknown key would throw loudly rather than corrupt. Process-level
+unhandledRejection/uncaughtException nets present. Message ceilings hold:
+feedback card worst case ~1830/2000, blocks capped 1900, modal inputs
+1500. ONE finding fixed: stacked `/gm override interject` notes concatenated
+unbounded into the exchange card — now capped at 200 chars, pinned.
+
+Diminishing returns noted: three passes over the same batch; the next
+audit should wait for new code rather than re-reading this one.
+
+## 8c · Second-pass audit (2026-08-16)
+
+Deeper sweep, different angles from 8b. Lane placement verified against
+the loredoc lesson — fbq in routeButton, fbcat in the select lane (first
+branch, reachable), fbm after isModalSubmit; no customId prefix emitted
+more than twice. Migration flags all appear in the ledger (5/5). Permission
+sweep covers what forums need (CreatePublicThreads, ManageThreads). One
+real finding fixed: `/feedback send` was never compared — anything not in
+the category group fell through to the picker, so a future leaf would have
+silently opened it. Now named explicitly with an unknown-leaf refusal;
+warnings 14→13. Everything else green.
+
+## 8b · Feedback post-audit (2026-08-16)
+
+Two of my own defects found by audit, both fixed. (1) The forum was built
+but EMPTY on T's server: neither setup path called ensureFeedbackThreads.
+Now called beside ensureApprovalThreads in both, outcome reported in run,
+pinned at both sites. (2) The plan entry invented a `feedback_forum`
+column plus a bridge, when siblings (approvals, roll-audit) declare
+`json: 'forum'` and let the planner write the routes blob directly —
+realigned to the idiom; the legacy column is still read once so anyone who
+ran the interim build is carried over. Everything else verified clean:
+three customIds round-trip, select menu within Discord's 25/100/100 caps,
+slug collision guarded, built-ins unremovable, quest button id bounded at
+80 chars, card sends to exactly one thread with mentions suppressed.
+
+## 8a · Player feedback (2026-08-16)
+
+`gm-feedback` forum (SETUP_PLAN, GM category — so players cannot see the
+threads at all), one thread per room via the shared ensureForumThreads
+mender: General · Quests · Encounters · System · Mechanics · DDice bot ·
+GMs, plus custom rooms from `/feedback category add` (slug-keyed in
+feedback_cats so renames keep thread ids; built-ins cannot be retired).
+`/feedback send` → ephemeral category SELECT → modal (scale 1-10 +
+prose) — Discord modals cannot hold dropdowns, hence the two-step. A
+finished quest posts a feedback button (fbq:<questTag>) straight to the
+same modal with the room pre-set to Quests and the run named on the card.
+The card shows the author (T: GMs see who spoke) with a star bar; every
+player-facing step is ephemeral (T: other players see nothing) — pinned
+by reading whole reply statements, after a naive up-to-first-brace regex
+gave three false positives on ${name} template holes. Commands 17->18.
 
 ## 7z · Post-batch audit (2026-08-15)
 

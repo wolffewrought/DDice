@@ -1033,8 +1033,9 @@ function feedbackRoutes(gid) {
   try { const o = JSON.parse(getConfig(gid)?.feedback_routes || 'null'); return (o && typeof o === 'object') ? o : null; }
   catch { return null; }
 }
-// SETUP_PLAN records the forum as `feedback_forum`; the shared mender
-// reads `feedback_routes.forum`. Seed the bridge, then mend.
+// The plan writes feedback_routes.forum itself (json:'forum', same idiom
+// as approvals and roll-audit), so the mender just mends. The legacy
+// feedback_forum column is read once for anyone who ran the interim build.
 async function ensureFeedbackThreads(client, gid) {
   const cfg = getConfig(gid);
   if (!feedbackRoutes(gid)?.forum && cfg?.feedback_forum) {
@@ -10492,7 +10493,7 @@ const SETUP_PLAN = [
     about: 'The full record of a death — cause, deeds and standing — for GMs.' },
   { key: 'backup_channel_id',     name: 'backups',          forum: false, gm: true,  essential: false,
     about: 'Where the nightly backup of everything is posted.' },
-  { key: 'feedback_forum',        name: 'gm-feedback', forum: true, gm: true, essential: false,
+  { key: 'feedback_routes', json: 'forum', name: 'gm-feedback', forum: true, gm: true, essential: false,
     about: 'Player feedback, one thread per category \u2014 GM eyes only; players post with `/feedback send`.' },
   { key: 'gm_char_forum',         name: 'gm-character-sheets', forum: true, gm: true, essential: false,
     about: 'GM characters live here — same five blocks and tags as the player forum, behind the GM category\'s eyes only.' },
@@ -15416,14 +15417,16 @@ async function handleFeedback(interaction) {
     }
   }
 
-  // `send` — the picker. Ephemeral, so no one else sees it happen.
+  // `send` — the picker. Ephemeral, so no one else sees it happen. Named
+  // explicitly rather than falling through, so a leaf added later cannot
+  // silently land here (the scanner's unrouted-subcommand warning, made
+  // moot 2026-08-16).
+  if (sub !== 'send')
+    return interaction.reply({ ephemeral: true, content: '\u274C Unknown feedback command.' });
   const types = feedbackTypes(gid);
   const routes = feedbackRoutes(gid);
-  if (!routes?.forum) {
-    const cfg = getConfig(gid);
-    if (!cfg?.feedback_forum)
-      return interaction.reply({ ephemeral: true, content: '\u274C No feedback forum is set up yet \u2014 a GM needs `/gm check build`.' });
-  }
+  if (!routes?.forum && !getConfig(gid)?.feedback_forum)
+    return interaction.reply({ ephemeral: true, content: '\u274C No feedback forum is set up yet \u2014 a GM needs `/gm check run`.' });
   const { ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
   const menu = new StringSelectMenuBuilder().setCustomId('fbcat').setPlaceholder('Which room?')
     .addOptions(Object.entries(types).slice(0, 25).map(([k, t]) => ({ label: t.name.slice(0, 100), value: k, description: t.about?.slice(0, 100) })));
@@ -15477,7 +15480,9 @@ async function gmInterject(interaction) {
   const slot = all[target.id] ??= {};
   if (amount) {
     slot.gmAdj = (slot.gmAdj || 0) + amount;
-    if (note) slot.gmAdjNote = slot.gmAdjNote ? `${slot.gmAdjNote}; ${note}` : note;
+    // Stacked interjections join their notes; bounded so a long chain
+    // cannot push the exchange card past Discord's 2000 (audit, 2026-08-16).
+    if (note) slot.gmAdjNote = (slot.gmAdjNote ? `${slot.gmAdjNote}; ${note}` : note).slice(0, 200);
   }
   if (forceStat) slot.gmStat = forceStat;
   upsertFight(gid, cid, { effect_state: JSON.stringify(all) });
