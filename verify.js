@@ -112,6 +112,49 @@ function collector() {
 // Faults that syntax checking cannot see: a function declared twice so the
 // second silently wins, an object key repeated so an earlier entry is dead,
 // a call to a helper that no longer exists. Each has bitten this file.
+// The layers worth carrying over from the Sec-Track audit: duplication,
+// drift between what the code does and what it says, failure paths that
+// swallow, and copy that contradicts itself. None of these are errors on
+// their own — they are the smells that preceded every real bug this month.
+function scanHabits(src, ast) {
+  const { out, err, warn } = collector();
+
+  // 1 · Swallowed failures. A bare catch {} on a WRITE is how a migration
+  // completes while achieving nothing.
+  const swallow = [];
+  for (const m of src.matchAll(/(db\.prepare\([^;]{0,200}?\.run\([^;]{0,120}?\)); \} catch \{\}/g)) {
+    swallow.push(lineAt(src, m.index));
+  }
+  if (swallow.length > 40) warn('many-silent-writes', swallow[0],
+    `${swallow.length} database writes discard their error \u2014 fine for ALTERs, a hiding place for anything else`);
+
+  // 2 · Drift: a command described in /help that no longer exists.
+  const registered = new Set([...src.matchAll(/\.setName\('([a-z]+)'\)\.setDescription/g)].map(m => m[1]));
+  const taught = new Set([...src.matchAll(/`\/([a-z]+) /g)].map(m => m[1]));
+  for (const t of taught) {
+    if (!registered.has(t) && t.length > 2) {
+      warn('taught-but-unregistered', 1, `/help or a reply teaches \`/${t}\` but no such command is registered`);
+    }
+  }
+
+  // 3 · Copy that contradicts the shape: a reply naming an option form
+  // (`x:true`) for a command that has since become a group of leaves.
+  for (const m of src.matchAll(/`\/gm check (\w+):true`/g)) {
+    err('stale-grammar', lineAt(src, m.index), `\`/gm check ${m[1]}:true\` is the pre-fold grammar \u2014 say \`/gm check ${m[1]}\``);
+  }
+
+  // 4 · Duplication: the same long literal in three or more places is a
+  // constant waiting to be named, and a place for two copies to diverge.
+  const strings = {};
+  for (const m of src.matchAll(/'([^'\n]{40,120})'/g)) strings[m[1]] = (strings[m[1]] || 0) + 1;
+  const dupes = Object.entries(strings).filter(([, n]) => n >= 3);
+  for (const [s0, n] of dupes.slice(0, 3)) warn('triplicated-copy', 1, `said ${n} times: "${s0.slice(0, 46)}\u2026"`);
+
+  out.summary = `${swallow.length} silent writes \u00b7 ${dupes.length} triplicated strings`;
+  return out;
+}
+function lineAt(src, i) { return src.slice(0, i).split('\n').length; }
+
 function scanStructure(src, ast) {
   const { out, err, warn } = collector();
 
@@ -965,10 +1008,68 @@ function testBuilders(src) {
                      'help', 'library', 'npc', 'quest', 'quiz', 'roll', 'spell', 'standing']) {
       ok(`/${n} is registered`, !!by[n]);
     }
-    ok('eighteen commands registered \u2014 /feedback joined 2026-08-16',
-      cmds.length === 18 && cmds.some(c => c.name === 'feedback'));
+    ok('twenty commands registered \\u2014 /target joined 2026-08-16',
+      cmds.length === 20 && cmds.some(c => c.name === 'button') && cmds.some(c => c.name === 'target'));
+    // Temporary targets: no sheet, no roster, no HP — the GM's verdict is
+    // the death check, asked in-channel or in the GM channel with `secret`.
+    // Schema ordering: an ALTER above its own CREATE fails into its catch
+    // on a fresh database and the column never appears (probe.js, 2026-08-19).
+    ok('every schema ALTER lives below the whole schema',
+      (() => {
+        const lastCreate = src.lastIndexOf('CREATE TABLE IF NOT EXISTS');
+        const end = src.indexOf(')`);', lastCreate);
+        return ![...src.matchAll(/^try \{ db\.exec\('ALTER TABLE/gm)].some(m => m.index < end);
+      })());
+    ok('a target is a row keyed by its own message, not button state',
+      /CREATE TABLE IF NOT EXISTS temp_targets/.test(src) &&
+      /SELECT \* FROM temp_targets WHERE guild_id=\? AND message_id=\?/.test(src));
+    ok('every hit asks the GM, and only a GM may answer',
+      /setCustomId\(`tgtdie:\$\{interaction\.message\.id\}:1`\)/.test(src) &&
+      /That call is the GM\\'s/.test(src));
+    ok('a fallen target stops taking swings',
+      /UPDATE temp_targets SET dead=1/.test(src) &&
+      /has already fallen/.test(src) && /components: \[\] \}\)\.catch/.test(src));
+    ok('secret sends the verdict to the GM channel instead',
+      /const gmChId = t\.secret \? \(getConfig\(gidT\)\?\.quest_log_gm/.test(src));
+    // Planted buttons: everything a press needs rides in the customId, so
+    // they survive restarts; only `once` stores anything.
+    ok('planted buttons are stateless but for once-mode',
+      /`btnroll:\$\{dice\}:\$\{dc \|\| 0\}:\$\{once\}:\$\{owner\}`/.test(src) &&
+      /`btnchk:\$\{stat\}:\$\{dc \|\| 0\}:\$\{once\}:\$\{owner\}`/.test(src) &&
+      /CREATE TABLE IF NOT EXISTS button_presses/.test(src));
+    ok('one leaf takes dice or a stat, never both',
+      /Dice or a stat, not both/.test(src) &&
+      /Give dice \(`2d6\+1`\) or a stat to roll/.test(src));
+    ok('a press inside a quest joins its timeline',
+      /async function logButtonPress\(interaction, gid, uid, detail, passed\)/.test(src) &&
+      /logQuestEvent\(gid, q\.number, 'roll'/.test(src) &&
+      /roll: '\\u\{1F3B2\}'/.test(src));
+    ok('an addressed button turns away everyone else',
+      /if \(owner && owner !== 'any' && owner !== uidB\)/.test(src) &&
+      /not addressed to you/.test(src));
+    ok('the check button rides the shared DC resolver',
+      /rollDcCheck\(\{ stat: stat === 'x' \? null : stat, dc, flat: stat === 'x', subject: ch, sig: ch \}\)/.test(src));
+    ok('the planted feedback button opens the same picker as /feedback send',
+      /interaction\.customId === 'btnfb'[\s\S]{0,700}?setCustomId\('fbcat'\)/.test(src));
     // Feedback: GM-only forum, per-room threads, every player step
     // ephemeral so no one sees who spoke (T). GMs see the author.
+    // Two logs, two audiences (T, 2026-08-16): the machine's account is
+    // GM-only; the players' chronicle carries the GM's own telling, given
+    // at completion or written later, and it is what records link to.
+    ok('the machine account goes to the GM log, not the chronicle',
+      /const logChId = getConfig\(gid\)\?\.quest_log_gm \|\| null;/.test(src) &&
+      /\{ key: 'quest_log_gm',          name: 'gm-quest-log'/.test(src));
+    ok('the chronicle is a forum, one thread per adventurer',
+      /name: 'quest-chronicle',  forum: true/.test(src) &&
+      /CREATE TABLE IF NOT EXISTS chronicle_threads/.test(src) &&
+      /forum\.threads\.create\(\{[\s\S]{0,200}?the quests they have seen through/.test(src));
+    ok('a tale mirrors to every participant and edits each copy in place',
+      /async function postQuestTale\(interaction, gid, quest, text, party\)/.test(src) &&
+      /for \(const uid of party\)/.test(src) && /if \(m\?\.editable\)/.test(src) &&
+      /sub === 'log'/.test(src));
+    ok('each adventurer\'s record links their own copy',
+      /taleUrls\[id\] \|\| summaryUrl/.test(src) &&
+      /UPDATE quest_summaries SET url=\? WHERE guild_id=\? AND number=\? AND user_id=\?/.test(src));
     ok('stacked interject notes are bounded',
       /\)\.slice\(0, 200\);/.test(src));
     ok('feedback leaves are named, never fallen-through',
@@ -1923,6 +2024,7 @@ function main() {
       ['wiring', scanWiring(src, ast)],
       ['limits', scanLimits(src, ast)],
       ['rulesets', scanRulesets(src)],
+      ['habits', scanHabits(src, ast)],
     ];
     for (const [name, found] of scans) {
       const errs = found.filter(f => f.sev === 'ERROR');

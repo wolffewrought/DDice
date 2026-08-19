@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 848 assertions passed and no scanner found an ERROR.
+Green means 883 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 848 assertions covering structure, registration and ruleset
+now is 883 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -303,6 +303,104 @@ with T's exact wording ("…contact a Moderator or Expeditioner. Thank
 you!"); notice_msg_id joined char_pages. New-server arrival now audits the
 bot's own permissions and names anything missing in the greeting; existing
 servers are never audited unprompted — build:true remains their lever.
+
+## 8e · Two quest logs, two audiences (2026-08-16)
+
+Per T: the auto summary (timings, events, payouts) now posts to a NEW
+GM-only channel `gm-quest-log` (quest_log_gm, plan gm:true);
+`quest-chronicle` stays player-facing and carries the GM's OWN telling.
+`complete` gained `summary:`; `/quest run log number: text:` writes or
+rewrites afterwards — postQuestTale edits the existing post in place
+(found via the stored url) rather than stacking tellings, and UPDATEs
+quest_summaries.url so every participant's record points at the tale.
+Records prefer taleUrl, falling back to the GM summary only if no tale
+exists. The completion reply nudges for a tale when none was given.
+
+### 8e addendum · chronicle as a per-player forum (2026-08-16)
+
+quest-chronicle is now a FORUM with one thread per adventurer
+(chronicle_threads ledger; thread named after them and renamed if they
+rename). A tale is MIRRORED into the thread of everyone who was there —
+each copy located via that player's own quest_summaries.url and edited in
+place on a rewrite, so retelling never stacks; every record links that
+player's own copy. 150ms paced. Cost accepted knowingly: a six-player
+quest stores six copies, which is what makes each thread readable alone.
+
+## 8h · The audit setup, ported from Sec-Track (2026-08-19)
+
+Three tools, T's ask. The Sec-Track originals were browser-PWA specific,
+so the ideas ported, not the code.
+
+**probe.js** (`node --experimental-sqlite probe.js`) — the runtime half
+verify.js never had. Loads index.js against a fake discord.js (builders
+that record their own shape, channels that record what was sent) and a
+REAL in-memory SQLite via node:sqlite behind a better-sqlite3 shim, then
+drives the captured interactionCreate handler with synthetic commands and
+presses. 13 probes: schema completeness, every ALTER lands, every emitted
+BUTTON id reaches a handler (modal/select ids excluded by reading the
+builder above each setCustomId), unknown command/button safety, migration
+ledger completeness, and RESTART SURVIVAL — the ready path run twice with
+table counts compared, which is precisely where the vacuous-migration bug
+lived.
+
+**FIRST RUN FOUND A REAL BUG:** 173 of 178 top-level schema ALTERs sat
+ABOVE the CREATE TABLE block. On T's live database the columns exist (the
+tables predated the statements), but on any FRESH install each ALTER fails
+into its own catch and the column never appears — six of them (backup_*,
+npcs.rerolls_current, fights.auto_npc) were in no CREATE either, so a new
+server would query columns it did not have. All ALTERs moved below the
+whole schema; pinned so it cannot regress.
+
+**check.js** — runs both, compares against .check-baseline.json, prints
+the DELTA: assertions/warnings/commands/customIds moved, and crucially
+what DISAPPEARED (a pin, a table, a command, a migration flag). Absolute
+health looks identical whether a pin is deleted or not; the delta does
+not. `--save` accepts current state; commit the baseline with the source.
+
+**verify.js gained a fifth scanner, `habits`** — the transferable layers
+from audit.js: swallowed writes, drift (copy teaching an unregistered
+command), stale grammar (pre-fold `check x:true` forms), and triplicated
+long strings. Warnings 13→16, all three new ones triplicated-copy.
+
+## 8g · /target — temporary targets (2026-08-16)
+
+T's design, and a good one: no HP, no sheet, no roster entry — the GM's
+verdict IS the death check. `/target create name: dice:|stat: dc: reason:
+for: secret:` plants a message with an Attack button; temp_targets is
+keyed by that message id, so the button carries no state and a restart
+loses nothing. Each press rolls (rollNotation or the shared rollDcCheck),
+posts publicly, bumps hits, logs into the quest timeline via
+logButtonPress, then asks the GM — in-channel by default so the table
+feels it, in quest_log_gm (falling back to roll-audit) when secret:true.
+Option A-with-switch, chosen by T over DMs. 'It falls' disables the
+target's own button (edited to a struck-through corpse line) and marks it
+dead; 'It holds' leaves it standing. Only GMs may answer; a fallen target
+refuses further swings; `for:` addresses it as buttons do.
+Commands 19->20.
+
+## 8f · /button — planted buttons (2026-08-16)
+
+GM plants a button in a channel; anyone may press it. Three kinds:
+`check` (stat or flat d20 vs DC, riding the shared rollDcCheck so it
+cannot drift from /gm dc), `roll` (a validated dice expression), and
+`feedback` (opens the exact picker /feedback send opens). Everything a
+press needs is encoded in the customId — btnchk:<stat>:<dc>:<once>,
+btnroll:<dice>:<once>, btnfb — so buttons survive restarts with no state
+to lose; button_presses exists solely so `once:true` can hold a player to
+a single go. Handlers live in routeButton per the lane discipline.
+Commands 18→19. Extended same day: `for:@player` addresses a
+check or roll button to one person — encoded as the customId's last
+segment ('any' when open), enforced on press, and the planted message
+mentions them. Note the near-miss caught in build: the first splice left
+TWO allowedMentions keys in one send object, where the later would have
+silently won and killed the mention. Then merged per T into ONE leaf
+`/button roll` taking dice OR stat (never both, refused rather than
+guessed), an optional dc, `reason` for flavour, then `for`/`once`/`label`
+— T's order. Both kinds now carry the dc in the customId
+(btnroll:<dice>:<dc>:<once>:<owner>). New: `logButtonPress` writes a
+`roll` quest event when the press happens in an active quest's channel or
+thread, so presses reach /quest timeline and the GM's completion log;
+outside a quest nothing is written. QUEST_EVENT_ICON gained `roll`.
 
 ## 8d · Third-pass audit (2026-08-16)
 

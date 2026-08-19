@@ -29,17 +29,12 @@ console.log('Database path:', DB_PATH);
 db.pragma('journal_mode = WAL');
 
 // ── Schema migrations ─────────────────────────────────────────────────────────
-try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_channel_id TEXT DEFAULT NULL'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_channel_id TEXT DEFAULT NULL'); } catch {}
 // The backup channel holds one file: the newest. This remembers which post that
 // is, so each backup can replace the last rather than piling up.
-try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_msg_id TEXT'); } catch {}
 // setInterval starts counting from process start, so on a server that deploys
 // often the 24-hour timer never reached zero and no automatic backup ever ran.
 // The last run is stored instead, and checked shortly after boot — so the cycle
 // is a real day rather than a day of uninterrupted uptime.
-try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_last INTEGER'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_hours INTEGER DEFAULT 24'); } catch {}
 // The last error each background job reported, so a repeated failure is
 // announced once rather than every cycle. A table rather than a column per job,
 // because job names carry spaces and brackets and there is one per schedule.
@@ -47,14 +42,12 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS job_failures (
   guild_id TEXT NOT NULL, job TEXT NOT NULL, message TEXT, at INTEGER NOT NULL,
   PRIMARY KEY (guild_id, job)
 )`); } catch (e) { console.error('job_failures schema', e); }
-try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
 // The audit's own catch: this mirror shipped writing to a column npcs
 // never had — the same phantom class as the chars table, caught here
 // before a live spend found it. Column first, then a ONE-TIME backfill:
 // the flag matters because "spent to zero" and "never filled" are the
 // same value, and a per-boot backfill would quietly refill spent pools
 // on every redeploy, which is rest's job and nobody else's.
-try { db.exec('ALTER TABLE npcs ADD COLUMN rerolls_current INTEGER DEFAULT 0'); } catch {}
 try { db.exec('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)'); } catch {}
 try {
   if (!db.prepare("SELECT 1 FROM meta WHERE k='npc_rr_backfill_1'").get()) {
@@ -80,32 +73,12 @@ try { db.exec("CREATE TABLE IF NOT EXISTS weapons (guild_id TEXT NOT NULL, name 
 // What a weapon lets you fight with. Stored as pipe-separated stat keys, the
 // same shape activities use — empty means no restriction, which is what every
 // weapon on an existing server already is.
-try { db.exec('ALTER TABLE weapons ADD COLUMN atk_stats TEXT'); } catch {}
-try { db.exec('ALTER TABLE weapons ADD COLUMN def_stats TEXT'); } catch {}
-try { db.exec('ALTER TABLE weapons ADD COLUMN note TEXT'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN atk_mode TEXT DEFAULT 'normal'"); } catch {}
-try { db.exec('ALTER TABLE fights ADD COLUMN atk_sides INTEGER DEFAULT 20'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN def_mode TEXT DEFAULT 'normal'"); } catch {}
-try { db.exec('ALTER TABLE fights ADD COLUMN def_sides INTEGER DEFAULT 20'); } catch {}
-try { db.exec('ALTER TABLE fights ADD COLUMN auto_npc INTEGER DEFAULT 0'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN rr_state TEXT DEFAULT '{}'"); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_rr_threshold INTEGER DEFAULT 8'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN fight_ping INTEGER DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN roll_audit_channel_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN signature_stat TEXT'); } catch {}
-try { db.exec('ALTER TABLE npcs ADD COLUMN class TEXT'); } catch {}
-try { db.exec('ALTER TABLE npcs ADD COLUMN signature_stat TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_role_ids TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN approval_channel_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN approval_state TEXT'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN approval_msg_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN approval_src_channel TEXT'); } catch {}
 // The queue must survive the Discord message: a post can fail, be deleted, or
 // land somewhere nobody reads. These two make the database the record of truth.
-try { db.exec('ALTER TABLE characters ADD COLUMN approval_requested_at INTEGER'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN approval_post_ok INTEGER DEFAULT 0'); } catch {}
 // Why a GM turned a sheet down, so the player knows what to change.
-try { db.exec('ALTER TABLE characters ADD COLUMN approval_reason TEXT'); } catch {}
 // The emoji columns carry a default (⚔️/🗡️), so their value can't tell us whether
 // a player actually picked one. These record that they did, per slot, so a sheet
 // can be required to be finished before a GM ever sees it.
@@ -129,11 +102,6 @@ try {
 // elapsed_ms is everything banked before the last pause. Elapsed time is
 // therefore (elapsed_ms + now - started_at) while running, or just elapsed_ms
 // while paused — so a pause can't lose time and a restart can't invent it.
-try { db.exec('ALTER TABLE quests ADD COLUMN started_at INTEGER'); } catch {}
-try { db.exec('ALTER TABLE quests ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE quests ADD COLUMN paused INTEGER NOT NULL DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE quests ADD COLUMN last_tick_ms INTEGER NOT NULL DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE quests ADD COLUMN last_recap_ms INTEGER NOT NULL DEFAULT 0'); } catch {}
 try { db.exec(`CREATE TABLE IF NOT EXISTS quest_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   guild_id TEXT NOT NULL, number INTEGER NOT NULL,
@@ -146,56 +114,57 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS quest_summaries (
   ended_at INTEGER NOT NULL,
   PRIMARY KEY (guild_id, number, user_id)
 )`); } catch (e) { console.error('quest_summaries schema', e); }
-try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_log_channel TEXT'); } catch {}
 // Where the command PDFs are published, which repository they come from, the
 // message currently holding them, and the file versions last seen — so a poll
 // can tell "nothing has changed" from "there is a new build".
-try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_channel TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_repo TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_branch TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_path TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_msg_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_sha TEXT'); } catch {}
 // The last thing that went wrong, so a repeated failure is reported once rather
 // than every quarter of an hour — and so it is reported at all. Logging to the
 // console meant a misconfigured repo failed silently for anyone not reading
 // Railway's output.
-try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_error TEXT'); } catch {}
 // When it last looked and what it concluded. Without this there is no way to
 // tell "hasn't tried yet" from "tried and found nothing new" from "tried and
 // failed" — which leaves a manual push as the only way to learn anything.
-try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_checked_at INTEGER'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_result TEXT'); } catch {}
 // A second home for the player book alone, posted quietly — no ping, no
 // notification — so a reference channel stays current without nagging anyone.
-try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_player_channel TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_player_msg_id TEXT'); } catch {}
 // Where the fallen are remembered, and the fact of a death itself. A dead
 // character keeps its whole record — the sheet, the deeds, the standing — so
 // the memorial can be rebuilt and a resurrection loses nothing.
-try { db.exec('ALTER TABLE guild_config ADD COLUMN memorial_channel TEXT'); } catch {}
 // The GM copy carries the full account and the revive button; the public one is
 // the story without the bookkeeping. Both message ids are kept so a revival can
 // clear the pair.
-try { db.exec('ALTER TABLE guild_config ADD COLUMN memorial_public_channel TEXT'); } catch {}
 // A forum where each approved character gets a page of their own. The thread is
 // the character's; the bot only needs to know which thread belongs to whom so it
 // can link to it.
-try { db.exec('ALTER TABLE guild_config ADD COLUMN char_forum TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_char_forum TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_forum TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_routes TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_cats TEXT'); } catch {}
+// Standing buttons a GM plants in a channel; the ledger only exists so
+// `once:true` can hold a player to a single press (T, 2026-08-16).
+// Temporary targets: something to swing at that lives in a channel, not
+// on the roster. No HP — the GM's judgement is the death check (T,
+// 2026-08-16). Disposable by design: nothing to clean up afterwards.
+try { db.exec(`CREATE TABLE IF NOT EXISTS temp_targets (
+  guild_id TEXT NOT NULL, message_id TEXT NOT NULL,
+  channel_id TEXT NOT NULL, name TEXT NOT NULL,
+  dc INTEGER, stat TEXT, dice TEXT, secret INTEGER NOT NULL DEFAULT 0,
+  owner TEXT, dead INTEGER NOT NULL DEFAULT 0, hits INTEGER NOT NULL DEFAULT 0,
+  created_by TEXT, at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, message_id)
+)`); } catch (e) { console.error('temp_targets schema', e); }
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS button_presses (
+  guild_id TEXT NOT NULL, message_id TEXT NOT NULL, user_id TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, message_id, user_id)
+)`); } catch (e) { console.error('button_presses schema', e); }
+// One chronicle thread per adventurer; a quest's tale is mirrored into the
+// thread of everyone who was there (T, 2026-08-16).
+try { db.exec(`CREATE TABLE IF NOT EXISTS chronicle_threads (
+  guild_id TEXT NOT NULL, user_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL, at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, user_id)
+)`); } catch (e) { console.error('chronicle_threads schema', e); }
 // The character thread's block layout: starter = sheet, plus three
 // bot-owned blocks (inventory · lore · dice) edited in place. Hashes let
 // the hourly sweep skip blocks that haven't changed — near-zero traffic
 // at rest, per T's strain question.
-try { db.exec('ALTER TABLE char_pages ADD COLUMN inv_msg_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE char_pages ADD COLUMN lore_msg_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE char_pages ADD COLUMN rolls_msg_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE char_pages ADD COLUMN standing_msg_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE char_pages ADD COLUMN notice_msg_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE char_pages ADD COLUMN block_hashes TEXT'); } catch {}
 // A duel is a proposal until a GM signs it off. One open proposal per player,
 // so the board can't be papered with them.
 try { db.exec(`CREATE TABLE IF NOT EXISTS duels (
@@ -211,10 +180,6 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS char_pages (
   thread_id TEXT NOT NULL, url TEXT, title TEXT, at INTEGER NOT NULL,
   PRIMARY KEY (guild_id, user_id)
 )`); } catch (e) { console.error('char_pages schema', e); }
-try { db.exec('ALTER TABLE deaths ADD COLUMN public_msg_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE deaths ADD COLUMN revived_at INTEGER'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN died_at INTEGER'); } catch {}
-try { db.exec('ALTER TABLE npcs ADD COLUMN died_at INTEGER'); } catch {}
 try { db.exec(`CREATE TABLE IF NOT EXISTS deaths (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   guild_id TEXT NOT NULL, subject_id TEXT NOT NULL, name TEXT NOT NULL,
@@ -226,23 +191,13 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS deaths (
 // quest it was copied from. A quest row is a single party on a single clock, so
 // two GMs running the same adventure need two rows; instance_of ties them
 // together for the board without merging them.
-try { db.exec('ALTER TABLE quests ADD COLUMN gm_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE quests ADD COLUMN gm_style TEXT'); } catch {}
-try { db.exec('ALTER TABLE quests ADD COLUMN instance_of INTEGER'); } catch {}
 // An NPC keeps the same records a player does. The page tables are keyed on a
 // plain id string, so the fighter id ("npc:Cave Orc") slots straight in — only
 // the balances need somewhere to live, since those hang off `characters`.
-try { db.exec('ALTER TABLE npcs ADD COLUMN merits INTEGER DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE npcs ADD COLUMN renown INTEGER DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE npcs ADD COLUMN lore TEXT'); } catch {}
 // An NPC carries what it fights with, the same as a player — otherwise weapon
 // stat restrictions could never apply to the side the bot plays.
-try { db.exec('ALTER TABLE npcs ADD COLUMN weapon1 TEXT'); } catch {}
-try { db.exec('ALTER TABLE npcs ADD COLUMN weapon2 TEXT'); } catch {}
 // Which stat the auto-pilot should reach for. Without this it always takes the
 // highest, so a character who fights with finesse over force had no say.
-try { db.exec('ALTER TABLE npcs ADD COLUMN preferred_atk TEXT'); } catch {}
-try { db.exec('ALTER TABLE npcs ADD COLUMN preferred_def TEXT'); } catch {}
 // Hero used to occupy the class slot, which meant a Hero could be nothing else.
 // As a flag it sits alongside a class and a knight order, and a GM can toggle
 // it without rewriting the sheet. The backfill runs on the boot that adds the
@@ -256,28 +211,15 @@ try {
   db.exec('ALTER TABLE npcs ADD COLUMN is_hero INTEGER DEFAULT 0');
   db.exec("UPDATE npcs SET is_hero=1, class=NULL WHERE class='Hero' COLLATE NOCASE");
 } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN preferred_atk TEXT'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN preferred_def TEXT'); } catch {}
 // One reroll per roll. A saved roll is marked the moment it is rerolled, so a
 // second attempt on the same result is refused rather than letting someone
 // chain rerolls until the dice agree with them.
-try { db.exec('ALTER TABLE roll_history ADD COLUMN rerolled INTEGER DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE fights ADD COLUMN atk_rerolled INTEGER DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE fights ADD COLUMN def_rerolled INTEGER DEFAULT 0'); } catch {}
 // Character creation budget, per guild. Defaults match the shipped rules.
-try { db.exec('ALTER TABLE guild_config ADD COLUMN stat_budget INTEGER DEFAULT 15'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN stat_min INTEGER DEFAULT 1'); } catch {}
 // The flat part of the max-HP formula: max HP = CON + hp_base.
-try { db.exec('ALTER TABLE guild_config ADD COLUMN hp_base INTEGER DEFAULT 2'); } catch {}
 // Scheduled recovery: everyone not out on a quest is restored every N hours.
-try { db.exec('ALTER TABLE guild_config ADD COLUMN autorest_enabled INTEGER DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN autorest_hours INTEGER DEFAULT 6'); } catch {}
 // (autorest_channel: added once, never used — recovery announcements go to
 //  the channel the schedule was set in. Left in place so an old database
 //  does not have to change; nothing reads it.)
-try { db.exec('ALTER TABLE guild_config ADD COLUMN autorest_channel TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN autorest_last INTEGER'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_stats_visible INTEGER DEFAULT 0'); } catch {}
 try {
   // Webhooks are bound to the channel they were created in. Storing one per NPC
   // meant every later roll posted back to the ORIGINAL channel, wherever the
@@ -321,14 +263,11 @@ try {
     PRIMARY KEY (guild_id, channel_id)
   )`);
 } catch (e) { console.error('history schema', e); }
-try { db.exec('ALTER TABLE characters ADD COLUMN merits INTEGER DEFAULT 0'); } catch {}
 // Renown is a currency: earned from quests, encounters and activities, and spent
 // again. Merits are a lifetime tally that only ever climbs, so the two can't
 // share a column.
-try { db.exec('ALTER TABLE characters ADD COLUMN renown INTEGER DEFAULT 0'); } catch {}
 // Writing and deleting activities is always GM-only; this decides whether
 // players may start one themselves. Locked to GMs until a server says otherwise.
-try { db.exec('ALTER TABLE guild_config ADD COLUMN activity_players INTEGER DEFAULT 0'); } catch {}
 // Runs used to be one-per-channel. They are now one per player per channel so
 // several people can play alongside each other and one leaving doesn't disturb
 // the rest. SQLite can't alter a primary key, so an old table is dropped —
@@ -345,8 +284,6 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS renown_log (
   guild_id TEXT NOT NULL, user_id TEXT NOT NULL, delta INTEGER NOT NULL,
   reason TEXT, at INTEGER NOT NULL
 )`); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN rank_name TEXT'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN lore_doc_url TEXT'); } catch {}
 try {
   db.exec(`CREATE TABLE IF NOT EXISTS ranks (
     guild_id TEXT NOT NULL,
@@ -558,69 +495,23 @@ db.exec(`
 // (fights.auto_npc / rr_state / log_state / effect_state are added higher up —
 //  a second ALTER for the same column always throws, so these were never live.)
 // Practice bouts: HP at or below which a fighter bows out. 0 = a real fight.
-try { db.exec('ALTER TABLE fights ADD COLUMN floor_hp INTEGER DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE fight_archive ADD COLUMN floor_hp INTEGER DEFAULT 0'); } catch {}
 // Approval routing: one forum, a thread per approval type. approval_routes is
 // a JSON map {forum, sheets, trades, duels, lore, exports} of channel ids. The
 // per-item *ch_id columns pin each posted request to wherever it actually
 // landed, so jump links and supersede-edits survive a routing change.
-try { db.exec('ALTER TABLE guild_config ADD COLUMN approval_routes TEXT'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN approval_ch_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE duels ADD COLUMN approval_ch_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE lore ADD COLUMN ch_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE merit_trades ADD COLUMN ch_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE export_requests ADD COLUMN ch_id TEXT'); } catch {}
 // Audit routing: same shape for the roll mirror — a JSON map
 // {forum, players, gms, npcs, say} of channel ids.
-try { db.exec('ALTER TABLE guild_config ADD COLUMN audit_routes TEXT'); } catch {}
 // Written props: a per-guild scroll font, stored as bytes so it survives
 // redeploys (the Railway filesystem does not).
-try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font BLOB'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font_name TEXT'); } catch {}
 // A shelf for the props: every /gm scroll's named PDF is also filed here.
-try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_archive_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_threads TEXT'); } catch {} // forum mode: JSON map gmId → thread id
-try { db.exec('ALTER TABLE characters ADD COLUMN next_mark TEXT'); } catch {} // 🔼/🔽 on their very next roll, anywhere
-try { db.exec('ALTER TABLE characters ADD COLUMN deception_spent INTEGER DEFAULT 0'); } catch {} // one trick per honest roll
 // A 5e sheet carries two more abilities and the numbers that hang off a class.
 // Added for every server; a Knightfall sheet simply never reads them.
-try { db.exec('ALTER TABLE characters ADD COLUMN int INTEGER DEFAULT 10'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN cha INTEGER DEFAULT 10'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN level INTEGER DEFAULT 1'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN char_class TEXT'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN hit_die INTEGER DEFAULT 8'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN armour_class INTEGER'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN proficient TEXT'); } catch {}   // JSON: saves and skills
-try { db.exec('ALTER TABLE characters ADD COLUMN hit_dice_left INTEGER'); } catch {}   // spent on a short rest
-try { db.exec('ALTER TABLE characters ADD COLUMN slots_used TEXT'); } catch {}         // JSON: spell level → how many spent
-try { db.exec('ALTER TABLE characters ADD COLUMN concentrating TEXT'); } catch {}      // what they are holding together
-try { db.exec('ALTER TABLE characters ADD COLUMN weapon1dice TEXT'); } catch {}        // e.g. 1d12 for a greataxe
-try { db.exec('ALTER TABLE characters ADD COLUMN weapon2dice TEXT'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN prepared_spells TEXT'); } catch {}    // JSON list
 // A 5e character can be dying rather than dead: three saves either way.
 // These two spent their whole life failing: the table is `characters`,
 // there is no `chars`, and the catch swallowed "no such table" on every
 // boot — so the columns never existed while upsertChar injected defaults
 // for them. First live fight to trip the injection died on the write.
-try { db.exec('ALTER TABLE characters ADD COLUMN death_success INTEGER DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN death_fail INTEGER DEFAULT 0'); } catch {}
 // And a monster needs the four numbers a statblock leads with.
-try { db.exec('ALTER TABLE npcs ADD COLUMN armour_class INTEGER'); } catch {}
-try { db.exec('ALTER TABLE npcs ADD COLUMN attack_bonus INTEGER'); } catch {}
-try { db.exec('ALTER TABLE npcs ADD COLUMN damage_dice TEXT'); } catch {}
-try { db.exec('ALTER TABLE npcs ADD COLUMN max_hp INTEGER'); } catch {}
-try { db.exec('ALTER TABLE npcs ADD COLUMN int INTEGER DEFAULT 10'); } catch {}
-try { db.exec('ALTER TABLE npcs ADD COLUMN cha INTEGER DEFAULT 10'); } catch {}
-try { db.exec('ALTER TABLE npcs ADD COLUMN conditions TEXT'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN conditions TEXT'); } catch {}          // JSON list
-try { db.exec('ALTER TABLE characters ADD COLUMN temp_hp INTEGER DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE npcs ADD COLUMN temp_hp INTEGER DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN inspiration INTEGER DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN damage_type TEXT'); } catch {}
-try { db.exec('ALTER TABLE npcs ADD COLUMN damage_type TEXT'); } catch {}
-try { db.exec('ALTER TABLE characters ADD COLUMN resist TEXT'); } catch {}              // comma list
-try { db.exec('ALTER TABLE npcs ADD COLUMN resist TEXT'); } catch {}
-try { db.exec('ALTER TABLE fights ADD COLUMN atk_used INTEGER DEFAULT 0'); } catch {}
 // The library. A monster or a spell written once and drawn on for ever —
 // either from the SRD set that ships here, or from whatever a GM imports.
 try { db.exec(`CREATE TABLE IF NOT EXISTS library_monsters (
@@ -637,20 +528,6 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS library_spells (
   body TEXT, source TEXT, added_by TEXT, at INTEGER,
   PRIMARY KEY (guild_id, name)
 )`); } catch (e) { console.error('library_spells schema', e); }
-try { db.exec('ALTER TABLE guild_config ADD COLUMN ruleset TEXT'); } catch {}
-try { db.exec('ALTER TABLE story_runs ADD COLUMN quiz_right INTEGER NOT NULL DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE story_runs ADD COLUMN quiz_asked INTEGER NOT NULL DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE story_runs ADD COLUMN quiz_log TEXT'); } catch {}   // for marking at the end
-try { db.exec('ALTER TABLE story_scenes ADD COLUMN ask INTEGER NOT NULL DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE story_scenes ADD COLUMN answers TEXT'); } catch {}
-try { db.exec('ALTER TABLE story_scenes ADD COLUMN right_to TEXT'); } catch {}
-try { db.exec('ALTER TABLE story_scenes ADD COLUMN wrong_to TEXT'); } catch {}
-try { db.exec('ALTER TABLE story_scenes ADD COLUMN hint TEXT'); } catch {}
-try { db.exec('ALTER TABLE stories ADD COLUMN quiz_mode TEXT'); } catch {}   // 'retry' or 'tally'
-try { db.exec('ALTER TABLE stories ADD COLUMN quiz_pass INTEGER'); } catch {}      // how many right counts as a pass
-try { db.exec('ALTER TABLE stories ADD COLUMN quiz_merit INTEGER'); } catch {}     // merits for passing
-try { db.exec('ALTER TABLE story_scenes ADD COLUMN qid INTEGER'); } catch {}       // which banked question this is
-try { db.exec('ALTER TABLE story_scenes ADD COLUMN explain TEXT'); } catch {}      // shown after the answer
 
 // The question bank. Questions live here because a draw, and the dropdown
 // that hand-picks them, must answer instantly; the forum copy is for reading.
@@ -678,8 +555,6 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS quiz_sets (
   author_id TEXT, created_at INTEGER NOT NULL,
   PRIMARY KEY (guild_id, name)
 )`); } catch (e) { console.error('quiz_sets schema', e); }
-try { db.exec('ALTER TABLE guild_config ADD COLUMN quiz_forum TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_forum TEXT'); } catch {}
 try { db.exec(`CREATE TABLE IF NOT EXISTS npc_pages (
   guild_id TEXT NOT NULL, name TEXT NOT NULL,
   thread_id TEXT, message_id TEXT, at INTEGER,
@@ -722,43 +597,17 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS dc_cards (
 // The on_fail / on_success marks moved off the customId and onto the card:
 // free text in an id overflows Discord's 100-char ceiling, and a colon in it
 // shifts every field after it in the split.
-try { db.exec('ALTER TABLE dc_cards ADD COLUMN s_mark TEXT'); } catch {}
-try { db.exec('ALTER TABLE dc_cards ADD COLUMN f_mark TEXT'); } catch {}
 // A card can bind the fight in its channel: the target's own fight buttons
 // wait until this card is pressed, and a failed bound check can skip their
 // turn. Cleared on resolution; a pruned card simply stops holding.
-try { db.exec('ALTER TABLE dc_cards ADD COLUMN bind_channel TEXT'); } catch {}
-try { db.exec('ALTER TABLE dc_cards ADD COLUMN bind_uid TEXT'); } catch {}
-try { db.exec('ALTER TABLE dc_cards ADD COLUMN bind_skip INTEGER DEFAULT 0'); } catch {}
 // Grappling: which attack-phase roll is pending, and who holds whom.
-try { db.exec('ALTER TABLE fights ADD COLUMN atk_kind TEXT'); } catch {}
 try { db.exec("ALTER TABLE fights ADD COLUMN grapples TEXT DEFAULT '{}'"); } catch {}
 // Quest board forum + GM planning mirror.
-try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_forum TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_plan_forum TEXT'); } catch {}
-try { db.exec('ALTER TABLE quests ADD COLUMN plan_thread_id TEXT'); } catch {}
 // The questline pipeline: a stage per quest, tag ids per guild, run records.
-try { db.exec('ALTER TABLE quests ADD COLUMN stage TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_plan_tags TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_dm_thread TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_plan_books TEXT'); } catch {}
-try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_thread_forum TEXT'); } catch {}
-try { db.exec('ALTER TABLE quests ADD COLUMN index_thread_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE quests ADD COLUMN index_msg_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE quests ADD COLUMN stage_msg_id TEXT'); } catch {}      // the one live status line in the plan thread
-try { db.exec('ALTER TABLE quests ADD COLUMN create_msg_id TEXT'); } catch {}     // the create card, swept when the board takes over
-try { db.exec('ALTER TABLE quests ADD COLUMN create_channel_id TEXT'); } catch {}
-try { db.exec('ALTER TABLE quests ADD COLUMN run_thread_id TEXT'); } catch {}     // the quest's own thread, opened at start
-try { db.exec('ALTER TABLE quests ADD COLUMN run_seq INTEGER'); } catch {}        // which run of the adventure this is — #002.2
-try { db.exec('ALTER TABLE quests ADD COLUMN run_label TEXT'); } catch {}         // and what the GM calls it
-try { db.exec('ALTER TABLE quests ADD COLUMN stage_at INTEGER'); } catch {}       // when it entered the stage it's in
-try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_spinoff INTEGER DEFAULT 0'); } catch {} // approval births a run
 try { db.exec(`CREATE TABLE IF NOT EXISTS npc_orders (
   guild_id TEXT NOT NULL, prefix TEXT NOT NULL, image_url TEXT NOT NULL,
   set_by TEXT, set_at INTEGER, PRIMARY KEY (guild_id, prefix)
 )`); } catch (e) { console.error('npc_orders schema', e); }
-try { db.exec('ALTER TABLE quests ADD COLUMN full_pinged INTEGER DEFAULT 0'); } catch {} // party-is-full nudge, once
-try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_instance_forum TEXT'); } catch {}
 db.exec(`CREATE TABLE IF NOT EXISTS quest_runs (
   guild_id TEXT NOT NULL,
   root_number INTEGER NOT NULL,
@@ -776,6 +625,197 @@ db.exec(`CREATE TABLE IF NOT EXISTS gm_profiles (
   available INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (guild_id, user_id)
 )`);
+
+// EVERY schema ALTER lives below the whole schema (2026-08-19). They
+// used to be interleaved above it, so on a fresh database an ALTER
+// could run before its own CREATE, fail silently into its catch, and
+// leave a column the code went on to query. probe.js found it.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN rerolls_current INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE weapons ADD COLUMN atk_stats TEXT'); } catch {}
+try { db.exec('ALTER TABLE weapons ADD COLUMN def_stats TEXT'); } catch {}
+try { db.exec('ALTER TABLE weapons ADD COLUMN note TEXT'); } catch {}
+try { db.exec('ALTER TABLE fights ADD COLUMN atk_sides INTEGER DEFAULT 20'); } catch {}
+try { db.exec('ALTER TABLE fights ADD COLUMN def_sides INTEGER DEFAULT 20'); } catch {}
+try { db.exec('ALTER TABLE fights ADD COLUMN auto_npc INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_rr_threshold INTEGER DEFAULT 8'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN fight_ping INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN roll_audit_channel_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN signature_stat TEXT'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN class TEXT'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN signature_stat TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_role_ids TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN approval_channel_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN approval_state TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN approval_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN approval_src_channel TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN approval_requested_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN approval_post_ok INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN approval_reason TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN started_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN paused INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN last_tick_ms INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN last_recap_ms INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_log_channel TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_channel TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_repo TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_branch TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_path TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_sha TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_error TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_checked_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_result TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_player_channel TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN docs_player_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN memorial_channel TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN memorial_public_channel TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN char_forum TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_char_forum TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_forum TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_log_gm TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_routes TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_cats TEXT'); } catch {}
+try { db.exec('ALTER TABLE char_pages ADD COLUMN inv_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE char_pages ADD COLUMN lore_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE char_pages ADD COLUMN rolls_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE char_pages ADD COLUMN standing_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE char_pages ADD COLUMN notice_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE char_pages ADD COLUMN block_hashes TEXT'); } catch {}
+try { db.exec('ALTER TABLE deaths ADD COLUMN public_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE deaths ADD COLUMN revived_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN died_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN died_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN gm_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN gm_style TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN instance_of INTEGER'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN merits INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN renown INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN lore TEXT'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN weapon1 TEXT'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN weapon2 TEXT'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN preferred_atk TEXT'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN preferred_def TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN preferred_atk TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN preferred_def TEXT'); } catch {}
+try { db.exec('ALTER TABLE roll_history ADD COLUMN rerolled INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE fights ADD COLUMN atk_rerolled INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE fights ADD COLUMN def_rerolled INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN stat_budget INTEGER DEFAULT 15'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN stat_min INTEGER DEFAULT 1'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN hp_base INTEGER DEFAULT 2'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN autorest_enabled INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN autorest_hours INTEGER DEFAULT 6'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN autorest_channel TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN autorest_last INTEGER'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_stats_visible INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN merits INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN renown INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN activity_players INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN rank_name TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN lore_doc_url TEXT'); } catch {}
+try { db.exec('ALTER TABLE fights ADD COLUMN floor_hp INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE fight_archive ADD COLUMN floor_hp INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN approval_routes TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN approval_ch_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE duels ADD COLUMN approval_ch_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE lore ADD COLUMN ch_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE merit_trades ADD COLUMN ch_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE export_requests ADD COLUMN ch_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN audit_routes TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font BLOB'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_font_name TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_archive_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN scroll_threads TEXT'); } catch {} // forum mode: JSON map gmId → thread id
+try { db.exec('ALTER TABLE characters ADD COLUMN next_mark TEXT'); } catch {} // 🔼/🔽 on their very next roll, anywhere
+try { db.exec('ALTER TABLE characters ADD COLUMN deception_spent INTEGER DEFAULT 0'); } catch {} // one trick per honest roll
+try { db.exec('ALTER TABLE characters ADD COLUMN int INTEGER DEFAULT 10'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN cha INTEGER DEFAULT 10'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN level INTEGER DEFAULT 1'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN char_class TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN hit_die INTEGER DEFAULT 8'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN armour_class INTEGER'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN proficient TEXT'); } catch {}   // JSON: saves and skills
+try { db.exec('ALTER TABLE characters ADD COLUMN hit_dice_left INTEGER'); } catch {}   // spent on a short rest
+try { db.exec('ALTER TABLE characters ADD COLUMN slots_used TEXT'); } catch {}         // JSON: spell level → how many spent
+try { db.exec('ALTER TABLE characters ADD COLUMN concentrating TEXT'); } catch {}      // what they are holding together
+try { db.exec('ALTER TABLE characters ADD COLUMN weapon1dice TEXT'); } catch {}        // e.g. 1d12 for a greataxe
+try { db.exec('ALTER TABLE characters ADD COLUMN weapon2dice TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN prepared_spells TEXT'); } catch {}    // JSON list
+try { db.exec('ALTER TABLE characters ADD COLUMN death_success INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN death_fail INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN armour_class INTEGER'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN attack_bonus INTEGER'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN damage_dice TEXT'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN max_hp INTEGER'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN int INTEGER DEFAULT 10'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN cha INTEGER DEFAULT 10'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN conditions TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN conditions TEXT'); } catch {}          // JSON list
+try { db.exec('ALTER TABLE characters ADD COLUMN temp_hp INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN temp_hp INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN inspiration INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN damage_type TEXT'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN damage_type TEXT'); } catch {}
+try { db.exec('ALTER TABLE characters ADD COLUMN resist TEXT'); } catch {}              // comma list
+try { db.exec('ALTER TABLE npcs ADD COLUMN resist TEXT'); } catch {}
+try { db.exec('ALTER TABLE fights ADD COLUMN atk_used INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN ruleset TEXT'); } catch {}
+try { db.exec('ALTER TABLE story_runs ADD COLUMN quiz_right INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE story_runs ADD COLUMN quiz_asked INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE story_runs ADD COLUMN quiz_log TEXT'); } catch {}   // for marking at the end
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN ask INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN answers TEXT'); } catch {}
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN right_to TEXT'); } catch {}
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN wrong_to TEXT'); } catch {}
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN hint TEXT'); } catch {}
+try { db.exec('ALTER TABLE stories ADD COLUMN quiz_mode TEXT'); } catch {}   // 'retry' or 'tally'
+try { db.exec('ALTER TABLE stories ADD COLUMN quiz_pass INTEGER'); } catch {}      // how many right counts as a pass
+try { db.exec('ALTER TABLE stories ADD COLUMN quiz_merit INTEGER'); } catch {}     // merits for passing
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN qid INTEGER'); } catch {}       // which banked question this is
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN explain TEXT'); } catch {}      // shown after the answer
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quiz_forum TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_forum TEXT'); } catch {}
+try { db.exec('ALTER TABLE dc_cards ADD COLUMN s_mark TEXT'); } catch {}
+try { db.exec('ALTER TABLE dc_cards ADD COLUMN f_mark TEXT'); } catch {}
+try { db.exec('ALTER TABLE dc_cards ADD COLUMN bind_channel TEXT'); } catch {}
+try { db.exec('ALTER TABLE dc_cards ADD COLUMN bind_uid TEXT'); } catch {}
+try { db.exec('ALTER TABLE dc_cards ADD COLUMN bind_skip INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE fights ADD COLUMN atk_kind TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_forum TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_plan_forum TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN plan_thread_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN stage TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_plan_tags TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_dm_thread TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_plan_books TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_thread_forum TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN index_thread_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN index_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN stage_msg_id TEXT'); } catch {}      // the one live status line in the plan thread
+try { db.exec('ALTER TABLE quests ADD COLUMN create_msg_id TEXT'); } catch {}     // the create card, swept when the board takes over
+try { db.exec('ALTER TABLE quests ADD COLUMN create_channel_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN run_thread_id TEXT'); } catch {}     // the quest's own thread, opened at start
+try { db.exec('ALTER TABLE quests ADD COLUMN run_seq INTEGER'); } catch {}        // which run of the adventure this is — #002.2
+try { db.exec('ALTER TABLE quests ADD COLUMN run_label TEXT'); } catch {}         // and what the GM calls it
+try { db.exec('ALTER TABLE quests ADD COLUMN stage_at INTEGER'); } catch {}       // when it entered the stage it's in
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_spinoff INTEGER DEFAULT 0'); } catch {} // approval births a run
+try { db.exec('ALTER TABLE quests ADD COLUMN full_pinged INTEGER DEFAULT 0'); } catch {} // party-is-full nudge, once
+try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_instance_forum TEXT'); } catch {}
+
+
+// Moved below the schema (2026-08-19): these ran BEFORE their tables
+// existed, so on a fresh database each failed silently into its own
+// catch and the column never appeared. Six were in no CREATE either,
+// so a new install queried columns it did not have. probe.js caught
+// it on its first run.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_channel_id TEXT DEFAULT NULL'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_channel_id TEXT DEFAULT NULL'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_last INTEGER'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN backup_hours INTEGER DEFAULT 24'); } catch {}
+
 
 function getChar(gid, uid) {
   return db.prepare('SELECT * FROM characters WHERE guild_id=? AND user_id=?').get(gid, uid);
@@ -3041,6 +3081,7 @@ function questEvents(gid, number, sinceMs = null) {
 const QUEST_EVENT_ICON = {
   start: '🚩', pause: '⏸️', resume: '▶️', remind: '⏱️', recap: '📻',
   combat: '⚔️', rp: '🎭', activity: '🎮', note: '📝', end: '🏁',
+  roll: '\u{1F3B2}',
 };
 function questEventLine(e) {
   return `\`${fmtElapsed(e.at_ms).padStart(7)}\` ${QUEST_EVENT_ICON[e.kind] ?? '•'} ${e.text || e.kind}`;
@@ -6290,6 +6331,9 @@ const slashCommands = [
       .addStringOption(o=>o.setName('kind').setDescription('What sort of moment').setRequired(false)
         .addChoices({name:'🎭 Roleplay',value:'rp'},{name:'⚔️ Combat',value:'combat'},{name:'📝 Note',value:'note'}))
       .addBooleanOption(o=>o.setName('public').setDescription('true = also post it in the quest\'s board thread (default: planning thread only)').setRequired(false)));
+      g.addSubcommand(s=>s.setName('log').setDescription('Write or rewrite the players\' account of a quest (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('text').setDescription('How it went, in your words').setRequired(true)));
       g.addSubcommand(s=>s.setName('timeline').setDescription('The full log of a quest so far')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)));
       g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — award merits to the party (GM)')
@@ -6338,6 +6382,33 @@ const slashCommands = [
         .addStringOption(o=>o.setName('name').setDescription('Which room').setRequired(true).setAutocomplete(true)));
       g.addSubcommand(s=>s.setName('list').setDescription('Every feedback room and its thread'));
       return g; }),
+
+  new SlashCommandBuilder()
+    .setName('button').setDescription('Plant a button in this channel for players to press (GM)')
+    .addSubcommand(s=>s.setName('roll').setDescription('Plant a roll anyone \u2014 or one named player \u2014 may press (GM)')
+      .addStringOption(o=>o.setName('dice').setDescription('e.g. 2d6+1 \u2014 leave blank to roll a stat').setRequired(false))
+      .addIntegerOption(o=>o.setName('dc').setDescription('The number to beat \u2014 blank for a plain roll').setRequired(false).setMinValue(1).setMaxValue(40))
+      .addStringOption(o=>o.setName('stat').setDescription('Roll this stat instead of dice').setRequired(false)
+        .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'},{name:'Flat d20',value:'x'}))
+      .addStringOption(o=>o.setName('reason').setDescription('The why of it \u2014 shown above the button').setRequired(false))
+      .addUserOption(o=>o.setName('for').setDescription('Only they may press it').setRequired(false))
+      .addBooleanOption(o=>o.setName('once').setDescription('true = one press each').setRequired(false))
+      .addStringOption(o=>o.setName('label').setDescription('Words on the button').setRequired(false)))
+    .addSubcommand(s=>s.setName('feedback').setDescription('A standing feedback button for this channel')
+      .addStringOption(o=>o.setName('prompt').setDescription('What to say above it').setRequired(false))),
+
+  new SlashCommandBuilder()
+    .setName('target').setDescription('Something for the party to swing at \u2014 no sheet, no roster (GM)')
+    .addSubcommand(s=>s.setName('create').setDescription('Plant a target with an attack button (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('What it is').setRequired(true))
+      .addStringOption(o=>o.setName('dice').setDescription('Roll dice against it, e.g. 2d6+1').setRequired(false))
+      .addIntegerOption(o=>o.setName('dc').setDescription('The number to beat').setRequired(false).setMinValue(1).setMaxValue(40))
+      .addStringOption(o=>o.setName('stat').setDescription('Roll this stat instead of dice').setRequired(false)
+        .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'},{name:'Flat d20',value:'x'}))
+      .addStringOption(o=>o.setName('reason').setDescription('The scene \u2014 shown above it').setRequired(false))
+      .addUserOption(o=>o.setName('for').setDescription('Only they may swing').setRequired(false))
+      .addBooleanOption(o=>o.setName('secret').setDescription('true = ask me in the GM channel, not here').setRequired(false)))
+    .addSubcommand(s=>s.setName('list').setDescription('Targets still standing in this channel (GM)')),
 ];
 
 // ─────────────────────────────────────────────
@@ -10467,8 +10538,10 @@ const SETUP_PLAN = [
     about: 'The board: a thread per posted quest.' },
   { key: 'quest_instance_forum',  name: 'quest-instances',  forum: true,  gm: false, essential: true,
     about: 'Each started quest opens its own instance here, for its party.' },
-  { key: 'quest_log_channel',     name: 'quest-chronicle',  forum: false, gm: false, essential: true,
-    about: 'Finished quests, written up for everyone.' },
+  { key: 'quest_log_channel',     name: 'quest-chronicle',  forum: true,  gm: false, essential: true,
+    about: 'A thread per adventurer \u2014 every quest they finished, told by the GM who ran it.' },
+  { key: 'quest_log_gm',          name: 'gm-quest-log',     forum: false, gm: true,  essential: false,
+    about: 'The machine\'s account of every finished quest \u2014 timings, events, payouts. GM eyes only.' },
   { key: 'memorial_public_channel', name: 'the-fallen',     forum: false, gm: false, essential: false,
     about: 'Those who did not come back, remembered by the table.' },
   { key: 'char_forum',            name: 'character-pages',  forum: true,  gm: false, essential: true,
@@ -11880,6 +11953,124 @@ async function routeButton(interaction) {
     // filed under modal traffic, so presses timed out unacknowledged
     // ("didn't respond in time", live 2026-08-14). Their modals
     // (loredocm/loredonm) stay in the modal lane where they belong.
+    if (interaction.customId === 'tgtatk') {
+      const gidT = interaction.guild.id, uidT = interaction.user.id;
+      const t = db.prepare('SELECT * FROM temp_targets WHERE guild_id=? AND message_id=?').get(gidT, interaction.message.id);
+      if (!t) return interaction.reply({ ephemeral: true, content: '\u274C That target is long gone.' });
+      if (t.dead) return interaction.reply({ ephemeral: true, content: `\u274C **${t.name}** has already fallen.` });
+      if (t.owner && t.owner !== uidT) return interaction.reply({ ephemeral: true, content: '\u274C That one is not addressed to you.' });
+
+      let line, total, passed = null;
+      if (t.dice) {
+        const rolled = rollNotation(t.dice);
+        if (!rolled) return interaction.reply({ ephemeral: true, content: '\u274C That expression no longer reads.' });
+        total = rolled.total;
+        const mod = rolled.modifier ? ` ${rolled.modifier > 0 ? '+' : ''}${rolled.modifier}` : '';
+        line = `**${t.dice}** \u2014 [${rolled.rolls.join(', ')}]${mod} = **${total}**`;
+      } else {
+        const ch = getChar(gidT, uidT);
+        if (!ch) return interaction.reply({ ephemeral: true, content: '\u274C You need a character sheet \u2014 `/char create`.' });
+        const r = rollDcCheck({ stat: t.stat === 'x' ? null : t.stat, dc: t.dc || 10, flat: t.stat === 'x', subject: ch, sig: ch });
+        if (!r) return interaction.reply({ ephemeral: true, content: '\u274C That check would not roll.' });
+        total = r.total; passed = t.dc ? r.passed : null;
+        line = r.rollLine;
+      }
+      if (t.dc && passed === null) passed = total >= t.dc;
+      db.prepare('UPDATE temp_targets SET hits=hits+1 WHERE guild_id=? AND message_id=?').run(gidT, interaction.message.id);
+
+      const nmT = await getDisplayName(interaction.guild, uidT).catch(() => 'Someone');
+      await logButtonPress(interaction, gidT, uidT, `${t.name}: ${total}${t.dc ? ` vs DC ${t.dc}` : ''}`, passed);
+      await interaction.reply({ content: [
+        `\u2694\uFE0F <@${uidT}> strikes at **${t.name}**`,
+        line,
+        t.dc ? (passed ? '\u2705 **A telling blow.**' : '\u274C **It glances off.**') : '',
+      ].filter(Boolean).join('\n'), allowedMentions: { users: [uidT] } });
+
+      // The GM's verdict — the only death check there is. In the channel by
+      // default so the table feels it; in the GM channel when `secret`.
+      const { ActionRowBuilder: TR, ButtonBuilder: TB, ButtonStyle: TS } = require('discord.js');
+      const ask = [`\u{1F5E1}\uFE0F **${t.name}** \u2014 struck by ${nmT} for **${total}**${t.dc ? ` vs DC ${t.dc}` : ''}. Does it fall?`];
+      const rowT = new TR().addComponents(
+        new TB().setCustomId(`tgtdie:${interaction.message.id}:1`).setLabel('\u{1FAA6} It falls').setStyle(TS.Danger),
+        new TB().setCustomId(`tgtdie:${interaction.message.id}:0`).setLabel('\u{1F6E1}\uFE0F It holds').setStyle(TS.Secondary));
+      const gmChId = t.secret ? (getConfig(gidT)?.quest_log_gm || getConfig(gidT)?.roll_audit_channel_id) : null;
+      const dest = gmChId ? await interaction.client.channels.fetch(gmChId).catch(() => null) : interaction.channel;
+      await (dest || interaction.channel).send({ content: ask.join('\n'), components: [rowT], allowedMentions: { parse: [] } }).catch(() => {});
+      return;
+    }
+
+    if (interaction.customId.startsWith('tgtdie:')) {
+      if (!(await isGm(interaction.guild, interaction.user.id)))
+        return interaction.reply({ ephemeral: true, content: '\u274C That call is the GM\'s.' });
+      const [, msgId, fellS] = interaction.customId.split(':');
+      const gidT = interaction.guild.id;
+      const t = db.prepare('SELECT * FROM temp_targets WHERE guild_id=? AND message_id=?').get(gidT, msgId);
+      if (!t) return interaction.reply({ ephemeral: true, content: '\u274C That target is long gone.' });
+      const fell = fellS === '1';
+      if (fell) {
+        db.prepare('UPDATE temp_targets SET dead=1 WHERE guild_id=? AND message_id=?').run(gidT, msgId);
+        // Its own button dies with it, so nobody swings at a corpse.
+        const ch = await interaction.client.channels.fetch(t.channel_id).catch(() => null);
+        const m = ch ? await ch.messages.fetch(msgId).catch(() => null) : null;
+        if (m?.editable) await m.edit({ content: `\u{1FAA6} ~~**${t.name}**~~ \u2014 fallen after ${t.hits} hit${t.hits === 1 ? '' : 's'}.`, components: [] }).catch(() => {});
+        await logButtonPress(interaction, gidT, interaction.user.id, `${t.name} falls`, null);
+      }
+      await interaction.update({ content: `${interaction.message.content}\n${fell ? '\u{1FAA6} **It falls.**' : '\u{1F6E1}\uFE0F **It holds.**'}`, components: [] }).catch(() => {});
+      return;
+    }
+
+    if (interaction.customId === 'btnfb') {
+      // The planted feedback button opens the same picker /feedback send
+      // does — one path, one voice.
+      const gidB = interaction.guild.id;
+      const types = feedbackTypes(gidB);
+      const { ActionRowBuilder: FR, StringSelectMenuBuilder: FS } = require('discord.js');
+      const menu = new FS().setCustomId('fbcat').setPlaceholder('Which room?')
+        .addOptions(Object.entries(types).slice(0, 25).map(([k, t]) => ({ label: t.name.slice(0, 100), value: k, description: t.about?.slice(0, 100) })));
+      return interaction.reply({ ephemeral: true, content: '\u{1F4DD} **Feedback** \u2014 pick a room, then score it and say your piece. Only the GMs will see it.',
+        components: [new FR().addComponents(menu)] });
+    }
+
+    if (interaction.customId.startsWith('btnchk:') || interaction.customId.startsWith('btnroll:')) {
+      const gidB = interaction.guild.id, uidB = interaction.user.id;
+      const parts = interaction.customId.split(':');
+      // …:<once>:<owner> — 'any' means the floor is open, an id means it
+      // was addressed and only they may press.
+      // …:<dc>:<once>:<owner> on both kinds now.
+      const owner = parts[parts.length - 1];
+      const once = parts[parts.length - 2] === '1';
+      const pressDc = parseInt(parts[parts.length - 3], 10) || 0;
+      if (owner && owner !== 'any' && owner !== uidB)
+        return interaction.reply({ ephemeral: true, content: '\u274C That one is not addressed to you.' });
+      if (once && !buttonPressGate(gidB, interaction.message.id, uidB))
+        return interaction.reply({ ephemeral: true, content: '\u274C You have had your go at this one.' });
+
+      if (parts[0] === 'btnchk') {
+        const stat = parts[1], dc = pressDc;
+        const ch = getChar(gidB, uidB);
+        if (!ch) return interaction.reply({ ephemeral: true, content: '\u274C You need a character sheet \u2014 `/char create`.' });
+        const r = rollDcCheck({ stat: stat === 'x' ? null : stat, dc, flat: stat === 'x', subject: ch, sig: ch });
+        if (!r) return interaction.reply({ ephemeral: true, content: '\u274C That check would not roll.' });
+        const face = stat === 'x' ? 'flat d20' : STAT_LABELS[stat];
+        await logButtonPress(interaction, gidB, uidB, `${face} ${r.total}${dc ? ` vs DC ${dc}` : ''}`, dc ? r.passed : null);
+        return interaction.reply({ content: [
+          `\u{1F3AF} <@${uidB}> \u2014 **${face}**${dc ? ` vs **DC ${dc}**` : ''}`,
+          r.rollLine,
+          r.passed ? '\u2705 **Passed.**' : '\u274C **Failed.**',
+        ].join('\n'), allowedMentions: { users: [uidB] } });
+      }
+
+      const dice = parts[1];
+      const rolled = rollNotation(dice);
+      if (!rolled) return interaction.reply({ ephemeral: true, content: '\u274C That expression no longer reads.' });
+      const faces = rolled.rolls.join(', ');
+      const mod = rolled.modifier ? ` ${rolled.modifier > 0 ? '+' : ''}${rolled.modifier}` : '';
+      const verdict = pressDc ? (rolled.total >= pressDc ? '\n\u2705 **Passed.**' : '\n\u274C **Failed.**') : '';
+      await logButtonPress(interaction, gidB, uidB, `${dice} = ${rolled.total}${pressDc ? ` vs DC ${pressDc}` : ''}`, pressDc ? rolled.total >= pressDc : null);
+      return interaction.reply({ content: `\u{1F3B2} <@${uidB}> rolled **${dice}**${pressDc ? ` vs **DC ${pressDc}**` : ''} \u2014 [${faces}]${mod} = **${rolled.total}**${verdict}`,
+        allowedMentions: { users: [uidB] } });
+    }
+
     if (interaction.customId.startsWith('fbq:')) {
       // Anyone in the run may speak; the press and everything after is
       // ephemeral, so the party never sees who did.
@@ -12552,6 +12743,8 @@ client.on('interactionCreate', async interaction => {
       if (sg === 'rank') return await handleRank(interaction);
     }
     if (interaction.commandName === 'instance') return await handleInstance(interaction);
+    if (interaction.commandName === 'target') return await handleTarget(interaction);
+    if (interaction.commandName === 'button') return await handleButton(interaction);
     if (interaction.commandName === 'feedback') return await handleFeedback(interaction);
     if (interaction.commandName === 'quest') return await handleQuest(interaction);
   } catch (err) {
@@ -15380,6 +15573,203 @@ function clearDcBind(gid, msgId) {
 // player-facing step ephemeral so nobody sees who said what (T,
 // 2026-08-16). GMs see the author on the card; other players see nothing
 // at all — not the command, not the reply, not the entry.
+// The players' chronicle entry: the GM's telling, headed by the quest and
+// its party, with the mechanical detail deliberately absent — that lives
+// in the GM log. Returns the jump link.
+// The players' chronicle: a thread per adventurer, and a quest's tale
+// mirrored into the thread of everyone who was there (T, 2026-08-16).
+// Rewriting edits each copy in place — found via that player's own stored
+// url — so a retelling never stacks. Returns a map of user_id -> url.
+async function postQuestTale(interaction, gid, quest, text, party) {
+  const chId = getConfig(gid)?.quest_log_channel;
+  if (!chId) return {};
+  const forum = await interaction.client.channels.fetch(chId).catch(() => null);
+  if (!forum) return {};
+  const out = {};
+  const isForum = forum.type === 15;
+  for (const uid of party) {
+    const name = await getDisplayName(interaction.guild, uid).catch(() => 'Adventurer');
+    const body = [`\u{1F4D6} **${questTag(quest)}**`, '', text].join('\n').slice(0, 1900);
+
+    // Their thread, made once and kept.
+    let thread = null;
+    if (isForum) {
+      const row = db.prepare('SELECT thread_id FROM chronicle_threads WHERE guild_id=? AND user_id=?').get(gid, uid);
+      thread = row?.thread_id ? await interaction.client.channels.fetch(row.thread_id).catch(() => null) : null;
+      if (thread && (!thread.isThread?.() || thread.parentId !== forum.id)) thread = null;
+      if (!thread) {
+        thread = await forum.threads.create({
+          name: name.slice(0, 90),
+          message: { content: `\u{1F4DC} **${name}** \u2014 the quests they have seen through.`, allowedMentions: { parse: [] } },
+        }).catch(() => null);
+        if (!thread) continue;
+        db.prepare(`INSERT INTO chronicle_threads (guild_id, user_id, thread_id, at) VALUES (?,?,?,?)
+                    ON CONFLICT(guild_id, user_id) DO UPDATE SET thread_id=excluded.thread_id, at=excluded.at`)
+          .run(gid, uid, thread.id, Date.now());
+      } else {
+        await wakeThread(thread);
+      }
+      if (thread.name !== name.slice(0, 90)) await thread.setName(name.slice(0, 90)).catch(() => {});
+    }
+    const target = isForum ? thread : forum;
+
+    // Their own copy, edited in place when it already exists.
+    const prior = db.prepare('SELECT url FROM quest_summaries WHERE guild_id=? AND number=? AND user_id=?').get(gid, quest.number, uid);
+    const priorId = prior?.url?.split('/').pop();
+    let url = null;
+    if (priorId) {
+      const m = await target.messages.fetch(priorId).catch(() => null);
+      if (m?.editable) { await m.edit({ content: body, allowedMentions: { parse: [] } }).catch(() => {}); url = prior.url; }
+    }
+    if (!url) {
+      const sent = await target.send({ content: body, allowedMentions: { parse: [] } }).catch(() => null);
+      if (sent) url = `https://discord.com/channels/${gid}/${target.id}/${sent.id}`;
+    }
+    if (url) out[uid] = url;
+    await pace(150);
+  }
+  return out;
+}
+
+// Buttons a GM plants in a channel, pressed by anyone who comes along.
+// Everything the press needs rides in the customId, so a button keeps
+// working after a restart with no state to lose; the only stored thing is
+// who has pressed, and only when `once` is asked for (T, 2026-08-16).
+// Temporary targets: a thing in a channel to swing at, with no sheet and
+// no roster entry. It has no HP — every hit asks the GM whether it falls,
+// which is both simpler and truer to how a table actually plays (T,
+// 2026-08-16). `secret` sends that question to the GM channel instead.
+async function handleTarget(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '\u274C Only GMs can set targets.', ephemeral: true });
+  const sub = interaction.options.getSubcommand();
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+
+  if (sub === 'list') {
+    const rows = db.prepare('SELECT name, hits, dead FROM temp_targets WHERE guild_id=? AND channel_id=? ORDER BY at DESC LIMIT 20')
+      .all(gid, interaction.channel.id);
+    if (!rows.length) return interaction.reply({ ephemeral: true, content: '\u{1F5FF} Nothing standing here.' });
+    return interaction.reply({ ephemeral: true, content: ['\u{1F5FF} **Targets here**', ...rows.map(r =>
+      `${r.dead ? '\u{1FAA6}' : '\u2694\uFE0F'} **${r.name}** \u2014 ${r.hits} hit${r.hits === 1 ? '' : 's'}${r.dead ? ', fallen' : ''}`)].join('\n') });
+  }
+
+  const name = interaction.options.getString('name').trim();
+  const dice = (interaction.options.getString('dice') || '').trim();
+  const stat = interaction.options.getString('stat');
+  const dc = interaction.options.getInteger('dc');
+  const reason = (interaction.options.getString('reason') || '').trim();
+  const forUser = interaction.options.getUser('for');
+  const secret = interaction.options.getBoolean('secret') ? 1 : 0;
+  if (dice && stat) return interaction.reply({ ephemeral: true, content: '\u274C Dice or a stat, not both.' });
+  if (!dice && !stat) return interaction.reply({ ephemeral: true, content: '\u274C Give dice (`2d6+1`) or a stat to swing with.' });
+  if (dice && !/^\d{0,2}d\d{1,3}([+-]\d{1,3})?$/i.test(dice))
+    return interaction.reply({ ephemeral: true, content: '\u274C That is not dice I can read \u2014 try `2d6+1`.' });
+
+  const face = dice || (stat === 'x' ? 'Flat d20' : STAT_LABELS[stat]);
+  const head = [`\u2694\uFE0F **${name}** stands${dc ? ` \u2014 **${face}** against **DC ${dc}**` : ` \u2014 swing with **${face}**`}.`];
+  if (reason) head.unshift(reason, '');
+  if (forUser) head.unshift(`<@${forUser.id}> \u2014`);
+  const msg = await interaction.channel.send({
+    content: head.join('\n'),
+    components: [new ActionRowBuilder().addComponents(new ButtonBuilder()
+      .setCustomId('tgtatk').setLabel(`\u2694\uFE0F Attack ${name}`.slice(0, 80)).setStyle(ButtonStyle.Danger))],
+    allowedMentions: forUser ? { users: [forUser.id] } : { parse: [] },
+  }).catch(() => null);
+  if (!msg) return interaction.reply({ ephemeral: true, content: '\u274C I could not post it here.' });
+
+  // The button carries no state: the row keyed by its own message is the
+  // target, so a restart loses nothing.
+  db.prepare(`INSERT INTO temp_targets (guild_id, message_id, channel_id, name, dc, stat, dice, secret, owner, created_by, at)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(gid, msg.id, interaction.channel.id, name, dc || null, stat || null, dice || null, secret, forUser?.id || null, interaction.user.id, Date.now());
+  return interaction.reply({ ephemeral: true, content: `\u2705 **${name}** is standing. Every hit will ask you whether it falls.` });
+}
+
+async function handleButton(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '\u274C Only GMs can plant buttons.', ephemeral: true });
+  const sub = interaction.options.getSubcommand();
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  const prompt = (interaction.options.getString('prompt') || '').trim();
+  const once = interaction.options.getBoolean('once') ? '1' : '0';
+  // A button can be addressed to one player; anyone else pressing is
+  // turned away (T, 2026-08-16). 'any' keeps the id slot filled so the
+  // customId parses the same either way.
+  const forUser = interaction.options.getUser?.('for');
+  const owner = forUser?.id || 'any';
+
+  if (sub === 'feedback') {
+    const row = new ActionRowBuilder().addComponents(new ButtonBuilder()
+      .setCustomId('btnfb').setLabel('\u{1F4DD} Send feedback').setStyle(ButtonStyle.Primary));
+    await interaction.channel.send({ content: prompt || '\u{1F4DD} **Tell the GMs what you think** \u2014 only they will see it.',
+      components: [row], allowedMentions: { parse: [] } });
+    return interaction.reply({ ephemeral: true, content: '\u2705 Planted.' });
+  }
+
+  if (sub === 'roll') {
+    // One leaf, T's order: dice or stat, an optional DC, the reason, then
+    // who it is for. Dice and stat are alternatives — naming both is a
+    // question with two answers, so it is refused rather than guessed.
+    const dice = (interaction.options.getString('dice') || '').trim();
+    const stat = interaction.options.getString('stat');
+    const dc = interaction.options.getInteger('dc');
+    const reason = (interaction.options.getString('reason') || '').trim();
+    if (dice && stat)
+      return interaction.reply({ ephemeral: true, content: '\u274C Dice or a stat, not both.' });
+    if (!dice && !stat)
+      return interaction.reply({ ephemeral: true, content: '\u274C Give dice (`2d6+1`) or a stat to roll.' });
+    if (dice && !/^\d{0,2}d\d{1,3}([+-]\d{1,3})?$/i.test(dice))
+      return interaction.reply({ ephemeral: true, content: '\u274C That is not dice I can read — try `2d6+1`.' });
+
+    const faceName = dice || (stat === 'x' ? 'Flat d20' : STAT_LABELS[stat]);
+    const label = (interaction.options.getString('label') || '').trim()
+      || `\u{1F3B2} ${faceName}${dc ? ` vs DC ${dc}` : ''}`;
+    const id = dice
+      ? `btnroll:${dice}:${dc || 0}:${once}:${owner}`
+      : `btnchk:${stat}:${dc || 0}:${once}:${owner}`;
+    const row = new ActionRowBuilder().addComponents(new ButtonBuilder()
+      .setCustomId(id).setLabel(label.slice(0, 80)).setStyle(ButtonStyle.Secondary));
+    const addressed = forUser ? `<@${forUser.id}> — ` : '';
+    const line = reason || (dc
+      ? `\u{1F3AF} **${faceName}** against **DC ${dc}**.`
+      : `\u{1F3B2} **${faceName}** — ${forUser ? 'yours to roll.' : 'anyone may roll.'}`);
+    await interaction.channel.send({ content: addressed + line,
+      components: [row],
+      allowedMentions: forUser ? { users: [forUser.id] } : { parse: [] } });
+    return interaction.reply({ ephemeral: true, content: '\u2705 Planted.' });
+  }
+
+  return interaction.reply({ ephemeral: true, content: '\u274C Unknown button.' });
+}
+
+// A press inside a quest's channel or thread joins that quest's timeline,
+// and so reaches the GM's log when the run is completed. Outside a quest
+// there is nothing to attach it to, so nothing is written (T, 2026-08-16).
+async function logButtonPress(interaction, gid, uid, detail, passed) {
+  try {
+    const chId = interaction.channel?.id;
+    const parentId = interaction.channel?.isThread?.() ? interaction.channel.parentId : null;
+    const q = db.prepare(`SELECT number FROM quests WHERE guild_id=? AND status='active'
+                            AND (run_channel_id=? OR run_thread_id=? OR run_channel_id=?) LIMIT 1`)
+      .get(gid, chId, chId, parentId || chId);
+    if (!q) return;
+    const nm = await getDisplayName(interaction.guild, uid).catch(() => 'Someone');
+    const mark = passed === null ? '' : passed ? ' \u2014 passed' : ' \u2014 failed';
+    logQuestEvent(gid, q.number, 'roll', `${nm}: ${detail}${mark}`, uid);
+  } catch {}
+}
+
+// One press each, when the GM asked for it.
+function buttonPressGate(gid, messageId, uid) {
+  const had = db.prepare('SELECT 1 FROM button_presses WHERE guild_id=? AND message_id=? AND user_id=?').get(gid, messageId, uid);
+  if (had) return false;
+  db.prepare('INSERT OR IGNORE INTO button_presses (guild_id, message_id, user_id, at) VALUES (?,?,?,?)')
+    .run(gid, messageId, uid, Date.now());
+  return true;
+}
+
 async function handleFeedback(interaction) {
   const gid = interaction.guild.id;
   const group = interaction.options.getSubcommandGroup(false);
@@ -22002,6 +22392,25 @@ async function handleQuest(interaction, forced) {
       ...events.map(questEventLine)], { ephemeral: true });
   }
 
+  if (sub === 'log') {
+    // The players' account, written or rewritten after the fact. Edits the
+    // chronicle post in place and re-points every participant's record, so
+    // a rushed completion is never a permanent loss.
+    if (!gm) return interaction.reply({ content: '\u274C Only GMs can write the quest log.', ephemeral: true });
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const text = interaction.options.getString('text').trim();
+    await interaction.deferReply({ ephemeral: true });
+    const party = getQuestMembers(gid, quest.number, 'party');
+    const urls = await postQuestTale(interaction, gid, quest, text, party).catch(() => ({}));
+    const n = Object.keys(urls).length;
+    if (!n) return interaction.editReply({ content: '\u274C No quest-chronicle forum is set \u2014 `/config channels questlog` first.' });
+    // Each adventurer's own copy, each linked from their own record.
+    const upd = db.prepare('UPDATE quest_summaries SET url=? WHERE guild_id=? AND number=? AND user_id=?');
+    for (const [uid2, u] of Object.entries(urls)) upd.run(u, gid, quest.number, uid2);
+    return interaction.editReply({ content: `\u{1F4D6} Written into **${n}** adventurer${n === 1 ? '' : 's'}' chronicle${n === 1 ? '' : 's'}.` });
+  }
+
   if (sub === 'complete') {
     const quest = await requireQuest(interaction, gid);
     if (!quest) return;
@@ -22099,7 +22508,11 @@ async function handleQuest(interaction, forced) {
     // Post it where a GM asked for it, and keep the link so it can hang off
     // each player's standing page.
     let summaryUrl = null;
-    const logChId = getConfig(gid)?.quest_log_channel;
+    // The machine's account is for GMs (T, 2026-08-16): timings, every
+    // logged event, the payout. The players' chronicle carries the GM's
+    // own telling instead — written at completion or later with
+    // `/quest log`.
+    const logChId = getConfig(gid)?.quest_log_gm || null;
     if (logChId) {
       try {
         const logCh = await interaction.client.channels.fetch(logChId);
@@ -22112,14 +22525,24 @@ async function handleQuest(interaction, forced) {
         if (first) summaryUrl = `https://discord.com/channels/${gid}/${logCh.id}/${first.id}`;
       } catch (err) { console.error('[quest] could not post summary:', err?.message || err); }
     }
+    // The players' chronicle: the GM's own telling. Given at completion via
+    // `summary:`, or written later with `/quest log` — which fills this in
+    // and updates every participant's record link.
+    let taleUrls = {};
+    const tale = (interaction.options?.getString?.('summary') || '').trim();
+    if (tale) taleUrls = await postQuestTale(interaction, gid, quest, tale, party).catch(() => ({}));
+    const taleUrl = Object.values(taleUrls)[0] || null;
+
     const ins = db.prepare(`INSERT INTO quest_summaries (guild_id,number,user_id,quest_name,url,duration_ms,ended_at)
                             VALUES (?,?,?,?,?,?,?)
                             ON CONFLICT(guild_id,number,user_id) DO UPDATE SET url=excluded.url, duration_ms=excluded.duration_ms`);
-    for (const id of party) ins.run(gid, number, id, questTag(quest), summaryUrl, runMs, Date.now());
+    for (const id of party) ins.run(gid, number, id, questTag(quest), taleUrls[id] || summaryUrl, runMs, Date.now());
 
-    lines.push('', ...(summaryUrl
-      ? [`📜 [Read the full summary](${summaryUrl}) — it is on everyone's \`/char view standing\` too.`]
-      : ['_No quest log channel set, so the summary was not posted — a GM can set one with `/config channels questlog`._']));
+    lines.push('', ...(taleUrl
+      ? [`\u{1F4D6} [Read the tale](${taleUrl}) \u2014 it is on everyone's record too.`]
+      : !tale ? ['_No tale written yet \u2014 `/quest log number:' + number + ' text:\u2026` writes one for the players._'] : []));
+        lines.push(...(summaryUrl
+      ? [`📒 [The GM record](${summaryUrl}) — timings, events and payouts, GM eyes only.`]      : ['_No quest log channel set, so the summary was not posted — a GM can set one with `/config channels questlog`._']));
     if (!logChId) lines.push(...summary.slice(2, 14));
 
     // Announce in the designated run channel if set and different from here
