@@ -14472,7 +14472,20 @@ async function ensureCharPage(client, guild, uid, displayName, scope = 'sheet') 
 const PACE_MS = 300;
 const pace = () => new Promise(r => setTimeout(r, PACE_MS));
 
+// Two menders running at once on the same character each read the row
+// before either wrote it, each found the blocks missing, and each posted a
+// full set — which is how T's threads ended up with two of everything once
+// bootMend joined the hourly sweep (2026-08-19). One mend per character at
+// a time; the loser simply skips.
+const charMendLocks = new Set();
 async function ensureCharBlocks(client, guild, uid, thread, sheetBody = null) {
+  const lockKey = `${guild.id}:${uid}`;
+  if (charMendLocks.has(lockKey)) return 0;
+  charMendLocks.add(lockKey);
+  try { return await ensureCharBlocksInner(client, guild, uid, thread, sheetBody); }
+  finally { charMendLocks.delete(lockKey); }
+}
+async function ensureCharBlocksInner(client, guild, uid, thread, sheetBody = null) {
   const gid = guild.id;
   const row = getCharPage(gid, uid);
   if (!row) return;
@@ -14540,6 +14553,22 @@ async function ensureCharBlocks(client, guild, uid, thread, sheetBody = null) {
   }
   db.prepare('UPDATE char_pages SET inv_msg_id=?, lore_msg_id=?, standing_msg_id=?, titles_msg_id=?, rolls_msg_id=?, notice_msg_id=?, block_hashes=? WHERE guild_id=? AND user_id=?')
     .run(ids.inv, ids.lore, ids.standing, ids.titles, ids.rolls, ids.notice, JSON.stringify(hashes), gid, uid);
+
+  // Duplicates left by an earlier race: the thread is locked to players, so
+  // every bot message in it is a block. Anything not currently recorded —
+  // and not the starter — is a stray, and goes.
+  try {
+    const keep = new Set([thread.id, ...Object.values(ids).filter(Boolean)]);
+    const recent = await thread.messages.fetch({ limit: 50 }).catch(() => null);
+    if (recent) {
+      for (const m of recent.values()) {
+        if (m.author?.id !== client.user.id || keep.has(m.id)) continue;
+        await m.delete().catch(() => {});
+        edited++;
+        await pace(150);
+      }
+    }
+  } catch {}
   return { edited, failed };
 }
 

@@ -1338,6 +1338,15 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     // deleteNpc reached for `interaction` from a scope that never had it:
     // the ReferenceError fell into its own catch, so the NPC's thread and
     // page row outlived them every time (audit, 2026-08-19).
+    // Two menders on one character posted two of everything; the lock ends
+    // that, and the stray sweep clears what the race already left.
+    ok('only one mender may touch a character at a time',
+      /const charMendLocks = new Set\(\);/.test(src) &&
+      /if \(charMendLocks\.has\(lockKey\)\) return 0;/.test(src) &&
+      /finally \{ charMendLocks\.delete\(lockKey\); \}/.test(src));
+    ok('unrecorded bot messages in a character thread are swept',
+      /const keep = new Set\(\[thread\.id, \.\.\.Object\.values\(ids\)\.filter\(Boolean\)\]\);/.test(src) &&
+      /m\.author\?\.id !== client\.user\.id \|\| keep\.has\(m\.id\)/.test(src));
     ok('deleteNpc takes a client rather than reaching for an interaction',
       /function deleteNpc\(gid, name, client = null\)/.test(src) &&
       (() => {

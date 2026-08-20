@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 918 assertions passed and no scanner found an ERROR.
+Green means 920 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 918 assertions covering structure, registration and ruleset
+now is 920 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -325,6 +325,23 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 8o · The duplicate-block race (2026-08-19, live)
+
+T's threads showed two of every block. Cause: adding `bootMend` put a
+second mender on the same characters as the 90-second sweep. Both read
+char_pages before either wrote it, both saw the new Titles block missing,
+and both posted a full set — a textbook read-modify-write race, created
+by me the same day the Titles block landed.
+
+Two fixes. `charMendLocks` (an in-process Set keyed guild:user) admits one
+mender per character; the loser returns 0 rather than queueing, because a
+mend that just ran has nothing left to do. And a stray sweep: the char
+forum is locked to players, so EVERY bot message in a thread is a block —
+anything not currently recorded in char_pages, and not the starter, is a
+leftover and is deleted (50-message window, 150ms paced). That clears the
+duplicates already posted on T's server without anyone tidying by hand.
+Both pinned.
 
 ## 8n · Audit: the deleteNpc scope bug (2026-08-19)
 
