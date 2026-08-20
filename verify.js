@@ -1334,6 +1334,34 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /function titlesLine\(gid, sid\)/.test(src) &&
       /const tl = titlesLine\(gid, npcFighterId\(npc\.name\)\);/.test(src) &&
       /function charTitlesBody\(gid, uid\)/.test(src));
+    // Mending on boot: add what is missing, never move what is placed.
+    // deleteNpc reached for `interaction` from a scope that never had it:
+    // the ReferenceError fell into its own catch, so the NPC's thread and
+    // page row outlived them every time (audit, 2026-08-19).
+    ok('deleteNpc takes a client rather than reaching for an interaction',
+      /function deleteNpc\(gid, name, client = null\)/.test(src) &&
+      (() => {
+        const i2 = src.indexOf('function deleteNpc(gid, name, client');
+        const body = src.slice(i2, src.indexOf('\nfunction ', i2 + 10));
+        return !/interaction\./.test(body);
+      })());
+    ok('titles and associations are purged with their subject',
+      /\['subject_titles', 'subject_id'\], \['subject_assocs', 'subject_id'\]/.test(src));
+    ok('title and association leaves are named, never fallen-through',
+      /if \(leaf !== 'revoke'\)/.test(src) && /if \(leaf !== 'remove'\)/.test(src));
+    ok('one mender serves the boot path and /gm check run',
+      /async function mendEverything\(client, guild/.test(src) &&
+      /async function bootMend\(client\)/.test(src) &&
+      /const mended = await mendEverything\(interaction\.client, interaction\.guild\)/.test(src));
+    ok('the mender never moves or renames anything',
+      (() => {
+        const i2 = src.indexOf('async function mendEverything');
+        const body = src.slice(i2, src.indexOf('\nasync function', i2 + 10));
+        return !/setPosition|setParent|setName\(|setConfig\(/.test(body);
+      })());
+    ok('an unconfigured guild is left alone on boot',
+      /const configured = \['char_forum', 'npc_forum', 'quest_board', 'approval_routes', 'quest_log_channel'\]/.test(src) &&
+      /if \(!configured\) continue;/.test(src));
     ok('the completion options the handler reads are actually declared',
       /setName\('summary'\)\.setDescription\('Your telling of it/.test(src) &&
       /setName\('title'\)\.setDescription\('A title every survivor earns/.test(src));

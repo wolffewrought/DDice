@@ -3277,12 +3277,12 @@ function getAllNpcs(gid, { includeTemp = false } = {}) {
 }
 // Sweep the throwaway cast. Anyone still in a fight is spared unless the
 // GM forces it, so a redeploy mid-brawl cannot disarm the enemies.
-function sweepTempNpcs(gid, { force = false } = {}) {
+function sweepTempNpcs(gid, { force = false, client = null } = {}) {
   const fighting = new Set(fightingNpcNames(gid));
   let n = 0;
   for (const t of getTempNpcs(gid)) {
     if (!force && fighting.has(t.name.toLowerCase())) continue;
-    try { deleteNpc(gid, t.name); n++; } catch {}
+    try { deleteNpc(gid, t.name, client); n++; } catch {}
   }
   return n;
 }
@@ -3306,7 +3306,11 @@ function upsertNpc(gid, name, fields) {
   }
   return getNpc(gid, name);
 }
-function deleteNpc(gid, name) {
+// `client` is threaded in because this used to reach for `interaction`,
+// which is not in scope here: the ReferenceError fell straight into the
+// catch below, so an NPC's thread and page row outlived them every single
+// time (audit, 2026-08-19).
+function deleteNpc(gid, name, client = null) {
   purgeSubjectRecords(gid, npcFighterId(name));
   // Their entry goes with them. The category thread stays: it belongs to the
   // category, not to any one NPC, and other NPCs are still in it.
@@ -3315,7 +3319,7 @@ function deleteNpc(gid, name) {
       // Their thread IS their page now — it goes with them.
       const row = db.prepare('SELECT thread_id FROM npc_pages WHERE guild_id=? AND name=?').get(gid, name);
       if (row?.thread_id) {
-        const th = await interaction.client.channels.fetch(row.thread_id).catch(() => null);
+        const th = client ? await client.channels.fetch(row.thread_id).catch(() => null) : null;
         if (th?.isThread?.()) await th.delete().catch(() => {});
       }
       db.prepare('DELETE FROM npc_pages WHERE guild_id=? AND name=?').run(gid, name);
@@ -7459,7 +7463,7 @@ async function handleGmTest(interaction) {
         e1b?.thread_id === e1?.thread_id ? 'entry did not move' : null);
 
       // 4 \u00b7 deleting an NPC removes the entry, keeps the thread
-      deleteNpc(gid, N2);
+      deleteNpc(gid, N2, interaction.client);
       await new Promise(r => setTimeout(r, 1500));   // the sweep is fire-and-forget
       const bThread = threadOf('npc_category_threads', B);
       const bLive = bThread ? await interaction.client.channels.fetch(bThread).catch(() => null) : null;
@@ -7481,7 +7485,7 @@ async function handleGmTest(interaction) {
       step('deleting a category closes its thread', aGone);
 
       // 6 \u00b7 tear-down: the fixture NPC, category and their threads
-      deleteNpc(gid, N1);
+      deleteNpc(gid, N1, interaction.client);
       deleteCategory(gid, B);
       for (const table of Object.values(NPC_THREAD_TABLES)) {
         for (const cat of [A, B]) {
@@ -11985,6 +11989,7 @@ client.once('clientReady', async () => {  // 'ready' is deprecated in favour of 
   runRenameMigration(client).catch(err => console.error('[run-rename]', err?.message || err));
   npcThreadMigration(client).catch(err => console.error('[npc-threads]', err?.message || err));
   forumSetupMigration(client).catch(err => console.error('[gm-forum]', err?.message || err));
+  bootMend(client).catch(err => console.error('[mend]', err?.message || err));
   charThreadMigration(client).catch(err => console.error('[char-threads]', err?.message || err));
   startCharBlockSweep(client);
   startBackupScheduler();
@@ -13911,7 +13916,8 @@ function purgeSubjectRecords(gid, id) {
   for (const [table, col] of [['inventory', 'user_id'], ['roll_tally', 'user_id'],
                               ['renown_log', 'user_id'], ['lore', 'user_id'],
                               ['deaths', 'subject_id'], ['quest_members', 'user_id'],
-                              ['quest_summaries', 'user_id'], ['heal_charges', 'user_id']]) {
+                              ['quest_summaries', 'user_id'], ['heal_charges', 'user_id'],
+                              ['subject_titles', 'subject_id'], ['subject_assocs', 'subject_id']]) {
     try { counts[table] = db.prepare(`DELETE FROM ${table} WHERE guild_id=? AND ${col}=?`).run(gid, id).changes; }
     catch { counts[table] = 0; }
   }
@@ -15862,6 +15868,7 @@ async function handleTitles(interaction, group) {
       return interaction.reply({ allowedMentions: { parse: [] },
         content: `\u{1F3C5} ${label} is now **${title}**${source ? ` \u2014 _${source}_` : ''}.` });
     }
+    if (leaf !== 'revoke') return interaction.reply({ ephemeral: true, content: '\u274C Unknown title command.' });
     const gone = revokeTitle(gid, sid, title);
     if (gone) refresh();
     return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] },
@@ -15875,6 +15882,9 @@ async function handleTitles(interaction, group) {
     return interaction.reply({ allowedMentions: { parse: [] },
       content: `\u{1F6E1}\uFE0F ${label} now stands with **${name}**.` });
   }
+  // Named rather than fallen-through, so a leaf added later cannot land
+  // here by accident (the same smell fixed for /feedback send).
+  if (leaf !== 'remove') return interaction.reply({ ephemeral: true, content: '\u274C Unknown association command.' });
   const parted = removeAssoc(gid, sid, name);
   if (parted) refresh();
   return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] },
@@ -18442,7 +18452,7 @@ async function handleFight(interaction, forced) {
       // The throwaway cast leaves with the fight. Anyone still standing in
       // another brawl is spared — sweepTempNpcs checks before it deletes.
       try {
-        const sweptT = sweepTempNpcs(gid);
+        const sweptT = sweepTempNpcs(gid, { client: guild?.client ?? interaction?.client ?? null });
         if (sweptT) console.log(`[temp-npcs] swept ${sweptT} after the fight in ${cid2}`);
       } catch {}
       await announceFightEnd(interaction.guild, gid, cid2, channel2, {
@@ -18732,7 +18742,7 @@ async function handleNpc(interaction) {
       if (fightingNpcNames(gid).has(name)) {
         return interaction.reply({ ephemeral: true, content: `❌ **${name}** is in an active fight — finish or end it before deleting them.` });
       }
-      deleteNpc(gid, name);
+      deleteNpc(gid, name, interaction.client);
       registerSlashCommands(gid).catch(console.error);
       return `🗑️ NPC **${name}** deleted.`;
     });
@@ -21562,6 +21572,67 @@ async function healChannelPerms(guild) {
   return out;
 }
 
+// Everything that should exist but might not: forum threads, character
+// pages, NPC pages, the permission sweep. It CREATES and REFRESHES only —
+// it never renames, moves, reparents or re-points anything already
+// configured, so a board you put somewhere else with a name of your own is
+// left exactly where you put it (T, 2026-08-19).
+// On every boot, quietly bring each already-set-up server up to date: new
+// forum threads, new page blocks, new features. It only ever ADDS. A guild
+// that has never been set up is skipped entirely, so the bot never
+// conjures channels into a server that did not ask (T, 2026-08-19).
+async function bootMend(client) {
+  for (const [gid, guild] of client.guilds.cache) {
+    const cfg = getConfig(gid) || {};
+    // "Already set up" means they pointed us at something. Without that
+    // there is nothing to keep current and nothing we should invent.
+    const configured = ['char_forum', 'npc_forum', 'quest_board', 'approval_routes', 'quest_log_channel']
+      .some(k => cfg[k]);
+    if (!configured) continue;
+    try {
+      const made = await mendEverything(client, guild);
+      if (made.length) console.log(`[mend] ${guild.name}: ${made.join(' \u00b7 ')}`);
+    } catch (e) { console.log(`[mend] ${guild.name}: ${e?.message || e}`); }
+  }
+}
+
+async function mendEverything(client, guild, { log = () => {} } = {}) {
+  const gid = guild.id;
+  const cfg = getConfig(gid) || {};
+  const made = [];
+
+  // Threads inside forums the guild already points at.
+  try { const r = await ensureApprovalThreads(client, gid); if (r?.made?.length) made.push(`approvals +${r.made.length}`); } catch {}
+  try { const r = await ensureFeedbackThreads(client, gid); if (r?.made?.length) made.push(`feedback +${r.made.length}`); } catch {}
+  try { const r = await ensureQuestBooks(client, guild, gid); if (r?.made?.length) made.push(`quest books +${r.made.length}`); } catch {}
+
+  // Pages: new blocks appear on existing threads without touching the rest.
+  let chars = 0;
+  try {
+    for (const c of db.prepare('SELECT user_id FROM characters WHERE guild_id=?').all(gid)) {
+      const r = await ensureCharPage(client, guild, c.user_id, null, 'all').catch(() => null);
+      if (r && !r.skipped) chars++;
+      await pace(150);
+    }
+  } catch {}
+  if (chars) made.push(`${chars} character page(s)`);
+
+  let npcs = 0;
+  try {
+    if (cfg.npc_forum) for (const n of getAllNpcs(gid)) {
+      if (await mirrorNpcSheet(client, gid, n.name).catch(() => null)) npcs++;
+      await pace(150);
+    }
+  } catch {}
+  if (npcs) made.push(`${npcs} NPC page(s)`);
+
+  // Permissions, which never move a channel either.
+  try { const h = await healChannelPerms(guild); if (h.fixed) made.push(`${h.fixed} permission repair(s)`); } catch {}
+
+  if (made.length) log(made.join(' \u00b7 '));
+  return made;
+}
+
 async function runSetupRepair(interaction) {
   const gid = interaction.guild.id;
   if (!(await isGm(interaction.guild, interaction.user.id))) {
@@ -21592,6 +21663,11 @@ async function runSetupRepair(interaction) {
   const quests = await ensureQuestBooks(interaction.client, interaction.guild, gid).catch(err => ({ error: err?.message || String(err) }));
   const appr2 = await ensureApprovalThreads(interaction.client, gid).catch(err => ({ error: err?.message || String(err) }));
   const fbk2 = await ensureFeedbackThreads(interaction.client, gid).catch(err => ({ error: err?.message || String(err) }));
+  // Pages and permissions mend here too — a GM reaching for `run` expects
+  // "make everything current", and until 2026-08-19 this lever quietly
+  // skipped the character and NPC pages entirely.
+  const mended = await mendEverything(interaction.client, interaction.guild).catch(() => []);
+  if (mended.length) lines.push(`\u{1F527} ${mended.join(' \u00b7 ')}`, '');
   if (fbk2?.error) lines.push(`\u26A0\uFE0F Feedback rooms \u2014 ${fbk2.error}`);
   else if (fbk2?.made?.length) lines.push(`\u{1F4DD} Feedback rooms opened: ${fbk2.made.length}`);
   else if (fbk2) lines.push('\u2705 Feedback rooms in place');

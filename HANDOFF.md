@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 912 assertions passed and no scanner found an ERROR.
+Green means 918 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 912 assertions covering structure, registration and ruleset
+now is 918 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -325,6 +325,48 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 8n · Audit: the deleteNpc scope bug (2026-08-19)
+
+Three findings, all fixed.
+
+**1. deleteNpc was reaching for `interaction`** — a variable never in its
+scope (the function takes gid, name). The ReferenceError fell straight
+into the surrounding try/catch, so the code after it never ran: an NPC's
+forum thread AND their npc_pages row survived every deletion, and a
+same-named replacement would adopt the orphaned thread. My edit had
+landed in the helper instead of the handler weeks ago. Now takes an
+optional `client`; all four callers thread one through (sweepTempNpcs
+gained a client option so the fight-end sweep passes the guild's).
+Pinned that the body contains no `interaction.` at all.
+
+**2. Titles and associations were not purged with their subject** — only
+the revoke commands deleted rows, so deleting a character or NPC left
+theirs orphaned and inheritable by a same-named successor. Added to
+purgeSubjectRecords, which both deletion paths already call.
+
+**3. handleTitles fell through** on revoke/remove rather than naming the
+leaves — the same smell fixed for /feedback send. Named explicitly;
+unrouted-subcommand warnings 6→5.
+
+## 8m · Mend on boot (2026-08-19)
+
+Root cause of T's missing Titles block: `/gm check run` never rebuilt
+character or NPC pages. The full-scope rebuild lived only in ANOTHER
+function, so the lever a GM naturally reaches for after an update did the
+forums and skipped the pages — new blocks could only arrive on the hourly
+sweep. Now one `mendEverything(client, guild)` does the lot: forum
+threads (approvals, feedback, quest books), every character page and NPC
+page at full scope, and the permission sweep. `/gm check run` calls it and
+reports what it did.
+
+`bootMend(client)` runs it on EVERY boot for guilds that are already set
+up — T's ask: an update should bring new threads, channels and features
+into being by itself. Two guarantees, both pinned: it only ADDS (the body
+contains no setPosition/setParent/setName/setConfig, so a quest board you
+moved and renamed stays exactly where you put it), and a guild that has
+never pointed the bot at anything is skipped entirely, so the bot never
+conjures channels into a server that did not ask.
 
 ## 8l · Titles & Associations (2026-08-19)
 
