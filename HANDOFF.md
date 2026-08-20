@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 883 assertions passed and no scanner found an ERROR.
+Green means 912 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 883 assertions covering structure, registration and ruleset
+now is 912 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -325,6 +325,72 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 8l · Titles & Associations (2026-08-19)
+
+Two tables keyed by FIGHTER ID (subject_titles, subject_assocs), so a
+player and an NPC are recorded identically — bare user id, or npc:Name.
+One renderer, `titlesLine(gid, sid)`, feeds all three surfaces: the
+character thread's new block, the NPC page body, and /char show. Block
+order is now Sheet · Inventory · Lore · Standing · **Titles** · Dice ·
+Notice — titles sit beside Standing because both are what someone has
+earned; titles_msg_id joined char_pages and the order-repair sequence.
+
+Commands on /standing (which already held renown): `title grant|revoke|
+list` and `association add|remove|list`, each taking `user:` OR `npc:`
+and refusing both. `association list group:` inverts the question and
+names everyone standing with a company. GM-gated for changes, open for
+looking. `/quest run complete title:…` grants a title to every survivor,
+stamped with the quest it came from.
+
+Found while building: the quest completion's `summary:` option had been
+LOST in an earlier rewrite — the handler read it, nothing declared it, so
+a GM's telling could never be given at completion. Restored, and pinned
+that the options the handler reads are actually declared.
+
+## 8k · The /npc manage fold (2026-08-19)
+
+/npc was at 23/25; folded to 18 by grouping the WORKSHOP verbs — copy ·
+rename · export · import · sync · create5e — under `/npc manage`. The
+principle, chosen deliberately: fold what is rare, keep what is daily.
+say, show, list, hp, heal, roll, hero, edit and the rest stay one
+keystroke away; only the things a GM does occasionally moved. Dispatch
+unchanged (getSubcommand returns the leaf; names stay unique). 21 taught
+strings regrammared across index.js and the books.
+
+Pin replaced: '/npc is now the most crowded command' asserted a fact the
+fold made false — it now reads 'no command is within two leaves of the
+25 ceiling' (max is 22, /gm), which is the property actually worth
+holding. A second pin keeps the daily verbs out of any group.
+
+## 8j · Audit after the temp-NPC layer (2026-08-19)
+
+892 assertions, 13 probes, warnings 19->18. One real finding, fixed: a
+dead `handleNpcTemp()` — a superseded first draft of the temp group's
+handler, 2091 bytes, never called because the live routing folds the
+group into templist/tempkeep/tempclear and handles them inline. Two
+truths in one file is how they drift; deleted, and the structure scanner
+is clean of dead-function again.
+
+Also noted, NOT acted on (T's call): **/npc sits at 23/25 leaves+groups**
+— the same wall /gm and /quest already hit. The natural fold when it
+comes is a `roster` group (list · show · copy · rename · delete) or a
+`sheet` group (hp · heal · hero · edit). Deciding before the wall is
+cheaper than deciding at it. The `library-ungated` warning is
+pre-existing and documented in §6.
+
+## 8i · The GM log tells the whole evening (2026-08-19)
+
+T asked what reaches the quest summary; the honest answer was: NPC speech
+(rp) and combat headlines did, via noteQuestActivity, but `/gm dc` — the
+most-used tool at the table — did not, leaving silent stretches in the
+GM log where the party had been rolling all evening. Now runDcRollPress
+writes a 'roll' event (who, face, total vs DC, passed/failed) into every
+active quest in that channel. Temporary NPCs joined too: `/library summon`
+logs what stepped out of the library, and `/target` logs both the thing
+standing up and the moment it falls (with its hit count). All go through
+noteQuestActivity, so a PAUSED quest still records nothing — that
+contract is unchanged. Pinned.
 
 ## 8h · The audit setup, ported from Sec-Track (2026-08-19)
 

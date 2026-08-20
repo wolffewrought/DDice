@@ -140,6 +140,21 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS quest_summaries (
 // Temporary targets: something to swing at that lives in a channel, not
 // on the roster. No HP — the GM's judgement is the death check (T,
 // 2026-08-16). Disposable by design: nothing to clean up afterwards.
+// Titles and associations, for players and NPCs alike — one table each,
+// keyed by fighter id, so a knight and a shopkeeper are recorded the same
+// way (T, 2026-08-19). Titles are earned or granted; associations are the
+// banners someone stands under.
+try { db.exec(`CREATE TABLE IF NOT EXISTS subject_titles (
+  guild_id TEXT NOT NULL, subject_id TEXT NOT NULL, title TEXT NOT NULL,
+  source TEXT, granted_by TEXT, at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, subject_id, title)
+)`); } catch (e) { console.error('subject_titles schema', e); }
+try { db.exec(`CREATE TABLE IF NOT EXISTS subject_assocs (
+  guild_id TEXT NOT NULL, subject_id TEXT NOT NULL, name TEXT NOT NULL,
+  note TEXT, at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, subject_id, name)
+)`); } catch (e) { console.error('subject_assocs schema', e); }
+
 try { db.exec(`CREATE TABLE IF NOT EXISTS temp_targets (
   guild_id TEXT NOT NULL, message_id TEXT NOT NULL,
   channel_id TEXT NOT NULL, name TEXT NOT NULL,
@@ -632,6 +647,12 @@ db.exec(`CREATE TABLE IF NOT EXISTS gm_profiles (
 // leave a column the code went on to query. probe.js found it.
 try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN rerolls_current INTEGER DEFAULT 0'); } catch {}
+// A temporary NPC is a real fighter in every way the engine cares about —
+// same table, same lookups, so a fight can never miss one — but it keeps
+// out of the forum and the roster, and is swept when its fight ends
+// (T, 2026-08-19: same store, separate view).
+try { db.exec('ALTER TABLE npcs ADD COLUMN is_temp INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN temp_at INTEGER'); } catch {}
 try { db.exec('ALTER TABLE weapons ADD COLUMN atk_stats TEXT'); } catch {}
 try { db.exec('ALTER TABLE weapons ADD COLUMN def_stats TEXT'); } catch {}
 try { db.exec('ALTER TABLE weapons ADD COLUMN note TEXT'); } catch {}
@@ -682,6 +703,7 @@ try { db.exec('ALTER TABLE char_pages ADD COLUMN lore_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE char_pages ADD COLUMN rolls_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE char_pages ADD COLUMN standing_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE char_pages ADD COLUMN notice_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE char_pages ADD COLUMN titles_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE char_pages ADD COLUMN block_hashes TEXT'); } catch {}
 try { db.exec('ALTER TABLE deaths ADD COLUMN public_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE deaths ADD COLUMN revived_at INTEGER'); } catch {}
@@ -851,11 +873,33 @@ function getRecentMeritHistory(gid, limit = 20) {
 }
 
 // ── Fight archive (last finished fight per channel, for /fight log) ────────────
+// Every fight ends through here, so this is where the throwaway cast is
+// swept: temporary NPCs that fought in it are deleted, and only those —
+// anyone still standing in another fight is left alone.
+function sweepTempFighters(gid, roster) {
+  let swept = 0;
+  try {
+    const busy = fightingNpcNames(gid);
+    for (const fid of roster || []) {
+      if (!isNpcFighter(fid)) continue;
+      const nm = npcNameFromFighter(fid);
+      const n = getNpc(gid, nm);
+      if (!n?.is_temp || busy.has(nm)) continue;
+      db.prepare('DELETE FROM npcs WHERE guild_id=? AND name=?').run(gid, nm);
+      swept++;
+    }
+  } catch {}
+  return swept;
+}
+
 function archiveFight(gid, cid, logState, roster, floor = 0) {
   db.prepare(`INSERT INTO fight_archive (guild_id, channel_id, log_state, roster, ended_at, floor_hp)
               VALUES (?,?,?,?,?,?)
               ON CONFLICT(guild_id, channel_id) DO UPDATE SET log_state=excluded.log_state, roster=excluded.roster, ended_at=excluded.ended_at, floor_hp=excluded.floor_hp`)
     .run(gid, cid, JSON.stringify(logState || {}), JSON.stringify(roster || []), Date.now(), floor || 0);
+  // The archive keeps the record; the temporary fighters themselves go.
+  const gone = sweepTempFighters(gid, roster);
+  if (gone) console.log(`[temp-npc] ${gone} swept after the fight in ${cid}`);
 }
 function getArchivedFight(gid, cid) {
   return db.prepare('SELECT * FROM fight_archive WHERE guild_id=? AND channel_id=?').get(gid, cid);
@@ -890,6 +934,47 @@ function upsertChar(gid, uid, fields) {
 }
 
 // ── Merits & ranks ───────────────────────────────────────────────────────────
+// Both tables answer to a fighter id: a bare user id for a player,
+// npc:Name for an NPC. Everything above them reads the same either way.
+function getTitles(gid, sid) {
+  return db.prepare('SELECT title, source FROM subject_titles WHERE guild_id=? AND subject_id=? ORDER BY at').all(gid, sid);
+}
+function getAssocs(gid, sid) {
+  return db.prepare('SELECT name, note FROM subject_assocs WHERE guild_id=? AND subject_id=? ORDER BY at').all(gid, sid);
+}
+function grantTitle(gid, sid, title, { source = null, by = null } = {}) {
+  db.prepare(`INSERT INTO subject_titles (guild_id, subject_id, title, source, granted_by, at)
+              VALUES (?,?,?,?,?,?) ON CONFLICT(guild_id, subject_id, title) DO NOTHING`)
+    .run(gid, sid, title, source, by, Date.now());
+}
+function revokeTitle(gid, sid, title) {
+  return db.prepare('DELETE FROM subject_titles WHERE guild_id=? AND subject_id=? AND title=? COLLATE NOCASE')
+    .run(gid, sid, title).changes;
+}
+function addAssoc(gid, sid, name, note = null) {
+  db.prepare(`INSERT INTO subject_assocs (guild_id, subject_id, name, note, at)
+              VALUES (?,?,?,?,?) ON CONFLICT(guild_id, subject_id, name) DO UPDATE SET note=excluded.note`)
+    .run(gid, sid, name, note, Date.now());
+}
+function removeAssoc(gid, sid, name) {
+  return db.prepare('DELETE FROM subject_assocs WHERE guild_id=? AND subject_id=? AND name=? COLLATE NOCASE')
+    .run(gid, sid, name).changes;
+}
+// The one rendering both forums and /char show share, so a title never
+// reads differently depending on where you found it.
+function titlesLine(gid, sid) {
+  const t = getTitles(gid, sid), a = getAssocs(gid, sid);
+  if (!t.length && !a.length) return null;
+  const out = [];
+  if (t.length) out.push(`\u{1F3C5} ${t.map(x => `**${x.title}**${x.source ? ` _(${x.source})_` : ''}`).join(' \u00b7 ')}`);
+  if (a.length) out.push(`\u{1F6E1}\uFE0F ${a.map(x => `**${x.name}**${x.note ? ` _(${x.note})_` : ''}`).join(' \u00b7 ')}`);
+  return out.join('\n');
+}
+function charTitlesBody(gid, uid) {
+  const body = titlesLine(gid, uid);
+  return ['\u{1F3F7}\uFE0F **Titles & Associations**', body || '_None yet._'].join('\n').slice(0, 1900);
+}
+
 function getMerits(gid, uid) {
   return getChar(gid, uid)?.merits ?? 0;
 }
@@ -3184,8 +3269,26 @@ function getNpc(gid, name) {
   }
   return row;
 }
-function getAllNpcs(gid) {
-  return db.prepare('SELECT * FROM npcs WHERE guild_id=? ORDER BY name').all(gid);
+function getAllNpcs(gid, { includeTemp = false } = {}) {
+  // The roster is the permanent cast. Temporary NPCs are fighters, not cast
+  // members — the forum mirror, the sweeps and /npc list should not see
+  // them unless they ask.
+  return db.prepare(`SELECT * FROM npcs WHERE guild_id=?${includeTemp ? '' : ' AND COALESCE(is_temp,0)=0'} ORDER BY name`).all(gid);
+}
+// Sweep the throwaway cast. Anyone still in a fight is spared unless the
+// GM forces it, so a redeploy mid-brawl cannot disarm the enemies.
+function sweepTempNpcs(gid, { force = false } = {}) {
+  const fighting = new Set(fightingNpcNames(gid));
+  let n = 0;
+  for (const t of getTempNpcs(gid)) {
+    if (!force && fighting.has(t.name.toLowerCase())) continue;
+    try { deleteNpc(gid, t.name); n++; } catch {}
+  }
+  return n;
+}
+
+function getTempNpcs(gid) {
+  return db.prepare('SELECT * FROM npcs WHERE guild_id=? AND COALESCE(is_temp,0)=1 ORDER BY temp_at DESC, name').all(gid);
 }
 function upsertNpc(gid, name, fields) {
   const ex = getNpc(gid, name);
@@ -4625,7 +4728,7 @@ function parseSheetSummary(text) {
 
 // NPCs travel too: the same weave, their own kind. The whole villain —
 // stats, class, hero flag, signature, auto-pilot preferences, lore — rides
-// a parchment PDF and lands on any server by /npc import, GM-direct.
+// a parchment PDF and lands on any server by /npc manage import, GM-direct.
 function npcPayloadObj(npc) {
   return { v: 1, kind: 'npc', name: npc.name,
     order: npc.order_name || null, class: npc.class || null,
@@ -5661,7 +5764,8 @@ const slashCommands = [
       .addStringOption(o=>o.setName('weapon2emoji').setDescription('Emoji for weapon slot 2').setRequired(false)
         .addChoices({name:'⚔️ Swords',value:'⚔️'},{name:'🗡️ Dagger',value:'🗡️'},{name:'🏹 Bow',value:'🏹'},{name:'🔱 Trident',value:'🔱'},{name:'⛏️ Pickaxe',value:'⛏️'},{name:'🛡️ Shield',value:'🛡️'},{name:'🪄 Wand',value:'🪄'}))
       .addStringOption(o=>o.setName('weapon2').setDescription('Weapon slot 2 — pick from list or type your own').setRequired(false).setAutocomplete(true))
-      .addUserOption(o=>o.setName('user').setDescription('Target player (GM only)').setRequired(false)))
+      .addUserOption(o=>o.setName('user').setDescription('Target player (GM only)').setRequired(false))
+      .addBooleanOption(o=>o.setName('temp').setDescription('true = a throwaway: no page, no roster seat, swept after the fight').setRequired(false)))
     .addSubcommand(s=>s.setName('weaponemoji').setDescription('Set the emoji for a weapon slot')
       .addStringOption(o=>o.setName('slot').setDescription('Which weapon slot').setRequired(true)
         .addChoices({name:'Weapon 1',value:'weapon1emoji'},{name:'Weapon 2',value:'weapon2emoji'}))
@@ -5731,6 +5835,35 @@ const slashCommands = [
       return g;
     })
     .addSubcommand(s=>s.setName('stat').setDescription('Show stat descriptions'))
+    // Titles and the banners people stand under \u2014 for players and NPCs
+    // alike, so `user:` or `npc:` names the subject either way.
+    .addSubcommandGroup(g => { g.setName('title').setDescription('Titles \u2014 earned on quests or granted by a GM');
+      g.addSubcommand(x=>x.setName('grant').setDescription('Grant a title (GM)')
+        .addStringOption(o=>o.setName('title').setDescription('The title itself').setRequired(true))
+        .addUserOption(o=>o.setName('user').setDescription('Which player').setRequired(false))
+        .addStringOption(o=>o.setName('npc').setDescription('Or which NPC').setRequired(false).setAutocomplete(true))
+        .addStringOption(o=>o.setName('source').setDescription('Where it came from, e.g. Sirens Redoubt').setRequired(false)));
+      g.addSubcommand(x=>x.setName('revoke').setDescription('Take a title back (GM)')
+        .addStringOption(o=>o.setName('title').setDescription('Which title').setRequired(true))
+        .addUserOption(o=>o.setName('user').setDescription('Which player').setRequired(false))
+        .addStringOption(o=>o.setName('npc').setDescription('Or which NPC').setRequired(false).setAutocomplete(true)));
+      g.addSubcommand(x=>x.setName('list').setDescription('Every title someone holds')
+        .addUserOption(o=>o.setName('user').setDescription('Which player').setRequired(false))
+        .addStringOption(o=>o.setName('npc').setDescription('Or which NPC').setRequired(false).setAutocomplete(true)));
+      return g; })
+    .addSubcommandGroup(g => { g.setName('association').setDescription('The groups someone stands with');
+      g.addSubcommand(x=>x.setName('add').setDescription('Associate them with a group (GM)')
+        .addStringOption(o=>o.setName('group').setDescription('The company, order or cause').setRequired(true))
+        .addUserOption(o=>o.setName('user').setDescription('Which player').setRequired(false))
+        .addStringOption(o=>o.setName('npc').setDescription('Or which NPC').setRequired(false).setAutocomplete(true))
+        .addStringOption(o=>o.setName('note').setDescription('Their part in it, e.g. Quartermaster').setRequired(false)));
+      g.addSubcommand(x=>x.setName('remove').setDescription('Part ways with a group (GM)')
+        .addStringOption(o=>o.setName('group').setDescription('Which group').setRequired(true))
+        .addUserOption(o=>o.setName('user').setDescription('Which player').setRequired(false))
+        .addStringOption(o=>o.setName('npc').setDescription('Or which NPC').setRequired(false).setAutocomplete(true)));
+      g.addSubcommand(x=>x.setName('list').setDescription('Everyone standing with a group')
+        .addStringOption(o=>o.setName('group').setDescription('Which group').setRequired(true).setAutocomplete(true)));
+      return g; })
     .addSubcommandGroup(g => {
       g.setName('profile').setDescription('Your roll card profile — display, snapshots');
       g.addSubcommand(s=>s.setName('card').setDescription('How much of your sheet shows when you roll')
@@ -5834,7 +5967,8 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('summon').setDescription('Bring a monster out of the library as an NPC, ready to fight')
       .addStringOption(o=>o.setName('name').setDescription('Which monster').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('as').setDescription('Call it something else here, e.g. Goblin Scout').setRequired(false))
-      .addIntegerOption(o=>o.setName('count').setDescription('How many — they are numbered').setRequired(false).setMinValue(1).setMaxValue(10)))
+      .addIntegerOption(o=>o.setName('count').setDescription('How many — they are numbered').setRequired(false).setMinValue(1).setMaxValue(10))
+      .addBooleanOption(o=>o.setName('temp').setDescription('true = this fight only; no page, swept after').setRequired(false)))
     .addSubcommand(s=>s.setName('forget').setDescription('Remove an entry from the library')
       .addStringOption(o=>o.setName('name').setDescription('Its name').setRequired(true).setAutocomplete(true))),
 
@@ -5931,21 +6065,6 @@ const slashCommands = [
       .addStringOption(o=>o.setName('flavour').setDescription('Flavour text').setRequired(false))
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'})))
-    .addSubcommand(s=>s.setName('sync').setDescription('Write up every NPC in the forum — or one of them (GM)')
-      .addStringOption(o=>o.setName('name').setDescription('Just this one — leave out for all of them').setRequired(false).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('create5e').setDescription('Make a 5e monster — AC, hit points, attack and damage from its statblock (GM)')
-      .addStringOption(o=>o.setName('name').setDescription('What it is called').setRequired(true))
-      .addIntegerOption(o=>o.setName('ac').setDescription('Armour Class').setRequired(true).setMinValue(1).setMaxValue(30))
-      .addIntegerOption(o=>o.setName('hp').setDescription('Hit points').setRequired(true).setMinValue(1).setMaxValue(999))
-      .addIntegerOption(o=>o.setName('attack').setDescription('Its attack bonus, e.g. 4').setRequired(true).setMinValue(-5).setMaxValue(20))
-      .addStringOption(o=>o.setName('damage').setDescription('Damage dice, e.g. 1d8+2').setRequired(true))
-      .addStringOption(o=>o.setName('category').setDescription('What kind they are — Enemy, Ally, Vendor… a new one is made if it does not exist').setRequired(false).setAutocomplete(true))
-      .addIntegerOption(o=>o.setName('str').setDescription('Strength score').setRequired(false).setMinValue(1).setMaxValue(30))
-      .addIntegerOption(o=>o.setName('dex').setDescription('Dexterity score').setRequired(false).setMinValue(1).setMaxValue(30))
-      .addIntegerOption(o=>o.setName('con').setDescription('Constitution score').setRequired(false).setMinValue(1).setMaxValue(30))
-      .addIntegerOption(o=>o.setName('int').setDescription('Intelligence score').setRequired(false).setMinValue(1).setMaxValue(30))
-      .addIntegerOption(o=>o.setName('wis').setDescription('Wisdom score').setRequired(false).setMinValue(1).setMaxValue(30))
-      .addIntegerOption(o=>o.setName('cha').setDescription('Charisma score').setRequired(false).setMinValue(1).setMaxValue(30)))
     .addSubcommand(s=>s.setName('edit').setDescription('Change an existing NPC — only the options you pass; the rest stays')
       .addStringOption(o=>o.setName('name').setDescription('Which NPC').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('category').setDescription('What kind they are — Enemy, Ally, Vendor… a new one is made if it does not exist').setRequired(false))
@@ -5969,9 +6088,6 @@ const slashCommands = [
         .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Red Knight',value:'Red Knight'},
                     {name:'Blue Knight',value:'Blue Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Purple Knight',value:'Purple Knight'},
                     {name:'Siege Knight',value:'Siege Knight'},{name:'✖️ Clear it',value:'none'})))
-    .addSubcommand(s=>s.setName('rename').setDescription('Rename an NPC — every record follows: pages, portrait, items, standing, history')
-      .addStringOption(o=>o.setName('name').setDescription('Who they are now').setRequired(true).setAutocomplete(true))
-      .addStringOption(o=>o.setName('to').setDescription('Who they become').setRequired(true)))
     .addSubcommand(s=>s.setName('reroll').setDescription('Reroll an NPC\'s last roll here — spends one of its LCK tokens')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
@@ -5996,7 +6112,8 @@ const slashCommands = [
         .addChoices({name:'💪 Strength',value:'str'},{name:'🫀 Constitution',value:'con'},{name:'⚡ Dexterity',value:'dex'},
                     {name:'🧠 Wisdom',value:'wis'},{name:'🍀 Luck',value:'lck'},{name:'✖️ Clear it',value:'none'}))
       .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
-        .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'})))
+        .addChoices({name:'White Knight',value:'White Knight'},{name:'Black Knight',value:'Black Knight'},{name:'Gold Knight',value:'Gold Knight'},{name:'Grey Knight',value:'Grey Knight'},{name:'Blue Knight',value:'Blue Knight'},{name:'Purple Knight',value:'Purple Knight'},{name:'Green Knight',value:'Green Knight'},{name:'Red Knight',value:'Red Knight'}))
+      .addBooleanOption(o=>o.setName('temp').setDescription('true = this fight only; no page, swept after').setRequired(false)))
     .addSubcommand(s=>s.setName('sheet').setDescription('An NPC\'s full record — stats, standing, inventory, rolls, lore')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('give').setDescription('Give an NPC an item')
@@ -6015,9 +6132,6 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('value').setDescription('Exact HP to set (omit = full heal)').setRequired(false).setMinValue(-99).setMaxValue(99)))
     .addSubcommand(s=>s.setName('heal').setDescription('Fully heal NPCs — "all" or comma-separated names')
       .addStringOption(o=>o.setName('names').setDescription('"all", or NPC names separated by commas').setRequired(true).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('copy').setDescription('Duplicate an NPC under a new name (fresh full HP)')
-      .addStringOption(o=>o.setName('name').setDescription('NPC to copy').setRequired(true).setAutocomplete(true))
-      .addStringOption(o=>o.setName('new_name').setDescription('Name for the copy').setRequired(true)))
     .addSubcommand(s=>s.setName('show').setDescription('Show one NPC\'s full stat block')
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('hero').setDescription('Make an NPC a Hero with a signature stat (GM)')
@@ -6033,15 +6147,47 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('list').setDescription('List all NPCs on this server — paged, with a names-only view for big rosters')
       .addStringOption(o=>o.setName('category').setDescription('Only show NPCs in this category').setRequired(false).setAutocomplete(true))
       .addBooleanOption(o=>o.setName('compact').setDescription('true = names only, sixty to a page — for finding who exists').setRequired(false)))
-    .addSubcommand(s=>s.setName('export').setDescription('An NPC as a woven parchment PDF — it survives Discord and imports anywhere')
-      .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('import').setDescription('Bring an exported NPC PDF onto this server — applied directly, you are the approver')
-      .addAttachmentOption(o=>o.setName('file').setDescription('An NPC PDF made by /npc export').setRequired(true)))
-    // The category family folded from six leaves into one group — freeing
-    // the room /npc edit needed against the 25-leaf wall. Leaf names inside
-    // deliberately reuse top-level ones (create, list, remove): dispatch
-    // reads the group first and prefixes it back, so the handlers below
-    // never changed.
+    // The workshop half of /npc, folded 2026-08-19: duplicating, renaming,
+    // moving sheets in and out, and the 5e-only makers. The daily verbs
+    // (say, show, list, hp, heal, roll) stay one keystroke away.
+    .addSubcommandGroup(g => { g.setName('manage').setDescription('Workshop \u2014 copy, rename, import, export');
+      g.addSubcommand(s=>s.setName('copy').setDescription('Duplicate an NPC under a new name (fresh full HP)')
+        .addStringOption(o=>o.setName('name').setDescription('NPC to copy').setRequired(true).setAutocomplete(true))
+        .addStringOption(o=>o.setName('new_name').setDescription('Name for the copy').setRequired(true)));
+      g.addSubcommand(s=>s.setName('rename').setDescription('Rename an NPC — every record follows: pages, portrait, items, standing, history')
+        .addStringOption(o=>o.setName('name').setDescription('Who they are now').setRequired(true).setAutocomplete(true))
+        .addStringOption(o=>o.setName('to').setDescription('Who they become').setRequired(true)));
+      g.addSubcommand(s=>s.setName('export').setDescription('An NPC as a woven parchment PDF — it survives Discord and imports anywhere')
+        .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('import').setDescription('Bring an exported NPC PDF onto this server — applied directly, you are the approver')
+        .addAttachmentOption(o=>o.setName('file').setDescription('An NPC PDF made by /npc manage export').setRequired(true)))
+      // The category family folded from six leaves into one group — freeing
+      // the room /npc edit needed against the 25-leaf wall. Leaf names inside
+      // deliberately reuse top-level ones (create, list, remove): dispatch
+      // reads the group first and prefixes it back, so the handlers below
+      // never changed.;
+      g.addSubcommand(s=>s.setName('sync').setDescription('Write up every NPC in the forum — or one of them (GM)')
+        .addStringOption(o=>o.setName('name').setDescription('Just this one — leave out for all of them').setRequired(false).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('create5e').setDescription('Make a 5e monster — AC, hit points, attack and damage from its statblock (GM)')
+        .addStringOption(o=>o.setName('name').setDescription('What it is called').setRequired(true))
+        .addIntegerOption(o=>o.setName('ac').setDescription('Armour Class').setRequired(true).setMinValue(1).setMaxValue(30))
+        .addIntegerOption(o=>o.setName('hp').setDescription('Hit points').setRequired(true).setMinValue(1).setMaxValue(999))
+        .addIntegerOption(o=>o.setName('attack').setDescription('Its attack bonus, e.g. 4').setRequired(true).setMinValue(-5).setMaxValue(20))
+        .addStringOption(o=>o.setName('damage').setDescription('Damage dice, e.g. 1d8+2').setRequired(true))
+        .addStringOption(o=>o.setName('category').setDescription('What kind they are — Enemy, Ally, Vendor… a new one is made if it does not exist').setRequired(false).setAutocomplete(true))
+        .addIntegerOption(o=>o.setName('str').setDescription('Strength score').setRequired(false).setMinValue(1).setMaxValue(30))
+        .addIntegerOption(o=>o.setName('dex').setDescription('Dexterity score').setRequired(false).setMinValue(1).setMaxValue(30))
+        .addIntegerOption(o=>o.setName('con').setDescription('Constitution score').setRequired(false).setMinValue(1).setMaxValue(30))
+        .addIntegerOption(o=>o.setName('int').setDescription('Intelligence score').setRequired(false).setMinValue(1).setMaxValue(30))
+        .addIntegerOption(o=>o.setName('wis').setDescription('Wisdom score').setRequired(false).setMinValue(1).setMaxValue(30))
+        .addIntegerOption(o=>o.setName('cha').setDescription('Charisma score').setRequired(false).setMinValue(1).setMaxValue(30)));
+      return g; })
+    .addSubcommandGroup(g => { g.setName('temp').setDescription('The throwaway cast \u2014 fighters with no page and no roster seat');
+      g.addSubcommand(x=>x.setName('list').setDescription('Every temporary NPC still lying about'));
+      g.addSubcommand(x=>x.setName('keep').setDescription('Make a temporary NPC permanent \u2014 it gains a page (GM)')
+        .addStringOption(o=>o.setName('name').setDescription('Which one').setRequired(true).setAutocomplete(true)));
+      g.addSubcommand(x=>x.setName('clear').setDescription('Sweep every temporary NPC away now (GM)'));
+      return g; })
     .addSubcommandGroup(g => { g.setName('category').setDescription('Make, rename, assign and tidy NPC categories');
       g.addSubcommand(s=>s.setName('list').setDescription('List all NPC categories'));
       g.addSubcommand(s=>s.setName('create').setDescription('Create a new NPC category')
@@ -6337,7 +6483,9 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('timeline').setDescription('The full log of a quest so far')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)));
       g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — award merits to the party (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)));
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('summary').setDescription('Your telling of it, for the players\' chronicle').setRequired(false))
+      .addStringOption(o=>o.setName('title').setDescription('A title every survivor earns, e.g. Siren\'s Bane').setRequired(false)));
       return g;
     })
     .addSubcommand(s=>s.setName('handoff').setDescription('Hand this quest to another GM — they become its DM (GM)')
@@ -8020,7 +8168,7 @@ async function handleConfig(interaction, forced) {
       `🎭 NPC pages now live in <#${channel.id}> — one thread per category, every NPC an entry inside it.`
       + (laid.written ? `\nWrote up **${laid.written}** NPC${laid.written === 1 ? '' : 's'}.` : '')
       + (laid.closed ? ` Closed **${laid.closed}** old per-NPC thread${laid.closed === 1 ? '' : 's'}.` : '')
-      + (laid.written ? '' : ' `/npc sync` writes them up once there are some.') });
+      + (laid.written ? '' : ' `/npc manage sync` writes them up once there are some.') });
     return;
   }
 
@@ -9105,7 +9253,7 @@ async function handleChar(interaction) {
     // same renderers, so this can never disagree with the thread. Blocks
     // pack into as few follow-ups as 2000 chars allow.
     await interaction.reply({ content: lines.join('\n') });
-    const blocks = [charInvBody(gid, tid), charLoreBody(gid, tid), charStandingBody(gid, tid), charRollsBody(gid, tid)];
+    const blocks = [charInvBody(gid, tid), charLoreBody(gid, tid), charStandingBody(gid, tid), charTitlesBody(gid, tid), charRollsBody(gid, tid)];
     let pack = [];
     const flush = async () => { if (pack.length) { await interaction.followUp({ content: pack.join('\n\n'), allowedMentions: { parse: [] } }).catch(() => {}); pack = []; } };
     for (const b of blocks) {
@@ -9977,6 +10125,14 @@ async function runDcRollPress(interaction) {
   const r = rollDcCheck({ stat, notation, dc, gmMode: markedMode, flat, modifier, subject: ch, sig: ch });
   if (!r) return interaction.reply({ content: '❌ That check\'s notation no longer reads.', ephemeral: true });
   const { nat, total, passed, band, rollLine, result } = r;
+  // A DC check inside a quest belongs in that quest's account, exactly as
+  // NPC speech and combat already do — otherwise the GM log shows a silent
+  // stretch where the table was rolling all evening (T, 2026-08-19).
+  try {
+    const whoDc = await getDisplayName(interaction.guild, uid).catch(() => 'Someone');
+    const faceDc = notation || (stat ? STAT_LABELS[stat] : 'flat d20');
+    noteQuestActivity(gid, cid, 'roll', `${whoDc}: ${faceDc} ${total} vs DC ${dc} \u2014 ${passed ? 'passed' : 'failed'}`, uid);
+  } catch {}
   const faceLabel = notation ?? (stat ? STAT_LABELS[stat] : 'flat d20');
   recordRoll(gid, { userId: uid, channelId: cid, interaction, result,
     input: '/gm dc', rollLine, context: `GM check (${faceLabel} vs DC ${dc}${flat ? ', flat' : ''}${secret ? ', secret' : ''})` });
@@ -10455,11 +10611,18 @@ async function handleLibrary(interaction) {
         armour_class: mon.ac, attack_bonus: mon.attack, damage_dice: mon.damage,
         max_hp: mon.hp, hp_current: mon.hp,
         str: mon.str, dex: mon.dex, con: mon.con, int: mon.int, wis: mon.wis, cha: mon.cha,
+        ...(interaction.options.getBoolean('temp') ? { is_temp: 1, temp_at: Date.now() } : {}),
       });
       made.push(nm);
     }
     if (!made.length) return interaction.reply({ content: `❌ **${base}** already stands here. Give a different \`as:\` name.`, ephemeral: true });
-    return interaction.reply({ content: [
+        // Monsters summoned mid-quest belong in that quest's account, like any
+    // other thing that happened at the table (T, 2026-08-19).
+    try {
+      noteQuestActivity(gid, interactionChannelId(interaction), 'combat',
+        `${made.length} \u00d7 ${mon.name} summoned${interaction.options.getBoolean('temp') ? ' (temporary)' : ''}: ${made.join(', ')}`, interaction.user.id);
+    } catch {}
+return interaction.reply({ content: [
       `🐉 **${made.length}** × **${mon.name}** step${made.length === 1 ? 's' : ''} out of the library: ${made.join(', ')}.`,
       `🛡️ AC ${mon.ac} · ❤️ ${mon.hp} hp${mon.attack != null ? ` · ⚔️ +${mon.attack}` : ''}${mon.damage ? ` · 🎲 ${mon.damage}` : ''}`,
       `_\`/fight start npcs:${made[0]}\` puts them in._`].join('\n') });
@@ -10694,6 +10857,11 @@ function npcPageBody(gid, npc) {
   const face = npcFace(gid, npc);
   if (face) lines.push(face);
   if (npc.lore) lines.push('', String(npc.lore).slice(0, 900));
+  // The same titles and associations a player's page shows, in the same
+  // words — an NPC's standing reads like a knight's.
+  const tl = titlesLine(gid, npcFighterId(npc.name));
+  if (tl) lines.push('', tl);
+
   return lines.join('\n').slice(0, 1990);
 }
 
@@ -10738,6 +10906,7 @@ async function mirrorNpcSheet(client, gid, name) {
   if (!forumId) return null;
   const npc = getNpc(gid, name);
   if (!npc) return null;
+  if (npc.is_temp) return null;                 // temporary: no page, by design
   const forum = await client.channels.fetch(forumId).catch(() => null);
   if (!forum || forum.type !== 15) return null;
 
@@ -12013,7 +12182,7 @@ async function routeButton(interaction) {
         const ch = await interaction.client.channels.fetch(t.channel_id).catch(() => null);
         const m = ch ? await ch.messages.fetch(msgId).catch(() => null) : null;
         if (m?.editable) await m.edit({ content: `\u{1FAA6} ~~**${t.name}**~~ \u2014 fallen after ${t.hits} hit${t.hits === 1 ? '' : 's'}.`, components: [] }).catch(() => {});
-        await logButtonPress(interaction, gidT, interaction.user.id, `${t.name} falls`, null);
+        try { noteQuestActivity(gidT, t.channel_id, 'combat', `${t.name} falls after ${t.hits} hit${t.hits === 1 ? '' : 's'}`, interaction.user.id); } catch {}
       }
       await interaction.update({ content: `${interaction.message.content}\n${fell ? '\u{1FAA6} **It falls.**' : '\u{1F6E1}\uFE0F **It holds.**'}`, components: [] }).catch(() => {});
       return;
@@ -12741,6 +12910,7 @@ client.on('interactionCreate', async interaction => {
       if (sg === 'renown') return await handleRenown(interaction);
       if (sg === 'merit') return await handleMerit(interaction);
       if (sg === 'rank') return await handleRank(interaction);
+      if (sg === 'title' || sg === 'association') return await handleTitles(interaction, sg);
     }
     if (interaction.commandName === 'instance') return await handleInstance(interaction);
     if (interaction.commandName === 'target') return await handleTarget(interaction);
@@ -12951,7 +13121,7 @@ client.on('messageCreate', async message => {
 
 // Whole commands that belong to one system only. A guild's picker carries
 // its own game: the filter runs per-guild at registration, and the runtime
-// gates stay as the backstop — subcommands (like /npc create5e) register
+// gates stay as the backstop — subcommands (like /npc manage create5e) register
 // with their command and cannot be hidden per-ruleset, only refused.
 const DND5E_ONLY = ['dnd', 'spell', 'library'];
 const KNIGHTFALL_ONLY = ['duel', 'deception', 'standing'];
@@ -14300,7 +14470,7 @@ async function ensureCharBlocks(client, guild, uid, thread, sheetBody = null) {
   const gid = guild.id;
   const row = getCharPage(gid, uid);
   if (!row) return;
-  const bodies = { ...(sheetBody ? { sheet: sheetBody } : {}), inv: charInvBody(gid, uid), lore: charLoreBody(gid, uid), standing: charStandingBody(gid, uid), rolls: charRollsBody(gid, uid), notice: CHAR_THREAD_NOTICE };
+  const bodies = { ...(sheetBody ? { sheet: sheetBody } : {}), inv: charInvBody(gid, uid), lore: charLoreBody(gid, uid), standing: charStandingBody(gid, uid), titles: charTitlesBody(gid, uid), rolls: charRollsBody(gid, uid), notice: CHAR_THREAD_NOTICE };
   let hashes = {};
   try { hashes = JSON.parse(row.block_hashes || '{}'); } catch {}
   // Order is a contract: Inventory · Lore · Standing · Dice · Notice.
@@ -14310,8 +14480,8 @@ async function ensureCharBlocks(client, guild, uid, thread, sheetBody = null) {
   // bot's block messages are cleared and re-sent in sequence. Player
   // messages and the starter are never touched.
   {
-    const seq = ['inv', 'lore', 'standing', 'rolls', 'notice']
-      .map(k => (k === 'inv' ? row.inv_msg_id : k === 'lore' ? row.lore_msg_id : k === 'standing' ? row.standing_msg_id : k === 'rolls' ? row.rolls_msg_id : row.notice_msg_id))
+    const seq = ['inv', 'lore', 'standing', 'titles', 'rolls', 'notice']
+      .map(k => row[`${k === 'inv' ? 'inv' : k}_msg_id`])
       .filter(Boolean);
     const ordered = seq.every((v, i, a) => i === 0 || BigInt(a[i - 1]) < BigInt(v));
     if (!ordered) {
@@ -14320,17 +14490,18 @@ async function ensureCharBlocks(client, guild, uid, thread, sheetBody = null) {
         if (m?.author?.id === client.user.id) await m.delete().catch(() => {});
         await pace(150);
       }
-      row.inv_msg_id = row.lore_msg_id = row.standing_msg_id = row.rolls_msg_id = row.notice_msg_id = null;
+      row.inv_msg_id = row.lore_msg_id = row.standing_msg_id = row.titles_msg_id = row.rolls_msg_id = row.notice_msg_id = null;
       hashes = {};
     }
   }
   const crypto = require('crypto');
   const h = (t) => crypto.createHash('sha1').update(t).digest('hex').slice(0, 12);
   let dirtyIds = false;
-  const ids = { sheet: row.message_id || thread.id, inv: row.inv_msg_id, lore: row.lore_msg_id, standing: row.standing_msg_id, rolls: row.rolls_msg_id, notice: row.notice_msg_id };
+  const ids = { sheet: row.message_id || thread.id, inv: row.inv_msg_id, lore: row.lore_msg_id, standing: row.standing_msg_id, titles: row.titles_msg_id, rolls: row.rolls_msg_id, notice: row.notice_msg_id };
   // T's order, enforced at creation: Sheet (starter) · Inventory · Lore · Standing · Dice.
   let edited = 0, failed = 0;
-  for (const key of ['sheet', 'inv', 'lore', 'standing', 'rolls', 'notice']) {
+  // Titles sit with Standing — both are what a character has earned.
+  for (const key of ['sheet', 'inv', 'lore', 'standing', 'titles', 'rolls', 'notice']) {
     if (!(key in bodies)) continue;
     const want = bodies[key], hw = h(want);
     // Unchanged blocks cost zero traffic — except the notice, which is
@@ -14361,8 +14532,8 @@ async function ensureCharBlocks(client, guild, uid, thread, sheetBody = null) {
     }
     hashes[key] = hw;
   }
-  db.prepare('UPDATE char_pages SET inv_msg_id=?, lore_msg_id=?, standing_msg_id=?, rolls_msg_id=?, notice_msg_id=?, block_hashes=? WHERE guild_id=? AND user_id=?')
-    .run(ids.inv, ids.lore, ids.standing, ids.rolls, ids.notice, JSON.stringify(hashes), gid, uid);
+  db.prepare('UPDATE char_pages SET inv_msg_id=?, lore_msg_id=?, standing_msg_id=?, titles_msg_id=?, rolls_msg_id=?, notice_msg_id=?, block_hashes=? WHERE guild_id=? AND user_id=?')
+    .run(ids.inv, ids.lore, ids.standing, ids.titles, ids.rolls, ids.notice, JSON.stringify(hashes), gid, uid);
   return { edited, failed };
 }
 
@@ -15639,6 +15810,77 @@ async function postQuestTale(interaction, gid, quest, text, party) {
 // no roster entry. It has no HP — every hit asks the GM whether it falls,
 // which is both simpler and truer to how a table actually plays (T,
 // 2026-08-16). `secret` sends that question to the GM channel instead.
+// Titles and associations, for players and NPCs through one door. The
+// subject is whichever of `user:` or `npc:` was given; everything below
+// reads a fighter id and neither knows nor cares which kind it is.
+async function handleTitles(interaction, group) {
+  const gid = interaction.guild.id;
+  const leaf = interaction.options.getSubcommand();
+  const gm = await isGm(interaction.guild, interaction.user.id);
+
+  // `association list` asks about a GROUP, not a subject.
+  if (group === 'association' && leaf === 'list') {
+    const name = interaction.options.getString('group').trim();
+    const rows = db.prepare('SELECT subject_id, note FROM subject_assocs WHERE guild_id=? AND name=? COLLATE NOCASE ORDER BY at').all(gid, name);
+    if (!rows.length) return interaction.reply({ ephemeral: true, content: `\u{1F6E1}\uFE0F Nobody stands with **${name}** yet.` });
+    const lines = [];
+    for (const r of rows) {
+      const who = isNpcFighter(r.subject_id)
+        ? `**${npcNameFromFighter(r.subject_id)}** \u{1F3AD}`
+        : `<@${r.subject_id}>`;
+      lines.push(`\u00b7 ${who}${r.note ? ` \u2014 _${r.note}_` : ''}`);
+    }
+    return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] },
+      content: [`\u{1F6E1}\uFE0F **${name}**`, ...lines].join('\n').slice(0, 1900) });
+  }
+
+  const user = interaction.options.getUser('user');
+  const npcName = (interaction.options.getString('npc') || '').trim();
+  if (user && npcName) return interaction.reply({ ephemeral: true, content: '\u274C A player or an NPC, not both.' });
+  if (!user && !npcName) return interaction.reply({ ephemeral: true, content: '\u274C Name a player with `user:` or an NPC with `npc:`.' });
+  if (npcName && !getNpc(gid, npcName)) return interaction.reply({ ephemeral: true, content: `\u274C No NPC called **${npcName}**.` });
+  const sid = user ? user.id : npcFighterId(getNpc(gid, npcName).name);
+  const label = user ? `<@${user.id}>` : `**${getNpc(gid, npcName).name}**`;
+  const refresh = () => {
+    if (user) ensureCharPage(interaction.client, interaction.guild, user.id, null, 'all').catch(() => {});
+    else mirrorNpcSheet(interaction.client, gid, getNpc(gid, npcName).name).catch(() => {});
+  };
+
+  if (leaf === 'list') {
+    const body = titlesLine(gid, sid);
+    return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] },
+      content: body ? `${label}\n${body}` : `${label} holds no titles and stands with no one yet.` });
+  }
+  if (!gm) return interaction.reply({ ephemeral: true, content: '\u274C Only GMs can grant or revoke these.' });
+
+  if (group === 'title') {
+    const title = interaction.options.getString('title').trim().slice(0, 60);
+    if (leaf === 'grant') {
+      const source = (interaction.options.getString('source') || '').trim() || null;
+      grantTitle(gid, sid, title, { source, by: interaction.user.id });
+      refresh();
+      return interaction.reply({ allowedMentions: { parse: [] },
+        content: `\u{1F3C5} ${label} is now **${title}**${source ? ` \u2014 _${source}_` : ''}.` });
+    }
+    const gone = revokeTitle(gid, sid, title);
+    if (gone) refresh();
+    return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] },
+      content: gone ? `\u2705 ${label} no longer holds **${title}**.` : `\u274C ${label} never held **${title}**.` });
+  }
+
+  const name = interaction.options.getString('group').trim().slice(0, 60);
+  if (leaf === 'add') {
+    addAssoc(gid, sid, name, (interaction.options.getString('note') || '').trim() || null);
+    refresh();
+    return interaction.reply({ allowedMentions: { parse: [] },
+      content: `\u{1F6E1}\uFE0F ${label} now stands with **${name}**.` });
+  }
+  const parted = removeAssoc(gid, sid, name);
+  if (parted) refresh();
+  return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] },
+    content: parted ? `\u2705 ${label} has parted from **${name}**.` : `\u274C ${label} never stood with **${name}**.` });
+}
+
 async function handleTarget(interaction) {
   const gid = interaction.guild.id;
   if (!(await isGm(interaction.guild, interaction.user.id)))
@@ -15683,6 +15925,7 @@ async function handleTarget(interaction) {
   db.prepare(`INSERT INTO temp_targets (guild_id, message_id, channel_id, name, dc, stat, dice, secret, owner, created_by, at)
               VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
     .run(gid, msg.id, interaction.channel.id, name, dc || null, stat || null, dice || null, secret, forUser?.id || null, interaction.user.id, Date.now());
+  try { noteQuestActivity(gid, interaction.channel.id, 'combat', `${name} stands as a target`, interaction.user.id); } catch {}
   return interaction.reply({ ephemeral: true, content: `\u2705 **${name}** is standing. Every hit will ask you whether it falls.` });
 }
 
@@ -18196,6 +18439,12 @@ async function handleFight(interaction, forced) {
       archiveFight(gid, cid2, endLog, endRoster, endFloor);
       upsertFight(gid, cid2, { state: 'idle', turn_order: '[]' });
       try { db.prepare('UPDATE dc_cards SET bind_channel=NULL, bind_uid=NULL, bind_skip=0 WHERE guild_id=? AND bind_channel=?').run(gid, cid2); } catch {}
+      // The throwaway cast leaves with the fight. Anyone still standing in
+      // another brawl is spared — sweepTempNpcs checks before it deletes.
+      try {
+        const sweptT = sweepTempNpcs(gid);
+        if (sweptT) console.log(`[temp-npcs] swept ${sweptT} after the fight in ${cid2}`);
+      } catch {}
       await announceFightEnd(interaction.guild, gid, cid2, channel2, {
         headline: `🏁 Called by **${gmName}** — no victor. HP states are preserved.`,
         log: endLog, roster: endRoster, hpState: endHp, floor: endFloor,
@@ -18241,6 +18490,8 @@ async function handleNpc(interaction) {
   // opposite existence guard.
   let sub = interaction.options.getSubcommand();
   if (interaction.options.getSubcommandGroup(false) === 'category') sub = 'category' + sub;
+  // The throwaway cast folds the same way: /npc temp list → 'templist'.
+  if (interaction.options.getSubcommandGroup(false) === 'temp') sub = 'temp' + sub;
   const wantsEdit = sub === 'edit';
   if (wantsEdit) sub = 'create';
   const gid = interaction.guild.id;
@@ -18259,7 +18510,7 @@ async function handleNpc(interaction) {
         dex: npc.dex, wis: npc.wis, lck: npc.lck, hp_current: npc.hp_current, rerolls_current: npc.lck ?? 0 };
       const buf = embedSheetData(renderSheetParchment(charLike, npc.name, gid, null, true), npcPayloadObj(npc));
       const { AttachmentBuilder } = require('discord.js');
-      return interaction.editReply({ content: `🎭 **${npc.name}**, packed for the road — the PDF survives Discord; \`/npc import\` unpacks it anywhere.`,
+      return interaction.editReply({ content: `🎭 **${npc.name}**, packed for the road — the PDF survives Discord; \`/npc manage import\` unpacks it anywhere.`,
         files: [new AttachmentBuilder(buf, { name: `${fileSlug(npc.name, 'npc')}-npc.pdf` })] });
     } catch (err) {
       console.error('[npc] export failed -', err?.message || err);
@@ -18269,7 +18520,7 @@ async function handleNpc(interaction) {
   if (sub === 'import') {
     const att = interaction.options.getAttachment('file');
     if (!/\.(png|pdf)$/i.test(att?.name || '')) {
-      return interaction.reply({ content: '❌ That isn\'t a .png or .pdf — use a file made by `/npc export`.', ephemeral: true });
+      return interaction.reply({ content: '❌ That isn\'t a .png or .pdf — use a file made by `/npc manage export`.', ephemeral: true });
     }
     if ((att.size ?? 0) > 8_000_000) {
       return interaction.reply({ content: '❌ That file is over 8 MB — not one of mine.', ephemeral: true });
@@ -18283,7 +18534,7 @@ async function handleNpc(interaction) {
     }
     const imp = validateImportedNpc(extractSheetData(bytes));
     if (!imp) {
-      return interaction.editReply({ content: '❌ No NPC is woven into that file — only PDFs made by `/npc export` carry one.' });
+      return interaction.editReply({ content: '❌ No NPC is woven into that file — only PDFs made by `/npc manage export` carry one.' });
     }
     const existed = !!getNpc(gid, imp.name);
     // GM-direct: you clicked it, you approved it. Webhooks and standing stay local.
@@ -18370,8 +18621,11 @@ async function handleNpc(interaction) {
     const name = interaction.options.getString('name');
     if (name.length > 50) return interaction.reply({ content: '❌ NPC name is too long (max 50 characters).', ephemeral: true });
     const already = !!getNpc(gid, name);
+    // Temporary NPCs are flagged at birth; the forum mirror, the roster and
+    // the sweeps all read that flag rather than a second table.
+    const wantTemp = interaction.options?.getBoolean?.('temp') ? 1 : 0;
     if (!wantsEdit && already) {
-      return interaction.reply({ content: `❌ **${name}** already exists — \`/npc edit name:${name}\` changes them; \`/npc copy\` duplicates them.`, ephemeral: true });
+      return interaction.reply({ content: `❌ **${name}** already exists — \`/npc edit name:${name}\` changes them; \`/npc manage copy\` duplicates them.`, ephemeral: true });
     }
     if (wantsEdit && !already) {
       return interaction.reply({ content: `❌ No NPC named **${name}** — \`/npc create\` makes a new one.`, ephemeral: true });
@@ -18432,7 +18686,8 @@ async function handleNpc(interaction) {
     // fights — start them at full so they're usable straight away.
     if (!existed) {
       const made = getNpc(gid, name);
-      upsertNpc(gid, name, { hp_current: maxHpFromCon(gid, made?.con) });
+      upsertNpc(gid, name, { hp_current: maxHpFromCon(gid, made?.con),
+        ...(wantTemp ? { is_temp: 1, temp_at: Date.now() } : {}) });
     }
 
     const filed = fileNpcByCategory(interaction, gid, name);
@@ -18680,6 +18935,33 @@ async function handleNpc(interaction) {
       return `🗑️ Category **${name}** deleted. Its threads are closing; the NPCs in it are moving to their next category.`;
     });
   }
+  if (sub === 'templist') {
+    const temps = getTempNpcs(gid);
+    if (!temps.length) return interaction.reply({ ephemeral: true, content: '\u{1F5FF} No temporary NPCs are lying about.' });
+    return interaction.reply({ ephemeral: true, content: ['\u{1F5FF} **The throwaway cast**', ...temps.map(t =>
+      `\u2022 **${t.name}** \u2014 HP ${t.hp_current}${t.max_hp ? `/${t.max_hp}` : ''}${fightingNpcNames(gid).includes(t.name.toLowerCase()) ? ' \u00b7 _in a fight_' : ''}`),
+      '', '_`/npc temp keep` makes one permanent \u00b7 `/npc temp clear` sweeps the rest._'].join('\n') });
+  }
+
+  if (sub === 'tempkeep') {
+    if (!gm) return interaction.reply({ content: '\u274C Only GMs can keep an NPC.', ephemeral: true });
+    const nameK = interaction.options.getString('name').trim();
+    const npcK = getNpc(gid, nameK);
+    if (!npcK || !npcK.is_temp) return interaction.reply({ ephemeral: true, content: `\u274C **${nameK}** is not a temporary NPC.` });
+    upsertNpc(gid, npcK.name, { is_temp: 0 });
+    // Promotion is the one moment a throwaway earns a page.
+    mirrorNpcSheet(interaction.client, gid, npcK.name).catch(() => {});
+    return interaction.reply({ content: `\u2705 **${npcK.name}** joins the cast \u2014 they have a page now.` });
+  }
+
+  if (sub === 'tempclear') {
+    if (!gm) return interaction.reply({ content: '\u274C Only GMs can sweep.', ephemeral: true });
+    const swept = sweepTempNpcs(gid, { force: true });
+    return interaction.reply({ ephemeral: true, content: swept
+      ? `\u{1F9F9} Swept **${swept}** temporary NPC${swept === 1 ? '' : 's'} away.`
+      : '\u{1F5FF} There was nothing to sweep.' });
+  }
+
   if (sub === 'categorylist') {
     const cats = getCategories(gid);
     const uncategorised = getUncategorisedNpcs(gid);
@@ -19108,7 +19390,7 @@ const HELP_CATEGORIES = {
     title: '📜 Character Sheet',
     blurb: 'sheets, approval, lore, profiles, weapons',
     body: [
-      '🏷️ Your character has their own thread in the character forum: **Sheet → Inventory → Lore → Standing → Dice**, all kept current by the bot (dice hourly). Tags (order · class · ⚰ Fallen · 🌟 Hero) filter the roster. GM sheets live in their own GM-only forum. Threads are staff-typed — to adjust your lore, ask a Moderator or Expeditioner (the thread says so).',
+      '🏷️ Your character has their own thread in the character forum: **Sheet → Inventory → Lore → Standing → Titles → Dice**, all kept current by the bot (dice hourly). Tags (order · class · ⚰ Fallen · 🌟 Hero) filter the roster. GM sheets live in their own GM-only forum. Threads are staff-typed — to adjust your lore, ask a Moderator or Expeditioner (the thread says so).',
       '_Your sheet is the one source of truth — stats, class, order and weapons — and fights, activities and heals all read from it._',
       '`/char create` — set up a full character at once (stats, order, class, weapons, weapon emojis)',
       '`/char set field:STR value:14` — set one field at a time (with approvals on, any change to your own sheet goes back to the GMs)',
@@ -19195,11 +19477,11 @@ const HELP_CATEGORIES = {
       '`/activity demo` — the built-in fishing tale, no stakes (GM)',
       '_In 5e, an attack is measured against the target\'s Armour Class — nobody rolls to defend, and the blow resolves at once. A natural 20 always hits and rolls the weapon dice twice; a natural 1 always misses._',
       '`/config channels npcforum channel:#forum` — every NPC gets a page there, tagged with their categories so the sidebar filter sorts them (Admin)',
-      '`/npc create name:X category:Enemy` · `/npc sync [name:]` — name a category as you make them and it is created if new; sync writes up everyone already made (GM)',
+      '`/npc create name:X category:Enemy` · `/npc manage sync [name:]` — name a category as you make them and it is created if new; sync writes up everyone already made (GM)',
       '`/library srd` · `/library summon name: [count:] [as:]` — keep monsters and spells once, then bring one out as an NPC ready to fight. The SRD set ships with the bot (GM)',
       '`/library import file: | paste:` · `/library list` · `/library show` · `/library forget` — read in your own: one entry a line, `[MONSTER] Goblin | ac 15 | hp 7 | attack +4 | damage 1d6+2` (GM)',
-      '`/npc create5e name: ac: hp: attack: damage:` — a monster from its statblock; it then fights by its own numbers (GM, 5e)',
-      '`/npc create5e name: ac: hp: attack: damage:` — a monster from its statblock: it fights with its own attack bonus and damage dice (GM, 5e)',
+      '`/npc manage create5e name: ac: hp: attack: damage:` — a monster from its statblock; it then fights by its own numbers (GM, 5e)',
+      '`/npc manage create5e name: ac: hp: attack: damage:` — a monster from its statblock: it fights with its own attack bonus and damage dice (GM, 5e)',
       '`/dnd condition [add:] [remove:] [clear:] [user:] [npc:]` — the fifteen SRD conditions; they bend the dice on their own, and one of each cancels out (5e)',
       '`/dnd deathsave` · `/dnd temphp amount:` · `/dnd inspiration [grant:] [use:]` — dying, temporary hit points, and inspiration (5e)',
       '_Damage types are honoured where a sheet declares them — write `fire, immune poison, x2 acid` and a blow is halved, spared or doubled. A Fighter swings twice from level 5, and the turn is held until the action is spent._',
@@ -19322,7 +19604,7 @@ const HELP_CATEGORIES = {
       '`/npc hp name:X value:N` — set an NPC\'s HP · omit value for a full heal (GM)',
       '`/npc heal names:all` · `/npc heal names:Goblin, Orc` — fully heal NPCs (GM)',
       '`/gm heal user:@a` / `npc:all` — restore HP, rerolls or charges, any amount (GM)',
-      '`/npc copy name:Goblin new_name:Goblin 2` — duplicate an NPC (GM)',
+      '`/npc manage copy name:Goblin new_name:Goblin 2` — duplicate an NPC (GM)',
       '`/npc show name:Goblin` — full stat block for one NPC',
       '`/npc hero name:X stat:str` — make an NPC a Hero with a signature stat (GM)',
       '`/npc say name:X message:...` — speak or act as an NPC, no dice (GM)',
@@ -19376,7 +19658,7 @@ const HELP_CATEGORIES = {
       'When NPC stats are hidden, fight cards mask the stat and modifier — the audit\'s NPC book gets the full card, every number revealed',
       '`/config mechanics scrollfont font:<file>` — store an .otf/.ttf; the reply renders a sample line so you see it works. `/gm scroll` then writes props in it (Admin)',
       '`/config channels scrollarchive` — the 📜 Scrolls book in the roll-audit forum archives every scroll automatically, both directions, text + image + PDF; `channel:#x` overrides with a plain channel (Admin)',
-      '`/npc export name:<npc>` / `/npc import file:<pdf>` — a villain packed as a woven parchment PDF; import applies directly, GM-as-approver — stats, class, hero flag, auto-pilot preferences and lore travel, standing and webhooks stay local',
+      '`/npc manage export name:<npc>` / `/npc manage import file:<pdf>` — a villain packed as a woven parchment PDF; import applies directly, GM-as-approver — stats, class, hero flag, auto-pilot preferences and lore travel, standing and webhooks stay local',
       '`/gm dicereport` — the table\'s dice health: top rollers, hot and cold d20 hands, nat leaders, the full d20 spread',
       '`/gm scroll` — write a title and body in a writing window; the bot posts the parchment as an image everyone can see plus a **PDF** with the writing woven invisibly inside — the PDF survives Discord, so scrolls travel between servers on their own. `file:` hands any scroll PDF back: plain text out, plus a readable edition in standard type as image and woven PDF (GM)',
       '`/config channels approvals channel:#x` — new sheets need GM approval before use (Admin)',
@@ -22528,6 +22810,14 @@ async function handleQuest(interaction, forced) {
     // The players' chronicle: the GM's own telling. Given at completion via
     // `summary:`, or written later with `/quest log` — which fills this in
     // and updates every participant's record link.
+    // A title earned by being there — granted to everyone in the party and
+    // stamped with the quest it came from, so the page says where.
+    const earned = (interaction.options?.getString?.('title') || '').trim().slice(0, 60);
+    if (earned) {
+      for (const id of party) grantTitle(gid, id, earned, { source: questTag(quest), by: interaction.user.id });
+      lines.push('', `\u{1F3C5} **${earned}** \u2014 earned by ${party.length} adventurer${party.length === 1 ? '' : 's'}.`);
+      for (const id of party) ensureCharPage(interaction.client, interaction.guild, id, null, 'all').catch(() => {});
+    }
     let taleUrls = {};
     const tale = (interaction.options?.getString?.('summary') || '').trim();
     if (tale) taleUrls = await postQuestTale(interaction, gid, quest, tale, party).catch(() => ({}));

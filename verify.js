@@ -1014,6 +1014,14 @@ function testBuilders(src) {
     // the death check, asked in-channel or in the GM channel with `secret`.
     // Schema ordering: an ALTER above its own CREATE fails into its catch
     // on a fresh database and the column never appears (probe.js, 2026-08-19).
+    // The GM log is only honest if everything that happened at the table
+    // reaches it: NPC speech and combat always did; DC checks, summoned
+    // monsters and targets joined them 2026-08-19.
+    ok('a DC check joins the quest it happened in',
+      /noteQuestActivity\(gid, cid, 'roll', `\$\{whoDc\}: \$\{faceDc\} \$\{total\} vs DC \$\{dc\}/.test(src));
+    ok('summoned monsters and targets are logged too',
+      /summoned\$\{interaction\.options\.getBoolean\('temp'\) \? ' \(temporary\)' : ''\}: \$\{made\.join\(', '\)\}/.test(src) &&
+      /stands as a target/.test(src) && /falls after \$\{t\.hits\}/.test(src));
     ok('every schema ALTER lives below the whole schema',
       (() => {
         const lastCreate = src.lastIndexOf('CREATE TABLE IF NOT EXISTS');
@@ -1126,8 +1134,18 @@ function testBuilders(src) {
     // slot, and /quest inherited the most-crowded seat at 23. These hold the
     // fold's arithmetic so it cannot silently unfold.
 // (party fold, 2026-08-13: quest dropped 23→20; npc leads at 22.)
-    ok('/npc is now the most crowded command', leaves(by.npc) === Math.max(...cmds.map(leaves)));
-    ok('/npc holds at 22 = 19 top + category group + edit + rename', leaves(by.npc) === 22);
+    // (was '/npc is the most crowded' — the manage fold ended that on
+    // 2026-08-19. What matters is that nothing sits near the wall.)
+    ok('no command is within two leaves of the 25 ceiling',
+      Math.max(...cmds.map(leaves)) <= 22);
+    ok('the workshop verbs live in a group, the daily ones do not',
+      /g\.setName\('manage'\)\.setDescription\('Workshop/.test(src) &&
+      /\.addSubcommand\(s=>s\.setName\('say'\)/.test(src) &&
+      /\.addSubcommand\(s=>s\.setName\('show'\)/.test(src));
+    // The throwaway cast is a GROUP on /npc, so the leaf count is what
+    // matters, not a raw option length — and it must stay under 25.
+    ok('/npc stays inside the subcommand ceiling with the temp group',
+      leaves(by.npc) <= 25 && /g\.setName\('temp'\)/.test(src));
     // The rename's contract: it mirrors deleteNpc's purge list as UPDATEs —
     // everything delete destroys under the old identity, rename carries to
     // the new. If purgeSubjectRecords gains a table, both lists gain it, or
@@ -1243,7 +1261,7 @@ function testBuilders(src) {
       /approvalDestination\(gidL, 'loredoc'\)/.test(src) &&
       /ensureApprovalThreads\(interaction\.client, gidL\)/.test(src));
     ok('/char show speaks with the forum renderers, never a second voice',
-      /const blocks = \[charInvBody\(gid, tid\), charLoreBody\(gid, tid\), charStandingBody\(gid, tid\), charRollsBody\(gid, tid\)\];/.test(src) &&
+      /const blocks = \[charInvBody\(gid, tid\), charLoreBody\(gid, tid\), charStandingBody\(gid, tid\), charTitlesBody\(gid, tid\), charRollsBody\(gid, tid\)\];/.test(src) &&
       /Their page: <#\$\{pg\.thread_id\}>/.test(src));
     ok('the char tag canon is 8 orders + 3 classes + Fallen',
       /CHAR_TAG_ORDERS = \['White Knight','Black Knight','Gold Knight','Grey Knight','Blue Knight','Purple Knight','Green Knight','Red Knight'\]/.test(src) &&
@@ -1305,11 +1323,25 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /m\?\.author\?\.id === client\.user\.id/.test(src));
     ok('the lore-doc buttons live in the button lane',
       /async function routeButton\(interaction\) \{[\s\S]*?startsWith\('loredoc:'\)[\s\S]*?startsWith\('loredocok:'\)[\s\S]*?\n    return;\n\}/.test(src));
-    ok('the thread carries six bot blocks — five living, one notice — in T\'s order',
-      /charStandingBody\(gid, uid\)/.test(src) &&
-      /for \(const key of \['sheet', 'inv', 'lore', 'standing', 'rolls', 'notice'\]\)/.test(src) &&
+    ok('the thread carries seven bot blocks — six living, one notice — in T\'s order',
+      /charStandingBody\(gid, uid\)/.test(src) && /charTitlesBody\(gid, uid\)/.test(src) &&
+      /for \(const key of \['sheet', 'inv', 'lore', 'standing', 'titles', 'rolls', 'notice'\]\)/.test(src) &&
       /contact a Moderator or Expeditioner\. Thank you!/.test(src) &&
-      /ALTER TABLE char_pages ADD COLUMN notice_msg_id/.test(src));
+      /ALTER TABLE char_pages ADD COLUMN titles_msg_id/.test(src));
+    // Titles and associations read the same on a player's page, an NPC's
+    // page and /char show, because one renderer serves all three.
+    ok('titles and associations are one renderer for players and NPCs',
+      /function titlesLine\(gid, sid\)/.test(src) &&
+      /const tl = titlesLine\(gid, npcFighterId\(npc\.name\)\);/.test(src) &&
+      /function charTitlesBody\(gid, uid\)/.test(src));
+    ok('the completion options the handler reads are actually declared',
+      /setName\('summary'\)\.setDescription\('Your telling of it/.test(src) &&
+      /setName\('title'\)\.setDescription\('A title every survivor earns/.test(src));
+    ok('a quest can grant its party a title, stamped with its name',
+      /for \(const id of party\) grantTitle\(gid, id, earned, \{ source: questTag\(quest\)/.test(src));
+    ok('one door serves both subjects, and refuses both at once',
+      /async function handleTitles\(interaction, group\)/.test(src) &&
+      /A player or an NPC, not both/.test(src));
     ok('the player forum is staff-typed, and the lock is honest about its needs',
       /SendMessagesInThreads: false, CreatePublicThreads: false/.test(src) &&
       /no gm role set/.test(src));
