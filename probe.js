@@ -391,6 +391,24 @@ async function fire(over) {
 // The shim records the handle index.js opened, so probes can query the
 // very same database the bot is using.
 function findDb() { return lastDb; }
+// Reaching into the loaded module: index.js keeps everything at module
+// scope, so the probe drives it through the same interaction handler the
+// gateway would — no exports needed.
+function dbRun(sql) { try { lastDb.prepare(sql).run(); } catch (e) { /* probe-only */ } }
+function setConfigProbe(key, val) {
+  try {
+    lastDb.prepare(`INSERT INTO guild_config (guild_id, ${key}) VALUES ('G1', ?)
+                    ON CONFLICT(guild_id) DO UPDATE SET ${key}=excluded.${key}`).run(val);
+  } catch (e) { /* probe-only */ }
+}
+function countBotMessages(thread) {
+  return sent.filter(x => x.channel === thread.id).length;
+}
+// The mender is reached the way a GM would reach it: /gm check run.
+async function callEnsureCharPage(g2, uid) {
+  const r = await fire({ commandName: 'gm', options: { _group: 'check', _sub: 'run' }, userId: uid });
+  return r.replies.length > 0;
+}
 function tableCounts(db) {
   const out = {};
   for (const r of db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()) {

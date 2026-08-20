@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 920 assertions passed and no scanner found an ERROR.
+Green means 923 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 920 assertions covering structure, registration and ruleset
+now is 923 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -325,6 +325,23 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 8p · /gm check pages — the blunt instrument (2026-08-20)
+
+T's threads were still doubled after deploying the lock+stray fix. From
+here I cannot tell whether the fix was actually live or whether the sweep
+failed for a reason the code does not surface — so rather than guess a
+third time, this adds a lever that REPORTS. `/gm check pages [user:]`
+deletes every bot message in a character thread except the starter
+(author-checked; players' posts are never touched), forgets the recorded
+ids and hashes, and re-posts a clean set in order. It replies with counts
+— pages rebuilt, blocks cleared, any that REFUSED to delete and why — so
+a thread that will not clean tells us what is stopping it.
+
+A probe for the stray sweep was attempted and abandoned: driving the
+whole /gm check run path through the fake gateway needed more scaffolding
+than the answer was worth. Noted as the honest limit of the probe harness
+today — it can prove structure and idempotency, not yet whole workflows.
 
 ## 8o · The duplicate-block race (2026-08-19, live)
 

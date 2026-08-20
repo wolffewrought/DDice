@@ -5532,6 +5532,8 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('restart').setDescription('DELETE every channel the bot set up, then build fresh'));
       g.addSubcommand(s=>s.setName('order').setDescription('The sidebar order \u2014 prompts to re-apply or keep yours'));
       g.addSubcommand(s=>s.setName('migrations').setDescription('Every one-time reshape and the counts it stamped'));
+      g.addSubcommand(s=>s.setName('pages').setDescription('Rebuild character pages (GM)')
+        .addUserOption(o=>o.setName('user').setDescription('Just this one').setRequired(false)));
       g.addSubcommand(s=>s.setName('portraits').setDescription('Move stored NPC faces into their category threads'));
       return g; })
     .addSubcommand(s=>s.setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)')
@@ -11547,6 +11549,7 @@ async function handleCheck(interaction) {
   const opt = (name) => checkLeaf ? checkLeaf === name : !!interaction.options?.getBoolean?.(name);
   // `run:true` builds whatever the code knows about and this server hasn't
   // got yet — the one switch to pull after an update adds a book.
+  if (opt('pages')) return rebuildCharPages(interaction);
   if (opt('portraits')) return runPortraitMigration(interaction);
   if (opt('migrations')) {
     // The deploy ledger, in Discord instead of Railway screenshots: every
@@ -21623,6 +21626,55 @@ async function bootMend(client) {
       if (made.length) console.log(`[mend] ${guild.name}: ${made.join(' \u00b7 ')}`);
     } catch (e) { console.log(`[mend] ${guild.name}: ${e?.message || e}`); }
   }
+}
+
+// The blunt instrument, for when a thread has gone wrong in a way the
+// gentle mend cannot see: every bot message in the thread except the
+// starter is deleted, the recorded ids are forgotten, and the blocks are
+// posted fresh in order. Players' own messages are never touched \u2014 the
+// author check is the whole safety of it. Reports what it found, so a
+// thread that refuses to clean tells us why (T's duplicates, 2026-08-19).
+async function rebuildCharPages(interaction) {
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '\u274C The setup check is for GMs.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+  const gid = interaction.guild.id;
+  const only = interaction.options.getUser('user');
+  const rows = only
+    ? [{ user_id: only.id }]
+    : db.prepare('SELECT user_id FROM characters WHERE guild_id=?').all(gid);
+  const lines = [];
+  let cleared = 0, rebuilt = 0, stuck = 0;
+  for (const r of rows) {
+    const page = getCharPage(gid, r.user_id);
+    if (!page?.thread_id) continue;
+    const thread = await interaction.client.channels.fetch(page.thread_id).catch(() => null);
+    if (!thread?.isThread?.()) { stuck++; lines.push(`\u26A0\uFE0F <@${r.user_id}> \u2014 thread unreachable`); continue; }
+    await wakeThread(thread);
+    let gone = 0, refused = 0;
+    const msgs = await thread.messages.fetch({ limit: 100 }).catch(() => null);
+    if (!msgs) { stuck++; lines.push(`\u26A0\uFE0F <@${r.user_id}> \u2014 could not read the thread`); continue; }
+    for (const m of msgs.values()) {
+      if (m.author?.id !== interaction.client.user.id) continue;
+      if (m.id === thread.id) continue;                       // the starter IS the sheet
+      const ok2 = await m.delete().then(() => true).catch(() => false);
+      if (ok2) gone++; else refused++;
+      await pace(120);
+    }
+    cleared += gone;
+    if (refused) lines.push(`\u26A0\uFE0F <@${r.user_id}> \u2014 ${refused} message(s) would not delete`);
+    // Forget the ids so the mender posts a clean set in order.
+    db.prepare(`UPDATE char_pages SET inv_msg_id=NULL, lore_msg_id=NULL, standing_msg_id=NULL,
+                titles_msg_id=NULL, rolls_msg_id=NULL, notice_msg_id=NULL, block_hashes='{}'
+                WHERE guild_id=? AND user_id=?`).run(gid, r.user_id);
+    await ensureCharPage(interaction.client, interaction.guild, r.user_id, null, 'all').catch(() => null);
+    rebuilt++;
+    await pace(200);
+  }
+  return interaction.editReply({ allowedMentions: { parse: [] }, content: [
+    `\u{1F9F9} **${rebuilt}** page(s) rebuilt \u00b7 **${cleared}** old block(s) cleared${stuck ? ` \u00b7 **${stuck}** unreachable` : ''}`,
+    ...lines.slice(0, 10),
+  ].join('\n') });
 }
 
 async function mendEverything(client, guild, { log = () => {} } = {}) {

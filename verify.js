@@ -1340,6 +1340,14 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     // page row outlived them every time (audit, 2026-08-19).
     // Two menders on one character posted two of everything; the lock ends
     // that, and the stray sweep clears what the race already left.
+    // The blunt instrument, for a thread the gentle mend cannot fix. Author-
+    // checked (players' messages are never touched) and it REPORTS, so a
+    // thread that refuses to clean says why instead of failing quietly.
+    ok('/gm check pages rebuilds a thread and reports what it found',
+      /async function rebuildCharPages\(interaction\)/.test(src) &&
+      /if \(m\.author\?\.id !== interaction\.client\.user\.id\) continue;/.test(src) &&
+      /would not delete/.test(src) &&
+      /old block\(s\) cleared/.test(src));
     ok('only one mender may touch a character at a time',
       /const charMendLocks = new Set\(\);/.test(src) &&
       /if \(charMendLocks\.has\(lockKey\)\) return 0;/.test(src) &&
