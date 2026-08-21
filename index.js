@@ -704,6 +704,7 @@ try { db.exec('ALTER TABLE char_pages ADD COLUMN rolls_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE char_pages ADD COLUMN standing_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE char_pages ADD COLUMN notice_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE char_pages ADD COLUMN titles_msg_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE char_pages ADD COLUMN assocs_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE char_pages ADD COLUMN block_hashes TEXT'); } catch {}
 try { db.exec('ALTER TABLE deaths ADD COLUMN public_msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE deaths ADD COLUMN revived_at INTEGER'); } catch {}
@@ -962,17 +963,27 @@ function removeAssoc(gid, sid, name) {
 }
 // The one rendering both forums and /char show share, so a title never
 // reads differently depending on where you found it.
-function titlesLine(gid, sid) {
-  const t = getTitles(gid, sid), a = getAssocs(gid, sid);
-  if (!t.length && !a.length) return null;
-  const out = [];
-  if (t.length) out.push(`\u{1F3C5} ${t.map(x => `**${x.title}**${x.source ? ` _(${x.source})_` : ''}`).join(' \u00b7 ')}`);
-  if (a.length) out.push(`\u{1F6E1}\uFE0F ${a.map(x => `**${x.name}**${x.note ? ` _(${x.note})_` : ''}`).join(' \u00b7 ')}`);
-  return out.join('\n');
+function titlesOnly(gid, sid) {
+  const t = getTitles(gid, sid);
+  if (!t.length) return null;
+  return t.map(x => `\u{1F3C5} **${x.title}**${x.source ? ` _(${x.source})_` : ''}`).join('\n');
 }
+function assocsOnly(gid, sid) {
+  const a = getAssocs(gid, sid);
+  if (!a.length) return null;
+  return a.map(x => `\u{1F6E1}\uFE0F **${x.name}**${x.note ? ` _(${x.note})_` : ''}`).join('\n');
+}
+// Kept for the NPC sheet, which is one message and shows both together.
+function titlesLine(gid, sid) {
+  return [titlesOnly(gid, sid), assocsOnly(gid, sid)].filter(Boolean).join('\n') || null;
+}
+// Separate blocks on a character page (T, 2026-08-20): a title is earned,
+// an association is chosen, and they read better apart.
 function charTitlesBody(gid, uid) {
-  const body = titlesLine(gid, uid);
-  return ['\u{1F3F7}\uFE0F **Titles & Associations**', body || '_None yet._'].join('\n').slice(0, 1900);
+  return ['\u{1F3C5} **Titles**', titlesOnly(gid, uid) || '_None yet._'].join('\n').slice(0, 1900);
+}
+function charAssocsBody(gid, uid) {
+  return ['\u{1F6E1}\uFE0F **Associations**', assocsOnly(gid, uid) || '_None yet._'].join('\n').slice(0, 1900);
 }
 
 function getMerits(gid, uid) {
@@ -6563,6 +6574,13 @@ const slashCommands = [
       .addUserOption(o=>o.setName('for').setDescription('Only they may swing').setRequired(false))
       .addBooleanOption(o=>o.setName('secret').setDescription('true = ask me in the GM channel, not here').setRequired(false)))
     .addSubcommand(s=>s.setName('list').setDescription('Targets still standing in this channel (GM)')),
+
+  new SlashCommandBuilder()
+    .setName('dd').setDescription('Speak to a player as the bot \u2014 keeps the game separate from you (GM)')
+    .addUserOption(o=>o.setName('user').setDescription('Who to write to').setRequired(true))
+    .addStringOption(o=>o.setName('message').setDescription('What to say').setRequired(true))
+    .addStringOption(o=>o.setName('as').setDescription('Speak as an NPC instead of the GMs').setRequired(false).setAutocomplete(true))
+    .addBooleanOption(o=>o.setName('quiet').setDescription('true = do not name which GM sent it').setRequired(false)),
 ];
 
 // ─────────────────────────────────────────────
@@ -9259,7 +9277,7 @@ async function handleChar(interaction) {
     // same renderers, so this can never disagree with the thread. Blocks
     // pack into as few follow-ups as 2000 chars allow.
     await interaction.reply({ content: lines.join('\n') });
-    const blocks = [charInvBody(gid, tid), charLoreBody(gid, tid), charStandingBody(gid, tid), charTitlesBody(gid, tid), charRollsBody(gid, tid)];
+    const blocks = [charInvBody(gid, tid), charLoreBody(gid, tid), charStandingBody(gid, tid), charTitlesBody(gid, tid), charAssocsBody(gid, tid), charRollsBody(gid, tid)];
     let pack = [];
     const flush = async () => { if (pack.length) { await interaction.followUp({ content: pack.join('\n\n'), allowedMentions: { parse: [] } }).catch(() => {}); pack = []; } };
     for (const b of blocks) {
@@ -12386,6 +12404,15 @@ client.on('interactionCreate', async interaction => {
         return await interaction.respond(choices);
       }
 
+      // /dd's `as:` names an NPC too — the same list, so a GM never has to
+      // remember a spelling the bot could have offered.
+      if (interaction.commandName === 'dd' && focusedOption.name === 'as') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        return await interaction.respond(getAllNpcs(interaction.guild.id)
+          .filter(n => !v || n.name.toLowerCase().includes(v))
+          .slice(0, 25).map(n => ({ name: n.name.slice(0, 100), value: n.name })))
+          .catch(() => {});
+      }
       if (interaction.commandName === 'gm' && (focusedOption.name === 'npc' || focusedOption.name === 'npcs')) {
         const v = String(focusedOption.value).toLowerCase();
         const choices = [{ name: 'all', value: 'all' },
@@ -12921,6 +12948,7 @@ client.on('interactionCreate', async interaction => {
       if (sg === 'title' || sg === 'association') return await handleTitles(interaction, sg);
     }
     if (interaction.commandName === 'instance') return await handleInstance(interaction);
+    if (interaction.commandName === 'dd') return await handleDd(interaction);
     if (interaction.commandName === 'target') return await handleTarget(interaction);
     if (interaction.commandName === 'button') return await handleButton(interaction);
     if (interaction.commandName === 'feedback') return await handleFeedback(interaction);
@@ -14492,7 +14520,7 @@ async function ensureCharBlocksInner(client, guild, uid, thread, sheetBody = nul
   const gid = guild.id;
   const row = getCharPage(gid, uid);
   if (!row) return;
-  const bodies = { ...(sheetBody ? { sheet: sheetBody } : {}), inv: charInvBody(gid, uid), lore: charLoreBody(gid, uid), standing: charStandingBody(gid, uid), titles: charTitlesBody(gid, uid), rolls: charRollsBody(gid, uid), notice: CHAR_THREAD_NOTICE };
+  const bodies = { ...(sheetBody ? { sheet: sheetBody } : {}), inv: charInvBody(gid, uid), lore: charLoreBody(gid, uid), standing: charStandingBody(gid, uid), titles: charTitlesBody(gid, uid), assocs: charAssocsBody(gid, uid), rolls: charRollsBody(gid, uid), notice: CHAR_THREAD_NOTICE };
   let hashes = {};
   try { hashes = JSON.parse(row.block_hashes || '{}'); } catch {}
   // Order is a contract: Inventory · Lore · Standing · Dice · Notice.
@@ -14502,7 +14530,7 @@ async function ensureCharBlocksInner(client, guild, uid, thread, sheetBody = nul
   // bot's block messages are cleared and re-sent in sequence. Player
   // messages and the starter are never touched.
   {
-    const seq = ['inv', 'lore', 'standing', 'titles', 'rolls', 'notice']
+    const seq = ['inv', 'lore', 'standing', 'titles', 'assocs', 'rolls', 'notice']
       .map(k => row[`${k === 'inv' ? 'inv' : k}_msg_id`])
       .filter(Boolean);
     const ordered = seq.every((v, i, a) => i === 0 || BigInt(a[i - 1]) < BigInt(v));
@@ -14512,18 +14540,18 @@ async function ensureCharBlocksInner(client, guild, uid, thread, sheetBody = nul
         if (m?.author?.id === client.user.id) await m.delete().catch(() => {});
         await pace(150);
       }
-      row.inv_msg_id = row.lore_msg_id = row.standing_msg_id = row.titles_msg_id = row.rolls_msg_id = row.notice_msg_id = null;
+      row.inv_msg_id = row.lore_msg_id = row.standing_msg_id = row.titles_msg_id = row.assocs_msg_id = row.rolls_msg_id = row.notice_msg_id = null;
       hashes = {};
     }
   }
   const crypto = require('crypto');
   const h = (t) => crypto.createHash('sha1').update(t).digest('hex').slice(0, 12);
   let dirtyIds = false;
-  const ids = { sheet: row.message_id || thread.id, inv: row.inv_msg_id, lore: row.lore_msg_id, standing: row.standing_msg_id, titles: row.titles_msg_id, rolls: row.rolls_msg_id, notice: row.notice_msg_id };
+  const ids = { sheet: row.message_id || thread.id, inv: row.inv_msg_id, lore: row.lore_msg_id, standing: row.standing_msg_id, titles: row.titles_msg_id, assocs: row.assocs_msg_id, rolls: row.rolls_msg_id, notice: row.notice_msg_id };
   // T's order, enforced at creation: Sheet (starter) · Inventory · Lore · Standing · Dice.
   let edited = 0, failed = 0;
   // Titles sit with Standing — both are what a character has earned.
-  for (const key of ['sheet', 'inv', 'lore', 'standing', 'titles', 'rolls', 'notice']) {
+  for (const key of ['sheet', 'inv', 'lore', 'standing', 'titles', 'assocs', 'rolls', 'notice']) {
     if (!(key in bodies)) continue;
     const want = bodies[key], hw = h(want);
     // Unchanged blocks cost zero traffic — except the notice, which is
@@ -14554,8 +14582,8 @@ async function ensureCharBlocksInner(client, guild, uid, thread, sheetBody = nul
     }
     hashes[key] = hw;
   }
-  db.prepare('UPDATE char_pages SET inv_msg_id=?, lore_msg_id=?, standing_msg_id=?, titles_msg_id=?, rolls_msg_id=?, notice_msg_id=?, block_hashes=? WHERE guild_id=? AND user_id=?')
-    .run(ids.inv, ids.lore, ids.standing, ids.titles, ids.rolls, ids.notice, JSON.stringify(hashes), gid, uid);
+  db.prepare('UPDATE char_pages SET inv_msg_id=?, lore_msg_id=?, standing_msg_id=?, titles_msg_id=?, assocs_msg_id=?, rolls_msg_id=?, notice_msg_id=?, block_hashes=? WHERE guild_id=? AND user_id=?')
+    .run(ids.inv, ids.lore, ids.standing, ids.titles, ids.assocs, ids.rolls, ids.notice, JSON.stringify(hashes), gid, uid);
 
   // Duplicates left by an earlier race: the thread is locked to players, so
   // every bot message in it is a block. Anything not currently recorded —
@@ -15479,7 +15507,7 @@ async function buildFightEnd(guild, gid, cid, lines, hpState, roster, floor, win
   const W = fightWords(floor);
   const endLog = JSON.parse(getFight(gid, cid)?.log_state || '{}');
   archiveFight(gid, cid, endLog, roster, floor);
-  upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState) });
+  upsertFight(gid, cid, { state: 'idle', turn_order: '[]', effect_state: '{}', hp_state: JSON.stringify(hpState) });
   return { lines, ended: true, nextF: null, announce: {
     headline: `🏆 **${winF.name}${winF.isNpc ? ' 🎭' : ''}** ${W.win}!`,
     log: endLog, roster, hpState, floor,
@@ -15921,6 +15949,45 @@ async function handleTitles(interaction, group) {
   if (parted) refresh();
   return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] },
     content: parted ? `\u2705 ${label} has parted from **${name}**.` : `\u274C ${label} never stood with **${name}**.` });
+}
+
+// A GM writing to a player as the bot. The point is separation: when a GM
+// also plays a character, a DM from their own account blurs the two, and
+// the player is left guessing which one is talking (T, 2026-08-20). This
+// always says who it is — the Game Masters, or a named NPC — and never
+// pretends to be the player's friend.
+async function handleDd(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '\u274C Only GMs can write as the bot.', ephemeral: true });
+  const target = interaction.options.getUser('user');
+  const message = interaction.options.getString('message').trim();
+  const asNpc = (interaction.options.getString('as') || '').trim();
+  const quiet = !!interaction.options.getBoolean('quiet');
+  if (asNpc && !getNpc(gid, asNpc))
+    return interaction.reply({ ephemeral: true, content: `\u274C No NPC called **${asNpc}**.` });
+
+  const npc = asNpc ? getNpc(gid, asNpc) : null;
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'a GM');
+  const head = npc
+    ? `\u{1F3AD} **${npc.name}** \u2014 _from ${interaction.guild.name}_`
+    : `\u{1F4DC} **The Game Masters of ${interaction.guild.name}**`;
+  // Who sent it is on the message unless the GM asks otherwise; even then
+  // the audit book keeps it, because an unattributable channel to players
+  // is a bad thing to build.
+  const foot = quiet
+    ? '_Sent through DDice. Reply in the game\'s channels \u2014 this message cannot be answered here._'
+    : `_Sent through DDice by **${gmName}**. Reply in the game\'s channels \u2014 this message cannot be answered here._`;
+
+  const sentDm = await target.send({ content: [head, '', message.slice(0, 1700), '', foot].join('\n') })
+    .then(() => true).catch(() => false);
+
+  sendRollAudit(interaction.client, gid,
+    `\u{1F4EC} DD \u2014 **${gmName}** \u2192 <@${target.id}>${npc ? ` as **${npc.name}**` : ''}: ${message.slice(0, 120)}${message.length > 120 ? '\u2026' : ''}`);
+
+  return interaction.reply({ ephemeral: true, content: sentDm
+    ? `\u2705 Sent to <@${target.id}>${npc ? ` as **${npc.name}**` : ''}.`
+    : `\u274C <@${target.id}> has DMs closed \u2014 nothing was delivered.` });
 }
 
 async function handleTarget(interaction) {
@@ -17425,6 +17492,11 @@ async function handleFight(interaction, forced) {
 
     upsertFight(gid, cid, {
       state: 'active',
+      // A new fight starts clean. This path (practice bouts and duels) was
+      // the one that did not, so a fumble sanction from an earlier brawl in
+      // the same channel landed on someone's first defence here — Fenrir,
+      // who had not swung yet (T's screenshot, 2026-08-20).
+      effect_state: '{}', grapples: '{}',
       turn_order: JSON.stringify(turnOrder),
       turn_index: 0,
       phase: 'attack',
@@ -17528,7 +17600,7 @@ async function handleFight(interaction, forced) {
       }
       const kickLog = JSON.parse(fight.log_state || '{}');
       archiveFight(gid, cid, kickLog, turnOrder, kickFloor);
-      upsertFight(gid, cid, { state: 'idle', turn_order: '[]', hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState) });
+      upsertFight(gid, cid, { state: 'idle', turn_order: '[]', effect_state: '{}', hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState) });
       await interaction.reply({ content: lines.join('\n') });
       await announceFightEnd(interaction.guild, gid, cid, chan, {
         headline, log: kickLog, roster: turnOrder, hpState: fightHp(fight), floor: kickFloor,
@@ -18358,7 +18430,7 @@ async function handleFight(interaction, forced) {
       }
       const ffLog = JSON.parse(fight.log_state || '{}');
       archiveFight(gid, cid, ffLog, turnOrder, ffFloor);
-      upsertFight(gid, cid, { state: 'idle', turn_order: '[]' });
+      upsertFight(gid, cid, { state: 'idle', turn_order: '[]', effect_state: '{}' });
       ffAnnounce = { headline, log: ffLog, roster: turnOrder, hpState, floor: ffFloor };
     } else {
       let newIndex = fight.turn_index % newOrder.length;
@@ -18479,7 +18551,7 @@ async function handleFight(interaction, forced) {
       const endRoster = JSON.parse(endRow?.turn_order || '[]');
       const endHp = JSON.parse(endRow?.hp_state || '{}');
       archiveFight(gid, cid2, endLog, endRoster, endFloor);
-      upsertFight(gid, cid2, { state: 'idle', turn_order: '[]' });
+      upsertFight(gid, cid2, { state: 'idle', turn_order: '[]', effect_state: '{}' });
       try { db.prepare('UPDATE dc_cards SET bind_channel=NULL, bind_uid=NULL, bind_skip=0 WHERE guild_id=? AND bind_channel=?').run(gid, cid2); } catch {}
       // The throwaway cast leaves with the fight. Anyone still standing in
       // another brawl is spared — sweepTempNpcs checks before it deletes.
@@ -19432,7 +19504,7 @@ const HELP_CATEGORIES = {
     title: '📜 Character Sheet',
     blurb: 'sheets, approval, lore, profiles, weapons',
     body: [
-      '🏷️ Your character has their own thread in the character forum: **Sheet → Inventory → Lore → Standing → Titles → Dice**, all kept current by the bot (dice hourly). Tags (order · class · ⚰ Fallen · 🌟 Hero) filter the roster. GM sheets live in their own GM-only forum. Threads are staff-typed — to adjust your lore, ask a Moderator or Expeditioner (the thread says so).',
+      '🏷️ Your character has their own thread in the character forum: **Sheet → Inventory → Lore → Standing → Titles → Associations → Dice**, all kept current by the bot (dice hourly). Tags (order · class · ⚰ Fallen · 🌟 Hero) filter the roster. GM sheets live in their own GM-only forum. Threads are staff-typed — to adjust your lore, ask a Moderator or Expeditioner (the thread says so).',
       '_Your sheet is the one source of truth — stats, class, order and weapons — and fights, activities and heals all read from it._',
       '`/char create` — set up a full character at once (stats, order, class, weapons, weapon emojis)',
       '`/char set field:STR value:14` — set one field at a time (with approvals on, any change to your own sheet goes back to the GMs)',
@@ -21054,7 +21126,7 @@ async function sweepQuestChannels(client, gid, quest) {
   if (quest.run_thread_id) {
     try {
       const f = getFight(gid, quest.run_thread_id);
-      if (f && f.state !== 'idle') upsertFight(gid, quest.run_thread_id, { state: 'idle', turn_order: '[]' });
+      if (f && f.state !== 'idle') upsertFight(gid, quest.run_thread_id, { state: 'idle', turn_order: '[]', effect_state: '{}' });
     } catch { /* no fight, or none to stand down */ }
     try {
       const th = await client.channels.fetch(quest.run_thread_id);
@@ -21665,7 +21737,7 @@ async function rebuildCharPages(interaction) {
     if (refused) lines.push(`\u26A0\uFE0F <@${r.user_id}> \u2014 ${refused} message(s) would not delete`);
     // Forget the ids so the mender posts a clean set in order.
     db.prepare(`UPDATE char_pages SET inv_msg_id=NULL, lore_msg_id=NULL, standing_msg_id=NULL,
-                titles_msg_id=NULL, rolls_msg_id=NULL, notice_msg_id=NULL, block_hashes='{}'
+                titles_msg_id=NULL, assocs_msg_id=NULL, rolls_msg_id=NULL, notice_msg_id=NULL, block_hashes='{}'
                 WHERE guild_id=? AND user_id=?`).run(gid, r.user_id);
     await ensureCharPage(interaction.client, interaction.guild, r.user_id, null, 'all').catch(() => null);
     rebuilt++;

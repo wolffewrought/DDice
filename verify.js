@@ -1008,8 +1008,16 @@ function testBuilders(src) {
                      'help', 'library', 'npc', 'quest', 'quiz', 'roll', 'spell', 'standing']) {
       ok(`/${n} is registered`, !!by[n]);
     }
-    ok('twenty commands registered \\u2014 /target joined 2026-08-16',
-      cmds.length === 20 && cmds.some(c => c.name === 'button') && cmds.some(c => c.name === 'target'));
+    ok('twenty-one commands registered \\u2014 /dd joined 2026-08-20',
+      cmds.length === 21 && cmds.some(c => c.name === 'target') && cmds.some(c => c.name === 'dd'));
+    // A GM writing as the bot: always says who it is, and the audit book
+    // keeps the attribution even when the message does not.
+    ok('/dd names its sender, or the audit does',
+      /async function handleDd\(interaction\)/.test(src) &&
+      /Sent through DDice by \*\*\$\{gmName\}\*\*/.test(src) &&
+      /sendRollAudit\(interaction\.client, gid,\s*\n\s*`\\u\{1F4EC\} DD/.test(src));
+    ok('/dd is GM-only and refuses an unknown NPC voice',
+      /Only GMs can write as the bot/.test(src) && /No NPC called \*\*\$\{asNpc\}\*\*/.test(src));
     // Temporary targets: no sheet, no roster, no HP — the GM's verdict is
     // the death check, asked in-channel or in the GM channel with `secret`.
     // Schema ordering: an ALTER above its own CREATE fails into its catch
@@ -1261,7 +1269,7 @@ function testBuilders(src) {
       /approvalDestination\(gidL, 'loredoc'\)/.test(src) &&
       /ensureApprovalThreads\(interaction\.client, gidL\)/.test(src));
     ok('/char show speaks with the forum renderers, never a second voice',
-      /const blocks = \[charInvBody\(gid, tid\), charLoreBody\(gid, tid\), charStandingBody\(gid, tid\), charTitlesBody\(gid, tid\), charRollsBody\(gid, tid\)\];/.test(src) &&
+      /const blocks = \[charInvBody\(gid, tid\), charLoreBody\(gid, tid\), charStandingBody\(gid, tid\), charTitlesBody\(gid, tid\), charAssocsBody\(gid, tid\), charRollsBody\(gid, tid\)\];/.test(src) &&
       /Their page: <#\$\{pg\.thread_id\}>/.test(src));
     ok('the char tag canon is 8 orders + 3 classes + Fallen',
       /CHAR_TAG_ORDERS = \['White Knight','Black Knight','Gold Knight','Grey Knight','Blue Knight','Purple Knight','Green Knight','Red Knight'\]/.test(src) &&
@@ -1323,11 +1331,11 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /m\?\.author\?\.id === client\.user\.id/.test(src));
     ok('the lore-doc buttons live in the button lane',
       /async function routeButton\(interaction\) \{[\s\S]*?startsWith\('loredoc:'\)[\s\S]*?startsWith\('loredocok:'\)[\s\S]*?\n    return;\n\}/.test(src));
-    ok('the thread carries seven bot blocks — six living, one notice — in T\'s order',
-      /charStandingBody\(gid, uid\)/.test(src) && /charTitlesBody\(gid, uid\)/.test(src) &&
-      /for \(const key of \['sheet', 'inv', 'lore', 'standing', 'titles', 'rolls', 'notice'\]\)/.test(src) &&
-      /contact a Moderator or Expeditioner\. Thank you!/.test(src) &&
-      /ALTER TABLE char_pages ADD COLUMN titles_msg_id/.test(src));
+    ok('the thread carries eight bot blocks — Titles and Associations apart',
+      /charTitlesBody\(gid, uid\)/.test(src) && /charAssocsBody\(gid, uid\)/.test(src) &&
+      /for \(const key of \['sheet', 'inv', 'lore', 'standing', 'titles', 'assocs', 'rolls', 'notice'\]\)/.test(src) &&
+      /ALTER TABLE char_pages ADD COLUMN assocs_msg_id/.test(src) &&
+      /contact a Moderator or Expeditioner\. Thank you!/.test(src));
     // Titles and associations read the same on a player's page, an NPC's
     // page and /char show, because one renderer serves all three.
     ok('titles and associations are one renderer for players and NPCs',
@@ -1406,6 +1414,31 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     // The autorest clock advances IN the fired branch, before the announce.
     // Losing this line is a 10-minute announcement storm once any schedule
     // falls due — it already happened live.
+    // Carried effects belong to their fight. Every start path must clear
+    // them and every end path must drop them, or a sanction from one brawl
+    // lands on an innocent in the next (live, 2026-08-20).
+    ok('every fight start clears the carried effects',
+      (() => {
+        // Count the declarations themselves: every `state: 'active'` must
+        // have an effect_state reset within the same upsert object.
+        const starts = [...src.matchAll(/state: 'active'/g)];
+        return starts.length >= 3 && starts.every(m => {
+          const win = src.slice(m.index, m.index + 700);
+          const end = win.indexOf('});');
+          return /effect_state: '\{\}'/.test(end > 0 ? win.slice(0, end) : win);
+        });
+      })());
+    ok('every fight end drops them too \u2014 all five paths',
+      (() => {
+        // Count the transitions themselves; a fifth path (the quest-thread
+        // stand-down) was missed by counting matches instead.
+        const ends = [...src.matchAll(/state: 'idle'/g)];
+        return ends.length >= 5 && ends.every(m => {
+          const win = src.slice(m.index, m.index + 300);
+          const cut = win.indexOf('});');
+          return /effect_state: '\{\}'/.test(cut > 0 ? win.slice(0, cut) : win);
+        });
+      })());
     ok('a fired rest advances its own clock first',
       /const result = await runAutoRest\(guild, sc\);[\s\S]{0,420}?upsertSchedule\(guild\.id, sc\.name, \{ last_run: Date\.now\(\) \}\);[\s\S]{0,80}?await announceAutoRest/.test(src));
     ok('the dice block walks the full ladder with averages and extremes',

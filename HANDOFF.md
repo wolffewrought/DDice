@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 923 assertions passed and no scanner found an ERROR.
+Green means 932 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 923 assertions covering structure, registration and ruleset
+now is 932 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -325,6 +325,69 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 8t · Audit: the fifth idle path (2026-08-20)
+
+Sweeping the fight-effect fix rather than trusting it found a FIFTH
+transition to idle — the quest-thread stand-down, which stands a fight
+down when its run ends. It still left the carries behind, so the leak
+survived in one lane after being fixed in four. Closed, and the pin now
+counts every `state: 'idle'` declaration and demands an effect_state reset
+inside the same upsert, so a sixth path cannot be added without one.
+
+That is twice in one day a pin written by counting MATCHES rather than
+DECLARATIONS would have passed a broken file. Worth remembering as a
+habit: pin the property over every site, never over the sites you happen
+to have found.
+
+Everything else cross-checked clean: the Associations block is plumbed
+through bodies/ids/order/seq/update//char show, rebuildCharPages routes,
+the mend lock wraps the inner function, the stray sweep runs after the
+ids are written, titles purge with their subject, /dd routes and
+autocompletes. Warnings 19, all documented — nine are the fall-through
+class from the folds, which the scanner cannot see through by design.
+
+## 8s · Carried effects leaked between fights (2026-08-20, live)
+
+T's screenshot: a practice bout began at 01:14, Fenrir had not attacked,
+and at 01:17 his first defence rolled a FLAT d20 'fumbled last attack'.
+The sanction was real — from an earlier brawl in the same channel.
+
+Cause: effect_state lives on the fight ROW, which is reused per channel.
+Two of the three start paths reset it; the third (practice bouts and
+duels) did not, and NO end path cleared it at all — so carries survived
+both the end of one fight and the start of the next. The books have
+promised 'leaving a fight clears any pending effects' since the carries
+were written; the code never did it.
+
+Fixed at both ends: all four idle-transitions now write effect_state
+'{}', and the third start path clears effect_state AND grapples like its
+siblings. Pinned by counting declarations rather than blocks — the first
+attempt matched only two of three start sites and would have passed a
+broken file.
+
+## 8r · /dd — a GM writing as the bot (2026-08-20)
+
+T's reason, and a good one: when a GM also plays a character, a DM from
+their personal account blurs the two and the player has to guess which is
+speaking. `/dd user: message: [as:] [quiet:]` sends it through the bot
+instead, headed either 'The Game Masters of <server>' or a named NPC
+(`as:` autocompletes the roster). The footer names the GM who sent it
+unless quiet:true, and the roll-audit book records sender, recipient,
+voice and text EITHER WAY — an unattributable channel to players is a bad
+thing to build, so quiet hides it from the player, never from the record.
+Closed DMs are reported to the GM rather than swallowed. Commands 20->21.
+
+## 8q · Titles and Associations split apart (2026-08-20)
+
+T: they are meant to be separate. Two renderers now (`titlesOnly`,
+`assocsOnly`) feeding two blocks — Titles and Associations — with
+assocs_msg_id joining char_pages and the order becoming Sheet, Inventory,
+Lore, Standing, Titles, Associations, Dice, Notice (eight blocks).
+`titlesLine` survives for the NPC SHEET, which is a single message and
+shows both together — splitting there would mean two messages per NPC for
+no gain. /char show renders both, in order. Existing threads gain the new
+block on the next mend; the order contract reshuffles them.
 
 ## 8p · /gm check pages — the blunt instrument (2026-08-20)
 
