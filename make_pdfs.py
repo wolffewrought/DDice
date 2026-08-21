@@ -686,7 +686,7 @@ CONTENT = [
 
 ('aud','all'),
 ('sec', 'Fight System'),
-('p', 'Structured fights with initiative, turn order, stat-based rolls and damage tracking.'),
+('p', 'Proper fights: everyone rolls to see who goes first, then takes turns. The bot keeps score.'),
 ('h2', 'Commands'),
 ('code', [('/fight start players:@a @b npcs:Goblin, Orc', 'any number of each', 'player'),
           ('/fight start ... manual:true', 'skip roll, keep listed order', 'player'),
@@ -1190,7 +1190,7 @@ CONTENT = [
 ('h2', 'Hit Points'),
 ('p', 'At first level, the class hit die plus the CON modifier. Every level after adds half the die (rounded up) plus the CON modifier again. A d10 class with CON 16 has 13 at first level and 22 at second.'),
 ('h2', 'Attacks and Armour Class'),
-('p', 'An attack is a d20 plus the ability modifier plus proficiency, rolled against the target\u2019s <b>Armour Class</b> \u2014 a number, not another roll. Meeting the AC exactly is a hit. A natural 20 always hits and is a critical; a natural 1 always misses, whatever the total.'),
+('p', 'To attack, roll a d20 and add your modifier and your proficiency. You are trying to reach the target\u2019s <b>Armour Class</b> \u2014 that is just a number, so nobody rolls to defend. Meeting the AC exactly is a hit. A natural 20 always hits and is a critical; a natural 1 always misses, whatever the total.'),
 ('p', 'Damage is the weapon\u2019s dice plus the ability modifier. A critical rolls the <b>dice</b> twice and leaves the modifier alone \u2014 so a 1d8+3 hit that crits is 2d8+3, never 2d8+6.'),
 ('h2', 'Levels, Hit Dice and Rest'),
 ('p', 'A level is not just a bigger number. <b>/dnd levelup</b> raises it and everything follows: the hit points arrive full, another hit die is added, and the proficiency bonus rises when it is due. A GM can level someone else with <b>user:</b>, or jump straight to a level with <b>to:</b>.'),
@@ -1237,7 +1237,7 @@ CONTENT = [
 ('code', [('/roll save:con', 'a Constitution save'),
           ('/roll skill:perception', 'a Wisdom (Perception) check'),
           ('/roll skill:athletics mode:Advantage', 'with advantage')]),
-('p', 'Initiative adds the DEX <b>modifier</b> on a 5e server, where Knightfall adds the score \u2014 the same command, the right arithmetic for the rules in force.'),
+('p', 'Going first: on a 5e server you add your DEX <b>modifier</b>; on Knightfall you add the whole DEX score \u2014 the same command, the right arithmetic for the rules in force.'),
 ('h2', 'Weapons'),
 ('p', 'Set what a weapon rolls with <b>/dnd weapondice slot:1 dice:1d12</b>, and an attack uses it for damage instead of the default 1d8. Clear it and it falls back.'),
 ('h2', 'Conditions, and Being Hard to Kill'),
@@ -1261,7 +1261,7 @@ CONTENT = [
 ('p', 'Clerics, Druids, Wizards and Paladins prepare spells: the ability modifier plus their level, or half their level for a Paladin. <b>/spell prepare add:</b> readies one, <b>drop:</b> lets one go and <b>clear:true</b> starts again \u2014 the list is capped at what you may hold, and it tells you when it is full. A long rest returns every slot.'),
 ('note', 'Concentration is tracked. Casting a second concentration spell lets the first go, and when a blow lands on a caster the card asks for the save: <b>CON, DC 10 or half the damage taken, whichever is harder</b>.'),
 ('h2', 'Saves and Skills'),
-('p', 'A saving throw is a d20 plus the ability modifier, plus proficiency if the class is trained in that save. A skill check is the same, against a DC the GM sets. All eighteen SRD skills are known, each tied to its ability: Athletics to STR; Acrobatics, Sleight of Hand and Stealth to DEX; Arcana, History, Investigation, Nature and Religion to INT; Animal Handling, Insight, Medicine, Perception and Survival to WIS; Deception, Intimidation, Performance and Persuasion to CHA.'),
+('p', 'A saving throw means rolling a d20 and adding your modifier. If your class is good at that kind of save, you add your proficiency too. A skill check is the same, against a DC the GM sets. All eighteen SRD skills are known, each tied to its ability: Athletics to STR; Acrobatics, Sleight of Hand and Stealth to DEX; Arcana, History, Investigation, Nature and Religion to INT; Animal Handling, Insight, Medicine, Perception and Survival to WIS; Deception, Intimidation, Performance and Persuasion to CHA.'),
 ('note', 'What is live today: the rules above are implemented, and a 5e server uses 5e abilities and hit points. Combat still resolves the Knightfall way until the fight engine is wired to attack-versus-AC \u2014 that work, a 5e character sheet, classes and levels, and spellcasting are each still to come.'),
 ('sec', 'NPC Records'),
 ('p', 'An NPC keeps the same records a player does. <b>/npc sheet</b> shows the lot on one page \u2014 stats and '
@@ -1711,6 +1711,85 @@ OUT = _os.path.join(_os.environ.get('DDICE_PDF_OUT', '/mnt/user-data/outputs'), 
 # (quests, NPCs, scrolls, activities, quizzes) bound in with the rules that
 # server actually plays by. Knightfall keeps the names it has always had; the
 # 5e set is prefaced so both can sit in one folder.
+
+# ── The Examples book ──────────────────────────────────────────────────
+# Every other book explains what a command IS. This one shows what happens
+# when you use it: what you type on one side, what the bot does on the
+# other, in the plainest words we can manage (T, 2026-08-20).
+EXAMPLES = [
+('sec', 'How to read this book'),
+('p', 'Each example shows two things: what you type, and what happens next. '
+      'You can copy the line exactly, then change the names to your own.'),
+('note', 'Words like <b>@Skol</b> mean "pick a person from the list Discord shows you". '
+        'Words like <b>name:</b> are labels \u2014 type the label, then your answer.'),
+
+('sec', 'Rolling dice'),
+('code', [('1d20', 'Rolls one twenty-sided die. The bot shows the number.'),
+          ('2d6+3', 'Rolls two six-sided dice, adds 3, shows the total.'),
+          ('r1d20+5 attack', 'Same roll with a name on it, so everyone knows what it was for.')]),
+('p', 'A <b>natural 20</b> is when the die itself shows 20, before you add anything. '
+      'A <b>natural 1</b> is when it shows 1. Both matter in fights.'),
+
+('sec', 'Making a character'),
+('code', [('/char create', 'The bot asks you questions and builds your sheet.'),
+          ('/char show', 'Shows your sheet: your stats, your things, your dice history.'),
+          ('/char show user:@Skol', 'Shows somebody else\u2019s sheet.')]),
+('p', 'Your sheet also lives in its own thread in the character forum. '
+      'It updates itself \u2014 you never have to edit it.'),
+
+('sec', 'Fighting'),
+('code', [('/fight start', 'Everyone rolls to see who goes first.'),
+          ('/fight atk stat:str target:@Skol', 'You swing at Skol using your strength.'),
+          ('/fight def stat:dex', 'You try to dodge, using how quick you are.'),
+          ('/fight resolve', 'The bot compares the two rolls and says what happened.')]),
+('p', 'If your attack roll shows a natural 1, the attack fails and your next defence is weaker \u2014 '
+      'you roll the die on its own, with no stat added. If your defence roll shows a natural 20, '
+      'you turn the blow aside AND your next attack gets +2.'),
+
+('sec', 'Quests'),
+('code', [('/quest create', 'Write a new quest.'),
+          ('/quest post number:1', 'Put it on the board so players can ask to join.'),
+          ('/quest party approve number:1 user:@Skol', 'Let Skol in.'),
+          ('/quest start number:1', 'Begin a run with everyone who was let in.'),
+          ('/quest run complete number:1 summary:\u2026', 'Finish it, pay merits, and tell the story.')]),
+
+('sec', 'Being an NPC'),
+('code', [('/npc create name:Garrick str:3 con:2 dex:2 wis:1 lck:2', 'Make a person for the world.'),
+          ('/npc say name:Garrick message:Hello there', 'Garrick speaks, in his own name and face.'),
+          ('/library summon name:Goblin count:3 temp:true', 'Three goblins appear for this fight only.')]),
+
+('sec', 'Buttons and targets'),
+('code', [('/button roll stat:dex dc:12 reason:The ledge is slippery',
+           'Puts a button in the channel. Anyone can press it to try climbing.'),
+          ('/button roll dice:2d6+1 for:@Skol once:true',
+           'Only Skol can press it, and only once.'),
+          ('/target create name:Barricade stat:str dc:12',
+           'Something to hit. Each hit asks the GM whether it falls.')]),
+
+('sec', 'Titles and groups'),
+('code', [('/standing title grant user:@Skol title:Siren\u2019s Bane source:Sirens Redoubt',
+           'Skol earns a title. It shows on their page.'),
+          ('/standing association add user:@Skol group:The Falconers note:Quartermaster',
+           'Skol now stands with the Falconers.')]),
+
+('sec', 'Telling the GMs something'),
+('code', [('/feedback send', 'Pick a room, score it out of ten, say your piece. Only GMs see it.'),
+          ('(the button on your page)', 'Ask a GM to update your lore document.')]),
+]
+
+# The examples book is its own edition: no audience filtering, one system-
+# free set of worked examples that suits either ruleset.
+def build_examples(outfile):
+    global CONTENT
+    keep = CONTENT
+    try:
+        CONTENT = EXAMPLES
+        build('full', outfile, 'Worked Examples \u00b7 What to type, and what happens')
+    finally:
+        CONTENT = keep
+
+build_examples(OUT + 'DDice-Examples.pdf')
+
 for _sys, _prefix, _name in [('knightfall', '', 'Knightfall'), ('dnd5e', 'DnD5e-', 'D&D 5e (SRD)')]:
     build('full',   OUT + _prefix + 'DDice-Commands-Parchment.pdf',
           f'A Chronicle of Commands \u00b7 {_name}', _sys)

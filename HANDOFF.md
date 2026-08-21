@@ -326,6 +326,24 @@ place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
 
+## 8u · Plain language and the Examples book (2026-08-20)
+
+Measured the books rather than guessing: Flesch reading ease across every
+prose block, median 71.6 (plain English) but a tail at 40-58 — the 5e
+rules paragraphs, which packed three ideas into one sentence. Rewrote the
+four hardest into short sentences with one idea each (saving throws,
+attacks, initiative, what a fight is). Median now 71.9 and the tail is
+52+. The remaining hard blocks are 5e TERMINOLOGY, where the jargon is the
+subject and simplifying it further would make it wrong.
+
+New seventh book: **DDice-Examples.pdf** — a worked 'what you type / what
+happens' pair for every part of the bot, written for a child: dice,
+characters, fighting (including nat 1 and nat 20 in plain words), quests,
+NPCs, buttons and targets, titles and groups, feedback. It reuses the
+existing build() by swapping CONTENT, so it inherits the covers, contents
+page and furniture for free; system-free, so one copy suits both
+rulesets. Median reading ease in the low 80s.
+
 ## 8t · Audit: the fifth idle path (2026-08-20)
 
 Sweeping the fight-effect fix rather than trusting it found a FIFTH
