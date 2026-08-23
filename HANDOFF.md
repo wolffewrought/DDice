@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 932 assertions passed and no scanner found an ERROR.
+Green means 950 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 932 assertions covering structure, registration and ruleset
+now is 950 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -325,6 +325,132 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 9a · Two examples books, published to their own channels (2026-08-21)
+
+The Examples book split in two by AUDIENCE, using the existing ('aud', ...)
+marker rather than a new mechanism: DDice-Examples-Player.pdf keeps dice,
+characters, fighting, quests and feedback (7 pages); DDice-Examples-
+GameMaster.pdf adds NPCs, buttons and targets, group checks, recaps and
+titles (12 pages). Verified by reading the built PDFs back — '/npc say'
+and '/button group' appear only in the GM one.
+
+Both joined DOC_FILES, and docFilesFor now exempts anything starting
+'DDice-Examples-' from the DnD5e/Knightfall prefix filter, since the pair
+is system-free. publishDocs already split GM channel from player channel;
+the player side now sends TWO files (commands + examples) instead of one.
+Pinned all three facts.
+
+NOTE for T: the books are fetched from GitHub by publishDocs, so both new
+PDFs must be committed to the repo alongside index.js or the player
+channel post will fail to find them.
+
+## 8z · Rests land on the hour (2026-08-21)
+
+T: the auto-rest should go off the nearest hour, not the minute the
+schedule happened to be created. `floorHour(ms)` now floors BOTH sides of
+every comparison and every write — the due check, the seeding write, the
+advance after a rest fires, `resume`, and the 'next due' display, which
+would otherwise promise a time the bot no longer keeps. A 12-hour rest set
+at 14:37 now falls due at 02:00, and 14:00 thereafter.
+
+Granularity worth knowing: the tick runs every 5 minutes, so a rest lands
+between :00 and :04 rather than on the stroke. The rest-storm pin was
+UPDATED to the aligned form rather than deleted, so it still guards the
+clock-advance whose absence caused the 10-minute announcement spam.
+
+## 8y · Audit after the clarity batch (2026-08-21)
+
+946 assertions, 13 probes, warnings 19 — all previously documented.
+Cross-checked the batch rather than trusting it: fighterStateLine guards a
+missing fight, handles NPC fighters, parses effect_state defensively and
+bounds its output; making announceNextTurn async propagated correctly —
+both call sites await, including through the handOver arrow; the group
+tally and the recap both cap their length and their item counts; three
+database reads per turn announcement, which is nothing.
+
+NEW PERMANENT RULE, born from my own near-miss: the habits scanner now
+walks the AST for plain strings containing ${...} — a template literal
+written with the wrong quotes, which prints the braces verbatim. I nearly
+shipped exactly that in the disarm headline yesterday and caught it by
+eye. The file is clean of them today (0 across 1.4MB), and none can be
+added silently now. This is the second scanner rule this month written
+from a mistake rather than a theory, which is the right way round.
+
+### 8x addendum · every ability names both sides (2026-08-21)
+
+Deception already read '**Deception** — A vs B'; the rest were bare nouns
+('Disarming Attempt', 'Shield Deflection', 'Feint Resolved', 'Escape
+Attempt') that made a busy channel unreadable. All four now name the doer
+and the done-to, in Deception's shape: **Disarm** — A vs B, **Deflect** —
+A shields against B, **Feint** — A vs B, **Escape** — A against B's hold.
+Pinned positively (each new form present) AND negatively (no bare-noun
+headline survives), so a future card cannot quietly regress to one.
+
+## 8x · Fight state, said out loud (2026-08-21)
+
+T: a grapple persists until released, escaped, or someone falls — so the
+table should not have to remember it for five rounds. New
+`fighterStateLine(guild, gid, cid, fid)` renders everything currently true
+about a fighter and rides the TURN ANNOUNCEMENT, where people are already
+looking: held by whom (with the consequences), holding whom (with the
+release/no-strike rule), a pending flat-d20 defence, a banked +2 riposte,
+a GM adjustment or forced stat, a feint they fell for, and any adv/dis/
+flat mark on their sheet. Indented under the turn line so it reads as
+context rather than noise.
+
+Also: the end-of-turn strain now names the holder every round ('X is still
+held by Y — 1 strain') instead of an anonymous 'the hold takes its toll',
+and the disarm card titles itself with both sides ('Disarm — A vs B').
+Note the near-miss: the disarm headline was inside SINGLE quotes, so the
+names would have printed as literal ${actorName}; converted to a template
+literal and eyeballed before pinning.
+
+## 8w · [undefined, undefined] and a 14 that failed a DC 10 (2026-08-21)
+
+T's screenshot: a WIS check vs DC 10 printed '1d20+5 (disadvantage) ->
+[undefined, undefined] +5 = 14' and then 'Failed.'
+
+Investigated by EXTRACTING the real functions (parseNotation, rollDie,
+rollNotation, rollAdvantage/Disadvantage, buildRollLine, rollDcCheck) into
+a scratch file and running them — the current path is correct in all three
+modes and judges 14 vs 10 as a pass, so that card came from a build older
+than the workspace. Rather than leave it at that, both symptoms are now
+impossible by construction:
+
+1. buildRollLine falls back to result.rolls when `chosen`/`dropped` are
+absent, so a caller pairing an adv/dis MODE with a plain roll prints the
+faces it actually rolled instead of a hole. Verified against exactly that
+mismatched call.
+2. rollDcCheck treats a non-finite DC as NO DC (passed = null) rather than
+comparing against NaN, which is the only way a 14 can lose to a 10; and
+`nat` falls back to rolls[0] so an absent `chosen` cannot silently skip
+the crit rules.
+
+Both pinned. Worth keeping the extraction trick: pulling functions out and
+running them answered in two minutes what three rounds of reading could
+not.
+
+## 8v · Group checks and session recaps (2026-08-20)
+
+Two RP tools T picked from six suggestions, both free of any external
+service.
+
+**`/button group stat:|dice: dc: reason:`** — one check the whole party
+rolls. Everyone presses once (group_check_rolls enforces it), the message
+itself is the scoreboard and re-renders on every press, and a GM-only
+'Call it' closes the scene with a verdict counting passes against the DC
+('4 of 6 made it. Most of the party is through.'). Nat 20s and 1s are
+marked. Rides the shared rollDcCheck, so it cannot drift from /gm dc, and
+presses log into the quest timeline like every other roll.
+
+**`/quest run recap number: [post:]`** — drafts a 'previously on…' from
+quest_events: the party by name, up to twelve roleplay/combat/note beats,
+then how the rolls fell. DRAFTS, deliberately: it replies privately for
+the GM to edit, and only reaches the party with post:true. It can only
+know what was written down, which is itself an argument for logging.
+
+Both documented in the GM books and in the Examples book.
 
 ## 8u · Plain language and the Examples book (2026-08-20)
 

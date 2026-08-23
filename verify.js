@@ -150,7 +150,20 @@ function scanHabits(src, ast) {
   const dupes = Object.entries(strings).filter(([, n]) => n >= 3);
   for (const [s0, n] of dupes.slice(0, 3)) warn('triplicated-copy', 1, `said ${n} times: "${s0.slice(0, 46)}\u2026"`);
 
-  out.summary = `${swallow.length} silent writes \u00b7 ${dupes.length} triplicated strings`;
+  // 5 · A plain string containing ${...} is a template literal someone
+  // wrote with the wrong quotes: it prints the placeholder verbatim. I
+  // nearly shipped one in the disarm headline (2026-08-21), so the check
+  // is permanent rather than a habit of mine.
+  let holes = 0;
+  walk(ast, (node) => {
+    if (node.type !== 'Literal' || typeof node.value !== 'string') return;
+    if (!/\$\{[A-Za-z_$][\w.$]*\}/.test(node.value)) return;
+    holes++;
+    err('placeholder-in-plain-string', lineOf(node),
+      `"${node.value.slice(0, 46)}" holds \u0024{...} but is not a template literal \u2014 it will print the braces`);
+  });
+
+  out.summary = `${swallow.length} silent writes \u00b7 ${dupes.length} triplicated strings${holes ? ` \u00b7 ${holes} placeholder holes` : ''}`;
   return out;
 }
 function lineAt(src, i) { return src.slice(0, i).split('\n').length; }
@@ -1387,6 +1400,51 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('an unconfigured guild is left alone on boot',
       /const configured = \['char_forum', 'npc_forum', 'quest_board', 'approval_routes', 'quest_log_channel'\]/.test(src) &&
       /if \(!configured\) continue;/.test(src));
+    // Group checks: one button, one roll each, the message IS the
+    // scoreboard, and only a GM calls it.
+    // A roll line must never print a hole, and a DC that never parsed must
+    // never be judged against (both seen live, 2026-08-21).
+    ok('an adv/dis line falls back to the faces actually rolled',
+      /const kept = result\.chosen \?\? \(Array\.isArray\(result\.rolls\)/.test(src) &&
+      !/\[\$\{result\.chosen\}, ~~\$\{result\.dropped\}~~\]/.test(src));
+    ok('an unparsed DC is treated as no DC, not as a failure',
+      /const dcNum = Number\.isFinite\(dc\) \? dc : null;/.test(src) &&
+      /dcNum === null \? null : total >= dcNum/.test(src));
+    // Holds and marks are stated where people are looking, every turn, so a
+    // five-round grapple is never something the table must remember.
+    // Every ability card names who did it and to whom, so a scene reads
+    // without anyone scrolling back (T, 2026-08-21).
+    ok('each ability card names both sides',
+      /\*\*Disarm\*\* \\u2014 \$\{actorName\} vs \$\{attackerName\}/.test(src) &&
+      /\*\*Deflect\*\* \\u2014 \$\{actorName\} shields against \$\{attackerName\}/.test(src) &&
+      /\*\*Feint\*\* \\u2014 \$\{atkName\} vs \$\{defName\}/.test(src) &&
+      /\*\*Escape\*\* \\u2014 \$\{actorName\} against \$\{holderName\}/.test(src) &&
+      /\*\*Deception\*\*/.test(src));
+    ok('no ability headline is a bare noun any more',
+      !/\*\*(Disarming Attempt|Shield Deflection|Feint Resolved|Escape Attempt)\*\*/.test(src));
+    ok('a turn announcement carries the fighter\'s state',
+      /async function fighterStateLine\(guild, gid, cid, fid\)/.test(src) &&
+      /held by \$\{await nameOf\(gmap\[fid\]\)\}/.test(src) &&
+      /holding \$\{await nameOf\(c\)\}/.test(src) &&
+      /\$\{turnPing\(gid, nextF\)\}\$\{state\}/.test(src));
+    ok('the state line names every carried mark',
+      /next defence is a flat d20/.test(src) && /to hit\*\* on the next attack/.test(src) &&
+      /taken in by a feint/.test(src));
+    ok('the strain line names who is holding them',
+      /is still held by \*\*\$\{holderName/.test(src));
+    ok('a group check tallies in place and refuses seconds',
+      /CREATE TABLE IF NOT EXISTS group_checks/.test(src) &&
+      /function groupCheckBody\(guild, gid, msgId\)/.test(src) &&
+      /You have had your roll \\u2014 one each/.test(src) &&
+      /Only a GM calls it/.test(src));
+    ok('the group tally counts passes against the DC',
+      /const passed = rolls\.filter\(r => r\.passed\)\.length;/.test(src) &&
+      /made it\./.test(src));
+    // The recap drafts from the timeline and stays private unless asked.
+    ok('the recap drafts rather than publishes',
+      /sub === 'recap'/.test(src) &&
+      /A draft, for you to edit/.test(src) &&
+      /if \(interaction\.options\.getBoolean\('post'\)\)/.test(src));
     ok('the completion options the handler reads are actually declared',
       /setName\('summary'\)\.setDescription\('Your telling of it/.test(src) &&
       /setName\('title'\)\.setDescription\('A title every survivor earns/.test(src));
@@ -1439,8 +1497,23 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
           return /effect_state: '\{\}'/.test(cut > 0 ? win.slice(0, cut) : win);
         });
       })());
+    // Rests land on the hour, not on the minute a schedule was created.
+    // The worked-examples pair: GM channel gets both, player channel gets
+    // the player one, and neither belongs to a ruleset.
+    ok('both examples books are published',
+      /'DDice-Examples-GameMaster\.pdf'/.test(src) && /'DDice-Examples-Player\.pdf'/.test(src));
+    ok('the examples books survive the ruleset filter',
+      /f\.startsWith\('DDice-Examples-'\) \|\| f\.startsWith\('DnD5e-'\) === is5e/.test(src));
+    ok('the player channel receives its pair, not one file',
+      /const playerFiles = await fetchDocFiles\(st, \[docPlayerFileFor\(gid\), 'DDice-Examples-Player\.pdf'\]\)/.test(src) &&
+      /files: playerFiles,/.test(src));
+    ok('the rest clock is hour-aligned everywhere it is read or written',
+      /const floorHour = \(ms\) => Math\.floor\(ms \/ 3600000\) \* 3600000;/.test(src) &&
+      /floorHour\(Date\.now\(\)\) < floorHour\(last\) \+ hours \* 3600 \* 1000/.test(src) &&
+      !/last_run: Date\.now\(\)/.test(src) &&
+      /floorHour\(sc\.last_run\) \+ sc\.hours/.test(src));
     ok('a fired rest advances its own clock first',
-      /const result = await runAutoRest\(guild, sc\);[\s\S]{0,420}?upsertSchedule\(guild\.id, sc\.name, \{ last_run: Date\.now\(\) \}\);[\s\S]{0,80}?await announceAutoRest/.test(src));
+      /const result = await runAutoRest\(guild, sc\);[\s\S]{0,420}?upsertSchedule\(guild\.id, sc\.name, \{ last_run: floorHour\(Date\.now\(\)\) \}\);[\s\S]{0,80}?await announceAutoRest/.test(src));
     ok('the dice block walks the full ladder with averages and extremes',
       /const LADDER = \[2, 4, 6, 8, 10, 12, 20\];/.test(src) &&
       /avg \*\*\$\{avg\}\*\*/.test(src) && /nat 1 \\u00d7\$\{p\.low\}/.test(src) && src.includes('🔴 nat 1') && src.includes('🟡 nat') &&

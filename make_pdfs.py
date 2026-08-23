@@ -380,6 +380,7 @@ CONTENT = [
           ('/config mechanics autorest action:List', 'every recovery schedule'),
           ('/config mechanics autorest action:Add or update name:Breather \\\n  hours:6 hp:50% rerolls:0% heal:0%', 'a light top-up'),
           ('/config mechanics autorest action:Run now name:Breather', 'fire one immediately'),
+          ('(when they land)', 'rests fall ON the hour \u2014 a 12-hour rest set at\n14:37 next falls due at 02:00, not 02:37'),
           ('/config channels ruleset system:knightfall', 'which rules this server plays by \u2014 Knightfall\n(five stats, blows decided by opposed rolls) or\nD&D 5e by the SRD (six abilities as modifiers,\nproficiency growing with level, attacks rolled\nagainst Armour Class). Set it BEFORE anyone makes a\ncharacter: it refuses to change once sheets exist,\nbecause a sheet written for one system cannot be\nread as another. Run it bare to see which rules\nare in force'),
           ('/config channels npcchannel #channel', 'set the NPC portrait forum \u2014 a thread per category'),
           ('/config mechanics npcreroll threshold:8', 'NPC auto-reroll on nat ≤ N — 0 disables'),
@@ -1456,6 +1457,7 @@ CONTENT = [
           ('/quest post number:1', 'post the quest with an Apply button. With a quest\nforum configured this opens the quest\u2019s own thread\non the board \u2014 applications, party changes, start,\npause, public notes and completion all mirror in,\nand the thread archives when the quest completes.\nPass channel: to post plainly instead'),
           ('/gm check status', 'which channels are set, which await'),
           ('/button roll dice:2d6+1 dc:9 reason:\u2026 for:@a once:true', 'plant a roll: dice OR a stat, an optional DC, the reason\nshown above it, and who it is for \u2014 anyone if left open.\nPressed inside a quest, it joins that quest\u2019s timeline and\nthe GM log (GM)'),
+          ('/button group stat:wis dc:12 reason:\u2026', 'one check the whole party rolls \u2014 each presses once, the\nmessage keeps the tally, and \u2696\ufe0f Call it closes the scene\nwith how many got through (GM)'),
           ('/target create name:Barricade stat:str dc:12', 'plant something to swing at \u2014 no sheet, no roster. Each\nhit rolls publicly, then asks YOU whether it falls;\nsecret:true asks in the GM channel instead (GM)'),
           ('/target list', 'what still stands in this channel (GM)'),
           ('/dd user:@a message:\u2026 as:Garrick Vale', 'write to a player AS THE BOT \u2014 so a GM who also plays\na character never blurs the two; names the sender unless\nquiet:true, and the roll-audit keeps it either way (GM)'),
@@ -1504,6 +1506,7 @@ CONTENT = [
           ('/quest run complete number:1', 'finish — auto-award merits, list rewards'),
           ('/quest run complete number:1 summary:\u2026', 'add your telling \u2014 it lands in each adventurer\u2019s thread in\nquest-chronicle; timings, events and payouts go to the\nGM-only gm-quest-log instead'),
           ('/quest run log number:1 text:\u2026', 'write or rewrite the tale afterwards \u2014 it is mirrored into\nevery adventurer\u2019s own chronicle thread, and rewriting edits\neach copy in place (GM)'),
+          ('/quest run recap number:1', 'drafts a \u201cpreviously on\u2026\u201d from everything logged \u2014\nprivate to you; add post:true to read it to the party (GM)'),
           ('/quest delete number:1', 'remove a quest permanently: its board thread or\npost and its planning thread (applications and\nnotes included) and the party\u2019s room are deleted\nwith it \u2014 and any instances of it go the same way,\nthreads and all. A fight still running in the room\nis stood down first. If the quest is live, the\nconfirmation says so before you commit: the clock\nstops and the party is released. Its number returns\nto the pool: the next quest created takes the\nlowest free number, reborn with a clean history\n(the run ledger keeps counting for DM credit but\nno longer answers to that number)')]),
 ('note', 'Every <b>number:</b> option across /quest autocompletes \u2014 start typing a number or part of a name '
          'and the matching quests appear as \u201c#012 \u2014 Goblin Cave (open)\u201d.'),
@@ -1753,11 +1756,13 @@ EXAMPLES = [
           ('/quest start number:1', 'Begin a run with everyone who was let in.'),
           ('/quest run complete number:1 summary:\u2026', 'Finish it, pay merits, and tell the story.')]),
 
+('aud', 'gm'),
 ('sec', 'Being an NPC'),
 ('code', [('/npc create name:Garrick str:3 con:2 dex:2 wis:1 lck:2', 'Make a person for the world.'),
           ('/npc say name:Garrick message:Hello there', 'Garrick speaks, in his own name and face.'),
           ('/library summon name:Goblin count:3 temp:true', 'Three goblins appear for this fight only.')]),
 
+('aud', 'gm'),
 ('sec', 'Buttons and targets'),
 ('code', [('/button roll stat:dex dc:12 reason:The ledge is slippery',
            'Puts a button in the channel. Anyone can press it to try climbing.'),
@@ -1766,12 +1771,29 @@ EXAMPLES = [
           ('/target create name:Barricade stat:str dc:12',
            'Something to hit. Each hit asks the GM whether it falls.')]),
 
+('aud', 'gm'),
+('sec', 'A check for everybody'),
+('code', [('/button group stat:wis dc:12 reason:The bridge groans',
+           'Everyone presses once and rolls. The message keeps score.'),
+          ('(press Call it)', 'The GM closes it, and the bot says how many got across.')]),
+('p', 'This is for moments when the whole party is doing the same thing at once \u2014 '
+      'climbing, hiding, holding a door. One message, one answer.'),
+
+('aud', 'gm'),
+('sec', 'Remembering last time'),
+('code', [('/quest run recap number:1', 'The bot writes up what happened, from its notes.'),
+          ('/quest run recap number:1 post:true', 'Same, but it reads it out to the party.')]),
+('p', 'The recap is a first draft. Change any of it before you share it \u2014 '
+      'the bot only knows what was written down.'),
+
+('aud', 'gm'),
 ('sec', 'Titles and groups'),
 ('code', [('/standing title grant user:@Skol title:Siren\u2019s Bane source:Sirens Redoubt',
            'Skol earns a title. It shows on their page.'),
           ('/standing association add user:@Skol group:The Falconers note:Quartermaster',
            'Skol now stands with the Falconers.')]),
 
+('aud', 'all'),
 ('sec', 'Telling the GMs something'),
 ('code', [('/feedback send', 'Pick a room, score it out of ten, say your piece. Only GMs see it.'),
           ('(the button on your page)', 'Ask a GM to update your lore document.')]),
@@ -1779,16 +1801,22 @@ EXAMPLES = [
 
 # The examples book is its own edition: no audience filtering, one system-
 # free set of worked examples that suits either ruleset.
-def build_examples(outfile):
+def build_examples(edition, outfile, subtitle):
     global CONTENT
     keep = CONTENT
     try:
         CONTENT = EXAMPLES
-        build('full', outfile, 'Worked Examples \u00b7 What to type, and what happens')
+        build(edition, outfile, subtitle)
     finally:
         CONTENT = keep
 
-build_examples(OUT + 'DDice-Examples.pdf')
+# Two books, because a player should not have to read past commands they
+# cannot run to find the one they can (T, 2026-08-21). The player book keeps
+# the sections anyone may use; the GM book is the whole thing.
+build_examples('player', OUT + 'DDice-Examples-Player.pdf',
+               'Worked Examples \u00b7 What to type, and what happens')
+build_examples('gm', OUT + 'DDice-Examples-GameMaster.pdf',
+               'Worked Examples \u00b7 Everything, including the GM\u2019s side')
 
 for _sys, _prefix, _name in [('knightfall', '', 'Knightfall'), ('dnd5e', 'DnD5e-', 'D&D 5e (SRD)')]:
     build('full',   OUT + _prefix + 'DDice-Commands-Parchment.pdf',

@@ -164,6 +164,21 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS temp_targets (
   PRIMARY KEY (guild_id, message_id)
 )`); } catch (e) { console.error('temp_targets schema', e); }
 
+// A group check: one button, everyone rolls once, the bot tallies. The
+// point is a skill-challenge scene that reads as ONE result rather than
+// twelve separate rolls nobody can hold in their head (T, 2026-08-20).
+try { db.exec(`CREATE TABLE IF NOT EXISTS group_checks (
+  guild_id TEXT NOT NULL, message_id TEXT NOT NULL,
+  channel_id TEXT NOT NULL, stat TEXT, dice TEXT, dc INTEGER,
+  reason TEXT, closed INTEGER NOT NULL DEFAULT 0, opened_by TEXT, at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, message_id)
+)`); } catch (e) { console.error('group_checks schema', e); }
+try { db.exec(`CREATE TABLE IF NOT EXISTS group_check_rolls (
+  guild_id TEXT NOT NULL, message_id TEXT NOT NULL, user_id TEXT NOT NULL,
+  total INTEGER NOT NULL, nat INTEGER, passed INTEGER, at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, message_id, user_id)
+)`); } catch (e) { console.error('group_check_rolls schema', e); }
+
 try { db.exec(`CREATE TABLE IF NOT EXISTS button_presses (
   guild_id TEXT NOT NULL, message_id TEXT NOT NULL, user_id TEXT NOT NULL,
   at INTEGER NOT NULL,
@@ -2643,7 +2658,11 @@ async function resolveActivityRoll(ctx, statWord, flavour, io, rerolled = false)
 // flat number, or 0% to leave that resource alone — so they round down the same
 // way and there's one format to learn.
 const AUTOREST_HOURS_DEFAULT = 6;
-const AUTOREST_TICK_MS = 5 * 60 * 1000;   // how often we ask whether anything is due
+const AUTOREST_TICK_MS = 5 * 60 * 1000;
+// Rests land ON the hour, not at whatever minute the schedule happened to
+// be created (T, 2026-08-21). Everything the clock compares is floored to
+// the hour, so a 12-hour rest set at 14:37 falls due at 02:00, not 02:37.
+const floorHour = (ms) => Math.floor(ms / 3600000) * 3600000;   // how often we ask whether anything is due
 
 function listSchedules(gid) {
   return db.prepare('SELECT * FROM autorest_schedules WHERE guild_id=? ORDER BY name').all(gid);
@@ -2816,15 +2835,16 @@ function startAutoRest(client) {
           if (!sc.enabled) continue;
           const hours = Number(sc.hours) > 0 ? Number(sc.hours) : AUTOREST_HOURS_DEFAULT;
           const last = Number(sc.last_run) || 0;
-          if (!last) { upsertSchedule(guild.id, sc.name, { last_run: Date.now() }); continue; }
-          if (Date.now() < last + hours * 3600 * 1000) continue;
+          if (!last) { upsertSchedule(guild.id, sc.name, { last_run: floorHour(Date.now()) }); continue; }
+          // Both sides floored, so the comparison is hour-to-hour.
+          if (floorHour(Date.now()) < floorHour(last) + hours * 3600 * 1000) continue;
           const result = await runAutoRest(guild, sc);
           // The clock advances the moment the rest fires — before the
           // announcement, so even a failed announce can't refire it. Its
           // absence (excised by the resource-mirror rewrite's span) made
           // every 10-minute tick refire forever once due: the live
           // announcement spam of 2026-08-13.
-          upsertSchedule(guild.id, sc.name, { last_run: Date.now() });
+          upsertSchedule(guild.id, sc.name, { last_run: floorHour(Date.now()) });
           await announceAutoRest(guild, sc, result);
           await reportJobRecovered(client, guild.id, sc?.channel || null, `Scheduled recovery (${sc?.name ?? '?'})`);
           console.log(`[autorest] ${guild.id}/${sc.name}: restored ${result.restored.length}, skipped ${result.skipped.length}`);
@@ -2953,6 +2973,11 @@ const DOC_FILES = [
   'DnD5e-DDice-Commands-GameMaster.pdf',
   'DnD5e-DDice-Commands-Player.pdf',
   'DnD5e-DDice-Commands-Parchment.pdf',
+  // The worked-examples pair rides along: the GM channel gets both, the
+  // player channel gets the player one (T, 2026-08-21). System-free, so
+  // one pair serves either ruleset.
+  'DDice-Examples-GameMaster.pdf',
+  'DDice-Examples-Player.pdf',
 ];
 // A server is handed the books it plays by, and no others: the whole
 // editions, the Core module, and the module for its own rules. A Knightfall
@@ -2960,7 +2985,9 @@ const DOC_FILES = [
 function docFilesFor(gid) {
   // Three books, for the rules this server plays by.
   const is5e = rulesFor(gid).id === 'dnd5e';
-  return DOC_FILES.filter(f => f.startsWith('DnD5e-') === is5e);
+  // The examples books belong to neither system, so they survive the
+  // prefix filter that keeps each ruleset's own set apart.
+  return DOC_FILES.filter(f => f.startsWith('DDice-Examples-') || f.startsWith('DnD5e-') === is5e);
 }
 
 const DOCS_POLL_MS = 15 * 60 * 1000;
@@ -3086,10 +3113,12 @@ async function publishDocs(client, guild, { reason = 'a new build', force = fals
   if (st.playerChannel) {
     try {
       const pCh = await client.channels.fetch(st.playerChannel);
-      const [playerFile] = await fetchDocFiles(st, [docPlayerFileFor(gid)]);
+      // Two books for players: the commands they can run, and the worked
+      // examples of running them.
+      const playerFiles = await fetchDocFiles(st, [docPlayerFileFor(gid), 'DDice-Examples-Player.pdf']);
       const pMsg = await pCh.send({
         content: '📘 **Player command reference** — latest version.',
-        files: [playerFile],
+        files: playerFiles,
         allowedMentions: { parse: [] },
         flags: MessageFlags.SuppressNotifications,
       });
@@ -3932,7 +3961,16 @@ function buildRollLine(result, mode, critType, successResult) {
   const suffix = successResult ? `  ${successResult.emoji} ${successResult.label}` : '';
   if (mode === 'normal') return `🎲  ${result.notation} → [${result.rolls.join(', ')}]${modStr} = ${ts}${suffix}`;
   const ml = mode === 'adv' ? '(advantage)' : '(disadvantage)';
-  return `🎲  ${result.notation} ${ml} → [${result.chosen}, ~~${result.dropped}~~]${modStr} = ${ts}${suffix}`;
+  // A caller pairing an adv/dis MODE with a plain roll has no chosen or
+  // dropped die, and this line then read "[undefined, undefined]" — which is
+  // what a player saw on 2026-08-21. Fall back to the faces actually rolled
+  // rather than printing a hole.
+  const kept = result.chosen ?? (Array.isArray(result.rolls) ? result.rolls[0] : undefined);
+  const shed = result.dropped ?? (Array.isArray(result.rolls) ? result.rolls[1] : undefined);
+  const pair = kept === undefined
+    ? `[${Array.isArray(result.rolls) ? result.rolls.join(', ') : '?'}]`
+    : (shed === undefined ? `[${kept}]` : `[${kept}, ~~${shed}~~]`);
+  return `\u{1F3B2}  ${result.notation} ${ml} \u2192 ${pair}${modStr} = ${ts}${suffix}`;
 }
 
 // Trailing RP flavour: collapse the lines, then restate the result above it.
@@ -6494,6 +6532,9 @@ const slashCommands = [
       .addStringOption(o=>o.setName('kind').setDescription('What sort of moment').setRequired(false)
         .addChoices({name:'🎭 Roleplay',value:'rp'},{name:'⚔️ Combat',value:'combat'},{name:'📝 Note',value:'note'}))
       .addBooleanOption(o=>o.setName('public').setDescription('true = also post it in the quest\'s board thread (default: planning thread only)').setRequired(false)));
+      g.addSubcommand(s=>s.setName('recap').setDescription('Draft a \u201cpreviously on\u2026\u201d from what was logged (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
+      .addBooleanOption(o=>o.setName('post').setDescription('true = read it out to the party too').setRequired(false)));
       g.addSubcommand(s=>s.setName('log').setDescription('Write or rewrite the players\' account of a quest (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('text').setDescription('How it went, in your words').setRequired(true)));
@@ -6559,6 +6600,12 @@ const slashCommands = [
       .addUserOption(o=>o.setName('for').setDescription('Only they may press it').setRequired(false))
       .addBooleanOption(o=>o.setName('once').setDescription('true = one press each').setRequired(false))
       .addStringOption(o=>o.setName('label').setDescription('Words on the button').setRequired(false)))
+    .addSubcommand(s=>s.setName('group').setDescription('One check the whole party rolls, tallied together (GM)')
+      .addStringOption(o=>o.setName('stat').setDescription('Which stat').setRequired(false)
+        .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'},{name:'Flat d20',value:'x'}))
+      .addIntegerOption(o=>o.setName('dc').setDescription('The number to beat').setRequired(false).setMinValue(1).setMaxValue(40))
+      .addStringOption(o=>o.setName('dice').setDescription('Or dice instead of a stat, e.g. 2d6+1').setRequired(false))
+      .addStringOption(o=>o.setName('reason').setDescription('What the party is attempting').setRequired(false)))
     .addSubcommand(s=>s.setName('feedback').setDescription('A standing feedback button for this channel')
       .addStringOption(o=>o.setName('prompt').setDescription('What to say above it').setRequired(false))),
 
@@ -8075,7 +8122,7 @@ async function handleConfig(interaction, forced) {
     const line = (sc) => `• **${sc.name}** — every **${sc.hours}h** · ${describeSchedule(sc)}`
       + (sc.channel ? ` · <#${sc.channel}>` : '')
       + (sc.enabled ? '' : ' · ⏸️ **paused**')
-      + (sc.last_run ? `\n   next <t:${Math.floor((sc.last_run + sc.hours * 3600 * 1000) / 1000)}:R>` : '');
+      + (sc.last_run ? `\n   next <t:${Math.floor((floorHour(sc.last_run) + sc.hours * 3600 * 1000) / 1000)}:R>` : '');
 
     if (action === 'list') {
       const all = listSchedules(gid);
@@ -8099,7 +8146,8 @@ async function handleConfig(interaction, forced) {
     if (action === 'pause' || action === 'resume') {
       if (!existing) return interaction.reply({ content: `❌ No schedule called **${name}**.`, ephemeral: true });
       const sc = upsertSchedule(gid, name, { enabled: action === 'resume' ? 1 : 0,
-        ...(action === 'resume' ? { last_run: Date.now() } : {}) });
+        // Resuming restarts the clock on the hour, like every other write.
+        ...(action === 'resume' ? { last_run: floorHour(Date.now()) } : {}) });
       return interaction.reply({ content: `${action === 'resume' ? '▶️ Resumed' : '⏸️ Paused'} **${sc.name}**.` });
     }
 
@@ -9789,10 +9837,16 @@ function rollDcCheck({ stat, notation, dc, gmMode, flat, modifier, subject, sig 
                : mode === 'dis' ? rollDisadvantage(useNotation)
                : rollNotation(useNotation);
   if (!result) return null;
-  const nat = mode === 'normal' ? result.rolls[0] : result.chosen;
+  // Same defence for the verdict: an absent `chosen` must not become an
+  // undefined natural, which skips the crit rules silently.
+  const nat = mode === 'normal' ? result.rolls[0] : (result.chosen ?? result.rolls?.[0]);
   const sides = result.sides ?? 20;
   const total = result.total + modifier;
-  const passed = (sides === 20 && nat === 20) ? true : (sides === 20 && nat === 1) ? false : total >= dc;
+  // A DC that never parsed is no DC at all; judging against NaN turns a
+  // passing total into a failure.
+  const dcNum = Number.isFinite(dc) ? dc : null;
+  const passed = (sides === 20 && nat === 20) ? true : (sides === 20 && nat === 1) ? false
+               : (dcNum === null ? null : total >= dcNum);
   const critType = sides === 20 ? (nat === 20 ? 'crit' : nat === 1 ? 'fail' : null) : null;
   const band = critType === 'crit' ? '🌟 **Critical Success**' : critType === 'fail' ? '💀 **Critical Fail**'
              : passed ? '✅ **Success**' : '❌ **Fail**';
@@ -12148,6 +12202,42 @@ async function routeButton(interaction) {
     // filed under modal traffic, so presses timed out unacknowledged
     // ("didn't respond in time", live 2026-08-14). Their modals
     // (loredocm/loredonm) stay in the modal lane where they belong.
+    if (interaction.customId === 'grproll' || interaction.customId === 'grpclose') {
+      const gidG = interaction.guild.id, uidG = interaction.user.id, mid = interaction.message.id;
+      const g = db.prepare('SELECT * FROM group_checks WHERE guild_id=? AND message_id=?').get(gidG, mid);
+      if (!g) return interaction.reply({ ephemeral: true, content: '\u274C That check is long over.' });
+
+      if (interaction.customId === 'grpclose') {
+        if (!(await isGm(interaction.guild, uidG)))
+          return interaction.reply({ ephemeral: true, content: '\u274C Only a GM calls it.' });
+        db.prepare('UPDATE group_checks SET closed=1 WHERE guild_id=? AND message_id=?').run(gidG, mid);
+        return interaction.update({ content: groupCheckBody(interaction.guild, gidG, mid), components: [] });
+      }
+
+      if (g.closed) return interaction.reply({ ephemeral: true, content: '\u274C That check has been called.' });
+      const had = db.prepare('SELECT 1 FROM group_check_rolls WHERE guild_id=? AND message_id=? AND user_id=?').get(gidG, mid, uidG);
+      if (had) return interaction.reply({ ephemeral: true, content: '\u274C You have had your roll \u2014 one each.' });
+
+      let total, nat = null, passed = null;
+      if (g.dice) {
+        const r = rollNotation(g.dice);
+        if (!r) return interaction.reply({ ephemeral: true, content: '\u274C That expression no longer reads.' });
+        total = r.total; nat = r.rolls[0] ?? null;
+      } else {
+        const ch = getChar(gidG, uidG);
+        if (!ch) return interaction.reply({ ephemeral: true, content: '\u274C You need a character sheet \u2014 `/char create`.' });
+        const r = rollDcCheck({ stat: g.stat === 'x' ? null : g.stat, dc: g.dc || 10, flat: g.stat === 'x', subject: ch, sig: ch });
+        if (!r) return interaction.reply({ ephemeral: true, content: '\u274C That check would not roll.' });
+        total = r.total; nat = r.nat;
+      }
+      if (g.dc) passed = total >= g.dc ? 1 : 0;
+      db.prepare(`INSERT INTO group_check_rolls (guild_id, message_id, user_id, total, nat, passed, at)
+                  VALUES (?,?,?,?,?,?,?)`).run(gidG, mid, uidG, total, nat, passed, Date.now());
+      await logButtonPress(interaction, gidG, uidG, `group ${g.dice || (g.stat === 'x' ? 'flat d20' : STAT_LABELS[g.stat])} ${total}${g.dc ? ` vs DC ${g.dc}` : ''}`, passed === null ? null : !!passed);
+      // The message itself is the scoreboard, so everyone watches it fill.
+      return interaction.update({ content: groupCheckBody(interaction.guild, gidG, mid), components: interaction.message.components });
+    }
+
     if (interaction.customId === 'tgtatk') {
       const gidT = interaction.guild.id, uidT = interaction.user.id;
       const t = db.prepare('SELECT * FROM temp_targets WHERE guild_id=? AND message_id=?').get(gidT, interaction.message.id);
@@ -15491,13 +15581,50 @@ function nextStandingIndex(turnOrder, hpState, floor, from) {
 
 // Whose turn it becomes, and the reminder a GM needs when driving an NPC by
 // hand. Shared by every path that hands the fight onward.
+// Everything currently true about a fighter, in one line: who holds them,
+// who they hold, what sanction or bonus they carry into this roll. It goes
+// with the turn announcement, because that is where people are looking and
+// a hold that lasts five rounds should not have to be remembered (T,
+// 2026-08-21).
+async function fighterStateLine(guild, gid, cid, fid) {
+  const bits = [];
+  const f = getFight(gid, cid);
+  if (!f) return '';
+  const gmap = fightGrapples(f);
+  const nameOf = async (id) => {
+    const r = await resolveFighter(guild, gid, id).catch(() => null);
+    return r ? `${r.name}${r.isNpc ? ' \u{1F3AD}' : ''}` : 'someone';
+  };
+  // Held BY someone: gmap maps captive -> holder.
+  if (gmap[fid]) bits.push(`\u{1FAA2} **held by ${await nameOf(gmap[fid])}** \u2014 cannot move, 1 strain at end of turn, actions roll flat`);
+  // Holding someone: the other side of the same map.
+  const captives = Object.entries(gmap).filter(([, h]) => h === fid).map(([t]) => t);
+  for (const c of captives) bits.push(`\u{1F91C} **holding ${await nameOf(c)}** \u2014 release freely, but no striking them`);
+
+  // Carried marks, so nobody is surprised by their own dice.
+  const eff = JSON.parse(f.effect_state || '{}')[fid] || {};
+  if (eff.flatDef) bits.push('\u{1F4A2} **next defence is a flat d20** \u2014 fumbled an attack');
+  if (eff.rollBonus) bits.push(`\u2694\uFE0F **+${eff.rollBonus} to hit** on the next attack \u2014 riposte`);
+  if (eff.gmAdj) bits.push(`\u2696\uFE0F **${eff.gmAdj > 0 ? '+' : ''}${eff.gmAdj}** from the GM`);
+  if (eff.gmStat) bits.push(`\u2696\uFE0F GM set the stat to **${STAT_LABELS[eff.gmStat] || eff.gmStat}**`);
+  if (eff.fooled) bits.push('\u{1F300} **taken in by a feint** \u2014 next action is a straight d20');
+  if (!isNpcFighter(fid)) {
+    const mk = getChar(gid, fid)?.next_mark;
+    if (mk === 'adv') bits.push('\u2b06\ufe0f advantage on the next roll');
+    if (mk === 'dis') bits.push('\u2b07\ufe0f disadvantage on the next roll');
+    if (mk === 'flat') bits.push('\u27a1\ufe0f next roll is flat');
+  }
+  return bits.length ? `\n${bits.map(b => `\u2003${b}`).join('\n')}` : '';
+}
+
 async function announceNextTurn(guild, gid, cid, lines, order, index) {
   const nextF = await resolveFighter(guild, gid, order[index]);
   const autoOn = !!getFight(gid, cid)?.auto_npc;
   const hint = (autoOn && nextF.isNpc) ? '' : nextF.isNpc
     ? `\n_A GM acts for them: \`/fight atk stat:str npc:${nextF.name} target:@player\`_`
     : '\n_\`/fight atk stat:str target:@player\` — or \`/roll dice:2d6+3 fight:true target:@player\` for a custom roll._';
-  lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${hint}${turnPing(gid, nextF)}`);
+    const state = await fighterStateLine(guild, gid, cid, order[index]);
+lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${hint}${turnPing(gid, nextF)}${state}`);
   return nextF;
 }
 
@@ -15533,7 +15660,10 @@ async function applyTurnEndStrain(guild, gid, cid, hpState, order, roster, floor
   const W = fightWords(floor);
   const nh = applyFightDamage(prev, 1, floor);
   hpState[fid] = nh; setFighterHp(gid, fid, nh);
-  lines.push('', `🤼 The hold takes its toll — **${name}** takes **1** strain.`);
+  // Name the holder every round, so a hold that lasts five of them never
+  // becomes a thing the table has to remember.
+  const holderName = await resolveFighter(guild, gid, gmap[fid]).catch(() => null);
+  lines.push('', `\u{1FAA2} **${name}** is still held by **${holderName ? holderName.name + (holderName.isNpc ? ' \u{1F3AD}' : '') : 'someone'}** \u2014 **1** strain.`);
   lines.push(hpChangeLine(gid, F.isNpc, F.name, prev, nh, F.maxHp, floor));
   if (nh <= floor) {
     lines.push('', `${W.icon} **${name}** ${W.out}! HP: **${nh}**`);
@@ -16052,6 +16182,33 @@ async function handleButton(interaction) {
   const forUser = interaction.options.getUser?.('for');
   const owner = forUser?.id || 'any';
 
+  if (sub === 'group') {
+    const stat = interaction.options.getString('stat');
+    const dice = (interaction.options.getString('dice') || '').trim();
+    const dc = interaction.options.getInteger('dc');
+    const reason = (interaction.options.getString('reason') || '').trim();
+    if (dice && stat) return interaction.reply({ ephemeral: true, content: '\u274C Dice or a stat, not both.' });
+    if (!dice && !stat) return interaction.reply({ ephemeral: true, content: '\u274C Give dice or a stat for the party to roll.' });
+    if (dice && !/^\d{0,2}d\d{1,3}([+-]\d{1,3})?$/i.test(dice))
+      return interaction.reply({ ephemeral: true, content: '\u274C That is not dice I can read \u2014 try `2d6+1`.' });
+    const face = dice || (stat === 'x' ? 'Flat d20' : STAT_LABELS[stat]);
+    const rowG = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('grproll').setLabel(`\u{1F3B2} Roll ${face}`.slice(0, 80)).setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('grpclose').setLabel('\u2696\uFE0F Call it').setStyle(ButtonStyle.Secondary));
+    const msg = await interaction.channel.send({
+      content: [
+        reason ? `\u{1F3AF} **${reason}**` : '\u{1F3AF} **A check for everyone**',
+        `Everyone rolls **${face}**${dc ? ` against **DC ${dc}**` : ''} \u2014 one go each.`,
+        '', '_Nobody has rolled yet._',
+      ].join('\n'), components: [rowG], allowedMentions: { parse: [] },
+    }).catch(() => null);
+    if (!msg) return interaction.reply({ ephemeral: true, content: '\u274C I could not post it here.' });
+    db.prepare(`INSERT INTO group_checks (guild_id, message_id, channel_id, stat, dice, dc, reason, opened_by, at)
+                VALUES (?,?,?,?,?,?,?,?,?)`)
+      .run(gid, msg.id, interaction.channel.id, stat || null, dice || null, dc || null, reason || null, interaction.user.id, Date.now());
+    return interaction.reply({ ephemeral: true, content: '\u2705 Planted. Press **Call it** when the scene has had enough.' });
+  }
+
   if (sub === 'feedback') {
     const row = new ActionRowBuilder().addComponents(new ButtonBuilder()
       .setCustomId('btnfb').setLabel('\u{1F4DD} Send feedback').setStyle(ButtonStyle.Primary));
@@ -16111,6 +16268,33 @@ async function logButtonPress(interaction, gid, uid, detail, passed) {
     const mark = passed === null ? '' : passed ? ' \u2014 passed' : ' \u2014 failed';
     logQuestEvent(gid, q.number, 'roll', `${nm}: ${detail}${mark}`, uid);
   } catch {}
+}
+
+// A group check reads as one result: who rolled what, then the verdict.
+// Rendered fresh every press so the message IS the scoreboard.
+function groupCheckBody(guild, gid, msgId) {
+  const g = db.prepare('SELECT * FROM group_checks WHERE guild_id=? AND message_id=?').get(gid, msgId);
+  if (!g) return null;
+  const rolls = db.prepare('SELECT * FROM group_check_rolls WHERE guild_id=? AND message_id=? ORDER BY at').all(gid, msgId);
+  const face = g.dice || (g.stat === 'x' ? 'Flat d20' : STAT_LABELS[g.stat]);
+  const head = [
+    g.reason ? `\u{1F3AF} **${g.reason}**` : '\u{1F3AF} **A check for everyone**',
+    `Everyone rolls **${face}**${g.dc ? ` against **DC ${g.dc}**` : ''} \u2014 one go each.`,
+    '',
+  ];
+  if (!rolls.length) return [...head, '_Nobody has rolled yet._'].join('\n');
+  const lines = rolls.map(r => {
+    const mark = r.passed === null ? '\u00b7' : (r.passed ? '\u2705' : '\u274c');
+    const crit = r.nat === 20 ? ' \u{1F7E1}' : r.nat === 1 ? ' \u{1F534}' : '';
+    return `${mark} <@${r.user_id}> \u2014 **${r.total}**${crit}`;
+  });
+  const passed = rolls.filter(r => r.passed).length;
+  const tail = g.dc
+    ? (g.closed
+        ? [`\u2696\uFE0F **${passed} of ${rolls.length} made it.** ${passed === rolls.length ? 'A clean sweep.' : passed === 0 ? 'Nobody got through.' : passed > rolls.length / 2 ? 'Most of the party is through.' : 'Only a few got through.'}`]
+        : [`_${passed} of ${rolls.length} so far._`])
+    : (g.closed ? ['\u2696\uFE0F **Called.**'] : []);
+  return [...head, ...lines, '', ...tail].join('\n').slice(0, 1900);
 }
 
 // One press each, when the GM asked for it.
@@ -16293,7 +16477,7 @@ async function resolveFeintInsight(guild, gid, cid, fight, { nat, total, mode = 
   const defF = await resolveFighter(guild, gid, targetId);
   const atkName = atkF.name + (atkF.isNpc ? ' 🎭' : '');
   const defName = defF.name + (defF.isNpc ? ' 🎭' : '');
-  const lines = ['─────────────────────────────', '🎭  **Feint Resolved**', ''];
+  const lines = ['\u2500'.repeat(29), `\u{1F300}  **Feint** \u2014 ${atkName} vs ${defName}`, ''];
   lines.push(`${atkName} (**WIS** feint): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
   lines.push(`${defName} (**WIS** insight${mode === 'adv' ? ', advantage' : mode === 'dis' ? ', disadvantage' : ''}): ${fightTotalStr(total, nat, 20)}`);
   lines.push('');
@@ -16938,7 +17122,7 @@ async function runFightEscape({ interaction, gid, cid, actorId, mode }) {
   const hpState = fightHp(fight);
   const floor = fightFloor(fight);
   const gmap = fightGrapples(fight);
-  const lines = ['─────────────────────────────', '🤼  **Escape Attempt**', ''];
+  const lines = ['\u2500'.repeat(29), `\u{1F91C}  **Escape** \u2014 ${actorName} against ${holderName}'s hold`, ''];
   lines.push(`${actorName} (**STR** escape): ${fightTotalStr(total, nat, 20)}`);
   lines.push(`${holderName} (**STR** hold${hold.adv ? ', advantage' : ''}): ${fightTotalStr(hold.total, hold.nat, 20)}`);
   lines.push('');
@@ -17094,7 +17278,7 @@ async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId
     input: '/fight act action:Deflect', rollLine, nat, sides: 20,
     context: `fight · shield deflection vs ${attackerF.name}` });
 
-  const lines = ['─────────────────────────────', '🛡️  **Shield Deflection**', ''];
+  const lines = ['\u2500'.repeat(29), `\u{1F6E1}\uFE0F  **Deflect** \u2014 ${actorName} shields against ${attackerName}`, ''];
   if (flavour) lines.push(`_${flavour}_`, '');
   lines.push(`${attackerName} attacks: ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
   lines.push(`**${actorName}** (**${STAT_LABELS[stat]}**): ${rollLine.replace('🛡️  ', '')}`);
@@ -17230,7 +17414,7 @@ async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
     input: '/fight act action:Disarm', rollLine, nat, sides: 20,
     context: `fight · weapon disarm vs ${attackerF.name}` });
 
-  const lines = ['─────────────────────────────', '⚔️  **Disarming Attempt**', ''];
+  const lines = ['\u2500'.repeat(29), `\u2694\uFE0F  **Disarm** \u2014 ${actorName} vs ${attackerName}`, ''];
   if (flavour) lines.push(`_${flavour}_`, '');
   lines.push(`${attackerName} attacks: ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
   lines.push(`**${actorName}** (**DEX**): ${rollLine.replace('⚔️  ', '')}`);
@@ -22901,6 +23085,48 @@ async function handleQuest(interaction, forced) {
     return replyLong(interaction, [
       `📜 **${questTag(quest)}** — ${quest.paused ? '⏸️ paused at' : 'running,'} **${fmtElapsed(questElapsed(quest))}**`, '',
       ...events.map(questEventLine)], { ephemeral: true });
+  }
+
+  if (sub === 'recap') {
+    // The timeline is already there; this shapes it into something to read
+    // aloud when the next session opens. It DRAFTS — the GM edits and
+    // decides. Nothing reaches the party unless post:true.
+    if (!gm) return interaction.reply({ content: '\u274C Only GMs can draft a recap.', ephemeral: true });
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    const evs = db.prepare('SELECT kind, text, at_ms FROM quest_events WHERE guild_id=? AND number=? ORDER BY at_ms')
+      .all(gid, quest.number);
+    if (!evs.length) return interaction.reply({ ephemeral: true, content: '\u274C Nothing was logged for that one.' });
+
+    const party = getQuestMembers(gid, quest.number, 'party');
+    const names = [];
+    for (const id of party) names.push(await getDisplayName(interaction.guild, id).catch(() => 'someone'));
+
+    // Roleplay, combat and notes are the story; rolls are the weather.
+    const beats = evs.filter(e => ['rp', 'combat', 'note'].includes(e.kind)).map(e => e.text).filter(Boolean);
+    const rolls = evs.filter(e => e.kind === 'roll');
+    const wins = rolls.filter(e => /passed/.test(e.text || '')).length;
+    const losses = rolls.filter(e => /failed/.test(e.text || '')).length;
+
+    const draft = [
+      `\u{1F4D6} **Previously, on ${questTag(quest)}\u2026**`,
+      '',
+      names.length ? `${names.join(', ')} set out.` : 'The party set out.',
+      ...beats.slice(0, 12).map(b => `\u00b7 ${b}`),
+      beats.length > 12 ? `\u00b7 \u2026and ${beats.length - 12} more moments.` : '',
+      '',
+      rolls.length ? `They rolled **${rolls.length}** times \u2014 **${wins}** went their way, **${losses}** did not.` : '',
+      quest.status === 'complete' ? 'And there it ended.' : 'And there we left them.',
+    ].filter(Boolean).join('\n').slice(0, 1800);
+
+    if (interaction.options.getBoolean('post')) {
+      const where = quest.run_channel_id || interactionChannelId(interaction);
+      const ch = await interaction.client.channels.fetch(where).catch(() => null);
+      if (ch) await ch.send({ content: draft, allowedMentions: { parse: [] } }).catch(() => {});
+      return interaction.reply({ ephemeral: true, content: `\u2705 Read out${ch ? ` in <#${ch.id}>` : ''}. Yours to change if you want it different.` });
+    }
+    return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] },
+      content: [draft, '', '_A draft, for you to edit. Add `post:true` to read it to the party._'].join('\n').slice(0, 1900) });
   }
 
   if (sub === 'log') {
