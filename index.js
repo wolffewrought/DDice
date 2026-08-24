@@ -12202,6 +12202,27 @@ async function routeButton(interaction) {
     // filed under modal traffic, so presses timed out unacknowledged
     // ("didn't respond in time", live 2026-08-14). Their modals
     // (loredocm/loredonm) stay in the modal lane where they belong.
+    if (interaction.customId === 'grpfree') {
+      // Only the holder's own press matters; the release itself is the same
+      // path /fight act action:Release takes, so the announcement, the log
+      // and the rules all stay in one place.
+      const gidR = interaction.guild.id, cidR = interaction.channel.id;
+      const fightR = getFight(gidR, cidR);
+      if (!fightR || fightR.state !== 'active')
+        return interaction.reply({ ephemeral: true, content: '\u274C That fight is over.' });
+      const heldR = grappleHeldTargetOf(fightR, interaction.user.id);
+      if (!heldR) return interaction.reply({ ephemeral: true, content: '\u274C You are not holding anyone.' });
+      const gmapR = fightGrapples(fightR);
+      delete gmapR[heldR];
+      setFightGrapples(gidR, cidR, gmapR);
+      const freed = await resolveFighter(interaction.guild, gidR, heldR).catch(() => null);
+      const holder = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'The grappler');
+      await interaction.channel.send({ allowedMentions: { parse: [] },
+        content: `\u{1F590}\uFE0F **${holder}** lets go of **${freed ? freed.name + (freed.isNpc ? ' \u{1F3AD}' : '') : 'their captive'}**.` }).catch(() => {});
+      try { noteQuestActivity(gidR, cidR, 'combat', `${holder} releases ${freed?.name ?? 'their captive'}`, interaction.user.id); } catch {}
+      return interaction.update({ content: '\u2705 Released \u2014 swing again when you are ready.', components: [] });
+    }
+
     if (interaction.customId === 'grproll' || interaction.customId === 'grpclose') {
       const gidG = interaction.guild.id, uidG = interaction.user.id, mid = interaction.message.id;
       const g = db.prepare('SELECT * FROM group_checks WHERE guild_id=? AND message_id=?').get(gidG, mid);
@@ -16623,7 +16644,15 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     // Grapple rules on the attack path: a holder cannot strike their captive,
     // and a held fighter swings on a flat d20 — no stat, no riposte, no edge.
     if (grappleHolderOf(fight, targetId) === actorId) {
-      return refuse('🤼 You are holding them — a grappler cannot strike their captive. `/fight act action:Release` first (it costs nothing).');
+      // The bot already knows who they are holding, so make letting go one tap
+      // rather than a retyped command (T, 2026-08-22).
+      {
+        const { ActionRowBuilder: RR, ButtonBuilder: RB, ButtonStyle: RS } = require('discord.js');
+        return interaction.reply({ ephemeral: true,
+          content: '\u{1F93C} You are holding them \u2014 a grappler cannot strike their captive. Let go and swing again, or pick another target.',
+          components: [new RR().addComponents(new RB()
+            .setCustomId('grpfree').setLabel('\u{1F590}\uFE0F Release the hold').setStyle(RS.Secondary))] });
+      }
     }
     const restrained = !!grappleHolderOf(fight, actorId);
     // A deflection's trade-off: the very next attack roll is a flat d20.

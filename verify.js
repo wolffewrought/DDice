@@ -1500,6 +1500,15 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     // Rests land on the hour, not on the minute a schedule was created.
     // The worked-examples pair: GM channel gets both, player channel gets
     // the player one, and neither belongs to a ruleset.
+    // Letting go is one tap from the refusal that mentions it, and the
+    // press walks the same release path the command does.
+    ok('the grapple refusal carries a release button',
+      /a grappler cannot strike their captive\. Let go and swing again/.test(src) &&
+      /setCustomId\('grpfree'\)/.test(src));
+    ok('the release press finds the captive itself',
+      /const heldR = grappleHeldTargetOf\(fightR, interaction\.user\.id\);/.test(src) &&
+      /You are not holding anyone/.test(src) &&
+      /setFightGrapples\(gidR, cidR, gmapR\)/.test(src));
     ok('both examples books are published',
       /'DDice-Examples-GameMaster\.pdf'/.test(src) && /'DDice-Examples-Player\.pdf'/.test(src));
     ok('the examples books survive the ruleset filter',

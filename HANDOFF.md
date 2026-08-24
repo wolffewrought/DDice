@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 950 assertions passed and no scanner found an ERROR.
+Green means 952 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 950 assertions covering structure, registration and ruleset
+now is 952 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -325,6 +325,29 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 9b · Grapple audited against T's written rule (2026-08-22)
+
+T supplied the canonical grapple text; compared clause by clause. Nine of
+ten already matched: STR-only throughout, meets-or-exceeds succeeds,
+immobile, 1 wound at end of turn regardless of action, acting at a flat
+d20, grappler releases free and cannot strike the captive, GM discretion.
+The tenth (escape vs a static Strength score) was resolved the other way
+by T: d20+STR for ALL aspects, so the live opposed roll stands.
+
+TIES KEEP THE HOLD, and T confirms that is intentional — a grapple is
+meant to be able to kill. Recorded so nobody 'fixes' it later.
+
+CORRECTION to my own reporting: I first told T the flat-d20 penalty was
+unenforced. It is enforced — `restrained` zeroes statVal in runFightAttack
+— and my probe had searched for the wrong helper name. A held fighter may
+attack anyone except their grappler, at a flat d20, and still takes the
+wound.
+
+Built: the refusal a holder gets when striking their captive now carries a
+Release button, walking the same path the command does (announce, quest
+log, same rules). `/fight act action:Release` already found the captive
+without a target. T: 'may come back to it later' — nothing further owed.
 
 ## 9a · Two examples books, published to their own channels (2026-08-21)
 
