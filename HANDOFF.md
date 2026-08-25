@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 957 assertions passed and no scanner found an ERROR.
+Green means 958 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 957 assertions covering structure, registration and ruleset
+now is 958 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -325,6 +325,26 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 9e · Grapple buttons, corrected to T's intent (2026-08-22)
+
+Two changes T asked for after seeing what I had built.
+
+1. The Grapple button is hidden from a fighter who is themselves held —
+no free hands to start one. Feint, Deflect and Disarm remain, since a
+held fighter may still act (at a flat d20).
+
+2. Maintaining a hold now COSTS A ROLL rather than being a declaration.
+`runFightMaintain` rolls the holder 1d20+STR and the captive 1d20+STR;
+ties keep the hold, matching Escape and the initial grapple, so a hold is
+lost only by being beaten outright. Release remains free. The rule T's
+document did not specify — what maintaining is compared against — was
+decided as an opposed roll for consistency, and is stated in the reply so
+the table can see the reasoning.
+
+This changes the mechanic's feel: a grapple can now fail on the
+GRAPPLER's turn with the captive doing nothing, which the previous rules
+did not allow. Flagged to T at the time.
 
 ## 9d · Ability buttons, and the grappler's choice (2026-08-22)
 

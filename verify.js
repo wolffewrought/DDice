@@ -1511,8 +1511,14 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('a grappler is offered the hold or the release, a captive the break',
       /if \(kind === 'hold'\) return/.test(src) && /Maintain the hold/.test(src) &&
       /if \(kind === 'escape'\) return/.test(src) && /Break free \(STR\)/.test(src));
-    ok('maintaining a hold is a declaration, not a roll',
-      /You keep your grip \\u2014 the hold stands/.test(src));
+    // (rewritten 2026-08-22: T asked for maintaining to cost a roll.)
+    ok('maintaining a hold is an opposed STR roll, ties keeping the hold',
+      /async function runFightMaintain\(interaction\)/.test(src) &&
+      /const kept = keep\.total >= slip\.total;/.test(src) &&
+      /twists loose \\u2014 the hold is broken/.test(src));
+    ok('a held fighter is offered no Grapple button',
+      /\.\.\.\(held \? \[\] : \[B\('fact:grapple'/.test(src) &&
+      /fightAnswerRows\(k, \{ held: isHeld \}\)/.test(src));
     ok('there is an attack button row, routed like the defence one',
       /if \(kind === 'atk'\) return \[/.test(src) &&
       /B\('fatk:str'/.test(src) &&

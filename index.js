@@ -12140,10 +12140,7 @@ async function routeButton(interaction) {
         const which = interaction.customId.split(':')[1];
         // 'hold' is a declaration, not a roll: the hold simply persists, so
         // it says so rather than pretending a die was thrown.
-        if (which === 'hold') {
-          return interaction.reply({ ephemeral: true,
-            content: '\u{1F91C} You keep your grip \u2014 the hold stands. They take their strain at the end of their turn.' });
-        }
+        if (which === 'maintain') return runFightMaintain(interaction);
         const ACTION_OF = { grapple: 'Grapple', feint: 'Feint', deflect: 'Deflect', disarm: 'Disarm', escape: 'Escape' };
         return handleFight(interaction, { sub: 'act', action: ACTION_OF[which] });
       }
@@ -15672,9 +15669,10 @@ lines.push(`\n\u{1F3AF} **${nextF.name}${nextF.isNpc ? ' \u{1F3AD}' : ''}**'s tu
   const rowsFor = gmapNow[id] ? ['escape', 'atk']
     : Object.values(gmapNow).includes(id) ? ['hold', 'atk']
     : ['atk'];
+  const isHeld = !!gmapNow[id];
   nextF.answerRows = (nextF.isNpc || autoNpc)
     ? []
-    : rowsFor.flatMap(k => fightAnswerRows(k)).slice(0, 5);
+    : rowsFor.flatMap(k => fightAnswerRows(k, { held: isHeld })).slice(0, 5);
   return nextF;
 }
 
@@ -17134,6 +17132,49 @@ async function runFightGrappleSave({ interaction, gid, cid, actorId, mode }) {
   return;
 }
 
+// Keeping a hold now costs a roll (T, 2026-08-22): on the grappler's turn
+// they roll 1d20+STR to keep their grip and the captive rolls 1d20+STR to
+// slip it. Ties keep the hold, exactly as Escape and the initial grapple
+// do, so a hold is lost only by being beaten outright. Their alternative
+// is Release, which costs nothing.
+async function runFightMaintain(interaction) {
+  const gid = interaction.guild.id, cid = interaction.channel.id, uid = interaction.user.id;
+  const refuse = (content) => interaction.reply({ content, ephemeral: true });
+  const fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active') return refuse(NO_ACTIVE_FIGHT);
+  if (fight.phase !== 'attack') return refuse('\u274C Resolve the pending exchange first.');
+  const turnOrder = fightOrder(fight);
+  const actorId = turnOrder[fight.turn_index];
+  if (actorId !== uid) return refuse('\u274C It is not your turn.');
+  const heldId = grappleHeldTargetOf(fight, actorId);
+  if (!heldId) return refuse('\u{1F91C} You are not holding anyone.');
+
+  const holderF = await resolveFighter(interaction.guild, gid, actorId);
+  const captiveF = await resolveFighter(interaction.guild, gid, heldId);
+  const holderRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
+  const captiveRow = isNpcFighter(heldId) ? getNpc(gid, npcNameFromFighter(heldId)) : getChar(gid, heldId);
+  const keep = autoRoll(holderF.stats.str ?? 0, hasSignatureAdvantage(holderRow, 'str'));
+  const slip = autoRoll(captiveF.stats.str ?? 0, hasSignatureAdvantage(captiveRow, 'str'));
+  const holderName = holderF.name + (holderF.isNpc ? ' \u{1F3AD}' : '');
+  const captiveName = captiveF.name + (captiveF.isNpc ? ' \u{1F3AD}' : '');
+
+  const lines = ['\u2500'.repeat(29), `\u{1F91C}  **Hold** \u2014 ${holderName} keeps their grip on ${captiveName}`, ''];
+  lines.push(`${holderName} (**STR** hold${keep.adv ? ', advantage' : ''}): ${fightTotalStr(keep.total, keep.nat, 20)}`);
+  lines.push(`${captiveName} (**STR** slip${slip.adv ? ', advantage' : ''}): ${fightTotalStr(slip.total, slip.nat, 20)}`);
+  lines.push('');
+  const kept = keep.total >= slip.total;
+  if (kept) {
+    lines.push(`\u{1F91C} **${holderName}** holds fast \u2014 **${captiveName}** is going nowhere.`);
+  } else {
+    const gmap = fightGrapples(fight);
+    delete gmap[heldId];
+    setFightGrapples(gid, cid, gmap);
+    lines.push(`\u{1F4A8} **${captiveName}** twists loose \u2014 the hold is broken!`);
+  }
+  try { noteQuestActivity(gid, cid, 'combat', `${holderName} ${kept ? 'holds' : 'loses'} ${captiveName}`, uid); } catch {}
+  return interaction.reply({ content: lines.join('\n') });
+}
+
 async function runFightEscape({ interaction, gid, cid, actorId, mode }) {
   const uid = interaction.user.id;
   const refuse = (content) => interaction.reply({ content, ephemeral: true });
@@ -17557,7 +17598,7 @@ async function runFightRelease({ interaction, gid, cid, actorId, forceTargetId =
 
 // The answer buttons a fight prompt carries. NPC targets keep their GM hint
 // instead — a button cannot say which NPC it acts for.
-function fightAnswerRows(kind, { forNpc = false } = {}) {
+function fightAnswerRows(kind, { forNpc = false, held = false } = {}) {
   if (forNpc) return [];
   const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
   const B = (id, label, style = ButtonStyle.Primary) => new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style);
@@ -17573,15 +17614,17 @@ function fightAnswerRows(kind, { forNpc = false } = {}) {
   // are answers, so they stay on the cards that ask the question.
   if (kind === 'atk') return [
     new ActionRowBuilder().addComponents(B('fatk:str', '\u{1F4AA} STR'), B('fatk:con', '\u{1FAC0} CON'), B('fatk:dex', '\u26A1 DEX'), B('fatk:wis', '\u{1F9E0} WIS'), B('fatk:lck', '\u{1F340} LCK')),
-    new ActionRowBuilder().addComponents(
-      B('fact:grapple', '\u{1F93C} Grapple', ButtonStyle.Secondary),
+    new ActionRowBuilder().addComponents(...[
+      // Someone already in a hold has no free hands to start one (T,
+      // 2026-08-22) — the rest they may still attempt, at a flat d20.
+      ...(held ? [] : [B('fact:grapple', '\u{1F93C} Grapple', ButtonStyle.Secondary)]),
       B('fact:feint', '\u{1F300} Feint', ButtonStyle.Secondary),
       B('fact:deflect', '\u{1F6E1}\uFE0F Deflect', ButtonStyle.Secondary),
-      B('fact:disarm', '\u2694\uFE0F Disarm', ButtonStyle.Secondary))];
+      B('fact:disarm', '\u2694\uFE0F Disarm', ButtonStyle.Secondary)])];
   // A held fighter, on their own turn: keep the hold or let it go. Escape
   // belongs to the captive, so it is offered on their turn instead.
   if (kind === 'hold') return [new ActionRowBuilder().addComponents(
-    B('fact:hold', '\u{1F91C} Maintain the hold', ButtonStyle.Primary),
+    B('fact:maintain', '\u{1F91C} Maintain the hold (STR)', ButtonStyle.Primary),
     B('grpfree', '\u{1F590}\uFE0F Release', ButtonStyle.Secondary))];
   if (kind === 'escape') return [new ActionRowBuilder().addComponents(
     B('fact:escape', '\u{1F91C} Break free (STR)', ButtonStyle.Primary))];
