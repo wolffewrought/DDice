@@ -1502,6 +1502,25 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     // the player one, and neither belongs to a ruleset.
     // Letting go is one tap from the refusal that mentions it, and the
     // press walks the same release path the command does.
+    // The attacker's turn had no buttons at all: you could answer a blow by
+    // tapping but never throw one (T, 2026-08-22).
+    ok('the four opening abilities have buttons, and answers do not',
+      /B\('fact:grapple'/.test(src) && /B\('fact:feint'/.test(src) &&
+      /B\('fact:deflect'/.test(src) && /B\('fact:disarm'/.test(src) &&
+      /const ACTION_OF = \{ grapple: 'Grapple', feint: 'Feint', deflect: 'Deflect', disarm: 'Disarm', escape: 'Escape' \};/.test(src));
+    ok('a grappler is offered the hold or the release, a captive the break',
+      /if \(kind === 'hold'\) return/.test(src) && /Maintain the hold/.test(src) &&
+      /if \(kind === 'escape'\) return/.test(src) && /Break free \(STR\)/.test(src));
+    ok('maintaining a hold is a declaration, not a roll',
+      /You keep your grip \\u2014 the hold stands/.test(src));
+    ok('there is an attack button row, routed like the defence one',
+      /if \(kind === 'atk'\) return \[/.test(src) &&
+      /B\('fatk:str'/.test(src) &&
+      /startsWith\('fatk:'\)\) \{\s*\n\s*return handleFight\(interaction, \{ sub: 'atk'/.test(src));
+    ok('the announcer offers rows and every fight sender attaches them',
+      /const rowsFor = gmapNow\[id\] \? \['escape', 'atk'\]/.test(src) &&
+      /Object\.values\(gmapNow\)\.includes\(id\) \? \['hold', 'atk'\]/.test(src) &&
+      (src.match(/components: [\w.?]+answerRows \?\? \[\]/g) || []).length >= 5);
     ok('the grapple refusal carries a release button',
       /a grappler cannot strike their captive\. Let go and swing again/.test(src) &&
       /setCustomId\('grpfree'\)/.test(src));

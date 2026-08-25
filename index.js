@@ -12127,11 +12127,25 @@ async function routeButton(interaction) {
       return interaction.reply({ ephemeral: true,
         content: buildCharCard(ch3, nm3, heal3.current, cfg3.heal_charges ?? 3, interaction.guild.id).join('\n') });
     }
-    if (interaction.customId.startsWith('fdef:') || ['fsave', 'finsight', 'fresolve', 'frr'].includes(interaction.customId)) {
+    if (interaction.customId.startsWith('fdef:') || interaction.customId.startsWith('fatk:') || interaction.customId.startsWith('fact:') || ['fsave', 'finsight', 'fresolve', 'frr'].includes(interaction.customId)) {
       // A press walks the exact slash path — the branch's own gates (turn,
       // phase, pending kind, roll ownership, tokens) do all the deciding.
       if (interaction.customId.startsWith('fdef:')) {
         return handleFight(interaction, { sub: 'def', stat: interaction.customId.split(':')[1] });
+      }
+      if (interaction.customId.startsWith('fatk:')) {
+        return handleFight(interaction, { sub: 'atk', stat: interaction.customId.split(':')[1] });
+      }
+      if (interaction.customId.startsWith('fact:')) {
+        const which = interaction.customId.split(':')[1];
+        // 'hold' is a declaration, not a roll: the hold simply persists, so
+        // it says so rather than pretending a die was thrown.
+        if (which === 'hold') {
+          return interaction.reply({ ephemeral: true,
+            content: '\u{1F91C} You keep your grip \u2014 the hold stands. They take their strain at the end of their turn.' });
+        }
+        const ACTION_OF = { grapple: 'Grapple', feint: 'Feint', deflect: 'Deflect', disarm: 'Disarm', escape: 'Escape' };
+        return handleFight(interaction, { sub: 'act', action: ACTION_OF[which] });
       }
       const map = { fsave: 'save', finsight: 'insight', fresolve: 'resolve', frr: 'rr' };
       return handleFight(interaction, map[interaction.customId]);
@@ -15645,7 +15659,22 @@ async function announceNextTurn(guild, gid, cid, lines, order, index) {
     ? `\n_A GM acts for them: \`/fight atk stat:str npc:${nextF.name} target:@player\`_`
     : '\n_\`/fight atk stat:str target:@player\` — or \`/roll dice:2d6+3 fight:true target:@player\` for a custom roll._';
     const state = await fighterStateLine(guild, gid, cid, order[index]);
-lines.push(`\n🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack!${hint}${turnPing(gid, nextF)}${state}`);
+lines.push(`\n\u{1F3AF} **${nextF.name}${nextF.isNpc ? ' \u{1F3AD}' : ''}**'s turn to attack!${hint}${turnPing(gid, nextF)}${state}`);
+  // Whoever sends these lines should offer the attacker their buttons — an
+  // NPC's turn belongs to a GM typing `npc:`, so it gets none.
+  const autoNpc = !!getFight(gid, cid)?.auto_npc;
+  // Which buttons suit this turn: a captive is offered the break, a
+  // grappler is offered the choice T asked for — keep the grip or let go —
+  // and everyone else gets the ordinary attack set (2026-08-22).
+  const fNow = getFight(gid, cid);
+  const gmapNow = fNow ? fightGrapples(fNow) : {};
+  const id = order[index];
+  const rowsFor = gmapNow[id] ? ['escape', 'atk']
+    : Object.values(gmapNow).includes(id) ? ['hold', 'atk']
+    : ['atk'];
+  nextF.answerRows = (nextF.isNpc || autoNpc)
+    ? []
+    : rowsFor.flatMap(k => fightAnswerRows(k)).slice(0, 5);
   return nextF;
 }
 
@@ -16541,7 +16570,7 @@ async function autoResolveExchange(guild, gid, cid, channel) {
   if (!fight || fight.state !== 'active') return false;
 
   const r = await resolveExchange(guild, gid, cid, fight);
-  await sendLong(channel, r.lines);
+  await sendLong(channel, r.lines, { components: r.nextF?.answerRows ?? [] });
   if (r.ended) await announceFightEnd(guild, gid, cid, channel, r.announce);
   return !r.ended;
 }
@@ -16756,7 +16785,7 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
       } else {
         upsertFight(gid, cid, { atk_used: 0 });
       }
-      await interaction.reply({ content: [head, ...res.lines, ...extra].join('\n') });
+      await interaction.reply({ content: [head, ...res.lines, ...extra].join('\n'), components: res.nextF?.answerRows ?? [] });
       return kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
     }
     upsertFight(gid, cid, {
@@ -17058,7 +17087,7 @@ async function runFightInsight({ interaction, gid, cid, actorId, mode }) {
     context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 feint insight` : 'fight · feint insight' });
   const r = await resolveFeintInsight(interaction.guild, gid, cid, fight, { nat, total, mode });
   if (actor.isNpc) {
-    await sendLong(chan, r.lines);
+    await sendLong(chan, r.lines, { components: r.nextF?.answerRows ?? [] });
     await interaction.reply({ content: `✅ Insight rolled as **${actor.name}**.`, ephemeral: true });
   } else {
     await replyLong(interaction, r.lines);
@@ -17096,7 +17125,7 @@ async function runFightGrappleSave({ interaction, gid, cid, actorId, mode }) {
     context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 grapple save` : 'fight · grapple save' });
   const r = await resolveGrappleSave(interaction.guild, gid, cid, fight, { nat, total, mode });
   if (actor.isNpc) {
-    await sendLong(chan, r.lines);
+    await sendLong(chan, r.lines, { components: r.nextF?.answerRows ?? [] });
     await interaction.reply({ content: `✅ Saved as **${actor.name}**.`, ephemeral: true });
   } else {
     await replyLong(interaction, r.lines);
@@ -17172,7 +17201,7 @@ async function runFightEscape({ interaction, gid, cid, actorId, mode }) {
   const order = st.order;
   const shrunk = order.length !== turnOrder.length;
   const nextIndex = nextStandingIndex(order, hpState, floor, shrunk ? fight.turn_index : fight.turn_index + 1);
-  await announceNextTurn(interaction.guild, gid, cid, lines, order, nextIndex);
+  const upNext = await announceNextTurn(interaction.guild, gid, cid, lines, order, nextIndex);
   upsertFight(gid, cid, { phase: 'attack', current_target: null, atk_kind: null,
     atk_roll: null, atk_nat: null, atk_stat: null, def_roll: null, def_nat: null, def_stat: null,
     atk_rerolled: 0, def_rerolled: 0,
@@ -17180,7 +17209,7 @@ async function runFightEscape({ interaction, gid, cid, actorId, mode }) {
     ...(shrunk ? { turn_order: JSON.stringify(order) } : {}) });
 
   if (actor.isNpc) {
-    await sendLong(chan, lines);
+    await sendLong(chan, lines, { components: upNext?.answerRows ?? [] });
     await interaction.reply({ content: `✅ Escape rolled as **${actor.name}**.`, ephemeral: true });
   } else {
     await replyLong(interaction, lines);
@@ -17536,6 +17565,26 @@ function fightAnswerRows(kind, { forNpc = false } = {}) {
   if (kind === 'def') return [
     new ActionRowBuilder().addComponents(B('fdef:str', '💪 STR'), B('fdef:con', '🫀 CON'), B('fdef:dex', '⚡ DEX'), B('fdef:wis', '🧠 WIS'), B('fdef:lck', '🍀 LCK')),
     new ActionRowBuilder().addComponents(rr)];
+// The attacker's turn had no buttons at all until now — you could answer
+  // a blow by tapping but never throw one (T, 2026-08-22). Same five stats,
+  // same shape; the target is asked for by the picker the press opens.
+  // The attacker gets their stats, and beneath them the four abilities that
+  // start something rather than answer it (T, 2026-08-22). Save and Insight
+  // are answers, so they stay on the cards that ask the question.
+  if (kind === 'atk') return [
+    new ActionRowBuilder().addComponents(B('fatk:str', '\u{1F4AA} STR'), B('fatk:con', '\u{1FAC0} CON'), B('fatk:dex', '\u26A1 DEX'), B('fatk:wis', '\u{1F9E0} WIS'), B('fatk:lck', '\u{1F340} LCK')),
+    new ActionRowBuilder().addComponents(
+      B('fact:grapple', '\u{1F93C} Grapple', ButtonStyle.Secondary),
+      B('fact:feint', '\u{1F300} Feint', ButtonStyle.Secondary),
+      B('fact:deflect', '\u{1F6E1}\uFE0F Deflect', ButtonStyle.Secondary),
+      B('fact:disarm', '\u2694\uFE0F Disarm', ButtonStyle.Secondary))];
+  // A held fighter, on their own turn: keep the hold or let it go. Escape
+  // belongs to the captive, so it is offered on their turn instead.
+  if (kind === 'hold') return [new ActionRowBuilder().addComponents(
+    B('fact:hold', '\u{1F91C} Maintain the hold', ButtonStyle.Primary),
+    B('grpfree', '\u{1F590}\uFE0F Release', ButtonStyle.Secondary))];
+  if (kind === 'escape') return [new ActionRowBuilder().addComponents(
+    B('fact:escape', '\u{1F91C} Break free (STR)', ButtonStyle.Primary))];
   if (kind === 'save') return [new ActionRowBuilder().addComponents(B('fsave', '💪 Save (STR)'), rr)];
   if (kind === 'insight') return [new ActionRowBuilder().addComponents(B('finsight', '👁️ Insight (WIS)'), rr)];
   if (kind === 'resolve') return [new ActionRowBuilder().addComponents(B('fresolve', '⚖️ Resolve', ButtonStyle.Success), rr)];

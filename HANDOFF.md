@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 952 assertions passed and no scanner found an ERROR.
+Green means 957 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 952 assertions covering structure, registration and ruleset
+now is 957 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -325,6 +325,42 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 9d · Ability buttons, and the grappler's choice (2026-08-22)
+
+The attack row gained a second line: Grapple · Feint · Deflect · Disarm —
+the four abilities that START something. Save and Insight are ANSWERS and
+stay on the cards that ask for them, which is why they are not here.
+Presses route through handleFight with a forced sub/action, same as the
+stat buttons, so no ability logic is duplicated.
+
+Per T, a grappler now gets a choice on their turn: **Maintain the hold**
+or **Release**. Maintain is a DECLARATION rather than a roll — the hold
+already persists by rule, so the button says so plainly instead of
+inventing a die. The captive gets **Break free (STR)** on their own turn.
+announceNextTurn picks the rows by reading the grapple map: captive gets
+escape+atk, holder gets hold+atk, everyone else atk; capped at Discord's
+five rows.
+
+## 9c · The attacker had no buttons (2026-08-22)
+
+T's screenshot: a feint resolved, the turn passed, and nothing to press.
+Cause, and it is older than any recent change: fightAnswerRows only ever
+built rows for 'def', 'save', 'insight' and 'resolve'. There was no 'atk'
+kind at all — a player could ANSWER a blow by tapping but never throw one.
+Nobody noticed because attack turns usually follow a card that already
+carried buttons.
+
+Added: an 'atk' row (STR/CON/DEX/WIS/LCK) routed exactly like the defence
+row, through handleFight with a forced sub. announceNextTurn now hangs the
+appropriate rows on the fighter it returns (none for NPCs, none when auto
+is on — those turns belong to a GM typing `npc:`), and all five fight
+senders attach them: the 5e reply, the feint path, autoResolveExchange,
+and both chan sends. Rest and quest senders deliberately untouched.
+
+Sandbox note: /home/claude/ddice was wiped mid-session and rebuilt from
+/mnt/user-data/outputs — which worked exactly because every file there is
+current. Worth keeping that habit.
 
 ## 9b · Grapple audited against T's written rule (2026-08-22)
 
