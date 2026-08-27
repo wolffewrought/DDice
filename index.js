@@ -6623,11 +6623,11 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('list').setDescription('Targets still standing in this channel (GM)')),
 
   new SlashCommandBuilder()
-    .setName('dd').setDescription('Speak to a player as the bot \u2014 keeps the game separate from you (GM)')
-    .addUserOption(o=>o.setName('user').setDescription('Who to write to').setRequired(true))
+    .setName('dd').setDescription('Speak as the bot \u2014 keeps the game separate from you (GM)')
     .addStringOption(o=>o.setName('message').setDescription('What to say').setRequired(true))
     .addStringOption(o=>o.setName('as').setDescription('Speak as an NPC instead of the GMs').setRequired(false).setAutocomplete(true))
-    .addBooleanOption(o=>o.setName('quiet').setDescription('true = do not name which GM sent it').setRequired(false)),
+    .addUserOption(o=>o.setName('user').setDescription('Someone to address by name').setRequired(false))
+    .addChannelOption(o=>o.setName('channel').setDescription('Somewhere other than here').setRequired(false)),
 ];
 
 // ─────────────────────────────────────────────
@@ -16135,39 +16135,41 @@ async function handleTitles(interaction, group) {
 // always says who it is — the Game Masters, or a named NPC — and never
 // pretends to be the player's friend.
 async function handleDd(interaction) {
+  // Speaking AS the bot, in the room (T, 2026-08-22). The point is still
+  // separation — when a GM also plays a character, words from their own
+  // account blur the two — but the words belong in the scene, not in a DM.
   const gid = interaction.guild.id;
   if (!(await isGm(interaction.guild, interaction.user.id)))
-    return interaction.reply({ content: '\u274C Only GMs can write as the bot.', ephemeral: true });
-  const target = interaction.options.getUser('user');
+    return interaction.reply({ content: '\u274C Only GMs can speak as the bot.', ephemeral: true });
   const message = interaction.options.getString('message').trim();
   const asNpc = (interaction.options.getString('as') || '').trim();
-  const quiet = !!interaction.options.getBoolean('quiet');
+  const target = interaction.options.getUser('user');
+  const where = interaction.options.getChannel('channel') || interaction.channel;
   if (asNpc && !getNpc(gid, asNpc))
     return interaction.reply({ ephemeral: true, content: `\u274C No NPC called **${asNpc}**.` });
+  if (!where?.send) return interaction.reply({ ephemeral: true, content: '\u274C I cannot speak there.' });
 
   const npc = asNpc ? getNpc(gid, asNpc) : null;
+  const head = npc ? `\u{1F3AD} **${npc.name}**` : '\u{1F4DC} **The Game Masters**';
+  const body = [
+    target ? `${head} \u2014 <@${target.id}>` : head,
+    '',
+    message.slice(0, 1800),
+  ].join('\n');
+
+  const sent = await where.send({ content: body,
+    allowedMentions: target ? { users: [target.id] } : { parse: [] } }).catch(() => null);
+
+  // Who said it is kept in the audit book, never in the room \u2014 the whole
+  // point is that the table hears the game, not the person running it.
   const gmName = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'a GM');
-  const head = npc
-    ? `\u{1F3AD} **${npc.name}** \u2014 _from ${interaction.guild.name}_`
-    : `\u{1F4DC} **The Game Masters of ${interaction.guild.name}**`;
-  // Who sent it is on the message unless the GM asks otherwise; even then
-  // the audit book keeps it, because an unattributable channel to players
-  // is a bad thing to build.
-  const foot = quiet
-    ? '_Sent through DDice. Reply in the game\'s channels \u2014 this message cannot be answered here._'
-    : `_Sent through DDice by **${gmName}**. Reply in the game\'s channels \u2014 this message cannot be answered here._`;
-
-  const sentDm = await target.send({ content: [head, '', message.slice(0, 1700), '', foot].join('\n') })
-    .then(() => true).catch(() => false);
-
   sendRollAudit(interaction.client, gid,
-    `\u{1F4EC} DD \u2014 **${gmName}** \u2192 <@${target.id}>${npc ? ` as **${npc.name}**` : ''}: ${message.slice(0, 120)}${message.length > 120 ? '\u2026' : ''}`);
+    `\u{1F4EC} DD \u2014 **${gmName}** in <#${where.id}>${npc ? ` as **${npc.name}**` : ''}: ${message.slice(0, 120)}${message.length > 120 ? '\u2026' : ''}`);
 
-  return interaction.reply({ ephemeral: true, content: sentDm
-    ? `\u2705 Sent to <@${target.id}>${npc ? ` as **${npc.name}**` : ''}.`
-    : `\u274C <@${target.id}> has DMs closed \u2014 nothing was delivered.` });
+  return interaction.reply({ ephemeral: true, content: sent
+    ? `\u2705 Said in <#${where.id}>${npc ? ` as **${npc.name}**` : ''}.`
+    : '\u274C I could not post there \u2014 check my permissions in that channel.' });
 }
-
 async function handleTarget(interaction) {
   const gid = interaction.guild.id;
   if (!(await isGm(interaction.guild, interaction.user.id)))

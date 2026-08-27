@@ -1025,12 +1025,14 @@ function testBuilders(src) {
       cmds.length === 21 && cmds.some(c => c.name === 'target') && cmds.some(c => c.name === 'dd'));
     // A GM writing as the bot: always says who it is, and the audit book
     // keeps the attribution even when the message does not.
-    ok('/dd names its sender, or the audit does',
+    // (rewritten 2026-08-22: T asked for /dd to speak in the room, not in DMs.)
+    ok('/dd speaks in a channel and keeps the sender in the audit only',
       /async function handleDd\(interaction\)/.test(src) &&
-      /Sent through DDice by \*\*\$\{gmName\}\*\*/.test(src) &&
-      /sendRollAudit\(interaction\.client, gid,\s*\n\s*`\\u\{1F4EC\} DD/.test(src));
+      /const where = interaction\.options\.getChannel\('channel'\) \|\| interaction\.channel;/.test(src) &&
+      /\\u\{1F4EC\} DD \\u2014 \*\*\$\{gmName\}\*\* in <#\$\{where\.id\}>/.test(src) &&
+      !/user\.send\(\{ content: \[head/.test(src));
     ok('/dd is GM-only and refuses an unknown NPC voice',
-      /Only GMs can write as the bot/.test(src) && /No NPC called \*\*\$\{asNpc\}\*\*/.test(src));
+      /Only GMs can speak as the bot/.test(src) && /No NPC called \*\*\$\{asNpc\}\*\*/.test(src));
     // Temporary targets: no sheet, no roster, no HP — the GM's verdict is
     // the death check, asked in-channel or in the GM channel with `secret`.
     // Schema ordering: an ALTER above its own CREATE fails into its catch

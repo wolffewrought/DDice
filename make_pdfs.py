@@ -1461,7 +1461,7 @@ CONTENT = [
           ('/button group stat:wis dc:12 reason:\u2026', 'one check the whole party rolls \u2014 each presses once, the\nmessage keeps the tally, and \u2696\ufe0f Call it closes the scene\nwith how many got through (GM)'),
           ('/target create name:Barricade stat:str dc:12', 'plant something to swing at \u2014 no sheet, no roster. Each\nhit rolls publicly, then asks YOU whether it falls;\nsecret:true asks in the GM channel instead (GM)'),
           ('/target list', 'what still stands in this channel (GM)'),
-          ('/dd user:@a message:\u2026 as:Garrick Vale', 'write to a player AS THE BOT \u2014 so a GM who also plays\na character never blurs the two; names the sender unless\nquiet:true, and the roll-audit keeps it either way (GM)'),
+          ('/dd message:\u2026 as:Garrick Vale user:@a channel:#x', 'speak AS THE BOT in the room \u2014 so a GM who also plays a\ncharacter never blurs the two. Posts where you type unless\nyou name a channel; user: addresses someone by name. Who\nsaid it is kept in the roll-audit, not in the room (GM)'),
           ('/button feedback', 'plant a feedback button in this channel (GM)'),
           ('/feedback category add|remove|list', 'the rooms feedback lands in \u2014 seven to begin with;\nadd your own and its thread opens at once (GM)'),
           ('/gm check run', 'build anything missing AND sweep every channel\u2019s\npermissions, repairing what it can \u2014 never moves or renames\nanything; names what only you can grant (GM)'),

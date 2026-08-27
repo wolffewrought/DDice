@@ -326,6 +326,21 @@ place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
 
+## 9f · /dd speaks in the room (2026-08-22)
+
+T: it should post wherever they type it, not DM players. Rewritten:
+`/dd message: [as:] [user:] [channel:]` posts in the current channel (or
+one you name) headed either 'The Game Masters' or a named NPC; `user:`
+addresses someone by mention rather than writing to them privately. The
+DM path is gone entirely.
+
+Attribution flipped with it, deliberately: the old DM named the GM in its
+footer for accountability, but a PUBLIC bot-voice message naming the GM
+would defeat the whole point of speaking as the bot. So the room hears the
+game; the roll-audit records who said it, where, and as whom. Hidden from
+the table, never from the record — the same principle as `quiet:`, which
+is now redundant and removed.
+
 ## 9e · Grapple buttons, corrected to T's intent (2026-08-22)
 
 Two changes T asked for after seeing what I had built.
