@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 958 assertions passed and no scanner found an ERROR.
+Green means 962 assertions passed and no scanner found an ERROR.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -166,7 +166,7 @@ command. Flagged as a NOTE, not a failure.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
-now is 958 assertions covering structure, registration and ruleset
+now is 962 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
 quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
 
@@ -325,6 +325,89 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 9j · Books audited against the code (2026-08-22)
+
+T asked whether the PDFs still match the commands and read properly.
+Checked three ways.
+
+CONSISTENCY: extracted all 146 command forms taught across the books and
+looked each one up in index.js — every command name and every leaf name
+resolves. Two apparent gaps ('leaderboard', 'pass') and two apparent
+phantoms ('/mnt', '/usr') were all artefacts of my extraction: the first
+pair are nested leaves my depth-check mis-read, the second pair are file
+paths inside make_pdfs.py itself.
+
+GRAMMAR: swept 397 printed rows and prose blocks for doubled words, double
+spaces, space-before-punctuation, missing spaces after full stops,
+unbalanced brackets and unclosed bold. Five hits, all false: brackets that
+close through `+ GM +` concatenation, and a line-break marker read as a
+space.
+
+RENDERED OUTPUT: read all eight built PDFs back with pdftotext and
+searched for unrendered ${placeholders}, raw \\uXXXX escapes, doubled
+words and unclosed brackets. Clean — the one flag was a bracket wrapping
+across a line in the extracted text, not in the page.
+
+Verdict: books and code agree, and nothing reads wrongly. No changes made,
+which is the right outcome for an audit that finds nothing.
+
+## 9i · Audit: maintain never ended the turn (2026-08-22)
+
+963 assertions, 13 probes, warnings 19 (all documented; /gm pages joined
+the fall-through class, which is expected).
+
+ONE REAL BUG, found by reading rather than trusting: `runFightMaintain`
+rolled, judged and replied — and then RETURNED. It never spent the turn,
+never applied the end-of-turn strain, and never advanced turn_index. A
+grappler pressing 'Maintain the hold' would have stalled the fight on
+their own turn and spared the captive their wound. Fixed by mirroring
+Escape's closing sequence exactly (applyTurnEndStrain, nextStandingIndex,
+announceNextTurn, the upsert, kickAutoIfNpcTurn), and pinned so the tail
+cannot be lost again.
+
+Everything else verified: maxHp/autoRoll/hasSignatureAdvantage/
+fightTotalStr all called with their real signatures; showRoster is
+GM-gated and defers before its per-player loop; /dd refuses a channel it
+cannot speak in (a category, say); the rest returns all five buckets; the
+autorest `who` view inherits /config's Discord-level ManageGuild gate,
+like every sibling action.
+
+## 9h · /gm check roster (2026-08-22)
+
+T asked for one place to see every player and what is holding them.
+`showRoster` lists each character with HP and their state: fallen, the
+QUEST BY NUMBER AND NAME, and the FIGHT BY CHANNEL LINK — not merely 'on
+a quest'. Green means free, red means the next rest will pass them over,
+which ties this straight to the healing complaint that prompted it.
+`busy:true` narrows it to those tied up. It reads the same tables
+questBusyUsers and fightBusyUsers read, so the roster and the rest can
+never disagree.
+
+Budget note: /gm hit 6288 against the 6200 tripwire. Rather than raise the
+line a second time, four wordy `check` descriptions were tightened — same
+meaning, fewer characters — bringing it to 6183. The tripwire has now paid
+for itself twice by forcing prose discipline instead of sprawl.
+
+## 9g · Why some players were never healed (2026-08-22)
+
+T: players not being healed though not in a quest or fight. Diagnosis:
+runAutoRest has FIVE outcomes but only announced three. `died_at` skipped
+silently — the fallen do not recover, which is correct, but nothing said
+so — and anyone already at full HP/rerolls fell through without being
+pushed to any bucket. From a player's chair both look identical to being
+forgotten.
+
+Now counted and said: 'Fallen, and beyond a rest's help: N — names' and
+'Already whole, nothing to restore: N'.
+
+The other half is worse and needed a tool: questBusyUsers and
+fightBusyUsers exclude anyone in a quest with status='active' or a fight
+with state='active' — and BOTH are indefinite. A run abandoned rather
+than completed, or a fight never ended, holds its people out of every rest
+forever. `/config mechanics autorest action:Who is excluded` now names
+every excluded player with the reason, plus the quests and fights doing
+the holding, and says how to release them.
 
 ## 9f · /dd speaks in the room (2026-08-22)
 

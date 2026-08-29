@@ -1517,7 +1517,11 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('maintaining a hold is an opposed STR roll, ties keeping the hold',
       /async function runFightMaintain\(interaction\)/.test(src) &&
       /const kept = keep\.total >= slip\.total;/.test(src) &&
-      /twists loose \\u2014 the hold is broken/.test(src));
+      /twists loose \\u2014 the hold is broken/.test(src) &&
+      // Keeping a grip spends the turn; the first cut returned early and
+      // stalled the fight (audit, 2026-08-22).
+      /async function runFightMaintain[\s\S]{0,3000}?applyTurnEndStrain\(interaction\.guild, gid, cid, hpState/.test(src) &&
+      /async function runFightMaintain[\s\S]{0,3600}?turn_index: nextIndex/.test(src));
     ok('a held fighter is offered no Grapple button',
       /\.\.\.\(held \? \[\] : \[B\('fact:grapple'/.test(src) &&
       /fightAnswerRows\(k, \{ held: isHeld \}\)/.test(src));
@@ -1543,6 +1547,25 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('the player channel receives its pair, not one file',
       /const playerFiles = await fetchDocFiles\(st, \[docPlayerFileFor\(gid\), 'DDice-Examples-Player\.pdf'\]\)/.test(src) &&
       /files: playerFiles,/.test(src));
+    // Nobody should be silently passed over by a rest: the fallen and the
+    // already-whole are counted and said, and `who` names every exclusion.
+    ok('the rest says who it passed over and why',
+      /const restored = \[\], skipped = \[\], inFight = \[\], fallen = \[\], already = \[\];/.test(src) &&
+      /if \(ch\.died_at\) \{ fallen\.push\(name\); continue; \}/.test(src) &&
+      /else already\.push\(name\);/.test(src) &&
+      /Fallen, and beyond a rest's help/.test(src) &&
+      /Already whole, nothing to restore/.test(src));
+    // One page answering 'where is everybody?', reading the same sources
+    // the rest reads so the two can never disagree.
+    ok('the roster names the quest and the fight holding each player',
+      /async function showRoster\(interaction\)/.test(src) &&
+      /questOf\.set\(r\.user_id, `#\$\{String\(r\.number\)\.padStart\(3, '0'\)\} \$\{r\.name\}`\)/.test(src) &&
+      /fightOf\.set\(fid, f\.channel_id\)/.test(src) &&
+      /Red means a rest will pass them over/.test(src));
+    ok('a GM can ask who the rest will exclude',
+      /if \(action === 'who'\)/.test(src) &&
+      /Active quests holding people/.test(src) &&
+      /Active fights holding people/.test(src));
     ok('the rest clock is hour-aligned everywhere it is read or written',
       /const floorHour = \(ms\) => Math\.floor\(ms \/ 3600000\) \* 3600000;/.test(src) &&
       /floorHour\(Date\.now\(\)\) < floorHour\(last\) \+ hours \* 3600 \* 1000/.test(src) &&

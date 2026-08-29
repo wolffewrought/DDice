@@ -2751,12 +2751,15 @@ async function runAutoRest(guild, sc) {
   const busy = questBusyUsers(gid);
   const fighting = fightBusyUsers(gid);
   const sheets = db.prepare('SELECT * FROM characters WHERE guild_id=?').all(gid);
-  const restored = [], skipped = [], inFight = [];
+  // Two states used to vanish without a word — the fallen, and anyone
+  // already at full. Both look identical to a player who thinks the rest
+  // has forgotten them (T, 2026-08-22), so both are counted and said.
+  const restored = [], skipped = [], inFight = [], fallen = [], already = [];
   for (const ch of sheets) {
     const name = await getDisplayName(guild, ch.user_id);
     // The fallen do not recover. Healing them to full while still dead leaves a
     // character in a state the rest of the bot can't read.
-    if (ch.died_at) continue;
+    if (ch.died_at) { fallen.push(name); continue; }
     if (busy.has(ch.user_id)) { skipped.push(name); continue; }
     if (fighting.has(ch.user_id)) { inFight.push(name); continue; }
     const updates = {};
@@ -2772,6 +2775,7 @@ async function runAutoRest(guild, sc) {
     // A schedule that touches nothing shouldn't claim to have restored anyone —
     // a charges-only rest was listing every player on the server.
     if (Object.keys(updates).length || healed) restored.push(name);
+    else already.push(name);
   }
 
   // NPCs rest too. They have only HP — no rerolls, no heal charges — so a
@@ -2803,7 +2807,7 @@ async function runAutoRest(guild, sc) {
     if (upd.hp_current !== undefined) setFighterHp(gid, npcFighterId(npc.name), upd.hp_current);
     restored.push(`${npc.name} 🎭`);
   }
-  return { restored, skipped, inFight };
+  return { restored, skipped, inFight , fallen, already };
 }
 
 // Post the result where the GM asked for it, if anywhere.
@@ -2818,7 +2822,16 @@ async function announceAutoRest(guild, sc, result) {
   }
   if (result.skipped.length) {
     lines.push(`🎒 Out on a quest, left as they are: **${result.skipped.length}** — ${result.skipped.join(', ')}`);
+
   }
+  // The two silent cases, now said out loud: a fallen character is not
+  // forgotten, they are dead; and someone already at full has nothing to
+  // restore. Both used to look like the rest had overlooked them.
+  if (result.fallen?.length) {
+    lines.push(`\u26B0\uFE0F Fallen, and beyond a rest's help: **${result.fallen.length}** \u2014 ${result.fallen.join(', ')}`);
+  }
+  if (result.already?.length) {
+    lines.push(`\u2705 Already whole, nothing to restore: **${result.already.length}**`);  }
   try {
     const ch = await guild.client.channels.fetch(sc.channel);
     await sendLong(ch, lines);
@@ -5575,12 +5588,14 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('questwipe').setDescription('Delete EVERY quest on this server — confirm-gated (GM)')
       .addBooleanOption(o=>o.setName('runs').setDescription('true = also erase the run ledger and DM guided-counters (default: history kept)').setRequired(false)))
     .addSubcommandGroup(g => { g.setName('check').setDescription('Setup health \u2014 inspect, repair, rebuild');
-      g.addSubcommand(s=>s.setName('status').setDescription('Which channels and forums are set up, and what is missing'));
-      g.addSubcommand(s=>s.setName('run').setDescription('Build anything missing \u2014 new books and tags, nothing destroyed'));
-      g.addSubcommand(s=>s.setName('build').setDescription('Make every channel and forum the bot needs, wire and fill them'));
+      g.addSubcommand(s=>s.setName('status').setDescription('What is set up, and what is missing'));
+      g.addSubcommand(s=>s.setName('run').setDescription('Build anything missing \u2014 nothing destroyed'));
+      g.addSubcommand(s=>s.setName('build').setDescription('Make every channel and forum, wired and filled'));
       g.addSubcommand(s=>s.setName('restart').setDescription('DELETE every channel the bot set up, then build fresh'));
-      g.addSubcommand(s=>s.setName('order').setDescription('The sidebar order \u2014 prompts to re-apply or keep yours'));
+      g.addSubcommand(s=>s.setName('order').setDescription('The sidebar order \u2014 re-apply, or keep yours'));
       g.addSubcommand(s=>s.setName('migrations').setDescription('Every one-time reshape and the counts it stamped'));
+      g.addSubcommand(s=>s.setName('roster').setDescription('Where every player is (GM)')
+        .addBooleanOption(o=>o.setName('busy').setDescription('Only those tied up').setRequired(false)));
       g.addSubcommand(s=>s.setName('pages').setDescription('Rebuild character pages (GM)')
         .addUserOption(o=>o.setName('user').setDescription('Just this one').setRequired(false)));
       g.addSubcommand(s=>s.setName('portraits').setDescription('Move stored NPC faces into their category threads'));
@@ -5762,7 +5777,7 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('autorest').setDescription('Scheduled recovery: named schedules, each with its own timing and strength')
       .addStringOption(o=>o.setName('action').setDescription('What to do').setRequired(false)
         .addChoices({name:'List',value:'list'},{name:'Add or update',value:'set'},{name:'Remove',value:'remove'},
-                    {name:'Run now',value:'run'},{name:'Pause',value:'pause'},{name:'Resume',value:'resume'}))
+                    {name:'Run now',value:'run'},{name:'Pause',value:'pause'},{name:'Resume',value:'resume'},{name:'Who is excluded',value:'who'}))
       .addStringOption(o=>o.setName('name').setDescription('Schedule name, e.g. Breather or Full Recovery').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('hours').setDescription('How often, in hours (default 6)').setRequired(false).setMinValue(1).setMaxValue(720))
       .addStringOption(o=>o.setName('hp').setDescription('HP restored: 100%, 50%, a flat number, or 0% to skip').setRequired(false))
@@ -8123,6 +8138,31 @@ async function handleConfig(interaction, forced) {
       + (sc.channel ? ` · <#${sc.channel}>` : '')
       + (sc.enabled ? '' : ' · ⏸️ **paused**')
       + (sc.last_run ? `\n   next <t:${Math.floor((floorHour(sc.last_run) + sc.hours * 3600 * 1000) / 1000)}:R>` : '');
+
+    if (action === 'who') {
+      // A rest is only understood by seeing who it will pass over. Both
+      // exclusions are indefinite: an abandoned quest or a fight left active
+      // holds its people out forever (T, 2026-08-22).
+      const busyW = questBusyUsers(gid), fightW = fightBusyUsers(gid);
+      const rowsW = db.prepare('SELECT user_id, died_at FROM characters WHERE guild_id=?').all(gid);
+      const outW = [];
+      for (const r of rowsW) {
+        const nm = await getDisplayName(interaction.guild, r.user_id).catch(() => r.user_id);
+        if (r.died_at) outW.push(`\u26B0\uFE0F **${nm}** \u2014 fallen`);
+        else if (busyW.has(r.user_id)) outW.push(`\u{1F5FA}\uFE0F **${nm}** \u2014 on an active quest`);
+        else if (fightW.has(r.user_id)) outW.push(`\u2694\uFE0F **${nm}** \u2014 in an active fight`);
+      }
+      const staleQ = db.prepare("SELECT number, name FROM quests WHERE guild_id=? AND status='active' ORDER BY number").all(gid);
+      const staleF = db.prepare("SELECT channel_id FROM fights WHERE guild_id=? AND state='active'").all(gid);
+      return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] }, content: [
+        outW.length ? '\u{1F6AB} **The rest will pass these over**' : '\u2705 Nobody is excluded \u2014 every sheet will be restored.',
+        ...outW,
+        '',
+        staleQ.length ? `\u{1F5FA}\uFE0F Active quests holding people: ${staleQ.map(q => `#${q.number} ${q.name}`).join(', ')}` : '',
+        staleF.length ? `\u2694\uFE0F Active fights holding people: ${staleF.map(f => `<#${f.channel_id}>`).join(', ')}` : '',
+        (staleQ.length || staleF.length) ? '_Complete the quest, or `/fight end`, to release them._' : '',
+      ].filter(Boolean).join('\n').slice(0, 1900) });
+    }
 
     if (action === 'list') {
       const all = listSchedules(gid);
@@ -11621,6 +11661,7 @@ async function handleCheck(interaction) {
   const opt = (name) => checkLeaf ? checkLeaf === name : !!interaction.options?.getBoolean?.(name);
   // `run:true` builds whatever the code knows about and this server hasn't
   // got yet — the one switch to pull after an update adds a book.
+  if (opt('roster')) return showRoster(interaction);
   if (opt('pages')) return rebuildCharPages(interaction);
   if (opt('portraits')) return runPortraitMigration(interaction);
   if (opt('migrations')) {
@@ -17174,7 +17215,30 @@ async function runFightMaintain(interaction) {
     lines.push(`\u{1F4A8} **${captiveName}** twists loose \u2014 the hold is broken!`);
   }
   try { noteQuestActivity(gid, cid, 'combat', `${holderName} ${kept ? 'holds' : 'loses'} ${captiveName}`, uid); } catch {}
-  return interaction.reply({ content: lines.join('\n') });
+
+  // Keeping a grip IS the grappler's action, so the turn is spent and the
+  // end-of-turn strain lands — exactly as Escape spends the captive's. The
+  // first cut of this returned here and stalled the fight (audit, same day).
+  const hpState = fightHp(fight);
+  const floor = fightFloor(fight);
+  const chan = await interactionChannel(interaction);
+  const st = await applyTurnEndStrain(interaction.guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, actorId);
+  if (st.endedRet) {
+    await replyLong(interaction, st.endedRet.lines);
+    return announceFightEnd(interaction.guild, gid, cid, chan, st.endedRet.announce);
+  }
+  const order = st.order;
+  const shrunk = order.length !== turnOrder.length;
+  const nextIndex = nextStandingIndex(order, hpState, floor, shrunk ? fight.turn_index : fight.turn_index + 1);
+  const upNext = await announceNextTurn(interaction.guild, gid, cid, lines, order, nextIndex);
+  upsertFight(gid, cid, { phase: 'attack', current_target: null, atk_kind: null,
+    atk_roll: null, atk_nat: null, atk_stat: null, def_roll: null, def_nat: null, def_stat: null,
+    atk_rerolled: 0, def_rerolled: 0,
+    turn_index: nextIndex, hp_state: JSON.stringify(hpState),
+    ...(shrunk ? { turn_order: JSON.stringify(order) } : {}) });
+  await replyLong(interaction, lines);
+  await kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
+  return;
 }
 
 async function runFightEscape({ interaction, gid, cid, actorId, mode }) {
@@ -22013,6 +22077,56 @@ async function bootMend(client) {
 // posted fresh in order. Players' own messages are never touched \u2014 the
 // author check is the whole safety of it. Reports what it found, so a
 // thread that refuses to clean tells us why (T's duplicates, 2026-08-19).
+// One page answering "where is everybody?" — the question a GM asks when
+// a session starts, a rest misfires, or someone says they were skipped
+// (T, 2026-08-22). Reads the same sources the rest does, so it can never
+// disagree with what the rest actually did.
+async function showRoster(interaction) {
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '\u274C The roster is for GMs.', ephemeral: true });
+  await interaction.deferReply({ ephemeral: true });
+  const gid = interaction.guild.id;
+  const onlyBusy = !!interaction.options.getBoolean('busy');
+
+  // Which quest, by name, rather than merely "a quest".
+  const questOf = new Map();
+  for (const r of db.prepare(`SELECT m.user_id, q.number, q.name FROM quest_members m
+                              JOIN quests q ON q.guild_id = m.guild_id AND q.number = m.number
+                              WHERE m.guild_id=? AND m.state='party' AND q.status='active'`).all(gid)) {
+    questOf.set(r.user_id, `#${String(r.number).padStart(3, '0')} ${r.name}`);
+  }
+  const fightOf = new Map();
+  for (const f of db.prepare("SELECT channel_id, turn_order FROM fights WHERE guild_id=? AND state='active'").all(gid)) {
+    let order = [];
+    try { order = JSON.parse(f.turn_order || '[]'); } catch {}
+    for (const fid of order) if (!isNpcFighter(fid)) fightOf.set(fid, f.channel_id);
+  }
+
+  const rows = db.prepare('SELECT * FROM characters WHERE guild_id=? ORDER BY rowid').all(gid);
+  const lines = [];
+  let free = 0;
+  for (const ch of rows) {
+    const nm = await getDisplayName(interaction.guild, ch.user_id).catch(() => ch.user_id);
+    const hp = `${ch.hp_current ?? 0}/${maxHp(ch, gid)}`;
+    const where = [];
+    if (ch.died_at) where.push('\u26B0\uFE0F fallen');
+    if (questOf.has(ch.user_id)) where.push(`\u{1F5FA}\uFE0F ${questOf.get(ch.user_id)}`);
+    if (fightOf.has(ch.user_id)) where.push(`\u2694\uFE0F <#${fightOf.get(ch.user_id)}>`);
+    const held = where.length > 0;
+    if (!held) free++;
+    if (onlyBusy && !held) continue;
+    lines.push(`${held ? '\u{1F534}' : '\u{1F7E2}'} **${nm}** \u2014 \u2764\uFE0F ${hp}${where.length ? ` \u00b7 ${where.join(' \u00b7 ')}` : ' \u00b7 free'}`);
+  }
+  if (!rows.length) return interaction.editReply({ content: '\u{1F464} No characters on this server yet.' });
+
+  const head = onlyBusy
+    ? `\u{1F464} **Tied up right now** \u2014 ${rows.length - free} of ${rows.length}`
+    : `\u{1F464} **The roster** \u2014 ${rows.length} character${rows.length === 1 ? '' : 's'}, ${free} free`;
+  const body = [head, '', ...(lines.length ? lines : ['\u2705 Everyone is free.']), '',
+    '_Red means a rest will pass them over. Complete the quest, or `/fight end`, to release them._'];
+  return interaction.editReply({ allowedMentions: { parse: [] }, content: body.join('\n').slice(0, 1900) });
+}
+
 async function rebuildCharPages(interaction) {
   if (!(await isGm(interaction.guild, interaction.user.id)))
     return interaction.reply({ content: '\u274C The setup check is for GMs.', ephemeral: true });
