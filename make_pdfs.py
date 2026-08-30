@@ -1492,6 +1492,7 @@ CONTENT = [
           ('/quest runs number:1', 'the run ledger for a quest and all its instances:\nhow many times it has been completed, and each\nrun\u2019s date, GM, party and NPCs'),
           ('/quest run note number:1 text:... public:true', 'log a moment \u2014 planning-thread mirror by default;\npublic:true posts it in the board thread too'),
           ('/quest party approve number:1 user:@a force:true', 'approve · under spin-off this STAGES them on the\nlisting until you launch · force past a hard cap'),
+          ('(one quest at a time)', 'a player may hold only one seat: approving someone\nalready on a live run is refused, and a launch leaves them\nan applicant rather than double-booking them'),
           ('/quest start number:1 (listing)', 'the launch: the whole staged group becomes one run\nwith its own thread and clock \u2014 or press \U0001F680 on the post'),
           ('/fight end all:true', 'end every active fight on the server at once \u2014\nrecaps post in their channels; HP states persist'),
           ('/instance add name:X [run:] user:@a', 'seat a player on a run \u2014 name autocompletes your\nlistings, run blank = the latest active one'),
@@ -1510,6 +1511,7 @@ CONTENT = [
           ('/quest run complete number:1 summary:\u2026', 'add your telling \u2014 it lands in each adventurer\u2019s thread in\nquest-chronicle; timings, events and payouts go to the\nGM-only gm-quest-log instead'),
           ('/quest run log number:1 text:\u2026', 'write or rewrite the tale afterwards \u2014 it is mirrored into\nevery adventurer\u2019s own chronicle thread, and rewriting edits\neach copy in place (GM)'),
           ('/quest run recap number:1', 'drafts a \u201cpreviously on\u2026\u201d from everything logged \u2014\nprivate to you; add post:true to read it to the party (GM)'),
+          ('/quest run winddown number:1', 'the story is over but the rewards are not settled:\nthe run stays live, its thread and log intact, but the\nparty is released to the rests while you decide.\nresume:true puts it back to running (GM)'),
           ('/quest delete number:1', 'remove a quest permanently: its board thread or\npost and its planning thread (applications and\nnotes included) and the party\u2019s room are deleted\nwith it \u2014 and any instances of it go the same way,\nthreads and all. A fight still running in the room\nis stood down first. If the quest is live, the\nconfirmation says so before you commit: the clock\nstops and the party is released. Its number returns\nto the pool: the next quest created takes the\nlowest free number, reborn with a clean history\n(the run ledger keeps counting for DM credit but\nno longer answers to that number)')]),
 ('note', 'Every <b>number:</b> option across /quest autocompletes \u2014 start typing a number or part of a name '
          'and the matching quests appear as \u201c#012 \u2014 Goblin Cave (open)\u201d.'),

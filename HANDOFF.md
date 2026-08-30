@@ -326,6 +326,44 @@ place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
 
+## 9l · A third quest state: winding down (2026-08-22)
+
+T asked whether a PAUSED quest lets its party heal. It does not — pause
+stops the clock and the logging but leaves status='active', so the rest
+still passes everyone over. Rather than change what pause means (a run
+paused mid-fight overnight should NOT heal), T asked for a third state.
+
+`quests.winding_down` (INTEGER, default 0) and `/quest run winddown
+number: [resume:]`. The run stays active in every other respect — thread,
+log, numbers, timeline — but questBusyUsers now excludes its party via
+`COALESCE(q.winding_down, 0) = 0`, so they are healed by the next rest
+while the GM settles rewards. Announced in the run thread both ways, and
+completion clears the flag along with everything else.
+
+The roster shows it distinctly: a winding-down run is listed with a
+resting mark rather than counted as holding anyone, so 'who is free?'
+stays truthful.
+
+## 9k · One quest at a time, enforced (2026-08-22)
+
+T asked how to take players off a deleted quest, and restated the rule
+that a player may only be on one quest at a time.
+
+Deletion was already correct: deleteQuest clears quest_members,
+quest_events and quest_summaries before removing the row, so a deleted
+quest releases its party. Anyone still held is on a quest that is ACTIVE,
+not deleted — `/gm check roster` names it, `/quest party kick` frees one
+player.
+
+The RULE, though, was nowhere in the code. Nothing stopped a player being
+seated on two live runs, which also held them out of rests twice over.
+Now `questAlreadyOn(gid, uid, except)` answers with the offending quest,
+and both seating paths respect it: `/quest party approve` refuses with the
+clash named and the kick command to fix it; a launch leaves a clashing
+player as an APPLICANT rather than seating them, and says so in the run
+thread so the demotion is never silent. Applying stays free — a hand up
+anywhere is fine; only the seat is exclusive.
+
 ## 9j · Books audited against the code (2026-08-22)
 
 T asked whether the PDFs still match the commands and read properly.

@@ -711,6 +711,10 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN char_forum TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_char_forum TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_forum TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_log_gm TEXT'); } catch {}
+// A third state between running and finished (T, 2026-08-22): the story is
+// over, the GM is still deciding rewards, and the party should be resting
+// while they wait rather than bleeding on the books.
+try { db.exec('ALTER TABLE quests ADD COLUMN winding_down INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_routes TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_cats TEXT'); } catch {}
 try { db.exec('ALTER TABLE char_pages ADD COLUMN inv_msg_id TEXT'); } catch {}
@@ -1127,6 +1131,19 @@ function getQuestMembers(gid, number, state) {
   if (state) return db.prepare('SELECT user_id FROM quest_members WHERE guild_id=? AND number=? AND state=?').all(gid, number, state).map(r => r.user_id);
   return db.prepare('SELECT user_id, state FROM quest_members WHERE guild_id=? AND number=?').all(gid, number);
 }
+// One quest at a time (T's rule, enforced 2026-08-22). Applying is free —
+// a player may put their hand up anywhere — but being SEATED on a run is
+// exclusive: this answers with the quest already holding them, so a GM can
+// see the conflict rather than wonder why an approval did nothing.
+function questAlreadyOn(gid, uid, exceptNumber = null) {
+  const row = db.prepare(`SELECT q.number, q.name FROM quest_members m
+                          JOIN quests q ON q.guild_id = m.guild_id AND q.number = m.number
+                          WHERE m.guild_id=? AND m.user_id=? AND m.state='party'
+                            AND q.status='active' AND q.number != ?
+                          LIMIT 1`).get(gid, uid, exceptNumber ?? -1);
+  return row || null;
+}
+
 function setQuestMember(gid, number, uid, state) {
   const ex = db.prepare('SELECT user_id FROM quest_members WHERE guild_id=? AND number=? AND user_id=?').get(gid, number, uid);
   if (ex) db.prepare('UPDATE quest_members SET state=? WHERE guild_id=? AND number=? AND user_id=?').run(state, gid, number, uid);
@@ -2705,7 +2722,8 @@ function describeSchedule(sc) {
 function questBusyUsers(gid) {
   const rows = db.prepare(`SELECT DISTINCT m.user_id FROM quest_members m
                            JOIN quests q ON q.guild_id = m.guild_id AND q.number = m.number
-                           WHERE m.guild_id = ? AND m.state = 'party' AND q.status = 'active'`).all(gid);
+                           WHERE m.guild_id = ? AND m.state = 'party'
+                             AND q.status = 'active' AND COALESCE(q.winding_down, 0) = 0`).all(gid);
   return new Set(rows.map(r => r.user_id));
 }
 
@@ -6555,7 +6573,10 @@ const slashCommands = [
       .addStringOption(o=>o.setName('text').setDescription('How it went, in your words').setRequired(true)));
       g.addSubcommand(s=>s.setName('timeline').setDescription('The full log of a quest so far')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)));
-      g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — award merits to the party (GM)')
+            g.addSubcommand(s=>s.setName('winddown').setDescription('The story is over \u2014 party rests while you settle rewards (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
+      .addBooleanOption(o=>o.setName('resume').setDescription('true = back to running').setRequired(false)));
+g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — award merits to the party (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('summary').setDescription('Your telling of it, for the players\' chronicle').setRequired(false))
       .addStringOption(o=>o.setName('title').setDescription('A title every survivor earns, e.g. Siren\'s Bane').setRequired(false)));
@@ -22090,10 +22111,11 @@ async function showRoster(interaction) {
 
   // Which quest, by name, rather than merely "a quest".
   const questOf = new Map();
-  for (const r of db.prepare(`SELECT m.user_id, q.number, q.name FROM quest_members m
+  for (const r of db.prepare(`SELECT m.user_id, q.number, q.name, q.winding_down FROM quest_members m
                               JOIN quests q ON q.guild_id = m.guild_id AND q.number = m.number
                               WHERE m.guild_id=? AND m.state='party' AND q.status='active'`).all(gid)) {
-    questOf.set(r.user_id, `#${String(r.number).padStart(3, '0')} ${r.name}`);
+    // A winding-down run still shows, but marked — its party is resting.
+    questOf.set(r.user_id, { label: `#${String(r.number).padStart(3, '0')} ${r.name}`, winding: !!r.winding_down });
   }
   const fightOf = new Map();
   for (const f of db.prepare("SELECT channel_id, turn_order FROM fights WHERE guild_id=? AND state='active'").all(gid)) {
@@ -22105,14 +22127,18 @@ async function showRoster(interaction) {
   const rows = db.prepare('SELECT * FROM characters WHERE guild_id=? ORDER BY rowid').all(gid);
   const lines = [];
   let free = 0;
+  const resting = [];
   for (const ch of rows) {
     const nm = await getDisplayName(interaction.guild, ch.user_id).catch(() => ch.user_id);
     const hp = `${ch.hp_current ?? 0}/${maxHp(ch, gid)}`;
     const where = [];
     if (ch.died_at) where.push('\u26B0\uFE0F fallen');
-    if (questOf.has(ch.user_id)) where.push(`\u{1F5FA}\uFE0F ${questOf.get(ch.user_id)}`);
+    const q = questOf.get(ch.user_id);
+    if (q && !q.winding) where.push(`\u{1F5FA}\uFE0F ${q.label}`);
+    else if (q) resting.push(`\u{1F6CC} ${q.label}`);
     if (fightOf.has(ch.user_id)) where.push(`\u2694\uFE0F <#${fightOf.get(ch.user_id)}>`);
     const held = where.length > 0;
+    if (!held && resting.length) where.push(...resting.splice(0));
     if (!held) free++;
     if (onlyBusy && !held) continue;
     lines.push(`${held ? '\u{1F534}' : '\u{1F7E2}'} **${nm}** \u2014 \u2764\uFE0F ${hp}${where.length ? ` \u00b7 ${where.join(' \u00b7 ')}` : ' \u00b7 free'}`);
@@ -22338,7 +22364,14 @@ async function spinOffRun(interaction, gid, root, approvedIds) {
   });
   // The staged group takes its seats; anyone still merely applied comes
   // along as an applicant of the run, so the DM can pull them in later.
-  for (const id of seats) setQuestMember(gid, number, id, 'party');
+  // Anyone already seated on another live run keeps that seat; here they
+  // stay an applicant rather than being quietly double-booked.
+  const clashed = [];
+  for (const id of seats) {
+    const clash = questAlreadyOn(gid, id, number);
+    if (clash) { clashed.push({ id, clash }); setQuestMember(gid, number, id, 'applied'); }
+    else setQuestMember(gid, number, id, 'party');
+  }
   const waiting = getQuestMembers(gid, root.number, 'applied').filter(id => !seats.includes(id));
   for (const id of waiting) setQuestMember(gid, number, id, 'applied');
   // And the board is clean again — same entry, same number, no party.
@@ -22356,7 +22389,17 @@ async function spinOffRun(interaction, gid, root, approvedIds) {
   }
   await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, root.number));
   await syncQuestBook(interaction.client, interaction.guild, gid, quest);
-  return { quest, room };
+  // Say who was left behind and why — a silent demotion would look like
+  // the launch had simply forgotten them.
+  if (clashed.length && room) {
+    const names = [];
+    for (const c of clashed) names.push(`<@${c.id}> (on #${String(c.clash.number).padStart(3, '0')} ${c.clash.name})`);
+    try {
+      await room.send({ allowedMentions: { parse: [] },
+        content: `\u26A0\uFE0F Left as applicants \u2014 already on another run: ${names.join(', ')}` });
+    } catch {}
+  }
+  return { quest, room, clashed };
 }
 
 // Enough hands. Said once per quest, in the planning thread, to whoever
@@ -23002,6 +23045,11 @@ async function handleQuest(interaction, forced) {
     // Approval STAGES, never births. The old block spun a run per approve
     // press; the group now waits on the listing until the GM launches, and
     // one launch carries them all.
+    // One quest at a time: seating someone already on a live run would put
+    // them in two places and hold them out of rests twice over.
+    const clashA = questAlreadyOn(gid, target.id, number);
+    if (clashA) return interaction.reply({ ephemeral: true,
+      content: `\u274C <@${target.id}> is already on **#${String(clashA.number).padStart(3, '0')} ${clashA.name}**. Finish or leave that one first \u2014 \`/quest party kick number:${clashA.number} user:@them\` releases them.` });
     setQuestMember(gid, number, target.id, 'party');
     if ((getConfig(gid)?.quest_spinoff ?? 0) && !quest.instance_of) {
       const staged = getQuestMembers(gid, number, 'party').length;
@@ -23324,6 +23372,35 @@ async function handleQuest(interaction, forced) {
       ...events.map(questEventLine)], { ephemeral: true });
   }
 
+  if (sub === 'winddown') {
+    // Between the last scene and the payout. The run stays active — its
+    // thread, its log and its numbers are all still live — but its party
+    // is released to the rests while the GM settles rewards (T's third
+    // state, 2026-08-22).
+    if (!gm) return interaction.reply({ content: '\u274C Only GMs can wind a quest down.', ephemeral: true });
+    const quest = await requireQuest(interaction, gid);
+    if (!quest) return;
+    if (quest.status !== 'active')
+      return interaction.reply({ ephemeral: true, content: `\u274C **${questTag(quest)}** is not running.` });
+    const back = !!interaction.options.getBoolean('resume');
+    updateQuest(gid, quest.number, { winding_down: back ? 0 : 1 });
+    try {
+      logQuestEvent(gid, quest.number, 'note',
+        back ? 'Back to running' : 'Winding down \u2014 rewards being settled', interaction.user.id);
+    } catch {}
+    const room = quest.run_thread_id || quest.run_channel_id;
+    if (room) {
+      const ch = await interaction.client.channels.fetch(room).catch(() => null);
+      if (ch) await ch.send({ allowedMentions: { parse: [] }, content: back
+        ? `\u25B6\uFE0F **${questTag(quest)}** is running again \u2014 rests will pass the party over once more.`
+        : `\u{1F6CC} **${questTag(quest)}** is winding down. The story is told; rewards are being settled. The party may rest in the meantime.` }).catch(() => {});
+    }
+    return interaction.reply({ ephemeral: true, content: back
+      ? `\u2705 **${questTag(quest)}** is running again.`
+      : `\u2705 **${questTag(quest)}** is winding down \u2014 its party will be healed by the next rest. Finish with \`/quest run complete\` when the rewards are right.` });
+  }
+
+
   if (sub === 'recap') {
     // The timeline is already there; this shapes it into something to read
     // aloud when the next session opens. It DRAFTS — the GM edits and
@@ -23504,6 +23581,8 @@ async function handleQuest(interaction, forced) {
     // and updates every participant's record link.
     // A title earned by being there — granted to everyone in the party and
     // stamped with the quest it came from, so the page says where.
+    // Finishing ends the winding-down state with everything else.
+    try { updateQuest(gid, quest.number, { winding_down: 0 }); } catch {}
     const earned = (interaction.options?.getString?.('title') || '').trim().slice(0, 60);
     if (earned) {
       for (const id of party) grantTitle(gid, id, earned, { source: questTag(quest), by: interaction.user.id });

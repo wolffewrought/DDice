@@ -1559,7 +1559,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     // the rest reads so the two can never disagree.
     ok('the roster names the quest and the fight holding each player',
       /async function showRoster\(interaction\)/.test(src) &&
-      /questOf\.set\(r\.user_id, `#\$\{String\(r\.number\)\.padStart\(3, '0'\)\} \$\{r\.name\}`\)/.test(src) &&
+      /questOf\.set\(r\.user_id, \{ label: `#\$\{String\(r\.number\)\.padStart\(3, '0'\)\} \$\{r\.name\}`, winding: !!r\.winding_down \}\)/.test(src) &&
       /fightOf\.set\(fid, f\.channel_id\)/.test(src) &&
       /Red means a rest will pass them over/.test(src));
     ok('a GM can ask who the rest will exclude',
@@ -1635,7 +1635,23 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /Approval STAGES, never births/.test(src));
     ok('one launch carries the whole staged group',
       /const born = await spinOffRun\(interaction, gid, listing, staged\);/.test(src) &&
-      /for \(const id of seats\) setQuestMember\(gid, number, id, 'party'\);/.test(src));
+      // (2026-08-22: seating became conditional — one quest at a time —
+      // so the group still travels, minus anyone already on a live run.)
+      /for \(const id of seats\) \{[\s\S]{0,260}?setQuestMember\(gid, number, id, 'party'\);/.test(src));
+    // The third quest state: told, not yet paid. The run stays active in
+    // every other respect; only the rest stops passing its party over.
+    ok('a winding-down run releases its party to the rests',
+      /ALTER TABLE quests ADD COLUMN winding_down/.test(src) &&
+      /AND COALESCE\(q\.winding_down, 0\) = 0/.test(src) &&
+      /sub === 'winddown'/.test(src) &&
+      /is winding down\. The story is told/.test(src));
+    ok('completing a quest clears the winding-down state',
+      /updateQuest\(gid, quest\.number, \{ winding_down: 0 \}\)/.test(src));
+    ok('a player may hold only one seat at a time',
+      /function questAlreadyOn\(gid, uid, exceptNumber = null\)/.test(src) &&
+      /const clashA = questAlreadyOn\(gid, target\.id, number\);/.test(src) &&
+      /is already on \*\*#\$\{String\(clashA\.number\)/.test(src) &&
+      /Left as applicants \\u2014 already on another run/.test(src));
     ok('start on a listing is the launch',
       /quest_spinoff \?\? 0\) && !quest\.instance_of\) \{[\s\S]{0,220}?launchListing\(interaction, gid, quest\)/.test(src));
     ok('the button and the command share one hand',
