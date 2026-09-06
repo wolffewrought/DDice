@@ -6462,37 +6462,39 @@ const slashCommands = [
   new SlashCommandBuilder()
     .setName('instance').setDescription('Speak to one run of a quest by name \u2014 add, rally, note, pause, complete')
     .addSubcommand(s=>s.setName('add').setDescription('Seat a player on this run')
-      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
-      .addUserOption(o=>o.setName('user').setDescription('Whose roll').setRequired(true))
+      // Discord insists required options come first, so `user` leads here
+      // now that `name` is optional.
+      .addUserOption(o=>o.setName('user').setDescription('Who to seat').setRequired(true))
+      .addStringOption(o=>o.setName('name').setDescription('The quest listing \u2014 blank in its own thread').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true))
       .addBooleanOption(o=>o.setName('force').setDescription('true = past a hard cap or the fallen').setRequired(false)))
     .addSubcommand(s=>s.setName('kick').setDescription('Remove a member or applicant from this run')
-      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
-      .addUserOption(o=>o.setName('user').setDescription('Whose roll').setRequired(true))
+            .addUserOption(o=>o.setName('user').setDescription('Whose roll').setRequired(true))
+.addStringOption(o=>o.setName('name').setDescription('The quest listing \u2014 blank in its own thread').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('rally').setDescription('Ping this run\'s party in its thread')
-      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('name').setDescription('The quest listing \u2014 blank in its own thread').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('message').setDescription('Said with the ping').setRequired(false))
       .addBooleanOption(o=>o.setName('here').setDescription('true = rally here instead of the quest\'s thread').setRequired(false)))
     .addSubcommand(s=>s.setName('note').setDescription("Mark something on this run's log")
-      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
-      .addStringOption(o=>o.setName('text').setDescription('The note').setRequired(true))
+            .addStringOption(o=>o.setName('text').setDescription('The note').setRequired(true))
+.addStringOption(o=>o.setName('name').setDescription('The quest listing \u2014 blank in its own thread').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('pause').setDescription('Stop this run\'s clock')
-      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('name').setDescription('The quest listing \u2014 blank in its own thread').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('resume').setDescription('Start this run\'s clock again')
-      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('name').setDescription('The quest listing \u2014 blank in its own thread').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('complete').setDescription('Complete this run \u2014 merits to its party')
-      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('name').setDescription('The quest listing \u2014 blank in its own thread').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('show').setDescription('This run in full')
-      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('name').setDescription('The quest listing \u2014 blank in its own thread').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('thread').setDescription('Open this run\'s thread if it lacks one')
-      .addStringOption(o=>o.setName('name').setDescription('The quest listing').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('name').setDescription('The quest listing \u2014 blank in its own thread').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true))),
   new SlashCommandBuilder()
     .setName('quest').setDescription('Quest board — create, post, join and complete quests')
@@ -15538,12 +15540,16 @@ async function fighterCharCard(guild, gid, fid) {
 // Returns the sent message when the API hands one back (so callers can build
 // audit jump links), otherwise a bare truthy/falsy success flag.
 // Speaking as an NPC in a quest's channel is a roleplay beat worth logging.
-function noteNpcSpeech(gid, channel, npcName) {
-  try { noteQuestActivity(gid, channel?.id, 'rp', `${npcName} speaks`); } catch {}
+function noteNpcSpeech(gid, channel, npcName, said = '') {
+  // A recap of twelve identical "X speaks" lines tells nobody anything
+  // (T's screenshot, 2026-08-23). Carry the words, trimmed to a beat.
+  const words = String(said || '').replace(/\s+/g, ' ').trim();
+  const beat = words ? `${npcName}: \u201c${words.slice(0, 120)}${words.length > 120 ? '\u2026' : ''}\u201d` : `${npcName} speaks`;
+  try { noteQuestActivity(gid, channel?.id, 'rp', beat); } catch {}
 }
 
 async function postAsNpc(channel, gid, npcName, content) {
-  noteNpcSpeech(gid, channel, npcName);
+  noteNpcSpeech(gid, channel, npcName, content);
   const npc = getNpc(gid, npcName);
   try {
     const face = npcFace(gid, npc);
@@ -22564,11 +22570,27 @@ function resolveListingByName(gid, raw) {
     const q = getQuest(gid, asNum);
     if (q && !q.instance_of) return { listing: q };
   }
-  const all = db.prepare('SELECT * FROM quests WHERE guild_id=? AND instance_of IS NULL').all(gid)
-    .filter(q => (q.name || '').toLowerCase() === String(raw).trim().toLowerCase());
+  // A run's THREAD is named "#002-The Falconer's Promise Run 001 <GM>", and
+  // that is what a GM copies or an autocomplete fills. Strip the number
+  // prefix and the run suffix before matching, so the obvious thing to type
+  // works (T's screenshot, 2026-08-23).
+  const cleaned = String(raw ?? '').trim()
+    .replace(/^#?"?#?\d{1,3}\s*[-\u2013]\s*/, '')
+    .replace(/\s+Run\s+\d{1,3}\b.*$/i, '')
+    .replace(/"$/, '')
+    .trim();
+  const want = cleaned.toLowerCase();
+  const listings = db.prepare('SELECT * FROM quests WHERE guild_id=? AND instance_of IS NULL').all(gid);
+  const all = listings.filter(q => (q.name || '').toLowerCase() === want);
   if (all.length === 1) return { listing: all[0] };
-  if (all.length > 1) return { err: `❌ ${all.length} listings share that name — pick from the autocomplete.` };
-  return { err: `❌ No listing named **${raw}**.` };
+  if (all.length > 1) return { err: `\u274C ${all.length} listings share that name \u2014 pick from the autocomplete.` };
+  // Then a forgiving match, so a near-miss still lands.
+  const near = listings.filter(q => {
+    const n = (q.name || '').toLowerCase();
+    return n && want && (n.startsWith(want) || want.startsWith(n));
+  });
+  if (near.length === 1) return { listing: near[0] };
+  return { err: `\u274C No listing named **${cleaned || raw}**. \`/quest board\` shows what is posted.` };
 }
 function resolveRun(gid, listing, runSeq) {
   if (runSeq != null) {
@@ -22581,9 +22603,24 @@ function resolveRun(gid, listing, runSeq) {
   return { run: runs.find(r => r.status === 'active') ?? runs[0] };
 }
 async function handleInstance(interaction) {
+  // Standing in a run's own thread is the clearest possible statement of
+  // which run you mean, so `name:` becomes optional there (T, 2026-08-23).
+  const hereRun = db.prepare(`SELECT number, instance_of FROM quests
+                              WHERE guild_id=? AND (run_thread_id=? OR run_channel_id=?)
+                              LIMIT 1`).get(interaction.guild.id, interaction.channel?.id, interaction.channel?.id);
+
   const gid = interaction.guild.id;
   const sub = interaction.options.getSubcommand();
-  const L = resolveListingByName(gid, interaction.options.getString('name'));
+  // The thread wins when no name is given, and rescues a name that does
+  // not resolve — a GM in the right room always meant that room.
+  const askedName = interaction.options.getString('name');
+  let L = askedName ? resolveListingByName(gid, askedName) : { err: null };
+  if ((!askedName || L.err) && hereRun) {
+    const rootNum = hereRun.instance_of ?? hereRun.number;
+    const root = getQuest(gid, rootNum);
+    if (root) L = { listing: root, fromHere: true };
+  }
+  if (!askedName && !L.listing) L = { err: '\u274C Name the quest, or run this in its own thread.' };
   if (L.err) return interaction.reply({ ephemeral: true, content: L.err });
   const R = resolveRun(gid, L.listing, interaction.options.getInteger('run'));
   if (R.err) return interaction.reply({ ephemeral: true, content: R.err });
@@ -23417,7 +23454,15 @@ async function handleQuest(interaction, forced) {
     for (const id of party) names.push(await getDisplayName(interaction.guild, id).catch(() => 'someone'));
 
     // Roleplay, combat and notes are the story; rolls are the weather.
-    const beats = evs.filter(e => ['rp', 'combat', 'note'].includes(e.kind)).map(e => e.text).filter(Boolean);
+    // Consecutive identical beats collapse: a scene where one NPC spoke
+    // ten times should read as one line saying so, not ten saying nothing.
+    const rawBeats = evs.filter(e => ['rp', 'combat', 'note'].includes(e.kind)).map(e => e.text).filter(Boolean);
+    const beats = [];
+    for (const b of rawBeats) {
+      const last = beats[beats.length - 1];
+      if (last && last.text === b) { last.n++; continue; }
+      beats.push({ text: b, n: 1 });
+    }
     const rolls = evs.filter(e => e.kind === 'roll');
     const wins = rolls.filter(e => /passed/.test(e.text || '')).length;
     const losses = rolls.filter(e => /failed/.test(e.text || '')).length;
@@ -23426,7 +23471,7 @@ async function handleQuest(interaction, forced) {
       `\u{1F4D6} **Previously, on ${questTag(quest)}\u2026**`,
       '',
       names.length ? `${names.join(', ')} set out.` : 'The party set out.',
-      ...beats.slice(0, 12).map(b => `\u00b7 ${b}`),
+      ...beats.slice(0, 12).map(b => `\u00b7 ${b.text}${b.n > 1 ? ` _(\u00d7${b.n})_` : ''}`),
       beats.length > 12 ? `\u00b7 \u2026and ${beats.length - 12} more moments.` : '',
       '',
       rolls.length ? `They rolled **${rolls.length}** times \u2014 **${wins}** went their way, **${losses}** did not.` : '',

@@ -1496,6 +1496,7 @@ CONTENT = [
           ('/quest start number:1 (listing)', 'the launch: the whole staged group becomes one run\nwith its own thread and clock \u2014 or press \U0001F680 on the post'),
           ('/fight end all:true', 'end every active fight on the server at once \u2014\nrecaps post in their channels; HP states persist'),
           ('/instance add name:X [run:] user:@a', 'seat a player on a run \u2014 name autocompletes your\nlistings, run blank = the latest active one'),
+          ('(naming a run)', 'paste the thread\u2019s own name if you like \u2014 the number\nprefix and \u201cRun 001 \u2026\u201d suffix are ignored. In a run\u2019s own\nthread you may leave name: blank entirely'),
           ('/instance kick/rally/note/pause/resume/complete/show/thread', 'the in-play nine, addressed by name and run \u2014\neach forwards into /quest, so gates and behaviour are identical'),
           ('(run names)', 'every launch is christened \u201c<Quest> Run 001 <GM>\u201d \u2014\nthe thread and the ledger wear the same name'),
           ('(who runs it)', 'the first GM to approve an applicant becomes\nthat quest\u2019s DM \u2014 /quest handoff passes it to\nanother GM. When approvals reach the party size,\nthat DM is pinged once in the planning thread'),

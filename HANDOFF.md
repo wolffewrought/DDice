@@ -326,6 +326,28 @@ place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
 
+## 9m · Two bugs from one screenshot (2026-08-23)
+
+1. `/instance complete` refused with 'No listing named ... #"#002-The
+Falconer's Promise Run 001 Zeus..."'. resolveListingByName matched only an
+EXACT listing name or a number, but the thing a GM copies is the run
+THREAD's name. Now the number prefix and the ' Run NNN <gm>' suffix are
+stripped, stray quotes dropped, and a near-match accepted when unambiguous.
+Better still: `name:` became optional on all nine /instance leaves and the
+RUN THREAD ITSELF stands in for it — a GM in the right room always meant
+that room. Discord requires required options first, so two leaves had
+their options reordered.
+
+2. The recap read '· Merchant | Roland Vale speaks' twelve times, because
+noteNpcSpeech logged only the speaker. It now carries the words (trimmed
+to 120 chars), and the recap collapses consecutive identical beats with a
+'(×3)' count.
+
+NEAR-MISS worth recording: an aborted patch left `cleaned` referenced in
+the error line while its declaration had been rolled back — a
+ReferenceError on every failed lookup. Caught by reading the function
+back rather than trusting the byte counts, which had looked fine.
+
 ## 9l · A third quest state: winding down (2026-08-22)
 
 T asked whether a PAUSED quest lets its party heal. It does not — pause

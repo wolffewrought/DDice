@@ -1640,6 +1640,17 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /for \(const id of seats\) \{[\s\S]{0,260}?setQuestMember\(gid, number, id, 'party'\);/.test(src));
     // The third quest state: told, not yet paid. The run stays active in
     // every other respect; only the rest stops passing its party over.
+    // Naming a run: the thread title is what a GM actually copies, and
+    // standing in the thread is clearer still (T's screenshot, 2026-08-23).
+    ok('a run thread name resolves to its listing',
+      /\.replace\(\/\^#\?"\?#\?\\d\{1,3\}\\s\*\[-\\u2013\]\\s\*\/, ''\)/.test(src) &&
+      /\.replace\(\/\\s\+Run\\s\+\\d\{1,3\}\\b\.\*\$\/i, ''\)/.test(src));
+    ok('the run thread stands in for the name',
+      /const hereRun = db\.prepare\(`SELECT number, instance_of FROM quests/.test(src) &&
+      /if \(\(!askedName \|\| L\.err\) && hereRun\)/.test(src));
+    ok('a recap carries what was said, and collapses repeats',
+      /const beat = words \? `\$\{npcName\}: /.test(src) &&
+      /if \(last && last\.text === b\) \{ last\.n\+\+; continue; \}/.test(src));
     ok('a winding-down run releases its party to the rests',
       /ALTER TABLE quests ADD COLUMN winding_down/.test(src) &&
       /AND COALESCE\(q\.winding_down, 0\) = 0/.test(src) &&
