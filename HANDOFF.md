@@ -326,6 +326,66 @@ place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
 
+## 9p · /help brought level with the books (2026-09-11)
+
+T asked for language and content to match everywhere, including /help.
+Extracted all 258 command forms from the builders and checked each
+against HELP_CATEGORIES and make_pdfs.py. The books were near-complete
+(seven rows added: check migrations, check pages, the three temp leaves,
+feedback category list/remove). /help was badly behind — it knew nothing
+of buttons, targets, group checks, /dd, feedback, the quest-run leaves
+(note/pause/resume/log/recap/timeline/winddown), the /instance
+translator, overrides, half the /gm check leaves, temp NPCs, the manage
+fold, titles and associations, /fight add, or the fight buttons.
+
+Added a new **Table Tools** page (buttons, targets, group checks, /dd,
+feedback) and extended quests, gm, npc, progression and fight. The
+progression choice was renamed 'Merits, Ranks & Titles'. Pinned by
+FEATURE rather than wording, so help can be rephrased but not allowed to
+forget.
+
+Language pass: 'DM' (the GM running a particular quest) vs 'GM' (the
+staff role) is a deliberate distinction and consistent; 'merit', 'sheet',
+'reroll', 'NPC' and 'Game Master' are each used one way throughout; the
+only US spellings are ReportLab API parameters. Rendered PDFs re-read:
+clean.
+
+## 9o · /fight add (2026-09-11)
+
+T asked whether players can be added and removed mid-fight. Removal
+existed (`/fight kick`); adding a PLAYER did not — only NPCs, via addnpc.
+Built `/fight add user: [where:]` as addnpc's mirror: sheet checked,
+fallen refused, HP taken from the sheet, initiative rolled for the record
+and the quest log, no duplicates.
+
+Placement is `next` (spliced straight after the current turn) or `last`.
+I first wrote a 'by initiative' option, then found initiative rolls are
+NOT stored once the order stands — there was nothing honest to slot a
+newcomer among, and the option would have silently behaved as 'last'.
+Replaced before shipping rather than offering a choice that lies.
+
+## 9n · Reviews that remember their run (2026-09-07)
+
+Planned with T first, then built to their three decisions: the button
+appears at COMPLETION only; all GMs see reviews (they land in gm-feedback
+anyway); the room picker stays, and `quest:` lists the player's OWN runs.
+
+Reviews were cards only — posted and gone. New `feedback_log` table keeps
+every one (room, score, words, optional run number). `/feedback send
+quest:` autocompletes the runs this player was on, newest first, marking
+any still running; the number rides the picker id (`fbcat:<n>`) and the
+modal id (`fbm:<room>:<n>`), so the card carries 'Re: #002 The Falconer's
+Promise Run 001' and the row carries the number. The completion button
+now encodes the run NUMBER (`fbq:<n>`) rather than a URI-encoded tag, and
+lands in the run's own THREAD (run_thread_id first, channel second).
+renderQuest gained a Reviews section — count, average star, latest three
+— so `/quest run show` reads how a run landed.
+
+The probe caught a real one: my select-lane guard read `A && B || C`, so a
+slash command with no customId reached `.startsWith` and threw. Static
+checks passed; the runtime harness did not. Parenthesised, and the lane
+pin updated to demand the wrapped form.
+
 ## 9m · Two bugs from one screenshot (2026-08-23)
 
 1. `/instance complete` refused with 'No listing named ... #"#002-The

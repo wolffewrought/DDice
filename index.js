@@ -167,6 +167,15 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS temp_targets (
 // A group check: one button, everyone rolls once, the bot tallies. The
 // point is a skill-challenge scene that reads as ONE result rather than
 // twelve separate rolls nobody can hold in their head (T, 2026-08-20).
+// Reviews used to exist only as cards in gm-feedback. Now they are rows
+// too, and may name the run they are about, so a GM can read how a run
+// landed without digging through a forum (T, 2026-09-07).
+try { db.exec(`CREATE TABLE IF NOT EXISTS feedback_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL, user_id TEXT NOT NULL, room TEXT NOT NULL,
+  scale INTEGER, body TEXT, quest_number INTEGER, at INTEGER NOT NULL
+)`); } catch (e) { console.error('feedback_log schema', e); }
+
 try { db.exec(`CREATE TABLE IF NOT EXISTS group_checks (
   guild_id TEXT NOT NULL, message_id TEXT NOT NULL,
   channel_id TEXT NOT NULL, stat TEXT, dice TEXT, dc INTEGER,
@@ -6128,11 +6137,12 @@ const slashCommands = [
         {name:'Fights & Duels',value:'fight'},
         {name:'Activities & Renown',value:'activities'},
         {name:'Quizzes & the Question Bank',value:'quizzes'},
-        {name:'Merits & Ranks',value:'progression'},
+        {name:'Merits, Ranks & Titles',value:'progression'},
         {name:'Quest Board',value:'quests'},
         {name:'Tags',value:'tags'},
         {name:'NPCs',value:'npc'},
-        {name:'GM & Config',value:'gm'}
+        {name:'GM & Config',value:'gm'},
+        {name:'Table Tools',value:'tools'}
       )),
 
   new SlashCommandBuilder()
@@ -6300,6 +6310,10 @@ const slashCommands = [
       .addStringOption(o=>o.setName('npcs').setDescription('GM NPCs to include — names, comma-separated').setRequired(false).setAutocomplete(true))
       .addBooleanOption(o=>o.setName('manual').setDescription('Skip initiative roll and use the order you listed fighters in').setRequired(false))
       .addBooleanOption(o=>o.setName('practice').setDescription('Friendly bout — fighters yield at 2 HP and are never driven below it').setRequired(false)))
+    .addSubcommand(s=>s.setName('add').setDescription('Bring a player into the current fight (GM)')
+      .addUserOption(o=>o.setName('user').setDescription('Who joins').setRequired(true))
+      .addStringOption(o=>o.setName('where').setDescription('Where they slot in').setRequired(false)
+        .addChoices({name:'Next \u2014 they act right after this turn',value:'next'},{name:'Last \u2014 they wait at the end',value:'last'})))
     .addSubcommand(s=>s.setName('addnpc').setDescription('Add GM NPCs to the current fight (GM only)')
       .addStringOption(o=>o.setName('npc').setDescription('NPC(s) to add — names, comma-separated').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('auto').setDescription('Auto-run a fight (GM only)')
@@ -6618,7 +6632,8 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
 
   new SlashCommandBuilder()
     .setName('feedback').setDescription('Tell the GMs what you think \u2014 privately')
-    .addSubcommand(s=>s.setName('send').setDescription('Send feedback to the GMs \u2014 pick a room, score it, say your piece'))
+    .addSubcommand(s=>s.setName('send').setDescription('Send feedback to the GMs \u2014 pick a room, score it, say your piece')
+      .addStringOption(o=>o.setName('quest').setDescription('A run you were on, if this is about one').setRequired(false).setAutocomplete(true)))
     .addSubcommandGroup(g => { g.setName('category').setDescription('The rooms feedback lands in (GM)');
       g.addSubcommand(s=>s.setName('add').setDescription('Add a feedback room (GM)')
         .addStringOption(o=>o.setName('name').setDescription('What to call it').setRequired(true)));
@@ -12592,6 +12607,19 @@ client.on('interactionCreate', async interaction => {
 
       // /dd's `as:` names an NPC too — the same list, so a GM never has to
       // remember a spelling the bot could have offered.
+      // /feedback send quest: — only the runs THIS player was on, newest
+      // first, so the list is a few names rather than the whole board.
+      if (interaction.commandName === 'feedback' && focusedOption.name === 'quest') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        const mine = db.prepare(`SELECT q.* FROM quest_members m
+                                 JOIN quests q ON q.guild_id = m.guild_id AND q.number = m.number
+                                 WHERE m.guild_id=? AND m.user_id=? AND q.instance_of IS NOT NULL
+                                 ORDER BY q.number DESC LIMIT 25`).all(interaction.guild.id, interaction.user.id);
+        return await interaction.respond(mine
+          .map(q => ({ name: `${questTag(q)}${q.status === 'complete' ? '' : ' (still running)'}`.slice(0, 100), value: String(q.number) }))
+          .filter(c => !v || c.name.toLowerCase().includes(v))
+          .slice(0, 25)).catch(() => {});
+      }
       if (interaction.commandName === 'dd' && focusedOption.name === 'as') {
         const v = String(focusedOption.value || '').toLowerCase();
         return await interaction.respond(getAllNpcs(interaction.guild.id)
@@ -12974,13 +13002,24 @@ client.on('interactionCreate', async interaction => {
     }
     if (interaction.customId.startsWith('fbm:') || interaction.customId.startsWith('fbq:')) {
       const isQuest = interaction.customId.startsWith('fbq:');
-      const key = isQuest ? 'quests' : interaction.customId.slice(4);
+      // fbm:<room>:<run>  from the picker;  fbq:<run>  from a completion.
+      const partsFb = interaction.customId.split(':');
+      const key = isQuest ? 'quests' : partsFb[1];
+      const runNum = parseInt(isQuest ? partsFb[1] : (partsFb[2] || '0'), 10) || 0;
+      const runRow = runNum ? getQuest(interaction.guild.id, runNum) : null;
       const raw = interaction.fields.getTextInputValue('scale').replace(/[^0-9]/g, '');
       const scale = parseInt(raw || '0', 10);
       if (!scale || scale < 1 || scale > 10)
         return interaction.reply({ ephemeral: true, content: '\u274C The score needs to be a number from 1 to 10.' });
       const body = interaction.fields.getTextInputValue('body').trim();
-      const extra = isQuest ? `\u{1F5FA}\uFE0F On quest **${decodeURIComponent(interaction.customId.slice(4))}**` : '';
+      const extra = runRow ? `\u{1F5FA}\uFE0F Re: **${questTag(runRow)}**` : '';
+      // The row is the archive; the card is the notice.
+      try {
+        db.prepare(`INSERT INTO feedback_log (guild_id, user_id, room, scale, body, quest_number, at)
+                    VALUES (?,?,?,?,?,?,?)`)
+          .run(interaction.guild.id, interaction.user.id, key, Number.isFinite(scale) ? scale : null,
+               body.slice(0, 2000), runNum || null, Date.now());
+      } catch (e) { console.error('[feedback] log', e?.message || e); }
       const posted = await postFeedbackCard(interaction, interaction.guild.id, key, scale, body, extra);
       return interaction.reply({ ephemeral: true, content: posted
         ? '\u2705 Sent to the GMs \u2014 thank you. No one else can see it.'
@@ -13014,10 +13053,11 @@ client.on('interactionCreate', async interaction => {
     if (!channel) return interaction.reply({ content: '❌ Couldn\'t read that channel.', ephemeral: true });
     return handleConfig(interaction, { sub: key, channel });
   }
-  if (interaction.isStringSelectMenu?.() && interaction.customId === 'fbcat') {
+  if (interaction.isStringSelectMenu?.() && (interaction.customId === 'fbcat' || interaction.customId?.startsWith('fbcat:'))) {
     const key = interaction.values[0];
     const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
-    const m = new ModalBuilder().setCustomId(`fbm:${key}`).setTitle('Feedback for the GMs');
+    const qFromPick = interaction.customId.includes(':') ? interaction.customId.split(':')[1] : '0';
+    const m = new ModalBuilder().setCustomId(`fbm:${key}:${qFromPick}`).setTitle('Feedback for the GMs');
     m.addComponents(
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('scale')
         .setLabel('Score it 1-10').setPlaceholder('7').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(2)),
@@ -16467,12 +16507,23 @@ async function handleFeedback(interaction) {
   // moot 2026-08-16).
   if (sub !== 'send')
     return interaction.reply({ ephemeral: true, content: '\u274C Unknown feedback command.' });
+  // A review may name a run the player was on; the number rides the picker
+  // and the modal so the card and the row both know it (T, 2026-09-07).
+  const questPick = (interaction.options.getString('quest') || '').trim();
+  let questNum = 0;
+  if (questPick) {
+    const qn = parseInt(questPick, 10);
+    const qRow = Number.isFinite(qn) ? getQuest(gid, qn) : null;
+    const mine = qRow && db.prepare('SELECT 1 FROM quest_members WHERE guild_id=? AND number=? AND user_id=?').get(gid, qn, interaction.user.id);
+    if (!qRow || !mine) return interaction.reply({ ephemeral: true, content: '\u274C Pick one of your own runs from the list.' });
+    questNum = qn;
+  }
   const types = feedbackTypes(gid);
   const routes = feedbackRoutes(gid);
   if (!routes?.forum && !getConfig(gid)?.feedback_forum)
     return interaction.reply({ ephemeral: true, content: '\u274C No feedback forum is set up yet \u2014 a GM needs `/gm check run`.' });
   const { ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
-  const menu = new StringSelectMenuBuilder().setCustomId('fbcat').setPlaceholder('Which room?')
+  const menu = new StringSelectMenuBuilder().setCustomId(`fbcat:${questNum}`).setPlaceholder('Which room?')
     .addOptions(Object.entries(types).slice(0, 25).map(([k, t]) => ({ label: t.name.slice(0, 100), value: k, description: t.about?.slice(0, 100) })));
   return interaction.reply({ ephemeral: true, content: '\u{1F4DD} **Feedback** \u2014 pick a room, then score it and say your piece. Only the GMs will see it.',
     components: [new ActionRowBuilder().addComponents(menu)] });
@@ -17910,6 +17961,48 @@ async function handleFight(interaction, forced) {
   }
 
   // ── ADDNPC (add one or more GM NPCs to an active fight) ───────────────────
+  if (sub === 'add') {
+    // A latecomer, or someone kicked by mistake. Mirrors addnpc: HP from the
+    // sheet, initiative rolled for the record, and a choice of slotting in
+    // by that roll or waiting at the end (T, 2026-09-11).
+    if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '\u274C Only GMs can add a player to a fight.', ephemeral: true });
+    const fight = getFight(gid, cid);
+    if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
+    const who = interaction.options.getUser('user');
+    const ch = getChar(gid, who.id);
+    if (!ch) return interaction.reply({ ephemeral: true, content: `\u274C <@${who.id}> has no character sheet.` });
+    if (isFallen(gid, who.id)) return interaction.reply({ ephemeral: true, content: `\u274C <@${who.id}> has fallen and cannot fight.` });
+    const addFloor = fightFloor(fight);
+    if ((ch.hp_current ?? 0) <= addFloor)
+      return interaction.reply({ ephemeral: true, content: `\u274C <@${who.id}> is at \u2764\uFE0F ${ch.hp_current ?? 0}${addFloor > 0 ? ` (bout floor is ${addFloor})` : ''} \u2014 heal them first.` });
+    const turnOrder = fightOrder(fight);
+    if (turnOrder.includes(who.id)) return interaction.reply({ ephemeral: true, content: `\u274C <@${who.id}> is already in this fight.` });
+    const hpState = fightHp(fight);
+    const where = interaction.options.getString('where') || 'last';
+    const roll = rollDie(20);
+    const total = roll + (ch.dex ?? 0);
+    const name = await getDisplayName(interaction.guild, who.id);
+    hpState[who.id] = ch.hp_current;
+
+    // Initiative rolls are not kept once the order stands, so there is
+    // nothing honest to slot a newcomer AMONG. Two placements only: right
+    // after whoever is acting now, or at the end.
+    let placed;
+    if (where === 'next') {
+      turnOrder.splice(fight.turn_index + 1, 0, who.id);
+      placed = 'acting next';
+    } else {
+      turnOrder.push(who.id);
+      placed = 'at the end of the turn order';
+    }
+    upsertFight(gid, cid, { turn_order: JSON.stringify(turnOrder), hp_state: JSON.stringify(hpState) });
+    try { noteQuestActivity(gid, cid, 'combat', `${name} joins the fight`, uid); } catch {}
+    return interaction.reply({ allowedMentions: { parse: [] }, content: [
+      `\u2694\uFE0F **${name}** joins the fight \u2014 \u{1F3B2} [${roll}] + \u26A1 ${ch.dex ?? 0} DEX = **${total} initiative**, ${placed}.`,
+      `\u2764\uFE0F ${ch.hp_current}/${maxHp(ch, gid)} \u00b7 _\`/fight order\` to reposition._`,
+    ].join('\n') });
+  }
+
   if (sub === 'addnpc') {
     if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can add NPCs to a fight.', ephemeral: true });
     const fight = getFight(gid, cid);
@@ -19965,6 +20058,8 @@ const HELP_CATEGORIES = {
       '`/fight refill npcs:all` — refill NPC reroll tokens to their LCK (GM)',
       '`/fight hp value:N target:@a` / `target_npc:Orc` — set HP mid-fight, sheet synced (GM)',
       '`/fight kick target:@a` / `target_npc:Orc` — remove a fighter, fight continues (GM)',
+      '`/fight add user:@a [where:Next|Last]` \u2014 bring a player into a running fight: HP from their sheet, placed straight after this turn or at the end (GM)',
+      '_On your turn the bot offers buttons: the five stats to attack with, then Grapple \u00b7 Feint \u00b7 Deflect \u00b7 Disarm. Holding someone adds Maintain the hold (an opposed STR roll) and Release; being held adds Break free._',
       '`/fight auto mode:Full teams:@a @b vs Goblin, Orc` — party-vs-monsters sides (GM)',
       'NPC lists accept `category:Name` to add a whole category at once',
       'When a fight ends a public 🏁 result posts in the channel — victor, everyone\'s final HP, and a 📜 recap',
@@ -20047,6 +20142,9 @@ const HELP_CATEGORIES = {
       '`/standing rank promote @user rank:Knight` — set a player\'s rank (GM, fully manual)',
       '`/standing rank eligible` — players who\'ve met a threshold but aren\'t promoted yet (GM)',
       '`/standing rank remove name:X` — delete a rank (GM)',
+      '`/standing title grant|revoke|list title:... user:@a|npc:X [source:]` \u2014 titles earned on quests or granted by a GM; they show on the character page and the NPC sheet',
+      '`/standing association add|remove|list group:... user:@a|npc:X [note:]` \u2014 the companies and causes someone stands with; `list group:` names everyone in one',
+      '`/quest run complete number:N title:...` \u2014 every survivor earns the title, stamped with the quest it came from',
     ],
   },
   quests: {
@@ -20069,6 +20167,9 @@ const HELP_CATEGORIES = {
       '`/gm test quest/npc/list/forum/clean` — throwaway fixtures, a live forum exercise, and the broom that clears them (GM)',
       '`/gm questwipe [runs:true]` — delete every quest on the server, confirm-gated; the run ledger and DM counters survive unless runs:true (GM)',
       '`/gm check build` — the one-command setup: makes every channel and forum the bot needs in two sections — **DDice** open to the table, **DDice · Game Masters** shut to everyone else — wires the config and fills them. Adopts anything already there, so it is safe to run on a server set up by hand (Admin)',
+      '`/gm check status|run|build|restart|order|migrations|portraits|pages|roster` \u2014 what is set up; mend everything (threads, pages, permissions); build from scratch; the sidebar order; the migration ledger; portrait repair; force-rebuild character pages; where every player is and what holds them (GM)',
+      '`/gm override skip` \u00b7 `/gm override dc hold:true` \u00b7 `/gm override interject user:@a [stat:] [amount:\u00b1N] [mode:adv|dis|flat] [die:1-20] [note:]` \u2014 the referee\'s hand on the next roll, all audited (GM)',
+      '`/config mechanics autorest action:Who is excluded` \u2014 who the next rest will pass over and why: the fallen, anyone on an active quest or fight, and what is holding them',
       '`/gm check run` — build anything missing: audit shelves, pipeline books and tags. Adopts what exists, so it is safe to run any time — pull it after an update adds a book (GM)',
       '`/gm check status` — the setup mirror: every channel-backed feature, unset first with the command that sets it, then the set ones with links — stored ids are verified live (GM)',
       '`/config channels questforum channel:#forum` — the board becomes a forum: one thread per quest, lifecycle mirrored in, archived on completion (Admin)',
@@ -20092,6 +20193,13 @@ const HELP_CATEGORIES = {
       '`/quest run start/note/pause/resume/timeline/complete` — the running of a quest: start the clock · log a detail · pause and resume · read the full log so far · finish and reward (GM)',
       '`/quest instance number:N [label:]` — run your own copy: it keeps the original\'s number and adds which run it is — `#002.2-Testing the waters · Blackfen party` (GM)',
       '`/quest run start number:N` — lock the party and mark in progress (GM)',
+      '`/quest run pause|resume number:N` \u2014 stop and restart the clock; a paused run logs nothing until resumed',
+      '`/quest run note number:N text:... kind:rp|combat|note [public:true]` \u2014 mark a moment in the run\'s account',
+      '`/quest timeline number:N` \u2014 the raw log \u00b7 `/quest run recap number:N [post:true]` \u2014 a "previously on\u2026" drafted from it, private until you post it (GM)',
+      '`/quest run winddown number:N [resume:true]` \u2014 the story is over but rewards are not settled: the run stays live, and its party is released to the rests while you decide (GM)',
+      '`/quest run log number:N text:...` \u2014 your telling of a finished run, into each player\'s chronicle thread; rewrites edit in place (GM)',
+      '`/instance add|kick|rally|note|pause|resume|complete|show|thread name:...` \u2014 the same by NAME rather than number; leave `name:` blank inside a run\'s own thread (GM)',
+      '_One quest at a time: approving someone already seated on a live run is refused, and a launch leaves them an applicant rather than double-booking them._',
       '`/quest run complete number:N` — finish it; merits auto-awarded, other rewards listed (GM)',
       '`/quest delete number:N` — remove a quest (GM)',
     ],
@@ -20171,6 +20279,8 @@ const HELP_CATEGORIES = {
       '`/config mechanics scrollfont font:<file>` — store an .otf/.ttf; the reply renders a sample line so you see it works. `/gm scroll` then writes props in it (Admin)',
       '`/config channels scrollarchive` — the 📜 Scrolls book in the roll-audit forum archives every scroll automatically, both directions, text + image + PDF; `channel:#x` overrides with a plain channel (Admin)',
       '`/npc manage export name:<npc>` / `/npc manage import file:<pdf>` — a villain packed as a woven parchment PDF; import applies directly, GM-as-approver — stats, class, hero flag, auto-pilot preferences and lore travel, standing and webhooks stay local',
+      '`/npc create ... temp:true` \u00b7 `/library summon name:Goblin count:3 temp:true` \u2014 throwaway fighters: no forum page, hidden from `/npc list`, swept when their fight ends \u00b7 `/npc temp list|keep|clear`',
+      '`/npc manage copy|rename|export|import|sync|create5e` \u2014 the workshop verbs, folded under `manage`',
       '`/gm dicereport` — the table\'s dice health: top rollers, hot and cold d20 hands, nat leaders, the full d20 spread',
       '`/gm scroll` — write a title and body in a writing window; the bot posts the parchment as an image everyone can see plus a **PDF** with the writing woven invisibly inside — the PDF survives Discord, so scrolls travel between servers on their own. `file:` hands any scroll PDF back: plain text out, plus a readable edition in standard type as image and woven PDF (GM)',
       '`/config channels approvals channel:#x` — new sheets need GM approval before use (Admin)',
@@ -20185,6 +20295,20 @@ const HELP_CATEGORIES = {
       '`gmr` / `gmrs 1d20+5` — public / secret GM roll',
       '`/gm backup now` — export the database · `/gm backup auto` — daily backups',
       '`/char stat` — show stat descriptions · `/help` — this menu',
+    ],
+  },
+  tools: {
+    title: '\u{1F9F0} Table Tools',
+    blurb: 'buttons, targets, group checks, feedback, speaking as the bot',
+    body: [
+      '_Things a GM plants in the channel for the table to press, and the ways players talk back._',
+      '`/button roll stat:dex dc:12 reason:...` \u2014 plant a check anyone may press; `dice:2d6+1` instead of a stat, `for:@a` to address one person, `once:true` for one press each',
+      '`/button group stat:wis dc:12 reason:...` \u2014 one check the whole party rolls; the message keeps the tally and \u2696\uFE0F Call it closes it with how many got through (GM)',
+      '`/target create name:Barricade stat:str dc:12` \u2014 something to strike, with no sheet; each hit asks the GM \u{1FAA6} It falls / \u{1F6E1}\uFE0F It holds; `secret:true` asks in the GM log instead \u00b7 `/target list`',
+      '`/dd message:... [as:NPC] [user:@a] [channel:#x]` \u2014 speak AS THE BOT in the room, as the Game Masters or a named NPC; who said it goes to the roll-audit, not the room (GM)',
+      '`/feedback send [quest:]` \u2014 pick a room, score it out of ten, say your piece; only GMs see it. Name one of your own runs and the card says which',
+      '`/feedback category add|remove|list` \u2014 the rooms feedback lands in (GM) \u00b7 `/button feedback` plants a standing feedback button',
+      '_A completed run posts its own \u{1F4DD} review button in its thread; `/quest run show` then carries the count, the average \u2b50 and the latest lines._',
     ],
   },
 };
@@ -21292,6 +21416,18 @@ async function renderQuest(guild, quest, { applyHint = true } = {}) {
   if (quest.merit_reward > 0) rewardBits.push(`🎖️ **${quest.merit_reward}** merit${quest.merit_reward === 1 ? '' : 's'} each (auto-awarded)`);
   if (quest.rewards) rewardBits.push(`🎁 ${quest.rewards}`);
   if (rewardBits.length) lines.push(`**Rewards**\n${rewardBits.join('\n')}\n`);
+  // How the run landed, from the reviews that named it (T, 2026-09-07).
+  try {
+    const rs = db.prepare('SELECT scale, body FROM feedback_log WHERE guild_id=? AND quest_number=? ORDER BY at DESC').all(guild.id, quest.number);
+    if (rs.length) {
+      const scored = rs.filter(r => Number.isFinite(r.scale) && r.scale > 0);
+      const avg = scored.length ? (scored.reduce((a, r) => a + r.scale, 0) / scored.length).toFixed(1) : null;
+      lines.push(`\u{1F4DD} **Reviews** \u2014 ${rs.length}${avg ? ` \u00b7 avg \u2b50 ${avg}/10` : ''}`);
+      for (const r of rs.slice(0, 3))
+        lines.push(`\u00b7 ${r.scale ? `\u2b50 ${r.scale} ` : ''}_${String(r.body || '').slice(0, 140)}${(r.body || '').length > 140 ? '\u2026' : ''}_`);
+      lines.push('');
+    }
+  } catch {}
 
   if (quest.party_size) {
     const kind = quest.party_hard ? 'cap' : 'suggested';
@@ -23657,11 +23793,17 @@ async function handleQuest(interaction, forced) {
     // press is private, the card lands in the GMs' Quests room.
     const { ActionRowBuilder: FbRow, ButtonBuilder: FbBtn, ButtonStyle: FbStyle } = require('discord.js');
     const fbRow = new FbRow().addComponents(new FbBtn()
-      .setCustomId(`fbq:${encodeURIComponent(questTag(quest)).slice(0, 80)}`)
+      .setCustomId(`fbq:${quest.number}`)
       .setLabel('\u{1F4DD} Feedback on this quest').setStyle(FbStyle.Secondary));
-    if (quest.run_channel_id && quest.run_channel_id !== interactionChannelId(interaction)) {
-      try { const rc = await interaction.client.channels.fetch(quest.run_channel_id); await rc.send({ content: announce, components: [fbRow] }); } catch {}
-      return interaction.editReply({ content: `${announce}\n\n_(Also posted in <#${quest.run_channel_id}>.)_` });
+    // The review button belongs where the party actually played: the run's
+    // own thread first, its channel second (T, 2026-09-07).
+    const home = quest.run_thread_id || quest.run_channel_id;
+    if (home && home !== interactionChannelId(interaction)) {
+      try {
+        const rc = await interaction.client.channels.fetch(home);
+        await rc.send({ content: `${announce}\n\n\u{1F4DD} How was it? A word for the GMs helps the next run.`, components: [fbRow] });
+      } catch {}
+      return interaction.editReply({ content: `${announce}\n\n_(Also posted in <#${home}>, with the review button.)_` });
     }
     return interaction.editReply({ content: announce, components: [fbRow] });
   }

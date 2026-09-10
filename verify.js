@@ -1113,7 +1113,10 @@ function testBuilders(src) {
         // not where the lanes sit in the file: fbq inside routeButton,
         // fbcat guarded by isStringSelectMenu, fbm after isModalSubmit.
         return src.slice(rb, end).includes("startsWith('fbq:')")
-          && /isStringSelectMenu\?\.\(\) && interaction\.customId === 'fbcat'/.test(src)
+          // (2026-09-07: the picker id may carry a run number, and the
+          // guard must wrap BOTH forms — the probe caught the precedence
+          // slip where the || escaped the select-menu check.)
+          && /isStringSelectMenu\?\.\(\) && \(interaction\.customId === 'fbcat' \|\| interaction\.customId\?\.startsWith\('fbcat:'\)\)/.test(src)
           && src.indexOf("startsWith('fbm:')") > src.indexOf('isModalSubmit');
       })());
     ok('the feedback forum uses the plan\'s json idiom, like approvals',
@@ -1142,9 +1145,22 @@ function testBuilders(src) {
       })());
     ok('the card names the author for GMs',
       /\\u\{1F4DD\} \*\*Feedback\*\* \\u2014 <@\$\{interaction\.user\.id\}>/.test(src));
-    ok('a finished quest offers its own feedback door',
-      /setCustomId\(`fbq:\$\{encodeURIComponent\(questTag\(quest\)\)/.test(src) &&
+    // (2026-09-07: the door now names the run by NUMBER and opens in the
+    // run's own thread, and every review is kept as a row.)
+    ok('a finished quest offers its own feedback door, in its own thread',
+      /setCustomId\(`fbq:\$\{quest\.number\}`\)/.test(src) &&
+      /const home = quest\.run_thread_id \|\| quest\.run_channel_id;/.test(src) &&
       /startsWith\('fbq:'\)/.test(src));
+    ok('a player picks from their own runs, and the card reads them back',
+      /commandName === 'feedback' && focusedOption\.name === 'quest'/.test(src) &&
+      /FROM feedback_log WHERE guild_id=\? AND quest_number=\? ORDER BY at DESC/.test(src) &&
+      /\*\*Reviews\*\* \\u2014 \$\{rs\.length\}/.test(src));
+    ok('every review is kept, and may name its run',
+      /CREATE TABLE IF NOT EXISTS feedback_log/.test(src) &&
+      /INSERT INTO feedback_log \(guild_id, user_id, room, scale, body, quest_number, at\)/.test(src) &&
+      /setCustomId\(`fbcat:\$\{questNum\}`\)/.test(src) &&
+      /setCustomId\(`fbm:\$\{key\}:\$\{qFromPick\}`\)/.test(src) &&
+      /Pick one of your own runs from the list/.test(src));
     ok('under the 100-command ceiling', cmds.length <= 100);
 
     for (const c of cmds) {
@@ -1651,6 +1667,27 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('a recap carries what was said, and collapses repeats',
       /const beat = words \? `\$\{npcName\}: /.test(src) &&
       /if \(last && last\.text === b\) \{ last\.n\+\+; continue; \}/.test(src));
+    // Players can join a running fight, mirroring addnpc; placement is
+    // next-or-last because initiative is not stored once the order stands.
+    // /help must know every family the bot has. Pinned by feature rather
+    // than by wording, so help can be rephrased but not allowed to forget.
+    ok('/help covers every command family',
+      (() => {
+        const hi = src.indexOf('const HELP_CATEGORIES');
+        const h = src.slice(hi, src.indexOf('\n};', hi));
+        return ['/button roll', '/button group', '/target create', '/dd message', '/feedback send',
+                '/quest run winddown', '/quest run recap', '/quest run note', '/instance add',
+                '/gm override interject', 'pages|roster', '/fight add', 'temp:true', '/npc temp',
+                '/standing title', '/standing association', 'Who is excluded', 'Maintain the hold']
+          .every(t => h.includes(t));
+      })());
+    ok('the help picker offers the tools page',
+      /\{name:'Table Tools',value:'tools'\}/.test(src) && /\n  tools: \{/.test(src));
+    ok('/fight add brings a player into a running fight',
+      /setName\('add'\)\.setDescription\('Bring a player into the current fight \(GM\)'\)/.test(src) &&
+      /has fallen and cannot fight/.test(src) &&
+      /is already in this fight/.test(src) &&
+      /turnOrder\.splice\(fight\.turn_index \+ 1, 0, who\.id\);/.test(src));
     ok('a winding-down run releases its party to the rests',
       /ALTER TABLE quests ADD COLUMN winding_down/.test(src) &&
       /AND COALESCE\(q\.winding_down, 0\) = 0/.test(src) &&
