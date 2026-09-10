@@ -1,0 +1,2390 @@
+#!/usr/bin/env node
+// verify.js — the whole verify loop, in one file.
+//
+//   node --expose-internals verify.js            everything
+//   node --expose-internals verify.js scan       scanners only
+//   node --expose-internals verify.js test       harnesses only
+//   node --expose-internals verify.js -v         list every warning
+//
+// --expose-internals is not decoration: the scanners parse real JavaScript
+// with node's bundled acorn, and there is no network here to fetch a parser.
+//
+// Exit 1 if any scanner reports an ERROR or any assertion fails. WARN
+// reports and does not fail — it needs a human. Do not silence one to get a
+// green run; the standing warnings are listed in HANDOFF.md §6.
+//
+// Layout:
+//   1  AST toolkit          shared by every scanner
+//   2  Scanners             structure · wiring · limits · rulesets
+//   3  Stubs                discord.js · better-sqlite3 · dotenv · canvas
+//   4  Loader               index.js, executed against the stubs
+//   5  Harnesses            builders · rules · structure pins
+//   6  Runner
+
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const Module = require('module');
+
+const ROOT = __dirname;
+const INDEX = path.join(ROOT, 'index.js');
+
+const argv = process.argv.slice(2);
+const VERBOSE = argv.includes('-v') || argv.includes('--verbose');
+const ONLY = argv.find(a => a === 'scan' || a === 'test') || null;
+
+// ═══ 1 · AST toolkit ════════════════════════════════════════════════
+
+const acorn = require('internal/deps/acorn/acorn/dist/acorn');
+
+function parse(src) {
+  return acorn.parse(src, {
+    ecmaVersion: 'latest', sourceType: 'script',
+    locations: true, allowReturnOutsideFunction: true,
+  });
+}
+
+const lineOf = (n) => (n && n.loc ? n.loc.start.line : 0);
+
+function walk(node, visit, parents = []) {
+  if (!node || typeof node.type !== 'string') return;
+  visit(node, parents);
+  const chain = parents.concat(node);
+  for (const key of Object.keys(node)) {
+    if (key === 'loc' || key === 'start' || key === 'end') continue;
+    const val = node[key];
+    if (Array.isArray(val)) {
+      for (const c of val) if (c && typeof c.type === 'string') walk(c, visit, chain);
+    } else if (val && typeof val.type === 'string') walk(val, visit, chain);
+  }
+}
+
+// A fluent chain alternates call and member links — a().b().c() is
+// Call(Member(Call(Member(...)))) — so climbing must alternate too. Stopping
+// after one pass of each lands on an intermediate call, which is how the
+// wiring scanner once silently reported zero subcommands.
+function rootOf(node) {
+  let n = node;
+  for (;;) {
+    if (n && n.type === 'CallExpression') { n = n.callee; continue; }
+    if (n && n.type === 'MemberExpression') { n = n.object; continue; }
+    return n;
+  }
+}
+
+// The static text of a node, when it is knowable. A template returns only
+// its fixed parts; substitutions are counted separately, because a string
+// that is over on its literal text alone is a certainty while one that
+// merely could be is a risk.
+function staticText(node) {
+  if (!node) return null;
+  if (node.type === 'Literal' && typeof node.value === 'string') return node.value;
+  if (node.type === 'TemplateLiteral') return node.quasis.map(q => q.value.cooked ?? '').join('');
+  if (node.type === 'BinaryExpression' && node.operator === '+') {
+    const l = staticText(node.left), r = staticText(node.right);
+    if (l !== null && r !== null) return l + r;
+  }
+  return null;
+}
+
+// A nested builder always sits inside an arrow callback. Method names cannot
+// tell you this, because in a fluent chain the earlier call is an AST
+// descendant of the later one.
+const atThisLevel = (parents) => !parents.some(p => /Function/.test(p.type));
+
+const OPTION_ADDERS = /^add(String|Integer|Boolean|User|Channel|Role|Mentionable|Number|Attachment)Option$/;
+const GETTERS = /^get(String|Integer|Boolean|User|Channel|Role|Mentionable|Number|Attachment)$/;
+
+function collector() {
+  const out = [];
+  return {
+    out,
+    err: (rule, msg, line) => out.push({ sev: 'ERROR', rule, msg, line }),
+    warn: (rule, msg, line) => out.push({ sev: 'WARN', rule, msg, line }),
+  };
+}
+
+// ═══ 2 · Scanners ═══════════════════════════════════════════════════
+
+// ── 2.1 Structure ───────────────────────────────────────────────────
+// Faults that syntax checking cannot see: a function declared twice so the
+// second silently wins, an object key repeated so an earlier entry is dead,
+// a call to a helper that no longer exists. Each has bitten this file.
+// The layers worth carrying over from the Sec-Track audit: duplication,
+// drift between what the code does and what it says, failure paths that
+// swallow, and copy that contradicts itself. None of these are errors on
+// their own — they are the smells that preceded every real bug this month.
+function scanHabits(src, ast) {
+  const { out, err, warn } = collector();
+
+  // 1 · Swallowed failures. A bare catch {} on a WRITE is how a migration
+  // completes while achieving nothing.
+  const swallow = [];
+  for (const m of src.matchAll(/(db\.prepare\([^;]{0,200}?\.run\([^;]{0,120}?\)); \} catch \{\}/g)) {
+    swallow.push(lineAt(src, m.index));
+  }
+  if (swallow.length > 40) warn('many-silent-writes', swallow[0],
+    `${swallow.length} database writes discard their error \u2014 fine for ALTERs, a hiding place for anything else`);
+
+  // 2 · Drift: a command described in /help that no longer exists.
+  const registered = new Set([...src.matchAll(/\.setName\('([a-z]+)'\)\.setDescription/g)].map(m => m[1]));
+  const taught = new Set([...src.matchAll(/`\/([a-z]+) /g)].map(m => m[1]));
+  for (const t of taught) {
+    if (!registered.has(t) && t.length > 2) {
+      warn('taught-but-unregistered', 1, `/help or a reply teaches \`/${t}\` but no such command is registered`);
+    }
+  }
+
+  // 3 · Copy that contradicts the shape: a reply naming an option form
+  // (`x:true`) for a command that has since become a group of leaves.
+  for (const m of src.matchAll(/`\/gm check (\w+):true`/g)) {
+    err('stale-grammar', lineAt(src, m.index), `\`/gm check ${m[1]}:true\` is the pre-fold grammar \u2014 say \`/gm check ${m[1]}\``);
+  }
+
+  // 4 · Duplication: the same long literal in three or more places is a
+  // constant waiting to be named, and a place for two copies to diverge.
+  const strings = {};
+  for (const m of src.matchAll(/'([^'\n]{40,120})'/g)) strings[m[1]] = (strings[m[1]] || 0) + 1;
+  const dupes = Object.entries(strings).filter(([, n]) => n >= 3);
+  for (const [s0, n] of dupes.slice(0, 3)) warn('triplicated-copy', 1, `said ${n} times: "${s0.slice(0, 46)}\u2026"`);
+
+  // 5 · A plain string containing ${...} is a template literal someone
+  // wrote with the wrong quotes: it prints the placeholder verbatim. I
+  // nearly shipped one in the disarm headline (2026-08-21), so the check
+  // is permanent rather than a habit of mine.
+  let holes = 0;
+  walk(ast, (node) => {
+    if (node.type !== 'Literal' || typeof node.value !== 'string') return;
+    if (!/\$\{[A-Za-z_$][\w.$]*\}/.test(node.value)) return;
+    holes++;
+    err('placeholder-in-plain-string', lineOf(node),
+      `"${node.value.slice(0, 46)}" holds \u0024{...} but is not a template literal \u2014 it will print the braces`);
+  });
+
+  out.summary = `${swallow.length} silent writes \u00b7 ${dupes.length} triplicated strings${holes ? ` \u00b7 ${holes} placeholder holes` : ''}`;
+  return out;
+}
+function lineAt(src, i) { return src.slice(0, i).split('\n').length; }
+
+function scanStructure(src, ast) {
+  const { out, err, warn } = collector();
+
+  const fnDecls = new Map();
+  walk(ast, (node, parents) => {
+    if (node.type !== 'FunctionDeclaration' || !node.id) return;
+    const depth = parents.filter(p => /Function/.test(p.type)).length;
+    if (!fnDecls.has(node.id.name)) fnDecls.set(node.id.name, []);
+    fnDecls.get(node.id.name).push({ line: lineOf(node), depth });
+  });
+  for (const [name, decls] of fnDecls) {
+    const top = decls.filter(d => d.depth === 0);
+    if (top.length > 1) {
+      err('dup-function',
+        `function ${name}() declared ${top.length}x at top level — last wins, earlier bodies are dead`,
+        top.map(d => d.line).join(','));
+    }
+  }
+
+  const varDecls = new Map();
+  walk(ast, (node, parents) => {
+    if (node.type !== 'VariableDeclarator' || node.id.type !== 'Identifier') return;
+    if (parents.some(p => /Function/.test(p.type) || p.type === 'BlockStatement')) return;
+    if (!varDecls.has(node.id.name)) varDecls.set(node.id.name, []);
+    varDecls.get(node.id.name).push(lineOf(node));
+  });
+  for (const [name, lines] of varDecls) {
+    if (lines.length > 1) err('dup-binding', `top-level binding "${name}" declared ${lines.length}x`, lines.join(','));
+  }
+
+  walk(ast, (node) => {
+    if (node.type !== 'ObjectExpression' || node.properties.length < 2) return;
+    const seen = new Map();
+    for (const p of node.properties) {
+      if (p.type !== 'Property' || p.computed) continue;
+      const k = p.key.type === 'Identifier' ? p.key.name
+              : p.key.type === 'Literal' ? String(p.key.value) : null;
+      if (k === null) continue;
+      if (seen.has(k)) {
+        err('dup-key', `object key "${k}" repeated — the later value wins, the earlier is dead`,
+          `${seen.get(k)},${lineOf(p)}`);
+      }
+      seen.set(k, lineOf(p));
+    }
+  });
+
+  // Every name that could legitimately be called: declarations, bindings,
+  // parameters, catch params, globals.
+  const known = new Set(fnDecls.keys());
+  const GLOBALS = ['require', 'console', 'process', 'Math', 'JSON', 'Object', 'Array', 'String',
+    'Number', 'Boolean', 'Date', 'Error', 'TypeError', 'RangeError', 'Promise', 'Set', 'Map',
+    'WeakMap', 'WeakSet', 'Symbol', 'BigInt', 'RegExp', 'parseInt', 'parseFloat', 'isNaN',
+    'isFinite', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval', 'setImmediate',
+    'Buffer', 'fetch', 'structuredClone', 'encodeURIComponent', 'decodeURIComponent',
+    'queueMicrotask', 'AbortController', 'TextEncoder', 'TextDecoder', 'URL', 'URLSearchParams',
+    'Intl', 'globalThis'];
+  for (const g of GLOBALS) known.add(g);
+  walk(ast, (node) => {
+    if (node.type === 'ClassDeclaration' && node.id) known.add(node.id.name);
+    if (node.type === 'CatchClause' && node.param && node.param.type === 'Identifier') known.add(node.param.name);
+    if (/Function/.test(node.type)) {
+      if (node.id) known.add(node.id.name);
+      for (const p of node.params) {
+        if (p.type === 'Identifier') known.add(p.name);
+        if (p.type === 'AssignmentPattern' && p.left.type === 'Identifier') known.add(p.left.name);
+        if (p.type === 'RestElement' && p.argument.type === 'Identifier') known.add(p.argument.name);
+        if (p.type === 'ObjectPattern') for (const q of p.properties) {
+          if (q.type === 'Property' && q.value.type === 'Identifier') known.add(q.value.name);
+        }
+      }
+    }
+    if (node.type === 'VariableDeclarator') {
+      if (node.id.type === 'Identifier') known.add(node.id.name);
+      if (node.id.type === 'ObjectPattern') for (const p of node.id.properties) {
+        if (p.type === 'Property' && p.value.type === 'Identifier') known.add(p.value.name);
+        if (p.type === 'RestElement' && p.argument.type === 'Identifier') known.add(p.argument.name);
+      }
+      if (node.id.type === 'ArrayPattern') for (const e of node.id.elements) {
+        if (e && e.type === 'Identifier') known.add(e.name);
+      }
+    }
+  });
+  const called = new Map();
+  walk(ast, (node) => {
+    if (node.type !== 'CallExpression' && node.type !== 'NewExpression') return;
+    if (node.callee.type !== 'Identifier') return;
+    if (!called.has(node.callee.name)) called.set(node.callee.name, lineOf(node));
+  });
+  for (const [name, line] of called) {
+    if (!known.has(name)) err('undefined-call', `${name}() is called but never declared`, line);
+  }
+
+  const referenced = new Set();
+  walk(ast, (node, parents) => {
+    if (node.type !== 'Identifier') return;
+    const p = parents[parents.length - 1];
+    if (!p) return;
+    if (p.type === 'FunctionDeclaration' && p.id === node) return;
+    if (p.type === 'Property' && p.key === node && !p.computed) return;
+    if (p.type === 'MemberExpression' && p.property === node && !p.computed) return;
+    referenced.add(node.name);
+  });
+  for (const [name, decls] of fnDecls) {
+    if (decls.some(d => d.depth > 0)) continue;
+    if (!referenced.has(name)) warn('dead-function', `function ${name}() is declared but never referenced`, decls[0].line);
+  }
+
+  // Repeated prose or table rows should be shared helpers. 256 chars, per
+  // LIMITS.md §8.
+  const strs = new Map();
+  const note = (text, line) => {
+    if (text.length < 256) return;
+    if (!strs.has(text)) strs.set(text, []);
+    strs.get(text).push(line);
+  };
+  walk(ast, (node) => {
+    if (node.type === 'Literal' && typeof node.value === 'string') note(node.value, lineOf(node));
+    if (node.type === 'TemplateLiteral') {
+      note(node.quasis.map(q => q.value.cooked ?? '').join('\u0000'), lineOf(node));
+    }
+  });
+  for (const [text, lines] of strs) {
+    if (lines.length > 1) {
+      warn('dup-block',
+        `identical ${text.length}-char literal appears ${lines.length}x — extract a shared helper`,
+        lines.join(','));
+    }
+  }
+
+  // A router that hands off with `return handleX(...)` is correctly async —
+  // the promise is the return value. Only a body that neither awaits nor
+  // delegates is suspicious.
+  walk(ast, (node) => {
+    if (!/Function/.test(node.type) || !node.async || !node.id) return;
+    let awaits = false, delegates = false;
+    walk(node.body, (n, ps) => {
+      if (ps.some(p => /Function/.test(p.type) && p !== node)) return;
+      if (n.type === 'AwaitExpression') awaits = true;
+      if (n.type === 'ReturnStatement' && n.argument &&
+          (n.argument.type === 'CallExpression' || n.argument.type === 'AwaitExpression')) delegates = true;
+    });
+    if (!awaits && !delegates) {
+      warn('async-no-await', `async function ${node.id.name}() neither awaits nor returns a promise`, lineOf(node));
+    }
+  });
+
+  return out;
+}
+
+// ── Shared: reconstruct the registered command tree ─────────────────
+// Builders are fluent chains of arrow callbacks. For any arrow passed to
+// addSubcommand/addSubcommandGroup/add*Option, the name is the argument of
+// the first .setName() applied to that arrow's own parameter.
+function readBuilder(fn) {
+  if (!fn || !/Function/.test(fn.type) || !fn.params[0]) return null;
+  const param = fn.params[0].name;
+  const out = { name: null, desc: null, line: lineOf(fn), choices: [], options: [], subs: [], groups: [] };
+  walk(fn.body, (n, parents) => {
+    if (n.type !== 'CallExpression' || n.callee.type !== 'MemberExpression') return;
+    const m = n.callee.property.name;
+    const r = rootOf(n.callee.object);
+    const onParam = r && r.type === 'Identifier' && r.name === param;
+    if (onParam && m === 'setName' && out.name === null) out.name = staticText(n.arguments[0]);
+    if (onParam && m === 'setDescription' && out.desc === null) out.desc = staticText(n.arguments[0]);
+    if (onParam && m === 'addChoices') {
+      for (const a of n.arguments) {
+        if (a.type === 'ObjectExpression') out.choices.push(a);
+        if (a.type === 'ArrayExpression') for (const e of a.elements) if (e) out.choices.push(e);
+      }
+    }
+    if (!atThisLevel(parents)) return;
+    if (OPTION_ADDERS.test(m)) { const o = readBuilder(n.arguments[0]); if (o) out.options.push(o); }
+    if (m === 'addSubcommand') { const s = readBuilder(n.arguments[0]); if (s) out.subs.push(s); }
+    if (m === 'addSubcommandGroup') { const g = readBuilder(n.arguments[0]); if (g) out.groups.push(g); }
+  });
+  return out;
+}
+
+function commandTree(ast) {
+  const cmds = [];
+  walk(ast, (node, parents) => {
+    if (node.type !== 'NewExpression' || !node.callee || node.callee.name !== 'SlashCommandBuilder') return;
+    let top = node;
+    for (let i = parents.length - 1; i >= 0; i--) {
+      const p = parents[i];
+      if ((p.type === 'CallExpression' || p.type === 'MemberExpression') && rootOf(p) === node) top = p;
+      else break;
+    }
+    const cmd = { name: null, desc: null, line: lineOf(node), choices: [], options: [], subs: [], groups: [] };
+    walk(top, (n, ps) => {
+      if (n.type !== 'CallExpression' || n.callee.type !== 'MemberExpression') return;
+      const m = n.callee.property.name;
+      if (rootOf(n.callee.object) === node) {
+        if (m === 'setName' && cmd.name === null) cmd.name = staticText(n.arguments[0]);
+        if (m === 'setDescription' && cmd.desc === null) cmd.desc = staticText(n.arguments[0]);
+      }
+      if (!atThisLevel(ps)) return;
+      if (m === 'addSubcommand') { const s = readBuilder(n.arguments[0]); if (s) cmd.subs.push(s); }
+      if (m === 'addSubcommandGroup') { const g = readBuilder(n.arguments[0]); if (g) cmd.groups.push(g); }
+      if (OPTION_ADDERS.test(m)) { const o = readBuilder(n.arguments[0]); if (o) cmd.options.push(o); }
+    });
+    if (cmd.name) cmds.push(cmd);
+  });
+  return cmds;
+}
+
+const allSubs = (c) => c.subs.concat(...c.groups.map(g => g.subs));
+
+// ── 2.2 Wiring ──────────────────────────────────────────────────────
+// Registration and routing live hundreds of lines apart, so they drift. A
+// subcommand Discord advertises but nothing routes is the worst failure
+// this bot has: it appears in the picker, the user runs it, and the
+// interaction times out with "the application did not respond".
+function scanWiring(src, ast) {
+  const { out, err, warn } = collector();
+  const cmds = commandTree(ast);
+
+  const compared = new Set();
+  const cmdRoutes = new Set();
+  const isProp = (s, name) => s.type === 'MemberExpression' && s.property.name === name;
+
+  walk(ast, (node) => {
+    if (node.type === 'BinaryExpression' && /^[!=]==?$/.test(node.operator)) {
+      for (const side of [node.left, node.right]) {
+        if (side.type === 'Literal' && typeof side.value === 'string') compared.add(side.value);
+      }
+      if (isProp(node.left, 'commandName') && node.right.type === 'Literal') cmdRoutes.add(String(node.right.value));
+      if (isProp(node.right, 'commandName') && node.left.type === 'Literal') cmdRoutes.add(String(node.left.value));
+    }
+    if (node.type === 'SwitchCase' && node.test && node.test.type === 'Literal' &&
+        typeof node.test.value === 'string') compared.add(node.test.value);
+    if (node.type === 'CallExpression' && node.callee.type === 'MemberExpression' &&
+        node.callee.property.name === 'includes' && node.callee.object.type === 'ArrayExpression') {
+      for (const el of node.callee.object.elements) {
+        if (el && el.type === 'Literal' && typeof el.value === 'string') compared.add(el.value);
+      }
+    }
+  });
+
+  let usesGroupApi = false;
+  walk(ast, (n) => {
+    if (n.type === 'CallExpression' && n.callee.type === 'MemberExpression' &&
+        n.callee.property.name === 'getSubcommandGroup') usesGroupApi = true;
+  });
+
+  for (const c of cmds) {
+    if (!cmdRoutes.has(c.name)) {
+      err('unrouted-command', `/${c.name} is registered but no dispatch compares interaction.commandName to it`, c.line);
+    }
+  }
+  for (const n of cmdRoutes) {
+    if (!cmds.some(c => c.name === n)) warn('orphan-route', `dispatch routes /${n} but no builder registers it`, 0);
+  }
+
+  // The last subcommand in a handler is often reached by fall-through
+  // rather than an explicit compare — `if (sub === 'list') {...}` then the
+  // clean path below it, marked only by a `// clean` comment. That is
+  // deliberate, so this cannot be an ERROR without crying wolf.
+  for (const c of cmds) {
+    for (const s of allSubs(c)) {
+      if (!compared.has(s.name)) {
+        warn('unrouted-subcommand',
+          `/${c.name} ${s.name} is registered but never compared — confirm a fall-through handles it`, c.line);
+      }
+    }
+  }
+  for (const c of cmds) {
+    if (c.groups.length && !usesGroupApi) {
+      err('group-never-read',
+        `/${c.name} declares groups (${c.groups.map(g => g.name).join(', ')}) but getSubcommandGroup is never called`, c.line);
+    }
+    for (const g of c.groups) {
+      if (!compared.has(g.name)) {
+        warn('group-not-compared', `/${c.name} group "${g.name}" is never compared — leaves may still route by name`, c.line);
+      }
+    }
+  }
+
+  // customId round-trip.
+  const builtExact = new Map(), builtPrefix = new Map();
+  walk(ast, (node, parents) => {
+    if (node.type !== 'CallExpression' || node.callee.type !== 'MemberExpression') return;
+    if (node.callee.property.name !== 'setCustomId') return;
+    const a = node.arguments[0];
+    if (!a) return;
+    // A page-counter button is built .setDisabled(true) and can never be
+    // clicked, so it needs no route.
+    for (let i = parents.length - 1; i >= 0; i--) {
+      const p = parents[i];
+      if (p.type !== 'CallExpression' && p.type !== 'MemberExpression') break;
+      if (p.type === 'CallExpression' && p.callee.type === 'MemberExpression' &&
+          p.callee.property.name === 'setDisabled' && p.arguments[0] && p.arguments[0].value === true) return;
+    }
+    if (a.type === 'Literal' && typeof a.value === 'string') builtExact.set(a.value, lineOf(node));
+    else if (a.type === 'TemplateLiteral' && a.quasis.length) {
+      const head = a.quasis[0].value.cooked || '';
+      if (head.includes(':')) builtPrefix.set(head.slice(0, head.indexOf(':') + 1), lineOf(node));
+      else if (head) builtPrefix.set(head, lineOf(node));
+    }
+  });
+
+  const routedExact = new Set(), routedPrefix = new Set();
+  walk(ast, (node) => {
+    if (node.type === 'BinaryExpression' && /^[!=]==?$/.test(node.operator)) {
+      if (isProp(node.left, 'customId') && node.right.type === 'Literal') routedExact.add(String(node.right.value));
+      if (isProp(node.right, 'customId') && node.left.type === 'Literal') routedExact.add(String(node.left.value));
+    }
+    if (node.type !== 'CallExpression' || node.callee.type !== 'MemberExpression') return;
+    if (node.callee.property.name === 'startsWith' && isProp(node.callee.object, 'customId')) {
+      const a = node.arguments[0];
+      if (a && a.type === 'Literal') routedPrefix.add(String(a.value));
+    }
+    // Regex routing: /^duel(join|out|send|cancel|ok|no):/.test(customId)
+    // routes six prefixes in one line.
+    if (node.callee.property.name === 'test' && node.callee.object.type === 'Literal' && node.callee.object.regex) {
+      const arg = node.arguments[0];
+      const onCid = arg && (isProp(arg, 'customId') || (arg.type === 'Identifier' && /customid|cid/i.test(arg.name)));
+      if (!onCid) return;
+      const pat = node.callee.object.regex.pattern;
+      const m = /^\^([A-Za-z0-9_-]*)\(([A-Za-z0-9_|-]+)\)([A-Za-z0-9_:-]*)/.exec(pat);
+      if (m) for (const alt of m[2].split('|')) routedPrefix.add(m[1] + alt + m[3]);
+      else {
+        const plain = /^\^([A-Za-z0-9_-]+:?)/.exec(pat);
+        if (plain) routedPrefix.add(plain[1]);
+      }
+    }
+  });
+
+  for (const [id, line] of builtExact) {
+    if (routedExact.has(id)) continue;
+    if ([...routedPrefix].some(p => id.startsWith(p))) continue;
+    if (src.includes(`getTextInputValue('${id}')`)) continue;   // a modal field, not a route
+    err('unrouted-customid', `customId "${id}" is built but nothing routes it`, line);
+  }
+  for (const [pre, line] of builtPrefix) {
+    if ([...routedPrefix].some(p => p === pre || pre.startsWith(p) || p.startsWith(pre))) continue;
+    if ([...routedExact].some(e => e.startsWith(pre))) continue;
+    err('unrouted-customid-prefix', `customId prefix "${pre}" is built but nothing routes it`, line);
+  }
+  // Many ids never touch setCustomId directly — a local helper assembles
+  // them, or they are handed to one. For the orphan check, any id-shaped
+  // literal counts as built; the rule only catches a route whose id appears
+  // nowhere at all.
+  const idShaped = new Set();
+  walk(ast, (node) => {
+    const add = (s) => { const m = /^([A-Za-z][A-Za-z0-9_-]*:)/.exec(s); if (m) idShaped.add(m[1]); };
+    if (node.type === 'Literal' && typeof node.value === 'string') add(node.value);
+    if (node.type === 'TemplateLiteral' && node.quasis.length) add(node.quasis[0].value.cooked || '');
+  });
+  for (const p of routedPrefix) {
+    const built = [...builtPrefix.keys()].some(b => b === p || b.startsWith(p) || p.startsWith(b))
+               || [...builtExact.keys()].some(b => b.startsWith(p))
+               || [...idShaped].some(b => b === p || b.startsWith(p) || p.startsWith(b));
+    if (!built) warn('orphan-customid-route', `nothing builds a customId starting "${p}"`, 0);
+  }
+
+  const declared = new Set();
+  for (const c of cmds) {
+    for (const o of c.options) declared.add(o.name);
+    for (const s of allSubs(c)) for (const o of s.options) declared.add(o.name);
+  }
+  const reads = new Map();
+  walk(ast, (node) => {
+    if (node.type !== 'CallExpression' || node.callee.type !== 'MemberExpression') return;
+    if (!GETTERS.test(node.callee.property.name)) return;
+    const a = node.arguments[0];
+    if (a && a.type === 'Literal' && typeof a.value === 'string' && !reads.has(a.value)) reads.set(a.value, lineOf(node));
+  });
+  for (const [name, line] of reads) {
+    if (!declared.has(name)) err('phantom-option', `options.get*('${name}') is read but no command declares that option`, line);
+  }
+
+  out.summary = `${cmds.length} commands · ${cmds.reduce((a, c) => a + allSubs(c).length, 0)} subcommands · ${builtExact.size + builtPrefix.size} customIds`;
+  return out;
+}
+
+// ── 2.3 Limits ──────────────────────────────────────────────────────
+// Every ceiling in LIMITS.md §1-§3 that can be checked without a network
+// call. Discord rejects an over-limit command at registration with a JSON
+// path and no line number, so the bot simply fails to boot.
+function scanLimits(src, ast) {
+  const { out, err, warn } = collector();
+  const cmds = commandTree(ast);
+  const NAME_RE = /^[a-z0-9_-]{1,32}$/;
+
+  const checkNamed = (node, kind, label) => {
+    if (node.name != null && !NAME_RE.test(node.name)) {
+      err('bad-name', `${kind} "${label}" — names are 1-32 chars of a-z0-9_- (got "${node.name}")`, node.line);
+    }
+    if (node.desc == null) {
+      if (node.name) warn('unreadable-description', `${kind} "${label}" description is not a static string`, node.line);
+      return;
+    }
+    if (!node.desc.length) err('no-description', `${kind} "${label}" has an empty description`, node.line);
+    else if (node.desc.length > 100) err('long-description', `${kind} "${label}" description is ${node.desc.length} chars (max 100)`, node.line);
+    else if (node.desc.length > 92) warn('near-description', `${kind} "${label}" description is ${node.desc.length}/100 chars`, node.line);
+  };
+
+  const checkOptions = (opts, label, line) => {
+    if (opts.length > 25) err('too-many-options', `"${label}" has ${opts.length} options (max 25)`, line);
+    for (const o of opts) {
+      checkNamed(o, 'option', `${label} ${o.name}`);
+      if (o.choices.length > 25) err('too-many-choices', `option "${label} ${o.name}" has ${o.choices.length} choices (max 25)`, o.line);
+    }
+    const names = opts.map(o => o.name).filter(Boolean);
+    for (const d of new Set(names.filter((n, i) => names.indexOf(n) !== i))) {
+      err('dup-option', `"${label}" declares option "${d}" more than once`, line);
+    }
+  };
+
+  // The real §1 wall counts the text a human wrote — names, descriptions
+  // and choice values — not the JSON syntax around them. Measuring the
+  // serialized blob reads roughly three times high.
+  const budget = (c) => {
+    let n = 0;
+    const opt = (o) => {
+      n += (o.name || '').length + (o.desc || '').length;
+      for (const ch of o.choices) {
+        for (const p of ch.properties || []) {
+          const v = staticText(p.value);
+          if (v) n += v.length;
+        }
+      }
+    };
+    n += (c.name || '').length + (c.desc || '').length;
+    c.options.forEach(opt);
+    for (const s of allSubs(c)) { n += (s.name || '').length + (s.desc || '').length; s.options.forEach(opt); }
+    for (const g of c.groups) n += (g.name || '').length + (g.desc || '').length;
+    return n;
+  };
+
+  const sizes = [];
+  for (const c of cmds) {
+    checkNamed(c, 'command', `/${c.name}`);
+    checkOptions(c.options, `/${c.name}`, c.line);
+    const leaves = c.subs.length + c.groups.length;
+    if (leaves > 25) err('too-many-subcommands', `/${c.name} has ${leaves} subcommands+groups (max 25)`, c.line);
+    else if (leaves >= 23) warn('near-subcommand-wall', `/${c.name} has ${leaves}/25 subcommands+groups`, c.line);
+    for (const s of c.subs) { checkNamed(s, 'subcommand', `/${c.name} ${s.name}`); checkOptions(s.options, `/${c.name} ${s.name}`, s.line); }
+    for (const g of c.groups) {
+      checkNamed(g, 'group', `/${c.name} ${g.name}`);
+      if (g.subs.length > 25) err('too-many-group-subs', `/${c.name} ${g.name} has ${g.subs.length} subcommands (max 25)`, g.line);
+      for (const s of g.subs) { checkNamed(s, 'subcommand', `/${c.name} ${g.name} ${s.name}`); checkOptions(s.options, `/${c.name} ${g.name} ${s.name}`, s.line); }
+    }
+    const size = budget(c);
+    sizes.push([c.name, size]);
+    if (size > 8000) err('command-json-over', `/${c.name} serializes to ~${size} chars (ceiling ~8000)`, c.line);
+    else if (size > 6500) warn('command-json-near', `/${c.name} serializes to ~${size}/8000 chars`, c.line);
+  }
+  if (cmds.length > 100) err('too-many-commands', `${cmds.length} global commands (max 100)`, 0);
+
+  // Chain-level string ceilings.
+  const LIMITS = { setPlaceholder: [100, 'placeholder'], setLabel: [80, 'label'], setTitle: [45, 'title'], setCustomId: [100, 'customId'] };
+  walk(ast, (node, parents) => {
+    if (node.type !== 'CallExpression' || node.callee.type !== 'MemberExpression') return;
+    const m = node.callee.property.name;
+    // hasOwnProperty, not truthiness: a method called `toString` or
+    // `valueOf` would otherwise match Object.prototype and hand back a
+    // function where a [max, label] pair was expected.
+    if (!Object.prototype.hasOwnProperty.call(LIMITS, m)) return;
+    const text = staticText(node.arguments[0]);
+    if (text === null) return;
+    let [max, what] = LIMITS[m];
+    const ctor = (() => { const r = rootOf(node); return r && r.type === 'NewExpression' && r.callee ? r.callee.name : null; })();
+    const inTextInput = ctor === 'TextInputBuilder' || parents.some(p => p.type === 'NewExpression' && p.callee && p.callee.name === 'TextInputBuilder');
+    if (m === 'setLabel' && inTextInput) { max = 45; what = 'text input label'; }
+    if (m === 'setTitle') { max = ctor === 'ModalBuilder' ? 45 : 256; what = ctor === 'ModalBuilder' ? 'modal title' : 'embed title'; }
+    const holes = node.arguments[0].type === 'TemplateLiteral' ? node.arguments[0].expressions.length : 0;
+    if (text.length > max) err('over-limit', `${what} is ${text.length} chars of fixed text (max ${max})`, lineOf(node));
+    else if (holes && text.length + holes * 4 > max) {
+      // Might exceed once the holes are filled — which depends on what a
+      // user typed. Exactly why it is worth naming: the id that fits in
+      // testing is the one that throws in play.
+      warn('runtime-limit', `${what} is ${text.length} fixed chars + ${holes} substitutions (max ${max}) — can exceed at runtime`, lineOf(node));
+    } else if (text.length > max * 0.92) warn('near-limit', `${what} is ${text.length}/${max} chars`, lineOf(node));
+  });
+
+  walk(ast, (node) => {
+    if (node.type !== 'CallExpression' || node.callee.type !== 'MemberExpression') return;
+    if (node.callee.property.name !== 'setMaxLength') return;
+    const v = node.arguments[0];
+    if (v && v.type === 'Literal' && v.value > 4000) {
+      err('textinput-maxlength', `setMaxLength(${v.value}) exceeds the 4000-char TextInput ceiling`, lineOf(node));
+    }
+  });
+
+  // Rows on modals and action rows: count addComponents along each chain.
+  const countRows = (ctorName) => {
+    walk(ast, (node, parents) => {
+      if (node.type !== 'NewExpression' || !node.callee || node.callee.name !== ctorName) return;
+      let n = 0, top = node;
+      for (let i = parents.length - 1; i >= 0; i--) {
+        const p = parents[i];
+        if ((p.type === 'CallExpression' || p.type === 'MemberExpression') && rootOf(p) === node) top = p;
+        else break;
+      }
+      walk(top, (c) => {
+        if (c.type === 'CallExpression' && c.callee.type === 'MemberExpression' &&
+            c.callee.property.name === 'addComponents' && rootOf(c) === node) n += c.arguments.length;
+      });
+      if (ctorName === 'ModalBuilder') {
+        if (n > 5) err('modal-rows', `modal has ${n} rows (max 5)`, lineOf(node));
+        else if (n === 5) warn('modal-rows-full', 'modal is at 5/5 rows — no field can be added', lineOf(node));
+      } else if (n > 5) err('row-overfull', `action row holds ${n} components (max 5)`, lineOf(node));
+    });
+  };
+  countRows('ModalBuilder');
+  countRows('ActionRowBuilder');
+
+  sizes.sort((a, b) => b[1] - a[1]);
+  out.budget = sizes;
+  out.summary = `${cmds.length} commands · ${cmds.reduce((a, c) => a + allSubs(c).length, 0)} subcommands`;
+  return out;
+}
+
+// ── 2.4 Rulesets ────────────────────────────────────────────────────
+// The seam is a promise: a server that never sets dnd5e should never meet a
+// proficiency bonus, an armour class or a spell slot. Nothing enforces that
+// at runtime — the seam is convention, and convention drifts.
+function scanRulesets(src) {
+  const { out, err, warn } = collector();
+  const lineAt = (i) => src.slice(0, i).split('\n').length;
+
+  const bodyOf = (fn, span) => {
+    const m = new RegExp(`^async function ${fn}\\s*\\(`, 'm').exec(src);
+    if (!m) return null;
+    const start = lineAt(m.index);
+    return { body: src.split('\n').slice(start - 1, start - 1 + span).join('\n'), start };
+  };
+
+  // Two idioms count. The capability check is the better one — it asks what
+  // the system can do rather than what it is called — so both pass.
+  const GATE = /\.id\s*!==\s*'dnd5e'|\.defence\s*!==\s*'ac'/;
+  for (const fn of ['handleCreate5e', 'handleNpcCreate5e', 'handleLevelUp', 'handleSpell', 'handle5eStatus']) {
+    const f = bodyOf(fn, 14);
+    if (!f) { warn('entry-missing', `${fn} not found — renamed or removed; update this list`, 0); continue; }
+    if (!GATE.test(f.body)) err('ungated-5e', `${fn} has no ruleset gate — a Knightfall server can reach 5e-only code`, f.start);
+    else if (!/return\s+interaction\.reply/.test(f.body)) err('gate-no-refusal', `${fn} checks the ruleset but does not refuse`, f.start);
+  }
+
+  const defn = /^const RULES_DND5E\s*=\s*\{/m.exec(src);
+  const reg = /^const RULESETS\s*=/m.exec(src);
+  if (!defn || !reg) err('registry-missing', 'RULES_DND5E or RULESETS is missing', 0);
+  else {
+    const lo = defn.index, hi = reg.index + 200;
+    const strays = [...src.matchAll(/\bRULES_DND5E\b/g)].filter(m => m.index < lo || m.index > hi).map(m => lineAt(m.index));
+    if (strays.length) {
+      err('hardcoded-5e', 'RULES_DND5E named outside its definition — reached whatever the server plays', strays.join(','));
+    }
+  }
+
+  const rf = /function rulesFor\s*\([^)]*\)\s*\{[\s\S]*?\n\}/.exec(src);
+  const lo = rf ? lineAt(rf.index) : -1;
+  const hi = rf ? lo + rf[0].split('\n').length : -1;
+  const strayReads = [...src.matchAll(/getConfig\([^)]*\)\??\.\s*ruleset/g)]
+    .map(m => lineAt(m.index)).filter(l => l < lo || l > hi);
+  if (strayReads.length) {
+    err('ruleset-read-bypass', 'ruleset read outside rulesFor() — bypasses the Knightfall default', strayReads.join(','));
+  }
+
+  const lib = bodyOf('handleLibrary', 12);
+  if (lib && !GATE.test(lib.body)) {
+    warn('library-ungated',
+      'handleLibrary has no ruleset gate — a Knightfall GM can import 5e spells and monsters; harmless if intended, but the Knightfall books do not document it',
+      lib.start);
+  }
+
+  return out;
+}
+
+// ═══ 3 · Stubs ══════════════════════════════════════════════════════
+// index.js requires discord.js, better-sqlite3, dotenv and @napi-rs/canvas.
+// None can run here: no network, no database, no native build. Each is
+// replaced by something that does the minimum to let the real code execute
+// and refuses anything the real service would refuse.
+
+const NAME_RE = /^[-_\p{L}\p{N}]{1,32}$/u;
+const sassert = (cond, msg) => { if (!cond) throw new Error('[stub] ' + msg); };
+
+class B {
+  constructor(kind) { this._kind = kind; this.name = null; this.description = null; }
+  setName(n) {
+    sassert(typeof n === 'string' && NAME_RE.test(n), `${this._kind} "${n}": names are 1-32 chars, no spaces`);
+    sassert(n === n.toLowerCase(), `${this._kind} "${n}": names must be lowercase`);
+    this.name = n; return this;
+  }
+  setDescription(d) {
+    sassert(typeof d === 'string' && d.length > 0, `${this._kind} "${this.name}": description required`);
+    sassert(d.length <= 100, `${this._kind} "${this.name}": description ${d.length} chars (max 100)`);
+    this.description = d; return this;
+  }
+  setRequired(v) { this.required = !!v; return this; }
+  setAutocomplete(v) { return this; }
+  setMinValue(v) { return this; }
+  setMaxValue(v) { return this; }
+  setMinLength(v) { return this; }
+  setMaxLength(v) { sassert(v <= 6000, `${this._kind} "${this.name}": maxLength ${v} over 6000`); return this; }
+  addChannelTypes() { return this; }
+  addChoices(...c) {
+    this.choices = (this.choices || []).concat(c.flat());
+    sassert(this.choices.length <= 25, `option "${this.name}": ${this.choices.length} choices (max 25)`);
+    for (const x of this.choices) {
+      sassert(x && typeof x.name === 'string', `option "${this.name}": choice needs a name`);
+      sassert(x.name.length <= 100, `option "${this.name}": choice name over 100 chars`);
+      if (typeof x.value === 'string') sassert(x.value.length <= 100, `option "${this.name}": choice value over 100 chars`);
+    }
+    return this;
+  }
+}
+
+class OptionHost extends B {
+  constructor(kind) { super(kind); this.options = []; }
+  _add(type, fn) {
+    const o = new B('option'); o._type = type; fn(o);
+    sassert(o.name, `${this._kind} "${this.name}": an option has no name`);
+    sassert(o.description, `${this._kind} "${this.name}": option "${o.name}" has no description`);
+    sassert(!this.options.some(x => x.name === o.name), `${this._kind} "${this.name}": option "${o.name}" declared twice`);
+    // Discord requires every required option before every optional one.
+    if (o.required) {
+      sassert(!this.options.some(x => !x.required),
+        `${this._kind} "${this.name}": required option "${o.name}" follows an optional one`);
+    }
+    this.options.push(o);
+    sassert(this.options.length <= 25, `${this._kind} "${this.name}": ${this.options.length} options (max 25)`);
+    return this;
+  }
+}
+for (const t of ['String', 'Integer', 'Boolean', 'User', 'Channel', 'Role', 'Mentionable', 'Number', 'Attachment']) {
+  OptionHost.prototype['add' + t + 'Option'] = function (fn) { return this._add(t, fn); };
+}
+
+class Sub extends OptionHost { constructor() { super('subcommand'); } }
+
+class Group extends B {
+  constructor() { super('group'); this.subcommands = []; }
+  addSubcommand(fn) {
+    const s = new Sub(); fn(s);
+    sassert(s.name && s.description, `group "${this.name}": a subcommand is missing name or description`);
+    this.subcommands.push(s);
+    sassert(this.subcommands.length <= 25, `group "${this.name}": ${this.subcommands.length} subcommands (max 25)`);
+    return this;
+  }
+}
+
+const ALL = [];
+class Cmd extends OptionHost {
+  constructor() { super('command'); this.subcommands = []; this.groups = []; ALL.push(this); }
+  addSubcommand(fn) {
+    const s = new Sub(); fn(s);
+    sassert(s.name && s.description, `/${this.name}: a subcommand is missing name or description`);
+    sassert(!this.options.length, `/${this.name}: a command cannot have both options and subcommands`);
+    this.subcommands.push(s); this._leaves(); return this;
+  }
+  addSubcommandGroup(fn) {
+    const g = new Group(); fn(g);
+    sassert(g.name && g.description, `/${this.name}: a group is missing name or description`);
+    this.groups.push(g); this._leaves(); return this;
+  }
+  _leaves() {
+    const n = this.subcommands.length + this.groups.length;
+    sassert(n <= 25, `/${this.name}: ${n} subcommands+groups (max 25)`);
+  }
+  setDefaultMemberPermissions() { return this; }
+  setDMPermission() { return this; }
+  setContexts() { return this; }
+  setIntegrationTypes() { return this; }
+}
+
+class Row {
+  constructor() { this.components = []; }
+  addComponents(...c) {
+    this.components.push(...c.flat());
+    sassert(this.components.length <= 5, `action row holds ${this.components.length} components (max 5)`);
+    return this;
+  }
+}
+class Btn {
+  setCustomId(id) { sassert(id.length <= 100, `button customId is ${id.length} chars (max 100)`); this.customId = id; return this; }
+  setLabel(l) { sassert(l.length <= 80, `button label is ${l.length} chars (max 80)`); return this; }
+  setStyle() { return this; } setEmoji() { return this; }
+  setDisabled(v) { this.disabled = !!v; return this; } setURL() { return this; }
+}
+class Select {
+  constructor() { this.options = []; }
+  setCustomId(id) { sassert(id.length <= 100, `select customId is ${id.length} chars (max 100)`); return this; }
+  setPlaceholder(p) { sassert(p.length <= 150, `select placeholder is ${p.length} chars (max 150)`); return this; }
+  addOptions(...o) {
+    this.options.push(...o.flat());
+    sassert(this.options.length <= 25, `select menu has ${this.options.length} options (max 25)`);
+    return this;
+  }
+  setMinValues() { return this; } setMaxValues() { return this; } setDisabled() { return this; }
+}
+class TextInput {
+  setCustomId(i) { return this; }
+  setLabel(l) { sassert(l.length <= 45, `text input label is ${l.length} chars (max 45)`); return this; }
+  setStyle() { return this; }
+  setPlaceholder(p) { sassert(p.length <= 100, `text input placeholder is ${p.length} chars (max 100)`); return this; }
+  setValue(v) { sassert(String(v).length <= 4000, `text input value is ${String(v).length} chars (max 4000)`); return this; }
+  setRequired() { return this; } setMinLength() { return this; }
+  setMaxLength(v) { sassert(v <= 4000, `text input maxLength ${v} over 4000`); return this; }
+}
+class Modal {
+  constructor() { this.rows = []; }
+  setCustomId(i) { sassert(i.length <= 100, `modal customId is ${i.length} chars (max 100)`); return this; }
+  setTitle(t) { sassert(t.length <= 45, `modal title is ${t.length} chars (max 45)`); return this; }
+  addComponents(...c) { this.rows.push(...c.flat()); sassert(this.rows.length <= 5, `modal has ${this.rows.length} rows (max 5)`); return this; }
+}
+class Embed {
+  constructor() { this.fields = []; }
+  setTitle(t) { sassert(String(t).length <= 256, 'embed title over 256'); return this; }
+  setDescription(d) { sassert(String(d).length <= 4096, 'embed description over 4096'); return this; }
+  addFields(...f) {
+    this.fields.push(...f.flat());
+    sassert(this.fields.length <= 25, `embed has ${this.fields.length} fields (max 25)`);
+    for (const x of this.fields) sassert(String(x.value).length <= 1024, `embed field "${x.name}" value over 1024`);
+    return this;
+  }
+  setColor() { return this; } setFooter() { return this; } setThumbnail() { return this; }
+  setImage() { return this; } setAuthor() { return this; } setTimestamp() { return this; }
+}
+
+const DISCORD = {
+  Client: class {
+    constructor() { this.handlers = {}; this.user = { id: 'stub', tag: 'DDice#0000' }; this.guilds = { cache: new Map() }; this.channels = { fetch: () => Promise.resolve(null) }; }
+    on(e, f) { (this.handlers[e] = this.handlers[e] || []).push(f); return this; }
+    once(e, f) { return this.on(e, f); }
+    login() { return Promise.resolve('stub'); }   // never touches the network
+  },
+  GatewayIntentBits: new Proxy({}, { get: (_, k) => k }),
+  PermissionFlagsBits: new Proxy({}, { get: () => 1n }),
+  MessageFlags: { Ephemeral: 64 },
+  REST: class { setToken() { return this; } put() { return Promise.resolve([]); } get() { return Promise.resolve([]); } },
+  Routes: {
+    applicationCommands: (a) => `/applications/${a}/commands`,
+    applicationGuildCommands: (a, g) => `/applications/${a}/guilds/${g}/commands`,
+  },
+  SlashCommandBuilder: Cmd,
+  SlashCommandSubcommandBuilder: Sub,
+  SlashCommandSubcommandGroupBuilder: Group,
+  ActionRowBuilder: Row,
+  ButtonBuilder: Btn,
+  ButtonStyle: { Primary: 1, Secondary: 2, Success: 3, Danger: 4, Link: 5 },
+  StringSelectMenuBuilder: Select,
+  StringSelectMenuOptionBuilder: class { setLabel() { return this; } setValue() { return this; } setDescription() { return this; } setDefault() { return this; } setEmoji() { return this; } },
+  TextInputBuilder: TextInput,
+  TextInputStyle: { Short: 1, Paragraph: 2 },
+  ModalBuilder: Modal,
+  EmbedBuilder: Embed,
+  AttachmentBuilder: class { constructor(b, o) { this.attachment = b; this.name = o && o.name; } },
+  WebhookClient: class { send() { return Promise.resolve({ id: 'stub' }); } destroy() {} },
+  ChannelType: new Proxy({}, { get: (_, k) => k }),
+  __BUILDERS__: ALL,
+};
+
+// better-sqlite3: every statement succeeds, every read comes back empty,
+// nothing touches disk. Empty reads are the important choice — they put
+// every function under test into the "new server, nothing configured yet"
+// case, the state most likely to throw in production and least likely to be
+// tried by hand.
+class Stmt {
+  run() { return { changes: 0, lastInsertRowid: 0 }; }
+  get() { return undefined; }
+  all() { return []; }
+  iterate() { return [][Symbol.iterator](); }
+  pluck() { return this; } raw() { return this; } bind() { return this; }
+}
+class Sqlite {
+  constructor(f) { this.name = f; this.open = true; this.memory = true; }
+  exec() { return this; }
+  prepare() { return new Stmt(); }
+  pragma() { return []; }
+  transaction(fn) {
+    const w = (...a) => fn(...a);
+    w.deferred = w; w.immediate = w; w.exclusive = w;
+    return w;
+  }
+  close() { this.open = false; }
+  backup() { return Promise.resolve(); }
+  function() { return this; } aggregate() { return this; }
+}
+
+// @napi-rs/canvas is absent on purpose. index.js guards every use behind a
+// try/require, so throwing exercises the same path a Railway box without the
+// native module takes.
+const STUBS = {
+  'discord.js': () => DISCORD,
+  'better-sqlite3': () => Object.assign(Sqlite, { default: Sqlite }),
+  'dotenv': () => ({ config: () => ({ parsed: {} }) }),
+  '@napi-rs/canvas': () => { throw new Error('canvas unavailable in tests (by design)'); },
+};
+
+let hooked = false;
+function installStubs() {
+  if (hooked) return;
+  const load = Module._load;
+  // Intercept exactly these four. fs, path and os resolve normally, so the
+  // code under test is the real code.
+  Module._load = function (request) {
+    if (Object.prototype.hasOwnProperty.call(STUBS, request)) return STUBS[request]();
+    return load.apply(this, arguments);
+  };
+  hooked = true;
+}
+
+// ═══ 4 · Loader ═════════════════════════════════════════════════════
+// index.js is a script, not a module: every helper is a top-level function
+// with no exports. Append an epilogue exporting the ones under test, write
+// it to a temp file outside the repo, and require it. Regenerated every run,
+// so a harness can never pin a stale build.
+
+const EXPORTS = ['chunkLines', 'rulesFor', 'abilityNeeds', 'belowBar', 'resolveDamage',
+  'weaponDiceFor', 'damageBonusFor', 'maxHp', 'maxHpFromCon', 'fightTotalStr',
+  'isNpcFighter', 'npcFighterId', 'npcNameFromFighter', 'RULESETS', 'RULES_KNIGHTFALL',
+  'RULES_DND5E', 'STAT_EMOJIS', 'STAT_NAMES', 'GMTEST_PREFIX'];
+
+let loaded = null;
+function loadIndex(src) {
+  if (loaded) return loaded;
+  installStubs();
+  const live = EXPORTS.filter(n => new RegExp(`(function|const|let|var)\\s+${n}\\b`).test(src));
+  const missing = EXPORTS.filter(n => !live.includes(n));
+  const tmp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ddice-')), 'index.js');
+  fs.writeFileSync(tmp, src + `\n\nmodule.exports = { ${live.join(', ')} };\n`);
+  loaded = { mod: require(tmp), missing };
+  return loaded;
+}
+
+// ═══ 5 · Harnesses ══════════════════════════════════════════════════
+
+function harness(name, fn) {
+  let pass = 0; const fails = [];
+  const ok = (label, cond) => { if (cond) pass++; else fails.push(label); };
+  const eq = (label, got, want) =>
+    ok(`${label} (got ${JSON.stringify(got)})`, JSON.stringify(got) === JSON.stringify(want));
+  fn(ok, eq);
+  return { name, pass, fails };
+}
+
+// Loading index.js already ran every builder through the validating stub, so
+// a breach of Discord's registration rules threw before a single assertion.
+// These check what the stub cannot: that the shape is the shape we meant.
+function testBuilders(src) {
+  return harness('builders', (ok) => {
+    const cmds = DISCORD.__BUILDERS__;
+    const by = Object.fromEntries(cmds.map(c => [c.name, c]));
+    const leaves = (c) => c.subcommands.length + c.groups.length;
+    const subs = (c) => c.subcommands.concat(...c.groups.map(g => g.subcommands));
+
+    for (const n of ['activity', 'char', 'config', 'deception', 'dnd', 'duel', 'fight', 'gm',
+                     'help', 'library', 'npc', 'quest', 'quiz', 'roll', 'spell', 'standing']) {
+      ok(`/${n} is registered`, !!by[n]);
+    }
+    ok('twenty-one commands registered \\u2014 /dd joined 2026-08-20',
+      cmds.length === 21 && cmds.some(c => c.name === 'target') && cmds.some(c => c.name === 'dd'));
+    // A GM writing as the bot: always says who it is, and the audit book
+    // keeps the attribution even when the message does not.
+    // (rewritten 2026-08-22: T asked for /dd to speak in the room, not in DMs.)
+    ok('/dd speaks in a channel and keeps the sender in the audit only',
+      /async function handleDd\(interaction\)/.test(src) &&
+      /const where = interaction\.options\.getChannel\('channel'\) \|\| interaction\.channel;/.test(src) &&
+      /\\u\{1F4EC\} DD \\u2014 \*\*\$\{gmName\}\*\* in <#\$\{where\.id\}>/.test(src) &&
+      !/user\.send\(\{ content: \[head/.test(src));
+    ok('/dd is GM-only and refuses an unknown NPC voice',
+      /Only GMs can speak as the bot/.test(src) && /No NPC called \*\*\$\{asNpc\}\*\*/.test(src));
+    // Temporary targets: no sheet, no roster, no HP — the GM's verdict is
+    // the death check, asked in-channel or in the GM channel with `secret`.
+    // Schema ordering: an ALTER above its own CREATE fails into its catch
+    // on a fresh database and the column never appears (probe.js, 2026-08-19).
+    // The GM log is only honest if everything that happened at the table
+    // reaches it: NPC speech and combat always did; DC checks, summoned
+    // monsters and targets joined them 2026-08-19.
+    ok('a DC check joins the quest it happened in',
+      /noteQuestActivity\(gid, cid, 'roll', `\$\{whoDc\}: \$\{faceDc\} \$\{total\} vs DC \$\{dc\}/.test(src));
+    ok('summoned monsters and targets are logged too',
+      /summoned\$\{interaction\.options\.getBoolean\('temp'\) \? ' \(temporary\)' : ''\}: \$\{made\.join\(', '\)\}/.test(src) &&
+      /stands as a target/.test(src) && /falls after \$\{t\.hits\}/.test(src));
+    ok('every schema ALTER lives below the whole schema',
+      (() => {
+        const lastCreate = src.lastIndexOf('CREATE TABLE IF NOT EXISTS');
+        const end = src.indexOf(')`);', lastCreate);
+        return ![...src.matchAll(/^try \{ db\.exec\('ALTER TABLE/gm)].some(m => m.index < end);
+      })());
+    ok('a target is a row keyed by its own message, not button state',
+      /CREATE TABLE IF NOT EXISTS temp_targets/.test(src) &&
+      /SELECT \* FROM temp_targets WHERE guild_id=\? AND message_id=\?/.test(src));
+    ok('every hit asks the GM, and only a GM may answer',
+      /setCustomId\(`tgtdie:\$\{interaction\.message\.id\}:1`\)/.test(src) &&
+      /That call is the GM\\'s/.test(src));
+    ok('a fallen target stops taking swings',
+      /UPDATE temp_targets SET dead=1/.test(src) &&
+      /has already fallen/.test(src) && /components: \[\] \}\)\.catch/.test(src));
+    ok('secret sends the verdict to the GM channel instead',
+      /const gmChId = t\.secret \? \(getConfig\(gidT\)\?\.quest_log_gm/.test(src));
+    // Planted buttons: everything a press needs rides in the customId, so
+    // they survive restarts; only `once` stores anything.
+    ok('planted buttons are stateless but for once-mode',
+      /`btnroll:\$\{dice\}:\$\{dc \|\| 0\}:\$\{once\}:\$\{owner\}`/.test(src) &&
+      /`btnchk:\$\{stat\}:\$\{dc \|\| 0\}:\$\{once\}:\$\{owner\}`/.test(src) &&
+      /CREATE TABLE IF NOT EXISTS button_presses/.test(src));
+    ok('one leaf takes dice or a stat, never both',
+      /Dice or a stat, not both/.test(src) &&
+      /Give dice \(`2d6\+1`\) or a stat to roll/.test(src));
+    ok('a press inside a quest joins its timeline',
+      /async function logButtonPress\(interaction, gid, uid, detail, passed\)/.test(src) &&
+      /logQuestEvent\(gid, q\.number, 'roll'/.test(src) &&
+      /roll: '\\u\{1F3B2\}'/.test(src));
+    ok('an addressed button turns away everyone else',
+      /if \(owner && owner !== 'any' && owner !== uidB\)/.test(src) &&
+      /not addressed to you/.test(src));
+    ok('the check button rides the shared DC resolver',
+      /rollDcCheck\(\{ stat: stat === 'x' \? null : stat, dc, flat: stat === 'x', subject: ch, sig: ch \}\)/.test(src));
+    ok('the planted feedback button opens the same picker as /feedback send',
+      /interaction\.customId === 'btnfb'[\s\S]{0,700}?setCustomId\('fbcat'\)/.test(src));
+    // Feedback: GM-only forum, per-room threads, every player step
+    // ephemeral so no one sees who spoke (T). GMs see the author.
+    // Two logs, two audiences (T, 2026-08-16): the machine's account is
+    // GM-only; the players' chronicle carries the GM's own telling, given
+    // at completion or written later, and it is what records link to.
+    ok('the machine account goes to the GM log, not the chronicle',
+      /const logChId = getConfig\(gid\)\?\.quest_log_gm \|\| null;/.test(src) &&
+      /\{ key: 'quest_log_gm',          name: 'gm-quest-log'/.test(src));
+    ok('the chronicle is a forum, one thread per adventurer',
+      /name: 'quest-chronicle',  forum: true/.test(src) &&
+      /CREATE TABLE IF NOT EXISTS chronicle_threads/.test(src) &&
+      /forum\.threads\.create\(\{[\s\S]{0,200}?the quests they have seen through/.test(src));
+    ok('a tale mirrors to every participant and edits each copy in place',
+      /async function postQuestTale\(interaction, gid, quest, text, party\)/.test(src) &&
+      /for \(const uid of party\)/.test(src) && /if \(m\?\.editable\)/.test(src) &&
+      /sub === 'log'/.test(src));
+    ok('each adventurer\'s record links their own copy',
+      /taleUrls\[id\] \|\| summaryUrl/.test(src) &&
+      /UPDATE quest_summaries SET url=\? WHERE guild_id=\? AND number=\? AND user_id=\?/.test(src));
+    ok('stacked interject notes are bounded',
+      /\)\.slice\(0, 200\);/.test(src));
+    ok('feedback leaves are named, never fallen-through',
+      /if \(sub !== 'send'\)/.test(src));
+    ok('the feedback buttons sit in the button lane, selects in the select lane',
+      (() => {
+        const rb = src.indexOf('async function routeButton');
+        const end = src.indexOf('\n    return;\n}', rb);
+        // The property that matters is WHICH LANE each handler lives in,
+        // not where the lanes sit in the file: fbq inside routeButton,
+        // fbcat guarded by isStringSelectMenu, fbm after isModalSubmit.
+        return src.slice(rb, end).includes("startsWith('fbq:')")
+          // (2026-09-07: the picker id may carry a run number, and the
+          // guard must wrap BOTH forms — the probe caught the precedence
+          // slip where the || escaped the select-menu check.)
+          && /isStringSelectMenu\?\.\(\) && \(interaction\.customId === 'fbcat' \|\| interaction\.customId\?\.startsWith\('fbcat:'\)\)/.test(src)
+          && src.indexOf("startsWith('fbm:')") > src.indexOf('isModalSubmit');
+      })());
+    ok('the feedback forum uses the plan\'s json idiom, like approvals',
+      /\{ key: 'feedback_routes', json: 'forum', name: 'gm-feedback'/.test(src));
+    ok('both setup paths mend the feedback rooms — the empty-forum bug',
+      /const fbk = await ensureFeedbackThreads\(interaction\.client, gid\)/.test(src) &&
+      /const fbk2 = await ensureFeedbackThreads\(interaction\.client, gid\)/.test(src));
+    ok('feedback rooms are seven, extensible, and thread-mended',
+      /FEEDBACK_TYPES_BASE = \{[\s\S]{0,900}?gms:/.test(src) &&
+      /function feedbackTypes\(gid\)/.test(src) &&
+      /configKey: 'feedback_routes'/.test(src));
+    ok('every player-facing feedback step is ephemeral \u2014 no one sees who spoke',
+      (() => {
+        const fn = src.slice(src.indexOf('async function handleFeedback'), src.indexOf('async function postFeedbackCard'));
+        // Whole statements, not up-to-first-brace — template holes like
+        // ${name} sit inside these calls and truncated the old match.
+        const replies = (fn.match(/interaction\.(?:reply|editReply)\([\s\S]*?\);/g) || [])
+          .filter(r => !/deferReply/.test(r));
+        const modalOut = src.match(/return interaction\.reply\(\{ ephemeral: true, content: posted/);
+        // editReply inherits the defer's ephemerality — the defer above it
+        // is checked instead.
+        const deferEph = /deferReply\(\{ ephemeral: true \}\)/.test(fn);
+        return replies.length > 0
+          && replies.every(r => /ephemeral: true/.test(r) || (/editReply/.test(r) && deferEph))
+          && !!modalOut;
+      })());
+    ok('the card names the author for GMs',
+      /\\u\{1F4DD\} \*\*Feedback\*\* \\u2014 <@\$\{interaction\.user\.id\}>/.test(src));
+    // (2026-09-07: the door now names the run by NUMBER and opens in the
+    // run's own thread, and every review is kept as a row.)
+    ok('a finished quest offers its own feedback door, in its own thread',
+      /setCustomId\(`fbq:\$\{quest\.number\}`\)/.test(src) &&
+      /const home = quest\.run_thread_id \|\| quest\.run_channel_id;/.test(src) &&
+      /startsWith\('fbq:'\)/.test(src));
+    ok('a player picks from their own runs, and the card reads them back',
+      /commandName === 'feedback' && focusedOption\.name === 'quest'/.test(src) &&
+      /FROM feedback_log WHERE guild_id=\? AND quest_number=\? ORDER BY at DESC/.test(src) &&
+      /\*\*Reviews\*\* \\u2014 \$\{rs\.length\}/.test(src));
+    ok('every review is kept, and may name its run',
+      /CREATE TABLE IF NOT EXISTS feedback_log/.test(src) &&
+      /INSERT INTO feedback_log \(guild_id, user_id, room, scale, body, quest_number, at\)/.test(src) &&
+      /setCustomId\(`fbcat:\$\{questNum\}`\)/.test(src) &&
+      /setCustomId\(`fbm:\$\{key\}:\$\{qFromPick\}`\)/.test(src) &&
+      /Pick one of your own runs from the list/.test(src));
+    ok('under the 100-command ceiling', cmds.length <= 100);
+
+    for (const c of cmds) {
+      ok(`/${c.name} has a description`, !!c.description);
+      ok(`/${c.name} does something`, leaves(c) > 0 || c.options.length > 0);
+      ok(`/${c.name} under the 25-leaf wall (${leaves(c)})`, leaves(c) <= 25);
+    }
+    // /npc stood at the 25-leaf wall until the category family folded into
+    // one group (2026-08-10): six leaves became one, /npc edit took a freed
+    // slot, and /quest inherited the most-crowded seat at 23. These hold the
+    // fold's arithmetic so it cannot silently unfold.
+// (party fold, 2026-08-13: quest dropped 23→20; npc leads at 22.)
+    // (was '/npc is the most crowded' — the manage fold ended that on
+    // 2026-08-19. What matters is that nothing sits near the wall.)
+    ok('no command is within two leaves of the 25 ceiling',
+      Math.max(...cmds.map(leaves)) <= 22);
+    ok('the workshop verbs live in a group, the daily ones do not',
+      /g\.setName\('manage'\)\.setDescription\('Workshop/.test(src) &&
+      /\.addSubcommand\(s=>s\.setName\('say'\)/.test(src) &&
+      /\.addSubcommand\(s=>s\.setName\('show'\)/.test(src));
+    // The throwaway cast is a GROUP on /npc, so the leaf count is what
+    // matters, not a raw option length — and it must stay under 25.
+    ok('/npc stays inside the subcommand ceiling with the temp group',
+      leaves(by.npc) <= 25 && /g\.setName\('temp'\)/.test(src));
+    // The rename's contract: it mirrors deleteNpc's purge list as UPDATEs —
+    // everything delete destroys under the old identity, rename carries to
+    // the new. If purgeSubjectRecords gains a table, both lists gain it, or
+    // renamed NPCs quietly shed that record while deleted ones purge it.
+    (() => {
+      const purge = src.slice(src.indexOf('function purgeSubjectRecords'), src.indexOf('function purgeSubjectRecords') + 900);
+      const ren = src.slice(src.indexOf("if (sub === 'rename')"), src.indexOf("if (sub === 'rename')") + 4800);
+      const tables = ['inventory', 'roll_tally', 'renown_log', 'lore', 'deaths', 'quest_members', 'quest_summaries'];
+      // The resource mirror: NPCs hold rerolls (pool = LCK) and White Knight
+    // heal charges exactly as characters do, and rest refills all three
+    // under the same schedule. Each piece failed silently before: the old
+    // reroll spend ATE THE LCK STAT permanently, rest skipped a full-HP NPC
+    // entirely, and a WIS-5 White Knight NPC had a gate open onto nothing.
+    ok('the reroll spend touches the pool, never the stat',
+      /rerolls_current: \(npc\.rerolls_current \?\? 0\) - 1/.test(src) &&
+      !/upsertNpc\(gid, name, \{ lck: npc\.lck - 1 \}\)/.test(src));
+    ok('setting LCK sets the pool, mirroring characters',
+      /if \(lck !== null\) fields\.rerolls_current = lck;/.test(src));
+    ok('the White Knight gate grants NPC heal charges',
+      /if \(isWhiteKnight\(after\)\) setHealCharges\(gid, npcFighterId\(name\)/.test(src));
+    ok('NPC rest refills all three resources',
+      /const rR = resolveRestToken\(sc\.rerolls, npc\.lck \?\? 0/.test(src) &&
+      /const healR = resolveRestToken\(sc\.heal, maxC/.test(src));
+    ok('every fight seed reads the persistent pool',
+      !/rrState\[fid\] = Math\.max\(0, npc\.lck \?\? 0\);/.test(src) &&
+      !/rrState\[fid\] = Math\.max\(0, f\.stats\.lck \?\? 0\);/.test(src) &&
+      !/rrTokens\[fid\] = Math\.max\(0, F\[fid\]\.stats\.lck \?\? 0\);/.test(src));
+    ok('fight spends write back to the pool',
+      (src.match(/upsertNpc\(gid, (?:defF|atkF)\.name, \{ rerolls_current: rrTokens/g) || []).length === 2 &&
+      /upsertNpc\(gid, nn, \{ rerolls_current: rr\[fid\] \}\)/.test(src));
+    // Today's audit fixes, each a conflict the sweep surfaced: the pool
+    // column now genuinely exists on npcs; the backfill runs ONCE behind a
+    // meta flag (per-boot would refill spent pools, which is rest's job);
+    // the heal grant only moves when the gate's own inputs do; and neither
+    // rename nor delete can orphan a live fight's state keys.
+    // The staging revision (confirmed 2026-08-12): approval never births a
+    // run — the old per-approve spin made two half-empty instances from two
+    // presses, live. One launch consumes the whole staged group; both the
+    // typed and the button hand go through the same launchListing; and the
+    // listing wears its ledger. Losing any of these quietly reverts to
+    // instance-per-press.
+    // /instance: one brain, two addresses. The translator must FORWARD into
+    // handleQuest (never reimplement), value listings by NUMBER so name
+    // twins can't ambiguate, default to the latest ACTIVE run, and the run
+    // name must carry the whole convention — losing any of these forks the
+    // quest logic or misaddresses a GM's hand mid-play.
+    // The sweep hand and the christening: end-all runs through the SAME
+    // closer as single-end (a forked closer would archive differently),
+    // ended channels release their dc binds, and the migration renumbers
+    // 001-up behind its one-time flag with threads renamed to match.
+    // The order diagnostic asks before it sorts: apply is a button press
+    // away, keep-mode goes through the observer twin that never edits, and
+    // only the prompt's owner (a GM) can choose. Losing the prompt returns
+    // us to silently stomping hand-arranged servers.
+    // The pages forum restructure: one NPC = one thread, categories ride as
+    // that thread's tags (Discord's filter needs tags ON threads — the old
+    // NPC-as-message shape could never be filtered). The mirror creates,
+    // renames, retags and edits in place; the migration is one-time; rename
+    // keeps the tag id so wearers follow free.
+    ok('the mirror builds one thread per NPC with category tags',
+      /forum\.threads\.create\(\{\s*\n\s*name: name\.slice\(0, 100\),[\s\S]{0,200}?appliedTags: applied,/.test(src));
+    ok('applied tags cap at five, categories at twenty',
+      /\.slice\(0, 5\);/.test(src) && /getCategories\(gid\)\.slice\(0, 20\)/.test(src));
+    ok('the mirror keeps thread name and tags in step',
+      /thread\.setName\(name\.slice\(0, 100\)\)/.test(src) && /thread\.setAppliedTags\(applied\)/.test(src));
+    ok('assign and remove resync on the spot',
+      (src.match(/mirrorNpcSheet\(interaction\.client, gid, npcName\)\.catch/g) || []).length === 2);
+    ok('a category rename renames the tag in place, keeping its id',
+      /\? \{ \.\.\.t, name: to\.slice\(0, 20\) \} : t/.test(src));
+    ok('migrations announce success or confess vacuity, never sit silent',
+      /christened \$\{christened\}\/\$\{runsSeen\}/.test(src) &&
+      /\$\{made\}\/\$\{total\} thread/.test(src) &&
+      (src.match(/VACUOUS/g) || []).length >= 2 && /flag NOT set/.test(src));
+    ok('a vacuous run never sets its flag',
+      /if \(made > 0 \|\| total === 0\) \{/.test(src) &&
+      /if \(christened > 0 \|\| runsSeen === 0\) \{/.test(src));
+    // The character forum is the NPC forum's twin: 8+3+1 fixed tags (the
+    // eight colour orders — Kalidale is a force, Siege Knight a class),
+    // the starter message is the live sheet, Fallen toggles with the deed,
+    // every sheet edit re-mirrors through done(), and the migration wears
+    // the v2 discipline from birth.
+    // The lore-doc pipeline: a tab of its own in approvals, requested by a
+    // button that works inside the locked thread, owner-gated twice, and
+    // the card lands via the same per-type router every approval uses.
+    ok('help teaches the party forms, not the flat ones',
+      src.includes('/quest party apply number:N') && src.includes('/quest party kick number:N') &&
+      !src.includes("'`/quest apply number:N`"));
+    // Approval buttons ack before they work: the ok paths build threads,
+    // edit cards and DM — past Discord's 3s window (live 10062, 2026-08-14).
+    // Reject paths stay un-acked so their reason modals can open.
+    ok('the three approval button handlers defer their ok paths',
+      (src.match(/if \(action === '(?:sheetok|impok|exportok)'\) \{ try \{ await interaction\.deferReply\(\{ ephemeral: true \}\); \} catch \{\} \}/g) || []).length === 3 &&
+      (src.match(/const respond = \(o\) => \(interaction\.deferred \|\| interaction\.replied\)/g) || []).length === 3);
+    ok('loredoc approve acks first, deny stays un-acked for its modal',
+      /startsWith\('loredocok:'\)\) \{\s*\n\s*try \{ await interaction\.deferUpdate\(\); \} catch \{\}/.test(src));
+    ok('Lore Docs is an approval type the mender builds',
+      /loredoc: \{ name: '📄 Lore Docs'/.test(src));
+    ok('the notice wears the request button and self-heals it',
+      /loredoc:\$\{uid\}/.test(src) && /needsComp/.test(src));
+    ok('the request is owner-gated at press and at submit',
+      /startsWith\('loredoc:'\)[\s\S]{0,220}?interaction\.user\.id !== owner/.test(src) &&
+      /startsWith\('loredocm:'\)[\s\S]{0,220}?interaction\.user\.id !== owner/.test(src));
+    ok('an approved doc becomes a titled Lore doc section, not lore text',
+      /ALTER TABLE characters ADD COLUMN lore_doc_url/.test(src) &&
+      /upsertChar\(interaction\.guild\.id, owner, \{ lore_doc_url: docUrl \}\)/.test(src) &&
+      /\*\*Lore doc\*\*/.test(src));
+    ok('approval refreshes the page on the spot',
+      /lore_doc_url: docUrl \}\);\s*\n\s*ensureCharPage\(interaction\.client, interaction\.guild, owner, null, 'all'\)/.test(src));
+    ok('a stale lore-doc route heals like an absent one',
+      /delete r0\.loredoc/.test(src) &&
+      /can\\'t be reached even after a rebuild/.test(src));
+    ok('the card routes through approvalDestination like every approval',
+      /approvalDestination\(gidL, 'loredoc'\)/.test(src) &&
+      /ensureApprovalThreads\(interaction\.client, gidL\)/.test(src));
+    ok('/char show speaks with the forum renderers, never a second voice',
+      /const blocks = \[charInvBody\(gid, tid\), charLoreBody\(gid, tid\), charStandingBody\(gid, tid\), charTitlesBody\(gid, tid\), charAssocsBody\(gid, tid\), charRollsBody\(gid, tid\)\];/.test(src) &&
+      /Their page: <#\$\{pg\.thread_id\}>/.test(src));
+    ok('the char tag canon is 8 orders + 3 classes + Fallen',
+      /CHAR_TAG_ORDERS = \['White Knight','Black Knight','Gold Knight','Grey Knight','Blue Knight','Purple Knight','Green Knight','Red Knight'\]/.test(src) &&
+      /CHAR_TAG_CLASSES = \['Vanguard','Defender','Siege Knight'\]/.test(src) &&
+      /CHAR_TAG_FALLEN = 'Fallen'/.test(src));
+    ok('the char starter is the living sheet — hash-skipped on sweeps, immediate on events',
+      /const starter = await thread\.messages\.fetch\(row\.message_id \|\| thread\.id\)/.test(src) &&
+      /ensureCharBlocks\(client, guild, uid, thread, body\)/.test(src) &&
+      /function charPageBody\(gid, ch, displayName\)/.test(src));
+    ok('every sheet edit re-mirrors through done',
+      /const done = \(content\) => \{ ensureCharPage\(interaction\.client/.test(src));
+    ok('the Fallen tag follows kill and revive',
+      (src.match(/gmSub === '(?:kill|revive)'\) \{ const r = await handleGm(?:Kill|Revive)\(interaction\);\s*\n\s*ensureCharPage\(/g) || []).length === 2);
+    // The four-block thread: sheet event-live, the other three hourly and
+    // hash-skipped so an unchanged block costs nothing — dice, the chatty
+    // source, only ever lands on the sweep.
+    // T's combat rules doc (2026-08-15): the automatics and the carries.
+    // /gm override interject — the hand on the scales. Consumed at the
+    // resolver (the one place all fight paths meet), gm-gated, audited,
+    // membership-checked, amounts sum, and the card names the adjustment.
+    ok('interject is gm-gated and audited',
+      /async function gmInterject\(interaction\)[\s\S]{0,400}?Only GMs can interject/.test(src) &&
+      /async function gmInterject\(interaction\)[\s\S]{0,3600}?sendRollAudit\(interaction\.client, gid/.test(src));
+    ok('interject refuses outsiders and empty hands',
+      /is not in this fight/.test(src) && /Nothing to apply/.test(src));
+    ok('interject wields three levers: amount, mode, forced stat',
+      /if \(forceStat\) slot\.gmStat = forceStat;/.test(src) &&
+      /if \(mode\) upsertChar\(gid, target\.id, \{ next_mark: mode \}\);/.test(src) &&
+      /function consumeGmStat\(gid, cid, fid\)/.test(src));
+    ok('the die declaration rewrites a cast natural, total recomputed around the modifier',
+      /const delta = die - was;/.test(src) &&
+      /\[natKey\]: die, \[rollKey\]: \(fight\[rollKey\] \?\? was\) \+ delta/.test(src) &&
+      /Nothing cast to override/.test(src));
+    ok('the forced stat is consumed in the shared attack runner, covering both callers',
+      /async function runFightAttack\(\{[\s\S]{0,600}?consumeGmStat\(gid, cid, actorId\)/.test(src) &&
+      /stat set to \$\{STAT_LABELS\[forced\]\} by the GM/.test(src));
+    ok('interjections are consumed at the resolver for both roles',
+      /for \(const \[fid, roleKey\] of \[\[attackerId, 'atk_roll'\], \[defenderId, 'def_roll'\]\]\)/.test(src) &&
+      /delete slot\.gmAdj; delete slot\.gmAdjNote;/.test(src));
+    ok('the card speaks the interjection, npc or player alike',
+      /GM interjection: \$\{amt\} to \$\{who\}'s roll/.test(src));
+    ok('a nat-1 attack fails automatically; a nat-20 defence auto-parries unless mutual',
+      /if \(atkNat === 1\) return \{ hit: false, dmg: 0, detail: 'fumbled' \};/.test(src) &&
+      /if \(defNat === defSides && atkNat !== atkSides\) return \{ hit: false, dmg: 0, detail: 'parried' \};/.test(src));
+    ok('the damage numbers are untouched: 1, +1, +1, 4',
+      /let dmg = 1;\s*\n\s*if \(atkNat === atkSides\) dmg \+= 1;\s*\n\s*if \(defNat === 1\) dmg \+= 1;\s*\n\s*if \(atkNat === atkSides && defNat === 1\) dmg \+= 1;/.test(src));
+    ok('the riposte banks on every defending 20 — the carry has no mutual exception',
+      /if \(defNat === 20\) \{\s*\n\s*ensure\(defenderId\)\.rollBonus = 2;/.test(src) &&
+      !/defNat === 20 && atkNat !== 20/.test(src));
+    ok('no attacker-side next-roll carry exists',
+      !/ensure\(attackerId\)\.rollBonus/.test(src));
+    ok('the parry and the fumble speak on the card',
+      /a perfect parry! No damage/.test(src) && /fumbles the attack/.test(src));
+    ok('a claimed rank can be unwritten — strip clears the title only',
+      /sub === 'strip'/.test(src) && /upsertChar\(gid, target\.id, \{ rank_name: null \}\)/.test(src) &&
+      /no longer holds \*\*\$\{held\}\*\*/.test(src));
+ok('block order is a contract — a disordered thread rebuilds in sequence',
+      /const ordered = seq\.every\(\(v, i, a\) => i === 0 \|\| BigInt\(a\[i - 1\]\) < BigInt\(v\)\);/.test(src) &&
+      /m\?\.author\?\.id === client\.user\.id/.test(src));
+    ok('the lore-doc buttons live in the button lane',
+      /async function routeButton\(interaction\) \{[\s\S]*?startsWith\('loredoc:'\)[\s\S]*?startsWith\('loredocok:'\)[\s\S]*?\n    return;\n\}/.test(src));
+    ok('the thread carries eight bot blocks — Titles and Associations apart',
+      /charTitlesBody\(gid, uid\)/.test(src) && /charAssocsBody\(gid, uid\)/.test(src) &&
+      /for \(const key of \['sheet', 'inv', 'lore', 'standing', 'titles', 'assocs', 'rolls', 'notice'\]\)/.test(src) &&
+      /ALTER TABLE char_pages ADD COLUMN assocs_msg_id/.test(src) &&
+      /contact a Moderator or Expeditioner\. Thank you!/.test(src));
+    // Titles and associations read the same on a player's page, an NPC's
+    // page and /char show, because one renderer serves all three.
+    ok('titles and associations are one renderer for players and NPCs',
+      /function titlesLine\(gid, sid\)/.test(src) &&
+      /const tl = titlesLine\(gid, npcFighterId\(npc\.name\)\);/.test(src) &&
+      /function charTitlesBody\(gid, uid\)/.test(src));
+    // Mending on boot: add what is missing, never move what is placed.
+    // deleteNpc reached for `interaction` from a scope that never had it:
+    // the ReferenceError fell into its own catch, so the NPC's thread and
+    // page row outlived them every time (audit, 2026-08-19).
+    // Two menders on one character posted two of everything; the lock ends
+    // that, and the stray sweep clears what the race already left.
+    // The blunt instrument, for a thread the gentle mend cannot fix. Author-
+    // checked (players' messages are never touched) and it REPORTS, so a
+    // thread that refuses to clean says why instead of failing quietly.
+    ok('/gm check pages rebuilds a thread and reports what it found',
+      /async function rebuildCharPages\(interaction\)/.test(src) &&
+      /if \(m\.author\?\.id !== interaction\.client\.user\.id\) continue;/.test(src) &&
+      /would not delete/.test(src) &&
+      /old block\(s\) cleared/.test(src));
+    ok('only one mender may touch a character at a time',
+      /const charMendLocks = new Set\(\);/.test(src) &&
+      /if \(charMendLocks\.has\(lockKey\)\) return 0;/.test(src) &&
+      /finally \{ charMendLocks\.delete\(lockKey\); \}/.test(src));
+    ok('unrecorded bot messages in a character thread are swept',
+      /const keep = new Set\(\[thread\.id, \.\.\.Object\.values\(ids\)\.filter\(Boolean\)\]\);/.test(src) &&
+      /m\.author\?\.id !== client\.user\.id \|\| keep\.has\(m\.id\)/.test(src));
+    ok('deleteNpc takes a client rather than reaching for an interaction',
+      /function deleteNpc\(gid, name, client = null\)/.test(src) &&
+      (() => {
+        const i2 = src.indexOf('function deleteNpc(gid, name, client');
+        const body = src.slice(i2, src.indexOf('\nfunction ', i2 + 10));
+        return !/interaction\./.test(body);
+      })());
+    ok('titles and associations are purged with their subject',
+      /\['subject_titles', 'subject_id'\], \['subject_assocs', 'subject_id'\]/.test(src));
+    ok('title and association leaves are named, never fallen-through',
+      /if \(leaf !== 'revoke'\)/.test(src) && /if \(leaf !== 'remove'\)/.test(src));
+    ok('one mender serves the boot path and /gm check run',
+      /async function mendEverything\(client, guild/.test(src) &&
+      /async function bootMend\(client\)/.test(src) &&
+      /const mended = await mendEverything\(interaction\.client, interaction\.guild\)/.test(src));
+    ok('the mender never moves or renames anything',
+      (() => {
+        const i2 = src.indexOf('async function mendEverything');
+        const body = src.slice(i2, src.indexOf('\nasync function', i2 + 10));
+        return !/setPosition|setParent|setName\(|setConfig\(/.test(body);
+      })());
+    ok('an unconfigured guild is left alone on boot',
+      /const configured = \['char_forum', 'npc_forum', 'quest_board', 'approval_routes', 'quest_log_channel'\]/.test(src) &&
+      /if \(!configured\) continue;/.test(src));
+    // Group checks: one button, one roll each, the message IS the
+    // scoreboard, and only a GM calls it.
+    // A roll line must never print a hole, and a DC that never parsed must
+    // never be judged against (both seen live, 2026-08-21).
+    ok('an adv/dis line falls back to the faces actually rolled',
+      /const kept = result\.chosen \?\? \(Array\.isArray\(result\.rolls\)/.test(src) &&
+      !/\[\$\{result\.chosen\}, ~~\$\{result\.dropped\}~~\]/.test(src));
+    ok('an unparsed DC is treated as no DC, not as a failure',
+      /const dcNum = Number\.isFinite\(dc\) \? dc : null;/.test(src) &&
+      /dcNum === null \? null : total >= dcNum/.test(src));
+    // Holds and marks are stated where people are looking, every turn, so a
+    // five-round grapple is never something the table must remember.
+    // Every ability card names who did it and to whom, so a scene reads
+    // without anyone scrolling back (T, 2026-08-21).
+    ok('each ability card names both sides',
+      /\*\*Disarm\*\* \\u2014 \$\{actorName\} vs \$\{attackerName\}/.test(src) &&
+      /\*\*Deflect\*\* \\u2014 \$\{actorName\} shields against \$\{attackerName\}/.test(src) &&
+      /\*\*Feint\*\* \\u2014 \$\{atkName\} vs \$\{defName\}/.test(src) &&
+      /\*\*Escape\*\* \\u2014 \$\{actorName\} against \$\{holderName\}/.test(src) &&
+      /\*\*Deception\*\*/.test(src));
+    ok('no ability headline is a bare noun any more',
+      !/\*\*(Disarming Attempt|Shield Deflection|Feint Resolved|Escape Attempt)\*\*/.test(src));
+    ok('a turn announcement carries the fighter\'s state',
+      /async function fighterStateLine\(guild, gid, cid, fid\)/.test(src) &&
+      /held by \$\{await nameOf\(gmap\[fid\]\)\}/.test(src) &&
+      /holding \$\{await nameOf\(c\)\}/.test(src) &&
+      /\$\{turnPing\(gid, nextF\)\}\$\{state\}/.test(src));
+    ok('the state line names every carried mark',
+      /next defence is a flat d20/.test(src) && /to hit\*\* on the next attack/.test(src) &&
+      /taken in by a feint/.test(src));
+    ok('the strain line names who is holding them',
+      /is still held by \*\*\$\{holderName/.test(src));
+    ok('a group check tallies in place and refuses seconds',
+      /CREATE TABLE IF NOT EXISTS group_checks/.test(src) &&
+      /function groupCheckBody\(guild, gid, msgId\)/.test(src) &&
+      /You have had your roll \\u2014 one each/.test(src) &&
+      /Only a GM calls it/.test(src));
+    ok('the group tally counts passes against the DC',
+      /const passed = rolls\.filter\(r => r\.passed\)\.length;/.test(src) &&
+      /made it\./.test(src));
+    // The recap drafts from the timeline and stays private unless asked.
+    ok('the recap drafts rather than publishes',
+      /sub === 'recap'/.test(src) &&
+      /A draft, for you to edit/.test(src) &&
+      /if \(interaction\.options\.getBoolean\('post'\)\)/.test(src));
+    ok('the completion options the handler reads are actually declared',
+      /setName\('summary'\)\.setDescription\('Your telling of it/.test(src) &&
+      /setName\('title'\)\.setDescription\('A title every survivor earns/.test(src));
+    ok('a quest can grant its party a title, stamped with its name',
+      /for \(const id of party\) grantTitle\(gid, id, earned, \{ source: questTag\(quest\)/.test(src));
+    ok('one door serves both subjects, and refuses both at once',
+      /async function handleTitles\(interaction, group\)/.test(src) &&
+      /A player or an NPC, not both/.test(src));
+    ok('the player forum is staff-typed, and the lock is honest about its needs',
+      /SendMessagesInThreads: false, CreatePublicThreads: false/.test(src) &&
+      /no gm role set/.test(src));
+    ok('arrival names any missing permissions — existing servers are never audited unprompted',
+      /const NEEDED = \['ManageChannels','ManageThreads','ManageRoles'/.test(src) &&
+      /Missing permissions:/.test(src));
+    ok('the GM forum births itself on push where the category exists',
+      /gm_forum_lock_1/.test(src) && /name: 'gm-character-sheets', type: 15, parent: cat\.id/.test(src) &&
+      /\[gm-forum\] VACUOUS/.test(src));
+    ok('GM sheets route to the GM forum, or stay private by absence',
+      /const forumId = gmUser \? \(getConfig\(gid\)\?\.gm_char_forum \?\? null\) : getConfig\(gid\)\?\.char_forum;/.test(src) &&
+      /gm-private/.test(src));
+    ok('a sheet in the wrong forum rebuilds where they now belong',
+      /if \(thread && thread\.parentId !== forum\.id\)[\s\S]{0,200}?Sheet moved between forums/.test(src));
+    ok('heroes wear the Hero tag',
+      /CHAR_TAG_HERO = 'Hero'/.test(src) && /if \(ch\?\.is_hero\)/.test(src));
+    // The autorest clock advances IN the fired branch, before the announce.
+    // Losing this line is a 10-minute announcement storm once any schedule
+    // falls due — it already happened live.
+    // Carried effects belong to their fight. Every start path must clear
+    // them and every end path must drop them, or a sanction from one brawl
+    // lands on an innocent in the next (live, 2026-08-20).
+    ok('every fight start clears the carried effects',
+      (() => {
+        // Count the declarations themselves: every `state: 'active'` must
+        // have an effect_state reset within the same upsert object.
+        const starts = [...src.matchAll(/state: 'active'/g)];
+        return starts.length >= 3 && starts.every(m => {
+          const win = src.slice(m.index, m.index + 700);
+          const end = win.indexOf('});');
+          return /effect_state: '\{\}'/.test(end > 0 ? win.slice(0, end) : win);
+        });
+      })());
+    ok('every fight end drops them too \u2014 all five paths',
+      (() => {
+        // Count the transitions themselves; a fifth path (the quest-thread
+        // stand-down) was missed by counting matches instead.
+        const ends = [...src.matchAll(/state: 'idle'/g)];
+        return ends.length >= 5 && ends.every(m => {
+          const win = src.slice(m.index, m.index + 300);
+          const cut = win.indexOf('});');
+          return /effect_state: '\{\}'/.test(cut > 0 ? win.slice(0, cut) : win);
+        });
+      })());
+    // Rests land on the hour, not on the minute a schedule was created.
+    // The worked-examples pair: GM channel gets both, player channel gets
+    // the player one, and neither belongs to a ruleset.
+    // Letting go is one tap from the refusal that mentions it, and the
+    // press walks the same release path the command does.
+    // The attacker's turn had no buttons at all: you could answer a blow by
+    // tapping but never throw one (T, 2026-08-22).
+    ok('the four opening abilities have buttons, and answers do not',
+      /B\('fact:grapple'/.test(src) && /B\('fact:feint'/.test(src) &&
+      /B\('fact:deflect'/.test(src) && /B\('fact:disarm'/.test(src) &&
+      /const ACTION_OF = \{ grapple: 'Grapple', feint: 'Feint', deflect: 'Deflect', disarm: 'Disarm', escape: 'Escape' \};/.test(src));
+    ok('a grappler is offered the hold or the release, a captive the break',
+      /if \(kind === 'hold'\) return/.test(src) && /Maintain the hold/.test(src) &&
+      /if \(kind === 'escape'\) return/.test(src) && /Break free \(STR\)/.test(src));
+    // (rewritten 2026-08-22: T asked for maintaining to cost a roll.)
+    ok('maintaining a hold is an opposed STR roll, ties keeping the hold',
+      /async function runFightMaintain\(interaction\)/.test(src) &&
+      /const kept = keep\.total >= slip\.total;/.test(src) &&
+      /twists loose \\u2014 the hold is broken/.test(src) &&
+      // Keeping a grip spends the turn; the first cut returned early and
+      // stalled the fight (audit, 2026-08-22).
+      /async function runFightMaintain[\s\S]{0,3000}?applyTurnEndStrain\(interaction\.guild, gid, cid, hpState/.test(src) &&
+      /async function runFightMaintain[\s\S]{0,3600}?turn_index: nextIndex/.test(src));
+    ok('a held fighter is offered no Grapple button',
+      /\.\.\.\(held \? \[\] : \[B\('fact:grapple'/.test(src) &&
+      /fightAnswerRows\(k, \{ held: isHeld \}\)/.test(src));
+    ok('there is an attack button row, routed like the defence one',
+      /if \(kind === 'atk'\) return \[/.test(src) &&
+      /B\('fatk:str'/.test(src) &&
+      /startsWith\('fatk:'\)\) \{\s*\n\s*return handleFight\(interaction, \{ sub: 'atk'/.test(src));
+    ok('the announcer offers rows and every fight sender attaches them',
+      /const rowsFor = gmapNow\[id\] \? \['escape', 'atk'\]/.test(src) &&
+      /Object\.values\(gmapNow\)\.includes\(id\) \? \['hold', 'atk'\]/.test(src) &&
+      (src.match(/components: [\w.?]+answerRows \?\? \[\]/g) || []).length >= 5);
+    ok('the grapple refusal carries a release button',
+      /a grappler cannot strike their captive\. Let go and swing again/.test(src) &&
+      /setCustomId\('grpfree'\)/.test(src));
+    ok('the release press finds the captive itself',
+      /const heldR = grappleHeldTargetOf\(fightR, interaction\.user\.id\);/.test(src) &&
+      /You are not holding anyone/.test(src) &&
+      /setFightGrapples\(gidR, cidR, gmapR\)/.test(src));
+    ok('both examples books are published',
+      /'DDice-Examples-GameMaster\.pdf'/.test(src) && /'DDice-Examples-Player\.pdf'/.test(src));
+    ok('the examples books survive the ruleset filter',
+      /f\.startsWith\('DDice-Examples-'\) \|\| f\.startsWith\('DnD5e-'\) === is5e/.test(src));
+    ok('the player channel receives its pair, not one file',
+      /const playerFiles = await fetchDocFiles\(st, \[docPlayerFileFor\(gid\), 'DDice-Examples-Player\.pdf'\]\)/.test(src) &&
+      /files: playerFiles,/.test(src));
+    // Nobody should be silently passed over by a rest: the fallen and the
+    // already-whole are counted and said, and `who` names every exclusion.
+    ok('the rest says who it passed over and why',
+      /const restored = \[\], skipped = \[\], inFight = \[\], fallen = \[\], already = \[\];/.test(src) &&
+      /if \(ch\.died_at\) \{ fallen\.push\(name\); continue; \}/.test(src) &&
+      /else already\.push\(name\);/.test(src) &&
+      /Fallen, and beyond a rest's help/.test(src) &&
+      /Already whole, nothing to restore/.test(src));
+    // One page answering 'where is everybody?', reading the same sources
+    // the rest reads so the two can never disagree.
+    ok('the roster names the quest and the fight holding each player',
+      /async function showRoster\(interaction\)/.test(src) &&
+      /questOf\.set\(r\.user_id, \{ label: `#\$\{String\(r\.number\)\.padStart\(3, '0'\)\} \$\{r\.name\}`, winding: !!r\.winding_down \}\)/.test(src) &&
+      /fightOf\.set\(fid, f\.channel_id\)/.test(src) &&
+      /Red means a rest will pass them over/.test(src));
+    ok('a GM can ask who the rest will exclude',
+      /if \(action === 'who'\)/.test(src) &&
+      /Active quests holding people/.test(src) &&
+      /Active fights holding people/.test(src));
+    ok('the rest clock is hour-aligned everywhere it is read or written',
+      /const floorHour = \(ms\) => Math\.floor\(ms \/ 3600000\) \* 3600000;/.test(src) &&
+      /floorHour\(Date\.now\(\)\) < floorHour\(last\) \+ hours \* 3600 \* 1000/.test(src) &&
+      !/last_run: Date\.now\(\)/.test(src) &&
+      /floorHour\(sc\.last_run\) \+ sc\.hours/.test(src));
+    ok('a fired rest advances its own clock first',
+      /const result = await runAutoRest\(guild, sc\);[\s\S]{0,420}?upsertSchedule\(guild\.id, sc\.name, \{ last_run: floorHour\(Date\.now\(\)\) \}\);[\s\S]{0,80}?await announceAutoRest/.test(src));
+    ok('the dice block walks the full ladder with averages and extremes',
+      /const LADDER = \[2, 4, 6, 8, 10, 12, 20\];/.test(src) &&
+      /avg \*\*\$\{avg\}\*\*/.test(src) && /nat 1 \\u00d7\$\{p\.low\}/.test(src) && src.includes('🔴 nat 1') && src.includes('🟡 nat') &&
+      /lines\.push\(`\*\*d\$\{sides\}\*\*`\);/.test(src) &&   // stanza heading per die
+      /no rolls yet/.test(src));
+    ok('unchanged blocks cost zero traffic',
+      /if \(ids\[key\] && hashes\[key\] === hw && key !== 'notice'\) continue;/.test(src));
+    ok('the sweep is hourly with one early pass',
+      /setInterval\(\(\) => run\(\)\.catch\(\(\) => \{\}\), 60 \* 60 \* 1000\);/.test(src) &&
+      /setTimeout\(\(\) => run\(\)\.catch\(\(\) => \{\}\), 90 \* 1000\);/.test(src));
+    ok('sheet hooks stay narrow — blocks only on the sweep or full passes',
+      /scope = 'sheet'/.test(src) && (src.match(/, 'all'\)/g) || []).length >= 3);
+    ok('the char migration wears the v2 discipline',
+      /char_threads_1/.test(src) && /\[char-threads\] VACUOUS/.test(src) &&
+      /if \(made > 0 \|\| total === 0\)[\s\S]{0,300}?char_threads_1/.test(src));
+
+    ok('the mirror never edits a foreign thread',
+      /if \(thread && thread\.name !== name\.slice\(0, 100\)\) thread = null;/.test(src));
+    ok('the recap survives departed fighters',
+      /resolveFighter\(guild, gid, fid\)\.catch\(\(\) => null\)/.test(src) &&
+      /A departed adventurer/.test(src));
+    ok('both migrations live in the clientReady handler, not in registration',
+      /client\.once\('clientReady'[\s\S]{0,700}?runRenameMigration\(client\)[\s\S]{0,200}?npcThreadMigration\(client\)/.test(src) &&
+      !/registerSlashCommands\(guildId\) \{[\s\S]{0,4000}?npcThreadMigration/.test(src));
+    ok('the restructure migration is one-time',
+      /npc_threads_2/.test(src));
+
+    ok('order:true prompts instead of applying',
+      /gmorder:apply:\$\{interaction\.user\.id\}/.test(src) &&
+      !/getBoolean\?\.\('order'\)\) return runOrderReport/.test(src));
+    ok('keep-mode observes and never edits',
+      /async function observeSidebarOrder\(guild, entries\)/.test(src) &&
+      !/observeSidebarOrder[\s\S]{0,600}?\.edit\(/.test(src.slice(src.indexOf('function observeSidebarOrder'), src.indexOf('async function applySidebarOrder'))));
+    ok('the prompt belongs to its GM alone',
+      /interaction\.user\.id !== owner/.test(src));
+
+    ok('end-all and end share one closer',
+      /const endOne = async \(cid2, channel2, gmName\)/.test(src) &&
+      (src.match(/await endOne\(/g) || []).length === 2);
+    ok('an ended channel releases its dc binds',
+      /UPDATE dc_cards SET bind_channel=NULL, bind_uid=NULL, bind_skip=0 WHERE guild_id=\? AND bind_channel=\?/.test(src));
+    ok('the christening is one-time and renumbers from 001',
+      /run_rename_2/.test(src) && /if \(run\.instance_of !== lastRoot\) \{ lastRoot = run\.instance_of; seq = 0; \}/.test(src));
+    ok('christened threads wear the new tag',
+      /th\.setName\(questTag\(getQuest\(gid, run\.number\)\)\.slice\(0, 100\)\)/.test(src));
+
+    ok('/instance forwards into the quest brain',
+      /return handleQuest\(interaction, \{ sub: map\[sub\] \?\? sub, number: R\.run\.number \}\);/.test(src));
+    ok('add is approve wearing instance clothes', /const map = \{ add: 'approve' \};/.test(src));
+    ok('listing autocomplete values are numbers', /value: String\(q\.number\)/.test(src));
+    ok('a bare run means the latest active one',
+      /runs\.find\(r => r\.status === 'active'\) \?\? runs\[0\]/.test(src));
+    ok('runs are named by the full convention',
+      /const runName = `\$\{root\.name\} Run \$\{String\(seqNo\)\.padStart\(3, '0'\)\}/.test(src));
+    ok('the tag carries no dot-suffix on top of the name', /const seq = '';/.test(src));
+    ok('the first launch is Run 001', /return \(seqs\.length \? Math\.max\(\.\.\.seqs\) : 0\) \+ 1;/.test(src));
+
+    ok('approving never calls spinOffRun',
+      !/births its run instead of/.test(src) &&
+      /Approval STAGES, never births/.test(src));
+    ok('one launch carries the whole staged group',
+      /const born = await spinOffRun\(interaction, gid, listing, staged\);/.test(src) &&
+      // (2026-08-22: seating became conditional — one quest at a time —
+      // so the group still travels, minus anyone already on a live run.)
+      /for \(const id of seats\) \{[\s\S]{0,260}?setQuestMember\(gid, number, id, 'party'\);/.test(src));
+    // The third quest state: told, not yet paid. The run stays active in
+    // every other respect; only the rest stops passing its party over.
+    // Naming a run: the thread title is what a GM actually copies, and
+    // standing in the thread is clearer still (T's screenshot, 2026-08-23).
+    ok('a run thread name resolves to its listing',
+      /\.replace\(\/\^#\?"\?#\?\\d\{1,3\}\\s\*\[-\\u2013\]\\s\*\/, ''\)/.test(src) &&
+      /\.replace\(\/\\s\+Run\\s\+\\d\{1,3\}\\b\.\*\$\/i, ''\)/.test(src));
+    ok('the run thread stands in for the name',
+      /const hereRun = db\.prepare\(`SELECT number, instance_of FROM quests/.test(src) &&
+      /if \(\(!askedName \|\| L\.err\) && hereRun\)/.test(src));
+    ok('a recap carries what was said, and collapses repeats',
+      /const beat = words \? `\$\{npcName\}: /.test(src) &&
+      /if \(last && last\.text === b\) \{ last\.n\+\+; continue; \}/.test(src));
+    // Players can join a running fight, mirroring addnpc; placement is
+    // next-or-last because initiative is not stored once the order stands.
+    // /help must know every family the bot has. Pinned by feature rather
+    // than by wording, so help can be rephrased but not allowed to forget.
+    ok('/help covers every command family',
+      (() => {
+        const hi = src.indexOf('const HELP_CATEGORIES');
+        const h = src.slice(hi, src.indexOf('\n};', hi));
+        return ['/button roll', '/button group', '/target create', '/dd message', '/feedback send',
+                '/quest run winddown', '/quest run recap', '/quest run note', '/instance add',
+                '/gm override interject', 'pages|roster', '/fight add', 'temp:true', '/npc temp',
+                '/standing title', '/standing association', 'Who is excluded', 'Maintain the hold']
+          .every(t => h.includes(t));
+      })());
+    ok('the help picker offers the tools page',
+      /\{name:'Table Tools',value:'tools'\}/.test(src) && /\n  tools: \{/.test(src));
+    ok('/fight add brings a player into a running fight',
+      /setName\('add'\)\.setDescription\('Bring a player into the current fight \(GM\)'\)/.test(src) &&
+      /has fallen and cannot fight/.test(src) &&
+      /is already in this fight/.test(src) &&
+      /turnOrder\.splice\(fight\.turn_index \+ 1, 0, who\.id\);/.test(src));
+    ok('a winding-down run releases its party to the rests',
+      /ALTER TABLE quests ADD COLUMN winding_down/.test(src) &&
+      /AND COALESCE\(q\.winding_down, 0\) = 0/.test(src) &&
+      /sub === 'winddown'/.test(src) &&
+      /is winding down\. The story is told/.test(src));
+    ok('completing a quest clears the winding-down state',
+      /updateQuest\(gid, quest\.number, \{ winding_down: 0 \}\)/.test(src));
+    ok('a player may hold only one seat at a time',
+      /function questAlreadyOn\(gid, uid, exceptNumber = null\)/.test(src) &&
+      /const clashA = questAlreadyOn\(gid, target\.id, number\);/.test(src) &&
+      /is already on \*\*#\$\{String\(clashA\.number\)/.test(src) &&
+      /Left as applicants \\u2014 already on another run/.test(src));
+    ok('start on a listing is the launch',
+      /quest_spinoff \?\? 0\) && !quest\.instance_of\) \{[\s\S]{0,220}?launchListing\(interaction, gid, quest\)/.test(src));
+    ok('the button and the command share one hand',
+      (src.match(/await launchListing\(/g) || []).length === 2 &&
+      /startsWith\('questlaunch:'\)/.test(src));
+    ok('the launch button wears the staged count',
+      /questlaunch:\$\{number\}/.test(src) && /Launch \(\$\{getQuestMembers\(gid, number, 'party'\)\.length\} staged\)/.test(src));
+    ok('the listing shows its ledger, never a clock',
+      /Runs so far: \*\*\$\{runsK\}\*\*/.test(src));
+
+    ok('npcs really has the reroll pool column',
+      /ALTER TABLE npcs ADD COLUMN rerolls_current INTEGER DEFAULT 0/.test(src));
+    ok('the backfill is one-time, behind the meta flag',
+      /npc_rr_backfill_1/.test(src) && /CREATE TABLE IF NOT EXISTS meta/.test(src));
+    ok('an unrelated edit cannot refill heal charges',
+      /if \(!already \|\| order !== null \|\| wis !== null\) \{/.test(src));
+    ok('rename refuses while they fight',
+      /if \(fightingNpcNames\(gid\)\.has\(from\)\)/.test(src));
+    ok('delete refuses while they fight',
+      /if \(fightingNpcNames\(gid\)\.has\(name\)\)/.test(src));
+    ok('the backfill heals the eaten-LCK era once',
+      /UPDATE npcs SET rerolls_current = lck WHERE rerolls_current = 0 AND lck > 0/.test(src));
+    // The override: a GM skip is the same clear-and-advance the machine
+    // uses, and a bound dc holds ONE named fighter until their card is
+    // pressed — released either way, skipping only when it is truly their
+    // turn, so a late resolution never eats someone else's.
+    ok('gm skip advances by the house idiom',
+      /async function gmSkipTurn\([\s\S]{0,900}?nextStandingIndex\(order, hpState, floor, fight\.turn_index \+ 1\)/.test(src));
+    ok('a hold names its fighter or refuses',
+      /if \(hold && !interaction\.options\.getUser\('target'\)\)/.test(src));
+    ok('the choke holds only the bound fighter',
+      /boundDcHold\(holdGid, holdCid, holdUid\)/.test(src));
+    ok('resolution releases the bind either way',
+      /if \(marks\.bind_channel\) \{\s*\n\s*clearDcBind\(/.test(src));
+    ok('a failed bound check skips only on their own turn',
+      /fightOrder\(bf\)\[bf\.turn_index\] === uid/.test(src));
+
+    ok('rename migrates every table the purge list names',
+        tables.every(t => purge.includes(`'${t}'`) && ren.includes(`'${t}'`)) &&
+        /UPDATE \$\{table\} SET \$\{col\}=\? WHERE guild_id=\? AND \$\{col\}=\?/.test(ren) &&
+        ren.includes("['history', 'user_id']"));   // folded into the loop, unlike purge's standalone
+      ok('rename refuses a case-variant of another NPC',
+        /n\.name\.toLowerCase\(\) === to\.toLowerCase\(\) && n\.name\.toLowerCase\(\) !== from\.toLowerCase\(\)/.test(ren));
+      ok('rename clears webhooks rather than migrating them',
+        /clearNpcWebhooks\(gid, from\)/.test(ren));
+      ok('the portrait caption follows the new name',
+        /m\.edit\(\{ content: to \}\)/.test(ren));
+    })();
+    ok('the category group holds all six family members',
+      (by.npc.groups || []).some(g => g.name === 'category' && (g.subcommands || g.subs || []).length === 6));
+    ok('/quest folded its party family: 20 leaves, 4 of them under the group',
+      leaves(by.quest) === 20 && by.quest.groups.some(g => g.name === 'party' && (g.subcommands || g.subs || []).length === 4));
+    ok('button and /instance forced names still route after the fold',
+      /const sub = \(forced && typeof forced === 'object'\) \? forced\.sub : interaction\.options\.getSubcommand\(\)/.test(src));
+
+    ok('/config folds into groups', by.config.groups.length >= 2);
+    ok('/config groups are channels and mechanics',
+      by.config.groups.map(g => g.name).sort().join(',') === 'channels,mechanics');
+    ok('/gm has backup and test groups',
+      ['backup', 'test'].every(n => by.gm.groups.some(g => g.name === n)));
+    for (const c of cmds) {
+      for (const g of c.groups) {
+        ok(`/${c.name} ${g.name} under 25 subcommands (${g.subcommands.length})`, g.subcommands.length <= 25);
+      }
+    }
+
+    // /char show exists in both the view and profile groups; /standing view
+    // in both renown and merit. Fine — but only because those commands read
+    // getSubcommandGroup() first. A command that collided without consulting
+    // the group would send both leaves to whichever branch is written first.
+    for (const c of cmds) {
+      const names = subs(c).map(s => s.name);
+      if (new Set(names).size === names.length) { ok(`/${c.name} leaf names are unique`, true); continue; }
+      ok(`/${c.name} collides on leaf names, so it must route by group`,
+        new RegExp(`commandName === '${c.name}'[\\s\\S]{0,400}?getSubcommandGroup`).test(src));
+    }
+
+    for (const c of cmds) {
+      for (const s of subs(c)) {
+        ok(`/${c.name} ${s.name} under 25 options (${s.options.length})`, s.options.length <= 25);
+        const req = s.options.map(o => !!o.required);
+        ok(`/${c.name} ${s.name} required options come first`, req.slice(req.lastIndexOf(true) + 1).every(x => !x));
+      }
+    }
+
+    // The real ceiling counts the text a human wrote, not JSON syntax.
+    const size = (c) => {
+      let n = (c.name || '').length + (c.description || '').length;
+      const opt = (o) => {
+        n += (o.name || '').length + (o.description || '').length;
+        for (const ch of o.choices || []) n += String(ch.name || '').length + String(ch.value || '').length;
+      };
+      c.options.forEach(opt);
+      for (const s of subs(c)) { n += s.name.length + s.description.length; s.options.forEach(opt); }
+      for (const g of c.groups) n += g.name.length + g.description.length;
+      return n;
+    };
+    const budget = cmds.map(c => [c.name, size(c)]).sort((a, b) => b[1] - a[1]);
+    for (const [n, s] of budget) ok(`/${n} under the 8000-char budget (${s})`, s < 8000);
+    // Which command is largest is trivia; the ceiling is the invariant. The
+    // leader has swapped once already (/gm overtook /config when restart's
+    // descriptions landed). The margin line moved from 5400 to 6000 on
+    // 2026-08-10 when the portrait migration option pushed /gm to 5482 —
+    // still a quarter of the 8000 budget spare, and the next trip of this
+    // line is the moment /gm's check options should fold into a group
+    // rather than the line moving again.
+    // Raised 6000→6200 (2026-08-15): /gm override interject spent the old
+    // margin on legible option prose — a fair tenant. Discord's true wall
+    // is 8000; this stays the tripwire well short of it.
+    ok('the largest command keeps clear headroom under the 8000 wall',
+      Math.max(...budget.map(([, sz]) => sz)) <= 6200);
+  });
+}
+
+// Arithmetic. The seam's whole promise is that one call site produces two
+// different correct answers depending on the server. A regression here does
+// not throw — it quietly hands out wrong damage for a week.
+function testRules(mod) {
+  const { RULES_KNIGHTFALL: K, RULES_DND5E: D, RULESETS, chunkLines } = mod;
+  return harness('rules', (ok, eq) => {
+    ok('two rulesets registered', Object.keys(RULESETS).length === 2);
+    ok('knightfall is registered under its id', RULESETS.knightfall === K);
+    ok('dnd5e is registered under its id', RULESETS.dnd5e === D);
+    ok('each ruleset knows its own id', K.id === 'knightfall' && D.id === 'dnd5e');
+    ok('each ruleset has a display name', !!K.name && !!D.name);
+
+    eq('KF hit scores one', K.damage(15, 7, 20, 10, 3, 20), { hit: true, dmg: 1 });
+    eq('KF miss scores nothing', K.damage(8, 4, 20, 15, 6, 20), { hit: false, dmg: 0 });
+    eq('KF natural max adds one', K.damage(20, 20, 20, 10, 3, 20), { hit: true, dmg: 2 });
+    eq("KF defender's natural 1 adds one", K.damage(15, 7, 20, 1, 1, 20), { hit: true, dmg: 2 });
+    // Both criticals take a fourth rung: their own bonuses plus one more for
+    // landing at once. An obvious-looking tidy-up that collapsed this to
+    // 1+1+1 would still produce a plausible number, and would quietly make
+    // the best moment in a fight worse.
+    eq('KF both criticals reach four', K.damage(20, 20, 20, 1, 1, 20), { hit: true, dmg: 4 });
+    ok('KF ties go to the attacker', K.damage(12, 6, 20, 12, 6, 20).hit === true);
+    eq('KF stat is added whole', K.statBonus({ str: 4 }, 'str'), 4);
+    eq('KF absent stat reads zero', K.statBonus({}, 'str'), 0);
+    eq('KF HP is CON plus the floor', K.maxHp({ con: 5 }, 10), 15);
+    ok('KF HP stat is CON', K.hpStat === 'con');
+    ok('Knightfall grants no proficiency', K.profBonus({ level: 9 }) === 0);
+
+    ok('5e defends with AC', D.defence === 'ac');
+    eq('5e beats AC', D.resolveAttack({ nat: 15, total: 18, ac: 14 }), { hit: true, crit: false });
+    eq('5e falls short', D.resolveAttack({ nat: 5, total: 8, ac: 14 }), { hit: false, crit: false });
+    // The two rules that override the arithmetic entirely. If either
+    // inverts, every fight still runs and every number still looks fine.
+    eq('5e natural 20 always hits', D.resolveAttack({ nat: 20, total: 23, ac: 99 }), { hit: true, crit: true });
+    eq('5e natural 1 always misses', D.resolveAttack({ nat: 1, total: 21, ac: 5 }), { hit: false, crit: false });
+    ok('5e total equal to AC hits', D.resolveAttack({ nat: 10, total: 14, ac: 14 }).hit === true);
+    eq('5e modifier for 16', D.statBonus({ str: 16 }, 'str'), 3);
+    eq('5e modifier for 10', D.statBonus({ str: 10 }, 'str'), 0);
+    eq('5e modifier for 8', D.statBonus({ str: 8 }, 'str'), -1);
+    eq('5e modifier for 20', D.statBonus({ str: 20 }, 'str'), 5);
+    eq('5e proficiency at level 1', D.profBonus({ level: 1 }), 2);
+    eq('5e proficiency at level 5', D.profBonus({ level: 5 }), 3);
+    eq('5e proficiency at level 17', D.profBonus({ level: 17 }), 6);
+    ok('5e proficiency never drops below 2', D.profBonus({}) >= 2);
+
+    // A key one ruleset answers and the other does not reads undefined at a
+    // shared call site and changes behaviour without throwing.
+    for (const k of ['id', 'name', 'stats', 'labels', 'statBonus', 'hpStat', 'maxHp', 'damage', 'defence', 'profBonus']) {
+      ok(`both rulesets answer "${k}"`, K[k] !== undefined && D[k] !== undefined);
+    }
+    ok('the two rulesets defend differently', K.defence !== D.defence);
+
+    // Every long reply passes through chunkLines. A chunk over 2000 is
+    // rejected by Discord and the message is simply lost.
+    const long = Array.from({ length: 400 }, (_, i) => `line ${i} ${'x'.repeat(30)}`);
+    const chunks = chunkLines(long);
+    ok('chunkLines splits a long list', chunks.length > 1);
+    ok('every chunk is under the wall', chunks.every(c => c.length <= 2000));
+    ok('chunkLines loses nothing', chunks.join('\n').split('\n').length === long.length);
+    ok('chunkLines keeps a short list whole', chunkLines(['one', 'two']).length === 1);
+    ok('chunkLines never emits an empty chunk', chunks.every(c => c.length > 0));
+    ok('an over-long single line is not dropped', chunkLines(['y'.repeat(5000)]).join('').includes('yyy'));
+    ok('KF the pair beats the sum of its parts',
+      K.damage(20, 20, 20, 1, 1, 20).dmg >
+      (K.damage(20, 20, 20, 10, 3, 20).dmg - 1) + (K.damage(15, 7, 20, 1, 1, 20).dmg - 1) + 1);
+  });
+}
+
+// Named pins for faults that have already happened once, so a regression
+// fails with the story attached rather than as an anonymous rule violation.
+function testPins(src) {
+  const count = (re) => (src.match(re) || []).length;
+  return harness('pins', (ok) => {
+    // sendLong was declared twice, twelve lines apart. The second won and
+    // had lost the first's null guard and its .catch(). Call sites were
+    // written against the tolerant one — one hands it the result of
+    // channels.fetch() unchecked — so a deleted channel took down the whole
+    // interaction.
+    ok('sendLong is declared exactly once', count(/async function sendLong\(/g) === 1);
+    ok('sendLong takes the rich signature',
+      /async function sendLong\(target, content, \{ files = null, \.\.\.opts \} = \{\}\)/.test(src));
+    ok('sendLong refuses a missing target', /async function sendLong\([\s\S]{0,200}?if \(!target\) return;/.test(src));
+    ok('sendLong survives a failed send',
+      /async function sendLong\([\s\S]{0,600}?\.catch\(e => console\.error\('\[sendLong\] delivery failed/.test(src));
+    ok('replyLong is declared exactly once', count(/async function replyLong\(/g) === 1);
+    // The comment describing replyLong was stranded above sendLong by the
+    // same botched edit; the merge put it back.
+    ok('replyLong keeps its own description',
+      /Reply with content that may exceed Discord's 2000-char hard limit[\s\S]{0,400}?async function replyLong/.test(src));
+
+    const decls = [...src.matchAll(/^(?:async )?function ([A-Za-z0-9_$]+)\(/gm)].map(m => m[1]);
+    const dupes = [...new Set(decls.filter((n, i) => decls.indexOf(n) !== i))];
+    ok(`no top-level function is declared twice${dupes.length ? ' — ' + dupes.join(', ') : ''}`, dupes.length === 0);
+
+    ok('the ruleset registry holds exactly two systems',
+      /const RULESETS = \{ knightfall: RULES_KNIGHTFALL, dnd5e: RULES_DND5E \};/.test(src));
+    ok('rulesFor defaults to Knightfall', /return RULESETS\[id\] \|\| RULES_KNIGHTFALL;/.test(src));
+    ok('rulesFor survives a server with no config yet',
+      /try \{ id = getConfig\(gid\)\?\.ruleset \|\| null; \} catch/.test(src));
+    ok('handle5eStatus gates on capability, not on the id',
+      /async function handle5eStatus\([\s\S]{0,400}?\.defence !== 'ac'/.test(src));
+
+    // Commands were registered at boot over the guilds already joined, so a
+    // server that added the bot afterwards saw nothing until the next restart.
+    ok('guildCreate registers commands for a new server', /client\.on\('guildCreate'/.test(src));
+    ok('a new server is told how to pick its ruleset',
+      /guildCreate[\s\S]{0,2000}?ruleset system:dnd5e/.test(src));
+
+    // Button handlers used to run outside a try, so anything they threw
+    // became an unhandled rejection: Discord showed "This interaction
+    // failed" and nothing reached the logs.
+    ok('button routing is wrapped', /try \{\s*return await routeButton\(interaction\);/.test(src));
+    ok('a thrown button is logged with its id', /console\.error\('\[button\]', interaction\.customId/.test(src));
+
+    // FIXED 2026-08-10: /gm dc used to pack two free-text options into the
+    // button customId — long text overflowed the 100-char ceiling and a
+    // colon shifted the whole split. The marks now ride the dc_cards row
+    // keyed by the card's message; the id carries numerics and short tokens
+    // only. These pin the fixed shape so the free text cannot creep back.
+    const dcroll = src.match(/setCustomId\(`dcroll:[^`]*`\)/);
+    ok('the dcroll id still exists to be measured', !!dcroll);
+    if (dcroll) {
+      const holes = (dcroll[0].match(/\$\{/g) || []).length;
+      ok(`dcroll carries ten fields at most (has ${holes})`, holes <= 10);
+      ok('no free text rides the dcroll id', !/dcroll:[^`]*onFail/.test(dcroll[0]) && !/dcroll:[^`]*onSucc/.test(dcroll[0]));
+    }
+    ok('the press reads its marks from the card row',
+      /const marks = getDcCard\(interaction\.guild\.id, interaction\.message\?\.id\)/.test(src));
+    ok('the card is saved whenever a press will need it — a hold included',
+      /if \(ids\.length && \(sF \|\| fF \|\| sS \|\| fS \|\| onFail \|\| onSucc \|\| hold\)\)/.test(src));
+    ok('the mark columns exist',
+      /ALTER TABLE dc_cards ADD COLUMN s_mark TEXT/.test(src) && /ALTER TABLE dc_cards ADD COLUMN f_mark TEXT/.test(src));
+
+    // The NPC forum folds by category: one thread per category, every NPC an
+    // entry inside it. Three things make that work, and each fails silently
+    // if it goes — an NPC in two threads at once, an orphaned entry, or a
+    // deleted NPC taking a whole category's thread down with them.
+    ok('an NPC folds into their first-assigned category',
+      /function npcHomeCategory\([\s\S]{0,300}?ORDER BY rowid LIMIT 1/.test(src));
+    ok('an NPC with no category still has a home', /const NPC_NO_CATEGORY = 'Uncategorised';/.test(src));
+    ok('the category thread is made once and reused',
+      /async function ensureCategoryThread\([\s\S]{0,500}?SELECT thread_id FROM \$\{table\}/.test(src));
+    // The portrait forum mirrors the page forum. Three things carry it, and
+    // each is silent when it breaks: the table whitelist (a bad kind would
+    // otherwise write into the wrong forum's map), the parentId check (a
+    // forum bank receives uploads in threads, never in the forum itself),
+    // and the guard that stops the bot answering every image on the server.
+    ok('the two forums keep separate thread maps',
+      /const NPC_THREAD_TABLES = \{ pages: 'npc_category_threads', portraits: 'npc_portrait_threads' \};/.test(src));
+    ok('the thread table is whitelisted, never user input',
+      /NPC_THREAD_TABLES\[kind\] \|\| NPC_THREAD_TABLES\.pages/.test(src));
+    // The manual config path must accept the forum the rest of the code is
+    // built around. isTextBased() is false for forums, and the old text-only
+    // guard shipped for a full day rejecting the intended channel while
+    // build:true wrote the same config without complaint.
+    // The portrait migration: re-hosts every stored face into its category
+    // thread and repoints the NPC row at the new copy. The pieces pinned
+    // here are the ones whose loss is silent: the tiered recovery (expired
+    // signed URLs walk the source channel's history), the repoint (without
+    // it the forum is a gallery and the old channel stays load-bearing),
+    // the idempotency record, and the order-face verdict — order faces are
+    // deliberately NOT migrated, so "safe to delete" must check them.
+    // Every ALTER must target a table some CREATE defines. Twenty-one
+    // ALTERs spent their whole lives targeting `chars` — no such table —
+    // with the catch swallowing the failure on every boot: the entire 5e
+    // character layer plus two Knightfall fields never existed as columns.
+    // Reads survived (SELECT * simply omits them); the first live write to
+    // name one killed a fight mid-exchange. This is an ERROR-class scan.
+    // Schema cross-reference, generalised from the chars incident and then
+    // proven the same day: the audit that added these caught npcs missing
+    // rerolls_current BEFORE a live spend found it. Every reference must
+    // have a definition — tables in any SQL verb, literal INSERT column
+    // lists, literal UPDATE SET columns, and object keys handed to the two
+    // dynamic upserts. Dynamic (${}) SQL is skipped; DO UPDATE SET is not a
+    // table named SET.
+    (() => {
+      const noComments = src.replace(/\/\/[^\n]*/g, '');
+      const tables = {};
+      for (const m of noComments.matchAll(/CREATE TABLE IF NOT EXISTS (\w+)\s*\(/g)) {
+        let i = m.index + m[0].length, depth = 1;
+        while (depth && i < noComments.length) { depth += noComments[i] === '('; depth -= noComments[i] === ')'; i++; }
+        const cols = new Set();
+        for (const line of noComments.slice(m.index + m[0].length, i - 1).split(',')) {
+          const w = line.trim().split(/\s+/)[0];
+          if (w && !['PRIMARY','UNIQUE','FOREIGN','CHECK'].includes(w) && /^\w+$/.test(w)) cols.add(w);
+        }
+        tables[m[1]] = new Set([...(tables[m[1]] || []), ...cols]);
+      }
+      for (const m of noComments.matchAll(/ALTER TABLE (\w+) ADD COLUMN (\w+)/g)) {
+        (tables[m[1]] = tables[m[1]] || new Set()).add(m[2]);
+      }
+      const phantoms = new Set();
+      // Only lines that carry a real SQL keyword — 'VACUUM INTO unavailable'
+      // in a log string is prose, not a table.
+      for (const line of noComments.split('\n')) {
+        if (!/\b(SELECT|INSERT|DELETE|UPDATE)\b/.test(line)) continue;
+        for (const m of line.matchAll(/(?<!DO )(?:FROM|INTO|UPDATE|DELETE FROM)\s+(\w+)/g)) {
+          const t = m[1];
+          if (!tables[t] && t !== 'sqlite_master' && !t.startsWith('$') && t !== 'SET') phantoms.add(t);
+        }
+      }
+      ok(`every SQL verb targets a created table${phantoms.size ? ` (phantoms: ${[...phantoms].join(', ')})` : ''}`,
+        phantoms.size === 0);
+      const badIns = [];
+      for (const m of noComments.matchAll(/INSERT (?:OR \w+ )?INTO (\w+)\s*\(([^)]+)\)/g)) {
+        if (!tables[m[1]] || m[2].includes('${')) continue;
+        const miss = m[2].split(',').map(c => c.trim()).filter(c => c && !tables[m[1]].has(c));
+        if (miss.length) badIns.push(`${m[1]}:${miss.join('/')}`);
+      }
+      ok(`every literal INSERT column is defined${badIns.length ? ` (${badIns.slice(0,3).join(' ')})` : ''}`, badIns.length === 0);
+      const badUpd = [];
+      for (const m of noComments.matchAll(/(?<!DO )UPDATE (\w+) SET ([^`'"]+?)(?:WHERE|['`"])/g)) {
+        if (!tables[m[1]] || m[0].includes('${')) continue;
+        const miss = [...m[2].matchAll(/(\w+)\s*=/g)].map(x => x[1]).filter(c => !tables[m[1]].has(c));
+        if (miss.length) badUpd.push(`${m[1]}:${[...new Set(miss)].join('/')}`);
+      }
+      ok(`every literal UPDATE column is defined${badUpd.length ? ` (${badUpd.slice(0,3).join(' ')})` : ''}`, badUpd.length === 0);
+      const badKeys = [];
+      for (const [fn, tbl] of [['upsertChar', 'characters'], ['upsertNpc', 'npcs']]) {
+        for (const m of noComments.matchAll(new RegExp(fn + "\\(\\s*\\w+,\\s*[^,{]+,\\s*\\{([\\s\\S]{0,500}?)\\}\\s*\\)", 'g'))) {
+          const body = ('{' + m[1]).replace(/\.\.\.[^,}]+/g, '');
+          for (const k of [...body.matchAll(/[{\s,](\w+)\s*:/g)].map(x => x[1])) {
+            if (!/^\d+$/.test(k) && !tables[tbl]?.has(k)) badKeys.push(`${fn}:${k}`);
+          }
+        }
+      }
+      ok(`every upsert key is a real column${badKeys.length ? ` (${[...new Set(badKeys)].slice(0,4).join(' ')})` : ''}`,
+        badKeys.length === 0);
+    })();
+    ok('the migration record table exists',
+      /CREATE TABLE IF NOT EXISTS npc_portrait_posts/.test(src));
+    // (regrammared 2026-08-15: check folded into a group — see the fold pins)
+    // Permission sweep (T, 2026-08-15): every channel checked, repaired
+    // where the bot holds ManageRoles there, new channels caught at birth.
+    // PERMISSIONS ONLY — the heal must never touch position or parent.
+    ok('the needs list is the working minimum — no ManageMessages',
+      (() => {
+        const m = src.match(/const CHANNEL_PERMS = \[([\s\S]*?)\];/);
+        return !!m && !m[1].includes('ManageMessages') && m[1].includes('ManageWebhooks');
+      })());
+    ok('the heal sweeps every channel and writes only its own overwrite',
+      /async function healChannelPerms\(guild\)/.test(src) &&
+      /ch\.permissionOverwrites\.edit\(me\.id, allow, \{ reason: 'DDice self-repair' \}\)/.test(src));
+    ok('the heal never reorders or reparents',
+      !/healChannelPerms[\s\S]{0,2400}?(setPosition|setParent|edit\(\{\s*position)/.test(src));
+    ok('it only grants what it already holds, and says what it cannot',
+      /const grantable = missing\.filter\(k => me\.permissions\.has\(k\)\);/.test(src) &&
+      /cannot repair myself/.test(src));
+    ok('new channels are healed at birth',
+      /client\.on\('channelCreate'[\s\S]{0,700}?DDice self-repair \(new channel\)/.test(src));
+    ok('status audits without writing',
+      /Permissions correct in every channel/.test(src));
+    ok('the check fold: seven leaves, shimmed dispatch, routed group',
+      /g\.setName\('check'\)/.test(src) &&
+      ['status','run','build','restart','order','migrations','portraits'].every(l => new RegExp(String.raw`g\.addSubcommand\(s=>s\.setName\('${l}'\)`).test(src)) &&
+      /const opt = \(name\) => checkLeaf \? checkLeaf === name : !!interaction\.options\?\.getBoolean\?\.\(name\);/.test(src) &&
+      /getSubcommandGroup\(false\) === 'check'\) return await handleCheck/.test(src) &&
+      /opt\('portraits'\)/.test(src));
+    ok('expired faces are recovered from channel history',
+      /const recover = async \(parsed\)[\s\S]{0,900}?a\.id === parsed\.attachmentId/.test(src));
+    ok('the NPC row is repointed at the re-hosted copy',
+      /const newUrl = posted\.attachments\.first\(\)\?\.url[\s\S]{0,120}?setNpcImage\(gid, npc\.name, newUrl\)/.test(src));
+    // Order faces are never re-hosted or repointed by the migration. The one
+    // write it may make is folding a stale case-variant into its fresh face:
+    // the wear-time lookup is COLLATE NOCASE, so "Black knight" beside
+    // "Black Knight" is one face with an arbitrary winner — observed live
+    // serving the dead URL after a fresh upload. The write path now
+    // collapses variants at set-time too, so the fold should become rare.
+    (() => {
+      // Slice between the function declarations — bare-name indexOf lands on
+      // the dispatch lines, which sit one line apart and slice to nothing.
+      const mig = src.slice(src.indexOf('async function runPortraitMigration'), src.indexOf('async function runOrderReport'));
+      ok('order faces are checked, never re-hosted',
+        /SELECT prefix, image_url, set_at FROM npc_orders WHERE guild_id=\?/.test(mig) &&
+        !/npc_orders SET image_url/.test(mig));
+      ok('stale case-variants fold into the healthy face',
+        /if \(healthy && r\.prefix !== healthy\.prefix\)/.test(mig));
+    })();
+    ok('setting an order face collapses its case-variants first',
+      /DELETE FROM npc_orders WHERE guild_id=\? AND prefix=\? COLLATE NOCASE/.test(src));
+    // The duplication bug: the kept-check sniffed the stored URL for the
+    // thread id and fell through to a fresh post when the sniff failed —
+    // live result, the same face posted again on every run. The record is
+    // the truth now; a live recorded message is kept and merely repointed.
+    // The face chain and the round trip, broken together by one export test:
+    // delete+import stripped the personal face (export never carried it) and
+    // the order fallback read only a pipe in the NAME, so a plain-named
+    // White Knight never inherited the White Knight face. Sheet first, name
+    // second; the face travels in the payload behind a CDN-only validator;
+    // and the migration resurrects a faceless NPC from their live forum post.
+    // Set-side and wear-side must agree on who belongs to an order, or an
+    // order of plain-named knights can never have its face set and knights
+    // who already spoke keep stale blank webhooks after one is.
+    ok('order membership counts the sheet, not just pipe names',
+      /add\(n\.order_name \|\| npcOrderOf\(n\.name\)\);/.test(src));
+    // (superseded: one wearer-refresh serves orders AND categories — pinned above)/.test(src));
+
+    // (superseded 2026-08-12: the pipe tier is gone — see the shared-face pins)
+    ok('the shared-face chain is order, then categories, never the name',
+      /if \(npc\.order_name && getOrderImage\(gid, npc\.order_name\)\) return npc\.order_name;/.test(src) &&
+      /for \(const cat of getCategoriesForNpc\(gid, npc\.name\)\)/.test(src) &&
+      !/getOrderImage\(gid, npcOrderOf\(npc\.name\)\)/.test(src));
+    ok('a bare category caption sets a shared face through the same store',
+      /const catMatch = getCategories\(gidF\)\.find\(c => c\.toLowerCase\(\) === npcName\.toLowerCase\(\)\)/.test(src) &&
+      /setOrderImage\(gidF, label,/.test(src));
+    ok('setting a shared face refreshes exactly its wearers',
+      /sharedFaceLabelFor\(gidF, n\) === label/.test(src));
+    ok('the face travels in the export payload',
+      /image: npc\.image_url \|\| null \};/.test(src) && /\.\.\.\(imp\.image \? \{ image_url: imp\.image \} : \{\}\)/.test(src));
+    ok('an imported face must be a Discord CDN attachment',
+      /o\.image != null && !\/\^https:/.test(src));
+    ok('the migration resurrects record-holders without a face',
+      /n\.image_url \|\| hasRecord\.has\(n\.name\)/.test(src));
+    ok('a dead record with no face lands on the lost list, not in fetch(null)',
+      /if \(!npc\.image_url\) \{ lost\.push\(npc\.name\); continue; \}/.test(src));
+
+    ok('the kept-check trusts the record, not URL sniffing',
+      !/includes\(`\/\$\{row\.thread_id\}\/`\)/.test(src));
+    ok('a live migrated post is repointed, never reposted',
+      /const liveUrl = alive\.attachments\.first\(\)\?\.url[\s\S]{0,400}?kept\+\+; continue;/.test(src));
+    ok('the verdict refuses "safe to delete" while anything leans',
+      /still load-bearing/.test(src));
+
+    ok('npcchannel accepts a forum and lays its threads out on the spot',
+      /const isForum = chan\?\.type === 15;/.test(src) &&
+      /if \(isForum\) \{[\s\S]{0,220}?await ensurePortraitThreads\(interaction\.client, gid\)/.test(src));
+    ok('npcchannel still takes a plain text channel',
+      /if \(!isForum && !chan\?\.isTextBased\?\.\(\)\)/.test(src));
+
+    ok('a portrait posted in a category thread is still recognised',
+      /message\.channel\.parentId === bankId/.test(src));
+    ok('the bot only answers images inside the bank',
+      /const inBank = !!bankId &&/.test(src) &&
+      !/No NPC image channel is set/.test(src));
+    ok('a text-channel bank still works', /message\.channel\.id === bankId/.test(src));
+    // The creation reply points at the exact portrait thread, or the bank,
+    // or \u2014 with none set \u2014 at the config command. Without this line the
+    // portrait forum is invisible until stumbled on.
+    ok('creating an NPC points at where their face goes',
+      /function portraitHint\(gid, npcName\)/.test(src) && /\$\{portraitHint\(gid, name\)\}/.test(src));
+    // Rename works IN PLACE. Membership rowids decide every member's home
+    // category, so delete-and-recreate would re-home NPCs whose first
+    // category this is. The three UPDATEs are the feature.
+    ok('categoryrename updates rather than recreates',
+      /UPDATE npc_categories SET name=\? WHERE guild_id=\? AND name=\?/.test(src) &&
+      /UPDATE npc_category_members SET category=\? WHERE guild_id=\? AND category=\?/.test(src) &&
+      /UPDATE \$\{table\} SET category=\? WHERE guild_id=\? AND category=\?/.test(src));
+    ok('categoryrename refuses a name already in use',
+      /merging categories is a different thing/.test(src));
+    // The sidebar is enforced, not suggested: one batched setPositions in
+    // plan order per category, re-parenting adopted strays as it goes.
+    // Without this, any channel adopted by name keeps its old position and
+    // the plan only governs fresh creates.
+    // The sidebar order has failed to land twice, two different ways, so the
+    // ordering code is now built to produce EVIDENCE: forced before/after
+    // raw positions on every edit, and a diagnostic that prints each
+    // category's raw sequences split by type. These pin the evidence
+    // machinery itself — losing it means the next failure is a guess again.
+    // One system per picker: whole 5e commands never register on Knightfall
+    // guilds and vice versa, and changing the ruleset re-registers so the
+    // picker flips with the setting. Subcommands cannot be hidden this way
+    // — the runtime gates stay as the backstop for /npc create5e and kin.
+    ok('registration filters whole commands by ruleset',
+      /const DND5E_ONLY = \['dnd', 'spell', 'library'\];/.test(src) &&
+      /const KNIGHTFALL_ONLY = \['duel', 'deception', 'standing'\];/.test(src) &&
+      /commands = commands\.filter\(cmd => !hidden\.includes\(cmd\.name\)\);/.test(src));
+    ok('the choice-injection map chains after the filter, not around it',
+      /commands = commands\.map\(cmd => \{/.test(src) &&
+      !/commands = slashCommands\.map\(cmd => \{/.test(src));
+    ok('changing the ruleset re-registers the picker',
+      /setConfig\(gid, \{ ruleset: want \}\);[\s\S]{0,300}?registerSlashCommands\(gid\)\.catch/.test(src));
+
+    ok('one order applier serves build, restart and the diagnostic',
+      /async function applySidebarOrder\(guild, entries\)/.test(src) &&
+      /await applySidebarOrder\(guild, sidebar\)/.test(src) &&
+      /await applySidebarOrder\(guild, entries\)/.test(src));
+    ok('every edit is verified against a forced refetch — and the observer force-fetches too',
+      (src.match(/fetch\(w\.id, \{ force: true \}\)/g) || []).length === 3);
+    ok('refused edits are counted and surfaced, not swallowed',
+      /if \(ord\.refused\) lines\.push/.test(src));
+    ok('the diagnostic shows per-type raw sequences',
+      /forums: \$\{seq\(c => c\.type === 15\)/.test(src));
+    ok('re-parenting never rewrites channel overwrites',
+      (src.match(/lockPermissions: false/g) || []).length >= 2);
+
+    // Restart is the most destructive thing the bot can do, so each of its
+    // four guards is pinned: the confirm (no accidental press-through), the
+    // doomed-channel refusal (or the report dies with its own channel), the
+    // clean-slate config wipe (or the rebuild adopts ghost ids), and the
+    // derived-map wipe (or every NPC and character page points at deleted
+    // threads).
+    ok('restart goes through the confirm flow',
+      /async function runFullRestart\([\s\S]{0,2500}?return requestConfirm\(interaction,/.test(src));
+    ok('restart refuses from a doomed channel',
+      /doomed\.has\(interaction\.channelId\)/.test(src));
+    ok('restart nulls every plan key before rebuilding',
+      /for \(const plan of SETUP_PLAN\) wipe\[plan\.key\] = null;/.test(src));
+    ok('restart wipes the derived thread maps',
+      /for \(const t of \['npc_pages', 'npc_category_threads', 'npc_portrait_threads', 'char_pages', 'npc_webhooks'\]\)/.test(src));
+    ok('restart warns that threads are unrecoverable',
+      /Discord has no undelete/.test(src));
+    ok('restart rebuilds through the shared body',
+      /const lines = await buildAllSetup\(interaction\);[\s\S]{0,200}?Torn down/.test(src));
+    ok('build and restart share one setup body',
+      (src.match(/await buildAllSetup\(interaction\)/g) || []).length === 2);
+    // The docs seed: without it the two PDF channels sit empty until someone
+    // finds /config channels docs by accident.
+    ok('setup seeds the docs repo when unset',
+      /if \(!getConfig\(gid\)\?\.docs_repo\) \{ setConfig\(gid, \{ docs_repo: DOCS_DEFAULT_REPO \}\)/.test(src));
+    ok('the default repo is the one shipping the books',
+      /const DOCS_DEFAULT_REPO = 'wolffewrought\/DDice';/.test(src));
+
+    ok('the forum lifecycle can be exercised live',
+      /setName\('forum'\)\.setDescription\('Exercise the NPC forums end to end/.test(src) &&
+      /if \(sub === 'forum'\) \{/.test(src));
+
+    ok('a new category opens its portrait thread at once',
+      /createCategory\(gid, name\);[\s\S]{0,300}?ensurePortraitThreads\(interaction\.client, gid\)/.test(src));
+    ok('the rebuild mirrors the portrait forum too',
+      /async function rebuildNpcForum\([\s\S]{0,2600}?await ensurePortraitThreads\(client, gid\)/.test(src));
+    // Deleting a category must not strand its threads. The sweep closes the
+    // thread in BOTH forums, drops both mappings, and re-homes every NPC that
+    // lived there — reading the orphan list BEFORE the membership rows go,
+    // because afterwards there is nothing left to read.
+    ok('categorydelete reads its orphans before deleting',
+      /const orphans = getNpcsInCategory\(gid, name\);\s*\n\s*deleteCategory\(gid, name\);/.test(src));
+    ok('categorydelete sweeps both thread tables',
+      /for \(const table of Object\.values\(NPC_THREAD_TABLES\)\)[\s\S]{0,400}?DELETE FROM \$\{table\} WHERE guild_id=\? AND category=\?/.test(src));
+    ok('categorydelete re-homes the orphans',
+      /for \(const npcName of orphans\) await mirrorNpcSheet\(client, gid, npcName\)/.test(src));
+    // Re-homing on assign and remove rides touchNpcPage -> mirrorNpcSheet's
+    // move logic. If either drops the call, an NPC whose home category
+    // changes keeps a stale entry in the old thread.
+    ok('assigning a category refreshes the entry',
+      /function assignNpcToCategory\([\s\S]{0,220}?touchNpcPage\(gid, npcName\);/.test(src));
+    ok('removing a category refreshes the entry',
+      /function removeNpcFromCategory\([\s\S]{0,220}?touchNpcPage\(gid, npcName\);/.test(src));
+
+    ok('portrait mirroring skips a non-forum bank',
+      /async function ensurePortraitThreads\([\s\S]{0,400}?forum\.type !== 15\) return 0;/.test(src));
+// (retired 2026-08-12: NPCs no longer move between threads — the thread is
+    // theirs for life, renamed and retagged in place by the mirror.)
+// (inverted 2026-08-12: the thread IS the page now — see the per-NPC pins)
+    ok('deleting an NPC deletes their thread',
+      /Their thread IS their page now/.test(src) && /await th\.delete\(\)\.catch/.test(src));
+    // The rebuild must not clear npc_pages before rewriting. It did once:
+    // every NPC then looked new, so a second run posted a fresh entry beside
+    // the existing one and orphaned it — the whole forum duplicated on the
+    // second press, silently, with nothing in the logs.
+    ok('the rebuild never wipes the page map',
+      !/async function rebuildNpcForum\([\s\S]{0,1600}?DELETE FROM npc_pages WHERE guild_id=\?'\)\.run\(gid\)/.test(src));
+    ok('one-command setup lays the NPC forum out too',
+      /const npcLaid = await rebuildNpcForum\(interaction\.client, gid\)/.test(src));
+    ok('the rebuild computes its keep-list after the write pass',
+      /async function rebuildNpcForum\([\s\S]{0,2400}?const keep = new Set\(db\.prepare\('SELECT thread_id FROM npc_category_threads/.test(src));
+    // Coloured orders are automatic homes: an explicit category assignment
+    // always wins, then the order on the sheet, then Uncategorised. Both
+    // forums pre-create a thread for every category AND every known order,
+    // and knownOrders is data-driven — a D&D server never grows knight
+    // threads, and a new colour births its thread with its first NPC.
+    ok('an unassigned knight files under their coloured order',
+      /if \(npc\?\.order_name\) return npc\.order_name;/.test(src));
+    ok('a hand-assigned category still outranks the order',
+      /if \(row\?\.category\) return row\.category;[\s\S]{0,500}?order_name/.test(src));
+    ok('known orders come from the data, not a hardcoded list',
+      /SELECT DISTINCT order_name FROM npcs/.test(src) &&
+      /SELECT DISTINCT prefix FROM npc_orders/.test(src.slice(src.indexOf('function knownOrders'), src.indexOf('function npcHomeCategory'))));
+    ok('both forums pre-create category and order threads',
+      /\[\.\.\.new Set\(\[\.\.\.getCategories\(gid\), \.\.\.knownOrders\(gid\), NPC_NO_CATEGORY\]\)\]/.test(src) &&
+      (src.match(/knownOrders\(gid\)/g) || []).length >= 2);
+    ok('setting the forum lays it out', /const laid = await rebuildNpcForum\(client, gid\)/.test(src));
+    ok('the rebuild defers — it can outrun three seconds',
+      /npc_forum: channel\.id \}\);\s*\n\s*await interaction\.deferReply\(\);/.test(src));
+
+    ok('no modal placeholder is written over 100 chars', count(/setPlaceholder\('([^']{101,})'\)/g) === 0);
+    ok('quest modals still fill all five rows',
+      count(/new ActionRowBuilder\(\)\.addComponents\(new TextInputBuilder\(\)/g) >= 5);
+    ok('the parchment edition is still referenced', /[Pp]archment/.test(src));
+
+    // The 5e gate pins that used to live here now belong to the rulesets
+    // scanner, which checks the same property more thoroughly. Not lost.
+    ok('the rulesets scanner owns the 5e gates', true);
+  });
+}
+
+// ═══ 6 · Runner ═════════════════════════════════════════════════════
+
+const C = process.stdout.isTTY
+  ? { red: '\u001b[31m', grn: '\u001b[32m', yel: '\u001b[33m', dim: '\u001b[2m', off: '\u001b[0m' }
+  : { red: '', grn: '', yel: '', dim: '', off: '' };
+
+function main() {
+  if (!fs.existsSync(INDEX)) {
+    console.error(`${C.red}index.js not found beside verify.js${C.off}`);
+    process.exit(1);
+  }
+  const src = fs.readFileSync(INDEX, 'utf8');
+
+  let ast;
+  try {
+    ast = parse(src);
+  } catch (e) {
+    console.error(`${C.red}✗ parse${C.off}  ${e.message}`);
+    process.exit(1);
+  }
+  console.log(`${C.grn}✓${C.off} parse                  ${C.dim}${src.length} bytes, ${src.split('\n').length} lines${C.off}`);
+
+  let errors = 0, warnings = 0, assertions = 0;
+  const failedSteps = [];
+
+  if (ONLY !== 'test') {
+    const scans = [
+      ['structure', scanStructure(src, ast)],
+      ['wiring', scanWiring(src, ast)],
+      ['limits', scanLimits(src, ast)],
+      ['rulesets', scanRulesets(src)],
+      ['habits', scanHabits(src, ast)],
+    ];
+    for (const [name, found] of scans) {
+      const errs = found.filter(f => f.sev === 'ERROR');
+      const warns = found.filter(f => f.sev === 'WARN');
+      errors += errs.length; warnings += warns.length;
+      const tail = found.summary ? `${found.summary} — ` : '';
+      if (errs.length) {
+        failedSteps.push(name);
+        console.log(`${C.red}✗${C.off} ${name.padEnd(22)} ${tail}${errs.length} error, ${warns.length} warn`);
+        for (const f of errs.slice(0, 20)) console.log(`    ${C.red}${f.rule}${C.off}  L${f.line}  ${f.msg}`);
+        if (errs.length > 20) console.log(`    … and ${errs.length - 20} more`);
+      } else {
+        console.log(`${C.grn}✓${C.off} ${name.padEnd(22)} ${C.dim}${tail}0 error, ${warns.length} warn${C.off}`);
+      }
+      if (VERBOSE) for (const f of warns) console.log(`    ${C.yel}${f.rule}${C.off}  L${f.line}  ${f.msg}`);
+      if (found.budget) {
+        console.log(`    ${C.dim}budget: ${found.budget.map(([n, s]) => `${n} ${s}`).join(' · ')}${C.off}`);
+      }
+    }
+  }
+
+  if (ONLY !== 'scan') {
+    let mod, missing;
+    try {
+      ({ mod, missing } = loadIndex(src));
+    } catch (e) {
+      console.log(`${C.red}✗${C.off} load                   a builder was refused before any test ran`);
+      console.log(`    ${e.message}`);
+      process.exit(1);
+    }
+    if (missing.length) console.log(`${C.yel}!${C.off} load                   ${C.dim}not exported: ${missing.join(', ')}${C.off}`);
+
+    for (const r of [testBuilders(src), testRules(mod), testPins(src)]) {
+      assertions += r.pass;
+      if (r.fails.length) {
+        failedSteps.push(r.name);
+        console.log(`${C.red}✗${C.off} ${r.name.padEnd(22)} ${r.pass} pass, ${r.fails.length} fail`);
+        for (const f of r.fails) console.log(`    ${C.red}FAIL${C.off}  ${f}`);
+      } else {
+        console.log(`${C.grn}✓${C.off} ${r.name.padEnd(22)} ${C.dim}${r.pass} pass${C.off}`);
+      }
+    }
+  }
+
+  console.log();
+  if (failedSteps.length) {
+    console.log(`${C.red}failed:${C.off} ${failedSteps.join(', ')}`);
+    process.exit(1);
+  }
+  const w = warnings ? ` · ${warnings} warning${warnings === 1 ? '' : 's'}${VERBOSE ? '' : ' (-v to list)'}` : '';
+  console.log(`${C.grn}all green${OFF_OR(C)}${assertions ? ` — ${assertions} assertions` : ''}${w}`);
+  process.exit(0);
+}
+
+function OFF_OR(c) { return c.off; }
+
+main();
