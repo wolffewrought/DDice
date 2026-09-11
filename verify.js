@@ -1545,10 +1545,14 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /if \(kind === 'atk'\) return \[/.test(src) &&
       /B\('fatk:str'/.test(src) &&
       /startsWith\('fatk:'\)\) \{\s*\n\s*return handleFight\(interaction, \{ sub: 'atk'/.test(src));
-    ok('the announcer offers rows and every fight sender attaches them',
-      /const rowsFor = gmapNow\[id\] \? \['escape', 'atk'\]/.test(src) &&
-      /Object\.values\(gmapNow\)\.includes\(id\) \? \['hold', 'atk'\]/.test(src) &&
-      (src.match(/components: [\w.?]+answerRows \?\? \[\]/g) || []).length >= 5);
+// (2026-09-12: rows are now claimed by sendLong/replyLong themselves, so
+    // no sender can forget — six had.)
+    ok('turn buttons are universal: the announcer stashes, the senders claim',
+      /const pendingTurnRows = new Map\(\);/.test(src) &&
+      /pendingTurnRows\.set\(`\$\{gid\}:\$\{cid\}`, nextF\.answerRows\);/.test(src) &&
+      /function claimTurnRows\(channelId, text, opts\)/.test(src) &&
+      /const withRows = last \? claimTurnRows\(target\.id, chunks\[i\], opts\) : opts;/.test(src) &&
+      /return first\(\{ content: text, \.\.\.claimTurnRows\(cid, text, opts\) \}\);/.test(src));
     ok('the grapple refusal carries a release button',
       /a grappler cannot strike their captive\. Let go and swing again/.test(src) &&
       /setCustomId\('grpfree'\)/.test(src));

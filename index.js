@@ -4284,11 +4284,25 @@ function chunkLines(content, limit = 1900) {
 // logged, not thrown. Every caller is a broadcast — a quest board post, an
 // archive copy, a DM notice — and none of them should take down the
 // interaction that triggered them because one channel lost its permissions.
+// A turn announcement's buttons, left by announceNextTurn and claimed by
+// whichever sender posts the line. Keyed guild:channel.
+const pendingTurnRows = new Map();
+function claimTurnRows(channelId, text, opts) {
+  if (opts.components || !/turn to attack!/.test(text)) return opts;
+  const key = [...pendingTurnRows.keys()].find(k => k.endsWith(`:${channelId}`));
+  if (!key) return opts;
+  const rows = pendingTurnRows.get(key) || [];
+  pendingTurnRows.delete(key);
+  return rows.length ? { ...opts, components: rows } : opts;
+}
+
 async function sendLong(target, content, { files = null, ...opts } = {}) {
   if (!target) return;
   const chunks = chunkLines(content);
   for (let i = 0; i < chunks.length; i++) {
-    await target.send({ content: chunks[i], ...(i === chunks.length - 1 && files ? { files } : {}), ...opts })
+    const last = i === chunks.length - 1;
+    const withRows = last ? claimTurnRows(target.id, chunks[i], opts) : opts;
+    await target.send({ content: chunks[i], ...(last && files ? { files } : {}), ...withRows })
       .catch(e => console.error('[sendLong] delivery failed -', e?.message || e));
   }
 }
@@ -4305,14 +4319,16 @@ async function replyLong(interaction, content, opts = {}) {
   const first = (payload) => interaction.deferred || interaction.replied
     ? interaction.editReply(payload)
     : interaction.reply(payload);
+  const cid = interaction.channelId || interaction.channel?.id;
   if (text.length <= LIMIT) {
-    return first({ content: text, ...opts });
+    return first({ content: text, ...claimTurnRows(cid, text, opts) });
   }
   // Chunk by lines, never mid-line unless a single line is itself too long.
   const chunks = chunkLines(Array.isArray(content) ? content : text, LIMIT);
-  await first({ content: chunks[0], ...opts });
+  await first({ content: chunks[0], ...(chunks.length === 1 ? claimTurnRows(cid, chunks[0], opts) : opts) });
   for (let i = 1; i < chunks.length; i++) {
-    await interaction.followUp({ content: chunks[i], ...opts }).catch(() => {});
+    const last = i === chunks.length - 1;
+    await interaction.followUp({ content: chunks[i], ...(last ? claimTurnRows(cid, chunks[i], opts) : opts) }).catch(() => {});
   }
 }
 
@@ -15781,6 +15797,11 @@ lines.push(`\n\u{1F3AF} **${nextF.name}${nextF.isNpc ? ' \u{1F3AD}' : ''}**'s tu
   nextF.answerRows = (nextF.isNpc || autoNpc)
     ? []
     : rowsFor.flatMap(k => fightAnswerRows(k, { held: isHeld })).slice(0, 5);
+  // Every sender used to be asked to attach these by hand, and six of them
+  // never did — the grappler's turn arrived with no Maintain/Release in
+  // sight (T, 2026-09-12). Now the announcer leaves them where sendLong and
+  // replyLong will find them, so no caller can forget.
+  pendingTurnRows.set(`${gid}:${cid}`, nextF.answerRows);
   return nextF;
 }
 

@@ -326,6 +326,24 @@ place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
 
+## 9q · Turn buttons made universal (2026-09-12, live)
+
+T: no Maintain/Release on the grappler's turn. Cause: the announcer put
+the rows on `nextF.answerRows` and each SENDER was expected to attach
+them. Five did; six did not — resolveGrappleSave, runFightMaintain,
+runFightDeflect, runFightDisarm, resolveFeintInsight, gmSkipTurn — and the
+grapple resolution itself was one of them, so the very first turn after a
+hold took had no buttons. Threading through callers is how this kept
+breaking.
+
+Now the announcer STASHES the rows in `pendingTurnRows` (keyed
+guild:channel) and sendLong/replyLong CLAIM them when the chunk they are
+posting carries the turn line and no rows were given explicitly. Every
+fight path goes through one of those two helpers, so no sender can
+forget again. The map entry is consumed on claim, so a stray claim cannot
+attach stale rows to a later message. Pinned on the stash, the claim and
+both helper sites.
+
 ## 9p · /help brought level with the books (2026-09-11)
 
 T asked for language and content to match everywhere, including /help.
