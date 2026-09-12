@@ -1522,10 +1522,36 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     // press walks the same release path the command does.
     // The attacker's turn had no buttons at all: you could answer a blow by
     // tapping but never throw one (T, 2026-08-22).
-    ok('the four opening abilities have buttons, and answers do not',
+// (2026-09-12: Grapple and Feint open the attack; Deflect and Disarm
+    // answer one, so they moved to the defence row.)
+    ok('opening abilities sit with the attack, answering ones with the defence',
       /B\('fact:grapple'/.test(src) && /B\('fact:feint'/.test(src) &&
-      /B\('fact:deflect'/.test(src) && /B\('fact:disarm'/.test(src) &&
-      /const ACTION_OF = \{ grapple: 'Grapple', feint: 'Feint', deflect: 'Deflect', disarm: 'Disarm', escape: 'Escape' \};/.test(src));
+      (() => {
+        const d = src.indexOf("if (kind === 'def') return [");
+        const a = src.indexOf("if (kind === 'atk') return [");
+        const defBlock = src.slice(d, src.indexOf('];', d));
+        const atkBlock = src.slice(a, src.indexOf('];', a));
+        return /fact:deflect/.test(defBlock) && /fact:disarm/.test(defBlock)
+            && !/fact:deflect/.test(atkBlock) && !/fact:disarm/.test(atkBlock);
+      })() &&
+      /return handleFight\(interaction, \{ sub: 'act', action: which, targetId: pendingAttacker \}\);/.test(src) &&
+      /\? String\(forced\.action\)\.toLowerCase\(\)/.test(src) &&
+      /async function offerAbilityTarget\(interaction, which\)/.test(src) &&
+      /startsWith\('fightfeint:'\)/.test(src));
+    // A button's path must pass through the same rules as the command's:
+    // the feint modal goes via handleFight, and the grapple select never
+    // double-acknowledges before the runner replies.
+    // Found by the fight-walk probe, not by any static check: the attack
+    // branch ignored forced.stat, and a plain attack inherited a stale kind.
+    ok('the attack branch honours a forced stat',
+      /const stat = \(\(forced && typeof forced === 'object'\) \? forced\.stat : null\) \?\? interaction\.options\?\.getString\?\.\('stat'\);/.test(src));
+    ok('a plain attack sets its own kind',
+      (src.match(/atk_sides: 20,\s*\n\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*atk_kind: null,/g) || []).length >= 2);
+    ok('the feint modal obeys the once-per-fight rule and the WIS bar',
+      /return handleFight\(interaction, \{ sub: 'act', action: 'feint', targetId, feintText: claim \}\);/.test(src) &&
+      /\? forced\.feintText : null\) \|\| interaction\.options\?\.getString\?\.\('feint'\)/.test(src));
+    ok('the grapple select hands straight to the runner',
+      !/Going for the hold/.test(src));
     ok('a grappler is offered the hold or the release, a captive the break',
       /if \(kind === 'hold'\) return/.test(src) && /Maintain the hold/.test(src) &&
       /if \(kind === 'escape'\) return/.test(src) && /Break free \(STR\)/.test(src));

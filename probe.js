@@ -59,6 +59,9 @@ function recorder(kind) {
     setDefaultMemberPermissions() { return this; }
     setDMPermission() { return this; }
     addChoices(...c) { (this._d.choices ??= []).push(...c.flat()); return this; }
+    addOptions(...c) { (this._d.options ??= []).push(...c.flat()); return this; }
+    setMinValues(v) { this._d.min = v; return this; }
+    setMaxValues(v) { this._d.max = v; return this; }
     addComponents(...c) { this._d.components.push(...c.flat()); return this; }
     addSubcommand(fn) { this._d.subcommands.push(fn(new (recorder('sub'))())._d ?? fn); return this; }
     addSubcommandGroup(fn) { const g = fn(new (recorder('group'))()); this._d.groups.push(g._d ?? g); return this; }
@@ -380,6 +383,66 @@ async function fire(over) {
     const ledger = src.slice(fi, src.indexOf(']];', fi));
     const absent = flags.filter(f => !ledger.includes(f));
     ok(`every migration flag is in the ledger (${flags.length})`, absent.length === 0, absent.join(', '));
+  }
+
+  // ── The fight walk ────────────────────────────────────────────────────
+  // Every button the bot offers in a fight is pressed against a seeded
+  // fight, through the real interaction handler. Two failures are hunted:
+  // SILENCE (no reply at all — Discord shows "didn't respond in time") and
+  // the generic error reply ("Something went wrong"), which means a throw.
+  // The three bugs of 2026-09-12 were all of these kinds, and no static
+  // pin can see them.
+  if (dbHandle) {
+    const seedChar = (uid) => dbHandle.prepare(
+      `INSERT OR REPLACE INTO characters (guild_id, user_id, str, con, dex, wis, lck, hp_current)
+       VALUES ('G1', ?, 3, 3, 3, 3, 3, 7)`).run(uid);
+    seedChar('U1'); seedChar('U2');
+    dbHandle.prepare(`INSERT OR REPLACE INTO fights (guild_id, channel_id, state, turn_order, turn_index, phase, hp_state)
+                      VALUES ('G1', 'C1', 'active', '["U1","U2"]', 0, 'attack', '{"U1":7,"U2":7}')`).run();
+
+    // Strict: silence is a timeout, the generic error reply is a throw, and
+    // so is ANYTHING the bot logged to console.error while handling the
+    // press — the listener swallows throws into a log line and a reply.
+    let logged = [];
+    const realErr = console.error;
+    console.error = (...a) => { logged.push(a.map(String).join(' ')); };
+    const silentOrThrew = (r) => {
+      if (!r.replies.length) return 'SILENT';
+      const said = r.replies.map(x => JSON.stringify(x)).join(' ');
+      if (/Something went wrong/.test(said)) return 'THREW';
+      if (logged.length) return `THREW: ${logged[0].slice(0, 90)}`;
+      return null;
+    };
+    const walk = [
+      ['fatk:str  (attack, no target → picker)', { isButton: true, customId: 'fatk:str' }],
+      ['fact:feint (opens target picker)',       { isButton: true, customId: 'fact:feint' }],
+      ['fact:grapple (opens target picker)',     { isButton: true, customId: 'fact:grapple' }],
+      ['fightact:feint select → modal',          { isSelect: true, customId: 'fightact:feint:U1', values: ['U2'] }],
+      ['fightfeint modal → runs the feint',      { isModal: true, customId: 'fightfeint:U2', fields: { claim: 'a lunge at the knee' } }],
+      ['fightact:grapple select → runs it',      { isSelect: true, customId: 'fightact:grapple:U1', values: ['U2'] }],
+      ['fighttarget select → attack lands',      { isSelect: true, customId: 'fighttarget:U1:str:normal:', values: ['U2'] }],
+      ['fdef:dex (defend after that attack)',    { isButton: true, customId: 'fdef:dex', userId: 'U2', keepState: true }],
+      ['fact:maintain (not holding → refusal)',  { isButton: true, customId: 'fact:maintain' }],
+      ['grpfree (not holding → refusal)',        { isButton: true, customId: 'grpfree' }],
+      ['fact:escape (not held → refusal)',       { isButton: true, customId: 'fact:escape' }],
+    ];
+    const broken = [];
+    for (const [label, over] of walk) {
+      // reset to a clean attack phase before each press
+      if (!over.keepState)
+        dbHandle.prepare(`UPDATE fights SET phase='attack', current_target=NULL, effect_state='{}', turn_index=0 WHERE guild_id='G1' AND channel_id='C1'`).run();
+      logged = [];
+      const r = await fire({ ...over, userId: over.userId || 'U1', message: { id: 'M9', content: '', components: [] } });
+      const bad = silentOrThrew(r);
+      if (bad) broken.push(`${label}: ${bad}`);
+      if (VERBOSE) {
+        const first = r.replies[0] || {};
+        const gist = (first.content || (first.modal ? `modal ${first.modal}` : '') || JSON.stringify(first)).replace(/\s+/g, ' ').slice(0, 88);
+        console.log(`      ${label.padEnd(42)} → ${gist}`);
+      }
+    }
+    console.error = realErr;
+    ok(`every fight button answers (${walk.length} presses)`, broken.length === 0, broken.join('\n        '));
   }
 
   report();

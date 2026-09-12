@@ -12236,8 +12236,16 @@ async function routeButton(interaction) {
         // 'hold' is a declaration, not a roll: the hold simply persists, so
         // it says so rather than pretending a die was thrown.
         if (which === 'maintain') return runFightMaintain(interaction);
-        const ACTION_OF = { grapple: 'Grapple', feint: 'Feint', deflect: 'Deflect', disarm: 'Disarm', escape: 'Escape' };
-        return handleFight(interaction, { sub: 'act', action: ACTION_OF[which] });
+        // Grapple needs a target and Feint a target AND a claim, so those two
+        // open pickers; the rest run straight through.
+        if (which === 'grapple' || which === 'feint') return offerAbilityTarget(interaction, which);
+        // Deflect and Disarm answer whoever is attacking right now.
+        let pendingAttacker = null;
+        if (which === 'deflect' || which === 'disarm') {
+          const fP = getFight(interaction.guild.id, interaction.channel.id);
+          if (fP?.state === 'active') pendingAttacker = fightOrder(fP)[fP.turn_index] ?? null;
+        }
+        return handleFight(interaction, { sub: 'act', action: which, targetId: pendingAttacker });
       }
       const map = { fsave: 'save', finsight: 'insight', fresolve: 'resolve', frr: 'rr' };
       return handleFight(interaction, map[interaction.customId]);
@@ -13016,6 +13024,15 @@ client.on('interactionCreate', async interaction => {
         })()] }).catch(() => null);
       return interaction.reply({ ephemeral: true, content: '✅ Sent to the GMs — they\'ll look it over in the Lore Docs approvals.' });
     }
+    if (interaction.customId.startsWith('fightfeint:')) {
+      const targetId = interaction.customId.split(':')[1];
+      const claim = interaction.fields.getTextInputValue('claim').trim();
+      if (!claim) return interaction.reply({ ephemeral: true, content: '\u274C A feint needs a claim.' });
+      // Through handleFight, not straight to the runner: the once-per-fight
+      // rule and the WIS bar live in the branch (audit, 2026-09-12).
+      return handleFight(interaction, { sub: 'act', action: 'feint', targetId, feintText: claim });
+    }
+
     if (interaction.customId.startsWith('fbm:') || interaction.customId.startsWith('fbq:')) {
       const isQuest = interaction.customId.startsWith('fbq:');
       // fbm:<room>:<run>  from the picker;  fbq:<run>  from a completion.
@@ -13082,6 +13099,24 @@ client.on('interactionCreate', async interaction => {
     );
     return interaction.showModal(m);
   }
+  if (interaction.isStringSelectMenu?.() && interaction.customId.startsWith('fightact:')) {
+    const [, which, actorId] = interaction.customId.split(':');
+    if (interaction.user.id !== actorId) return interaction.reply({ ephemeral: true, content: '\u274C That picker is not yours.' });
+    const targetId = interaction.values[0];
+    if (which === 'grapple') {
+      const gidA = interaction.guild.id, cidA = interaction.channel.id;
+      // No update() here: the runner replies itself, and a second
+      // acknowledgement would throw. Its reply is public; the ephemeral
+      // picker simply stays behind for the one who used it.
+      return runFightGrapple({ interaction, gid: gidA, cid: cidA, actorId, targetId, mode: 'normal', flavour: null });
+    }
+    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: MR } = require('discord.js');
+    const m = new ModalBuilder().setCustomId(`fightfeint:${targetId}`).setTitle('The feint');
+    m.addComponents(new MR().addComponents(new TextInputBuilder().setCustomId('claim')
+      .setLabel('What do you pretend to do?').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(200)));
+    return interaction.showModal(m);
+  }
+
   if (interaction.isStringSelectMenu?.() && interaction.customId.startsWith('fighttarget:')) {
     try {
       const [, actorId, stat, mode, flavEnc] = interaction.customId.split(':');
@@ -16906,6 +16941,9 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
       upsertFight(gid, cid, {
         phase: 'defend', current_target: targetId,
         atk_roll: total, atk_nat: nat, atk_stat: stat, atk_mode: mode, atk_sides: 20,
+      // A plain strike is a plain strike: never inherit a stale grapple/feint
+      // kind from an earlier attempt (probe, 2026-09-12).
+      atk_kind: null,
         def_roll: ac, def_nat: 0, def_stat: 'ac', def_mode: 'normal',
         atk_rerolled: 0, def_rerolled: 0,
       });
@@ -16931,6 +16969,9 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     upsertFight(gid, cid, {
       phase: 'defend', current_target: targetId,
       atk_roll: total, atk_nat: nat, atk_stat: stat, atk_mode: mode, atk_sides: 20,
+      // A plain strike is a plain strike: never inherit a stale grapple/feint
+      // kind from an earlier attempt (probe, 2026-09-12).
+      atk_kind: null,
       def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
       atk_rerolled: 0, def_rerolled: 0,
     });
@@ -17770,7 +17811,13 @@ function fightAnswerRows(kind, { forNpc = false, held = false } = {}) {
   const rr = B('frr', '🔁 Reroll', ButtonStyle.Secondary);
   if (kind === 'def') return [
     new ActionRowBuilder().addComponents(B('fdef:str', '💪 STR'), B('fdef:con', '🫀 CON'), B('fdef:dex', '⚡ DEX'), B('fdef:wis', '🧠 WIS'), B('fdef:lck', '🍀 LCK')),
-    new ActionRowBuilder().addComponents(rr)];
+    new ActionRowBuilder().addComponents(rr),
+    // Deflect and Disarm ANSWER an NPC's attack, so they live with the
+    // defence, not the attack (moved 2026-09-12; on your own attack turn
+    // they could only refuse).
+    new ActionRowBuilder().addComponents(
+      B('fact:deflect', '\u{1F6E1}\uFE0F Deflect', ButtonStyle.Secondary),
+      B('fact:disarm', '\u2694\uFE0F Disarm', ButtonStyle.Secondary))];
 // The attacker's turn had no buttons at all until now — you could answer
   // a blow by tapping but never throw one (T, 2026-08-22). Same five stats,
   // same shape; the target is asked for by the picker the press opens.
@@ -17783,9 +17830,7 @@ function fightAnswerRows(kind, { forNpc = false, held = false } = {}) {
       // Someone already in a hold has no free hands to start one (T,
       // 2026-08-22) — the rest they may still attempt, at a flat d20.
       ...(held ? [] : [B('fact:grapple', '\u{1F93C} Grapple', ButtonStyle.Secondary)]),
-      B('fact:feint', '\u{1F300} Feint', ButtonStyle.Secondary),
-      B('fact:deflect', '\u{1F6E1}\uFE0F Deflect', ButtonStyle.Secondary),
-      B('fact:disarm', '\u2694\uFE0F Disarm', ButtonStyle.Secondary)])];
+      B('fact:feint', '\u{1F300} Feint', ButtonStyle.Secondary)])];
   // A held fighter, on their own turn: keep the hold or let it go. Escape
   // belongs to the captive, so it is offered on their turn instead.
   if (kind === 'hold') return [new ActionRowBuilder().addComponents(
@@ -17799,10 +17844,39 @@ function fightAnswerRows(kind, { forNpc = false, held = false } = {}) {
   return [];
 }
 
+// A grapple or feint pressed from a button has no target yet. Offer the
+// other fighters; a feint then asks for the claim in a modal.
+async function offerAbilityTarget(interaction, which) {
+  const gid = interaction.guild.id, cid = interaction.channel.id, uid = interaction.user.id;
+  const fight = getFight(gid, cid);
+  if (!fight || fight.state !== 'active') return interaction.reply({ ephemeral: true, content: NO_ACTIVE_FIGHT });
+  const order = fightOrder(fight);
+  const hp = fightHp(fight), floor = fightFloor(fight);
+  const opts = [];
+  for (const fid of order) {
+    if (fid === uid) continue;
+    if (hp[fid] !== undefined && hp[fid] <= floor) continue;
+    const F = await resolveFighter(interaction.guild, gid, fid).catch(() => null);
+    if (F) opts.push({ label: `${F.name}${F.isNpc ? ' (NPC)' : ''}`.slice(0, 100), value: fid });
+  }
+  if (!opts.length) return interaction.reply({ ephemeral: true, content: '\u274C Nobody left to target.' });
+  const { ActionRowBuilder: PR, StringSelectMenuBuilder: PS } = require('discord.js');
+  const menu = new PS().setCustomId(`fightact:${which}:${uid}`).setPlaceholder(which === 'feint' ? 'Feint at whom?' : 'Grapple whom?')
+    .addOptions(opts.slice(0, 25));
+  return interaction.reply({ ephemeral: true, content: which === 'feint'
+    ? '\u{1F300} Pick your mark \u2014 then you will be asked what you pretend to do.'
+    : '\u{1F93C} Pick who you are grabbing.', components: [new PR().addComponents(menu)] });
+}
+
 async function handleFight(interaction, forced) {
   let sub = (forced && typeof forced === 'object') ? forced.sub : (forced ?? interaction.options?.getSubcommand?.());
-  if (sub === 'act') sub = interaction.options?.getString?.('action');
-  if (sub === 'feint' && !interaction.options?.getString?.('feint')) {
+  // A button press carries the action on `forced`; a slash command on the
+  // option. Reading only the option left every ability button silent —
+  // "DDice didn't respond in time" (T's screenshot, 2026-09-12).
+  if (sub === 'act') sub = (forced && typeof forced === 'object' && forced.action)
+    ? String(forced.action).toLowerCase()
+    : interaction.options?.getString?.('action');
+  if (sub === 'feint' && !interaction.options?.getString?.('feint') && !(forced && typeof forced === 'object' && forced.feintText)) {
     return interaction.reply({ content: '❌ A feint needs `feint:` — what you pretend to do.', ephemeral: true });
   }
   const gid = interaction.guild.id;
@@ -18566,7 +18640,10 @@ async function handleFight(interaction, forced) {
 
     if (fight.phase !== 'attack') return interaction.reply({ content: '❌ Waiting for defender to roll first.', ephemeral: true });
 
-    const stat = interaction.options?.getString?.('stat');
+    // A stat button carries its stat on `forced`; the slash command on the
+    // option. The defence branch honoured this; the attack branch did not,
+    // so every attack button swung with no stat (probe, 2026-09-12).
+    const stat = ((forced && typeof forced === 'object') ? forced.stat : null) ?? interaction.options?.getString?.('stat');
     const targetUser = interaction.options?.getUser?.('target');
     const targetNpc = interaction.options?.getString?.('target_npc');
     const flavour = interaction.options?.getString?.('flavour') ?? null;
@@ -18723,11 +18800,12 @@ async function handleFight(interaction, forced) {
       if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can act as an NPC.', ephemeral: true });
       actorId = npcFighterId(npcActAs);
     }
+    const forcedTarget = (forced && typeof forced === 'object') ? forced.targetId : null;
     const tUser = interaction.options?.getUser?.('target');
     const tNpc = interaction.options?.getString?.('target_npc');
-    if (!tUser && !tNpc) return interaction.reply({ content: '❌ Name a target — `target:@player` or `target_npc:Name`.', ephemeral: true });
-    const targetId = tNpc ? npcFighterId(tNpc) : tUser.id;
-    const feintText = interaction.options?.getString?.('feint');
+    if (!forcedTarget && !tUser && !tNpc) return interaction.reply({ content: '❌ Name a target — `target:@player` or `target_npc:Name`.', ephemeral: true });
+    const targetId = forcedTarget || (tNpc ? npcFighterId(tNpc) : tUser.id);
+    const feintText = ((forced && typeof forced === 'object') ? forced.feintText : null) || interaction.options?.getString?.('feint');
     const mode = interaction.options?.getString?.('roll') || 'normal';
     const flavour = interaction.options?.getString?.('flavour');
     return runFightFeint({ interaction, gid, cid, actorId, targetId, feintText, mode, flavour });
@@ -18765,10 +18843,11 @@ async function handleFight(interaction, forced) {
       if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can act as an NPC.', ephemeral: true });
       actorId = npcFighterId(npcActAs);
     }
+    const forcedTarget = (forced && typeof forced === 'object') ? forced.targetId : null;
     const tUser = interaction.options?.getUser?.('target');
     const tNpc = interaction.options?.getString?.('target_npc');
-    if (!tUser && !tNpc) return interaction.reply({ content: '❌ Name a target — `target:@player` or `target_npc:Name`.', ephemeral: true });
-    const targetId = tNpc ? npcFighterId(tNpc) : tUser.id;
+    if (!forcedTarget && !tUser && !tNpc) return interaction.reply({ content: '❌ Name a target — `target:@player` or `target_npc:Name`.', ephemeral: true });
+    const targetId = forcedTarget || (tNpc ? npcFighterId(tNpc) : tUser.id);
     const mode = interaction.options?.getString?.('roll') || 'normal';
     const flavour = interaction.options?.getString?.('flavour');
     return runFightGrapple({ interaction, gid, cid, actorId, targetId, mode, flavour });
@@ -20080,7 +20159,7 @@ const HELP_CATEGORIES = {
       '`/fight hp value:N target:@a` / `target_npc:Orc` — set HP mid-fight, sheet synced (GM)',
       '`/fight kick target:@a` / `target_npc:Orc` — remove a fighter, fight continues (GM)',
       '`/fight add user:@a [where:Next|Last]` \u2014 bring a player into a running fight: HP from their sheet, placed straight after this turn or at the end (GM)',
-      '_On your turn the bot offers buttons: the five stats to attack with, then Grapple \u00b7 Feint \u00b7 Deflect \u00b7 Disarm. Holding someone adds Maintain the hold (an opposed STR roll) and Release; being held adds Break free._',
+      '_On your turn the bot offers buttons: the five stats to attack with, then Grapple and Feint (each asks whom; Feint then asks what you pretend). When an NPC attacks you, the defence row adds Deflect and Disarm. Holding someone adds Maintain the hold (an opposed STR roll) and Release; being held adds Break free._',
       '`/fight auto mode:Full teams:@a @b vs Goblin, Orc` — party-vs-monsters sides (GM)',
       'NPC lists accept `category:Name` to add a whole category at once',
       'When a fight ends a public 🏁 result posts in the channel — victor, everyone\'s final HP, and a 📜 recap',
