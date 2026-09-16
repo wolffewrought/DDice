@@ -1026,13 +1026,17 @@ function testBuilders(src) {
     // A GM writing as the bot: always says who it is, and the audit book
     // keeps the attribution even when the message does not.
     // (rewritten 2026-08-22: T asked for /dd to speak in the room, not in DMs.)
-    ok('/dd speaks in a channel and keeps the sender in the audit only',
+    // (rewritten 2026-09-13: plain by default \u2014 no header unless written,
+    // no NPC voice at all, and as many channels as the GM names.)
+    ok('/dd is plain by default and speaks in every channel named',
       /async function handleDd\(interaction\)/.test(src) &&
-      /const where = interaction\.options\.getChannel\('channel'\) \|\| interaction\.channel;/.test(src) &&
-      /\\u\{1F4EC\} DD \\u2014 \*\*\$\{gmName\}\*\* in <#\$\{where\.id\}>/.test(src) &&
-      !/user\.send\(\{ content: \[head/.test(src));
-    ok('/dd is GM-only and refuses an unknown NPC voice',
-      /Only GMs can speak as the bot/.test(src) && /No NPC called \*\*\$\{asNpc\}\*\*/.test(src));
+      /setName\('header'\)\.setDescription\('A bold line above it/.test(src) &&
+      /header \? `\*\*\$\{header\}\*\*` : null,/.test(src) &&
+      /const ids = \[\.\.\.raw\.matchAll\(\/<#\(\\d\+\)>\|\\b\(\\d\{15,22\}\)\\b\/g\)\]/.test(src) &&
+      /\\u\{1F4EC\} DD \\u2014 \*\*\$\{gmName\}\*\* in \$\{said\.join\(' '\)/.test(src) &&
+      !/setName\('as'\)\.setDescription\('Speak as an NPC/.test(src));
+    ok('/dd is GM-only',
+      /Only GMs can speak as the bot/.test(src));
     // Temporary targets: no sheet, no roster, no HP — the GM's verdict is
     // the death check, asked in-channel or in the GM channel with `secret`.
     // Schema ordering: an ALTER above its own CREATE fails into its catch

@@ -326,6 +326,93 @@ place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
 
+## 9u · /dd, plain (2026-09-13, pushed 2026-09-16)
+
+T's three changes. `/dd message: [header:] [user:] [channels:]` — no
+header unless the GM writes one (bold, above the words); the NPC voice and
+its autocomplete removed entirely (`/npc say` remains the tool for a
+faced character); `channels:` takes any number of channel mentions and
+posts to each, replying with where it landed and where it could not.
+Blank means the current channel. In-room the message is now ONLY the
+words typed — anonymous — while the roll-audit still records the GM, the
+rooms and the header. Help and books updated; pins rewritten.
+
+## 9t · The fight walk: behaviour, not presence (2026-09-12)
+
+T's criticism, and it was right: 'the parameters grow for checks but
+simple stuff keeps falling through.' The assertion count measures
+PRESENCE — regexes proving code exists. The last four bugs were all
+BEHAVIOUR: a value never read, a double acknowledgement, a path skipping
+a branch, a null stat. No presence check can see those. Only pressing the
+buttons can.
+
+So probe.js now walks a fight for real: two seeded characters, a seeded
+active fight, and ELEVEN presses through the genuine interactionCreate
+handler — attack button, the target picker it opens, the defence that
+answers, both ability pickers, the feint modal, the grapple select, and
+the hold/release/escape refusals. Strict detector: silence is a timeout,
+the generic error reply is a throw, and so is ANYTHING logged to
+console.error during the press (the listener swallows throws into a log
+line, which is how the first version of this walk passed a broken press).
+`-v` prints what each press actually said, so a refusal cannot pose as a
+success.
+
+ON ITS FIRST HONEST RUN IT FOUND TWO MORE BUGS in the same day's code:
+(1) the attack branch never read forced.stat — only the defence branch
+did — so every STR/CON/DEX/WIS/LCK attack button would have swung with no
+stat, and its picker encoded 'stat:null'; (2) a plain attack never set
+atk_kind, so it INHERITED a stale grapple kind and the defender was told
+to Save against a grapple that was not one. Both fixed and pinned.
+
+The lesson generalises: the static pins are a floor, not a ceiling. Every
+button family the bot gains should get a walk here on the day it is
+built. Baseline re-saved at 982 / 14.
+
+## 9s · Audit of the ability-button fix (2026-09-12)
+
+Two real findings in code written hours earlier, both from reading the
+paths end to end rather than trusting green.
+
+1. The grapple picker called `interaction.update()` to close itself and
+THEN handed off to runFightGrapple, which replies — a second
+acknowledgement, which throws. The attack picker avoids exactly this.
+Removed the update; the runner's reply is public and the ephemeral
+picker simply stays behind for the one who used it.
+
+2. The feint modal called runFightFeint DIRECTLY, bypassing two rules the
+slash branch enforces: one feint per fight, and the WIS bar to attempt
+one. It now routes through handleFight with `forced.feintText`, and the
+early 'a feint needs feint:' guard accepts the forced claim. The grapple
+select was checked the same way and is safe — its branch holds no rules
+of its own; all thirteen guards live in the runner.
+
+Standing rule, now twice-learned: a button path must pass through the
+SAME branch as the command, never straight to the runner, or the rules
+that branch holds are silently skipped. Both pinned. Warnings 19,
+unchanged and all documented.
+
+## 9r · The ability buttons did nothing (2026-09-12, live)
+
+T pressed Feint: 'DDice didn't respond in time'. Cause in handleFight's
+third line: `if (sub === 'act') sub = interaction.options?.getString?.
+('action')` — a button press has no `options`, so `sub` became undefined,
+nothing matched, and the interaction timed out. My `forced.action` was
+never read. Every one of the four ability buttons was dead on arrival.
+
+Fixed three ways. (1) handleFight reads `forced.action` first. (2) A press
+carries no target, so Grapple and Feint open an ephemeral picker of the
+other fighters (`fightact:<which>:<actor>`); Grapple runs on selection,
+Feint opens a modal for the claim (`fightfeint:<target>`) and runs on
+submit. (3) Deflect and Disarm ANSWER an NPC's attack — on your own attack
+turn they could only refuse — so they moved to the defence row and their
+press names the pending attacker as its target; the three target-reading
+branches now honour `forced.targetId`.
+
+Lesson recorded: a button that calls a slash handler must supply EVERY
+option that handler reads, or the handler must read `forced` for each.
+The stat buttons worked only because `forced.stat` had been threaded by
+hand. Pinned on the dispatch, the picker, the modal and the row split.
+
 ## 9q · Turn buttons made universal (2026-09-12, live)
 
 T: no Maintain/Release on the grappler's turn. Cause: the announcer put

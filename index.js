@@ -6694,9 +6694,9 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
   new SlashCommandBuilder()
     .setName('dd').setDescription('Speak as the bot \u2014 keeps the game separate from you (GM)')
     .addStringOption(o=>o.setName('message').setDescription('What to say').setRequired(true))
-    .addStringOption(o=>o.setName('as').setDescription('Speak as an NPC instead of the GMs').setRequired(false).setAutocomplete(true))
+    .addStringOption(o=>o.setName('header').setDescription('A bold line above it \u2014 blank for none').setRequired(false))
     .addUserOption(o=>o.setName('user').setDescription('Someone to address by name').setRequired(false))
-    .addChannelOption(o=>o.setName('channel').setDescription('Somewhere other than here').setRequired(false)),
+    .addStringOption(o=>o.setName('channels').setDescription('Where to say it \u2014 #one #two #three; blank means here').setRequired(false)),
 ];
 
 // ─────────────────────────────────────────────
@@ -12644,13 +12644,6 @@ client.on('interactionCreate', async interaction => {
           .filter(c => !v || c.name.toLowerCase().includes(v))
           .slice(0, 25)).catch(() => {});
       }
-      if (interaction.commandName === 'dd' && focusedOption.name === 'as') {
-        const v = String(focusedOption.value || '').toLowerCase();
-        return await interaction.respond(getAllNpcs(interaction.guild.id)
-          .filter(n => !v || n.name.toLowerCase().includes(v))
-          .slice(0, 25).map(n => ({ name: n.name.slice(0, 100), value: n.name })))
-          .catch(() => {});
-      }
       if (interaction.commandName === 'gm' && (focusedOption.name === 'npc' || focusedOption.name === 'npcs')) {
         const v = String(focusedOption.value).toLowerCase();
         const choices = [{ name: 'all', value: 'all' },
@@ -16299,40 +16292,49 @@ async function handleTitles(interaction, group) {
 // always says who it is — the Game Masters, or a named NPC — and never
 // pretends to be the player's friend.
 async function handleDd(interaction) {
-  // Speaking AS the bot, in the room (T, 2026-08-22). The point is still
-  // separation — when a GM also plays a character, words from their own
-  // account blur the two — but the words belong in the scene, not in a DM.
+  // Speaking AS the bot, in the room. Plain by default: no header, no
+  // voice, just the words \u2014 a header only if the GM writes one, and as
+  // many channels as they name (T, 2026-09-13).
   const gid = interaction.guild.id;
   if (!(await isGm(interaction.guild, interaction.user.id)))
     return interaction.reply({ content: '\u274C Only GMs can speak as the bot.', ephemeral: true });
   const message = interaction.options.getString('message').trim();
-  const asNpc = (interaction.options.getString('as') || '').trim();
+  const header = (interaction.options.getString('header') || '').trim().slice(0, 100);
   const target = interaction.options.getUser('user');
-  const where = interaction.options.getChannel('channel') || interaction.channel;
-  if (asNpc && !getNpc(gid, asNpc))
-    return interaction.reply({ ephemeral: true, content: `\u274C No NPC called **${asNpc}**.` });
-  if (!where?.send) return interaction.reply({ ephemeral: true, content: '\u274C I cannot speak there.' });
+  const raw = (interaction.options.getString('channels') || '').trim();
 
-  const npc = asNpc ? getNpc(gid, asNpc) : null;
-  const head = npc ? `\u{1F3AD} **${npc.name}**` : '\u{1F4DC} **The Game Masters**';
+  // Channels: mentions (<#id>) or bare ids; nothing named means here.
+  const ids = [...raw.matchAll(/<#(\d+)>|\b(\d{15,22})\b/g)].map(m => m[1] || m[2]);
+  const wanted = ids.length ? [...new Set(ids)] : [interaction.channel?.id].filter(Boolean);
+  const rooms = [];
+  for (const id of wanted) {
+    const ch = await interaction.client.channels.fetch(id).catch(() => null);
+    if (ch?.send && ch.guildId === gid) rooms.push(ch);
+  }
+  if (!rooms.length) return interaction.reply({ ephemeral: true, content: '\u274C None of those are channels I can speak in.' });
+
   const body = [
-    target ? `${head} \u2014 <@${target.id}>` : head,
-    '',
+    header ? `**${header}**` : null,
+    target ? `<@${target.id}>` : null,
     message.slice(0, 1800),
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 
-  const sent = await where.send({ content: body,
-    allowedMentions: target ? { users: [target.id] } : { parse: [] } }).catch(() => null);
+  const said = [], failed = [];
+  for (const ch of rooms) {
+    const ok2 = await ch.send({ content: body, allowedMentions: target ? { users: [target.id] } : { parse: [] } })
+      .then(() => true).catch(() => false);
+    (ok2 ? said : failed).push(`<#${ch.id}>`);
+  }
 
-  // Who said it is kept in the audit book, never in the room \u2014 the whole
-  // point is that the table hears the game, not the person running it.
+  // Who said it lives in the audit book, never in the room.
   const gmName = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'a GM');
   sendRollAudit(interaction.client, gid,
-    `\u{1F4EC} DD \u2014 **${gmName}** in <#${where.id}>${npc ? ` as **${npc.name}**` : ''}: ${message.slice(0, 120)}${message.length > 120 ? '\u2026' : ''}`);
+    `\u{1F4EC} DD \u2014 **${gmName}** in ${said.join(' ') || '(nowhere)'}${header ? ` \u00b7 header \u201c${header}\u201d` : ''}: ${message.slice(0, 120)}${message.length > 120 ? '\u2026' : ''}`);
 
-  return interaction.reply({ ephemeral: true, content: sent
-    ? `\u2705 Said in <#${where.id}>${npc ? ` as **${npc.name}**` : ''}.`
-    : '\u274C I could not post there \u2014 check my permissions in that channel.' });
+  return interaction.reply({ ephemeral: true, content: [
+    said.length ? `\u2705 Said in ${said.join(', ')}.` : '',
+    failed.length ? `\u274C Could not post in ${failed.join(', ')} \u2014 check my permissions there.` : '',
+  ].filter(Boolean).join('\n') });
 }
 async function handleTarget(interaction) {
   const gid = interaction.guild.id;
@@ -20405,7 +20407,7 @@ const HELP_CATEGORIES = {
       '`/button roll stat:dex dc:12 reason:...` \u2014 plant a check anyone may press; `dice:2d6+1` instead of a stat, `for:@a` to address one person, `once:true` for one press each',
       '`/button group stat:wis dc:12 reason:...` \u2014 one check the whole party rolls; the message keeps the tally and \u2696\uFE0F Call it closes it with how many got through (GM)',
       '`/target create name:Barricade stat:str dc:12` \u2014 something to strike, with no sheet; each hit asks the GM \u{1FAA6} It falls / \u{1F6E1}\uFE0F It holds; `secret:true` asks in the GM log instead \u00b7 `/target list`',
-      '`/dd message:... [as:NPC] [user:@a] [channel:#x]` \u2014 speak AS THE BOT in the room, as the Game Masters or a named NPC; who said it goes to the roll-audit, not the room (GM)',
+      '`/dd message:... [header:] [user:@a] [channels:#one #two]` \u2014 speak AS THE BOT: plain words by default, a bold header only if you write one, in every channel you name (or here); who said it goes to the roll-audit, not the room (GM)',
       '`/feedback send [quest:]` \u2014 pick a room, score it out of ten, say your piece; only GMs see it. Name one of your own runs and the card says which',
       '`/feedback category add|remove|list` \u2014 the rooms feedback lands in (GM) \u00b7 `/button feedback` plants a standing feedback button',
       '_A completed run posts its own \u{1F4DD} review button in its thread; `/quest run show` then carries the count, the average \u2b50 and the latest lines._',
