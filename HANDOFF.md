@@ -326,6 +326,56 @@ place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
 
+## 9w · The seat override (2026-09-25)
+
+T: a GM's explicit add should be able to override one-quest-at-a-time,
+with a double confirm so it cannot be a mistake. On a clash, approve now
+replies with the clash named and two buttons — 'Seat them anyway'
+(danger) and Cancel — instead of a flat refusal. The press replays the
+same approve with `forced.overrideSeat`, so spin-off, staging and
+announcements all happen as normal, and the roll-audit records who
+overrode whom onto what. /instance add inherits it, being approve by
+another name.
+
+Caught before shipping, by re-reading against the 09-12 lesson: my first
+cut called update() on the prompt and THEN handed to approve, whose bare
+interaction.reply would have thrown on the second acknowledgement.
+Removed; walked under the harness (prompt, press, row present). 19
+probes.
+
+## 9v · Encounters and campaigns (2026-09-24)
+
+Planned first, built to T's decisions: encounters do NOT count toward one
+quest at a time; an idle encounter is never ended for the GM — the room is
+reminded with a GM ping every six quiet hours; campaign threads are
+GM-only; a completion title for campaigns is undecided and left off.
+
+DESIGN: no new machinery. An encounter is a quests row with kind=
+'encounter' — created and started in one command, run_channel/thread set
+to where it was called, party seated from `players:` plus an encjoin/
+encleave button pair — so timelines, noteQuestActivity, chronicles,
+rewards, reviews, winddown and rests all work untouched. `/encounter end`
+is literally the ordinary completion via forced {sub:'complete', number,
+summary, title}; requireQuest and the completion reads now honour forced
+values. A campaign is the umbrella above listings: `campaigns` and
+`campaign_notes` tables, quests.campaign_id (one campaign per quest; a
+listing's runs follow it), a GM-only `campaigns` forum in SETUP_PLAN with
+one thread per campaign carrying a live card (premise, situation,
+entries with status, participants, merits paid, latest notes), refreshed
+on every change and by the mender. An encounter started inside a
+campaign run's thread joins the campaign unasked. Players get a public
+view of `/campaign show`. Roster marks encounters distinctly.
+
+THE PROBE EARNED ITS KEEP AGAIN: the button-reach probe caught me
+admitting encjoin/encleave into the FIGHT gate, where nothing handled
+them — a silent drop, 'didn't respond in time' in production. Fixed
+before it ever shipped. A new encounter walk (create campaign, start,
+join, show, end) runs under the harness end to end; fake members are
+now admins so GM paths can be walked. 17 probes.
+
+Ordering pin also fired correctly: I had put the two new CREATE TABLEs
+below the ALTER block; moved into the schema block.
+
 ## 9u · /dd, plain (2026-09-13, pushed 2026-09-16)
 
 T's three changes. `/dd message: [header:] [user:] [channels:]` — no

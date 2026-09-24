@@ -187,6 +187,16 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS group_check_rolls (
   total INTEGER NOT NULL, nat INTEGER, passed INTEGER, at INTEGER NOT NULL,
   PRIMARY KEY (guild_id, message_id, user_id)
 )`); } catch (e) { console.error('group_check_rolls schema', e); }
+try { db.exec(`CREATE TABLE IF NOT EXISTS campaigns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT, situation TEXT,
+  gm_id TEXT, status TEXT NOT NULL DEFAULT 'active',
+  thread_id TEXT, card_msg_id TEXT, created_at INTEGER NOT NULL, completed_at INTEGER
+)`); } catch (e) { console.error('campaigns schema', e); }
+try { db.exec(`CREATE TABLE IF NOT EXISTS campaign_notes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL, campaign_id INTEGER NOT NULL, text TEXT NOT NULL, by_id TEXT, at INTEGER NOT NULL
+)`); } catch (e) { console.error('campaign_notes schema', e); }
 
 try { db.exec(`CREATE TABLE IF NOT EXISTS button_presses (
   guild_id TEXT NOT NULL, message_id TEXT NOT NULL, user_id TEXT NOT NULL,
@@ -724,6 +734,15 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN quest_log_gm TEXT'); } catch 
 // over, the GM is still deciding rewards, and the party should be resting
 // while they wait rather than bleeding on the books.
 try { db.exec('ALTER TABLE quests ADD COLUMN winding_down INTEGER DEFAULT 0'); } catch {}
+// Encounters and campaigns (T, 2026-09-24). An encounter IS a quest row —
+// kind='encounter', no listing, created and started in one breath — so
+// timelines, chronicles, rewards, reviews and rests all work unchanged. A
+// campaign is the umbrella above listings and encounters alike.
+try { db.exec("ALTER TABLE quests ADD COLUMN kind TEXT DEFAULT 'quest'"); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN campaign_id INTEGER'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN last_activity INTEGER'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN idle_nagged_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN campaign_forum TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_routes TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_cats TEXT'); } catch {}
 try { db.exec('ALTER TABLE char_pages ADD COLUMN inv_msg_id TEXT'); } catch {}
@@ -1144,11 +1163,47 @@ function getQuestMembers(gid, number, state) {
 // a player may put their hand up anywhere — but being SEATED on a run is
 // exclusive: this answers with the quest already holding them, so a GM can
 // see the conflict rather than wonder why an approval did nothing.
+// ── Campaign helpers ────────────────────────────────────────────────
+function getCampaign(gid, id) {
+  return db.prepare('SELECT * FROM campaigns WHERE guild_id=? AND id=?').get(gid, id);
+}
+function findCampaign(gid, raw) {
+  const n = parseInt(raw, 10);
+  if (Number.isFinite(n)) { const c = getCampaign(gid, n); if (c) return c; }
+  const want = String(raw || '').trim().toLowerCase();
+  const all = db.prepare('SELECT * FROM campaigns WHERE guild_id=? ORDER BY id').all(gid);
+  return all.find(c => c.name.toLowerCase() === want)
+      || all.find(c => c.name.toLowerCase().startsWith(want)) || null;
+}
+function campaignEntries(gid, cid) {
+  // Listings and encounters linked directly, plus every run of a linked listing.
+  return db.prepare(`SELECT * FROM quests WHERE guild_id=? AND (campaign_id=?
+                       OR instance_of IN (SELECT number FROM quests WHERE guild_id=? AND campaign_id=?))
+                     ORDER BY number`).all(gid, cid, gid, cid);
+}
+function campaignParticipants(gid, cid) {
+  const ids = new Set();
+  for (const q of campaignEntries(gid, cid))
+    for (const id of getQuestMembers(gid, q.number, 'party')) ids.add(id);
+  return [...ids];
+}
+// The campaign a quest belongs to, directly or through its listing.
+function campaignOfQuest(gid, quest) {
+  if (!quest) return null;
+  if (quest.campaign_id) return getCampaign(gid, quest.campaign_id);
+  if (quest.instance_of) { const root = getQuest(gid, quest.instance_of); if (root?.campaign_id) return getCampaign(gid, root.campaign_id); }
+  return null;
+}
+const isEncounter = (q) => q?.kind === 'encounter';
+
+// The one-quest rule does not see encounters: they are spontaneous, so a
+// player mid-quest can still be jumped by bandits (T, 2026-09-24).
 function questAlreadyOn(gid, uid, exceptNumber = null) {
   const row = db.prepare(`SELECT q.number, q.name FROM quest_members m
                           JOIN quests q ON q.guild_id = m.guild_id AND q.number = m.number
                           WHERE m.guild_id=? AND m.user_id=? AND m.state='party'
                             AND q.status='active' AND q.number != ?
+                            AND COALESCE(q.kind, 'quest') != 'encounter'
                           LIMIT 1`).get(gid, uid, exceptNumber ?? -1);
   return row || null;
 }
@@ -3262,6 +3317,7 @@ function noteQuestActivity(gid, cid, kind, text, actor = null) {
   for (const q of activeQuestsInChannel(gid, cid)) {
     if (q.paused) continue;               // a paused quest records nothing
     logQuestEvent(gid, q.number, kind, text, actor);
+    if (isEncounter(q)) { try { updateQuest(gid, q.number, { last_activity: Date.now() }); } catch {} }
   }
 }
 
@@ -3269,6 +3325,7 @@ function noteQuestActivity(gid, cid, kind, text, actor = null) {
 // the mark; both counters are stored on the quest, so a redeploy mid-session
 // resumes exactly where it left off rather than restarting the count.
 const QUEST_TICK_MS = 60 * 1000;
+const ENCOUNTER_IDLE_MS = 6 * 3600 * 1000;
 
 async function questTick(client) {
   for (const guild of client.guilds.cache.values()) {
@@ -3278,6 +3335,21 @@ async function questTick(client) {
     for (const q of running) {
       try {
         if (!q.run_channel_id) continue;
+        // An encounter left running holds its party out of rests. It is not
+        // ended for them — a reminder goes to the room, pinging the GMs,
+        // every six hours of silence (T, 2026-09-24).
+        if (isEncounter(q)) {
+          const quiet = Date.now() - (Number(q.last_activity) || Number(q.started_at) || Date.now());
+          const nagged = Number(q.idle_nagged_at) || 0;
+          if (quiet >= ENCOUNTER_IDLE_MS && Date.now() - nagged >= ENCOUNTER_IDLE_MS) {
+            const room = await client.channels.fetch(q.run_thread_id || q.run_channel_id).catch(() => null);
+            const gmRoles = getGmRoleIds(guild.id);
+            if (room?.send) await room.send({ allowedMentions: { roles: gmRoles },
+              content: `\u23F3 **${questTag(q)}** has been quiet for ${Math.round(quiet / 3600000)}h ${gmRoles.map(r => `<@&${r}>`).join(' ')} \u2014 \`/encounter end\` when it is done, or it keeps holding its party out of rests.` }).catch(() => {});
+            updateQuest(guild.id, q.number, { idle_nagged_at: Date.now() });
+          }
+          continue;   // encounters have no recap/reminder clock of their own
+        }
         const now = questElapsed(q);
 
         // Hourly recap first — it also satisfies the quarter-hour mark, so the
@@ -6541,7 +6613,8 @@ const slashCommands = [
         .addChoices({name:'⚙️ Mechanics-focused',value:'mechanics'},{name:'🎭 Roleplay-focused',value:'rp'},
                     {name:'⚖️ Mixed elements',value:'mixed'},{name:'⚔️ Combat-heavy',value:'combat'},
                     {name:'🧩 Puzzle & investigation',value:'puzzle'},{name:'🗺️ Sandbox — led by the players',value:'sandbox'}))
-      .addIntegerOption(o=>o.setName('from').setDescription('Copy fields from an existing quest as a fresh draft').setRequired(false).setAutocomplete(true)))
+      .addIntegerOption(o=>o.setName('from').setDescription('Copy fields from an existing quest as a fresh draft').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('campaign').setDescription('Part of a campaign').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('edit').setDescription('Edit a quest — bare opens a prefilled window; numeric options apply directly (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('merit_reward').setDescription('Merits each member earns on completion').setRequired(false).setMinValue(0).setMaxValue(999))
@@ -6697,6 +6770,41 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
     .addStringOption(o=>o.setName('header').setDescription('A bold line above it \u2014 blank for none').setRequired(false))
     .addUserOption(o=>o.setName('user').setDescription('Someone to address by name').setRequired(false))
     .addStringOption(o=>o.setName('channels').setDescription('Where to say it \u2014 #one #two #three; blank means here').setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName('encounter').setDescription('A short session run on the fly \u2014 no board, no applications (GM)')
+    .addSubcommand(s=>s.setName('start').setDescription('Begin one here, right now (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('What is happening').setRequired(true))
+      .addStringOption(o=>o.setName('players').setDescription('Who is in it \u2014 @mentions; others may press Join').setRequired(false))
+      .addIntegerOption(o=>o.setName('merits').setDescription('Merits each at the end').setRequired(false).setMinValue(0))
+      .addStringOption(o=>o.setName('campaign').setDescription('Part of a campaign').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('end').setDescription('Finish it \u2014 payout, chronicle, review button (GM)')
+      .addStringOption(o=>o.setName('summary').setDescription('Your telling of it').setRequired(false))
+      .addStringOption(o=>o.setName('title').setDescription('A title every survivor earns').setRequired(false)))
+    .addSubcommand(s=>s.setName('list').setDescription('Encounters running right now')),
+  new SlashCommandBuilder()
+    .setName('campaign').setDescription('The long arc \u2014 quests, mini-quests and encounters under one name (GM)')
+    .addSubcommand(s=>s.setName('create').setDescription('Name a new campaign (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('The campaign').setRequired(true))
+      .addStringOption(o=>o.setName('description').setDescription('The player-facing premise').setRequired(false)))
+    .addSubcommand(s=>s.setName('add').setDescription('Link a quest or encounter to a campaign (GM)')
+      .addStringOption(o=>o.setName('campaign').setDescription('Which campaign').setRequired(true).setAutocomplete(true))
+      .addIntegerOption(o=>o.setName('quest').setDescription('Quest or encounter number').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('remove').setDescription('Unlink a quest or encounter (GM)')
+      .addIntegerOption(o=>o.setName('quest').setDescription('Quest or encounter number').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('note').setDescription('An arc-level beat between runs (GM)')
+      .addStringOption(o=>o.setName('campaign').setDescription('Which campaign').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('text').setDescription('What happened').setRequired(true)))
+    .addSubcommand(s=>s.setName('status').setDescription('Where things stand \u2014 the present, not the history (GM)')
+      .addStringOption(o=>o.setName('campaign').setDescription('Which campaign').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('text').setDescription('The current situation').setRequired(true)))
+    .addSubcommand(s=>s.setName('show').setDescription('The arc \u2014 players see the public parts, GMs everything')
+      .addStringOption(o=>o.setName('campaign').setDescription('Which campaign').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('list').setDescription('Every campaign'))
+    .addSubcommand(s=>s.setName('recap').setDescription('A previously-on across every linked run (GM)')
+      .addStringOption(o=>o.setName('campaign').setDescription('Which campaign').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('complete').setDescription('Close the arc (GM)')
+      .addStringOption(o=>o.setName('campaign').setDescription('Which campaign').setRequired(true).setAutocomplete(true))),
 ];
 
 // ─────────────────────────────────────────────
@@ -10901,6 +11009,8 @@ const SETUP_PLAN = [
     about: 'The full record of a death — cause, deeds and standing — for GMs.' },
   { key: 'backup_channel_id',     name: 'backups',          forum: false, gm: true,  essential: false,
     about: 'Where the nightly backup of everything is posted.' },
+  { key: 'campaign_forum', name: 'campaigns', forum: true, gm: true, essential: false,
+    about: 'One thread per campaign \u2014 GM eyes only; the arc, its linked runs, and where things stand.' },
   { key: 'feedback_routes', json: 'forum', name: 'gm-feedback', forum: true, gm: true, essential: false,
     about: 'Player feedback, one thread per category \u2014 GM eyes only; players post with `/feedback send`.' },
   { key: 'gm_char_forum',         name: 'gm-character-sheets', forum: true, gm: true, essential: false,
@@ -12316,6 +12426,22 @@ async function routeButton(interaction) {
     // filed under modal traffic, so presses timed out unacknowledged
     // ("didn't respond in time", live 2026-08-14). Their modals
     // (loredocm/loredonm) stay in the modal lane where they belong.
+    if (interaction.customId.startsWith('seatover:') || interaction.customId === 'seatno') {
+      if (interaction.customId === 'seatno')
+        return interaction.update({ content: '\u2705 Left as they were.', components: [] });
+      if (!(await isGm(interaction.guild, interaction.user.id)))
+        return interaction.reply({ ephemeral: true, content: '\u274C Only a GM can override a seat.' });
+      const [, numS, uidS] = interaction.customId.split(':');
+      // No update() first: the approve replies for itself, and a second
+      // acknowledgement throws (the lesson of 2026-09-12). Its reply is a
+      // fresh message; the prompt simply stays behind for the GM who used it.
+      return handleQuest(interaction, { sub: 'approve', group: 'party', number: parseInt(numS, 10), userId: uidS, overrideSeat: true });
+    }
+
+    if (interaction.customId.startsWith('encjoin:') || interaction.customId.startsWith('encleave:')) {
+      return handleEncounterPress(interaction);
+    }
+
     if (interaction.customId === 'grpfree') {
       // Only the holder's own press matters; the release itself is the same
       // path /fight act action:Release takes, so the announcement, the log
@@ -12631,6 +12757,22 @@ client.on('interactionCreate', async interaction => {
 
       // /dd's `as:` names an NPC too — the same list, so a GM never has to
       // remember a spelling the bot could have offered.
+      if (focusedOption.name === 'campaign' && ['campaign', 'encounter', 'quest'].includes(interaction.commandName)) {
+        const v = String(focusedOption.value || '').toLowerCase();
+        const rows = db.prepare("SELECT id, name, status FROM campaigns WHERE guild_id=? ORDER BY status, id").all(interaction.guild.id);
+        return await interaction.respond(rows
+          .filter(c => !v || c.name.toLowerCase().includes(v))
+          .slice(0, 25).map(c => ({ name: `${c.name}${c.status === 'completed' ? ' (completed)' : ''}`.slice(0, 100), value: c.name })))
+          .catch(() => {});
+      }
+      if (interaction.commandName === 'campaign' && focusedOption.name === 'quest') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        const rows = db.prepare(`SELECT * FROM quests WHERE guild_id=? AND (instance_of IS NULL OR COALESCE(kind,'quest')='encounter') ORDER BY number DESC LIMIT 50`).all(interaction.guild.id);
+        return await interaction.respond(rows
+          .map(q => ({ name: `${questTag(q)}${isEncounter(q) ? ' (encounter)' : ''}`.slice(0, 100), value: q.number }))
+          .filter(c => !v || c.name.toLowerCase().includes(v)).slice(0, 25))
+          .catch(() => {});
+      }
       // /feedback send quest: — only the runs THIS player was on, newest
       // first, so the list is a few names rather than the whole board.
       if (interaction.commandName === 'feedback' && focusedOption.name === 'quest') {
@@ -12879,8 +13021,10 @@ client.on('interactionCreate', async interaction => {
     if (interaction.customId.startsWith('questcreate:')) {
       const gidq = interaction.guild.id;
       if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ Only GMs can manage quests.', ephemeral: true });
-      const [, m, p, h, ...styleParts] = interaction.customId.split(':');
+      // campaign rides fifth; the style, which may itself hold ':', is the rest.
+      const [, m, p, h, campSeg, ...styleParts] = interaction.customId.split(':');
       return finishQuestCreate(interaction, gidq, interaction.user.id, {
+        campaign_id: campSeg ? parseInt(campSeg, 10) : null,
         name: interaction.fields.getTextInputValue('name'),
         objectives: interaction.fields.getTextInputValue('objectives') || null,
         lore: interaction.fields.getTextInputValue('lore') || null,
@@ -13219,6 +13363,8 @@ client.on('interactionCreate', async interaction => {
     }
     if (interaction.commandName === 'instance') return await handleInstance(interaction);
     if (interaction.commandName === 'dd') return await handleDd(interaction);
+    if (interaction.commandName === 'encounter') return await handleEncounter(interaction);
+    if (interaction.commandName === 'campaign') return await handleCampaign(interaction);
     if (interaction.commandName === 'target') return await handleTarget(interaction);
     if (interaction.commandName === 'button') return await handleButton(interaction);
     if (interaction.commandName === 'feedback') return await handleFeedback(interaction);
@@ -16291,6 +16437,266 @@ async function handleTitles(interaction, group) {
 // the player is left guessing which one is talking (T, 2026-08-20). This
 // always says who it is — the Game Masters, or a named NPC — and never
 // pretends to be the player's friend.
+// ── Encounters ───────────────────────────────────────────────────────
+// A short session run on the fly. It is a quest row with kind='encounter':
+// no listing, no applications, no staging — created and started in one
+// command, in the channel it is happening in (T, 2026-09-24).
+async function handleEncounter(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const sub = interaction.options.getSubcommand();
+  const gm = await isGm(interaction.guild, uid);
+
+  if (sub === 'list') {
+    const rows = db.prepare("SELECT * FROM quests WHERE guild_id=? AND kind='encounter' AND status='active' ORDER BY number").all(gid);
+    if (!rows.length) return interaction.reply({ ephemeral: true, content: '\u{1F3AF} No encounters are running.' });
+    return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] }, content: [
+      '\u{1F3AF} **Encounters running now**',
+      ...rows.map(q => `\u00b7 **${questTag(q)}** \u2014 ${getQuestMembers(gid, q.number, 'party').length} in it \u00b7 <#${q.run_thread_id || q.run_channel_id}>`),
+    ].join('\n').slice(0, 1900) });
+  }
+  if (!gm) return interaction.reply({ content: '\u274C Only GMs run encounters.', ephemeral: true });
+
+  if (sub === 'start') {
+    const name = interaction.options.getString('name').trim().slice(0, 80);
+    const merits = interaction.options.getInteger('merits') ?? 0;
+    const players = parsePlayerMentions(interaction.options.getString('players'));
+    const campRaw = (interaction.options.getString('campaign') || '').trim();
+    let camp = campRaw ? findCampaign(gid, campRaw) : null;
+    if (campRaw && !camp) return interaction.reply({ ephemeral: true, content: `\u274C No campaign called **${campRaw}**.` });
+    // Started inside a campaign quest's run thread? Then it is part of that
+    // campaign without being told.
+    if (!camp) {
+      const here = db.prepare('SELECT * FROM quests WHERE guild_id=? AND (run_thread_id=? OR run_channel_id=?) LIMIT 1')
+        .get(gid, interaction.channel?.id, interaction.channel?.id);
+      camp = campaignOfQuest(gid, here);
+    }
+
+    const number = createQuest(gid, { name, merit_reward: merits, created_by: uid, run_channel_id: interaction.channel?.id });
+    // createQuest writes a listing; an encounter is already running.
+    updateQuest(gid, number, {
+      kind: 'encounter', status: 'active', gm_id: uid, started_at: Date.now(), elapsed_ms: 0,
+      paused: 0, last_tick_ms: 0, last_recap_ms: 0, stage: 'approved', stage_at: Date.now(),
+      run_thread_id: interaction.channel?.isThread?.() ? interaction.channel.id : null,
+      campaign_id: camp?.id ?? null, last_activity: Date.now(),
+    });
+    for (const id of players) setQuestMember(gid, number, id, 'party');
+    logQuestEvent(gid, number, 'start', `Encounter begins \u2014 ${players.length} in it`, uid);
+    const quest = getQuest(gid, number);
+
+    const { ActionRowBuilder: ER, ButtonBuilder: EB, ButtonStyle: ES } = require('discord.js');
+    const row = new ER().addComponents(
+      new EB().setCustomId(`encjoin:${number}`).setLabel('\u2694\uFE0F Join').setStyle(ES.Success),
+      new EB().setCustomId(`encleave:${number}`).setLabel('\u{1F6AA} Step out').setStyle(ES.Secondary));
+    const named = [];
+    for (const id of players) named.push(await getDisplayName(interaction.guild, id));
+    await interaction.reply({ allowedMentions: { users: players }, content: [
+      `\u{1F3AF} **Encounter \u2014 ${questTag(quest)}**`,
+      camp ? `_Part of **${camp.name}**._` : '',
+      named.length ? `In it: ${named.join(', ')}` : 'Nobody seated yet \u2014 press **Join**.',
+      merits ? `\u{1F396}\uFE0F **${merits}** merits each at the end.` : '',
+      '', '_Notes, recap and winddown work by number: `/quest run note number:' + number + '`. `/encounter end` finishes it._',
+    ].filter(Boolean).join('\n'), components: [row] });
+    try { await syncQuestBook(interaction.client, interaction.guild, gid, quest); } catch {}
+    if (camp) refreshCampaignCard(interaction.client, interaction.guild, camp.id).catch(() => {});
+    return;
+  }
+
+  if (sub === 'end') {
+    // The encounter in THIS channel; a GM may be running several.
+    const quest = db.prepare("SELECT * FROM quests WHERE guild_id=? AND kind='encounter' AND status='active' AND (run_thread_id=? OR run_channel_id=?) ORDER BY number DESC LIMIT 1")
+      .get(gid, interaction.channel?.id, interaction.channel?.id);
+    if (!quest) return interaction.reply({ ephemeral: true, content: '\u274C No encounter is running here. `/encounter list` shows where they are.' });
+    // Hand to the ordinary completion so payout, chronicle, reviews, quest
+    // log and the winding-down reset all happen exactly as for a run.
+    return handleQuest(interaction, { sub: 'complete', group: 'run', number: quest.number,
+      summary: interaction.options.getString('summary'), title: interaction.options.getString('title') });
+  }
+}
+
+// Join/leave for a running encounter — anyone present may sit down.
+async function handleEncounterPress(interaction) {
+  const [kind, numS] = interaction.customId.split(':');
+  const gid = interaction.guild.id, uid = interaction.user.id, number = parseInt(numS, 10);
+  const quest = getQuest(gid, number);
+  if (!quest || quest.status !== 'active') return interaction.reply({ ephemeral: true, content: '\u274C That encounter is over.' });
+  if (kind === 'encjoin') {
+    if (isFallen(gid, uid)) return interaction.reply({ ephemeral: true, content: '\u26B0\uFE0F The fallen cannot take part.' });
+    if (!getChar(gid, uid)) return interaction.reply({ ephemeral: true, content: '\u274C You need a character sheet \u2014 `/char create`.' });
+    if (getQuestMembers(gid, number, 'party').includes(uid)) return interaction.reply({ ephemeral: true, content: '\u2705 You are already in it.' });
+    setQuestMember(gid, number, uid, 'party');
+    logQuestEvent(gid, number, 'note', `${await getDisplayName(interaction.guild, uid)} joins`, uid);
+    updateQuest(gid, number, { last_activity: Date.now() });
+    return interaction.reply({ allowedMentions: { parse: [] }, content: `\u2694\uFE0F **${await getDisplayName(interaction.guild, uid)}** joins **${questTag(quest)}**.` });
+  }
+  if (!getQuestMembers(gid, number, 'party').includes(uid)) return interaction.reply({ ephemeral: true, content: '\u274C You are not in it.' });
+  removeQuestMember(gid, number, uid);
+  logQuestEvent(gid, number, 'note', `${await getDisplayName(interaction.guild, uid)} steps out`, uid);
+  return interaction.reply({ allowedMentions: { parse: [] }, content: `\u{1F6AA} **${await getDisplayName(interaction.guild, uid)}** steps out of **${questTag(quest)}**.` });
+}
+
+// ── Campaigns ────────────────────────────────────────────────────────
+// The umbrella. Its thread lives in the GM-only campaigns forum and holds a
+// live card: the premise, where things stand, every linked entry with its
+// status, who has taken part, merits paid, titles earned.
+function campaignCardText(guild, gid, camp) {
+  const entries = campaignEntries(gid, camp.id);
+  const done = entries.filter(q => q.status === 'completed');
+  const live = entries.filter(q => q.status === 'active');
+  const parts = campaignParticipants(gid, camp.id);
+  const merits = done.reduce((a, q) => a + (q.merit_reward || 0) * getQuestMembers(gid, q.number, 'party').length, 0);
+  const notes = db.prepare('SELECT text, at FROM campaign_notes WHERE guild_id=? AND campaign_id=? ORDER BY at DESC LIMIT 5').all(gid, camp.id);
+  const mark = (q) => q.status === 'completed' ? '\u2705' : q.status === 'active' ? (q.winding_down ? '\u{1F6CC}' : '\u25B6\uFE0F') : '\u{1F4CB}';
+  const kindOf = (q) => isEncounter(q) ? ' \u{1F3AF}' : q.instance_of ? '' : ' \u{1F4DC}';
+  return [
+    `\u{1F5FA}\uFE0F **${camp.name}**${camp.status === 'completed' ? ' \u2014 _completed_' : ''}`,
+    camp.description ? `_${camp.description}_` : '',
+    '',
+    camp.situation ? `\u{1F9ED} **Where things stand**\n${camp.situation}` : '',
+    camp.situation ? '' : null,
+    `\u{1F4D6} **Entries** \u2014 ${done.length} done \u00b7 ${live.length} running \u00b7 ${entries.length - done.length - live.length} planned`,
+    ...entries.slice(0, 20).map(q => `${mark(q)} ${questTag(q)}${kindOf(q)}`),
+    entries.length > 20 ? `\u2026and ${entries.length - 20} more` : '',
+    '',
+    `\u{1F465} **${parts.length}** adventurer${parts.length === 1 ? '' : 's'} have taken part \u00b7 \u{1F396}\uFE0F **${merits}** merits paid`,
+    notes.length ? ['', '\u{1F4DD} **Arc notes**', ...notes.map(n => `\u00b7 ${n.text.slice(0, 160)}`)].join('\n') : '',
+  ].filter(x => x !== null && x !== '').join('\n').slice(0, 1900);
+}
+
+async function refreshCampaignCard(client, guild, campId) {
+  const gid = guild.id;
+  const camp = getCampaign(gid, campId);
+  if (!camp) return;
+  const cfg = getConfig(gid) || {};
+  if (!cfg.campaign_forum) return;
+  const forum = await client.channels.fetch(cfg.campaign_forum).catch(() => null);
+  if (!forum || forum.type !== 15) return;
+  const text = campaignCardText(guild, gid, camp);
+  let thread = camp.thread_id ? await client.channels.fetch(camp.thread_id).catch(() => null) : null;
+  if (!thread) {
+    thread = await forum.threads.create({ name: camp.name.slice(0, 100), message: { content: text } }).catch(() => null);
+    if (!thread) return;
+    const starter = await thread.fetchStarterMessage().catch(() => null);
+    db.prepare('UPDATE campaigns SET thread_id=?, card_msg_id=? WHERE guild_id=? AND id=?').run(thread.id, starter?.id ?? null, gid, camp.id);
+    return;
+  }
+  await wakeThread(thread);
+  const msg = camp.card_msg_id ? await thread.messages.fetch(camp.card_msg_id).catch(() => null) : null;
+  if (msg) await msg.edit({ content: text }).catch(() => {});
+  else {
+    const m = await thread.send({ content: text }).catch(() => null);
+    if (m) db.prepare('UPDATE campaigns SET card_msg_id=? WHERE guild_id=? AND id=?').run(m.id, gid, camp.id);
+  }
+}
+
+async function handleCampaign(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const sub = interaction.options.getSubcommand();
+  const gm = await isGm(interaction.guild, uid);
+  const pick = () => {
+    const raw = (interaction.options.getString('campaign') || '').trim();
+    const c = findCampaign(gid, raw);
+    if (!c) interaction.reply({ ephemeral: true, content: `\u274C No campaign called **${raw}**.` });
+    return c;
+  };
+
+  if (sub === 'list') {
+    const rows = db.prepare('SELECT * FROM campaigns WHERE guild_id=? ORDER BY status, id').all(gid);
+    if (!rows.length) return interaction.reply({ ephemeral: true, content: '\u{1F5FA}\uFE0F No campaigns yet.' });
+    return interaction.reply({ ephemeral: true, content: ['\u{1F5FA}\uFE0F **Campaigns**',
+      ...rows.map(c => `\u00b7 **${c.name}**${c.status === 'completed' ? ' \u2014 completed' : ''} \u00b7 ${campaignEntries(gid, c.id).length} entries`)].join('\n').slice(0, 1900) });
+  }
+
+  if (sub === 'show') {
+    const camp = pick(); if (!camp) return;
+    if (gm) return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] }, content: campaignCardText(interaction.guild, gid, camp) });
+    // Players see the public parts only: the premise, what is done, and
+    // their own place in it. Notes and the situation stay GM-side.
+    const entries = campaignEntries(gid, camp.id).filter(q => q.status === 'completed');
+    const mine = entries.filter(q => getQuestMembers(gid, q.number, 'party').includes(uid));
+    return interaction.reply({ ephemeral: true, content: [
+      `\u{1F5FA}\uFE0F **${camp.name}**`, camp.description ? `_${camp.description}_` : '', '',
+      entries.length ? `\u2705 **So far:** ${entries.map(q => questTag(q)).join(' \u00b7 ')}` : '_Nothing has been told yet._',
+      mine.length ? `\u{1F9ED} You were there for ${mine.length} of ${entries.length}.` : '',
+    ].filter(Boolean).join('\n').slice(0, 1900) });
+  }
+
+  if (!gm) return interaction.reply({ content: '\u274C Only GMs shape campaigns.', ephemeral: true });
+
+  if (sub === 'create') {
+    const name = interaction.options.getString('name').trim().slice(0, 80);
+    const description = (interaction.options.getString('description') || '').trim().slice(0, 600) || null;
+    if (findCampaign(gid, name)?.name.toLowerCase() === name.toLowerCase())
+      return interaction.reply({ ephemeral: true, content: `\u274C **${name}** already exists.` });
+    const r = db.prepare('INSERT INTO campaigns (guild_id, name, description, gm_id, created_at) VALUES (?,?,?,?,?)')
+      .run(gid, name, description, uid, Date.now());
+    refreshCampaignCard(interaction.client, interaction.guild, r.lastInsertRowid).catch(() => {});
+    return interaction.reply({ ephemeral: true, content: `\u2705 **${name}** begins. Link runs with \`campaign:\` on \`/quest create\` and \`/encounter start\`, or \`/campaign add\`.` });
+  }
+
+  if (sub === 'add' || sub === 'remove') {
+    const number = interaction.options.getInteger('quest');
+    const q = getQuest(gid, number);
+    if (!q) return interaction.reply({ ephemeral: true, content: `\u274C No quest #${String(number).padStart(3, '0')}.` });
+    if (q.instance_of && !isEncounter(q))
+      return interaction.reply({ ephemeral: true, content: `\u274C Link the listing (#${String(q.instance_of).padStart(3, '0')}) \u2014 its runs follow it.` });
+    if (sub === 'remove') {
+      const was = q.campaign_id;
+      updateQuest(gid, number, { campaign_id: null });
+      if (was) refreshCampaignCard(interaction.client, interaction.guild, was).catch(() => {});
+      return interaction.reply({ ephemeral: true, content: `\u2705 **${questTag(q)}** unlinked.` });
+    }
+    const camp = pick(); if (!camp) return;
+    if (q.campaign_id && q.campaign_id !== camp.id) {
+      const other = getCampaign(gid, q.campaign_id);
+      return interaction.reply({ ephemeral: true, content: `\u274C **${questTag(q)}** already belongs to **${other?.name ?? 'another campaign'}** \u2014 one campaign each. \`/campaign remove quest:${number}\` first.` });
+    }
+    updateQuest(gid, number, { campaign_id: camp.id });
+    refreshCampaignCard(interaction.client, interaction.guild, camp.id).catch(() => {});
+    return interaction.reply({ ephemeral: true, content: `\u2705 **${questTag(q)}** is now part of **${camp.name}**.` });
+  }
+
+  if (sub === 'note') {
+    const camp = pick(); if (!camp) return;
+    const text = interaction.options.getString('text').trim().slice(0, 500);
+    db.prepare('INSERT INTO campaign_notes (guild_id, campaign_id, text, by_id, at) VALUES (?,?,?,?,?)').run(gid, camp.id, text, uid, Date.now());
+    refreshCampaignCard(interaction.client, interaction.guild, camp.id).catch(() => {});
+    return interaction.reply({ ephemeral: true, content: `\u{1F4DD} Noted on **${camp.name}**.` });
+  }
+
+  if (sub === 'status') {
+    const camp = pick(); if (!camp) return;
+    const text = interaction.options.getString('text').trim().slice(0, 800);
+    db.prepare('UPDATE campaigns SET situation=? WHERE guild_id=? AND id=?').run(text, gid, camp.id);
+    refreshCampaignCard(interaction.client, interaction.guild, camp.id).catch(() => {});
+    return interaction.reply({ ephemeral: true, content: `\u{1F9ED} **${camp.name}** \u2014 where things stand, updated.` });
+  }
+
+  if (sub === 'recap') {
+    const camp = pick(); if (!camp) return;
+    const entries = campaignEntries(gid, camp.id).filter(q => q.status === 'completed' || q.status === 'active');
+    if (!entries.length) return interaction.reply({ ephemeral: true, content: '\u274C Nothing has run under it yet.' });
+    const lines = [`\u{1F4D6} **Previously, on ${camp.name}\u2026**`, ''];
+    for (const q of entries.slice(0, 8)) {
+      const tale = db.prepare('SELECT text FROM quest_summaries WHERE guild_id=? AND number=? ORDER BY rowid DESC LIMIT 1').get(gid, q.number)?.text;
+      const beats = db.prepare("SELECT text FROM quest_events WHERE guild_id=? AND number=? AND kind IN ('rp','combat','note') ORDER BY at_ms LIMIT 3").all(gid, q.number).map(e => e.text).filter(Boolean);
+      lines.push(`**${questTag(q)}** \u2014 ${tale ? tale.slice(0, 220) : (beats.length ? beats.join('; ').slice(0, 220) : '_nothing logged_')}`);
+    }
+    const notes = db.prepare('SELECT text FROM campaign_notes WHERE guild_id=? AND campaign_id=? ORDER BY at').all(gid, camp.id);
+    if (notes.length) lines.push('', `**Between runs:** ${notes.map(n => n.text).join(' \u00b7 ').slice(0, 400)}`);
+    lines.push('', camp.situation ? `\u{1F9ED} **Now:** ${camp.situation}` : '', '_A draft, for you to edit._');
+    return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] }, content: lines.filter(Boolean).join('\n').slice(0, 1900) });
+  }
+
+  if (sub === 'complete') {
+    const camp = pick(); if (!camp) return;
+    const live = campaignEntries(gid, camp.id).filter(q => q.status === 'active');
+    if (live.length) return interaction.reply({ ephemeral: true, content: `\u274C **${live.length}** entr${live.length === 1 ? 'y is' : 'ies are'} still running \u2014 finish them first: ${live.map(q => questTag(q)).join(', ')}` });
+    db.prepare("UPDATE campaigns SET status='completed', completed_at=? WHERE guild_id=? AND id=?").run(Date.now(), gid, camp.id);
+    refreshCampaignCard(interaction.client, interaction.guild, camp.id).catch(() => {});
+    return interaction.reply({ content: `\u{1F3C1} **${camp.name}** is complete \u2014 ${campaignParticipants(gid, camp.id).length} adventurers saw it through.` });
+  }
+}
+
 async function handleDd(interaction) {
   // Speaking AS the bot, in the room. Plain by default: no header, no
   // voice, just the words \u2014 a header only if the GM writes one, and as
@@ -20301,7 +20707,9 @@ const HELP_CATEGORIES = {
       '`/quest run winddown number:N [resume:true]` \u2014 the story is over but rewards are not settled: the run stays live, and its party is released to the rests while you decide (GM)',
       '`/quest run log number:N text:...` \u2014 your telling of a finished run, into each player\'s chronicle thread; rewrites edit in place (GM)',
       '`/instance add|kick|rally|note|pause|resume|complete|show|thread name:...` \u2014 the same by NAME rather than number; leave `name:` blank inside a run\'s own thread (GM)',
-      '_One quest at a time: approving someone already seated on a live run is refused, and a launch leaves them an applicant rather than double-booking them._',
+      '_One quest at a time: approving someone already seated on a live run prompts for a second press to override (audited), and a launch leaves them an applicant rather than double-booking them._',
+      '`/encounter start name:... [players:@a @b] [merits:] [campaign:]` \u2014 a short session run on the fly, here and now: no board, no applications. A Join button seats whoever is present; `/encounter end [summary:] [title:]` pays out, writes the chronicle and posts the review button. Encounters do not count toward one-quest-at-a-time; one left quiet six hours reminds the room and pings the GMs (GM)',
+      '`/campaign create name:... [description:]` \u2014 the long arc: quests, mini-quests and encounters under one name, with a GM-only thread in the campaigns forum. `campaign:` on `/quest create` or `/encounter start` links at birth; `/campaign add|remove` afterwards. `note` for beats between runs, `status` for where things stand, `recap` across every run, `complete` to close it. Players get `/campaign show` \u2014 the premise, what is done, and their own part (GM)',
       '`/quest run complete number:N` — finish it; merits auto-awarded, other rewards listed (GM)',
       '`/quest delete number:N` — remove a quest (GM)',
     ],
@@ -22355,11 +22763,11 @@ async function showRoster(interaction) {
 
   // Which quest, by name, rather than merely "a quest".
   const questOf = new Map();
-  for (const r of db.prepare(`SELECT m.user_id, q.number, q.name, q.winding_down FROM quest_members m
+  for (const r of db.prepare(`SELECT m.user_id, q.number, q.name, q.winding_down, q.kind FROM quest_members m
                               JOIN quests q ON q.guild_id = m.guild_id AND q.number = m.number
                               WHERE m.guild_id=? AND m.state='party' AND q.status='active'`).all(gid)) {
     // A winding-down run still shows, but marked — its party is resting.
-    questOf.set(r.user_id, { label: `#${String(r.number).padStart(3, '0')} ${r.name}`, winding: !!r.winding_down });
+    questOf.set(r.user_id, { label: `#${String(r.number).padStart(3, '0')} ${r.name}`, winding: !!r.winding_down, encounter: r.kind === 'encounter' });
   }
   const fightOf = new Map();
   for (const f of db.prepare("SELECT channel_id, turn_order FROM fights WHERE guild_id=? AND state='active'").all(gid)) {
@@ -22378,7 +22786,7 @@ async function showRoster(interaction) {
     const where = [];
     if (ch.died_at) where.push('\u26B0\uFE0F fallen');
     const q = questOf.get(ch.user_id);
-    if (q && !q.winding) where.push(`\u{1F5FA}\uFE0F ${q.label}`);
+    if (q && !q.winding) where.push(`${q.encounter ? '\u{1F3AF}' : '\u{1F5FA}\uFE0F'} ${q.label}`);
     else if (q) resting.push(`\u{1F6CC} ${q.label}`);
     if (fightOf.has(ch.user_id)) where.push(`\u2694\uFE0F <#${fightOf.get(ch.user_id)}>`);
     const held = where.length > 0;
@@ -22469,6 +22877,16 @@ async function mendEverything(client, guild, { log = () => {} } = {}) {
     }
   } catch {}
   if (npcs) made.push(`${npcs} NPC page(s)`);
+
+  // Campaign cards: a card per campaign in the campaigns forum.
+  let camps = 0;
+  try {
+    if (cfg.campaign_forum) for (const c of db.prepare('SELECT id FROM campaigns WHERE guild_id=?').all(gid)) {
+      await refreshCampaignCard(client, guild, c.id).catch(() => {}); camps++;
+      await pace(150);
+    }
+  } catch {}
+  if (camps) made.push(`${camps} campaign card(s)`);
 
   // Permissions, which never move a channel either.
   try { const h = await healChannelPerms(guild); if (h.fixed) made.push(`${h.fixed} permission repair(s)`); } catch {}
@@ -23069,6 +23487,8 @@ async function finishQuestCreate(interaction, gid, uid, f) {
     party_hard: f.party_hard ?? false,
     created_by: uid,
   });
+  // A campaign named at creation links the listing at birth.
+  if (f.campaign_id) { try { updateQuest(gid, number, { campaign_id: f.campaign_id }); refreshCampaignCard(interaction.client, interaction.guild, f.campaign_id).catch(() => {}); } catch {} }
   updateQuest(gid, number, { gm_id: uid, gm_style: f.gm_style ?? null, stage: 'concept', stage_at: Date.now() });
   let quest = getQuest(gid, number);
   let planLine = '';
@@ -23172,6 +23592,10 @@ async function handleQuest(interaction, forced) {
   if (!gm) return interaction.reply({ content: '❌ Only GMs can manage quests.', ephemeral: true });
 
   if (sub === 'create') {
+    // campaign: links the listing at birth; every run of it follows.
+    const campRawQ = (interaction.options?.getString?.('campaign') || '').trim();
+    const campQ = campRawQ ? findCampaign(gid, campRawQ) : null;
+    if (campRawQ && !campQ) return interaction.reply({ ephemeral: true, content: `\u274C No campaign called **${campRawQ}**.` });
     const fromN = interaction.options?.getInteger?.('from');
     const srcQ = fromN ? getQuest(gid, fromN) : null;
     if (fromN && !srcQ) return interaction.reply({ content: `❌ No quest #${String(fromN).padStart(3, '0')} to copy from.`, ephemeral: true });
@@ -23191,7 +23615,7 @@ async function handleQuest(interaction, forced) {
       // customId so the modal submit can carry them into the creation.
       const { ModalBuilder, TextInputStyle } = require('discord.js');
       const modal = new ModalBuilder()
-        .setCustomId(`questcreate:${f.merit_reward}:${f.party_size ?? ''}:${f.party_hard ? 1 : 0}:${f.gm_style ?? ''}`)
+        .setCustomId(`questcreate:${f.merit_reward}:${f.party_size ?? ''}:${f.party_hard ? 1 : 0}:${campQ?.id ?? ''}:${f.gm_style ?? ''}`)
         .setTitle(srcQ ? `New quest from #${fromN}`.slice(0, 45) : 'Write a quest')
         .addComponents(
           questTextRow('name', 'Quest name', TextInputStyle.Short, true, srcQ ? `${srcQ.name} (copy)` : null),
@@ -23323,8 +23747,21 @@ async function handleQuest(interaction, forced) {
     // One quest at a time: seating someone already on a live run would put
     // them in two places and hold them out of rests twice over.
     const clashA = questAlreadyOn(gid, target.id, number);
-    if (clashA) return interaction.reply({ ephemeral: true,
-      content: `\u274C <@${target.id}> is already on **#${String(clashA.number).padStart(3, '0')} ${clashA.name}**. Finish or leave that one first \u2014 \`/quest party kick number:${clashA.number} user:@them\` releases them.` });
+    const overriding = (forced && typeof forced === 'object') && forced.overrideSeat === true;
+    if (clashA && !overriding) {
+      // A GM typing a name is a decision, so the rule may be overridden \u2014
+      // but only through a second press, so it cannot happen by accident
+      // (T, 2026-09-25). The press replays this approve with overrideSeat.
+      const { ActionRowBuilder: OR, ButtonBuilder: OB, ButtonStyle: OS } = require('discord.js');
+      const row = new OR().addComponents(
+        new OB().setCustomId(`seatover:${number}:${target.id}`).setLabel('\u26A0\uFE0F Seat them anyway').setStyle(OS.Danger),
+        new OB().setCustomId('seatno').setLabel('Cancel').setStyle(OS.Secondary));
+      return interaction.reply({ ephemeral: true, components: [row], allowedMentions: { parse: [] },
+        content: `\u26A0\uFE0F <@${target.id}> is already on **#${String(clashA.number).padStart(3, '0')} ${clashA.name}**. One quest at a time is the rule.\nSeating them here as well holds them out of rests twice over. Press to override, or \`/quest party kick number:${clashA.number} user:@them\` to move them cleanly.` });
+    }
+    if (clashA && overriding) {
+      sendRollAudit(interaction.client, gid, `\u26A0\uFE0F Seat override \u2014 **${await getDisplayName(interaction.guild, interaction.user.id)}** seated <@${target.id}> on ${questTag(quest)} while on #${String(clashA.number).padStart(3, '0')} ${clashA.name}`);
+    }
     setQuestMember(gid, number, target.id, 'party');
     if ((getConfig(gid)?.quest_spinoff ?? 0) && !quest.instance_of) {
       const staged = getQuestMembers(gid, number, 'party').length;
@@ -23746,7 +24183,7 @@ async function handleQuest(interaction, forced) {
   }
 
   if (sub === 'complete') {
-    const quest = await requireQuest(interaction, gid);
+    const quest = await requireQuest(interaction, gid, (forced && typeof forced === 'object') ? forced.number : null);
     if (!quest) return;
     const number = quest.number;
     if (quest.status === 'completed') return interaction.reply({ content: '❌ That quest is already completed.', ephemeral: true });
@@ -23866,14 +24303,15 @@ async function handleQuest(interaction, forced) {
     // stamped with the quest it came from, so the page says where.
     // Finishing ends the winding-down state with everything else.
     try { updateQuest(gid, quest.number, { winding_down: 0 }); } catch {}
-    const earned = (interaction.options?.getString?.('title') || '').trim().slice(0, 60);
+    const forcedC = (forced && typeof forced === 'object') ? forced : {};
+    const earned = (forcedC.title ?? interaction.options?.getString?.('title') ?? '').trim().slice(0, 60);
     if (earned) {
       for (const id of party) grantTitle(gid, id, earned, { source: questTag(quest), by: interaction.user.id });
       lines.push('', `\u{1F3C5} **${earned}** \u2014 earned by ${party.length} adventurer${party.length === 1 ? '' : 's'}.`);
       for (const id of party) ensureCharPage(interaction.client, interaction.guild, id, null, 'all').catch(() => {});
     }
     let taleUrls = {};
-    const tale = (interaction.options?.getString?.('summary') || '').trim();
+    const tale = (forcedC.summary ?? interaction.options?.getString?.('summary') ?? '').trim();
     if (tale) taleUrls = await postQuestTale(interaction, gid, quest, tale, party).catch(() => ({}));
     const taleUrl = Object.values(taleUrls)[0] || null;
 

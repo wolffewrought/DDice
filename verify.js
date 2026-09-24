@@ -1021,8 +1021,8 @@ function testBuilders(src) {
                      'help', 'library', 'npc', 'quest', 'quiz', 'roll', 'spell', 'standing']) {
       ok(`/${n} is registered`, !!by[n]);
     }
-    ok('twenty-one commands registered \\u2014 /dd joined 2026-08-20',
-      cmds.length === 21 && cmds.some(c => c.name === 'target') && cmds.some(c => c.name === 'dd'));
+    ok('twenty-three commands registered \\u2014 /encounter and /campaign joined 2026-09-24',
+      cmds.length === 23 && cmds.some(c => c.name === 'encounter') && cmds.some(c => c.name === 'campaign'));
     // A GM writing as the bot: always says who it is, and the audit book
     // keeps the attribution even when the message does not.
     // (rewritten 2026-08-22: T asked for /dd to speak in the room, not in DMs.)
@@ -1609,7 +1609,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     // the rest reads so the two can never disagree.
     ok('the roster names the quest and the fight holding each player',
       /async function showRoster\(interaction\)/.test(src) &&
-      /questOf\.set\(r\.user_id, \{ label: `#\$\{String\(r\.number\)\.padStart\(3, '0'\)\} \$\{r\.name\}`, winding: !!r\.winding_down \}\)/.test(src) &&
+      /questOf\.set\(r\.user_id, \{ label: `#\$\{String\(r\.number\)\.padStart\(3, '0'\)\} \$\{r\.name\}`, winding: !!r\.winding_down, encounter: r\.kind === 'encounter' \}\)/.test(src) &&
       /fightOf\.set\(fid, f\.channel_id\)/.test(src) &&
       /Red means a rest will pass them over/.test(src));
     ok('a GM can ask who the rest will exclude',
@@ -1717,6 +1717,32 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       })());
     ok('the help picker offers the tools page',
       /\{name:'Table Tools',value:'tools'\}/.test(src) && /\n  tools: \{/.test(src));
+    // Encounters and campaigns (2026-09-24). An encounter is a quest row of
+    // kind 'encounter'; a campaign is the umbrella above listings.
+    ok('an encounter is a running quest with no listing',
+      /async function handleEncounter\(interaction\)/.test(src) &&
+      /kind: 'encounter', status: 'active', gm_id: uid, started_at: Date\.now\(\)/.test(src) &&
+      /setCustomId\(`encjoin:\$\{number\}`\)/.test(src) &&
+      /async function handleEncounterPress\(interaction\)/.test(src));
+    ok('encounters do not count toward one quest at a time',
+      /AND COALESCE\(q\.kind, 'quest'\) != 'encounter'/.test(src));
+    ok('an idle encounter reminds the room and pings the GMs, never ends itself',
+      /const ENCOUNTER_IDLE_MS = 6 \* 3600 \* 1000;/.test(src) &&
+      /has been quiet for \$\{Math\.round\(quiet \/ 3600000\)\}h/.test(src) &&
+      !/updateQuest\([^)]*status: 'completed'[^)]*\)[^\n]*idle/.test(src));
+    ok('ending an encounter is the ordinary completion',
+      /return handleQuest\(interaction, \{ sub: 'complete', group: 'run', number: quest\.number,/.test(src) &&
+      /const quest = await requireQuest\(interaction, gid, \(forced && typeof forced === 'object'\) \? forced\.number : null\);/.test(src));
+    ok('a campaign has a card, notes, a situation, and one campaign per quest',
+      /CREATE TABLE IF NOT EXISTS campaigns \(/.test(src) &&
+      /function campaignCardText\(guild, gid, camp\)/.test(src) &&
+      /async function refreshCampaignCard\(client, guild, campId\)/.test(src) &&
+      /one campaign each/.test(src) &&
+      /key: 'campaign_forum', name: 'campaigns', forum: true, gm: true/.test(src));
+    ok('players see a campaign\'s public parts only',
+      /Players see the public parts only/.test(src) && /You were there for \$\{mine\.length\} of/.test(src));
+    ok('an encounter started in a campaign run joins the campaign unasked',
+      /camp = campaignOfQuest\(gid, here\);/.test(src));
     ok('/fight add brings a player into a running fight',
       /setName\('add'\)\.setDescription\('Bring a player into the current fight \(GM\)'\)/.test(src) &&
       /has fallen and cannot fight/.test(src) &&
@@ -1729,6 +1755,13 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /is winding down\. The story is told/.test(src));
     ok('completing a quest clears the winding-down state',
       /updateQuest\(gid, quest\.number, \{ winding_down: 0 \}\)/.test(src));
+    // A GM may override the one-seat rule, but only by a second press,
+    // and the audit book records it (T, 2026-09-25).
+    ok('the seat override is a second press, audited, never a double ack',
+      /setCustomId\(`seatover:\$\{number\}:\$\{target\.id\}`\)/.test(src) &&
+      /forced\.overrideSeat === true/.test(src) &&
+      /Seat override \\u2014 \*\*/.test(src) &&
+      !/Overriding\\u2026/.test(src));
     ok('a player may hold only one seat at a time',
       /function questAlreadyOn\(gid, uid, exceptNumber = null\)/.test(src) &&
       /const clashA = questAlreadyOn\(gid, target\.id, number\);/.test(src) &&
