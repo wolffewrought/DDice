@@ -1413,6 +1413,12 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /async function mendEverything\(client, guild/.test(src) &&
       /async function bootMend\(client\)/.test(src) &&
       /const mended = await mendEverything\(interaction\.client, interaction\.guild\)/.test(src));
+    // The boot mender builds plan entries this guild lacks — a forum that
+    // shipped after setup appears by itself — touching only UNCONFIGURED
+    // keys, and re-reads config so what it built is used the same boot.
+    ok('the boot mender creates missing plan channels and forums',
+      /async function mendEverything[\s\S]{0,2500}?for \(const plan of SETUP_PLAN\) \{[\s\S]{0,400}?if \(have\) continue;[\s\S]{0,300}?setupOneChannel\(guild, gid, plan, cat\)/.test(src) &&
+      /cfg = getConfig\(gid\) \|\| \{\};\n  \} catch \(e\) \{ console\.error\('\[mend\] channels'/.test(src));
     ok('the mender never moves or renames anything',
       (() => {
         const i2 = src.indexOf('async function mendEverything');

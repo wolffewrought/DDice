@@ -326,6 +326,23 @@ place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
 
+## 9x · The boot mender builds missing channels (2026-09-25)
+
+T asked whether the campaigns forum would appear by itself. It would
+not have: bootMend ran mendEverything, which filled threads, pages and
+cards but never created a plan CHANNEL — only `/gm check build` did, and
+even `/gm check run` merely said 'not set; /config channels X first'. That
+contradicted the 09-20 promise that an update brings its own channels.
+
+mendEverything now walks SETUP_PLAN and, for any entry with NO config,
+calls setupOneChannel — adopt by name if a channel already exists, create
+in the right category if not. Configured entries are never touched, so
+the never-move guarantee stands (pinned: the mender body still contains
+no setName/setParent/setPosition/setConfig; setupOneChannel owns those).
+Categories are looked up, never created — an un-set-up server has none,
+and bootMend skips those anyway. Config is re-read after building so the
+campaign cards find the forum in the same boot. Pinned.
+
 ## 9w · The seat override (2026-09-25)
 
 T: a GM's explicit add should be able to override one-quest-at-a-time,

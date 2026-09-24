@@ -22850,8 +22850,37 @@ async function rebuildCharPages(interaction) {
 
 async function mendEverything(client, guild, { log = () => {} } = {}) {
   const gid = guild.id;
-  const cfg = getConfig(gid) || {};
+  let cfg = getConfig(gid) || {};
   const made = [];
+
+  // Channels and forums the plan has that this guild does not yet — a
+  // feature that shipped after setup. Only entries with NO config are
+  // touched: adopted by name if a channel already exists, created in the
+  // right category if not; nothing configured is ever moved or renamed
+  // (the promise of 2026-09-20, closed properly 2026-09-25). Categories
+  // are looked up, never created here — a server without them was never
+  // set up, and bootMend skips those anyway.
+  try {
+    const cats = { open: null, gm: null };
+    for (const [key, name] of [['open', 'DDice'], ['gm', 'DDice \u00b7 Game Masters']]) {
+      const c = guild.channels.cache.find(ch => ch.type === 4 && ch.name === name);
+      cats[key] = c || null;
+    }
+    let built = 0;
+    for (const plan of SETUP_PLAN) {
+      let have = cfg[plan.key] || null;
+      if (plan.json) { try { have = JSON.parse(cfg[plan.key] || '{}')[plan.json] || null; } catch { have = null; } }
+      if (have) continue;
+      const cat = plan.gm ? cats.gm : cats.open;
+      if (!cat) continue;
+      const r = await setupOneChannel(guild, gid, plan, cat).catch(() => null);
+      if (r && r.state !== 'kept') built++;
+      await pace(200);
+    }
+    if (built) made.push(`${built} new channel(s)/forum(s)`);
+    // Everything below reads cfg: the forums just built must be visible now.
+    cfg = getConfig(gid) || {};
+  } catch (e) { console.error('[mend] channels', e?.message || e); }
 
   // Threads inside forums the guild already points at.
   try { const r = await ensureApprovalThreads(client, gid); if (r?.made?.length) made.push(`approvals +${r.made.length}`); } catch {}
