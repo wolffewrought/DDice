@@ -232,7 +232,8 @@ const guild = {
   id: GID, name: 'Probe Hall',
   members: {
     me: { id: 'BOT', permissions: { has: () => true } },
-    fetch: async (uid) => ({ id: uid, nickname: null, user: { id: uid, username: `user${uid}`, tag: `user${uid}#1` }, roles: { cache: new Map() } }),
+    // Every fake member is an admin, so GM-gated paths can be walked.
+    fetch: async (uid) => ({ id: uid, nickname: null, user: { id: uid, username: `user${uid}`, tag: `user${uid}#1` }, roles: { cache: new Map() }, permissions: { has: () => true } }),
     cache: new Map(),
   },
   roles: { everyone: { id: 'EVERYONE' }, cache: new Map() },
@@ -443,6 +444,51 @@ async function fire(over) {
     }
     console.error = realErr;
     ok(`every fight button answers (${walk.length} presses)`, broken.length === 0, broken.join('\n        '));
+  }
+
+  // ── The encounter walk ────────────────────────────────────────────
+  // Start one, join it, note into it, end it — through the real handler.
+  if (dbHandle) {
+    const broken = [];
+    let logged = [];
+    const realErr = console.error;
+    console.error = (...a) => { logged.push(a.map(String).join(' ')); };
+    const press = async (label, over) => {
+      logged = [];
+      const r = await fire(over);
+      const said = r.replies.map(x => JSON.stringify(x)).join(' ');
+      const bad = !r.replies.length ? 'SILENT' : /Something went wrong/.test(said) ? 'THREW' : logged.length ? `THREW: ${logged[0].slice(0, 90)}` : null;
+      if (bad) broken.push(`${label}: ${bad}`);
+      if (VERBOSE) console.log(`      ${label.padEnd(42)} → ${(r.replies[0]?.content || JSON.stringify(r.replies[0] || {})).replace(/\s+/g, ' ').slice(0, 88)}`);
+      return r;
+    };
+    // Feedback: a named room goes straight to the modal; a bad name refuses.
+    const fb1 = await press('feedback send room:general → modal', { commandName: 'feedback', options: { _sub: 'send', room: 'general' } });
+    ok('a named feedback room opens the modal directly', /"modal":"fbm:general:0"/.test(JSON.stringify(fb1.replies)));
+    await press('feedback send room:nope → refusal',   { commandName: 'feedback', options: { _sub: 'send', room: 'nope' } });
+    await press('campaign create',   { commandName: 'campaign', options: { _sub: 'create', name: 'The Probe War', description: 'A test arc' } });
+    await press('encounter start',   { commandName: 'encounter', options: { _sub: 'start', name: 'Bandits on the ridge', players: '<@U2>', merits: 2, campaign: 'The Probe War' } });
+    const enc = dbHandle.prepare("SELECT number FROM quests WHERE guild_id='G1' AND kind='encounter' ORDER BY number DESC LIMIT 1").get();
+    ok('an encounter row exists after start', !!enc);
+    if (enc) {
+      await press('encjoin press (U1 sits down)', { isButton: true, customId: `encjoin:${enc.number}`, userId: 'U1', message: { id: 'M8', content: '', components: [] } });
+      await press('campaign show (GM)',       { commandName: 'campaign', options: { _sub: 'show', campaign: 'The Probe War' } });
+      // The seat override: a second quest for U1 while the encounter runs
+      // is allowed (encounters are exempt), so make a real clash first.
+      dbHandle.prepare(`INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at) VALUES ('G1', 900, 'Other Run', 'active', 'quest', 0)`).run();
+      dbHandle.prepare(`INSERT OR REPLACE INTO quest_members (guild_id, number, user_id, state) VALUES ('G1', 900, 'U2', 'party')`).run();
+      dbHandle.prepare(`INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at) VALUES ('G1', 901, 'Second Run', 'active', 'quest', 0)`).run();
+      const r1 = await press('approve U2 onto a second quest → prompt', { commandName: 'quest', options: { _group: 'party', _sub: 'approve', number: 901, user: 'U2' } });
+      ok('a clashing seat prompts for a second press', /Seat them anyway|One quest at a time/.test(JSON.stringify(r1.replies)));
+      await press('seatover press → seated with audit',  { isButton: true, customId: 'seatover:901:U2', message: { id: 'M7', content: '', components: [] } });
+      const seated = dbHandle.prepare("SELECT 1 FROM quest_members WHERE guild_id='G1' AND number=901 AND user_id='U2' AND state='party'").get();
+      ok('the override actually seats them', !!seated);
+      await press('encounter end',            { commandName: 'encounter', options: { _sub: 'end', summary: 'They fled.' } });
+      const after = dbHandle.prepare("SELECT status FROM quests WHERE guild_id='G1' AND number=?").get(enc.number);
+      ok('ending an encounter completes it', after?.status === 'completed', `status ${after?.status}`);
+    }
+    console.error = realErr;
+    ok(`the encounter walk answers everywhere`, broken.length === 0, broken.join('\n        '));
   }
 
   report();

@@ -1155,6 +1155,10 @@ function testBuilders(src) {
       /setCustomId\(`fbq:\$\{quest\.number\}`\)/.test(src) &&
       /const home = quest\.run_thread_id \|\| quest\.run_channel_id;/.test(src) &&
       /startsWith\('fbq:'\)/.test(src));
+    ok('a feedback room may be named up front, or picked from the menu',
+      /setName\('room'\)\.setDescription\('Which room \\u2014 leave blank to pick from a menu'\)/.test(src) &&
+      /commandName === 'feedback' && focusedOption\.name === 'room'/.test(src) &&
+      /const roomPick = \(interaction\.options\.getString\('room'\) \|\| ''\)\.trim\(\);/.test(src));
     ok('a player picks from their own runs, and the card reads them back',
       /commandName === 'feedback' && focusedOption\.name === 'quest'/.test(src) &&
       /FROM feedback_log WHERE guild_id=\? AND quest_number=\? ORDER BY at DESC/.test(src) &&

@@ -6722,7 +6722,8 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
   new SlashCommandBuilder()
     .setName('feedback').setDescription('Tell the GMs what you think \u2014 privately')
     .addSubcommand(s=>s.setName('send').setDescription('Send feedback to the GMs \u2014 pick a room, score it, say your piece')
-      .addStringOption(o=>o.setName('quest').setDescription('A run you were on, if this is about one').setRequired(false).setAutocomplete(true)))
+      .addStringOption(o=>o.setName('room').setDescription('Which room \u2014 leave blank to pick from a menu').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('quest').setDescription('A run you were on or ran, if this is about one').setRequired(false).setAutocomplete(true)))
     .addSubcommandGroup(g => { g.setName('category').setDescription('The rooms feedback lands in (GM)');
       g.addSubcommand(s=>s.setName('add').setDescription('Add a feedback room (GM)')
         .addStringOption(o=>o.setName('name').setDescription('What to call it').setRequired(true)));
@@ -12775,12 +12776,22 @@ client.on('interactionCreate', async interaction => {
       }
       // /feedback send quest: — only the runs THIS player was on, newest
       // first, so the list is a few names rather than the whole board.
+      if (interaction.commandName === 'feedback' && focusedOption.name === 'room') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        const types = feedbackTypes(interaction.guild.id);
+        return await interaction.respond(Object.entries(types)
+          .map(([key, label]) => ({ name: String(label).slice(0, 100), value: key }))
+          .filter(c => !v || c.name.toLowerCase().includes(v)).slice(0, 25)).catch(() => {});
+      }
       if (interaction.commandName === 'feedback' && focusedOption.name === 'quest') {
         const v = String(focusedOption.value || '').toLowerCase();
-        const mine = db.prepare(`SELECT q.* FROM quest_members m
-                                 JOIN quests q ON q.guild_id = m.guild_id AND q.number = m.number
-                                 WHERE m.guild_id=? AND m.user_id=? AND q.instance_of IS NOT NULL
-                                 ORDER BY q.number DESC LIMIT 25`).all(interaction.guild.id, interaction.user.id);
+        // Runs the user was ON, or RAN — a GM reviewing their own session is
+        // as valid as a player reviewing it (T's screenshot, 2026-09-25).
+        const mine = db.prepare(`SELECT DISTINCT q.* FROM quests q
+                                 LEFT JOIN quest_members m ON m.guild_id = q.guild_id AND m.number = q.number AND m.user_id = ?
+                                 WHERE q.guild_id=? AND (q.instance_of IS NOT NULL OR COALESCE(q.kind,'quest')='encounter')
+                                   AND (m.user_id IS NOT NULL OR q.gm_id = ?)
+                                 ORDER BY q.number DESC LIMIT 25`).all(interaction.user.id, interaction.guild.id, interaction.user.id);
         return await interaction.respond(mine
           .map(q => ({ name: `${questTag(q)}${q.status === 'complete' ? '' : ' (still running)'}`.slice(0, 100), value: String(q.number) }))
           .filter(c => !v || c.name.toLowerCase().includes(v))
@@ -16982,6 +16993,20 @@ async function handleFeedback(interaction) {
     if (!qRow || !mine) return interaction.reply({ ephemeral: true, content: '\u274C Pick one of your own runs from the list.' });
     questNum = qn;
   }
+  const roomPick = (interaction.options.getString('room') || '').trim();
+  if (roomPick) {
+    const typesR = feedbackTypes(gid);
+    const key = typesR[roomPick] ? roomPick
+      : Object.keys(typesR).find(k => String(typesR[k]).toLowerCase() === roomPick.toLowerCase()) || null;
+    if (!key) return interaction.reply({ ephemeral: true, content: `\u274C No room called **${roomPick}** \u2014 leave it blank to pick from the menu.` });
+    // Straight to the modal: the same one the picker opens.
+    const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+    const m = new ModalBuilder().setCustomId(`fbm:${key}:${questNum}`).setTitle('Feedback for the GMs');
+    m.addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('scale').setLabel('Score it out of ten').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(2).setPlaceholder('1\u201310')),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('body').setLabel('Say your piece').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1500)));
+    return interaction.showModal(m);
+  }
   const types = feedbackTypes(gid);
   const routes = feedbackRoutes(gid);
   if (!routes?.forum && !getConfig(gid)?.feedback_forum)
@@ -20816,7 +20841,7 @@ const HELP_CATEGORIES = {
       '`/button group stat:wis dc:12 reason:...` \u2014 one check the whole party rolls; the message keeps the tally and \u2696\uFE0F Call it closes it with how many got through (GM)',
       '`/target create name:Barricade stat:str dc:12` \u2014 something to strike, with no sheet; each hit asks the GM \u{1FAA6} It falls / \u{1F6E1}\uFE0F It holds; `secret:true` asks in the GM log instead \u00b7 `/target list`',
       '`/dd message:... [header:] [user:@a] [channels:#one #two]` \u2014 speak AS THE BOT: plain words by default, a bold header only if you write one, in every channel you name (or here); who said it goes to the roll-audit, not the room (GM)',
-      '`/feedback send [quest:]` \u2014 pick a room, score it out of ten, say your piece; only GMs see it. Name one of your own runs and the card says which',
+      '`/feedback send [room:] [quest:]` \u2014 name a room to go straight to the form, or leave it blank for a menu; score it out of ten, say your piece; only GMs see it. Name a run you were on (or ran) and the card says which',
       '`/feedback category add|remove|list` \u2014 the rooms feedback lands in (GM) \u00b7 `/button feedback` plants a standing feedback button',
       '_A completed run posts its own \u{1F4DD} review button in its thread; `/quest run show` then carries the count, the average \u2b50 and the latest lines._',
     ],

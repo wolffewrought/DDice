@@ -326,6 +326,19 @@ place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
 
+## 9y · /feedback send room: (2026-09-25)
+
+T's screenshot: typing `/feedback send quest:` showed no rooms, only an
+empty quest list. Nothing was broken — the rooms menu is the REPLY to a
+bare `/feedback send` — but the option field looked like where rooms
+should be, which is a fair expectation. Added `room:` with autocomplete
+of the rooms; naming one skips the menu and opens the same modal the
+picker does (`fbm:<room>:<quest>`), a wrong name refuses and points at
+the menu. The quest list was also empty for T because it showed only
+runs the user was ON; it now includes runs they RAN, since a GM reviewing
+their own session is as valid as a player. Walked under the harness (20
+probes). Books and help updated.
+
 ## 9x · The boot mender builds missing channels (2026-09-25)
 
 T asked whether the campaigns forum would appear by itself. It would
