@@ -462,6 +462,11 @@ async function fire(over) {
       if (VERBOSE) console.log(`      ${label.padEnd(42)} → ${(r.replies[0]?.content || JSON.stringify(r.replies[0] || {})).replace(/\s+/g, ' ').slice(0, 88)}`);
       return r;
     };
+    // Autocomplete for the room must answer with the rooms.
+    const ac = await press('feedback room autocomplete', { commandName: 'feedback', isAutocomplete: true, options: { _sub: 'send', _focused: 'room', _focusedValue: '' } });
+    const choices = ac.replies.find(r => r.autocomplete)?.autocomplete || [];
+    ok('the room autocomplete lists the rooms', choices.length > 0 && choices.every(c => typeof c.name === 'string' && !/object/.test(c.name)),
+      `got ${choices.length}: ${choices.slice(0, 3).map(c => c.name).join(' | ')}`);
     // Feedback: a named room goes straight to the modal; a bad name refuses.
     const fb1 = await press('feedback send room:general → modal', { commandName: 'feedback', options: { _sub: 'send', room: 'general' } });
     ok('a named feedback room opens the modal directly', /"modal":"fbm:general:0"/.test(JSON.stringify(fb1.replies)));

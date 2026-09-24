@@ -326,6 +326,23 @@ place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
 
+## 9z · The empty room list (2026-09-25, live)
+
+T: `/feedback send room:` listed nothing. Reproduced under the harness
+first (an autocomplete probe, now permanent), THEN found: an older
+branch for `/feedback category remove name:` was guarded on the COMMAND
+ALONE — `if (commandName === 'feedback')` — so it claimed every /feedback
+autocomplete and answered `room:` with the custom rooms only, of which T
+has none. My new branch sat below it and never ran. Narrowed to the
+option it was written for (`name`), and the room list now renders room
+NAMES (feedbackTypes returns {name, about} objects; String() would have
+printed [object Object]).
+
+Pinned as a rule with teeth: no autocomplete branch may be guarded on a
+command alone — the pin scans the autocomplete block, bounded at the
+chat-command router (my first cut scanned too far and flagged the
+router itself). 21 probes.
+
 ## 9y · /feedback send room: (2026-09-25)
 
 T's screenshot: typing `/feedback send quest:` showed no rooms, only an

@@ -12738,7 +12738,10 @@ client.on('interactionCreate', async interaction => {
 
       // Which feedback rooms a GM may retire — the seven built-ins never
       // appear, since they cannot be removed.
-      if (interaction.commandName === 'feedback') {
+      // Only `/feedback category remove name:` wants the custom rooms; this
+      // used to claim every /feedback autocomplete and answered `room:`
+      // with nothing (T's screenshot, 2026-09-25).
+      if (interaction.commandName === 'feedback' && focusedOption.name === 'name') {
         const q = String(focusedOption.value || '').toLowerCase();
         const opts = feedbackCats(interaction.guild.id)
           .filter(c => !q || c.name.toLowerCase().includes(q))
@@ -12780,7 +12783,7 @@ client.on('interactionCreate', async interaction => {
         const v = String(focusedOption.value || '').toLowerCase();
         const types = feedbackTypes(interaction.guild.id);
         return await interaction.respond(Object.entries(types)
-          .map(([key, label]) => ({ name: String(label).slice(0, 100), value: key }))
+          .map(([key, t]) => ({ name: String(t?.name ?? t).slice(0, 100), value: key }))
           .filter(c => !v || c.name.toLowerCase().includes(v)).slice(0, 25)).catch(() => {});
       }
       if (interaction.commandName === 'feedback' && focusedOption.name === 'quest') {
