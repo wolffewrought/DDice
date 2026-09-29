@@ -4,7 +4,7 @@
 // ============================================================
 
 require('dotenv').config();
-const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, MessageFlags, REST, Routes } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, ContextMenuCommandBuilder, ApplicationCommandType, PermissionFlagsBits, MessageFlags, REST, Routes } = require('discord.js');
 
 // Refusals said often enough that they deserve one home.
 const MSG_NO_ACCESS_FULL = '❌ I can\'t access this channel. Check my View Channel and Send Messages permissions.';
@@ -197,6 +197,17 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS campaign_notes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   guild_id TEXT NOT NULL, campaign_id INTEGER NOT NULL, text TEXT NOT NULL, by_id TEXT, at INTEGER NOT NULL
 )`); } catch (e) { console.error('campaign_notes schema', e); }
+// Which commands are actually used. A REPORT, never a pruner: nothing is
+// removed automatically on the strength of this (T, 2026-09-29).
+try { db.exec(`CREATE TABLE IF NOT EXISTS command_uses (
+  guild_id TEXT NOT NULL, command TEXT NOT NULL, leaf TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0, last_at INTEGER,
+  PRIMARY KEY (guild_id, command, leaf)
+)`); } catch (e) { console.error('command_uses schema', e); }
+try { db.exec(`CREATE TABLE IF NOT EXISTS encounter_presets (
+  guild_id TEXT NOT NULL, name TEXT NOT NULL, merits INTEGER DEFAULT 0, npcs TEXT, by_id TEXT, at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, name)
+)`); } catch (e) { console.error('encounter_presets schema', e); }
 
 try { db.exec(`CREATE TABLE IF NOT EXISTS button_presses (
   guild_id TEXT NOT NULL, message_id TEXT NOT NULL, user_id TEXT NOT NULL,
@@ -742,6 +753,16 @@ try { db.exec("ALTER TABLE quests ADD COLUMN kind TEXT DEFAULT 'quest'"); } catc
 try { db.exec('ALTER TABLE quests ADD COLUMN campaign_id INTEGER'); } catch {}
 try { db.exec('ALTER TABLE quests ADD COLUMN last_activity INTEGER'); } catch {}
 try { db.exec('ALTER TABLE quests ADD COLUMN idle_nagged_at INTEGER'); } catch {}
+// The final word on a quest, written by the GM at archive time (T,
+// 2026-09-29). A completed quest keeps status='completed' (players' records
+// depend on it) and gains archived_at instead.
+try { db.exec('ALTER TABLE quests ADD COLUMN archive_summary TEXT'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN archived_at INTEGER'); } catch {}
+// Completion snapshot for the five-minute Reopen (T, 2026-09-29): what was
+// paid, to whom, and which titles this completion granted.
+try { db.exec('ALTER TABLE quests ADD COLUMN completion_snapshot TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_digest_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN changelog_seen TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN campaign_forum TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_routes TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_cats TEXT'); } catch {}
@@ -1204,6 +1225,7 @@ function questAlreadyOn(gid, uid, exceptNumber = null) {
                           WHERE m.guild_id=? AND m.user_id=? AND m.state='party'
                             AND q.status='active' AND q.number != ?
                             AND COALESCE(q.kind, 'quest') != 'encounter'
+                            AND COALESCE(q.winding_down, 0) = 0
                           LIMIT 1`).get(gid, uid, exceptNumber ?? -1);
   return row || null;
 }
@@ -3326,9 +3348,45 @@ function noteQuestActivity(gid, cid, kind, text, actor = null) {
 // resumes exactly where it left off rather than restarting the count.
 const QUEST_TICK_MS = 60 * 1000;
 const ENCOUNTER_IDLE_MS = 6 * 3600 * 1000;
+// A pause rounds the clock UP to the quarter-hour (T, 2026-09-28).
+const QUARTER_MS = 15 * 60 * 1000;
+
+// ── The live table rules, as data ───────────────────────────────────
+// One place that says what the resolvers do, in the words a player reads.
+// `/config rules` prints it and verify.js pins each line to the code that
+// enforces it, so a rule cannot change on one side only (T, 2026-09-29).
+// Values that ARE constants are read from the constants.
+const RULES = [
+  { key: 'attack-nat1',    text: 'A natural 1 on an attack fails outright, and your next defence is a flat d20.' },
+  { key: 'defence-nat20',  text: 'A natural 20 on a defence is a perfect parry (unless the attacker also rolled 20 \u2014 then totals decide), and banks +2 to hit on your next attack.' },
+  { key: 'damage',         text: 'A hit deals 1. An attacking 20 adds 1; a defending 1 adds 1; both together deal 4.' },
+  { key: 'grapple',        text: 'Grapple is STR against a STR save; meeting the save takes the hold. Held: immobile, 1 wound at the end of each of your turns, actions on a flat d20, and you may strike anyone but your grappler.' },
+  { key: 'grapple-hold',   text: 'Keeping a hold costs an opposed STR roll each turn, or release it for free. Escape is an opposed STR roll on your turn. Ties keep the hold, every time.' },
+  { key: 'one-quest',      text: 'One quest at a time. A run that is winding down does not count; nor does an encounter.' },
+  { key: 'winddown-kick',  text: 'Kicked while a run is winding down? You are still paid when it completes.' },
+  { key: 'pause-round',    text: () => `A pause rounds the clock up to the next ${Math.round(QUARTER_MS / 60000)} minutes.` },
+  { key: 'encounter-idle', text: () => `An encounter quiet for ${Math.round(ENCOUNTER_IDLE_MS / 3600000)} hours reminds the room and pings the GMs; it never ends itself.` },
+  { key: 'reopen',         text: 'A completion can be reopened by a GM within five minutes: the payout is reversed, that run\'s titles revoked.' },
+  { key: 'rest-exclusion', text: 'A rest passes over anyone on an active quest or fight, and the fallen.' },
+];
+const ruleText = (r) => (typeof r.text === 'function' ? r.text() : r.text);
 
 async function questTick(client) {
   for (const guild of client.guilds.cache.values()) {
+    // Weekly digest of what is stalled, to gm-quest-log, so nothing depends
+    // on someone noticing (T, 2026-09-29).
+    try {
+      const cfgD = getConfig(guild.id) || {};
+      if (cfgD.quest_log_gm && Date.now() - (Number(cfgD.gm_digest_at) || 0) >= 7 * 86400000) {
+        setConfig(guild.id, { gm_digest_at: Date.now() });
+        const out = await stalledReport(guild);
+        if (out.length) {
+          const ch = await client.channels.fetch(cfgD.quest_log_gm).catch(() => null);
+          if (ch?.send) await ch.send({ allowedMentions: { roles: getGmRoleIds(guild.id) },
+            content: ['\u{1F5DE}\uFE0F **Weekly digest \u2014 waiting on a GM** ' + getGmRoleIds(guild.id).map(r => `<@&${r}>`).join(' '), '', ...out].join('\n').slice(0, 1900) }).catch(() => {});
+        }
+      }
+    } catch (e) { console.error('[digest]', e?.message || e); }
     let running;
     try { running = db.prepare(`SELECT * FROM quests WHERE guild_id=? AND status='active' AND paused=0`).all(guild.id); }
     catch { continue; }
@@ -3447,7 +3505,18 @@ function upsertNpc(gid, name, fields) {
   if (!ex) {
     db.prepare('INSERT INTO npcs (guild_id, name, order_name, str, con, dex, wis, lck, hp_current, image_url, webhook_id, webhook_token) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
       .run(gid, name, fields.order_name??null, fields.str??0, fields.con??0, fields.dex??0, fields.wis??0, fields.lck??0,
-        (fields.con??0)+2, fields.image_url??null, fields.webhook_id??null, fields.webhook_token??null);
+        fields.hp_current ?? ((fields.con??0)+2), fields.image_url??null, fields.webhook_id??null, fields.webhook_token??null);
+    // The insert knows only the base columns. Everything else passed —
+    // is_temp, max_hp, the 5e block — used to be dropped on the floor here,
+    // so `/library summon temp:true` never made a temp and lost its stats
+    // (probe, 2026-09-29). Apply the rest now.
+    const base = new Set(['order_name', 'str', 'con', 'dex', 'wis', 'lck', 'hp_current', 'image_url', 'webhook_id', 'webhook_token']);
+    const rest = Object.fromEntries(Object.entries(fields).filter(([k]) => !base.has(k)));
+    if (Object.keys(rest).length) {
+      const sets = Object.keys(rest).map(k => `${k}=?`).join(',');
+      try { db.prepare(`UPDATE npcs SET ${sets} WHERE guild_id=? AND name=?`).run(...Object.values(rest), gid, name); }
+      catch (e) { console.error('[upsertNpc] extra fields', e?.message || e); }
+    }
   } else {
     const sets = Object.entries(fields).map(([k])=>`${k}=?`).join(',');
     db.prepare(`UPDATE npcs SET ${sets} WHERE guild_id=? AND name=?`).run(...Object.values(fields), gid, name);
@@ -5706,14 +5775,17 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('status').setDescription('What is set up, and what is missing'));
       g.addSubcommand(s=>s.setName('run').setDescription('Build anything missing \u2014 nothing destroyed'));
       g.addSubcommand(s=>s.setName('build').setDescription('Make every channel and forum, wired and filled'));
-      g.addSubcommand(s=>s.setName('restart').setDescription('DELETE every channel the bot set up, then build fresh'));
+      g.addSubcommand(s=>s.setName('restart').setDescription('Delete the bot\'s channels, build fresh'));
       g.addSubcommand(s=>s.setName('order').setDescription('The sidebar order \u2014 re-apply, or keep yours'));
-      g.addSubcommand(s=>s.setName('migrations').setDescription('Every one-time reshape and the counts it stamped'));
-      g.addSubcommand(s=>s.setName('roster').setDescription('Where every player is (GM)')
+      g.addSubcommand(s=>s.setName('migrations').setDescription('The migration ledger'));
+      g.addSubcommand(s=>s.setName('stalled').setDescription('Waiting on a GM'));
+      g.addSubcommand(s=>s.setName('usage').setDescription('Command use'));
+      g.addSubcommand(s=>s.setName('rehearse').setDescription('Sparring thread'));
+      g.addSubcommand(s=>s.setName('roster').setDescription('Where every player is')
         .addBooleanOption(o=>o.setName('busy').setDescription('Only those tied up').setRequired(false)));
-      g.addSubcommand(s=>s.setName('pages').setDescription('Rebuild character pages (GM)')
+      g.addSubcommand(s=>s.setName('pages').setDescription('Rebuild character pages')
         .addUserOption(o=>o.setName('user').setDescription('Just this one').setRequired(false)));
-      g.addSubcommand(s=>s.setName('portraits').setDescription('Move stored NPC faces into their category threads'));
+      g.addSubcommand(s=>s.setName('portraits').setDescription('Move NPC faces into their threads'));
       return g; })
     .addSubcommand(s=>s.setName('scroll').setDescription('Unfurl a written prop for the players, in the server\'s scroll font (GM)')
       .addAttachmentOption(o=>o.setName('file').setDescription('A scroll PDF made by /gm scroll — I read it back as text and a fresh copy in this server\'s font').setRequired(false)))
@@ -6230,7 +6302,8 @@ const slashCommands = [
         {name:'Tags',value:'tags'},
         {name:'NPCs',value:'npc'},
         {name:'GM & Config',value:'gm'},
-        {name:'Table Tools',value:'tools'}
+        {name:'Table Tools',value:'tools'},
+        {name:'The Rules',value:'rules'}
       )),
 
   new SlashCommandBuilder()
@@ -6715,7 +6788,8 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
       .addStringOption(o=>o.setName('stage').setDescription('Pipeline stage').setRequired(true)
         .addChoices({name:'🌱 Concept',value:'concept'},{name:'⏳ Awaiting Approval',value:'awaiting'},{name:'✅ Approved',value:'approved'})))
     .addSubcommand(s=>s.setName('archive').setDescription('Take a quest off the board — board thread locked, applications closed (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)))
+      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('summary').setDescription('The final word \u2014 blank opens a box to write it').setRequired(false)))
     .addSubcommand(s=>s.setName('delete').setDescription('Delete a quest permanently (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))),
 
@@ -6778,11 +6852,21 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
       .addStringOption(o=>o.setName('name').setDescription('What is happening').setRequired(true))
       .addStringOption(o=>o.setName('players').setDescription('Who is in it \u2014 @mentions; others may press Join').setRequired(false))
       .addIntegerOption(o=>o.setName('merits').setDescription('Merits each at the end').setRequired(false).setMinValue(0))
-      .addStringOption(o=>o.setName('campaign').setDescription('Part of a campaign').setRequired(false).setAutocomplete(true)))
+      .addStringOption(o=>o.setName('campaign').setDescription('Part of a campaign').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('preset').setDescription('Start from a saved scene').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('end').setDescription('Finish it \u2014 payout, chronicle, review button (GM)')
       .addStringOption(o=>o.setName('summary').setDescription('Your telling of it').setRequired(false))
       .addStringOption(o=>o.setName('title').setDescription('A title every survivor earns').setRequired(false)))
-    .addSubcommand(s=>s.setName('list').setDescription('Encounters running right now')),
+    .addSubcommand(s=>s.setName('list').setDescription('Encounters running right now'))
+    .addSubcommandGroup(g => { g.setName('preset').setDescription('Saved scenes \u2014 start one in a single command (GM)');
+      g.addSubcommand(x=>x.setName('save').setDescription('Save a scene: name, merits, and the monsters it summons (GM)')
+        .addStringOption(o=>o.setName('name').setDescription('The scene, e.g. Bandits on the ridge').setRequired(true))
+        .addIntegerOption(o=>o.setName('merits').setDescription('Merits each at the end').setRequired(false).setMinValue(0))
+        .addStringOption(o=>o.setName('npcs').setDescription('Library monsters to summon, e.g. Goblin x3, Orc').setRequired(false)));
+      g.addSubcommand(x=>x.setName('list').setDescription('Every saved scene'));
+      g.addSubcommand(x=>x.setName('remove').setDescription('Forget a scene (GM)')
+        .addStringOption(o=>o.setName('name').setDescription('Which scene').setRequired(true).setAutocomplete(true)));
+      return g; }),
   new SlashCommandBuilder()
     .setName('campaign').setDescription('The long arc \u2014 quests, mini-quests and encounters under one name (GM)')
     .addSubcommand(s=>s.setName('create').setDescription('Name a new campaign (GM)')
@@ -6806,6 +6890,10 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
       .addStringOption(o=>o.setName('campaign').setDescription('Which campaign').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('complete').setDescription('Close the arc (GM)')
       .addStringOption(o=>o.setName('campaign').setDescription('Which campaign').setRequired(true).setAutocomplete(true))),
+  // A message context-menu entry (long-press a message → Apps). It edits
+  // what the bot itself said — narration, recaps, announcements — so a GM
+  // can fix a spelling without reposting (T, 2026-09-28).
+  new ContextMenuCommandBuilder().setName('Edit (DDice)').setType(ApplicationCommandType.Message),
 ];
 
 // ─────────────────────────────────────────────
@@ -11826,6 +11914,9 @@ async function handleCheck(interaction) {
   const opt = (name) => checkLeaf ? checkLeaf === name : !!interaction.options?.getBoolean?.(name);
   // `run:true` builds whatever the code knows about and this server hasn't
   // got yet — the one switch to pull after an update adds a book.
+  if (opt('stalled')) return showStalled(interaction);
+  if (opt('usage')) return showUsage(interaction);
+  if (opt('rehearse')) return startRehearsal(interaction);
   if (opt('roster')) return showRoster(interaction);
   if (opt('pages')) return rebuildCharPages(interaction);
   if (opt('portraits')) return runPortraitMigration(interaction);
@@ -12439,6 +12530,33 @@ async function routeButton(interaction) {
       return handleQuest(interaction, { sub: 'approve', group: 'party', number: parseInt(numS, 10), userId: uidS, overrideSeat: true });
     }
 
+    if (interaction.customId.startsWith('qreopen:')) {
+      // Five minutes to take a completion back: merits reversed, this run's
+      // titles revoked, the run set winding-down so the party is free while
+      // the GM fixes what was wrong. The chronicle tale and review button
+      // are left standing \u2014 a second completion rewrites the tale in place.
+      if (!(await isGm(interaction.guild, interaction.user.id)))
+        return interaction.reply({ ephemeral: true, content: '\u274C Only a GM can reopen a run.' });
+      const gidR = interaction.guild.id, numR = parseInt(interaction.customId.split(':')[1], 10);
+      const q = getQuest(gidR, numR);
+      let snap = null; try { snap = JSON.parse(q?.completion_snapshot || 'null'); } catch {}
+      if (!q || q.status !== 'completed' || !snap)
+        return interaction.reply({ ephemeral: true, content: '\u274C Nothing to reopen.' });
+      if (Date.now() - snap.at > 5 * 60 * 1000)
+        return interaction.reply({ ephemeral: true, content: '\u23F3 The five minutes have passed \u2014 reverse it by hand with `/standing merit` and `/quest edit`.' });
+      for (const id of snap.party || []) {
+        if (snap.merits) addMerits(gidR, id, -snap.merits);
+        if (snap.title) revokeTitle(gidR, id, snap.title);
+      }
+      updateQuest(gidR, numR, { status: 'active', winding_down: 1, paused: 1, completion_snapshot: null, elapsed_ms: snap.elapsed || 0 });
+      logQuestEvent(gidR, numR, 'note', 'Completion reopened \u2014 payout reversed', interaction.user.id);
+      const gmR = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'a GM');
+      sendRollAudit(interaction.client, gidR, `\u21A9\uFE0F **${gmR}** reopened ${questTag(q)}: ${snap.merits || 0} merits reversed for ${(snap.party || []).length}${snap.title ? `, title \u201c${snap.title}\u201d revoked` : ''}`);
+      try { await interaction.message.edit({ components: [] }); } catch {}
+      return interaction.reply({ allowedMentions: { parse: [] },
+        content: `\u21A9\uFE0F **${questTag(q)}** reopened by **${gmR}** \u2014 payout reversed, party released. Fix it, then \`/quest run complete\` again.` });
+    }
+
     if (interaction.customId.startsWith('encjoin:') || interaction.customId.startsWith('encleave:')) {
       return handleEncounterPress(interaction);
     }
@@ -12761,6 +12879,12 @@ client.on('interactionCreate', async interaction => {
 
       // /dd's `as:` names an NPC too — the same list, so a GM never has to
       // remember a spelling the bot could have offered.
+      if (interaction.commandName === 'encounter' && (focusedOption.name === 'preset' || (focusedOption.name === 'name' && interaction.options.getSubcommandGroup(false) === 'preset'))) {
+        const v = String(focusedOption.value || '').toLowerCase();
+        const rows = db.prepare('SELECT name FROM encounter_presets WHERE guild_id=? ORDER BY name').all(interaction.guild.id);
+        return await interaction.respond(rows.filter(r => !v || r.name.toLowerCase().includes(v)).slice(0, 25)
+          .map(r => ({ name: r.name.slice(0, 100), value: r.name }))).catch(() => {});
+      }
       if (focusedOption.name === 'campaign' && ['campaign', 'encounter', 'quest'].includes(interaction.commandName)) {
         const v = String(focusedOption.value || '').toLowerCase();
         const rows = db.prepare("SELECT id, name, status FROM campaigns WHERE guild_id=? ORDER BY status, id").all(interaction.guild.id);
@@ -13175,6 +13299,13 @@ client.on('interactionCreate', async interaction => {
         })()] }).catch(() => null);
       return interaction.reply({ ephemeral: true, content: '✅ Sent to the GMs — they\'ll look it over in the Lore Docs approvals.' });
     }
+    if (interaction.customId.startsWith('questarch:')) {
+      const numA = parseInt(interaction.customId.split(':')[1], 10);
+      const text = interaction.fields.getTextInputValue('summary').trim();
+      return handleQuest(interaction, { sub: 'archive', number: numA, summary: text, skipSummary: true });
+    }
+    if (interaction.customId.startsWith('botedit:')) return saveBotEdit(interaction);
+
     if (interaction.customId.startsWith('fightfeint:')) {
       const targetId = interaction.customId.split(':')[1];
       const claim = interaction.fields.getTextInputValue('claim').trim();
@@ -13304,7 +13435,19 @@ client.on('interactionCreate', async interaction => {
     }
   }
 
+  if (interaction.isMessageContextMenuCommand?.() && interaction.commandName === 'Edit (DDice)') {
+    return openBotEdit(interaction).catch(e => console.error('[edit]', e?.message || e));
+  }
   if (!interaction.isChatInputCommand()) return;
+  // Count the use. Grouped leaves count as group/leaf; failures count too —
+  // a command people try and fail at is still a command people reach for.
+  try {
+    const g = interaction.options?.getSubcommandGroup?.(false), l = interaction.options?.getSubcommand?.(false);
+    const leaf = [g, l].filter(Boolean).join('/') || '-';
+    db.prepare(`INSERT INTO command_uses (guild_id, command, leaf, count, last_at) VALUES (?,?,?,1,?)
+                ON CONFLICT(guild_id, command, leaf) DO UPDATE SET count=count+1, last_at=excluded.last_at`)
+      .run(interaction.guild?.id ?? 'dm', interaction.commandName, leaf, Date.now());
+  } catch {}
   try {
     if (interaction.commandName === 'dnd') return await handleDnd(interaction);
     if (interaction.commandName === 'library') return await handleLibrary(interaction);
@@ -16455,10 +16598,55 @@ async function handleTitles(interaction, group) {
 // A short session run on the fly. It is a quest row with kind='encounter':
 // no listing, no applications, no staging — created and started in one
 // command, in the channel it is happening in (T, 2026-09-24).
+// "Goblin x3, Orc" → temporary NPCs from the library, exactly as
+// `/library summon temp:true` makes them. Returns what stepped out.
+function summonSpec(gid, spec) {
+  const made = [], missing = [];
+  for (const part of String(spec || '').split(',').map(x => x.trim()).filter(Boolean)) {
+    const m = part.match(/^(.*?)(?:\s*[x\u00d7]\s*(\d{1,2}))?$/i);
+    const name = (m?.[1] || part).trim(), count = Math.min(12, Math.max(1, parseInt(m?.[2] || '1', 10)));
+    const mon = db.prepare('SELECT * FROM library_monsters WHERE guild_id=? AND name=? COLLATE NOCASE').get(gid, name);
+    if (!mon) { missing.push(name); continue; }
+    for (let i = 1; i <= count; i++) {
+      const nm = count > 1 ? `${mon.name} ${i}` : mon.name;
+      if (getNpc(gid, nm)) continue;
+      upsertNpc(gid, nm, {
+        armour_class: mon.ac, attack_bonus: mon.attack, damage_dice: mon.damage,
+        max_hp: mon.hp, hp_current: mon.hp,
+        str: mon.str, dex: mon.dex, con: mon.con, int: mon.int, wis: mon.wis, cha: mon.cha,
+        is_temp: 1, temp_at: Date.now(),
+      });
+      made.push(nm);
+    }
+  }
+  return { made, missing };
+}
+
 async function handleEncounter(interaction) {
   const gid = interaction.guild.id, uid = interaction.user.id;
   const sub = interaction.options.getSubcommand();
+  const group = interaction.options.getSubcommandGroup(false);
   const gm = await isGm(interaction.guild, uid);
+
+  if (group === 'preset') {
+    if (sub === 'list') {
+      const rows = db.prepare('SELECT * FROM encounter_presets WHERE guild_id=? ORDER BY name').all(gid);
+      if (!rows.length) return interaction.reply({ ephemeral: true, content: '\u{1F3AF} No saved scenes yet \u2014 `/encounter preset save`.' });
+      return interaction.reply({ ephemeral: true, content: ['\u{1F3AF} **Saved scenes**',
+        ...rows.map(r => `\u00b7 **${r.name}** \u2014 ${r.merits || 0} merits${r.npcs ? ` \u00b7 ${r.npcs}` : ''}`)].join('\n').slice(0, 1900) });
+    }
+    if (!gm) return interaction.reply({ content: '\u274C Only GMs keep scenes.', ephemeral: true });
+    const nameP = interaction.options.getString('name').trim().slice(0, 80);
+    if (sub === 'remove') {
+      const gone = db.prepare('DELETE FROM encounter_presets WHERE guild_id=? AND name=? COLLATE NOCASE').run(gid, nameP).changes;
+      return interaction.reply({ ephemeral: true, content: gone ? `\u2705 Forgot **${nameP}**.` : `\u274C No scene called **${nameP}**.` });
+    }
+    const npcsP = (interaction.options.getString('npcs') || '').trim().slice(0, 200) || null;
+    db.prepare(`INSERT INTO encounter_presets (guild_id, name, merits, npcs, by_id, at) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(guild_id, name) DO UPDATE SET merits=excluded.merits, npcs=excluded.npcs, by_id=excluded.by_id, at=excluded.at`)
+      .run(gid, nameP, interaction.options.getInteger('merits') ?? 0, npcsP, uid, Date.now());
+    return interaction.reply({ ephemeral: true, content: `\u2705 Scene **${nameP}** saved \u2014 \`/encounter start name:${nameP} preset:${nameP}\` runs it.` });
+  }
 
   if (sub === 'list') {
     const rows = db.prepare("SELECT * FROM quests WHERE guild_id=? AND kind='encounter' AND status='active' ORDER BY number").all(gid);
@@ -16471,8 +16659,11 @@ async function handleEncounter(interaction) {
   if (!gm) return interaction.reply({ content: '\u274C Only GMs run encounters.', ephemeral: true });
 
   if (sub === 'start') {
+    const presetName = (interaction.options.getString('preset') || '').trim();
+    const preset = presetName ? db.prepare('SELECT * FROM encounter_presets WHERE guild_id=? AND name=? COLLATE NOCASE').get(gid, presetName) : null;
+    if (presetName && !preset) return interaction.reply({ ephemeral: true, content: `\u274C No scene called **${presetName}**.` });
     const name = interaction.options.getString('name').trim().slice(0, 80);
-    const merits = interaction.options.getInteger('merits') ?? 0;
+    const merits = interaction.options.getInteger('merits') ?? preset?.merits ?? 0;
     const players = parsePlayerMentions(interaction.options.getString('players'));
     const campRaw = (interaction.options.getString('campaign') || '').trim();
     let camp = campRaw ? findCampaign(gid, campRaw) : null;
@@ -16501,6 +16692,11 @@ async function handleEncounter(interaction) {
     const row = new ER().addComponents(
       new EB().setCustomId(`encjoin:${number}`).setLabel('\u2694\uFE0F Join').setStyle(ES.Success),
       new EB().setCustomId(`encleave:${number}`).setLabel('\u{1F6AA} Step out').setStyle(ES.Secondary));
+    let stepped = null;
+    if (preset?.npcs) {
+      stepped = summonSpec(gid, preset.npcs);
+      if (stepped.made.length) try { noteQuestActivity(gid, interaction.channel?.id, 'combat', `${stepped.made.length} summoned: ${stepped.made.join(', ')}`, uid); } catch {}
+    }
     const named = [];
     for (const id of players) named.push(await getDisplayName(interaction.guild, id));
     await interaction.reply({ allowedMentions: { users: players }, content: [
@@ -16508,6 +16704,8 @@ async function handleEncounter(interaction) {
       camp ? `_Part of **${camp.name}**._` : '',
       named.length ? `In it: ${named.join(', ')}` : 'Nobody seated yet \u2014 press **Join**.',
       merits ? `\u{1F396}\uFE0F **${merits}** merits each at the end.` : '',
+      stepped?.made?.length ? `\u{1F9DF} Out of the library: ${stepped.made.join(', ')}` : '',
+      stepped?.missing?.length ? `\u26A0\uFE0F Not in the library: ${stepped.missing.join(', ')}` : '',
       '', '_Notes, recap and winddown work by number: `/quest run note number:' + number + '`. `/encounter end` finishes it._',
     ].filter(Boolean).join('\n'), components: [row] });
     try { await syncQuestBook(interaction.client, interaction.guild, gid, quest); } catch {}
@@ -16559,7 +16757,7 @@ function campaignCardText(guild, gid, camp) {
   const parts = campaignParticipants(gid, camp.id);
   const merits = done.reduce((a, q) => a + (q.merit_reward || 0) * getQuestMembers(gid, q.number, 'party').length, 0);
   const notes = db.prepare('SELECT text, at FROM campaign_notes WHERE guild_id=? AND campaign_id=? ORDER BY at DESC LIMIT 5').all(gid, camp.id);
-  const mark = (q) => q.status === 'completed' ? '\u2705' : q.status === 'active' ? (q.winding_down ? '\u{1F6CC}' : '\u25B6\uFE0F') : '\u{1F4CB}';
+  const mark = (q) => q.archived_at ? '\u{1F4E6}' : q.status === 'completed' ? '\u2705' : q.status === 'active' ? (q.winding_down ? '\u{1F6CC}' : '\u25B6\uFE0F') : '\u{1F4CB}';
   const kindOf = (q) => isEncounter(q) ? ' \u{1F3AF}' : q.instance_of ? '' : ' \u{1F4DC}';
   return [
     `\u{1F5FA}\uFE0F **${camp.name}**${camp.status === 'completed' ? ' \u2014 _completed_' : ''}`,
@@ -16709,6 +16907,76 @@ async function handleCampaign(interaction) {
     refreshCampaignCard(interaction.client, interaction.guild, camp.id).catch(() => {});
     return interaction.reply({ content: `\u{1F3C1} **${camp.name}** is complete \u2014 ${campaignParticipants(gid, camp.id).length} adventurers saw it through.` });
   }
+}
+
+// ── Editing what the bot said ────────────────────────────────────────
+// Long-press → Apps → Edit (DDice). Only the bot's own messages, and only
+// a GM; the modal opens prefilled and the save is recorded in the audit
+// book with what changed. Webhook speech (/npc say) is a different animal
+// and is not covered here.
+// A WebhookClient for a webhook the bot stored for this channel (or its
+// parent, for a thread), but only if the id matches — never someone
+// else's hook.
+function ownWebhookFor(gid, channel, webhookId) {
+  try {
+    const host = webhookHost(channel);
+    if (!host) return null;
+    const rows = db.prepare('SELECT webhook_id, webhook_token FROM npc_webhooks WHERE guild_id=? AND channel_id=?').all(gid, host.id);
+    const hit = rows.find(r => r.webhook_id === webhookId && r.webhook_token);
+    if (!hit) return null;
+    const { WebhookClient } = require('discord.js');
+    return new WebhookClient({ id: hit.webhook_id, token: hit.webhook_token });
+  } catch { return null; }
+}
+
+async function openBotEdit(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ ephemeral: true, content: '\u274C Only GMs can edit what the bot said.' });
+  const msg = interaction.targetMessage;
+  // NPC speech is posted by a webhook the bot owns; the message's author is
+  // the webhook, and the bot keeps its id and token per channel. So a
+  // webhook message counts as ours when the hook is ours (T, 2026-09-29).
+  const hook = msg?.webhookId ? ownWebhookFor(gid, interaction.channel, msg.webhookId) : null;
+  if (!msg || (msg.author?.id !== interaction.client.user.id && !hook))
+    return interaction.reply({ ephemeral: true, content: '\u274C I can only edit what I posted \u2014 my own messages and my NPCs\u2019 speech.' });
+  if (msg.components?.length)
+    return interaction.reply({ ephemeral: true, content: '\u274C That message carries buttons; its text is managed by the bot and should not be hand-edited.' });
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+  const m = new ModalBuilder().setCustomId(`botedit:${msg.channelId}:${msg.id}`).setTitle('Edit what the bot said');
+  m.addComponents(new ActionRowBuilder().addComponents(
+    new TextInputBuilder().setCustomId('text').setLabel('The message').setStyle(TextInputStyle.Paragraph)
+      .setRequired(true).setMaxLength(4000).setValue(String(msg.content || '').slice(0, 4000))));
+  return interaction.showModal(m);
+}
+
+async function saveBotEdit(interaction) {
+  const [, channelId, messageId] = interaction.customId.split(':');
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ ephemeral: true, content: '\u274C Only GMs can edit what the bot said.' });
+  const text = interaction.fields.getTextInputValue('text');
+  if (!text.trim()) return interaction.reply({ ephemeral: true, content: '\u274C Nothing to save \u2014 the message cannot be emptied.' });
+  const ch = await interaction.client.channels.fetch(channelId).catch(() => null);
+  const msg = ch ? await ch.messages.fetch(messageId).catch(() => null) : null;
+  if (!msg || (msg.author?.id !== interaction.client.user.id && !(msg.webhookId && ownWebhookFor(gid, ch, msg.webhookId))))
+    return interaction.reply({ ephemeral: true, content: '\u274C That message is gone, or not mine.' });
+  const before = String(msg.content || '');
+  let ok2;
+  if (msg.webhookId) {
+    const hook = ownWebhookFor(gid, ch, msg.webhookId);
+    if (!hook) return interaction.reply({ ephemeral: true, content: '\u274C That was said through a webhook I no longer hold.' });
+    const inThread = typeof ch.isThread === 'function' && ch.isThread();
+    ok2 = await hook.editMessage(messageId, { content: text.slice(0, 2000), ...(inThread ? { threadId: ch.id } : {}) })
+      .then(() => true).catch(() => false);
+  } else {
+    ok2 = await msg.edit({ content: text.slice(0, 4000) }).then(() => true).catch(() => false);
+  }
+  if (!ok2) return interaction.reply({ ephemeral: true, content: '\u274C Discord refused the edit.' });
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'a GM');
+  sendRollAudit(interaction.client, gid,
+    `\u270F\uFE0F Edit \u2014 **${gmName}** in <#${channelId}>: \u201c${before.slice(0, 80)}${before.length > 80 ? '\u2026' : ''}\u201d \u2192 \u201c${text.slice(0, 80)}${text.length > 80 ? '\u2026' : ''}\u201d`);
+  return interaction.reply({ ephemeral: true, content: '\u2705 Edited.' });
 }
 
 async function handleDd(interaction) {
@@ -18373,11 +18641,13 @@ async function handleFight(interaction, forced) {
 
     const fighters = [];
     // Players from the @mention list
-    for (const id of parsePlayerMentions(interaction.options?.getString?.('players'))) {
+    const fPlayers = (forced && typeof forced === 'object') ? forced.players : null;
+    const fNpcs = (forced && typeof forced === 'object') ? forced.npcs : null;
+    for (const id of parsePlayerMentions(fPlayers ?? interaction.options?.getString?.('players'))) {
       fighters.push(id);
     }
     // GM NPCs from the comma list (only a GM may add NPCs)
-    const npcNames = expandNpcList(gid, interaction.options?.getString?.('npcs'));
+    const npcNames = expandNpcList(gid, fNpcs ?? interaction.options?.getString?.('npcs'));
     if (npcNames.length && !(await isGm(interaction.guild, uid))) {
       return interaction.reply({ content: '❌ Only GMs can add NPCs to a fight.', ephemeral: true });
     }
@@ -20729,11 +20999,17 @@ const HELP_CATEGORIES = {
       '`/quest run start/note/pause/resume/timeline/complete` — the running of a quest: start the clock · log a detail · pause and resume · read the full log so far · finish and reward (GM)',
       '`/quest instance number:N [label:]` — run your own copy: it keeps the original\'s number and adds which run it is — `#002.2-Testing the waters · Blackfen party` (GM)',
       '`/quest run start number:N` — lock the party and mark in progress (GM)',
-      '`/quest run pause|resume number:N` \u2014 stop and restart the clock; a paused run logs nothing until resumed',
+      '`/quest run pause|resume number:N` \u2014 stop and restart the clock (a pause rounds it up to the quarter-hour); a paused run logs nothing until resumed',
       '`/quest run note number:N text:... kind:rp|combat|note [public:true]` \u2014 mark a moment in the run\'s account',
       '`/quest timeline number:N` \u2014 the raw log \u00b7 `/quest run recap number:N [post:true]` \u2014 a "previously on\u2026" drafted from it, private until you post it (GM)',
-      '`/quest run winddown number:N [resume:true]` \u2014 the story is over but rewards are not settled: the run stays live, and its party is released to the rests while you decide (GM)',
+      '`/quest run winddown number:N [resume:true]` \u2014 the story is over but rewards are not settled: the run stays live, its party is released to the rests and free to join other quests, and anyone kicked now is still paid at completion (GM)',
       '`/quest run log number:N text:...` \u2014 your telling of a finished run, into each player\'s chronicle thread; rewrites edit in place (GM)',
+      '`/quest archive number:N [summary:]` \u2014 the final shelf. Leave `summary:` blank and a box opens for the final word; it goes on the record, into the run\'s thread and the GM quest log, and marks the campaign card. A completed quest stays completed on everyone\'s record (GM)',
+      '**\u21A9\uFE0F Reopen** \u2014 a completion message carries a Reopen button for five minutes: the payout is reversed, this run\'s titles revoked, the party released; fix it and complete again (GM)',
+      '`/encounter preset save name:... [merits:] [npcs:Goblin x3, Orc]` \u2014 a saved scene; `/encounter start ... preset:` runs it with the merits set and the monsters summoned as temps \u00b7 `/encounter preset list|remove` (GM)',
+      '`/gm check stalled` \u2014 what is waiting on a GM: winding-down runs, quiet encounters, staged parties never launched, idle campaigns, reviews this week. A weekly digest of the same lands in gm-quest-log (GM)',
+      '`/gm check usage` \u2014 sixty days of command use, quietest first \u2014 a report only; nothing is removed by it \u00b7 `/gm check rehearse` \u2014 a private sparring thread against a dummy the bot runs, to try new buttons before the table sees them (GM)',
+      '`/help category:rules` \u2014 the live table rules, as the bot enforces them, for everyone. Every deploy posts **What\'s new** to the GM log (and a player version to the docs channel) and a **Deploy mend** line saying what it built',
       '`/instance add|kick|rally|note|pause|resume|complete|show|thread name:...` \u2014 the same by NAME rather than number; leave `name:` blank inside a run\'s own thread (GM)',
       '_One quest at a time: approving someone already seated on a live run prompts for a second press to override (audited), and a launch leaves them an applicant rather than double-booking them._',
       '`/encounter start name:... [players:@a @b] [merits:] [campaign:]` \u2014 a short session run on the fly, here and now: no board, no applications. A Join button seats whoever is present; `/encounter end [summary:] [title:]` pays out, writes the chronicle and posts the review button. Encounters do not count toward one-quest-at-a-time; one left quiet six hours reminds the room and pings the GMs (GM)',
@@ -20844,6 +21120,7 @@ const HELP_CATEGORIES = {
       '`/button group stat:wis dc:12 reason:...` \u2014 one check the whole party rolls; the message keeps the tally and \u2696\uFE0F Call it closes it with how many got through (GM)',
       '`/target create name:Barricade stat:str dc:12` \u2014 something to strike, with no sheet; each hit asks the GM \u{1FAA6} It falls / \u{1F6E1}\uFE0F It holds; `secret:true` asks in the GM log instead \u00b7 `/target list`',
       '`/dd message:... [header:] [user:@a] [channels:#one #two]` \u2014 speak AS THE BOT: plain words by default, a bold header only if you write one, in every channel you name (or here); who said it goes to the roll-audit, not the room (GM)',
+      '**Edit (DDice)** \u2014 long-press any message the bot sent \u2192 Apps \u2192 Edit (DDice): the text opens prefilled, save replaces it, the roll-audit records what changed. Covers the bot\'s own messages and NPC speech from `/npc say` alike (GM)',
       '`/feedback send [room:] [quest:]` \u2014 name a room to go straight to the form, or leave it blank for a menu; score it out of ten, say your piece; only GMs see it. Name a run you were on (or ran) and the card says which',
       '`/feedback category add|remove|list` \u2014 the rooms feedback lands in (GM) \u00b7 `/button feedback` plants a standing feedback button',
       '_A completed run posts its own \u{1F4DD} review button in its thread; `/quest run show` then carries the count, the average \u2b50 and the latest lines._',
@@ -21092,6 +21369,12 @@ async function handleScrollModal(interaction) {
 }
 
 async function handleHelp(interaction) {
+  // `/help category:rules` prints the live RULES table \u2014 the rules the bot
+  // actually plays by, readable by everyone, in the same words the books use.
+  if (interaction.options?.getString?.('category') === 'rules') {
+    return interaction.reply({ ephemeral: true, content: ['\u{1F4DC} **The table rules** \u2014 as the bot enforces them', '',
+      ...RULES.map(r => `\u00b7 ${ruleText(r)}`)].join('\n').slice(0, 1900) });
+  }
   const cat = interaction.options.getString('category');
   const gm = await isGm(interaction.guild, interaction.user.id);
   const handbook = playerHandbookLink(interaction.guild.id);
@@ -21954,6 +22237,14 @@ async function renderQuest(guild, quest, { applyHint = true } = {}) {
   if (quest.merit_reward > 0) rewardBits.push(`🎖️ **${quest.merit_reward}** merit${quest.merit_reward === 1 ? '' : 's'} each (auto-awarded)`);
   if (quest.rewards) rewardBits.push(`🎁 ${quest.rewards}`);
   if (rewardBits.length) lines.push(`**Rewards**\n${rewardBits.join('\n')}\n`);
+  // The clock, on the record: what a run took, or how long it has run so
+  // far. Kept in elapsed_ms all along, but never shown here (T, 2026-09-29).
+  if (quest.instance_of || isEncounter(quest)) {
+    const ranMs = quest.status === 'active' ? questElapsed(quest) : Number(quest.elapsed_ms) || 0;
+    if (ranMs > 0) lines.push(`\u23F1\uFE0F ${quest.status === 'active' ? 'Running for' : 'Ran for'} **${fmtElapsed(ranMs)}**`, '');
+  }
+  // The final word, if the GM wrote one at archive time.
+  if (quest.archive_summary) lines.push(`\u{1F4DC} **The final word**\n${String(quest.archive_summary).slice(0, 700)}`, '');
   // How the run landed, from the reviews that named it (T, 2026-09-07).
   try {
     const rs = db.prepare('SELECT scale, body FROM feedback_log WHERE guild_id=? AND quest_number=? ORDER BY at DESC').all(guild.id, quest.number);
@@ -22757,6 +23048,48 @@ async function healChannelPerms(guild) {
 // forum threads, new page blocks, new features. It only ever ADDS. A guild
 // that has never been set up is skipped entirely, so the bot never
 // conjures channels into a server that did not ask (T, 2026-08-19).
+// ── Changelog ──────────────────────────────────────────────────────
+// One entry per push, newest first. Each feature adds its line here as it
+// is built, the way it adds a pin. On boot, unseen entries go to the GM log
+// and player-tagged lines to the player docs channel (T, 2026-09-29).
+const CHANGELOG = [
+  { key: '2026-09-29', gm: [
+      '\u21A9\uFE0F **Reopen** \u2014 a completion can be taken back within five minutes',
+      '`/gm check stalled` \u2014 what is waiting on a GM; a weekly digest lands here',
+      '`/encounter preset` \u2014 saved scenes that summon their own monsters',
+      '`/quest archive` \u2014 invites a final word; a completed quest stays completed',
+      'A kick during winding-down keeps the player\'s share; a winding-down seat no longer blocks other quests',
+      'Edit (DDice) \u2014 long-press any bot or NPC message \u2192 Apps to fix it',
+      '`/gm check usage` \u2014 which commands are actually used \u00b7 `/gm check rehearse` \u2014 a private sparring thread \u00b7 `/config rules` \u2014 the live table rules',
+      'Fixed: `/library summon temp:true` never made a temp and lost 5e stats',
+    ], player: [
+      'A pause now rounds the clock up to the quarter-hour',
+      'Your seat on a quest that is winding down no longer stops you joining another',
+    ] },
+  { key: '2026-09-25', gm: [
+      '`/gm check roster` \u2014 where every player is, and what holds them',
+      'Campaigns (`/campaign`) and encounters (`/encounter`)',
+      'The campaigns forum is built on boot if missing',
+    ], player: [
+      '`/feedback send room:` \u2014 name the room to go straight to the form',
+    ] },
+];
+
+async function announceChangelog(client, guild) {
+  const gid = guild.id;
+  const cfg = getConfig(gid) || {};
+  const seen = cfg.changelog_seen || '';
+  const fresh = CHANGELOG.filter(e => e.key > seen);
+  if (!fresh.length) return;
+  setConfig(gid, { changelog_seen: CHANGELOG[0].key });
+  const gmLines = fresh.flatMap(e => [`**${e.key}**`, ...e.gm.map(l => `\u00b7 ${l}`), '']);
+  const plLines = fresh.flatMap(e => e.player.length ? [`**${e.key}**`, ...e.player.map(l => `\u00b7 ${l}`), ''] : []);
+  const gmCh = cfg.quest_log_gm ? await client.channels.fetch(cfg.quest_log_gm).catch(() => null) : null;
+  if (gmCh?.send && gmLines.length) await gmCh.send({ content: ['\u{1F4F0} **What\'s new**', '', ...gmLines].join('\n').slice(0, 1900) }).catch(() => {});
+  const plCh = cfg.docs_player_channel ? await client.channels.fetch(cfg.docs_player_channel).catch(() => null) : null;
+  if (plCh?.send && plLines.length) await plCh.send({ content: ['\u{1F4F0} **What\'s new for players**', '', ...plLines].join('\n').slice(0, 1900) }).catch(() => {});
+}
+
 async function bootMend(client) {
   for (const [gid, guild] of client.guilds.cache) {
     const cfg = getConfig(gid) || {};
@@ -22768,6 +23101,15 @@ async function bootMend(client) {
     try {
       const made = await mendEverything(client, guild);
       if (made.length) console.log(`[mend] ${guild.name}: ${made.join(' \u00b7 ')}`);
+      // A deploy announces what it did, in the GM log rather than only on
+      // the host's console (T, 2026-09-29).
+      if (made.length) {
+        const logId = (getConfig(gid) || {}).quest_log_gm;
+        const ch = logId ? await client.channels.fetch(logId).catch(() => null) : null;
+        if (ch?.send) await ch.send({ content: `\u{1F527} **Deploy mend** \u2014 ${made.join(' \u00b7 ')}` }).catch(() => {});
+      }
+      // And what changed, if anything is new since the last boot.
+      await announceChangelog(client, guild).catch(e => console.error('[changelog]', e?.message || e));
     } catch (e) { console.log(`[mend] ${guild.name}: ${e?.message || e}`); }
   }
 }
@@ -22782,6 +23124,85 @@ async function bootMend(client) {
 // a session starts, a rest misfires, or someone says they were skipped
 // (T, 2026-08-22). Reads the same sources the rest does, so it can never
 // disagree with what the rest actually did.
+// "What is waiting on the GM side?" \u2014 the mirror of the roster. One
+// builder serves the on-demand view and the weekly digest (T, 2026-09-29).
+// Sixty days of use, quietest first, so the next fold is decided by
+// evidence. It reports; the GM decides; nothing is removed by it.
+// A private sparring thread: the GM's own character against a temporary
+// dummy the bot runs, so every button can be pressed before the table sees
+// a new one. It is the probe walk, live (T, 2026-09-29).
+async function startRehearsal(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  if (!(await isGm(interaction.guild, uid)))
+    return interaction.reply({ content: '\u274C Rehearsals are for GMs.', ephemeral: true });
+  if (!getChar(gid, uid)) return interaction.reply({ ephemeral: true, content: '\u274C You need a character of your own to spar with \u2014 `/char create`.' });
+  const parent = interaction.channel?.isThread?.() ? await interaction.client.channels.fetch(interaction.channel.parentId).catch(() => null) : interaction.channel;
+  if (!parent?.threads?.create) return interaction.reply({ ephemeral: true, content: '\u274C I cannot open a thread here.' });
+  const thread = await parent.threads.create({ name: `\u{1F94A} Rehearsal \u2014 ${await getDisplayName(interaction.guild, uid)}`.slice(0, 100), type: 12, invitable: false })
+    .catch(() => null);
+  if (!thread) return interaction.reply({ ephemeral: true, content: '\u274C Discord would not open a private thread here \u2014 check my Create Private Threads permission.' });
+  await thread.members.add(uid).catch(() => {});
+  const dummy = 'Sparring Dummy';
+  if (!getNpc(gid, dummy)) upsertNpc(gid, dummy, { str: 3, con: 4, dex: 2, wis: 2, lck: 1, hp_current: 6, is_temp: 1, temp_at: Date.now() });
+  await interaction.reply({ ephemeral: true, content: `\u{1F94A} Rehearsal open in <#${thread.id}> \u2014 the dummy fights back on its own. \`/fight end\` in there when you are done; the dummy is swept with the fight.` });
+  // Start the fight IN the thread, as the GM, with the dummy running itself.
+  const proxy = Object.create(interaction);
+  proxy.channel = thread; proxy.channelId = thread.id;
+  proxy.replied = false; proxy.deferred = false;
+  proxy.reply = (p) => thread.send(typeof p === 'string' ? { content: p } : { ...p, ephemeral: undefined });
+  proxy.editReply = proxy.reply; proxy.followUp = proxy.reply;
+  proxy.deferReply = async () => {};
+  await handleFight(proxy, { sub: 'start', players: `<@${uid}>`, npcs: dummy }).catch(e => console.error('[rehearse]', e?.message || e));
+  try { upsertFight(gid, thread.id, { auto_npc: 1 }); } catch {}
+  try { await kickAutoIfNpcTurn(interaction.guild, gid, thread.id, thread); } catch {}
+}
+
+async function showUsage(interaction) {
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '\u274C The usage report is for GMs.', ephemeral: true });
+  const gid = interaction.guild.id;
+  const since = Date.now() - 60 * 86400000;
+  const rows = db.prepare('SELECT command, leaf, count, last_at FROM command_uses WHERE guild_id=? ORDER BY command, leaf').all(gid);
+  if (!rows.length) return interaction.reply({ ephemeral: true, content: '\u{1F4CA} Nothing counted yet \u2014 counts begin with this deploy.' });
+  const recent = rows.filter(r => (r.last_at || 0) >= since);
+  const byCmd = new Map();
+  for (const r of recent) byCmd.set(r.command, (byCmd.get(r.command) || 0) + r.count);
+  const quiet = rows.filter(r => (r.last_at || 0) < since).map(r => `/${r.command} ${r.leaf === '-' ? '' : r.leaf}`.trim());
+  const lines = ['\u{1F4CA} **Command use, last sixty days** \u2014 report only; nothing is removed by this', '',
+    ...[...byCmd.entries()].sort((a, b) => a[1] - b[1]).map(([c, n]) => `\u00b7 /${c} \u2014 **${n}**`)];
+  if (quiet.length) lines.push('', `\u{1F4A4} **Not used in sixty days:** ${quiet.slice(0, 30).join(', ')}${quiet.length > 30 ? '\u2026' : ''}`);
+  return interaction.reply({ ephemeral: true, content: lines.join('\n').slice(0, 1900) });
+}
+
+function stalledReport(guild) {
+  const gid = guild.id;
+  const now = Date.now();
+  const out = [];
+  const winding = db.prepare("SELECT * FROM quests WHERE guild_id=? AND status='active' AND COALESCE(winding_down,0)=1 ORDER BY number").all(gid);
+  if (winding.length) out.push(`\u{1F6CC} **Winding down, not completed** \u2014 ${winding.map(q => questTag(q)).join(', ')}`);
+  const quiet = db.prepare("SELECT * FROM quests WHERE guild_id=? AND status='active' AND kind='encounter' ORDER BY number").all(gid)
+    .filter(q => now - (Number(q.last_activity) || Number(q.started_at) || now) >= ENCOUNTER_IDLE_MS);
+  if (quiet.length) out.push(`\u{1F3AF} **Encounters gone quiet** \u2014 ${quiet.map(q => `${questTag(q)} (${Math.round((now - (Number(q.last_activity) || Number(q.started_at) || now)) / 3600000)}h)`).join(', ')}`);
+  const staged = db.prepare("SELECT * FROM quests WHERE guild_id=? AND instance_of IS NULL AND status='open' ORDER BY number").all(gid)
+    .filter(q => getQuestMembers(gid, q.number, 'party').length > 0);
+  if (staged.length) out.push(`\u{1F4CB} **Staged, never launched** \u2014 ${staged.map(q => `${questTag(q)} (${getQuestMembers(gid, q.number, 'party').length} seated)`).join(', ')}`);
+  const idleCamps = db.prepare("SELECT * FROM campaigns WHERE guild_id=? AND status='active'").all(gid)
+    .filter(c => { const es = campaignEntries(gid, c.id); const last = Math.max(0, ...es.map(q => Number(q.created_at) || 0)); return !es.length || now - Math.max(last, Number(c.created_at) || 0) > 30 * 86400000; });
+  if (idleCamps.length) out.push(`\u{1F5FA}\uFE0F **Campaigns with nothing new in a month** \u2014 ${idleCamps.map(c => c.name).join(', ')}`);
+  const fb = db.prepare('SELECT COUNT(*) AS n FROM feedback_log WHERE guild_id=? AND at > ?').get(gid, now - 7 * 86400000)?.n || 0;
+  if (fb) out.push(`\u{1F4DD} **${fb}** review${fb === 1 ? '' : 's'} in the last seven days \u2014 see gm-feedback`);
+  return out;
+}
+
+async function showStalled(interaction) {
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '\u274C The stalled view is for GMs.', ephemeral: true });
+  const out = await stalledReport(interaction.guild);
+  return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] }, content: out.length
+    ? ['\u{1F6A7} **Waiting on a GM**', '', ...out].join('\n').slice(0, 1900)
+    : '\u2705 Nothing is waiting on a GM.' });
+}
+
 async function showRoster(interaction) {
   if (!(await isGm(interaction.guild, interaction.user.id)))
     return interaction.reply({ content: '\u274C The roster is for GMs.', ephemeral: true });
@@ -23610,6 +24031,11 @@ async function handleQuest(interaction, forced) {
       lines.push('**Party:**');
       for (const id of party) lines.push(`✅ ${await getDisplayName(interaction.guild, id)}`);
     } else lines.push('_No party members yet._');
+    const departed = getQuestMembers(gid, number, 'departed');
+    if (departed.length) {
+      lines.push('', '**Departed \u2014 still paid at completion:**');
+      for (const id of departed) lines.push(`\u00b7 ${await getDisplayName(interaction.guild, id)}`);
+    }
     if (applied.length) {
       lines.push('', '**Applicants:**');
       for (const id of applied) lines.push(`⏳ ${await getDisplayName(interaction.guild, id)}`);
@@ -23845,6 +24271,17 @@ async function handleQuest(interaction, forced) {
     if (!quest) return;
     const number = quest.number;
     const target = (forced?.userId ? { id: forced.userId } : interaction.options?.getUser?.('user'));
+    // The story is told, the rewards are pending: a kick now must not cost
+    // the player their share. They become 'departed' — free to rest and to
+    // sit elsewhere, still paid and chronicled at completion (T, 2026-09-28).
+    if (quest.winding_down && getQuestMembers(gid, number, 'party').includes(target.id)) {
+      setQuestMember(gid, number, target.id, 'departed');
+      logQuestEvent(gid, number, 'note', `${await getDisplayName(interaction.guild, target.id)} departs before the payout`, uid);
+      const nmD = await getDisplayName(interaction.guild, target.id);
+      const roomD = quest.run_thread_id || quest.run_channel_id;
+      if (roomD) { const chD = await interaction.client.channels.fetch(roomD).catch(() => null); if (chD?.send) await chD.send({ allowedMentions: { parse: [] }, content: `\u{1F462} **${nmD}** steps away from **${questTag(quest)}** \u2014 their share is kept for the payout.` }).catch(() => {}); }
+      return interaction.reply({ ephemeral: true, content: `\u2705 **${nmD}** is free to rest and join elsewhere; they are still paid when this completes.` });
+    }
     const removed = removeQuestMember(gid, number, target.id);
     if (!removed) return interaction.reply({ content: 'They\'re not on this quest.', ephemeral: true });
     await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, number));
@@ -24015,7 +24452,7 @@ async function handleQuest(interaction, forced) {
     if (sub === 'pause') {
       if (paused) return interaction.reply({ content: '❌ It is already paused.', ephemeral: true });
       // Bank the running stretch, then stop the clock.
-      updateQuest(gid, number, { elapsed_ms: questElapsed(quest), paused: 1, started_at: null });
+      updateQuest(gid, number, { elapsed_ms: Math.ceil(questElapsed(quest) / QUARTER_MS) * QUARTER_MS, paused: 1, started_at: null });
       await syncQuestBook(interaction.client, interaction.guild, gid, getQuest(gid, number));
       logQuestEvent(gid, number, 'pause', 'Paused', uid);
       await questAnnounce(interaction.client, getQuest(gid, number), `⏸️ Paused at **${fmtElapsed(questElapsed(getQuest(gid, number)))}**.`);
@@ -24100,10 +24537,33 @@ async function handleQuest(interaction, forced) {
   }
 
   if (sub === 'archive') {
-    const quest = await requireQuest(interaction, gid);
+    const quest = await requireQuest(interaction, gid, (forced && typeof forced === 'object') ? forced.number : null);
     if (!quest) return;
-    if (quest.status === 'completed') return interaction.reply({ content: '❌ Completed quests keep their record — nothing to archive.', ephemeral: true });
-    updateQuest(gid, quest.number, { status: 'archived', stage: 'archived' });
+    const forcedA = (forced && typeof forced === 'object') ? forced : {};
+    const epilogue = String(forcedA.summary ?? interaction.options?.getString?.('summary') ?? '').trim().slice(0, 1500);
+    // No summary given: invite one before the shelf closes. The modal replays
+    // this archive with the text (or none).
+    if (!epilogue && !forcedA.skipSummary) {
+      const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+      const m = new ModalBuilder().setCustomId(`questarch:${quest.number}`).setTitle(`Archive ${questTag(quest).slice(0, 36)}`);
+      m.addComponents(new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('summary').setLabel('The final word (leave blank for none)')
+          .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1500)));
+      return interaction.showModal(m);
+    }
+    // A completed quest keeps its status — players' completed lists depend on
+    // it — and is shelved by date; an open one is retired outright.
+    if (quest.status === 'completed') updateQuest(gid, quest.number, { archived_at: Date.now(), archive_summary: epilogue || null });
+    else updateQuest(gid, quest.number, { status: 'archived', stage: 'archived', archived_at: Date.now(), archive_summary: epilogue || null });
+    if (epilogue) {
+      logQuestEvent(gid, quest.number, 'note', `Archived — ${epilogue.slice(0, 200)}`, interaction.user.id);
+      const homeA = quest.run_thread_id || quest.run_channel_id;
+      if (homeA) { const chA = await interaction.client.channels.fetch(homeA).catch(() => null); if (chA?.send) await chA.send({ allowedMentions: { parse: [] }, content: `\u{1F4DC} **${questTag(quest)} — the final word**\n${epilogue}` }).catch(() => {}); }
+      const cfgA = getConfig(gid) || {};
+      if (cfgA.quest_log_gm) { const gl = await interaction.client.channels.fetch(cfgA.quest_log_gm).catch(() => null); if (gl?.send) await gl.send({ allowedMentions: { parse: [] }, content: `\u{1F4E6} **${questTag(quest)}** archived by ${await getDisplayName(interaction.guild, interaction.user.id)}\n${epilogue}` }).catch(() => {}); }
+      const campA = campaignOfQuest(gid, quest);
+      if (campA) refreshCampaignCard(interaction.client, interaction.guild, campA.id).catch(() => {});
+    }
     const fresh = getQuest(gid, quest.number);
     await refreshQuestPost(interaction.client, interaction.guild, fresh);   // the Apply button drops
     await questAnnounce(interaction.client, fresh, '🗄️ Taken off the board — applications are closed. `/quest post` re-lists it.');
@@ -24244,7 +24704,9 @@ async function handleQuest(interaction, forced) {
     if (!quest) return;
     const number = quest.number;
     if (quest.status === 'completed') return interaction.reply({ content: '❌ That quest is already completed.', ephemeral: true });
-    const party = getQuestMembers(gid, number, 'party');
+    // Everyone seated when the story ended is paid — including anyone who
+    // departed during the winding-down (see the kick above).
+    const party = [...new Set([...getQuestMembers(gid, number, 'party'), ...getQuestMembers(gid, number, 'departed')])];
     if (!party.length) return interaction.reply({ content: '❌ No party members to reward. Approve applicants first.', ephemeral: true });
 
     // This does several network round-trips (name lookups, post refresh, optional
@@ -24266,6 +24728,14 @@ async function handleQuest(interaction, forced) {
     const runMs = questElapsed(quest);
     logQuestEvent(gid, number, 'end', 'Quest complete', uid);
     updateQuest(gid, number, { status: 'completed', elapsed_ms: runMs, paused: 1, started_at: null });
+    // Snapshot for Reopen: reversal needs to know exactly what was done.
+    try {
+      const wasWinding = !!quest.winding_down;
+      updateQuest(gid, number, { completion_snapshot: JSON.stringify({
+        at: Date.now(), party, merits: quest.merit_reward || 0,
+        title: String(((forced && typeof forced === 'object') ? forced.title : null) ?? interaction.options?.getString?.('title') ?? '').trim().slice(0, 60) || null,
+        wasWinding, elapsed: runMs }) });
+    } catch {}
     await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, number));
 
     const lines = [`🎉 **${questTag(quest)}** complete!`, `⏱️ Ran for **${fmtElapsed(runMs)}**.`, ''];
@@ -24390,6 +24860,7 @@ async function handleQuest(interaction, forced) {
     // press is private, the card lands in the GMs' Quests room.
     const { ActionRowBuilder: FbRow, ButtonBuilder: FbBtn, ButtonStyle: FbStyle } = require('discord.js');
     const fbRow = new FbRow().addComponents(new FbBtn()
+      .setCustomId(`qreopen:${quest.number}`).setLabel('\u21A9\uFE0F Reopen (5 min)').setStyle(FbStyle.Secondary), new FbBtn()
       .setCustomId(`fbq:${quest.number}`)
       .setLabel('\u{1F4DD} Feedback on this quest').setStyle(FbStyle.Secondary));
     // The review button belongs where the party actually played: the run's

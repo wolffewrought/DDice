@@ -60,6 +60,8 @@ function recorder(kind) {
     setDMPermission() { return this; }
     addChoices(...c) { (this._d.choices ??= []).push(...c.flat()); return this; }
     addOptions(...c) { (this._d.options ??= []).push(...c.flat()); return this; }
+    setValue(v) { this._d.value = v; return this; }
+    setMinLength(v) { this._d.minLength = v; return this; }
     setMinValues(v) { this._d.min = v; return this; }
     setMaxValues(v) { this._d.max = v; return this; }
     addComponents(...c) { this._d.components.push(...c.flat()); return this; }
@@ -151,6 +153,8 @@ const fakeDiscord = {
   ButtonStyle: { Primary: 1, Secondary: 2, Success: 3, Danger: 4, Link: 5 },
   TextInputStyle: { Short: 1, Paragraph: 2 },
   SlashCommandBuilder: recorder('cmd'),
+  ContextMenuCommandBuilder: class { setName(n) { this._d = { name: n, contextMenu: true }; return this; } setType(t) { this._d.type = t; return this; } toJSON() { return this._d; } },
+  ApplicationCommandType: { ChatInput: 1, User: 2, Message: 3 },
   ActionRowBuilder: recorder('row'),
   ButtonBuilder: recorder('button'),
   ModalBuilder: recorder('modal'),
@@ -158,7 +162,7 @@ const fakeDiscord = {
   StringSelectMenuBuilder: recorder('select'),
   ChannelSelectMenuBuilder: recorder('cselect'),
   AttachmentBuilder: class { constructor(a, b) { this.a = a; this.b = b; } },
-  WebhookClient: class { async send() { return { id: nextId() }; } async edit() {} },
+  WebhookClient: class { constructor(o) { this.id = o?.id; } async send() { return { id: nextId() }; } async edit() {} async editMessage(id, p) { const m = sentById.get(id); if (m) m.content = p?.content ?? m.content; return m; } },
   REST: class { setToken() { return this; } async put() { return []; } async get() { return []; } },
   Routes: new Proxy({}, { get: () => () => 'route' }),
   EmbedBuilder: recorder('embed'),
@@ -267,6 +271,8 @@ function makeInteraction(over = {}) {
     isModalSubmit: () => !!over.isModal,
     isChatInputCommand: () => !!over.commandName,
     isAutocomplete: () => !!over.isAutocomplete,
+    isMessageContextMenuCommand: () => !!over.isContextMenu,
+    targetMessage: over.targetMessage,
     isCommand: () => !!over.commandName,
     options: {
       getSubcommand: (req) => opts._sub ?? (req === false ? null : null),
@@ -408,10 +414,10 @@ async function fire(over) {
     const realErr = console.error;
     console.error = (...a) => { logged.push(a.map(String).join(' ')); };
     const silentOrThrew = (r) => {
+      if (logged.length) return `THREW: ${logged[0].slice(0, 90)}`;
       if (!r.replies.length) return 'SILENT';
       const said = r.replies.map(x => JSON.stringify(x)).join(' ');
       if (/Something went wrong/.test(said)) return 'THREW';
-      if (logged.length) return `THREW: ${logged[0].slice(0, 90)}`;
       return null;
     };
     const walk = [
@@ -457,9 +463,9 @@ async function fire(over) {
       logged = [];
       const r = await fire(over);
       const said = r.replies.map(x => JSON.stringify(x)).join(' ');
-      const bad = !r.replies.length ? 'SILENT' : /Something went wrong/.test(said) ? 'THREW' : logged.length ? `THREW: ${logged[0].slice(0, 90)}` : null;
+      const bad = logged.length ? `THREW: ${logged[0].slice(0, 90)}` : !r.replies.length ? 'SILENT' : /Something went wrong/.test(said) ? 'THREW' : null;
       if (bad) broken.push(`${label}: ${bad}`);
-      if (VERBOSE) console.log(`      ${label.padEnd(42)} → ${(r.replies[0]?.content || JSON.stringify(r.replies[0] || {})).replace(/\s+/g, ' ').slice(0, 88)}`);
+      if (VERBOSE) console.log(`      ${label.padEnd(42)} → ${(r.replies[0]?.content || JSON.stringify(r.replies[0] || {})).replace(/\s+/g, ' ').slice(0, 300)}`);
       return r;
     };
     // Autocomplete for the room must answer with the rooms.
@@ -467,6 +473,54 @@ async function fire(over) {
     const choices = ac.replies.find(r => r.autocomplete)?.autocomplete || [];
     ok('the room autocomplete lists the rooms', choices.length > 0 && choices.every(c => typeof c.name === 'string' && !/object/.test(c.name)),
       `got ${choices.length}: ${choices.slice(0, 3).map(c => c.name).join(' | ')}`);
+    // Edit (DDice): a bot message opens a prefilled modal; the save edits it.
+    const botMsg = await chan.send({ content: 'after much effort and some accidents, the party would make it' });
+    const e1 = await press('Edit (DDice) on a bot message', { isContextMenu: true, commandName: 'Edit (DDice)', targetMessage: botMsg });
+    ok('editing a bot message opens the modal', /botedit:C1:/.test(JSON.stringify(e1.replies)));
+    const e2 = await press('botedit modal → saved',   { isModal: true, customId: `botedit:C1:${botMsg.id}`, fields: { text: 'After much effort and some accidents, the party made it.' } });
+    ok('the edit lands on the message', /^After much effort/.test(botMsg.content), `content now: ${botMsg.content.slice(0, 40)}`);
+    // NPC speech: a webhook message whose hook the bot holds is editable too.
+    dbHandle.prepare(`INSERT OR REPLACE INTO npc_webhooks (guild_id, channel_id, npc_name, webhook_id, webhook_token) VALUES ('G1','C1','__shared__','WH1','tok')`).run();
+    const npcMsg = await chan.send({ content: 'Thats the beauty of it' });
+    npcMsg.author = { id: 'WH1' }; npcMsg.webhookId = 'WH1';
+    const e3 = await press('Edit (DDice) on NPC speech', { isContextMenu: true, commandName: 'Edit (DDice)', targetMessage: npcMsg });
+    ok('NPC speech opens the modal', /botedit:C1:/.test(JSON.stringify(e3.replies)));
+    await press('botedit modal on NPC speech → saved', { isModal: true, customId: `botedit:C1:${npcMsg.id}`, fields: { text: "That's the beauty of it" } });
+    ok('the NPC edit lands through the webhook', /^That's/.test(npcMsg.content), `content: ${npcMsg.content}`);
+    const notMine = { id: 'X1', content: 'hi', author: { id: 'U2' }, channelId: 'C1', components: [] };
+    await press('Edit (DDice) on a player message → refusal', { isContextMenu: true, commandName: 'Edit (DDice)', targetMessage: notMine });
+    // Archive: a bare archive opens the final-word box; the modal replays it.
+    dbHandle.prepare(`INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at) VALUES ('G1', 903, 'Done Run', 'completed', 'quest', 0)`).run();
+    const a1 = await press('archive without summary → modal', { commandName: 'quest', options: { _sub: 'archive', number: 903 } });
+    ok('archiving invites a final word', /questarch:903/.test(JSON.stringify(a1.replies)));
+    await press('questarch modal → shelved with the word', { isModal: true, customId: 'questarch:903', fields: { summary: 'The siren sleeps. For now.' } });
+    const rowA = dbHandle.prepare("SELECT status, archived_at, archive_summary FROM quests WHERE guild_id='G1' AND number=903").get();
+    ok('a completed quest keeps its status and gains the word', rowA?.status === 'completed' && !!rowA?.archived_at && /siren/.test(rowA?.archive_summary || ''), JSON.stringify(rowA));
+    // Presets → start → complete → Reopen → stalled: the whole new loop.
+    dbHandle.prepare(`INSERT OR REPLACE INTO library_monsters (guild_id, name, hp, ac, attack, damage, str, dex, con, int, wis, cha) VALUES ('G1','Goblin',7,13,4,'1d6',8,14,10,10,8,8)`).run();
+    await press('preset save',   { commandName: 'encounter', options: { _group: 'preset', _sub: 'save', name: 'Ridge bandits', merits: 3, npcs: 'Goblin x2' } });
+    await press('start from preset', { commandName: 'encounter', options: { _sub: 'start', name: 'Bandits again', preset: 'Ridge bandits' } });
+    const goblins = dbHandle.prepare("SELECT COUNT(*) AS n FROM npcs WHERE guild_id='G1' AND name LIKE 'Goblin %' AND is_temp=1").get()?.n || 0;
+    ok('a preset summons its monsters as temps', goblins === 2, `got ${goblins}`);
+    const enc2 = dbHandle.prepare("SELECT number, merit_reward FROM quests WHERE guild_id='G1' AND kind='encounter' ORDER BY number DESC LIMIT 1").get();
+    ok('a preset carries its merits', enc2?.merit_reward === 3, `merits ${enc2?.merit_reward}`);
+    dbHandle.prepare(`INSERT OR REPLACE INTO quest_members (guild_id, number, user_id, state) VALUES ('G1', ?, 'U2', 'party')`).run(enc2.number);
+    const before = dbHandle.prepare("SELECT merits FROM characters WHERE guild_id='G1' AND user_id='U2'").get()?.merits ?? 0;
+    await press('encounter end (pays 3)', { commandName: 'encounter', options: { _sub: 'end' } });
+    const paid = dbHandle.prepare("SELECT merits FROM characters WHERE guild_id='G1' AND user_id='U2'").get()?.merits ?? 0;
+    ok('completion pays the preset merits', paid - before === 3, `delta ${paid - before}`);
+    await press('qreopen press (5-min undo)', { isButton: true, customId: `qreopen:${enc2.number}`, message: { id: 'M6', content: '', components: [], edit: async () => {} } });
+    const back = dbHandle.prepare("SELECT merits FROM characters WHERE guild_id='G1' AND user_id='U2'").get()?.merits ?? 0;
+    const st = dbHandle.prepare("SELECT status, winding_down FROM quests WHERE guild_id='G1' AND number=?").get(enc2.number);
+    ok('reopen reverses the payout and releases the party', back === before && st?.status === 'active' && st?.winding_down === 1, `merits ${back}, ${JSON.stringify(st)}`);
+    const st1 = await press('gm check stalled', { commandName: 'gm', options: { _group: 'check', _sub: 'stalled' } });
+    ok('the stalled view names the reopened run', /Winding down, not completed/.test(JSON.stringify(st1.replies)));
+    // The new GM views answer, and /help rules prints the table.
+    await press('gm check usage',    { commandName: 'gm', options: { _group: 'check', _sub: 'usage' } });
+    const hr = await press('help category:rules', { commandName: 'help', options: { category: 'rules' } });
+    ok('/help rules prints the live table', /Ties keep the hold/.test(JSON.stringify(hr.replies)));
+    const uses = dbHandle.prepare("SELECT SUM(count) AS n FROM command_uses WHERE guild_id='G1'").get()?.n || 0;
+    ok('command use is being counted', uses > 0, `total ${uses}`);
     // Feedback: a named room goes straight to the modal; a bad name refuses.
     const fb1 = await press('feedback send room:general → modal', { commandName: 'feedback', options: { _sub: 'send', room: 'general' } });
     ok('a named feedback room opens the modal directly', /"modal":"fbm:general:0"/.test(JSON.stringify(fb1.replies)));
@@ -488,6 +542,16 @@ async function fire(over) {
       await press('seatover press → seated with audit',  { isButton: true, customId: 'seatover:901:U2', message: { id: 'M7', content: '', components: [] } });
       const seated = dbHandle.prepare("SELECT 1 FROM quest_members WHERE guild_id='G1' AND number=901 AND user_id='U2' AND state='party'").get();
       ok('the override actually seats them', !!seated);
+      // Winding down: a kick departs rather than removes, the seat no
+      // longer blocks another quest, and completion still pays them.
+      dbHandle.prepare(`UPDATE quests SET winding_down=1 WHERE guild_id='G1' AND number=901`).run();
+      await press('kick during winddown → departed', { commandName: 'quest', options: { _group: 'party', _sub: 'kick', number: 901, user: 'U2' } });
+      const dep = dbHandle.prepare("SELECT state FROM quest_members WHERE guild_id='G1' AND number=901 AND user_id='U2'").get();
+      ok('a kick from a winding-down run marks departed, not gone', dep?.state === 'departed', `state ${dep?.state}`);
+      dbHandle.prepare(`INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at) VALUES ('G1', 902, 'Third Run', 'active', 'quest', 0)`).run();
+      dbHandle.prepare(`INSERT OR REPLACE INTO quest_members (guild_id, number, user_id, state) VALUES ('G1', 900, 'U2', 'applied')`).run();
+      const r2 = await press('approve U2 elsewhere while 901 winds down', { commandName: 'quest', options: { _group: 'party', _sub: 'approve', number: 902, user: 'U2' } });
+      ok('a winding-down seat does not block another quest', !/Seat them anyway/.test(JSON.stringify(r2.replies)));
       await press('encounter end',            { commandName: 'encounter', options: { _sub: 'end', summary: 'They fled.' } });
       const after = dbHandle.prepare("SELECT status FROM quests WHERE guild_id='G1' AND number=?").get(enc.number);
       ok('ending an encounter completes it', after?.status === 'completed', `status ${after?.status}`);

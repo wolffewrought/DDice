@@ -326,6 +326,171 @@ place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
 
+## 10i · Final audit before the push (2026-09-29)
+
+1060 assertions, 36 probes, 22 warnings — the three new ones since the
+last push are two 5/5-row modals (the create-quest and feint modals,
+full by design) and one async-no-await on renderDuel, pre-existing and
+harmless. Cross-checked the batch's invariants by reading: the Reopen
+snapshot stores the PAID party (party ∪ departed); addMerits accepts a
+negative delta and books it as 'lost', so a reversal is visible; the
+rehearsal proxy strips `ephemeral` before thread.send and its dummy is a
+temp, so `/fight end` sweeps it; the usage bump is inside a try so it can
+never break dispatch; changelog and digest write their seen-markers
+BEFORE posting, so a crash mid-post cannot cause a double post next boot.
+Baseline re-saved.
+
+THIS PUSH CARRIES (held since 09-28): winding-down departed/exemption/
+quarter-hour pause; Edit (DDice) incl. NPC speech; the final word at
+archive; the clock on the record; Reopen; /gm check stalled|usage|
+rehearse; encounter presets; the weekly digest; the changelog and deploy
+report; /help rules; the upsertNpc insert fix (summon temp:true finally
+works); the examples book's new GM sections.
+
+After deploy: the first boot posts 'What's new' and a 'Deploy mend' line
+to gm-quest-log. Summoned monsters that became permanent under the old
+bug are still in the roster: `/npc delete` them by hand.
+
+## 10h · Five more: changelog, deploy report, usage, rehearsal, rules (2026-09-29, NOT pushed)
+
+Built in the order 4, 1, 5, 3, 2.
+
+4. bootMend posts its mend summary to gm-quest-log ('Deploy mend — …').
+1. CHANGELOG is data in the source (key, gm[], player[]); on boot,
+entries newer than guild_config.changelog_seen post to the GM log and
+the player docs channel. Every feature adds its line as it is built.
+5. command_uses counts every chat command (group/leaf) on dispatch;
+`/gm check usage` reports sixty days quietest-first and names anything
+unused. REPORT ONLY — T was explicit; pinned that no delete path exists.
+3. `/gm check rehearse` opens a private thread, seats the GM's own
+character against a temp 'Sparring Dummy', and starts the fight through
+handleFight with forced players/npcs (start now honours forced), auto
+NPC on, via a proxy interaction that replies into the thread.
+2. RULES: a table of eleven rule lines in player words; constants
+(QUARTER_MS, ENCOUNTER_IDLE_MS) are read live. Printed by `/help
+category:rules` — it first went under /config, which is ManageGuild-only
+and so invisible to players; moved. HONEST SCOPE: the resolvers were NOT
+refactored to read from RULES; instead verify.js pins each rule line to
+the code that enforces it (attack-nat1 → fumble text, grapple-hold → the
+three >= / > comparisons, one-quest → the two COALESCE clauses, pause/
+idle → the constants), so a rule cannot change on one side only.
+
+/gm budget: two new check leaves pushed it to 6256; tightened six
+descriptions to 6175. 36 probes. Held.
+
+## 10g · Five improvements, and the August bug they exposed (2026-09-29, NOT pushed)
+
+T asked for all five suggestions.
+
+1. **Reopen.** Completion stores a snapshot (party, merits, title, was-
+winding, elapsed) and the completion card carries ↩️ Reopen for five
+minutes: merits reversed, this run's titles revoked, status back to
+active + winding_down so the party is free while the GM fixes it;
+audited. The tale and review button stand — a second completion rewrites
+the tale in place.
+2. **/gm check stalled** — winding-down runs, quiet encounters, staged
+parties never launched, campaigns idle a month, reviews this week.
+3. **Encounter presets** — encounter_presets table; `preset save|list|
+remove`; `start preset:` carries merits and summons `npcs:` ("Goblin x3,
+Orc") as temps via summonSpec, the library summon's shape.
+4. **Weekly digest** — stalledReport posted to gm-quest-log every seven
+days (guild_config.gm_digest_at), GM roles pinged, silent when empty.
+5. **Examples book** — GM sections for encounters, campaigns, wrapping up
+(winddown, complete, Reopen, archive, stalled) and Edit (DDice).
+
+THE WALK FOUND A SHIPPED BUG FROM AUGUST: upsertNpc on a NEW row wrote
+only the base columns and dropped every other field — is_temp, max_hp,
+AC, attack, damage. So `/library summon temp:true` has never made a temp
+NPC (every summoned monster became a permanent roster entry with a forum
+page) and lost its 5e block; `/npc create temp:true` only worked because
+it calls upsertNpc twice. Fixed at the root: the insert now applies the
+remaining fields. Pinned. 34 probes. Held.
+
+## 10f · The clock on the record (2026-09-29, NOT pushed)
+
+T asked whether the hourly quest time is logged for archival. It was, in
+three places — recap/remind events on the timeline, the machine record
+in gm-quest-log at completion, and elapsed_ms on the row — but
+renderQuest never SHOWED it, so `/quest show` on an archived run had no
+duration. Now: 'Ran for 6h 32m' on a finished run, 'Running for …' on a
+live one, beside the final word. Pinned. Held.
+
+## 10e · The final word at archive (2026-09-29, NOT pushed)
+
+T wanted a GM-written summary before the final close-out. `/quest
+archive number: [summary:]`: blank opens a modal (`questarch:<n>`) that
+replays the archive with the text via forced {summary, skipSummary}.
+Stored in quests.archive_summary with archived_at; logged as a note;
+posted to the run's thread and gm-quest-log; shown on renderQuest as
+'The final word'; the campaign card marks archived entries.
+
+IMPORTANT DESIGN POINT: archive previously REFUSED completed quests. It
+now shelves them, but keeps status='completed' — getPlayerCompletedQuests
+and the merit/renown records read that status, and flipping it to
+'archived' would have erased quests from every player's history. Open
+quests are retired to 'archived' as before. Walked (29 probes). Held.
+
+## 10d · Edit (DDice) reaches NPC speech (2026-09-29, NOT pushed)
+
+T: how to edit what an NPC said. /npc say posts through a webhook the bot
+owns, whose id and token are stored per host channel (npc_webhooks). So
+a webhook message is 'ours' when its webhookId matches a stored hook —
+`ownWebhookFor(gid, channel, webhookId)` builds a WebhookClient only on a
+match, never for anyone else's hook. Open accepts such messages; save
+routes through `hook.editMessage(id, { content, threadId })` (threads
+need the threadId; webhook content caps at 2000). The 10b 'out of scope'
+note is withdrawn. Walked: NPC speech opens and saves. 27 probes. Held.
+
+## 10c · A lost edit, and a staging rule (2026-09-28)
+
+While adding the Edit (DDice) row I found the books still described the
+OLD /dd (`as:` voice, single channel). The 09-13 row edit was lost when
+the sandbox reset on 09-25: the workspace was rebuilt from
+/mnt/user-data/outputs, and make_pdfs.py had not been staged there since
+before 09-13 (T's preference is not to ATTACH build files, and I had read
+that as not staging them either). Re-applied. Rule from here: every file
+I edit is copied to outputs as staging — the preference governs what is
+attached in the reply, not what is kept safe.
+
+## 10b · Edit (DDice) — a message context menu (2026-09-28, NOT pushed)
+
+T asked for GMs to fix spelling in messages the bot sent. Built as a
+MESSAGE CONTEXT-MENU command (ContextMenuCommandBuilder, type Message):
+long-press → Apps → Edit (DDice). GM only; the bot's own messages only
+(webhook NPC speech is a different mechanism, out of scope); a message
+carrying buttons is refused, since its text is bot-managed. The modal
+opens prefilled (TextInput.setValue, up to 4000), save edits in place,
+and the roll-audit records before → after.
+
+Both harnesses had to learn the builder: verify's stub gained
+ContextMenuCommandBuilder/ApplicationCommandType and the wiring scan
+looks context-menu names up separately; the probe's fake gained the
+builder, isMessageContextMenuCommand, targetMessage and
+TextInput.setValue. The walk found the last of those: the prefill threw
+on the fake and my detector said SILENT before THREW, so detectors now
+report a throw first. 25 probes. Held in the workspace.
+
+## 10a · Winding down, finished properly (2026-09-28, NOT pushed)
+
+T's screenshot: a GM kicked two players from a winding-down run so they
+could join a new quest, and asked whether they could still be paid at
+completion. Three changes, planned then built.
+
+1. A kick from a run that is winding down marks the member 'departed'
+rather than removing them; completion pays and chronicles party ∪
+departed. questBusyUsers reads 'party' only, so the departed are free to
+rest. /quest roster lists them under 'Departed — still paid'. A kick from
+a LIVE run remains a real removal.
+2. questAlreadyOn ignores winding-down runs, so a winding-down seat no
+longer blocks another quest — removing the reason for the kick.
+3. A pause rounds elapsed_ms UP to the quarter-hour (QUARTER_MS).
+Completion still reports what the clock holds.
+
+For the two already kicked from Sirens Redoubt (rows deleted by the old
+kick): `/instance add` them back before completing; with (2) live there
+is no clash prompt, and they are paid with everyone else. Walked under
+the harness (23 probes). Held in the workspace at T's request.
+
 ## 9z · The empty room list (2026-09-25, live)
 
 T: `/feedback send room:` listed nothing. Reproduced under the harness

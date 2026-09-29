@@ -418,8 +418,11 @@ function scanWiring(src, ast) {
       err('unrouted-command', `/${c.name} is registered but no dispatch compares interaction.commandName to it`, c.line);
     }
   }
+  // Context-menu commands are registered by ContextMenuCommandBuilder, not
+  // by the slash builder the scan collects, so they are looked up by name.
+  const ctxNames = new Set([...src.matchAll(/new ContextMenuCommandBuilder\(\)\.setName\('([^']+)'\)/g)].map(m => m[1]));
   for (const n of cmdRoutes) {
-    if (!cmds.some(c => c.name === n)) warn('orphan-route', `dispatch routes /${n} but no builder registers it`, 0);
+    if (!cmds.some(c => c.name === n) && !ctxNames.has(n)) warn('orphan-route', `dispatch routes /${n} but no builder registers it`, 0);
   }
 
   // The last subcommand in a handler is often reached by fall-through
@@ -906,6 +909,10 @@ const DISCORD = {
     applicationGuildCommands: (a, g) => `/applications/${a}/guilds/${g}/commands`,
   },
   SlashCommandBuilder: Cmd,
+  // A message context-menu command: a name and a type, nothing else, and it
+  // must not be mistaken for a slash command by the builder scan.
+  ContextMenuCommandBuilder: class { setName(n) { this.name = n; this.contextMenu = true; return this; } setType(t) { this.type = t; return this; } toJSON() { return { name: this.name, type: this.type }; } },
+  ApplicationCommandType: { ChatInput: 1, User: 2, Message: 3 },
   SlashCommandSubcommandBuilder: Sub,
   SlashCommandSubcommandGroupBuilder: Group,
   ActionRowBuilder: Row,
@@ -1035,6 +1042,74 @@ function testBuilders(src) {
       /const ids = \[\.\.\.raw\.matchAll\(\/<#\(\\d\+\)>\|\\b\(\\d\{15,22\}\)\\b\/g\)\]/.test(src) &&
       /\\u\{1F4EC\} DD \\u2014 \*\*\$\{gmName\}\*\* in \$\{said\.join\(' '\)/.test(src) &&
       !/setName\('as'\)\.setDescription\('Speak as an NPC/.test(src));
+    // Long-press → Apps → Edit (DDice): the bot's own messages only, GMs
+    // only, prefilled, audited. Webhook speech is deliberately excluded.
+    // The final word at archive time; a completed quest keeps its status
+    // (players' records read it) and is shelved by date instead.
+    ok('the record shows how long a run took',
+      /Running for' : 'Ran for'\} \*\*\$\{fmtElapsed\(ranMs\)\}\*\*/.test(src));
+    // The five improvements of 2026-09-29, and the August bug they exposed.
+    // RULES is the one place that says what the resolvers do. Each line is
+    // held to the code that enforces it, so neither can drift alone.
+    ok('the rules table exists and is printed by /help',
+      /const RULES = \[/.test(src) && /getString\?\.\('category'\) === 'rules'/.test(src) &&
+      /\{name:'The Rules',value:'rules'\}/.test(src));
+    ok('RULES: attacking 1 auto-fails and flat-d20s the next defence',
+      /key: 'attack-nat1'/.test(src) && /fumbles the attack/.test(src) && /flat d20 \\u2014 fumbled last attack|fumbled last attack/.test(src));
+    ok('RULES: defending 20 parries and banks +2',
+      /key: 'defence-nat20'/.test(src) && /perfect parry/.test(src) && /rollBonus/.test(src));
+    ok('RULES: ties keep the hold on grapple, escape and maintain',
+      /key: 'grapple-hold'/.test(src) && /const grappled = fight\.atk_roll >= total;/.test(src) &&
+      /const freed = total > hold\.total;/.test(src) && /const kept = keep\.total >= slip\.total;/.test(src));
+    ok('RULES: one quest at a time exempts winding-down runs and encounters',
+      /key: 'one-quest'/.test(src) && /COALESCE\(q\.kind, 'quest'\) != 'encounter'/.test(src) && /COALESCE\(q\.winding_down, 0\) = 0\s*\n\s*LIMIT 1/.test(src));
+    ok('RULES: the pause and idle values are read from their constants',
+      /Math\.round\(QUARTER_MS \/ 60000\)/.test(src) && /Math\.round\(ENCOUNTER_IDLE_MS \/ 3600000\)/.test(src));
+    // The rest of the batch
+    ok('the changelog is data, and unseen entries post on boot',
+      /const CHANGELOG = \[/.test(src) && /async function announceChangelog\(client, guild\)/.test(src) &&
+      /const fresh = CHANGELOG\.filter\(e => e\.key > seen\);/.test(src));
+    ok('a deploy mend reports to the GM log',
+      /\*\*Deploy mend\*\* \\u2014 \$\{made\.join/.test(src));
+    ok('usage is counted on every command and only ever reported',
+      /INSERT INTO command_uses \(guild_id, command, leaf, count, last_at\)/.test(src) &&
+      /report only; nothing is removed by this/.test(src) &&
+      !/DELETE FROM command_uses|deleteCommand|commands\.delete/.test(src));
+    ok('a rehearsal is a private thread against a self-running dummy',
+      /async function startRehearsal\(interaction\)/.test(src) && /type: 12, invitable: false/.test(src) &&
+      /handleFight\(proxy, \{ sub: 'start', players: `<@\$\{uid\}>`, npcs: dummy \}\)/.test(src));
+    ok('a completion can be reopened within five minutes',
+      /setCustomId\(`qreopen:\$\{quest\.number\}`\)/.test(src) &&
+      /completion_snapshot: JSON\.stringify\(\{/.test(src) &&
+      /if \(Date\.now\(\) - snap\.at > 5 \* 60 \* 1000\)/.test(src) &&
+      /if \(snap\.merits\) addMerits\(gidR, id, -snap\.merits\);/.test(src));
+    ok('one stalled report serves the view and the weekly digest',
+      /function stalledReport\(guild\)/.test(src) &&
+      /if \(opt\('stalled'\)\) return showStalled/.test(src) &&
+      /Weekly digest \\u2014 waiting on a GM/.test(src) &&
+      /gm_digest_at/.test(src));
+    ok('an encounter can start from a saved scene that summons its own monsters',
+      /CREATE TABLE IF NOT EXISTS encounter_presets/.test(src) &&
+      /function summonSpec\(gid, spec\)/.test(src) &&
+      /stepped = summonSpec\(gid, preset\.npcs\);/.test(src));
+    ok('upsertNpc keeps every field on an insert, not only the base columns',
+      /const base = new Set\(\['order_name', 'str', 'con', 'dex', 'wis', 'lck', 'hp_current', 'image_url', 'webhook_id', 'webhook_token'\]\);/.test(src) &&
+      /const rest = Object\.fromEntries\(Object\.entries\(fields\)\.filter\(\(\[k\]\) => !base\.has\(k\)\)\);/.test(src));
+    ok('archiving invites a final word, and keeps a completed quest completed',
+      /setName\('summary'\)\.setDescription\('The final word/.test(src) &&
+      /setCustomId\(`questarch:\$\{quest\.number\}`\)/.test(src) &&
+      /if \(quest\.status === 'completed'\) updateQuest\(gid, quest\.number, \{ archived_at: Date\.now\(\), archive_summary: epilogue \|\| null \}\);/.test(src) &&
+      /startsWith\('questarch:'\)/.test(src) &&
+      /The final word\*\*\\n\$\{String\(quest\.archive_summary\)/.test(src));
+    ok('a GM can edit what the bot said, from the message itself',
+      /new ContextMenuCommandBuilder\(\)\.setName\('Edit \(DDice\)'\)\.setType\(ApplicationCommandType\.Message\)/.test(src) &&
+      /isMessageContextMenuCommand\?\.\(\) && interaction\.commandName === 'Edit \(DDice\)'/.test(src) &&
+      /I can only edit what I posted/.test(src) &&
+      /function ownWebhookFor\(gid, channel, webhookId\)/.test(src) &&
+      /hook\.editMessage\(messageId, \{ content: text\.slice\(0, 2000\)/.test(src) &&
+      /setCustomId\(`botedit:\$\{msg\.channelId\}:\$\{msg\.id\}`\)/.test(src) &&
+      /startsWith\('botedit:'\)\) return saveBotEdit/.test(src) &&
+      /\\u270F\\uFE0F Edit \\u2014 \*\*\$\{gmName\}\*\*/.test(src));
     ok('/dd is GM-only',
       /Only GMs can speak as the bot/.test(src));
     // Temporary targets: no sheet, no roster, no HP — the GM's verdict is
@@ -1777,6 +1852,16 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /updateQuest\(gid, quest\.number, \{ winding_down: 0 \}\)/.test(src));
     // A GM may override the one-seat rule, but only by a second press,
     // and the audit book records it (T, 2026-09-25).
+    // Winding down (T, 2026-09-28): a kick departs rather than removes, the
+    // seat stops blocking other quests, and completion pays the departed.
+    ok('a kick during winding-down keeps the player\'s share',
+      /setQuestMember\(gid, number, target\.id, 'departed'\);/.test(src) &&
+      /\.\.\.getQuestMembers\(gid, number, 'departed'\)\]\)\];/.test(src));
+    ok('a winding-down seat does not count toward one quest at a time',
+      /AND COALESCE\(q\.winding_down, 0\) = 0\s*\n\s*LIMIT 1`\)\.get\(gid, uid, exceptNumber/.test(src));
+    ok('a pause rounds the clock up to the quarter-hour',
+      /const QUARTER_MS = 15 \* 60 \* 1000;/.test(src) &&
+      /elapsed_ms: Math\.ceil\(questElapsed\(quest\) \/ QUARTER_MS\) \* QUARTER_MS, paused: 1/.test(src));
     ok('the seat override is a second press, audited, never a double ack',
       /setCustomId\(`seatover:\$\{number\}:\$\{target\.id\}`\)/.test(src) &&
       /forced\.overrideSeat === true/.test(src) &&
