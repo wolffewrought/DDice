@@ -92,6 +92,7 @@ class FakeChannel {
         const t = new FakeChannel(nextId(), 11, name, guild);
         t.parentId = this.id; t._isThread = true;
         threads.push(t);
+        channelsById.set(t.id, t);   // fetchable by id, as a real thread is
         if (message) await t.send(message);
         return t;
       },
@@ -497,16 +498,42 @@ async function fire(over) {
     const rowA = dbHandle.prepare("SELECT status, archived_at, archive_summary FROM quests WHERE guild_id='G1' AND number=903").get();
     ok('a completed quest keeps its status and gains the word', rowA?.status === 'completed' && !!rowA?.archived_at && /siren/.test(rowA?.archive_summary || ''), JSON.stringify(rowA));
     // Presets → start → complete → Reopen → stalled: the whole new loop.
+    // Encounters open in the instance forum from a roster picker (2026-10-08):
+    // start → the picker lists the roster → tick → press → a thread opens.
+    const forum = new FakeChannel('FORUM1', 15, 'quest-instances', guild);
+    channelsById.set(forum.id, forum);
+    setConfigProbe('quest_instance_forum', 'FORUM1');
+    const openEncounter = async (label, options, users) => {
+      const r0 = await press(`${label} (picker)`, { commandName: 'encounter', options: { _sub: 'start', ...options } });
+      const rows = r0.replies[0]?.components || [];
+      const menu = rows[0]?._d?.components?.[0]?._d || {};
+      const sel = menu.customId || '';
+      const anyJoin = rows.some(rw => (rw._d?.components || []).some(c => /encjoin|encleave/.test(c._d?.customId || '')));
+      ok(`${label}: the picker lists the roster and offers no Join`, /^encpick:/.test(sel) && (menu.options || []).length >= 2 && !anyJoin, `${sel} · ${(menu.options || []).length} listed`);
+      const key = sel.split(':')[1];
+      if (!key) return { room: null, r: r0 };
+      const n = threads.length;
+      await press(`${label} (tick)`, { isSelect: true, customId: sel, values: users, message: { id: nextId(), content: 'x', components: [] } });
+      const r2 = await press(`${label} (open)`, { isButton: true, customId: `encgo:${key}`, message: { id: nextId(), content: 'x', components: [] } });
+      return { room: threads.length > n ? threads[threads.length - 1] : null, r: r2 };
+    };
     dbHandle.prepare(`INSERT OR REPLACE INTO library_monsters (guild_id, name, hp, ac, attack, damage, str, dex, con, int, wis, cha) VALUES ('G1','Goblin',7,13,4,'1d6',8,14,10,10,8,8)`).run();
     await press('preset save',   { commandName: 'encounter', options: { _group: 'preset', _sub: 'save', name: 'Ridge bandits', merits: 3, npcs: 'Goblin x2' } });
-    await press('start from preset', { commandName: 'encounter', options: { _sub: 'start', name: 'Bandits again', preset: 'Ridge bandits' } });
+    const { room: roomP } = await openEncounter('start from preset', { name: 'Bandits again', preset: 'Ridge bandits' }, ['U2']);
     const goblins = dbHandle.prepare("SELECT COUNT(*) AS n FROM npcs WHERE guild_id='G1' AND name LIKE 'Goblin %' AND is_temp=1").get()?.n || 0;
     ok('a preset summons its monsters as temps', goblins === 2, `got ${goblins}`);
     const enc2 = dbHandle.prepare("SELECT number, merit_reward FROM quests WHERE guild_id='G1' AND kind='encounter' ORDER BY number DESC LIMIT 1").get();
     ok('a preset carries its merits', enc2?.merit_reward === 3, `merits ${enc2?.merit_reward}`);
-    dbHandle.prepare(`INSERT OR REPLACE INTO quest_members (guild_id, number, user_id, state) VALUES ('G1', ?, 'U2', 'party')`).run(enc2.number);
+    const encRow = dbHandle.prepare("SELECT run_thread_id, run_channel_id FROM quests WHERE guild_id='G1' AND number=?").get(enc2?.number);
+    ok('a picked encounter opens its own room in the instance forum', !!roomP && roomP.parentId === 'FORUM1' && /^🎯 /.test(roomP.name)
+      && encRow?.run_thread_id === roomP.id && encRow?.run_channel_id === roomP.id, `${roomP?.name} · thread ${encRow?.run_thread_id}`);
+    const seatedP = dbHandle.prepare("SELECT state FROM quest_members WHERE guild_id='G1' AND number=? AND user_id='U2'").get(enc2?.number);
+    ok('the ticked player is seated by the press', seatedP?.state === 'party', `state ${seatedP?.state}`);
+    ok('the room carries the card and the party is pulled in by mention', !!roomP && sent.some(x => x.channel === roomP.id && /<@U2>/.test(x.content))
+      && sent.some(x => x.channel === roomP.id && /merits each at the end/.test(x.content)));
+    ok('one pointer line lands where the command was run', sent.some(x => x.channel === 'C1' && /has begun/.test(x.content) && x.content.includes(`<#${roomP?.id}>`)));
     const before = dbHandle.prepare("SELECT merits FROM characters WHERE guild_id='G1' AND user_id='U2'").get()?.merits ?? 0;
-    await press('encounter end (pays 3)', { commandName: 'encounter', options: { _sub: 'end' } });
+    await press('encounter end (pays 3)', { commandName: 'encounter', options: { _sub: 'end' }, channel: roomP });
     const paid = dbHandle.prepare("SELECT merits FROM characters WHERE guild_id='G1' AND user_id='U2'").get()?.merits ?? 0;
     ok('completion pays the preset merits', paid - before === 3, `delta ${paid - before}`);
     await press('qreopen press (5-min undo)', { isButton: true, customId: `qreopen:${enc2.number}`, message: { id: 'M6', content: '', components: [], edit: async () => {} } });
@@ -526,11 +553,19 @@ async function fire(over) {
     ok('a named feedback room opens the modal directly', /"modal":"fbm:general:0"/.test(JSON.stringify(fb1.replies)));
     await press('feedback send room:nope → refusal',   { commandName: 'feedback', options: { _sub: 'send', room: 'nope' } });
     await press('campaign create',   { commandName: 'campaign', options: { _sub: 'create', name: 'The Probe War', description: 'A test arc' } });
-    await press('encounter start',   { commandName: 'encounter', options: { _sub: 'start', name: 'Bandits on the ridge', players: '<@U2>', merits: 2, campaign: 'The Probe War' } });
+    const { room: roomW } = await openEncounter('encounter start', { name: 'Bandits on the ridge', merits: 2, campaign: 'The Probe War' }, ['U2']);
     const enc = dbHandle.prepare("SELECT number FROM quests WHERE guild_id='G1' AND kind='encounter' ORDER BY number DESC LIMIT 1").get();
     ok('an encounter row exists after start', !!enc);
     if (enc) {
-      await press('encjoin press (U1 sits down)', { isButton: true, customId: `encjoin:${enc.number}`, userId: 'U1', message: { id: 'M8', content: '', components: [] } });
+      // Seats are the GM's: add from elsewhere lands in the room, remove from
+      // inside it is the reply itself.
+      await press('encounter add U1 (from C1)', { commandName: 'encounter', options: { _sub: 'add', user: 'U1' } });
+      const addRow = dbHandle.prepare("SELECT state FROM quest_members WHERE guild_id='G1' AND number=? AND user_id='U1'").get(enc.number);
+      ok('/encounter add seats a player', addRow?.state === 'party' && !!roomW && sent.some(x => x.channel === roomW.id && /<@U1> is seated/.test(x.content)), `state ${addRow?.state}`);
+      await press('encounter add U1 again → already', { commandName: 'encounter', options: { _sub: 'add', user: 'U1' } });
+      await press('encounter remove U1 (in the room)', { commandName: 'encounter', options: { _sub: 'remove', user: 'U1' }, channel: roomW });
+      const remRow = dbHandle.prepare("SELECT state FROM quest_members WHERE guild_id='G1' AND number=? AND user_id='U1'").get(enc.number);
+      ok('/encounter remove takes them out', !remRow, `state ${remRow?.state}`);
       await press('campaign show (GM)',       { commandName: 'campaign', options: { _sub: 'show', campaign: 'The Probe War' } });
       // The seat override: a second quest for U1 while the encounter runs
       // is allowed (encounters are exempt), so make a real clash first.
@@ -552,7 +587,7 @@ async function fire(over) {
       dbHandle.prepare(`INSERT OR REPLACE INTO quest_members (guild_id, number, user_id, state) VALUES ('G1', 900, 'U2', 'applied')`).run();
       const r2 = await press('approve U2 elsewhere while 901 winds down', { commandName: 'quest', options: { _group: 'party', _sub: 'approve', number: 902, user: 'U2' } });
       ok('a winding-down seat does not block another quest', !/Seat them anyway/.test(JSON.stringify(r2.replies)));
-      await press('encounter end',            { commandName: 'encounter', options: { _sub: 'end', summary: 'They fled.' } });
+      await press('encounter end',            { commandName: 'encounter', options: { _sub: 'end', summary: 'They fled.' }, channel: roomW });
       const after = dbHandle.prepare("SELECT status FROM quests WHERE guild_id='G1' AND number=?").get(enc.number);
       ok('ending an encounter completes it', after?.status === 'completed', `status ${after?.status}`);
     }

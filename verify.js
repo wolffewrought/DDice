@@ -1807,7 +1807,8 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         return ['/button roll', '/button group', '/target create', '/dd message', '/feedback send',
                 '/quest run winddown', '/quest run recap', '/quest run note', '/instance add',
                 '/gm override interject', 'pages|roster', '/fight add', 'temp:true', '/npc temp',
-                '/standing title', '/standing association', 'Who is excluded', 'Maintain the hold']
+                '/standing title', '/standing association', 'Who is excluded', 'Maintain the hold',
+                '/encounter add user:', 'Open the encounter']
           .every(t => h.includes(t));
       })());
     ok('the help picker offers the tools page',
@@ -1816,9 +1817,26 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     // kind 'encounter'; a campaign is the umbrella above listings.
     ok('an encounter is a running quest with no listing',
       /async function handleEncounter\(interaction\)/.test(src) &&
-      /kind: 'encounter', status: 'active', gm_id: uid, started_at: Date\.now\(\)/.test(src) &&
-      /setCustomId\(`encjoin:\$\{number\}`\)/.test(src) &&
-      /async function handleEncounterPress\(interaction\)/.test(src));
+      /kind: 'encounter', status: 'active', gm_id: p\.uid, started_at: Date\.now\(\)/.test(src) &&
+      /async function openEncounter\(client, guild, p, party\)/.test(src));
+    // The party is picked, not typed, and the seats are the GM's (T,
+    // 2026-10-08): a roster picker, a press that opens the room in the
+    // instance forum, no Join button anywhere, add/remove by command.
+    ok('an encounter starts from a roster picker and opens in the instance forum',
+      /async function encounterRosterMenus\(guild, gid\)/.test(src) &&
+      /setCustomId\(`encpick:\$\{key\}:\$\{i\}`\)/.test(src) &&
+      /setCustomId\(`encgo:\$\{key\}`\)/.test(src) &&
+      /async function handleEncounterPick\(interaction\)/.test(src) &&
+      /const opened = await openRunThread\(client, guild, gid, getQuest\(gid, number\)\);/.test(src) &&
+      /const enc = isEncounter\(quest\);/.test(src) &&
+      !/setName\('players'\)/.test(src.slice(src.indexOf(".setName('encounter')"), src.indexOf(".setName('campaign')")))) ;
+    ok('an encounter has no Join button; seats are the GM\'s by command',
+      !/encjoin|encleave|handleEncounterPress/.test(src) &&
+      /setName\('add'\)\.setDescription\('Seat a player in the encounter running here \(GM\)'\)/.test(src) &&
+      /setName\('remove'\)\.setDescription\('Take a player out of the encounter running here \(GM\)'\)/.test(src) &&
+      /function encounterHere\(gid, cid\)/.test(src) &&
+      /async function encounterRoomSay\(interaction, quest, text, mentionIds, privateLine\)/.test(src) &&
+      /key: 'encounter-seats'/.test(src));
     ok('encounters do not count toward one quest at a time',
       /AND COALESCE\(q\.kind, 'quest'\) != 'encounter'/.test(src));
     ok('an idle encounter reminds the room and pings the GMs, never ends itself',

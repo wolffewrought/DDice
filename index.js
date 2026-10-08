@@ -3366,6 +3366,7 @@ const RULES = [
   { key: 'winddown-kick',  text: 'Kicked while a run is winding down? You are still paid when it completes.' },
   { key: 'pause-round',    text: () => `A pause rounds the clock up to the next ${Math.round(QUARTER_MS / 60000)} minutes.` },
   { key: 'encounter-idle', text: () => `An encounter quiet for ${Math.round(ENCOUNTER_IDLE_MS / 3600000)} hours reminds the room and pings the GMs; it never ends itself.` },
+  { key: 'encounter-seats', text: 'An encounter\'s seats are the GM\'s: there is no Join button. The GM picks the party when it starts, and `/encounter add` or `/encounter remove` after.' },
   { key: 'reopen',         text: 'A completion can be reopened by a GM within five minutes: the payout is reversed, that run\'s titles revoked.' },
   { key: 'rest-exclusion', text: 'A rest passes over anyone on an active quest or fight, and the fallen.' },
 ];
@@ -6848,12 +6849,15 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
 
   new SlashCommandBuilder()
     .setName('encounter').setDescription('A short session run on the fly \u2014 no board, no applications (GM)')
-    .addSubcommand(s=>s.setName('start').setDescription('Begin one here, right now (GM)')
+    .addSubcommand(s=>s.setName('start').setDescription('Begin one \u2014 pick the party; it opens its own thread (GM)')
       .addStringOption(o=>o.setName('name').setDescription('What is happening').setRequired(true))
-      .addStringOption(o=>o.setName('players').setDescription('Who is in it \u2014 @mentions; others may press Join').setRequired(false))
       .addIntegerOption(o=>o.setName('merits').setDescription('Merits each at the end').setRequired(false).setMinValue(0))
       .addStringOption(o=>o.setName('campaign').setDescription('Part of a campaign').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('preset').setDescription('Start from a saved scene').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('add').setDescription('Seat a player in the encounter running here (GM)')
+      .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true)))
+    .addSubcommand(s=>s.setName('remove').setDescription('Take a player out of the encounter running here (GM)')
+      .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true)))
     .addSubcommand(s=>s.setName('end').setDescription('Finish it \u2014 payout, chronicle, review button (GM)')
       .addStringOption(o=>o.setName('summary').setDescription('Your telling of it').setRequired(false))
       .addStringOption(o=>o.setName('title').setDescription('A title every survivor earns').setRequired(false)))
@@ -12557,8 +12561,8 @@ async function routeButton(interaction) {
         content: `\u21A9\uFE0F **${questTag(q)}** reopened by **${gmR}** \u2014 payout reversed, party released. Fix it, then \`/quest run complete\` again.` });
     }
 
-    if (interaction.customId.startsWith('encjoin:') || interaction.customId.startsWith('encleave:')) {
-      return handleEncounterPress(interaction);
+    if (interaction.customId.startsWith('encgo:') || interaction.customId.startsWith('encno:')) {
+      return handleEncounterPick(interaction);
     }
 
     if (interaction.customId === 'grpfree') {
@@ -13367,6 +13371,9 @@ client.on('interactionCreate', async interaction => {
     const channel = await interaction.guild.channels.fetch(interaction.values[0]).catch(() => null);
     if (!channel) return interaction.reply({ content: '❌ Couldn\'t read that channel.', ephemeral: true });
     return handleConfig(interaction, { sub: key, channel });
+  }
+  if (interaction.isStringSelectMenu?.() && interaction.customId.startsWith('encpick:')) {
+    return handleEncounterPick(interaction).catch(e => console.error('[encpick]', e?.message || e));
   }
   if (interaction.isStringSelectMenu?.() && (interaction.customId === 'fbcat' || interaction.customId?.startsWith('fbcat:'))) {
     const key = interaction.values[0];
@@ -16597,7 +16604,10 @@ async function handleTitles(interaction, group) {
 // ── Encounters ───────────────────────────────────────────────────────
 // A short session run on the fly. It is a quest row with kind='encounter':
 // no listing, no applications, no staging — created and started in one
-// command, in the channel it is happening in (T, 2026-09-24).
+// command (T, 2026-09-24). Since 2026-10-08 the party is PICKED, not typed:
+// the GM ticks players off the roster and the encounter opens in its own
+// thread in the instance forum. There is no Join button; seats are the
+// GM's, through /encounter add and /encounter remove.
 // "Goblin x3, Orc" → temporary NPCs from the library, exactly as
 // `/library summon temp:true` makes them. Returns what stepped out.
 function summonSpec(gid, spec) {
@@ -16664,60 +16674,63 @@ async function handleEncounter(interaction) {
     if (presetName && !preset) return interaction.reply({ ephemeral: true, content: `\u274C No scene called **${presetName}**.` });
     const name = interaction.options.getString('name').trim().slice(0, 80);
     const merits = interaction.options.getInteger('merits') ?? preset?.merits ?? 0;
-    const players = parsePlayerMentions(interaction.options.getString('players'));
     const campRaw = (interaction.options.getString('campaign') || '').trim();
     let camp = campRaw ? findCampaign(gid, campRaw) : null;
     if (campRaw && !camp) return interaction.reply({ ephemeral: true, content: `\u274C No campaign called **${campRaw}**.` });
+    const cid = interactionChannelId(interaction);
     // Started inside a campaign quest's run thread? Then it is part of that
     // campaign without being told.
     if (!camp) {
-      const here = db.prepare('SELECT * FROM quests WHERE guild_id=? AND (run_thread_id=? OR run_channel_id=?) LIMIT 1')
-        .get(gid, interaction.channel?.id, interaction.channel?.id);
+      const here = db.prepare('SELECT * FROM quests WHERE guild_id=? AND (run_thread_id=? OR run_channel_id=?) LIMIT 1').get(gid, cid, cid);
       camp = campaignOfQuest(gid, here);
     }
+    // The party is picked, not typed: every living character listed with HP
+    // and what is holding them; the GM ticks who is in it, and the press
+    // opens the encounter in its own thread (T, 2026-10-08).
+    const roster = await encounterRosterMenus(interaction.guild, gid);
+    if (!roster.menus.length) return interaction.reply({ ephemeral: true, content: '\u274C Nobody living has a character sheet yet \u2014 there is no one to seat.' });
+    const head = `\u{1F3AF} **${name}**${merits ? ` \u00b7 ${merits} merits each` : ''}${camp ? ` \u00b7 part of **${camp.name}**` : ''}${preset ? ` \u00b7 scene **${preset.name}**` : ''}`;
+    const key = pendEncounter({ gid, uid, name, merits, campaignId: camp?.id ?? null, presetName: preset?.name ?? null, cid, head, picked: {} });
+    const { ActionRowBuilder: ER, ButtonBuilder: EB, ButtonStyle: ES, StringSelectMenuBuilder: ESel } = require('discord.js');
+    const rows = roster.menus.map((m, i) => new ER().addComponents(
+      new ESel().setCustomId(`encpick:${key}:${i}`)
+        .setPlaceholder(roster.menus.length > 1 ? `Who is in it? (list ${i + 1} of ${roster.menus.length})` : 'Who is in it?')
+        .setMinValues(0).setMaxValues(m.length).addOptions(m)));
+    rows.push(new ER().addComponents(
+      new EB().setCustomId(`encgo:${key}`).setLabel('\u{1F3AF} Open the encounter').setStyle(ES.Success),
+      new EB().setCustomId(`encno:${key}`).setLabel('Cancel').setStyle(ES.Secondary)));
+    return interaction.reply({ ephemeral: true, components: rows, content: [head, ENCOUNTER_PICK_HINT,
+      roster.more ? `_The roster is longer than four lists \u2014 \`/encounter add\` seats the rest._` : ''].filter(Boolean).join('\n') });
+  }
 
-    const number = createQuest(gid, { name, merit_reward: merits, created_by: uid, run_channel_id: interaction.channel?.id });
-    // createQuest writes a listing; an encounter is already running.
-    updateQuest(gid, number, {
-      kind: 'encounter', status: 'active', gm_id: uid, started_at: Date.now(), elapsed_ms: 0,
-      paused: 0, last_tick_ms: 0, last_recap_ms: 0, stage: 'approved', stage_at: Date.now(),
-      run_thread_id: interaction.channel?.isThread?.() ? interaction.channel.id : null,
-      campaign_id: camp?.id ?? null, last_activity: Date.now(),
-    });
-    for (const id of players) setQuestMember(gid, number, id, 'party');
-    logQuestEvent(gid, number, 'start', `Encounter begins \u2014 ${players.length} in it`, uid);
-    const quest = getQuest(gid, number);
-
-    const { ActionRowBuilder: ER, ButtonBuilder: EB, ButtonStyle: ES } = require('discord.js');
-    const row = new ER().addComponents(
-      new EB().setCustomId(`encjoin:${number}`).setLabel('\u2694\uFE0F Join').setStyle(ES.Success),
-      new EB().setCustomId(`encleave:${number}`).setLabel('\u{1F6AA} Step out').setStyle(ES.Secondary));
-    let stepped = null;
-    if (preset?.npcs) {
-      stepped = summonSpec(gid, preset.npcs);
-      if (stepped.made.length) try { noteQuestActivity(gid, interaction.channel?.id, 'combat', `${stepped.made.length} summoned: ${stepped.made.join(', ')}`, uid); } catch {}
+  if (sub === 'add' || sub === 'remove') {
+    const quest = encounterHere(gid, interactionChannelId(interaction));
+    if (!quest) return interaction.reply({ ephemeral: true, content: encounterNoneHere(gid) });
+    const who = interaction.options.getUser('user');
+    const nm = await getDisplayName(interaction.guild, who.id);
+    const inIt = getQuestMembers(gid, quest.number, 'party').includes(who.id);
+    if (sub === 'add') {
+      if (isFallen(gid, who.id)) return interaction.reply({ ephemeral: true, content: `\u26B0\uFE0F **${nm}** has fallen and cannot take part.` });
+      if (!getChar(gid, who.id)) return interaction.reply({ ephemeral: true, content: `\u274C **${nm}** has no character sheet.` });
+      if (inIt) return interaction.reply({ ephemeral: true, content: `\u2705 **${nm}** is already in it.` });
+      setQuestMember(gid, quest.number, who.id, 'party');
+      logQuestEvent(gid, quest.number, 'note', `${nm} is seated`, uid);
+      updateQuest(gid, quest.number, { last_activity: Date.now() });
+      // The mention pulls them into the thread.
+      return encounterRoomSay(interaction, quest, `\u2694\uFE0F <@${who.id}> is seated in **${questTag(quest)}**.`, [who.id],
+        `\u2705 **${nm}** seated in **${questTag(quest)}**.`);
     }
-    const named = [];
-    for (const id of players) named.push(await getDisplayName(interaction.guild, id));
-    await interaction.reply({ allowedMentions: { users: players }, content: [
-      `\u{1F3AF} **Encounter \u2014 ${questTag(quest)}**`,
-      camp ? `_Part of **${camp.name}**._` : '',
-      named.length ? `In it: ${named.join(', ')}` : 'Nobody seated yet \u2014 press **Join**.',
-      merits ? `\u{1F396}\uFE0F **${merits}** merits each at the end.` : '',
-      stepped?.made?.length ? `\u{1F9DF} Out of the library: ${stepped.made.join(', ')}` : '',
-      stepped?.missing?.length ? `\u26A0\uFE0F Not in the library: ${stepped.missing.join(', ')}` : '',
-      '', '_Notes, recap and winddown work by number: `/quest run note number:' + number + '`. `/encounter end` finishes it._',
-    ].filter(Boolean).join('\n'), components: [row] });
-    try { await syncQuestBook(interaction.client, interaction.guild, gid, quest); } catch {}
-    if (camp) refreshCampaignCard(interaction.client, interaction.guild, camp.id).catch(() => {});
-    return;
+    if (!inIt) return interaction.reply({ ephemeral: true, content: `\u274C **${nm}** is not in it.` });
+    removeQuestMember(gid, quest.number, who.id);
+    logQuestEvent(gid, quest.number, 'note', `${nm} is taken out`, uid);
+    return encounterRoomSay(interaction, quest, `\u{1F6AA} **${nm}** is taken out of **${questTag(quest)}**.`, [],
+      `\u2705 **${nm}** removed from **${questTag(quest)}**.`);
   }
 
   if (sub === 'end') {
-    // The encounter in THIS channel; a GM may be running several.
-    const quest = db.prepare("SELECT * FROM quests WHERE guild_id=? AND kind='encounter' AND status='active' AND (run_thread_id=? OR run_channel_id=?) ORDER BY number DESC LIMIT 1")
-      .get(gid, interaction.channel?.id, interaction.channel?.id);
-    if (!quest) return interaction.reply({ ephemeral: true, content: '\u274C No encounter is running here. `/encounter list` shows where they are.' });
+    // The encounter in THIS channel or thread; a GM may be running several.
+    const quest = encounterHere(gid, interactionChannelId(interaction));
+    if (!quest) return interaction.reply({ ephemeral: true, content: encounterNoneHere(gid) });
     // Hand to the ordinary completion so payout, chronicle, reviews, quest
     // log and the winding-down reset all happen exactly as for a run.
     return handleQuest(interaction, { sub: 'complete', group: 'run', number: quest.number,
@@ -16725,25 +16738,164 @@ async function handleEncounter(interaction) {
   }
 }
 
-// Join/leave for a running encounter — anyone present may sit down.
-async function handleEncounterPress(interaction) {
-  const [kind, numS] = interaction.customId.split(':');
-  const gid = interaction.guild.id, uid = interaction.user.id, number = parseInt(numS, 10);
-  const quest = getQuest(gid, number);
-  if (!quest || quest.status !== 'active') return interaction.reply({ ephemeral: true, content: '\u274C That encounter is over.' });
-  if (kind === 'encjoin') {
-    if (isFallen(gid, uid)) return interaction.reply({ ephemeral: true, content: '\u26B0\uFE0F The fallen cannot take part.' });
-    if (!getChar(gid, uid)) return interaction.reply({ ephemeral: true, content: '\u274C You need a character sheet \u2014 `/char create`.' });
-    if (getQuestMembers(gid, number, 'party').includes(uid)) return interaction.reply({ ephemeral: true, content: '\u2705 You are already in it.' });
-    setQuestMember(gid, number, uid, 'party');
-    logQuestEvent(gid, number, 'note', `${await getDisplayName(interaction.guild, uid)} joins`, uid);
-    updateQuest(gid, number, { last_activity: Date.now() });
-    return interaction.reply({ allowedMentions: { parse: [] }, content: `\u2694\uFE0F **${await getDisplayName(interaction.guild, uid)}** joins **${questTag(quest)}**.` });
+const ENCOUNTER_PICK_HINT = 'Tick who is in it, then press **Open the encounter**. Nobody can join by themselves \u2014 later seats are `/encounter add`.';
+
+// The encounter a command concerns: the one running in this channel or
+// thread, else the only one running at all. Two running and none here is
+// ambiguous, and says so.
+function encounterHere(gid, cid) {
+  const here = db.prepare("SELECT * FROM quests WHERE guild_id=? AND kind='encounter' AND status='active' AND (run_thread_id=? OR run_channel_id=?) ORDER BY number DESC LIMIT 1")
+    .get(gid, cid, cid);
+  if (here) return here;
+  const all = db.prepare("SELECT * FROM quests WHERE guild_id=? AND kind='encounter' AND status='active'").all(gid);
+  // A winding-down one (a reopened completion) has released its party, so
+  // it is not where seats happen; the one still playing wins.
+  const live = all.filter(q => !q.winding_down);
+  return live.length === 1 ? live[0] : all.length === 1 ? all[0] : null;
+}
+// Why encounterHere came up empty, in the GM's terms.
+function encounterNoneHere(gid) {
+  const n = db.prepare("SELECT COUNT(*) AS n FROM quests WHERE guild_id=? AND kind='encounter' AND status='active'").get(gid)?.n || 0;
+  return n > 1 ? '\u274C Several encounters are running \u2014 run this inside the one you mean. `/encounter list` shows where they are.'
+               : '\u274C No encounter is running here. `/encounter list` shows where they are.';
+}
+
+// Say something in the encounter's room. Run from inside the room it is the
+// reply itself; from elsewhere it lands in the room and the GM gets a private
+// line. Mentioned players are pulled into the thread by the mention.
+async function encounterRoomSay(interaction, quest, text, mentionIds, privateLine) {
+  const home = quest.run_thread_id || quest.run_channel_id;
+  const payload = { content: text, allowedMentions: { users: mentionIds } };
+  if (interactionChannelId(interaction) === home) return interaction.reply(payload);
+  const ch = await interaction.client.channels.fetch(home).catch(() => null);
+  try { await ch?.send?.(payload); } catch (e) { console.error('[encounter] room say -', e?.message || e); }
+  return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] }, content: privateLine });
+}
+
+// The roster as select-menu options: every living character, with HP and
+// what is holding them, so the GM seats with eyes open. Four lists of
+// twenty-five is Discord's ceiling for one message (the fifth row is the
+// buttons); a longer roster seats the rest with /encounter add.
+async function encounterRosterMenus(guild, gid) {
+  const rows = db.prepare('SELECT * FROM characters WHERE guild_id=? ORDER BY rowid').all(gid)
+    .filter(ch => !isFallen(gid, ch.user_id));
+  const questOf = new Map();
+  for (const r of db.prepare(`SELECT m.user_id, q.number, q.kind, q.winding_down FROM quest_members m
+                              JOIN quests q ON q.guild_id = m.guild_id AND q.number = m.number
+                              WHERE m.guild_id=? AND m.state='party' AND q.status='active'`).all(gid)) questOf.set(r.user_id, r);
+  const inFight = new Set();
+  for (const f of db.prepare("SELECT turn_order FROM fights WHERE guild_id=? AND state='active'").all(gid)) {
+    try { for (const fid of JSON.parse(f.turn_order || '[]')) inFight.add(fid); } catch {}
   }
-  if (!getQuestMembers(gid, number, 'party').includes(uid)) return interaction.reply({ ephemeral: true, content: '\u274C You are not in it.' });
-  removeQuestMember(gid, number, uid);
-  logQuestEvent(gid, number, 'note', `${await getDisplayName(interaction.guild, uid)} steps out`, uid);
-  return interaction.reply({ allowedMentions: { parse: [] }, content: `\u{1F6AA} **${await getDisplayName(interaction.guild, uid)}** steps out of **${questTag(quest)}**.` });
+  const cache = new Map();
+  const opts = [];
+  for (const ch of rows.slice(0, 100)) {
+    const nm = await getDisplayNameCached(guild, ch.user_id, cache);
+    const q = questOf.get(ch.user_id);
+    const where = q ? (q.winding_down ? '\u{1F6CC} resting' : `${q.kind === 'encounter' ? '\u{1F3AF}' : '\u{1F5FA}\uFE0F'} on #${String(q.number).padStart(3, '0')}`) : 'free';
+    opts.push({ label: String(nm).slice(0, 100), value: ch.user_id,
+      description: `\u2764\uFE0F ${ch.hp_current ?? 0}/${maxHp(ch, gid)} \u00b7 ${where}${inFight.has(ch.user_id) ? ' \u00b7 \u2694\uFE0F in a fight' : ''}`.slice(0, 100) });
+  }
+  const menus = [];
+  for (let i = 0; i < opts.length; i += 25) menus.push(opts.slice(i, i + 25));
+  return { menus, more: rows.length > 100 };
+}
+
+// A started-but-not-opened encounter: the GM's choices wait here between the
+// picker and the press, keyed by a short nonce so the custom ids stay well
+// under Discord's hundred characters whatever the name is. A restart in
+// between loses the draft, and the picker says so when pressed.
+const pendingEncounters = new Map();
+const ENCOUNTER_PICK_MS = 15 * 60 * 1000;
+function pendEncounter(p) {
+  const now = Date.now();
+  for (const [k, v] of pendingEncounters) if (now - v.at > ENCOUNTER_PICK_MS) pendingEncounters.delete(k);
+  const key = Math.random().toString(36).slice(2, 10);
+  pendingEncounters.set(key, { ...p, at: now });
+  return key;
+}
+
+// The picker's three custom ids: a list ticked (encpick), the press that
+// opens it (encgo), and cancel (encno). Only the GM who started it may use
+// them.
+async function handleEncounterPick(interaction) {
+  const [kind, key, idxS] = interaction.customId.split(':');
+  const p = pendingEncounters.get(key);
+  if (!p || p.gid !== interaction.guild.id)
+    return interaction.update({ content: '\u23F3 That draft has gone \u2014 run `/encounter start` again.', components: [] }).catch(() => {});
+  if (interaction.user.id !== p.uid) return interaction.reply({ ephemeral: true, content: '\u274C That picker is not yours.' });
+  if (kind === 'encno') { pendingEncounters.delete(key); return interaction.update({ content: '\u2705 Nothing opened.', components: [] }); }
+  if (kind === 'encpick') {
+    p.picked[idxS] = [...(interaction.values || [])];
+    const all = [...new Set(Object.values(p.picked).flat())];
+    const names = [];
+    for (const id of all) names.push(await getDisplayName(interaction.guild, id));
+    // The lists stay; only the headline moves, so the GM sees the count.
+    return interaction.update({ content: [p.head, all.length ? `In it: ${names.join(', ')}` : 'Nobody ticked yet.', ENCOUNTER_PICK_HINT].join('\n') });
+  }
+  const party = [...new Set(Object.values(p.picked).flat())];
+  if (!party.length) return interaction.reply({ ephemeral: true, content: '\u274C Tick at least one player first.' });
+  pendingEncounters.delete(key);
+  await interaction.update({ content: `${p.head}\n\u23F3 Opening…`, components: [] });
+  const out = await openEncounter(interaction.client, interaction.guild, p, party);
+  return interaction.editReply({ content: `${p.head}\n${out.gmLine}`, allowedMentions: { parse: [] } });
+}
+
+// Creates the row, seats the party, opens the room in the instance forum,
+// posts the card there and leaves one pointer where the command was run.
+// Without a forum it runs where it was called, as it always did, and the GM
+// is told why. Returns the GM's private line.
+async function openEncounter(client, guild, p, party) {
+  const gid = p.gid;
+  const preset = p.presetName ? db.prepare('SELECT * FROM encounter_presets WHERE guild_id=? AND name=? COLLATE NOCASE').get(gid, p.presetName) : null;
+  const camp = p.campaignId ? db.prepare('SELECT * FROM campaigns WHERE guild_id=? AND id=?').get(gid, p.campaignId) : null;
+  const number = createQuest(gid, { name: p.name, merit_reward: p.merits, created_by: p.uid, run_channel_id: p.cid });
+  // createQuest writes a listing; an encounter is already running.
+  updateQuest(gid, number, {
+    kind: 'encounter', status: 'active', gm_id: p.uid, started_at: Date.now(), elapsed_ms: 0,
+    paused: 0, last_tick_ms: 0, last_recap_ms: 0, stage: 'approved', stage_at: Date.now(),
+    run_thread_id: null, campaign_id: camp?.id ?? null, last_activity: Date.now(),
+  });
+  for (const id of party) setQuestMember(gid, number, id, 'party');
+  logQuestEvent(gid, number, 'start', `Encounter begins \u2014 ${party.length} in it`, p.uid);
+  const opened = await openRunThread(client, guild, gid, getQuest(gid, number));
+  const room = opened.thread;
+  if (!room) {
+    // No room: where it was called from is its home, as it always was.
+    const origin = await client.channels.fetch(p.cid).catch(() => null);
+    updateQuest(gid, number, { run_thread_id: origin?.isThread?.() ? origin.id : null });
+  }
+  const quest = getQuest(gid, number);
+  let stepped = null;
+  if (preset?.npcs) {
+    stepped = summonSpec(gid, preset.npcs);
+    if (stepped.made.length) try { noteQuestActivity(gid, quest.run_channel_id, 'combat', `${stepped.made.length} summoned: ${stepped.made.join(', ')}`, p.uid); } catch {}
+  }
+  const named = [];
+  for (const id of party) named.push(await getDisplayName(guild, id));
+  const card = [
+    `\u{1F3AF} **Encounter \u2014 ${questTag(quest)}**`,
+    camp ? `_Part of **${camp.name}**._` : '',
+    `In it: ${named.join(', ')}`,
+    p.merits ? `\u{1F396}\uFE0F **${p.merits}** merits each at the end.` : '',
+    stepped?.made?.length ? `\u{1F9DF} Out of the library: ${stepped.made.join(', ')}` : '',
+    stepped?.missing?.length ? `\u26A0\uFE0F Not in the library: ${stepped.missing.join(', ')}` : '',
+    '', '_Seats are the GM\'s: `/encounter add` and `/encounter remove`. Notes, recap and winddown work by number: `/quest run note number:' + number + '`. `/encounter end` finishes it._',
+  ].filter(Boolean).join('\n');
+  const home = room || await client.channels.fetch(quest.run_channel_id).catch(() => null);
+  try { await home?.send?.({ content: card, allowedMentions: { parse: [] } }); } catch (e) { console.error('[encounter] card -', e?.message || e); }
+  // One line where the command was run, pointing at the room.
+  if (room && p.cid && p.cid !== room.id) {
+    const origin = await client.channels.fetch(p.cid).catch(() => null);
+    try { await origin?.send?.({ content: `\u{1F3AF} **${questTag(quest)}** has begun \u2014 <#${room.id}>`, allowedMentions: { parse: [] } }); } catch {}
+  }
+  try { await syncQuestBook(client, guild, gid, quest); } catch {}
+  if (camp) refreshCampaignCard(client, guild, camp.id).catch(() => {});
+  return { quest, room, gmLine: [
+    `\u2705 **${questTag(quest)}** is open${room ? ` in <#${room.id}>` : ' here'} with ${party.length} in it.`,
+    opened.why ? `\u26A0\uFE0F **No room opened.** ${opened.why}` : '',
+    stepped?.missing?.length ? `\u26A0\uFE0F Not in the library: ${stepped.missing.join(', ')}` : '',
+  ].filter(Boolean).join('\n') };
 }
 
 // ── Campaigns ────────────────────────────────────────────────────────
@@ -21012,7 +21164,7 @@ const HELP_CATEGORIES = {
       '`/help category:rules` \u2014 the live table rules, as the bot enforces them, for everyone. Every deploy posts **What\'s new** to the GM log (and a player version to the docs channel) and a **Deploy mend** line saying what it built',
       '`/instance add|kick|rally|note|pause|resume|complete|show|thread name:...` \u2014 the same by NAME rather than number; leave `name:` blank inside a run\'s own thread (GM)',
       '_One quest at a time: approving someone already seated on a live run prompts for a second press to override (audited), and a launch leaves them an applicant rather than double-booking them._',
-      '`/encounter start name:... [players:@a @b] [merits:] [campaign:]` \u2014 a short session run on the fly, here and now: no board, no applications. A Join button seats whoever is present; `/encounter end [summary:] [title:]` pays out, writes the chronicle and posts the review button. Encounters do not count toward one-quest-at-a-time; one left quiet six hours reminds the room and pings the GMs (GM)',
+      '`/encounter start name:... [merits:] [campaign:] [preset:]` \u2014 a short session run on the fly: no board, no applications. The bot lists every living character with HP and what is holding them; tick who is in it and press **Open the encounter** \u2014 it opens its own thread in quest-instances (where it was called if no forum is set), the party pulled in by mention. Nobody can join by themselves: `/encounter add user:` and `/encounter remove user:` are the GM\'s, run in the encounter\'s thread. `/encounter end [summary:] [title:]` pays out, writes the chronicle and posts the review button. Encounters do not count toward one-quest-at-a-time; one left quiet six hours reminds the room and pings the GMs (GM)',
       '`/campaign create name:... [description:]` \u2014 the long arc: quests, mini-quests and encounters under one name, with a GM-only thread in the campaigns forum. `campaign:` on `/quest create` or `/encounter start` links at birth; `/campaign add|remove` afterwards. `note` for beats between runs, `status` for where things stand, `recap` across every run, `complete` to close it. Players get `/campaign show` \u2014 the premise, what is done, and their own part (GM)',
       '`/quest run complete number:N` — finish it; merits auto-awarded, other rewards listed (GM)',
       '`/quest delete number:N` — remove a quest (GM)',
@@ -23053,6 +23205,12 @@ async function healChannelPerms(guild) {
 // is built, the way it adds a pin. On boot, unseen entries go to the GM log
 // and player-tagged lines to the player docs channel (T, 2026-09-29).
 const CHANGELOG = [
+  { key: '2026-10-08', gm: [
+      '`/encounter start` now lists the roster \u2014 tick the party, press **Open the encounter**, and it opens its own thread in quest-instances',
+      'No Join button on an encounter: `/encounter add user:` and `/encounter remove user:` are the GM\'s, in its thread',
+    ], player: [
+      'An encounter\'s seats are the GM\'s \u2014 you are pulled into its thread when seated, not asked to press Join',
+    ] },
   { key: '2026-09-29', gm: [
       '\u21A9\uFE0F **Reopen** \u2014 a completion can be taken back within five minutes',
       '`/gm check stalled` \u2014 what is waiting on a GM; a weekly digest lands here',
@@ -23810,14 +23968,18 @@ async function openRunThread(client, guild, gid, quest) {
     const party = getQuestMembers(gid, quest.number, 'party');
     const roll = [];
     for (const id of party) roll.push(`<@${id}>`);
+    // An encounter's room is named and worded as one; the mentions pull
+    // the picked party in, since nobody can press their own way in.
+    const enc = isEncounter(quest);
     const thread = await forum.threads.create({
-      name: questTag(quest).slice(0, 100),
+      name: `${enc ? '\u{1F3AF} ' : ''}${questTag(quest)}`.slice(0, 100),
       autoArchiveDuration: 10080,
       message: { content: [
-        `⚔️ **${questTag(quest)}** — the party assembles.`,
+        enc ? `\u{1F3AF} **${questTag(quest)}** — an encounter begins.` : `⚔️ **${questTag(quest)}** — the party assembles.`,
         quest.gm_id ? `🎲 DM: <@${quest.gm_id}>` : '',
         roll.length ? `👥 ${roll.join(' ')}` : '',
-        '', '_This is your quest thread: rolls, planning and the run itself. `/quest rally` calls everyone back._',
+        '', enc ? '_This is the encounter\'s room. Seats are the GM\'s — `/encounter add` and `/encounter remove`; `/encounter end` finishes it._'
+                : '_This is your quest thread: rolls, planning and the run itself. `/quest rally` calls everyone back._',
       ].filter(Boolean).join('\n'), allowedMentions: { users: mentionList(party, quest.gm_id) } },
     });
     const hadChannel = quest.run_channel_id && quest.run_channel_id !== thread.id;

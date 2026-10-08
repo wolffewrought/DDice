@@ -326,6 +326,54 @@ place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
 
+## 10j · Encounters: picked party, own thread, no Join (2026-10-08)
+
+T, on seeing that an encounter ran wherever it was called: open it in the
+instances forum, no Join button, GM seats by hand, and the players listed
+while the GM sets it up.
+
+`/encounter start name: [merits:] [campaign:] [preset:]` — the `players:`
+option is gone. The reply is a private picker: `encounterRosterMenus()`
+lists every living character as select options (label = display name,
+description = HP · free / on #012 / resting / in a fight), up to four
+lists of 25 (Discord: five rows, the fifth is the buttons), plus
+**Open the encounter** / Cancel. The draft waits in `pendingEncounters`
+(nonce-keyed, 15 min). `encpick:<key>:<i>` ticks a list (the headline
+updates, the lists stay); `encgo:<key>` calls `openEncounter()`, which
+creates the row, seats the party, and goes through the SAME
+`openRunThread()` as a quest launch — now encounter-aware: thread named
+`🎯 #013-Name`, starter worded as an encounter, the party pulled in
+by mention. The card (merits, campaign, summoned monsters) is posted in
+the thread; one pointer line lands where the command was run. No forum
+set → runs where it was called, as before, and the GM is told why.
+`encno:` cancels; nobody ticked refuses the press.
+
+No `encjoin`/`encleave` anywhere. `/encounter add user:` and
+`/encounter remove user:` (GM) resolve the encounter through
+`encounterHere(gid, cid)`: the one running in this channel/thread, else
+the only live (not winding-down) one, else the only active one; two and
+none here refuses with `encounterNoneHere()` naming the ambiguity.
+`encounterRoomSay()` speaks in the room: from inside it is the reply
+itself, from elsewhere it lands in the room and the GM gets a private
+line. `/encounter end` resolves the same way.
+
+RULES gained `encounter-seats`; CHANGELOG 2026-10-08 (first boot posts
+it). Books: the GM table now carries the whole /encounter family and a
+/campaign row it never had; examples updated.
+
+Probe: the fake forum `FORUM1` (type 15) is set as quest_instance_forum
+before the encounter walk; `openEncounter()` helper in the probe drives
+start → tick → press and returns the thread. Fake threads are now
+registered in `channelsById` so `client.channels.fetch(threadId)` finds
+them — before this, anything sent to a fetched thread was silently
+dropped in the probe (a fidelity hole; real Discord never had it).
+Walk is 44 probes; verify 1066.
+
+Tool note for the next session: the harness converts `\uXXXX` in tool
+input to the real character. index.js keeps four-hex escapes in strings,
+so anchors on such lines must be rebuilt from chr(92) (see the esc()
+trick in this session's patch script); `\u{...}` survives untouched.
+
 ## 10i · Final audit before the push (2026-09-29)
 
 1060 assertions, 36 probes, 22 warnings — the three new ones since the
