@@ -49,9 +49,9 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1068 as of 2026-10-11) and no scanner
+Green means every assertion passed (1070 as of 2026-10-11) and no scanner
 found an ERROR. Then run the probe: `node --experimental-sqlite probe.js`
-(61 probes: the fight, encounter, override, autocomplete and every-leaf
+(64 probes: the fight, encounter, override, autocomplete and every-leaf
 walks, the GM-gate walk, chat shorthands, scheduled ticks, junk-id lanes,
 SQL compile, forum seeding and sweep, and a double-ack check).
 
@@ -434,6 +434,24 @@ comment that read 'player'. DejaVu has no emoji and Serif lacks even ⚔ ⚖
 had been printing Greek). The examples book had four temp-NPC rows
 outside their tuple (silently dropped) and a `/library summon` that does
 not exist on Knightfall.
+
+**Addendum, same evening (T: "why aren't the posts in order"):** Discord
+orders a forum by thread creation, never by title, and the seeding boot
+had made its Deploy mend before the back-catalogue, so today's mend sat
+at the bottom. Three changes: bootMend now runs announceChangelog, then
+the digest seeding, then `tidyDatedForum` on both update forums, and
+posts the Deploy mend LAST (the day's report tops the day's What's new);
+`tidyDatedForum` reads the bot's own dated threads (`DATED_TITLE_RE`),
+sorts by (date, What's new before Deploy mend), keeps the longest opening
+run already in id order and re-posts the rest in order — content copied
+message by message, the old thread deleted — skipping any thread someone
+else has written in; `postWeeklyDigest(client, guild)` is the one digest
+path, called by the tick weekly and by the first boot with the forum
+(`gm_digest_seeded_at`), and a quiet week posts "Nothing is waiting"
+rather than nothing. Probe: a misplaced Deploy mend planted before the
+seeding boot must come back re-posted on top, gm-updates must read in
+date order, gm-digest must hold one thread after the boot and two after
+the tick. 1070 assertions, 64 probes.
 
 **Recipe:** the re-lay was done by a script (relay_books.py, scratch) that
 takes every original item and row by AST span and asserts each is used

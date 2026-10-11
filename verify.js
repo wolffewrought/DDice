@@ -1477,9 +1477,14 @@ function testBuilders(src) {
       /async function sweepOldUpdatePosts\(client, gid\)/.test(src) &&
       /if \(msg\.author\?\.id !== client\.user\?\.id\) continue;/.test(src) &&
       /if \(!after\.updates_seeded_at && \(after\.gm_updates_forum \|\| after\.updates_forum\)\)/.test(src));
-    ok('the weekly digest is a dated thread in gm-digest, titled by its Monday',
-      /postDatedThread\(client, cfgD\.gm_digest_forum, 'Weekly digest', mondayOf\(Date\.now\(\)\),/.test(src) &&
-      /function mondayOf\(ms\)/.test(src));
+    ok('the weekly digest is a dated thread in gm-digest, titled by its Monday — one helper, called by the tick and by the first boot with the forum',
+      /postDatedThread\(client, cfg\.gm_digest_forum, 'Weekly digest', mondayOf\(Date\.now\(\)\),/.test(src) &&
+      /function mondayOf\(ms\)/.test(src) && (src.match(/await postWeeklyDigest\(client, guild\)/g) || []).length === 2 &&
+      /!after\.gm_digest_seeded_at/.test(src));
+    ok('the deploy mend thread is posted after the changelog and the tidy pass, so the day\'s report tops gm-updates',
+      (() => { const i = src.indexOf("'Deploy mend', Date.now()"); const c = src.indexOf('await announceChangelog(client, guild)'); const t = src.indexOf('tidyDatedForum(client, fid)'); return i > 0 && c > 0 && t > 0 && c < t && t < i; })());
+    ok('a dated thread out of date order is re-posted; one anyone else wrote in is left alone',
+      /function tidyDatedForum\(client, forumId\)/.test(src) && /msgs\.some\(m => m\.author\?\.id !== client\.user\.id\)/.test(src) && /DATED_TITLE_RE\.exec\(t\.name/.test(src));
     ok('usage is counted on every command and only ever reported',
       /INSERT INTO command_uses \(guild_id, command, leaf, count, last_at\)/.test(src) &&
       /report only; nothing is removed by this/.test(src) &&

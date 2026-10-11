@@ -763,6 +763,7 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN campaign_forum TEXT'); } catc
 try { db.exec('ALTER TABLE guild_config ADD COLUMN updates_forum TEXT'); } catch {}       // players: What's new, a dated thread each
 try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_updates_forum TEXT'); } catch {}    // GMs: What's new and Deploy mend
 try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_digest_forum TEXT'); } catch {}     // GMs: the weekly digest, a thread per week
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_digest_seeded_at INTEGER'); } catch {} // the boot that posted the first digest into it
 try { db.exec('ALTER TABLE guild_config ADD COLUMN updates_seeded_at INTEGER'); } catch {} // the boot that opened the forums and posted the back-catalogue
 try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_routes TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_cats TEXT'); } catch {}
@@ -13479,6 +13480,23 @@ const ENCOUNTER_IDLE_MS = 6 * 3600 * 1000;
 // A pause rounds the clock UP to the quarter-hour (T, 2026-09-28).
 const QUARTER_MS = 15 * 60 * 1000;
 
+// The weekly digest: one dated thread in gm-digest, titled by the Monday of
+// the week it covers, posted whether or not anything is waiting, so a quiet
+// week still shows the bot looked. Called by the tick once a week and by the
+// first boot that has the forum (T, 2026-10-11).
+async function postWeeklyDigest(client, guild) {
+  const gid = guild.id;
+  const cfg = getConfig(gid) || {};
+  if (!cfg.gm_digest_forum) return null;
+  setConfig(gid, { gm_digest_at: Date.now() });
+  const out = stalledReport(guild);
+  const roles = getGmRoleIds(gid);
+  return postDatedThread(client, cfg.gm_digest_forum, 'Weekly digest', mondayOf(Date.now()),
+    ['\u{1F5DE}\uFE0F **Weekly digest \u2014 waiting on a GM** ' + roles.map(r => `<@&${r}>`).join(' '), '',
+     ...(out.length ? out : ['Nothing is waiting on a GM this week.'])],
+    { allowedMentions: { roles } });
+}
+
 async function questTick(client) {
   for (const guild of client.guilds.cache.values()) {
     // Weekly digest of what is stalled, one dated thread a week in
@@ -13486,13 +13504,8 @@ async function questTick(client) {
     // depends on someone noticing (T, 2026-09-29 / 10-11).
     try {
       const cfgD = getConfig(guild.id) || {};
-      if (cfgD.gm_digest_forum && Date.now() - (Number(cfgD.gm_digest_at) || 0) >= 7 * 86400000) {
-        setConfig(guild.id, { gm_digest_at: Date.now() });
-        const out = stalledReport(guild);
-        if (out.length) await postDatedThread(client, cfgD.gm_digest_forum, 'Weekly digest', mondayOf(Date.now()),
-          ['\u{1F5DE}\uFE0F **Weekly digest \u2014 waiting on a GM** ' + getGmRoleIds(guild.id).map(r => `<@&${r}>`).join(' '), '', ...out],
-          { allowedMentions: { roles: getGmRoleIds(guild.id) } });
-      }
+      if (cfgD.gm_digest_forum && Date.now() - (Number(cfgD.gm_digest_at) || 0) >= 7 * 86400000)
+        await postWeeklyDigest(client, guild);
     } catch (e) { console.error('[digest]', e?.message || e); }
     let running;
     try { running = db.prepare(`SELECT * FROM quests WHERE guild_id=? AND status='active' AND paused=0`).all(guild.id); }
@@ -19650,6 +19663,51 @@ async function postDatedThread(client, forumId, kind, ms, content, extra = {}) {
   if (thread) for (const c of chunks.slice(1)) await thread.send({ content: c, allowedMentions: { parse: [] } }).catch(() => {});
   return thread;
 }
+// Discord orders a forum by when each thread was made, never by its title,
+// so a dated thread posted out of turn sits in the wrong place for good.
+// On boot the bot's own dated threads in an update forum are read against
+// their titles; the first one that is older than a thread it should follow,
+// and everything after it, are re-posted in date order so each lands where
+// its date says. A thread anyone else has written in is left alone
+// (T, 2026-10-11: the seeding boot had made its Deploy mend first).
+const DATED_TITLE_RE = /^\[(\d\d)\/(\d\d)\/(\d{4})\] \[WEEK \d+\] .+ \u00b7 (.+)$/;
+const DATED_KIND_RANK = { 'What\'s new': 0, 'Deploy mend': 1 };
+async function tidyDatedForum(client, forumId) {
+  if (!forumId) return [];
+  const forum = await client.channels.fetch(forumId).catch(() => null);
+  if (!forum?.threads?.fetchActive) return [];
+  const active = await forum.threads.fetchActive().catch(() => null);
+  const mine = [];
+  for (const t of active?.threads?.values?.() || []) {
+    if (t.ownerId && t.ownerId !== client.user.id) continue;
+    const m = DATED_TITLE_RE.exec(t.name || '');
+    if (!m) continue;
+    mine.push({ t, key: `${m[3]}${m[2]}${m[1]}`, rank: DATED_KIND_RANK[m[4]] ?? 2 });
+  }
+  if (mine.length < 2) return [];
+  const later = (a, b) => (BigInt(a.t.id) < BigInt(b.t.id) ? -1 : 1);
+  const wanted = [...mine].sort((a, b) => a.key.localeCompare(b.key) || a.rank - b.rank || later(a, b));
+  // The longest opening run already in order stays; the rest is re-posted
+  // in order, so every re-posted thread lands after everything before it.
+  let k = 1;
+  while (k < wanted.length && BigInt(wanted[k].t.id) > BigInt(wanted[k - 1].t.id)) k++;
+  const out = [];
+  for (const { t } of wanted.slice(k)) {
+    const fetched = await t.messages.fetch({ limit: 100 }).catch(() => null);
+    const msgs = [...(fetched?.values?.() || [])].sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+    if (!msgs.length || msgs.some(m => m.author?.id !== client.user.id)) {
+      out.push(`${forum.name}: \u201c${t.name}\u201d sits out of date order but someone has written in it \u2014 left where it is`);
+      continue;
+    }
+    const fresh = await forum.threads.create({ name: t.name, autoArchiveDuration: 10080,
+      message: { content: msgs[0].content || '\u200b', allowedMentions: { parse: [] } } }).catch((e) => { console.error('[dated-thread]', 'tidy', e?.message || e); return null; });
+    if (!fresh) continue;
+    for (const m of msgs.slice(1)) await fresh.send({ content: m.content || '\u200b', allowedMentions: { parse: [] } }).catch(() => {});
+    await t.delete().catch(() => {});
+    out.push(`${forum.name}: \u201c${t.name}\u201d re-posted into date order`);
+  }
+  return out;
+}
 // The headers the bot's own update posts began with while they lived in
 // gm-quest-log and player-pdf. The one-time sweep removes exactly these,
 // and only the bot's own messages.
@@ -19695,6 +19753,7 @@ const CHANGELOG = [
       '`/encounter preset … npcs:` now clones an NPC of that name when the library has no such monster \u2014 on Knightfall the library never existed, so presets could not summon at all',
       '`/npc give|take|npclore` were open to any player; `/npc sheet` showed hidden stats to players; `/config` had no check of its own. All gated',
       '`/standing` registers on 5e servers too \u2014 quests paid merits and titles there with no way to manage them',
+      'Dated threads keep date order: one posted out of turn is re-posted on the next boot, the Deploy mend goes up last so it tops the day, and the first boot with **gm-digest** posts the week\'s digest at once \u2014 a quiet week says so',
     ], player: [
       '`/roll save:` and `/roll skill:` (5e) work \u2014 they had been registered on the GM\'s roll, where nothing read them',
       'Your sheet in your character thread updates the moment a stat changes',
@@ -19772,12 +19831,23 @@ async function bootMend(client) {
         const swept = await sweepOldUpdatePosts(client, gid).catch(e => { console.error('[updates-sweep]', e?.message || e); return []; });
         made.push(...swept);
       }
-      // A deploy announces what it did, as a dated thread in gm-updates
-      // rather than only on the host's console (T, 2026-09-29 / 10-11).
+      // What changed, if anything is new since the last boot.
+      await announceChangelog(client, guild).catch(e => console.error('[changelog]', e?.message || e));
+      // The first boot with a digest forum posts this week's digest at once
+      // rather than leaving the forum empty until the cycle comes round.
+      if (after.gm_digest_forum && !after.gm_digest_seeded_at) {
+        const posted = await postWeeklyDigest(client, guild).catch(e => { console.error('[digest]', e?.message || e); return null; });
+        setConfig(gid, { gm_digest_seeded_at: Date.now() });
+        if (posted) made.push('the first weekly digest, posted in gm-digest');
+      }
+      // Dated threads sit in date order; one posted out of turn is re-posted.
+      for (const fid of [after.gm_updates_forum, after.updates_forum])
+        made.push(...await tidyDatedForum(client, fid).catch(e => { console.error('[dated-thread]', 'tidy', e?.message || e); return []; }));
+      // A deploy announces what it did, as a dated thread in gm-updates rather
+      // than only on the host's console (T, 2026-09-29 / 10-11) \u2014 posted last,
+      // so the day's report tops the forum above the day's What's new.
       if (made.length) await postDatedThread(client, after.gm_updates_forum, 'Deploy mend', Date.now(),
         ['\u{1F527} **Deploy mend**', '', ...made.map(l => `\u00b7 ${l}`)]);
-      // And what changed, if anything is new since the last boot.
-      await announceChangelog(client, guild).catch(e => console.error('[changelog]', e?.message || e));
     } catch (e) { console.log(`[mend] ${guild.name}: ${e?.message || e}`); }
   }
 }

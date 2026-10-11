@@ -115,12 +115,14 @@ class FakeChannel {
     this.threads = {
       create: async ({ name, message }) => {
         const t = new FakeChannel(nextId(), 11, name, guild);
-        t.parentId = this.id; t._isThread = true;
+        t.parentId = this.id; t._isThread = true; t.ownerId = 'BOT';
         threads.push(t);
         channelsById.set(t.id, t);   // fetchable by id, as a real thread is
         if (message) await t.send(message);
         return t;
       },
+      // The forum's live threads, as discord.js hands them back.
+      fetchActive: async () => ({ threads: new FakeCollection(threads.filter(t => t.parentId === this.id && !deleted.includes(t.id)).map(t => [t.id, t])), hasMore: false }),
       cache: new Map(),
     };
     this.permissionOverwrites = { edit: async () => {} };
@@ -793,10 +795,32 @@ async function fire(over) {
       keepPost = await logCh.send({ content: '🎉 **#001-Bandits again** complete! — a completion summary that must stay' });
       humanPost = await logCh.send({ content: '📰 **What\'s new** — but typed by a person' }); humanPost.author = { id: 'U1' };
     }
+    // A Deploy mend thread already in gm-updates, made BEFORE the back-catalogue
+    // will be (the seeding boot of 2026-10-11 did exactly this), so the tidy
+    // pass has something to put right.
+    const gmForumBefore = dbHandle.prepare("SELECT gm_updates_forum, gm_digest_forum FROM guild_config WHERE guild_id='G1'").get() || {};
+    const gmForumCh = gmForumBefore.gm_updates_forum ? channelsById.get(gmForumBefore.gm_updates_forum) : null;
+    const planted = gmForumCh ? await gmForumCh.threads.create({ name: '[11/10/2026] [WEEK 41] Sunday 11th of October 2026 · Deploy mend', message: { content: '🔧 **Deploy mend**\n\n· planted out of turn' } }) : null;
     const realTimeoutB = globalThis.setTimeout; globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
     for (const fn of listeners.clientReady || listeners.ready || []) await fn().catch(e => bad.push('ready: ' + e.message));
     await (lastClient?.mendDone || null);
     globalThis.setTimeout = realTimeoutB;
+    {
+      const fid = dbHandle.prepare("SELECT gm_updates_forum FROM guild_config WHERE guild_id='G1'").get()?.gm_updates_forum;
+      const live = threads.filter(t => t.parentId === fid && !deleted.includes(t.id)).sort((a, b) => Number(a.id) - Number(b.id));
+      const keyOf = (t) => { const m = /^\[(\d\d)\/(\d\d)\/(\d{4})\].* · (.+)$/.exec(t.name); return m ? `${m[3]}${m[2]}${m[1]}${m[4] === "What's new" ? 0 : 1}` : null; };
+      const keys = live.map(keyOf);
+      const ordered = keys.every((k, i) => k && (i === 0 || k >= keys[i - 1]));
+      ok('gm-updates reads in date order after the boot — What\'s new before Deploy mend on a day, the Deploy mend of the boot on top',
+        ordered && live.length > 0 && / · Deploy mend$/.test(live[live.length - 1].name), live.map(t => t.name).join(' | '));
+      ok('a dated thread that sat out of turn is re-posted into order and the old one deleted',
+        !!planted && deleted.includes(planted.id) && live.some(t => t.name === planted.name && t.id !== planted.id)
+          && sent.some(x => /re-posted into date order/.test(x.content)),
+        planted ? `planted ${planted.id} deleted=${deleted.includes(planted.id)}` : 'no gm-updates forum before the boot');
+      const dForum = dbHandle.prepare("SELECT gm_digest_forum, gm_digest_seeded_at FROM guild_config WHERE guild_id='G1'").get() || {};
+      const seededDigests = threads.filter(t => t.parentId === dForum.gm_digest_forum && !deleted.includes(t.id));
+      ok('the first boot with a digest forum posts this week\'s digest at once', !!dForum.gm_digest_seeded_at && seededDigests.length === 1 && / · Weekly digest$/.test(seededDigests[0].name), `${seededDigests.length} digest thread(s), seeded_at ${dForum.gm_digest_seeded_at}`);
+    }
     ok('the forum-opening boot sweeps the bot\'s old update posts out of gm-quest-log and nothing else',
       !!oldPost && deleted.includes(oldPost.id) && !deleted.includes(keepPost.id) && !deleted.includes(humanPost.id),
       `old ${oldPost && deleted.includes(oldPost.id)} · summary kept ${keepPost && !deleted.includes(keepPost.id)} · human kept ${humanPost && !deleted.includes(humanPost.id)}`);
@@ -814,7 +838,7 @@ async function fire(over) {
     ok(`every scheduled tick runs once (${ticks.length})`, bad.length === 0, bad.join('\n        '));
     const digestForum = dbHandle.prepare("SELECT gm_digest_forum FROM guild_config WHERE guild_id='G1'").get()?.gm_digest_forum;
     const digests = threads.filter(t => t.parentId === digestForum);
-    ok('the weekly digest is one dated thread in gm-digest, titled by a Monday', digests.length === 1 && /\] Monday \d{1,2}(st|nd|rd|th) of [A-Z][a-z]+ \d{4} · Weekly digest$/.test(digests[0].name), digests.map(t => t.name).join(' | ') || 'none');
+    ok('the weekly digest is a dated thread in gm-digest, titled by a Monday — the seeded one and the tick\'s', digests.length === 2 && digests.every(t => /\] Monday \d{1,2}(st|nd|rd|th) of [A-Z][a-z]+ \d{4} · Weekly digest$/.test(t.name)), digests.map(t => t.name).join(' | ') || 'none');
   }
 
   // ── The three update forums ─────────────────────────────────────────
