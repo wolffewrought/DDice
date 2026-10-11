@@ -453,6 +453,34 @@ seeding boot must come back re-posted on top, gm-updates must read in
 date order, gm-digest must hold one thread after the boot and two after
 the tick. 1070 assertions, 64 probes.
 
+**The cast (T, 18:05):** every placeholder in the books and in /help is now
+one of four: `@Players` for a player slot, `@GMs` for a GM slot or the GM
+role, and `@Artorius` / `@Meliora` (Zeus held in reserve) where an example
+needs real people — the four two-person commands (`/fight start players:`,
+`/fight order sequence:`, `teams:`, `/gm dc targets:`) and the worked
+examples. `@a`, `@b`, `@user`, `@player`, `@p`, `@Bo`, `@them`, `@someone`,
+`@friend`, `@rival`, `@Role` are gone; four /help lines that had the option
+name missing (`merit add @user`) were fixed on the way.
+
+**The enemies (T, 18:12):** every enemy in the books and /help is a
+**Hollow** (the common foe) or a **Hollow tank** (the stat-block one that
+speaks, rolls, holds a weapon and a class, and is the Hero-NPC example);
+**Hollow Lieutenant** is the boss (the full stat block, the Hero-NPC with a
+STR signature, the feints, the record with lore and loot); the tank is a
+mute elite — hit points and reach, no class, no speech — and no Hollow ever
+speaks or holds a knight class: the voice examples (`/npc say`, `AS` in an
+activity, "speaks" on the timeline) are Garrick's. Hollow weapons are
+Weaponised appendage, Claw and Talon, added to the server weapon list in
+the Weapons chapter (NPC weapons sit on the same list). Mysterious
+Stranger, not Mystery. /help's `/npc say` line named a `message:` option
+that never existed — it is `speech:` / `action:`. The category is Hollows, the quest is Hollow Cave, the encounter scenes
+are Hollows on the ridge / Ridge hollows. Friendly NPCs keep their names:
+Garrick (now a Vendor, with Ally as his second tag) and Mystery Stranger
+(was Mystery Figure). The 5e Library rows keep Goblin and Orc on purpose —
+they are real SRD entries `/library srd` loads. Zeus joins the three
+list-shaped fight rows and the group-check example. The 5e example
+character is Artorius.
+
 **Recipe:** the re-lay was done by a script (relay_books.py, scratch) that
 takes every original item and row by AST span and asserts each is used
 exactly once or dropped with a written reason — 445 items whole, 156 rows
