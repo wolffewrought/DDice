@@ -49,15 +49,17 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1066 as of 2026-10-11) and no scanner
+Green means every assertion passed (1068 as of 2026-10-11) and no scanner
 found an ERROR. Then run the probe: `node --experimental-sqlite probe.js`
-(46 probes, the last of which fires every registered leaf).
+(61 probes: the fight, encounter, override, autocomplete and every-leaf
+walks, the GM-gate walk, chat shorthands, scheduled ticks, junk-id lanes,
+SQL compile, forum seeding and sweep, and a double-ack check).
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
 no network in the sandbox, so npm cannot supply a parser.
 
-`verify.js` sits beside `index.js` and reads it from there. It has six parts:
+`verify.js` sits beside `index.js` and reads it from there. It has eight parts:
 
 | Part | What it does |
 |---|---|
@@ -68,11 +70,12 @@ no network in the sandbox, so npm cannot supply a parser.
 | **stubs + loader** | Fake discord.js, better-sqlite3, dotenv and canvas, installed by a require hook, then `index.js` executed for real against them. The discord.js half validates: it refuses anything the real API would refuse, at build time, naming the command. Teach it a new builder method before `index.js` uses one. |
 | **harnesses** | `builders` (shape and ceilings, via the stub), `rules` (arithmetic of both damage models, 5e modifiers, `chunkLines`), `pins` (named regressions with the story attached). |
 | **scopes** | What the bag-of-names scanners cannot see. Scope-aware: an identifier read where no enclosing scope declares it (a ReferenceError the moment the line runs); a local never read; a call that leaves out a parameter the body reads unguarded. Per-command: an option read in a handler that none of the commands routed to it declares; a group or subcommand compared under a dispatch block that the command does not register; an autocomplete option no branch answers. SQL against the schema: a column no table has, a dynamic-UPDATE key that is not a column, a table nothing queries. Comments naming identifiers that are gone. Added 2026-10-11 after one pass found eight bugs every global check had passed for weeks. |
+| **docs** | Every `/command sub [leaf]` named in HELP_CATEGORIES and in make_pdfs.py (read from beside index.js) must be a leaf the command registers — grouped leaves under their group, top-level leaves bare. `doc-names-unknown-command` is an ERROR: a reader typing it gets a command Discord has never heard of. Option names (`name:`) and `/`-lists are skipped; DOC_PROSE is the stoplist. Added 2026-10-11 after seven wrong commands were found in the books by hand. |
 
 ### Severity means something
 
 ERROR fails the run and is provably wrong. WARN reports and does not fail:
-it needs a human. Do not silence a WARN to get a green run — the twelve
+it needs a human. Do not silence a WARN to get a green run — the fifteen
 standing ones are all correct-by-design and are listed in §6.
 
 ## 4 · House conventions
@@ -83,8 +86,12 @@ standing ones are all correct-by-design and are listed in §6.
 - **Deliver only what changed.** Code-only turn: `index.js` alone. Content
   change: the PDFs too. Never zips. Build scripts (`make_pdfs.py`) only when
   asked.
-- **PDFs:** parchment is the reference edition. Six books total — Knightfall
-  and DnD5e, each in Player / GameMaster / Parchment.
+- **PDFs:** eight books — Knightfall and DnD5e, each in Player / GameMaster /
+  Parchment, plus the two Examples books. Since 2026-10-11 the Game Master's
+  edition carries the table's half as well as the GM's, so the GM book and
+  Parchment hold the same content under different covers (§10l). Build with
+  `DDICE_PDF_OUT=<dir> python3 make_pdfs.py`; the default writes to
+  /mnt/user-data/outputs.
 - **Ask before architectural changes.** Questions first, build after.
 - **Plain language in user-facing text.** Every refusal explains what to do
   instead.
@@ -341,6 +348,98 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 10l · Update forums, dated threads, and the books re-laid as journeys (2026-10-11)
+
+T: gm-quest-log is for quests, not for the bot's news; make the bot its own
+forums, one dated thread per update, the back-catalogue too, and clear the
+old posts. Then: plan the books by what a player and a GM actually do, in
+order, with less empty space. Built after a "Build" on the full plan.
+
+**Three forums, made on boot from SETUP_PLAN:** `updates` (open —
+What's new for players), `gm-updates` (GM — What's new for GMs, and Deploy
+mend), `gm-digest` (GM — the weekly digest, one thread per week). Config
+columns `updates_forum`, `gm_updates_forum`, `gm_digest_forum`,
+`updates_seeded_at`. Every post is a thread made by
+`postDatedThread(client, forumId, kind, ms, lines)`, titled
+`dateLine(ms) · kind`; the date line is T's spec, ISO weeks Monday-first
+(week 53 when the year has one), calendar date in Europe/London:
+`[11/10/2026] [WEEK 41] Sunday 11th of October 2026 · What's new`. Helpers
+sit beside CHANGELOG: BOT_TZ, localDateParts (Intl parts), isoWeek,
+ordinalDay, dateLine, mondayOf. `announceChangelog` posts oldest-first; on
+the first boot with the forums (`!updates_seeded_at`) it seeds the whole
+CHANGELOG, GM lines to gm-updates and player lines to updates, and
+bootMend runs `sweepOldUpdatePosts` first — the bot's own What's new /
+Deploy mend / Weekly digest posts in gm-quest-log and player-pdf, header-
+matched, paged ten by a hundred, paced 1200 ms — and reports the count in
+that boot's Deploy mend thread. Silent when a forum is missing: no
+fallback to the old channels, by design. The digest in questTick is gated
+on `gm_digest_forum` and titled by `mondayOf(now)`. Target-secret verdicts
+go to the audit's `checks` shelf. Help and CHANGELOG say all of this.
+
+**Also in the same build:** `summonSpec` clones an NPC of the name as temps
+when the library has no such monster (Knightfall had no route at all);
+`KNIGHTFALL_ONLY = ['duel','deception']` so `/standing` registers on 5e;
+`/npc give|take|npclore` and `/config` gated; `/npc sheet` masks stats for
+players unless npcstats is on; handleCheck's GM gate moved to the top; the
+`/npc hero` stat path set `class: 'Hero'` (clobbering the class) — now the
+flag; the `/char signature` refusal named a route that no longer exists.
+Probe: strict fake interaction (a second reply/defer/update throws
+InteractionAlreadyReplied, so a double ack is a failure), `messages.fetch`
+history, ticks captured for the whole run, forum seeding and sweep walked
+with a third boot.
+
+**The books, re-laid.** make_pdfs.py no longer holds one flat CONTENT
+list. `PARTS` bundles every item by subject (start, roll, roll-kf, roll2,
+char, sheet, hp, fight, gmfight, quest, gmquest, standing, activities,
+gmactivities, fallen, reference, reference-kf, feedback, setup, gmroll,
+gmchar, gmhp, npcs, weapons, scrolls, keeping, rules5e, library5e);
+`BOOKS` is the journey per edition — chapter title and the parts it binds,
+in reading order — and `PART_SYSTEM` marks the Knightfall-only and 5e-only
+parts. The player's journey: Start Here · Rolling Dice · [The Rules of 5e]
+· Making Your Character · Your Sheet and Your Thread · HP, Healing and
+Rest · Fighting · Quests · Standing · Activities and Quizzes · The Fallen ·
+Reference. The GM's: Start Here · Setting Up · Rolling Dice (+ the GM's) ·
+[The Rules of 5e] · Characters and Approvals · HP, Healing and Rest · NPCs
+(+ The Library on 5e) · Weapons · Running Fights · Quests · Standing ·
+Activities and Quizzes · Scrolls, the Bot's Voice, and Fixing What Was Said
+· Keeping the Server · The Fallen · Reference — inside each chapter the
+table's half first, then the GM's. `KEEP['gm']` is None: the GM book is the
+whole thing, so Parchment is the same content under another cover (kept
+because the bot publishes all eight; retire it only with T). The two
+grab-bag blocks ('Config (Admin only)', 39 rows; 'For the GM', 81 rows)
+were dealt out row by row. The 5e rules sat under aud gm, so the 5e player
+book had none of them — now a shared part. New text: Start Here (how to
+read, /help, the updates forum), Your Thread, the player's Quests chapter
+(party thread, encounters, campaigns, chronicle and review), Titles &
+Associations, Quizzes for players, Temporary NPCs — Enemies for One Fight,
+Setting Up (the one-command setup, a table of every channel the plan
+makes, mechanics), Updates and the Deploy Mend, Checks and Reports.
+
+**Spacing:** a chapter starts where the last ended unless under a quarter
+page remains (`CondPageBreak(doc.height/4)`); a heading needs 92 pt below
+it, not the whole block (the old `KeepTogether([h2, block])` was the empty
+space); a comment over 100 characters runs full-width under its command
+instead of 15 lines in a 58 mm column; a run of spaces in a command may
+break at its end. Player book 22 → 19 pages with more in it; GM 60 → 56.
+
+**Stale text found by reading every page:** Hero as a class (three
+places), `/gm check run:true` and friends (leaves, not flags), `/config
+mechanics heal charges 3`, `/npc say text:`, two commands a row in NPC
+Records, positional `/char profile save mysave`, "one run per channel",
+"anyone can press", the Core/Knightfall/DnD5e module books that never
+existed, What's new "to the GM log", the digest "in gm-quest-log", a
+comment that read 'player'. DejaVu has no emoji and Serif lacks even ⚔ ⚖
+❤, so every such glyph is stripped at generation (a five-hex `\u1f4aa`
+had been printing Greek). The examples book had four temp-NPC rows
+outside their tuple (silently dropped) and a `/library summon` that does
+not exist on Knightfall.
+
+**Recipe:** the re-lay was done by a script (relay_books.py, scratch) that
+takes every original item and row by AST span and asserts each is used
+exactly once or dropped with a written reason — 445 items whole, 156 rows
+re-dealt, 29 items and 22 rows dropped. The docs scanner passed before and
+after.
 
 ## 10k · The dead-end pass: eight bugs, a scope scanner, a leaf walk, the re-lay (2026-10-11)
 

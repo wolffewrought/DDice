@@ -760,6 +760,10 @@ try { db.exec('ALTER TABLE quests ADD COLUMN completion_snapshot TEXT'); } catch
 try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_digest_at INTEGER'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN changelog_seen TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN campaign_forum TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN updates_forum TEXT'); } catch {}       // players: What's new, a dated thread each
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_updates_forum TEXT'); } catch {}    // GMs: What's new and Deploy mend
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_digest_forum TEXT'); } catch {}     // GMs: the weekly digest, a thread per week
+try { db.exec('ALTER TABLE guild_config ADD COLUMN updates_seeded_at INTEGER'); } catch {} // the boot that opened the forums and posted the back-catalogue
 try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_routes TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_cats TEXT'); } catch {}
 try { db.exec('ALTER TABLE char_pages ADD COLUMN inv_msg_id TEXT'); } catch {}
@@ -2188,6 +2192,10 @@ async function isGm(guild, uid) {
 
 async function handleConfig(interaction, forced) {
   const sub = forced?.sub ?? interaction.options.getSubcommand(), gid = interaction.guild.id;
+  // Discord hides /config behind Manage Server by default, but that is a
+  // setting a server can change by accident. The bot checks for itself.
+  if (!interaction.member?.permissions?.has?.(PermissionFlagsBits.ManageGuild))
+    return interaction.reply({ content: '❌ Configuration needs **Manage Server**.', ephemeral: true });
   if (sub === 'gmrole') {
     const role = interaction.options?.getRole?.('role');
     const remove = interaction.options?.getBoolean?.('remove') ?? false;
@@ -5175,7 +5183,7 @@ async function handleChar(interaction) {
       upsertChar(gid, target.id, { signature_stat: null });
       return interaction.reply({ content: `✅ Cleared **${nm}**'s signature stat.` });
     }
-    if (!isHero(ch)) return interaction.reply({ content: `❌ **${nm}** isn't a Hero. Set their class first with \`/char set field:class value:Hero\`.`, ephemeral: true });
+    if (!isHero(ch)) return interaction.reply({ content: `❌ **${nm}** isn't a Hero. Grant that first with \`/char hero user:@them value:true\`.`, ephemeral: true });
     const val = ch[stat] ?? 0;
     if (val < SIGNATURE_MIN) return interaction.reply({ content: `❌ **${nm}**'s ${STAT_LABELS[stat]} is **${val}** — a signature stat needs **${SIGNATURE_MIN}+**.`, ephemeral: true });
     upsertChar(gid, target.id, { signature_stat: stat });
@@ -7719,8 +7727,12 @@ async function handleNpcPages(interaction, sub) {
   if (npc.class) lines.push(`🏅  ${npc.class}`);
   if (isHero(npc) && npc.signature_stat) lines.push(`${STAT_EMOJIS[npc.signature_stat] ?? '✨'}:  ${STAT_LABELS[npc.signature_stat]} advantage`);
   lines.push(`❤️  HP          ${npc.hp_current} / ${max}`);
-  lines.push('', `💪  STR         ${npc.str ?? 0}`, `🫀  CON         ${npc.con ?? 0}`,
+  // The stat block follows the same switch as roll cards: hidden means a
+  // player sees name, order and HP, and not the numbers.
+  const showStats = npcStatsVisible(gid) || await isGm(interaction.guild, interaction.user.id);
+  if (showStats) lines.push('', `💪  STR         ${npc.str ?? 0}`, `🫀  CON         ${npc.con ?? 0}`,
              `⚡  DEX         ${npc.dex ?? 0}`, `🧠  WIS         ${npc.wis ?? 0}`, `🍀  LCK         ${npc.lck ?? 0}`);
+  else lines.push('', '_Stats are the GM\'s to see._');
   if (npc.weapon1 || npc.weapon2) {
     lines.push('');
     for (const w of [npc.weapon1, npc.weapon2].filter(Boolean)) {
@@ -8077,8 +8089,16 @@ async function postAsNpc(channel, gid, npcName, content) {
 
 async function handleNpc(interaction) {
   {
+    // The sheet is readable by anyone (stats masked below when hidden);
+    // giving, taking and lore are a GM's. These four sat above the gate
+    // for months (plain-player walk, 2026-10-11).
     const sub0 = interaction.options.getSubcommand();
-    if (['sheet', 'give', 'take', 'npclore'].includes(sub0)) return handleNpcPages(interaction, sub0);
+    if (sub0 === 'sheet') return handleNpcPages(interaction, sub0);
+    if (['give', 'take', 'npclore'].includes(sub0)) {
+      if (!(await isGm(interaction.guild, interaction.user.id)))
+        return interaction.reply({ content: '❌ Only GMs can change an NPC\'s record.', ephemeral: true });
+      return handleNpcPages(interaction, sub0);
+    }
   }
   // The category group reuses top-level leaf names (create, list, remove),
   // so the group is read FIRST and prefixed back onto the leaf — the six
@@ -8399,7 +8419,7 @@ async function handleNpc(interaction) {
     }
     const val = npc[stat] ?? 0;
     if (val < SIGNATURE_MIN) return interaction.reply({ content: `❌ **${npc.name}**'s ${STAT_LABELS[stat]} is **${val}** — a signature stat needs **${SIGNATURE_MIN}+**.`, ephemeral: true });
-    upsertNpc(gid, npc.name, { class: 'Hero', signature_stat: stat });
+    upsertNpc(gid, npc.name, { is_hero: 1, signature_stat: stat });   // the flag, never the class slot
     return interaction.reply({ content: `⭐ **${npc.name}** is a **Hero** with signature **${STAT_LABELS[stat]}** (${val}) — their ${STAT_LABELS[stat]} rolls now have **advantage**.` });
   }
 
@@ -13461,18 +13481,17 @@ const QUARTER_MS = 15 * 60 * 1000;
 
 async function questTick(client) {
   for (const guild of client.guilds.cache.values()) {
-    // Weekly digest of what is stalled, to gm-quest-log, so nothing depends
-    // on someone noticing (T, 2026-09-29).
+    // Weekly digest of what is stalled, one dated thread a week in
+    // gm-digest, titled by the Monday of the week it covers, so nothing
+    // depends on someone noticing (T, 2026-09-29 / 10-11).
     try {
       const cfgD = getConfig(guild.id) || {};
-      if (cfgD.quest_log_gm && Date.now() - (Number(cfgD.gm_digest_at) || 0) >= 7 * 86400000) {
+      if (cfgD.gm_digest_forum && Date.now() - (Number(cfgD.gm_digest_at) || 0) >= 7 * 86400000) {
         setConfig(guild.id, { gm_digest_at: Date.now() });
-        const out = await stalledReport(guild);
-        if (out.length) {
-          const ch = await client.channels.fetch(cfgD.quest_log_gm).catch(() => null);
-          if (ch?.send) await ch.send({ allowedMentions: { roles: getGmRoleIds(guild.id) },
-            content: ['\u{1F5DE}\uFE0F **Weekly digest \u2014 waiting on a GM** ' + getGmRoleIds(guild.id).map(r => `<@&${r}>`).join(' '), '', ...out].join('\n').slice(0, 1900) }).catch(() => {});
-        }
+        const out = stalledReport(guild);
+        if (out.length) await postDatedThread(client, cfgD.gm_digest_forum, 'Weekly digest', mondayOf(Date.now()),
+          ['\u{1F5DE}\uFE0F **Weekly digest \u2014 waiting on a GM** ' + getGmRoleIds(guild.id).map(r => `<@&${r}>`).join(' '), '', ...out],
+          { allowedMentions: { roles: getGmRoleIds(guild.id) } });
       }
     } catch (e) { console.error('[digest]', e?.message || e); }
     let running;
@@ -13680,15 +13699,28 @@ function summonSpec(gid, spec) {
   for (const part of String(spec || '').split(',').map(x => x.trim()).filter(Boolean)) {
     const m = part.match(/^(.*?)(?:\s*[x\u00d7]\s*(\d{1,2}))?$/i);
     const name = (m?.[1] || part).trim(), count = Math.min(12, Math.max(1, parseInt(m?.[2] || '1', 10)));
+    // The 5e library first; failing that, an NPC of that name is the
+    // template — the only route a Knightfall server has, since /library
+    // never registers there (found 2026-10-11).
     const mon = db.prepare('SELECT * FROM library_monsters WHERE guild_id=? AND name=? COLLATE NOCASE').get(gid, name);
-    if (!mon) { missing.push(name); continue; }
+    const tpl = mon ? null : getNpc(gid, name);
+    if (!mon && !tpl) { missing.push(name); continue; }
+    const base = mon ? mon.name : tpl.name;
     for (let i = 1; i <= count; i++) {
-      const nm = count > 1 ? `${mon.name} ${i}` : mon.name;
+      const nm = count > 1 ? `${base} ${i}` : base;
       if (getNpc(gid, nm)) continue;
-      upsertNpc(gid, nm, {
+      if (mon) upsertNpc(gid, nm, {
         armour_class: mon.ac, attack_bonus: mon.attack, damage_dice: mon.damage,
         max_hp: mon.hp, hp_current: mon.hp,
         str: mon.str, dex: mon.dex, con: mon.con, int: mon.int, wis: mon.wis, cha: mon.cha,
+        is_temp: 1, temp_at: Date.now(),
+      });
+      else upsertNpc(gid, nm, {
+        order_name: tpl.order_name, class: tpl.class, str: tpl.str, con: tpl.con, dex: tpl.dex, wis: tpl.wis, lck: tpl.lck,
+        int: tpl.int, cha: tpl.cha, hp_current: tpl.max_hp ?? maxHpFromCon(gid, tpl.con), max_hp: tpl.max_hp,
+        armour_class: tpl.armour_class, attack_bonus: tpl.attack_bonus, damage_dice: tpl.damage_dice,
+        weapon1: tpl.weapon1, weapon2: tpl.weapon2, preferred_atk: tpl.preferred_atk, preferred_def: tpl.preferred_def,
+        image_url: tpl.image_url, is_hero: tpl.is_hero, signature_stat: tpl.signature_stat,
         is_temp: 1, temp_at: Date.now(),
       });
       made.push(nm);
@@ -14310,7 +14342,7 @@ async function renderQuest(guild, quest, { applyHint = true } = {}) {
     lines.push(`Applicants: ${names.join('  ')}`);
   }
   if (quest.run_channel_id) lines.push(`\n📍 Runs in <#${quest.run_channel_id}>`);
-  if (applyHint && quest.status === 'open') lines.push(`\n_Apply with the button below or_ \`/quest apply number:${quest.number}\``);
+  if (applyHint && quest.status === 'open') lines.push(`\n_Apply with the button below or_ \`/quest party apply number:${quest.number}\``);
   return lines.join('\n');
 }
 
@@ -18785,7 +18817,7 @@ const SETUP_PLAN = [
   { key: 'quest_log_channel',     name: 'quest-chronicle',  forum: true,  gm: false, essential: true,
     about: 'A thread per adventurer \u2014 every quest they finished, told by the GM who ran it.' },
   { key: 'quest_log_gm',          name: 'gm-quest-log',     forum: false, gm: true,  essential: false,
-    about: 'The machine\'s account of every finished quest \u2014 timings, events, payouts. GM eyes only.' },
+    about: 'The machine\'s account of every finished quest \u2014 timings, events, payouts, final words. GM eyes only.' },
   { key: 'memorial_public_channel', name: 'the-fallen',     forum: false, gm: false, essential: false,
     about: 'Those who did not come back, remembered by the table.' },
   { key: 'char_forum',            name: 'character-pages',  forum: true,  gm: false, essential: true,
@@ -18812,6 +18844,12 @@ const SETUP_PLAN = [
     about: 'Where the nightly backup of everything is posted.' },
   { key: 'campaign_forum', name: 'campaigns', forum: true, gm: true, essential: false,
     about: 'One thread per campaign \u2014 GM eyes only; the arc, its linked runs, and where things stand.' },
+  { key: 'updates_forum',         name: 'updates',          forum: true,  gm: false, essential: false,
+    about: 'What changed for players \u2014 one dated thread per update.' },
+  { key: 'gm_updates_forum',      name: 'gm-updates',       forum: true,  gm: true,  essential: false,
+    about: 'What changed for GMs, and what each deploy mended \u2014 one dated thread each.' },
+  { key: 'gm_digest_forum',       name: 'gm-digest',        forum: true,  gm: true,  essential: false,
+    about: 'The weekly digest of what is waiting on a GM \u2014 one thread per week, titled by its Monday.' },
   { key: 'feedback_routes', json: 'forum', name: 'gm-feedback', forum: true, gm: true, essential: false,
     about: 'Player feedback, one thread per category \u2014 GM eyes only; players post with `/feedback send`.' },
   { key: 'gm_char_forum',         name: 'gm-character-sheets', forum: true, gm: true, essential: false,
@@ -18906,6 +18944,9 @@ async function handleCheck(interaction) {
   // to the setup report at the bottom.
   const checkLeaf = interaction.options.getSubcommand();
   const opt = (name) => checkLeaf === name;
+  // One gate for every leaf — the migrations ledger and the order prompt
+  // used to sit above the gate at the bottom (plain-player walk, 2026-10-11).
+  if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ The setup check is for GMs.', ephemeral: true });
   // `run:true` builds whatever the code knows about and this server hasn't
   // got yet — the one switch to pull after an update adds a book.
   if (opt('stalled')) return showStalled(interaction);
@@ -18941,7 +18982,6 @@ async function handleCheck(interaction) {
   if (opt('build')) return runFullSetup(interaction);
   if (opt('run')) return runSetupRepair(interaction);
   const gid = interaction.guild.id;
-  if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ The setup check is for GMs.', ephemeral: true });
   await interaction.deferReply({ ephemeral: true });
   const cfg = getConfig(gid) || {};
   const routes = (k) => { try { return JSON.parse(cfg[k] || '{}'); } catch { return {}; } };
@@ -19561,6 +19601,88 @@ async function healChannelPerms(guild) {
 // One entry per push, newest first. Each feature adds its line here as it
 // is built, the way it adds a pin. On boot, unseen entries go to the GM log
 // and player-tagged lines to the player docs channel (T, 2026-09-29).
+// ── Dated threads ─────────────────────────────────────────────────────
+// Every thread the bot opens in the three update forums carries the same
+// title line, in T's format (2026-10-11): [DD/MM/YYYY] [WEEK n] Weekday
+// ordinal of Month year — ISO weeks, Monday first, week 53 when the year
+// has one. The calendar date is read in the table's time zone, so a post
+// at ten to midnight is dated the day it was made, not the UTC day.
+const BOT_TZ = 'Europe/London';
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+function localDateParts(ms) {
+  const f = new Intl.DateTimeFormat('en-GB', { timeZone: BOT_TZ, year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'long' });
+  const p = Object.fromEntries(f.formatToParts(new Date(ms)).map(x => [x.type, x.value]));
+  return { y: Number(p.year), m: Number(p.month), d: Number(p.day), weekday: p.weekday };
+}
+function isoWeek(y, m, d) {
+  const t = Date.UTC(y, m - 1, d);
+  const dow = (new Date(t).getUTCDay() + 6) % 7;             // Monday = 0
+  const thursday = t + (3 - dow) * 86400000;                   // the week belongs to the year its Thursday is in
+  const jan1 = Date.UTC(new Date(thursday).getUTCFullYear(), 0, 1);
+  return Math.floor((thursday - jan1) / 86400000 / 7) + 1;
+}
+function ordinalDay(n) {
+  const v = n % 100;
+  return n + (v >= 11 && v <= 13 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' })[n % 10] || 'th');
+}
+function dateLine(ms = Date.now()) {
+  const { y, m, d, weekday } = localDateParts(ms);
+  return `[${String(d).padStart(2, '0')}/${String(m).padStart(2, '0')}/${y}] [WEEK ${isoWeek(y, m, d)}] ${weekday} ${ordinalDay(d)} of ${MONTH_NAMES[m - 1]} ${y}`;
+}
+// The Monday of the week an instant falls in, as that same noon instant.
+function mondayOf(ms) {
+  const { y, m, d } = localDateParts(ms);
+  const t = Date.UTC(y, m - 1, d, 12);
+  return t - ((new Date(t).getUTCDay() + 6) % 7) * 86400000;
+}
+// Open one dated thread in a forum: title is the date line, then what it
+// is; the body is the content. Returns the thread, or null when the forum
+// is not set or cannot be reached — silence, never a fallback into some
+// other channel (the quest log was that fallback for a fortnight).
+async function postDatedThread(client, forumId, kind, ms, content, extra = {}) {
+  if (!forumId) return null;
+  const forum = await client.channels.fetch(forumId).catch(() => null);
+  if (!forum?.threads?.create) return null;
+  const name = `${dateLine(ms)} \u00b7 ${kind}`.slice(0, 100);
+  const chunks = chunkLines(Array.isArray(content) ? content : String(content).split('\n'), 1900);
+  const thread = await forum.threads.create({ name, autoArchiveDuration: 10080,
+    message: { content: chunks[0] || content, allowedMentions: extra.allowedMentions || { parse: [] } } }).catch((e) => { console.error('[dated-thread]', kind, e?.message || e); return null; });
+  if (thread) for (const c of chunks.slice(1)) await thread.send({ content: c, allowedMentions: { parse: [] } }).catch(() => {});
+  return thread;
+}
+// The headers the bot's own update posts began with while they lived in
+// gm-quest-log and player-pdf. The one-time sweep removes exactly these,
+// and only the bot's own messages.
+const OLD_UPDATE_HEADERS = ['\u{1F4F0} **What\'s new', '\u{1F527} **Deploy mend**', '\u{1F5DE}\uFE0F **Weekly digest'];
+async function sweepOldUpdatePosts(client, gid) {
+  const cfg = getConfig(gid) || {};
+  const out = [];
+  for (const key of ['quest_log_gm', 'docs_player_channel']) {
+    const id = cfg[key];
+    if (!id) continue;
+    const ch = await client.channels.fetch(id).catch(() => null);
+    if (!ch?.messages?.fetch) continue;
+    let before = undefined, removed = 0, scanned = 0;
+    for (let page = 0; page < 10; page++) {
+      const batch = await ch.messages.fetch({ limit: 100, ...(before ? { before } : {}) }).catch(() => null);
+      if (!batch || !batch.size) break;
+      for (const msg of batch.values()) {
+        scanned++;
+        if (msg.author?.id !== client.user?.id) continue;
+        if (!OLD_UPDATE_HEADERS.some(h => String(msg.content || '').startsWith(h))) continue;
+        // Older than two weeks cannot be bulk-deleted; one at a time, paced.
+        const gone = await msg.delete().then(() => true).catch(() => false);
+        if (gone) removed++;
+        await new Promise(r => setTimeout(r, 1200));
+      }
+      before = batch.last()?.id;
+      if (batch.size < 100) break;
+    }
+    if (removed) out.push(`${removed} old update post${removed === 1 ? '' : 's'} removed from <#${id}>`);
+  }
+  return out;
+}
+
 const CHANGELOG = [
   { key: '2026-10-11', gm: [
       'Fixed, having never worked: `/gm dc` (flavours, sanctions and `hold:` were lost after the card posted) \u00b7 `/gm override skip` \u00b7 `/npc temp keep|clear|list` \u00b7 `/npc reroll` \u00b7 `/npc manage sync|create5e`',
@@ -19569,9 +19691,14 @@ const CHANGELOG = [
       'Fresh installs: four migrations (hero flag, weapon emoji flags) ran before their tables existed; `/char hero` and `/npc hero` threw on a new database',
       'The sheet in a character\'s thread now refreshes on every stat edit, not on the next hourly sweep',
       'index.js laid out by family \u2014 twenty parts, a map at the top; nothing inside a function changed',
+      'Three forums, made on this boot: **updates** (players), **gm-updates** (What\'s new and Deploy mend) and **gm-digest** (the weekly digest) \u2014 one dated thread each. gm-quest-log is for quests again; its old update posts were cleared',
+      '`/encounter preset … npcs:` now clones an NPC of that name when the library has no such monster \u2014 on Knightfall the library never existed, so presets could not summon at all',
+      '`/npc give|take|npclore` were open to any player; `/npc sheet` showed hidden stats to players; `/config` had no check of its own. All gated',
+      '`/standing` registers on 5e servers too \u2014 quests paid merits and titles there with no way to manage them',
     ], player: [
       '`/roll save:` and `/roll skill:` (5e) work \u2014 they had been registered on the GM\'s roll, where nothing read them',
       'Your sheet in your character thread updates the moment a stat changes',
+      'A new **updates** forum: what changed, one dated thread each \u2014 this is the first',
     ] },
   { key: '2026-10-08', gm: [
       '`/encounter start` now lists the roster \u2014 tick the party, press **Open the encounter**, and it opens its own thread in quest-instances',
@@ -19601,19 +19728,30 @@ const CHANGELOG = [
     ] },
 ];
 
+// What's new, as one dated thread per entry: GM lines to gm-updates,
+// player lines to updates. The boot that first finds either forum posts
+// the whole back-catalogue, oldest first, so the forum opens with the
+// history in order; every boot after that posts only what is new. Markers
+// are written BEFORE posting, so a crash mid-way cannot double-post.
 async function announceChangelog(client, guild) {
   const gid = guild.id;
   const cfg = getConfig(gid) || {};
+  const forums = { gm: cfg.gm_updates_forum || null, player: cfg.updates_forum || null };
+  if (!forums.gm && !forums.player) return;
+  const seeding = !cfg.updates_seeded_at;
   const seen = cfg.changelog_seen || '';
-  const fresh = CHANGELOG.filter(e => e.key > seen);
-  if (!fresh.length) return;
-  setConfig(gid, { changelog_seen: CHANGELOG[0].key });
-  const gmLines = fresh.flatMap(e => [`**${e.key}**`, ...e.gm.map(l => `\u00b7 ${l}`), '']);
-  const plLines = fresh.flatMap(e => e.player.length ? [`**${e.key}**`, ...e.player.map(l => `\u00b7 ${l}`), ''] : []);
-  const gmCh = cfg.quest_log_gm ? await client.channels.fetch(cfg.quest_log_gm).catch(() => null) : null;
-  if (gmCh?.send && gmLines.length) await gmCh.send({ content: ['\u{1F4F0} **What\'s new**', '', ...gmLines].join('\n').slice(0, 1900) }).catch(() => {});
-  const plCh = cfg.docs_player_channel ? await client.channels.fetch(cfg.docs_player_channel).catch(() => null) : null;
-  if (plCh?.send && plLines.length) await plCh.send({ content: ['\u{1F4F0} **What\'s new for players**', '', ...plLines].join('\n').slice(0, 1900) }).catch(() => {});
+  const entries = (seeding ? [...CHANGELOG] : CHANGELOG.filter(e => e.key > seen)).reverse();   // oldest first
+  if (!entries.length) { if (seeding) setConfig(gid, { updates_seeded_at: Date.now() }); return; }
+  setConfig(gid, { changelog_seen: CHANGELOG[0].key, updates_seeded_at: cfg.updates_seeded_at || Date.now() });
+  for (const e of entries) {
+    // The key is a date (YYYY-MM-DD); noon UTC lands on that calendar date in the table's zone.
+    const [ky, km, kd] = e.key.split('-').map(Number);
+    const at = Date.UTC(ky, km - 1, kd, 12);
+    if (e.gm.length) await postDatedThread(client, forums.gm, 'What\'s new', at,
+      ['\u{1F4F0} **What\'s new for GMs**', '', ...e.gm.map(l => `\u00b7 ${l}`)]);
+    if (e.player.length) await postDatedThread(client, forums.player, 'What\'s new', at,
+      ['\u{1F4F0} **What\'s new**', '', ...e.player.map(l => `\u00b7 ${l}`)]);
+  }
 }
 
 async function bootMend(client) {
@@ -19627,13 +19765,17 @@ async function bootMend(client) {
     try {
       const made = await mendEverything(client, guild);
       if (made.length) console.log(`[mend] ${guild.name}: ${made.join(' \u00b7 ')}`);
-      // A deploy announces what it did, in the GM log rather than only on
-      // the host's console (T, 2026-09-29).
-      if (made.length) {
-        const logId = (getConfig(gid) || {}).quest_log_gm;
-        const ch = logId ? await client.channels.fetch(logId).catch(() => null) : null;
-        if (ch?.send) await ch.send({ content: `\u{1F527} **Deploy mend** \u2014 ${made.join(' \u00b7 ')}` }).catch(() => {});
+      // The boot that opens the update forums also clears the old posts
+      // out of gm-quest-log and player-pdf, once, and says how many.
+      const after = getConfig(gid) || {};
+      if (!after.updates_seeded_at && (after.gm_updates_forum || after.updates_forum)) {
+        const swept = await sweepOldUpdatePosts(client, gid).catch(e => { console.error('[updates-sweep]', e?.message || e); return []; });
+        made.push(...swept);
       }
+      // A deploy announces what it did, as a dated thread in gm-updates
+      // rather than only on the host's console (T, 2026-09-29 / 10-11).
+      if (made.length) await postDatedThread(client, after.gm_updates_forum, 'Deploy mend', Date.now(),
+        ['\u{1F527} **Deploy mend**', '', ...made.map(l => `\u00b7 ${l}`)]);
       // And what changed, if anything is new since the last boot.
       await announceChangelog(client, guild).catch(e => console.error('[changelog]', e?.message || e));
     } catch (e) { console.log(`[mend] ${guild.name}: ${e?.message || e}`); }
@@ -23331,7 +23473,9 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
 // gates stay as the backstop — subcommands (like /npc manage create5e) register
 // with their command and cannot be hidden per-ruleset, only refused.
 const DND5E_ONLY = ['dnd', 'spell', 'library'];
-const KNIGHTFALL_ONLY = ['duel', 'deception', 'standing'];
+// Duels and deception are Knightfall mechanics. Standing is not: quests pay
+// merits and grant titles under either ruleset, so /standing registers on both.
+const KNIGHTFALL_ONLY = ['duel', 'deception'];
 
 // ══════════════════════════════════════════════════════════════════════
 //  HELP
@@ -23351,10 +23495,11 @@ const HELP_CATEGORIES = {
       '**4 · HP and rests** — `!hp -3` after a hit, `lrest` for a full rest, `srest` for a breather. White Knights (WIS ≥ 5) can `!heal @friend`.',
       '**5 · Fights** — a GM opens one with `/fight start` and initiative sets the order. On your turn, `/fight atk stat:str` — leave the target off and a menu appears; picking someone rolls the attack on the spot. The defender answers with `/fight def stat:dex`, either side may spend a token on `/fight rr`, and `/fight resolve` settles the exchange. When it all ends, a 🏁 result and a full recap post on their own.',
       '**6 · Duels** — `/duel opponent:@rival terms:first blood` raises one. A GM signs it off and starts the fight.',
-      '**7 · Quests** — `/quest board` shows what\'s posted. Tap **Apply** on a quest post (or `/quest apply number:N`), a GM approves the party, and merits pay out when it completes.',
+      '**7 · Quests** — `/quest board` shows what\'s posted. Tap **Apply** on a quest post (or `/quest party apply number:N`), a GM approves the party, and merits pay out when it completes.',
       '**8 · Activities** — minigames written for this server: branching scenes with rolls and rewards. `/activity list` to browse, `/activity run name:Fishing` to start one here. When a scene asks for a roll, just type the stat word — `wis`, or `wis steady does it` to add flavour — and the story moves.',
       '**9 · Renown & merits** — renown is the coin quests, encounters and activities pay out; spend it as the server allows (`/standing renown view`). Merits are lifetime honour that only climbs, and ranks hang off them (`/standing merit view`, `/standing rank list`). You can offer merit to a friend with `/standing merit give` — a GM signs it off. GMs move the coin with `/standing renown gain/loss`.',
       '**10 · Death** — characters can fall. That call belongs to a GM: a memorial is posted, the sheet locks, and the fallen keep their history. Revival is possible when the story allows it.',
+      '**11 · What changed** — the **updates** forum carries one dated thread per change the bot has had, newest at the top. When something looks different from what you remember, it says what changed and when.',
       '',
       '_Lost mid-game? `/help category:X` for any group, `/char stat` for what each stat means, `/roll last:true` if you forgot what you just threw._',
     ],
@@ -23583,15 +23728,15 @@ const HELP_CATEGORIES = {
       '`/quest run start number:N` — lock the party and mark in progress (GM)',
       '`/quest run pause|resume number:N` \u2014 stop and restart the clock (a pause rounds it up to the quarter-hour); a paused run logs nothing until resumed',
       '`/quest run note number:N text:... kind:rp|combat|note [public:true]` \u2014 mark a moment in the run\'s account',
-      '`/quest timeline number:N` \u2014 the raw log \u00b7 `/quest run recap number:N [post:true]` \u2014 a "previously on\u2026" drafted from it, private until you post it (GM)',
+      '`/quest run timeline number:N` \u2014 the raw log \u00b7 `/quest run recap number:N [post:true]` \u2014 a "previously on\u2026" drafted from it, private until you post it (GM)',
       '`/quest run winddown number:N [resume:true]` \u2014 the story is over but rewards are not settled: the run stays live, its party is released to the rests and free to join other quests, and anyone kicked now is still paid at completion (GM)',
       '`/quest run log number:N text:...` \u2014 your telling of a finished run, into each player\'s chronicle thread; rewrites edit in place (GM)',
       '`/quest archive number:N [summary:]` \u2014 the final shelf. Leave `summary:` blank and a box opens for the final word; it goes on the record, into the run\'s thread and the GM quest log, and marks the campaign card. A completed quest stays completed on everyone\'s record (GM)',
       '**\u21A9\uFE0F Reopen** \u2014 a completion message carries a Reopen button for five minutes: the payout is reversed, this run\'s titles revoked, the party released; fix it and complete again (GM)',
       '`/encounter preset save name:... [merits:] [npcs:Goblin x3, Orc]` \u2014 a saved scene; `/encounter start ... preset:` runs it with the merits set and the monsters summoned as temps \u00b7 `/encounter preset list|remove` (GM)',
-      '`/gm check stalled` \u2014 what is waiting on a GM: winding-down runs, quiet encounters, staged parties never launched, idle campaigns, reviews this week. A weekly digest of the same lands in gm-quest-log (GM)',
+      '`/gm check stalled` \u2014 what is waiting on a GM: winding-down runs, quiet encounters, staged parties never launched, idle campaigns, reviews this week. Once a week the same report is posted as a dated thread in the **gm-digest** forum, titled by its Monday (GM)',
       '`/gm check usage` \u2014 sixty days of command use, quietest first \u2014 a report only; nothing is removed by it \u00b7 `/gm check rehearse` \u2014 a private sparring thread against a dummy the bot runs, to try new buttons before the table sees them (GM)',
-      '`/help category:rules` \u2014 the live table rules, as the bot enforces them, for everyone. Every deploy posts **What\'s new** to the GM log (and a player version to the docs channel) and a **Deploy mend** line saying what it built',
+      '`/help category:rules` \u2014 the live table rules, as the bot enforces them, for everyone. Every deploy posts **What\'s new** and **Deploy mend** as dated threads in the **gm-updates** forum, and the player half of the news in **updates** \u2014 the whole back-catalogue is there from the first boot',
       '`/instance add|kick|rally|note|pause|resume|complete|show|thread name:...` \u2014 the same by NAME rather than number; leave `name:` blank inside a run\'s own thread (GM)',
       '_One quest at a time: approving someone already seated on a live run prompts for a second press to override (audited), and a launch leaves them an applicant rather than double-booking them._',
       '`/encounter start name:... [merits:] [campaign:] [preset:]` \u2014 a short session run on the fly: no board, no applications. The bot lists every living character with HP and what is holding them; tick who is in it and press **Open the encounter** \u2014 it opens its own thread in quest-instances (where it was called if no forum is set), the party pulled in by mention. Nobody can join by themselves: `/encounter add user:` and `/encounter remove user:` are the GM\'s, run in the encounter\'s thread. `/encounter end [summary:] [title:]` pays out, writes the chronicle and posts the review button. Encounters do not count toward one-quest-at-a-time; one left quiet six hours reminds the room and pings the GMs (GM)',
@@ -23705,7 +23850,7 @@ const HELP_CATEGORIES = {
       '**Edit (DDice)** \u2014 long-press any message the bot sent \u2192 Apps \u2192 Edit (DDice): the text opens prefilled, save replaces it, the roll-audit records what changed. Covers the bot\'s own messages and NPC speech from `/npc say` alike (GM)',
       '`/feedback send [room:] [quest:]` \u2014 name a room to go straight to the form, or leave it blank for a menu; score it out of ten, say your piece; only GMs see it. Name a run you were on (or ran) and the card says which',
       '`/feedback category add|remove|list` \u2014 the rooms feedback lands in (GM) \u00b7 `/button feedback` plants a standing feedback button',
-      '_A completed run posts its own \u{1F4DD} review button in its thread; `/quest run show` then carries the count, the average \u2b50 and the latest lines._',
+      '_A completed run posts its own \u{1F4DD} review button in its thread; `/quest show` then carries the count, the average \u2b50 and the latest lines._',
     ],
   },
 };
@@ -24101,7 +24246,7 @@ async function routeButton(interaction) {
       const rowT = new TR().addComponents(
         new TB().setCustomId(`tgtdie:${interaction.message.id}:1`).setLabel('\u{1FAA6} It falls').setStyle(TS.Danger),
         new TB().setCustomId(`tgtdie:${interaction.message.id}:0`).setLabel('\u{1F6E1}\uFE0F It holds').setStyle(TS.Secondary));
-      const gmChId = t.secret ? (getConfig(gidT)?.quest_log_gm || getConfig(gidT)?.roll_audit_channel_id) : null;
+      const gmChId = t.secret ? auditDestination(gidT, 'checks') : null;
       const dest = gmChId ? await interaction.client.channels.fetch(gmChId).catch(() => null) : interaction.channel;
       await (dest || interaction.channel).send({ content: ask.join('\n'), components: [rowT], allowedMentions: { parse: [] } }).catch(() => {});
       return;
@@ -25202,7 +25347,8 @@ client.once('clientReady', async () => {  // 'ready' is deprecated in favour of 
   runRenameMigration(client).catch(err => console.error('[run-rename]', err?.message || err));
   npcThreadMigration(client).catch(err => console.error('[npc-threads]', err?.message || err));
   forumSetupMigration(client).catch(err => console.error('[gm-forum]', err?.message || err));
-  bootMend(client).catch(err => console.error('[mend]', err?.message || err));
+  // Kept on the client so a harness can await the mend; the bot itself never waits on it.
+  client.mendDone = bootMend(client).catch(err => console.error('[mend]', err?.message || err));
   charThreadMigration(client).catch(err => console.error('[char-threads]', err?.message || err));
   startCharBlockSweep(client);
   startBackupScheduler();

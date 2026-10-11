@@ -1083,6 +1083,57 @@ function scanScopes(src, ast) {
   return out;
 }
 
+
+// ── 2.7 Docs ──────────────────────────────────────────────────────────
+// Every `/command sub` the books (make_pdfs.py, beside index.js) and /help
+// name must be a command Discord registers. Six wrong ones had sat in the
+// books for weeks — a player typed `/char show` and Discord had never
+// heard of it (2026-10-11).
+const DOC_PROSE = new Set(['the', 'a', 'an', 'and', 'or', 'of', 'in', 'on', 'to', 'for', 'by', 'with', 'as', 'at', 'is', 'it', 'if',
+  'autocompletes', 'command', 'commands', 'app', 'api', 'bin', 'usr', 'mnt', 'env', 'home', 'fonts', 'truetype', 'outputs', 'share', 'sections', 'breaks',
+  'user', 'number', 'name', 'text', 'channel', 'file', 'npc', 'npcs', 'target', 'targets', 'category', 'players', 'dice', 'stat', 'teams', 'mode', 'terms',
+  'claim', 'summary', 'title', 'message', 'header', 'enabled', 'role', 'item', 'id', 'slot', 'value', 'reason', 'amount', 'merits', 'group', 'campaign',
+  'preset', 'action', 'key', 'count', 'temp', 'flavour', 'label', 'save', 'skill', 'last', 'fight', 'style', 'post', 'repo', 'hours', 'threshold',
+  'disable', 'list', 'clear', 'unlink', 'thread', 'order', 'class', 'hero', 'tag', 'emoji', 'kind', 'public', 'ids', 'status', 'reveal', 'secret',
+  'hold', 'skipfail', 'dc', 'notation', 'manual', 'practice', 'where', 'full', 'sides', 'format', 'image', 'description', 'objectives', 'merit',
+  'party', 'hard', 'gm', 'instance', 'room', 'quest', 'ac', 'hp', 'attack', 'damage', 'str', 'con', 'dex', 'wis', 'lck', 'int', 'cha', 'level',
+  'cr', 'die', 'question', 'answer', 'global', 'force', 'busy', 'spell', 'grant', 'use', 'from', 'all', 'dis', 'flat', 'fumble', 'dejavu', 'adv']);
+function scanDocs(src, ast) {
+  const { out, err } = collector();
+  const cmds = commandTree(ast);
+  // top-level leaves, and each group's own leaves: a grouped leaf named
+  // without its group (`/char show` for `/char view show`) is as wrong as
+  // a leaf that does not exist.
+  const tree = new Map(cmds.map(c => [c.name, { top: new Set(c.subs.map(s => s.name)), groups: new Map(c.groups.map(g => [g.name, new Set(g.subs.map(s => s.name))])) }]));
+  const sources = [['help', (() => { const i = src.indexOf('const HELP_CATEGORIES'); return i < 0 ? '' : src.slice(i, src.indexOf('\n};', i)); })()]];
+  const pdfPath = path.join(ROOT, 'make_pdfs.py');
+  if (fs.existsSync(pdfPath)) sources.push(['make_pdfs.py', fs.readFileSync(pdfPath, 'utf8')]);
+  for (const [where, text] of sources) {
+    const seen = new Set();
+    for (const m of text.matchAll(/\/([a-z]+)(?: ([a-z0-9]+))?(?: ([a-z0-9]+))?/g)) {
+      const [, c, s1, s2] = m;
+      if (!tree.has(c) || !s1) continue;
+      const afterS1 = text[m.index + 1 + c.length + 1 + s1.length];
+      if (afterS1 === ':') continue;                                                                          // an option, `/quest number:1`
+      if (text[m.index + m[0].length] === '/' || text[m.index + m[0].length] === '|') continue;                            // a slash-separated list of leaves
+      const t = tree.get(c);
+      if (!t.top.size && !t.groups.size) continue;    // a command without subcommands: whatever follows is prose
+      if (t.top.has(s1) || DOC_PROSE.has(s1)) continue;
+      let why = null;
+      const s2IsOption = s2 && text[m.index + m[0].length] === ':';
+      if (t.groups.has(s1)) { if (s2 && !s2IsOption && !t.groups.get(s1).has(s2) && !DOC_PROSE.has(s2) && text[m.index + m[0].length] !== '/') why = `group "${s1}" has no "${s2}"`; }
+      else { const owners = [...t.groups].filter(([, leaves]) => leaves.has(s1)).map(([g]) => g); why = owners.length ? `"${s1}" only under ${owners.map(g => `/${c} ${g} ${s1}`).join(' or ')}` : `no "${s1}"`; }
+      if (!why) continue;
+      const key = `${where}: /${c} ${s1} ${s2 || ''}`;
+      if (seen.has(key)) continue; seen.add(key);
+      err('doc-names-unknown-command', `${where} says \`/${c} ${s1}${s2 ? ' ' + s2 : ''}\` but /${c} registers ${why} — the reader types a command Discord has never heard of`,
+        where === 'help' ? lineAt(src, src.indexOf('const HELP_CATEGORIES') + m.index) : text.slice(0, m.index).split('\n').length);
+    }
+  }
+  out.summary = `${sources.length} source${sources.length === 1 ? '' : 's'} read`;
+  return out;
+}
+
 // ═══ 3 · Stubs ══════════════════════════════════════════════════════
 // index.js requires discord.js, better-sqlite3, dotenv and @napi-rs/canvas.
 // None can run here: no network, no database, no native build. Each is
@@ -1408,11 +1459,27 @@ function testBuilders(src) {
     ok('RULES: the pause and idle values are read from their constants',
       /Math\.round\(QUARTER_MS \/ 60000\)/.test(src) && /Math\.round\(ENCOUNTER_IDLE_MS \/ 3600000\)/.test(src));
     // The rest of the batch
-    ok('the changelog is data, and unseen entries post on boot',
+    ok('the changelog is data; the first boot with a forum posts the whole back-catalogue, later boots the unseen, each a dated thread',
       /const CHANGELOG = \[/.test(src) && /async function announceChangelog\(client, guild\)/.test(src) &&
-      /const fresh = CHANGELOG\.filter\(e => e\.key > seen\);/.test(src));
-    ok('a deploy mend reports to the GM log',
-      /\*\*Deploy mend\*\* \\u2014 \$\{made\.join/.test(src));
+      /const seeding = !cfg\.updates_seeded_at;/.test(src) &&
+      /const entries = \(seeding \? \[\.\.\.CHANGELOG\] : CHANGELOG\.filter\(e => e\.key > seen\)\)\.reverse\(\);/.test(src) &&
+      /setConfig\(gid, \{ changelog_seen: CHANGELOG\[0\]\.key, updates_seeded_at: cfg\.updates_seeded_at \|\| Date\.now\(\) \}\);/.test(src) &&
+      /postDatedThread\(client, forums\.gm, 'What\\'s new', at,/.test(src) &&
+      /postDatedThread\(client, forums\.player, 'What\\'s new', at,/.test(src) &&
+      !/quest_log_gm[^\n]*What\\'s new/.test(src));
+    ok('the date line is T\'s format, ISO weeks, the table\'s time zone; every dated thread goes through one helper',
+      /const BOT_TZ = 'Europe\/London';/.test(src) &&
+      /return `\[\$\{String\(d\)\.padStart\(2, '0'\)\}\/\$\{String\(m\)\.padStart\(2, '0'\)\}\/\$\{y\}\] \[WEEK \$\{isoWeek\(y, m, d\)\}\] \$\{weekday\} \$\{ordinalDay\(d\)\} of \$\{MONTH_NAMES\[m - 1\]\} \$\{y\}`;/.test(src) &&
+      /async function postDatedThread\(client, forumId, kind, ms, content, extra = \{\}\)/.test(src) &&
+      (src.match(/postDatedThread\(/g) || []).length === 5);
+    ok('a deploy mend is a dated thread in gm-updates, and the forum-opening boot sweeps the old posts once',
+      /postDatedThread\(client, after\.gm_updates_forum, 'Deploy mend', Date\.now\(\),/.test(src) &&
+      /async function sweepOldUpdatePosts\(client, gid\)/.test(src) &&
+      /if \(msg\.author\?\.id !== client\.user\?\.id\) continue;/.test(src) &&
+      /if \(!after\.updates_seeded_at && \(after\.gm_updates_forum \|\| after\.updates_forum\)\)/.test(src));
+    ok('the weekly digest is a dated thread in gm-digest, titled by its Monday',
+      /postDatedThread\(client, cfgD\.gm_digest_forum, 'Weekly digest', mondayOf\(Date\.now\(\)\),/.test(src) &&
+      /function mondayOf\(ms\)/.test(src));
     ok('usage is counted on every command and only ever reported',
       /INSERT INTO command_uses \(guild_id, command, leaf, count, last_at\)/.test(src) &&
       /report only; nothing is removed by this/.test(src) &&
@@ -1481,8 +1548,8 @@ function testBuilders(src) {
     ok('a fallen target stops taking swings',
       /UPDATE temp_targets SET dead=1/.test(src) &&
       /has already fallen/.test(src) && /components: \[\] \}\)\.catch/.test(src));
-    ok('secret sends the verdict to the GM channel instead',
-      /const gmChId = t\.secret \? \(getConfig\(gidT\)\?\.quest_log_gm/.test(src));
+    ok('secret sends the verdict to the checks shelf of the audit, never the quest log',
+      /const gmChId = t\.secret \? auditDestination\(gidT, 'checks'\) : null;/.test(src));
     // Planted buttons: everything a press needs rides in the customId, so
     // they survive restarts; only `once` stores anything.
     ok('planted buttons are stateless but for once-mode',
@@ -2700,7 +2767,7 @@ function testPins(src) {
     // — the runtime gates stay as the backstop for /npc create5e and kin.
     ok('registration filters whole commands by ruleset',
       /const DND5E_ONLY = \['dnd', 'spell', 'library'\];/.test(src) &&
-      /const KNIGHTFALL_ONLY = \['duel', 'deception', 'standing'\];/.test(src) &&
+      /const KNIGHTFALL_ONLY = \['duel', 'deception'\];/.test(src) &&
       /commands = commands\.filter\(cmd => !hidden\.includes\(cmd\.name\)\);/.test(src));
     ok('registration filters the picker per ruleset and injects nothing — the /pr choice map is gone',
       /commands = commands\.filter\(cmd => !hidden\.includes\(cmd\.name\)\);/.test(src) &&
@@ -2854,6 +2921,7 @@ function main() {
       ['rulesets', scanRulesets(src)],
       ['habits', scanHabits(src, ast)],
       ['scopes', scanScopes(src, ast)],
+      ['docs', scanDocs(src, ast)],
     ];
     for (const [name, found] of scans) {
       const errs = found.filter(f => f.sev === 'ERROR');

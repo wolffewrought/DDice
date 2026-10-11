@@ -39,6 +39,10 @@ function ok(label, cond, detail) {
 // probes can read the command tree back.
 
 const sent = [];          // every message the bot tried to send
+// No interval ever really ticks in the probe: each is captured here and run
+// once, by hand, in the tick walk — including the ones a boot starts only once.
+const ticks = [];
+globalThis.setInterval = (fn, ms) => { ticks.push({ fn, ms }); return 0; };
 const listeners = {};     // event name -> [fn]
 
 function recorder(kind) {
@@ -88,13 +92,24 @@ class FakeCollection extends Map {
   some(fn) { for (const v of this.values()) if (fn(v)) return true; return false; }
   map(fn) { return [...this.values()].map(fn); }
   first() { return this.values().next().value; }
+  last() { let v; for (v of this.values()); return v; }
 }
 class FakeChannel {
   constructor(id, type = 0, name = 'chan', guild = null) {
     this.id = id; this.type = type; this.name = name; this.guild = guild;
     this.members = { add: async () => {}, remove: async () => {}, cache: new FakeCollection() };
     this.messages = {
-      fetch: async (mid) => sentById.get(mid) || null,
+      // By id, as before; with a { limit, before } query, the channel's own
+      // history newest first, as discord.js returns it — the update sweep
+      // reads back through gm-quest-log this way.
+      fetch: async (arg) => {
+        if (typeof arg === 'string') return sentById.get(arg) || null;
+        const mine = sent.filter(x => x.channel === this.id && !deleted.includes(x.msg.id)).map(x => x.msg).reverse();
+        const from = arg?.before ? mine.findIndex(m => m.id === arg.before) + 1 : 0;
+        const page = mine.slice(from, from + (arg?.limit || 50));
+        const col = new FakeCollection(page.map(m => [m.id, m]));
+        return col;
+      },
       cache: new Map(),
     };
     this.threads = {
@@ -145,8 +160,9 @@ class FakeClient {
   constructor() {
     this.user = { id: 'BOT', tag: 'DDice#0000' };
     this.guilds = { cache: new Map() };
-    lastClient = this;
+    if (!lastClient) lastClient = this;   // index.js's own instance comes first; the probe's own, below, is a second
     this.channels = { fetch: async (id) => channelsById.get(id) || null, cache: new Map() };
+    this.users = { fetch: async (id) => ({ id, username: `user${id}`, send: async () => ({ id: nextId() }) }) };
     this.ws = { ping: 1 };
   }
   on(evt, fn) { (listeners[evt] ??= []).push(fn); return this; }
@@ -271,12 +287,16 @@ channelsById.set(chan.id, chan);
 
 // ── synthetic interactions ──────────────────────────────────────────────
 const replies = [];
+// A second acknowledgement throws, as discord.js's does: InteractionAlreadyReplied
+// was the grapple picker's death in September. Every one is recorded.
+const doubleAcks = [];
+const already = (over, what) => { doubleAcks.push(`${over.commandName || over.customId}: ${what}`); return new Error('InteractionAlreadyReplied'); };
 function makeInteraction(over = {}) {
   const opts = over.options || {};
   const i = {
     guild, guildId: GID, channel: over.channel || chan, channelId: (over.channel || chan).id,
     user: { id: over.userId || 'U1', tag: 'u1#1', username: 'u1' },
-    member: { id: over.userId || 'U1', roles: { cache: new Map() }, permissions: { has: () => true } },
+    member: over.member || { id: over.userId || 'U1', roles: { cache: new Map() }, permissions: { has: () => true } },
     client, appPermissions: { has: () => true },
     commandName: over.commandName,
     customId: over.customId,
@@ -304,14 +324,14 @@ function makeInteraction(over = {}) {
       data: [],
     },
     fields: { getTextInputValue: (n) => (over.fields || {})[n] ?? '' },
-    reply: async (p) => { i.replied = true; replies.push(norm(p)); return { id: nextId() }; },
+    reply: async (p) => { if (i.replied || i.deferred) throw already(over, `reply after ${i.deferred ? 'defer' : 'reply'}`); i.replied = true; replies.push(norm(p)); return { id: nextId() }; },
     fetchReply: async () => ({ id: nextId(), channelId: (over.channel || chan).id, edit: async () => {} }),
     editReply: async (p) => { replies.push(norm(p)); return { id: nextId() }; },
     followUp: async (p) => { replies.push(norm(p)); return { id: nextId() }; },
-    deferReply: async () => { i.deferred = true; },
-    deferUpdate: async () => { i.deferred = true; },
-    update: async (p) => { i.replied = true; replies.push(norm(p)); },
-    showModal: async (m) => { replies.push({ modal: m?._d?.customId ?? 'modal' }); },
+    deferReply: async () => { if (i.replied || i.deferred) throw already(over, 'defer after ack'); i.deferred = true; },
+    deferUpdate: async () => { if (i.replied || i.deferred) throw already(over, 'deferUpdate after ack'); i.deferred = true; },
+    update: async (p) => { if (i.replied) throw already(over, 'update after reply'); i.replied = true; replies.push(norm(p)); },
+    showModal: async (m) => { if (i.replied || i.deferred) throw already(over, 'showModal after ack'); i.replied = true; replies.push({ modal: m?._d?.customId ?? 'modal' }); },
     respond: async (c) => { replies.push({ autocomplete: c }); },
   };
   return i;
@@ -386,13 +406,10 @@ async function fire(over) {
   // the vacuous-flag bug lived exactly here.
   if (dbHandle) {
     const before = tableCounts(dbHandle);
-    for (const fn of listeners.clientReady || listeners.ready || []) {
-      await fn().catch(() => {});
-    }
+    const boot = async () => { for (const fn of listeners.clientReady || listeners.ready || []) await fn().catch(() => {}); await (lastClient?.mendDone || null); };
+    await boot();
     const once = tableCounts(dbHandle);
-    for (const fn of listeners.clientReady || listeners.ready || []) {
-      await fn().catch(() => {});
-    }
+    await boot();
     const twice = tableCounts(dbHandle);
     ok('a second boot changes nothing (restart survival)',
       JSON.stringify(once) === JSON.stringify(twice),
@@ -679,6 +696,173 @@ async function fire(over) {
     globalThis.setTimeout = realTimeout;
     ok(`every registered leaf answers (${answered} of ${leaves.length})`, dead.length === 0, dead.join('\n        '));
   }
+
+
+  // ── Every static SQL statement compiles against the real schema ────
+  if (dbHandle) {
+    const bad = []; let n = 0; const seenSql = new Set();
+    for (const m of src.matchAll(/(['"`])((?:SELECT|INSERT|UPDATE|DELETE|WITH)\b[\s\S]*?)\1/g)) {
+      const sql = m[2];
+      if (sql.includes('${') || (sql.includes('\n') && m[1] !== '`') || seenSql.has(sql)) continue;
+      seenSql.add(sql); n++;
+      try { dbHandle.prepare(sql); } catch (e) { bad.push(`${sql.replace(/\s+/g, ' ').slice(0, 90)} → ${e.message}`); }
+    }
+    ok(`every static SQL statement compiles (${n})`, bad.length === 0, bad.join('\n        '));
+  }
+
+  // ── The GM gate, and what a plain player can reach ──────────────────
+  // Every leaf whose description marks it (GM) is fired by a member with no
+  // permissions and no role; anything but a refusal fails, except the few
+  // reads that are open on purpose. Three write leaves and all of /config
+  // were open until 2026-10-11; nothing had ever tested the gate.
+  if (dbHandle && registered.length) {
+    const OPEN_ON_PURPOSE = new Set(['/encounter list', '/encounter preset list', '/campaign show', '/campaign list', '/npc sheet']);
+    const byName = new Map();
+    for (const body of registered) for (const c of body) byName.set(c.name, c);
+    const plain = 'U7';
+    const plainMember = { id: plain, roles: { cache: new Map() }, permissions: { has: () => false } };
+    const realFetch = guild.members.fetch;
+    guild.members.fetch = async (uid) => { const mb = await realFetch(uid); if (uid === plain) { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+    const realTimeoutG = globalThis.setTimeout; globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
+    const realErrG = console.error; console.error = () => {};
+    const dummy = (o, cmd) => {
+      if (o.choices?.length) return o.choices[0].value;
+      switch (o.type) { case 'int': case 'num': return o.min ?? 1; case 'bool': return true; case 'user': return 'U2'; case 'channel': return chan; case 'role': case 'file': return null;
+        default: return /npc/.test(o.name) ? 'Goblin' : o.name === 'name' ? (cmd === 'npc' ? 'Goblin' : 'Probe') : o.name === 'dice' || o.name === 'notation' ? '1d20' : o.name === 'stat' ? 'str' : o.name === 'number' ? '1' : 'probe'; }
+    };
+    const open = []; let checked = 0;
+    for (const c of byName.values()) {
+      if (c.contextMenu) continue;
+      const leaves = [...(c.subcommands || []).map(s => ({ g: null, s })), ...(c.groups || []).flatMap(g => (g.subcommands || []).map(s => ({ g: g.name, s })))];
+      const cmdGm = /\(GM|GM only|Admin/i.test(c.description || '');
+      for (const { g, s } of (leaves.length ? leaves : [{ g: null, s: null }])) {
+        const label = `/${c.name}${g ? ' ' + g : ''}${s ? ' ' + s.name : ''}`;
+        if (!cmdGm && !/\(GM|GM only|GM\)|Admin/i.test(`${s?.description || ''}`)) continue;
+        if (OPEN_ON_PURPOSE.has(label)) continue;
+        checked++;
+        const options = { _group: g ?? undefined, _sub: s?.name ?? undefined };
+        for (const o of (s ? s.options : c.options) || []) { const v = dummy(o, c.name); if (v != null) options[o.name] = v; }
+        const r = await fire({ commandName: c.name, options, userId: plain, member: plainMember }).catch(() => ({ replies: [] }));
+        const said = r.replies.map(x => x.content || JSON.stringify(x)).join(' ');
+        if (!/❌|⛔|⚠️/.test(said)) open.push(`${label} → ${said.replace(/\s+/g, ' ').slice(0, 80)}`);
+      }
+    }
+    // The NPC sheet is open, but a hidden stat block stays hidden from a player.
+    dbHandle.prepare("UPDATE guild_config SET npc_stats_visible=0 WHERE guild_id='G1'").run();
+    const sheetR = await fire({ commandName: 'npc', options: { _sub: 'sheet', name: 'Goblin' }, userId: plain, member: plainMember }).catch(() => ({ replies: [] }));
+    const sheetSaid = sheetR.replies.map(x => x.content || '').join(' ');
+    ok('a player reading an NPC sheet does not see hidden stats', /Stats are the GM/.test(sheetSaid) && !/STR\s+\d/.test(sheetSaid), sheetSaid.slice(0, 120));
+    guild.members.fetch = realFetch; globalThis.setTimeout = realTimeoutG; console.error = realErrG;
+    ok(`every GM-marked leaf refuses a plain player (${checked} checked)`, open.length === 0, open.join('\n        '));
+  }
+
+  // ── Every chat shorthand answers ────────────────────────────────────
+  {
+    const realErrC = console.error; const loggedC = [];
+    console.error = (...a) => { loggedC.push(a.map(x => (x && x.stack) ? x.stack.split('\n').slice(0, 2).join(' | ') : String(x)).join(' ')); };
+    const bad = [];
+    const mk = (text, uid = 'U1') => ({ content: text, author: { id: uid, bot: false }, guild, channel: chan, channelId: chan.id, member: { id: uid, roles: { cache: new Map() }, permissions: { has: () => true } }, attachments: { size: 0, first: () => null }, client,
+      reply: async (p) => { replies.push(norm(p)); return { id: nextId() }; } });
+    const lines = ['r 1d20+3 perception', 'ra 1d20', 'rd 1d20', '!r', 'r', 'rr', 'rra', 'rrd', '?r 1d20 dc:12', 'h @U2', 'heal @U2', 'hp', 'hp +2', 'hp 5 @U2', 'rerolls', 'srest', 'lrest', 'srest @U2', 'hpfull @U2', 'hphalf @U2', 'gmr 1d20+5 stealth', 'gmrs 1d20', '1d20', '2d6+1', 'str', 'dexa', 'wisd', '?lck', '!roll 3d6'];
+    for (const text of lines) {
+      replies.length = 0; loggedC.length = 0; const sentBefore = sent.length;
+      try { for (const fn of listeners.messageCreate || []) await fn(mk(text)); }
+      catch (e) { bad.push(`${text}: THREW ${e.message}`); continue; }
+      const threw = loggedC.find(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined/.test(l));
+      if (threw) bad.push(`${text}: ${threw.slice(0, 100)}`);
+      else if (!replies.length && sent.length === sentBefore) bad.push(`${text}: SILENT`);
+    }
+    console.error = realErrC;
+    ok(`every chat shorthand answers (${lines.length})`, bad.length === 0, bad.join('\n        '));
+  }
+
+  // ── Every scheduled tick runs once; the digest lands as a dated thread ──
+  if (dbHandle) {
+    const bad = [];
+    // The leaf walk above unset most channels (every /config leaf fired with a
+    // dummy); bootMend only mends a server that is set up, so point it back at
+    // the character forum it made. Then a third boot: the one that seeds.
+    const charForum = [...channelsById.values()].find(c => c.name === 'character-pages');
+    if (charForum) dbHandle.prepare("UPDATE guild_config SET char_forum=? WHERE guild_id='G1'").run(charForum.id);
+    // Two old update posts in gm-quest-log, one of them a player's own message, so the sweep has something to judge.
+    const logId = dbHandle.prepare("SELECT quest_log_gm FROM guild_config WHERE guild_id='G1'").get()?.quest_log_gm;
+    const logCh = logId ? channelsById.get(logId) : null;
+    let oldPost = null, keepPost = null, humanPost = null;
+    if (logCh) {
+      oldPost = await logCh.send({ content: '📰 **What\'s new**\n\n**2026-09-29**\n· old lines' });
+      keepPost = await logCh.send({ content: '🎉 **#001-Bandits again** complete! — a completion summary that must stay' });
+      humanPost = await logCh.send({ content: '📰 **What\'s new** — but typed by a person' }); humanPost.author = { id: 'U1' };
+    }
+    const realTimeoutB = globalThis.setTimeout; globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
+    for (const fn of listeners.clientReady || listeners.ready || []) await fn().catch(e => bad.push('ready: ' + e.message));
+    await (lastClient?.mendDone || null);
+    globalThis.setTimeout = realTimeoutB;
+    ok('the forum-opening boot sweeps the bot\'s old update posts out of gm-quest-log and nothing else',
+      !!oldPost && deleted.includes(oldPost.id) && !deleted.includes(keepPost.id) && !deleted.includes(humanPost.id),
+      `old ${oldPost && deleted.includes(oldPost.id)} · summary kept ${keepPost && !deleted.includes(keepPost.id)} · human kept ${humanPost && !deleted.includes(humanPost.id)}`);
+    ok('the sweep is reported in the Deploy mend thread', threads.some(t => / · Deploy mend$/.test(t.name)) && sent.some(x => /1 old update post removed from/.test(x.content)));
+    dbHandle.prepare("UPDATE guild_config SET gm_digest_at=0 WHERE guild_id='G1'").run();   // a week has passed
+    const realErrT = console.error; const loggedT = [];
+    console.error = (...a) => { loggedT.push(a.map(String).join(' ')); };
+    for (const t of ticks) {
+      loggedT.length = 0;
+      try { await t.fn(); } catch (e) { bad.push(`tick(${t.ms}ms): THREW ${e.message}`); continue; }
+      const threw = loggedT.find(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined/.test(l));
+      if (threw) bad.push(`tick(${t.ms}ms): ${threw.slice(0, 120)}`);
+    }
+    console.error = realErrT;
+    ok(`every scheduled tick runs once (${ticks.length})`, bad.length === 0, bad.join('\n        '));
+    const digestForum = dbHandle.prepare("SELECT gm_digest_forum FROM guild_config WHERE guild_id='G1'").get()?.gm_digest_forum;
+    const digests = threads.filter(t => t.parentId === digestForum);
+    ok('the weekly digest is one dated thread in gm-digest, titled by a Monday', digests.length === 1 && /\] Monday \d{1,2}(st|nd|rd|th) of [A-Z][a-z]+ \d{4} · Weekly digest$/.test(digests[0].name), digests.map(t => t.name).join(' | ') || 'none');
+  }
+
+  // ── The three update forums ─────────────────────────────────────────
+  // The boot made them from the plan; the first boot with them posts the
+  // whole back-catalogue as dated threads; the second boot posted nothing
+  // more (the restart-survival pass above ran the ready path twice).
+  if (dbHandle) {
+    const cfgU = dbHandle.prepare("SELECT updates_forum, gm_updates_forum, gm_digest_forum, updates_seeded_at, changelog_seen FROM guild_config WHERE guild_id='G1'").get() || {};
+    ok('the boot makes the updates, gm-updates and gm-digest forums', !!(cfgU.updates_forum && cfgU.gm_updates_forum && cfgU.gm_digest_forum), JSON.stringify(cfgU));
+    const entries = [...src.matchAll(/\{ key: '(\d{4}-\d{2}-\d{2})', gm: \[/g)].map(m => m[1]);
+    const inForum = (fid) => threads.filter(t => t.parentId === fid);
+    const DATE_RE = /^\[\d{2}\/\d{2}\/\d{4}\] \[WEEK \d{1,2}\] (Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) \d{1,2}(st|nd|rd|th) of [A-Z][a-z]+ \d{4} · /;
+    const gmAll = inForum(cfgU.gm_updates_forum), plT = inForum(cfgU.updates_forum);
+    const gmT = gmAll.filter(t => / · What's new$/.test(t.name));
+    ok('the deploy mend is a dated thread in gm-updates, reporting what the boot built', gmAll.some(t => / · Deploy mend$/.test(t.name) && DATE_RE.test(t.name)), gmAll.map(t => t.name).join(' | '));
+    ok(`the back-catalogue is seeded once, oldest first, one dated thread per entry (${entries.length} entries)`,
+      gmT.length === entries.length && gmT.every(t => DATE_RE.test(t.name)) && !!cfgU.updates_seeded_at && cfgU.changelog_seen === entries[0]
+        && gmT.map(t => t.name.slice(1, 11)).join(',') === [...entries].reverse().map(k => k.split('-').reverse().join('/')).join(','),
+      `gm threads ${gmT.length}: ${gmT.map(t => t.name).join(' | ')}`);
+    ok('player entries go to the players\' forum, dated the same way', plT.length > 0 && plT.length <= entries.length && plT.every(t => DATE_RE.test(t.name)), plT.map(t => t.name).join(' | '));
+    {
+      // Nothing of the kind remains in gm-quest-log: whatever is there was swept (the seeded old post), nothing new was posted.
+      const qlog = dbHandle.prepare("SELECT quest_log_gm FROM guild_config WHERE guild_id='G1'").get()?.quest_log_gm;
+      const stray = sent.filter(x => x.channel === qlog && /What's new|Deploy mend|Weekly digest/.test(x.content) && x.msg.author?.id === 'BOT' && !deleted.includes(x.msg.id));
+      ok('no What\'s new, Deploy mend or Weekly digest remains in gm-quest-log', stray.length === 0, stray.map(x => x.content.slice(0, 60)).join(' | '));
+    }
+  }
+
+  // ── No button, modal or select id throws on a junk payload ──────────
+  {
+    const realErrJ = console.error; const loggedJ = [];
+    console.error = (...a) => { loggedJ.push(a.map(x => (x && x.stack) ? x.stack.split('\n').slice(0, 2).join(' | ') : String(x)).join(' ')); };
+    const bad = []; const ids = new Set();
+    for (const m of src.matchAll(/setCustomId\(`?([a-zA-Z]+)[:`']/g)) ids.add(m[1]);
+    for (const id of ids) {
+      for (const shape of [{ isButton: true }, { isModal: true, fields: {} }, { isSelect: true, values: ['U2'] }]) {
+        loggedJ.length = 0;
+        const r = await fire({ ...shape, customId: `${id}:probe:1:2`, message: { id: nextId(), content: 'x', components: [], edit: async () => {} } }).catch(e => ({ replies: [{ content: 'THREW ' + e.message }] }));
+        const said = r.replies.map(x => x.content || '').join(' ');
+        const threw = loggedJ.find(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined/.test(l));
+        if (threw || /hit an error|Something went wrong|^THREW/.test(said)) bad.push(`${id} (${Object.keys(shape)[0]}): ${(threw || said).replace(/\s+/g, ' ').slice(0, 110)}`);
+      }
+    }
+    console.error = realErrJ;
+    ok(`no button, modal or select id throws on a junk payload (${ids.size} ids × 3 lanes)`, bad.length === 0, bad.join('\n        '));
+  }
+
+  ok('no interaction was acknowledged twice anywhere in this run', doubleAcks.length === 0, doubleAcks.join('\n        '));
 
   report();
 })().catch(e => {
