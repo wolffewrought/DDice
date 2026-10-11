@@ -49,7 +49,9 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means 962 assertions passed and no scanner found an ERROR.
+Green means every assertion passed (1066 as of 2026-10-11) and no scanner
+found an ERROR. Then run the probe: `node --experimental-sqlite probe.js`
+(46 probes, the last of which fires every registered leaf).
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -65,6 +67,7 @@ no network in the sandbox, so npm cannot supply a parser.
 | **rulesets** | 5e code reachable on a Knightfall server: an ungated entry point, a hard-coded `RULES_DND5E`, a ruleset read bypassing `rulesFor()`. |
 | **stubs + loader** | Fake discord.js, better-sqlite3, dotenv and canvas, installed by a require hook, then `index.js` executed for real against them. The discord.js half validates: it refuses anything the real API would refuse, at build time, naming the command. Teach it a new builder method before `index.js` uses one. |
 | **harnesses** | `builders` (shape and ceilings, via the stub), `rules` (arithmetic of both damage models, 5e modifiers, `chunkLines`), `pins` (named regressions with the story attached). |
+| **scopes** | What the bag-of-names scanners cannot see. Scope-aware: an identifier read where no enclosing scope declares it (a ReferenceError the moment the line runs); a local never read; a call that leaves out a parameter the body reads unguarded. Per-command: an option read in a handler that none of the commands routed to it declares; a group or subcommand compared under a dispatch block that the command does not register; an autocomplete option no branch answers. SQL against the schema: a column no table has, a dynamic-UPDATE key that is not a column, a table nothing queries. Comments naming identifiers that are gone. Added 2026-10-11 after one pass found eight bugs every global check had passed for weeks. |
 
 ### Severity means something
 
@@ -131,6 +134,18 @@ send both leaves to whichever branch is written first.
 fight target select, buttons (via `routeButton`, inside a try that logs the
 customId), then chat input commands.
 
+**The file is laid out by family (2026-10-11).** Twenty parts, each under
+a double-rule banner, listed in the header at the top of index.js:
+PRELUDE · DATABASE · CORE · DICE · RULESETS · CONFIG · CHARACTERS · NPCS ·
+WEAPONS · FIGHT · QUESTS · ACTIVITIES · D&D 5E · SCHEDULES · SETUP · GM
+TOOLS · COMMANDS · HELP · DISPATCH · BOOT. Data layer, then rendering,
+then the command handler, inside each part. New code goes in its family;
+a helper used by several goes in CORE. The re-lay was done statement by
+statement from the AST (every top-level statement kept byte-for-byte, the
+multiset checked before and after) with a TDZ pass proving no module-level
+read of a const precedes its declaration; the old sub-banners travelled
+with the statement beneath them.
+
 ---
 
 ## 6 · Standing warnings — all correct, do not "fix"
@@ -138,8 +153,9 @@ customId), then chat input commands.
 | Warning | Why it is fine |
 |---|---|
 | structure · `buildMemorial`, `renderDuel` neither await nor delegate | Both build strings. Harmless. |
-| wiring · `/gm clean` never compared | Fall-through, §4. |
-| wiring · `/config` groups never compared | The leaves route by name; the group is not consulted for `/config`. |
+| wiring · `/gm clean`, `/npc clear` never compared | `/gm test clean` falls through, §4; `/npc temp clear` is compared as the composed `tempclear`. The seven `/gm check` leaves used to sit here too; the scanner now reads `opt('leaf')` as a compare. |
+| wiring · `/config` groups, `/npc manage` never compared | The leaves route by name; the group is not consulted. |
+| habits · three triplicated strings | Always the three most-repeated literals left; a rolling list, not a defect. |
 | limits · `/npc` at 24/25, `/quest` at 23/25 | Real headroom warning. See §7. |
 | limits · two modals at 5/5 rows | LIMITS.md §2. No sixth field is possible. |
 | limits · two descriptions at 95 and 98 of 100 chars | Real headroom warning; both still fit. |
@@ -325,6 +341,72 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 10k · The dead-end pass: eight bugs, a scope scanner, a leaf walk, the re-lay (2026-10-11)
+
+T: clean up, keep auditing, organise. A scope-aware pass over the whole
+file, then a generic walk of every registered leaf, found what the
+global checks had passed for weeks. All fixed, all now pinned, all now
+caught by tooling that runs every time.
+
+**Broken, every time, found by no-undef:** `/gm dc` read `hold`, `one`,
+`skipFail` in postDcCheck without being passed them (card posted, then
+threw; flavours, sanctions and the hold never saved). `/gm override skip`
+called a `hpFloor()` that never existed and `resolveFighter` with the
+wrong arity. `/npc temp keep|clear` gated on a `gm` nobody declared.
+`/fight end`'s temp sweep read `guild` out of scope (swallowed). The
+sheet refresh after every stat edit read `row.message_id` with no `row`
+(swallowed; the hourly sweep hid it).
+
+**Broken, found by per-command routing:** the title and association
+groups were registered on /char and routed only under /standing — neither
+path worked since 2026-08-19; the books said /standing, so they moved
+there, with autocomplete for `npc:` and `group:` that never existed.
+`/roll save:` and `/roll skill:` sat on `/gm roll`, which ignores them,
+while handleRollSlash read them from /roll: the whole 5e check feature
+unreachable. `/dnd condition npc:` autocomplete had no branch.
+
+**Broken, found by the leaf walk:** `/npc reroll`, `/npc manage sync`,
+`/npc manage create5e` lived in handlePr but only say|roll were routed
+there — silent timeouts. `/npc temp list` called `.includes` on a Set.
+Four migrations (weapon emoji flags, is_hero on both tables) ran ABOVE
+their CREATE TABLE: fresh installs never got the columns, so /char hero,
+/npc hero and every weapon-emoji write threw 'no such column'. (Live
+databases had them, which is why T never saw it.)
+
+**The temp-NPC sweep was dead three ways:** archiveFight's sweep ran
+before the row went idle, so everyone in the fight counted as still
+fighting; /fight end's sweep read `guild`; and no other ending swept at
+all. Now `standDownFight(gid, cid, client, fields)` is the one way a
+fight goes idle — six endings, one helper: idle + carried state cleared,
+the bound DC check released, then the sweep. Pinned: exactly one
+`state: 'idle'` in the file.
+
+**Dead and gone:** quest_counter (a table nothing read), four autorest_*
+columns, MSG_NO_ACCESS_FULL, a 50-line choice injector for a /pr command
+that stopped existing, `pr_create`, two unreachable handleChar branches,
+a `DELETE … name=?` on npc_webhooks (no such column, swallowed, the line
+above did the job), the /gm check boolean shim from August, nine unused
+locals, stale comments, the CHANGELOG line that still said /config rules.
+
+**Deduped:** openFightTurn() replaces the eight-fold runner preamble;
+withNpcStatOptions(s) builds the stat half of /npc create and edit (edit
+had grown a 'Siege Knight' ORDER — a class); KNIGHT_ORDER_CHOICES feeds
+four pickers; clearQuestEvents(); allChars(); MSG_APPROVALS_UNREACHABLE.
+
+**Tooling:** verify.js gained the `scopes` scanner (§3 table). probe.js
+gained the leaf walk: the fake REST captures what the ready path
+registers, then every subcommand of every command is fired with a dummy
+value in every option — a refusal passes, a throw or a silence fails.
+The probe guild now sits in the bot's client (so the ready path runs for
+it), fake threads are fetchable, Collections have find(), setTimeout is
+flattened during the walk. Verify's tree reader follows builder helpers
+(`s=>withX(s.setName…)`). 46 probes, 1066 assertions, 0 scopes warnings.
+
+**Harness note:** patching with a greedy regex across parens corrupted
+the file once this session (30 lines of handleConfig collapsed into one;
+restored from the pristine copy by line). Keep the pristine copy before
+a scripted patch, diff hunk sizes after, and never match `)*` greedily.
 
 ## 10j · Encounters: picked party, own thread, no Join (2026-10-08)
 

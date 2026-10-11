@@ -56,6 +56,7 @@ function recorder(kind) {
     setCustomId(v) { this._d.customId = v; return this; }
     setTitle(v) { this._d.title = v; return this; }
     setAutocomplete(v) { this._d.autocomplete = v; return this; }
+    setDisabled(v) { this._d.disabled = v; return this; }
     setDefaultMemberPermissions() { return this; }
     setDMPermission() { return this; }
     addChoices(...c) { (this._d.choices ??= []).push(...c.flat()); return this; }
@@ -80,9 +81,18 @@ function recorder(kind) {
   };
 }
 
+// discord.js hands back Collections, which are Maps with find/filter/some.
+class FakeCollection extends Map {
+  find(fn) { for (const v of this.values()) if (fn(v)) return v; return undefined; }
+  filter(fn) { const c = new FakeCollection(); for (const [k, v] of this) if (fn(v)) c.set(k, v); return c; }
+  some(fn) { for (const v of this.values()) if (fn(v)) return true; return false; }
+  map(fn) { return [...this.values()].map(fn); }
+  first() { return this.values().next().value; }
+}
 class FakeChannel {
   constructor(id, type = 0, name = 'chan', guild = null) {
     this.id = id; this.type = type; this.name = name; this.guild = guild;
+    this.members = { add: async () => {}, remove: async () => {}, cache: new FakeCollection() };
     this.messages = {
       fetch: async (mid) => sentById.get(mid) || null,
       cache: new Map(),
@@ -130,10 +140,12 @@ const sentById = new Map();
 const threads = [];
 const deleted = [];
 
+let lastClient = null;      // the instance index.js made — the one the ready handler walks
 class FakeClient {
   constructor() {
     this.user = { id: 'BOT', tag: 'DDice#0000' };
     this.guilds = { cache: new Map() };
+    lastClient = this;
     this.channels = { fetch: async (id) => channelsById.get(id) || null, cache: new Map() };
     this.ws = { ping: 1 };
   }
@@ -144,6 +156,7 @@ class FakeClient {
 }
 
 const channelsById = new Map();
+const registered = [];      // every command set handed to REST.put — the picker as Discord would see it
 
 const fakeDiscord = {
   Client: FakeClient,
@@ -164,10 +177,10 @@ const fakeDiscord = {
   ChannelSelectMenuBuilder: recorder('cselect'),
   AttachmentBuilder: class { constructor(a, b) { this.a = a; this.b = b; } },
   WebhookClient: class { constructor(o) { this.id = o?.id; } async send() { return { id: nextId() }; } async edit() {} async editMessage(id, p) { const m = sentById.get(id); if (m) m.content = p?.content ?? m.content; return m; } },
-  REST: class { setToken() { return this; } async put() { return []; } async get() { return []; } },
+  REST: class { setToken() { return this; } async put(route, opts) { if (opts?.body) registered.push(opts.body); return []; } async get() { return []; } },
   Routes: new Proxy({}, { get: () => () => 'route' }),
   EmbedBuilder: recorder('embed'),
-  Collection: Map,
+  Collection: FakeCollection,
 };
 
 // A better-sqlite3 shape over node:sqlite, so index.js's data layer runs
@@ -244,11 +257,14 @@ const guild = {
   roles: { everyone: { id: 'EVERYONE' }, cache: new Map() },
   channels: {
     create: async ({ name, type }) => { const c = new FakeChannel(nextId(), type ?? 0, name, guild); channelsById.set(c.id, c); return c; },
-    fetch: async () => new Map(channelsById),
-    cache: new Map(),
+    fetch: async () => new FakeCollection(channelsById),
+    cache: new FakeCollection(),
   },
 };
 guild.members.me.permissions.has = () => true;
+// The bot's own client sees the probe guild, so the ready path registers
+// its commands (what the leaf walk reads back) and mends it like a real one.
+if (lastClient) { lastClient.guilds.cache.set(GID, guild); guild.client = lastClient; }
 
 const chan = new FakeChannel('C1', 0, 'testing', guild);
 channelsById.set(chan.id, chan);
@@ -289,6 +305,7 @@ function makeInteraction(over = {}) {
     },
     fields: { getTextInputValue: (n) => (over.fields || {})[n] ?? '' },
     reply: async (p) => { i.replied = true; replies.push(norm(p)); return { id: nextId() }; },
+    fetchReply: async () => ({ id: nextId(), channelId: (over.channel || chan).id, edit: async () => {} }),
     editReply: async (p) => { replies.push(norm(p)); return { id: nextId() }; },
     followUp: async (p) => { replies.push(norm(p)); return { id: nextId() }; },
     deferReply: async () => { i.deferred = true; },
@@ -593,6 +610,74 @@ async function fire(over) {
     }
     console.error = realErr;
     ok(`the encounter walk answers everywhere`, broken.length === 0, broken.join('\n        '));
+  }
+
+  // ── Every leaf answers ──────────────────────────────────────────────
+  // The walks above press what they know about. This presses EVERYTHING
+  // Discord was told exists — every subcommand of every command, with a
+  // dummy value in every option — and fails on a throw or a silence. A
+  // refusal is a fine answer; "the application did not respond" is not.
+  // Five ReferenceErrors lived in unwalked leaves until 2026-10-11, each
+  // one a command that had never once worked.
+  ok('the ready path registered a command set to read back', registered.length > 0);
+  if (dbHandle && registered.length) {
+    const byName = new Map();
+    for (const body of registered) for (const c of body) byName.set(c.name, c);
+    const realTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));   // handlers that pace themselves run flat out
+    const realErr = console.error;
+    const logged = [];
+    console.error = (...a) => { logged.push(a.map(x => (x && x.stack) ? x.stack.split('\n').slice(0, 3).join(' | ') : String(x)).join(' ')); };
+    const dummy = (o, cmd, sub) => {
+      if (o.choices?.length) return o.choices[0].value;
+      switch (o.type) {
+        case 'int': case 'num': return o.min ?? 1;
+        case 'bool': return true;
+        case 'user': return 'U2';
+        case 'channel': return chan;
+        case 'role': case 'file': return null;
+        default: {
+          const n = o.name;
+          if (/^(npc|npcs|target_npc|redirect_npc)$/.test(n)) return 'Goblin';
+          if (n === 'name') return cmd === 'npc' || cmd === 'library' ? 'Goblin' : 'Probe';
+          if (n === 'dice' || n === 'notation') return '1d20';
+          if (n === 'stat') return 'str';
+          if (/^(players|targets|reveal)$/.test(n)) return '<@U2>';
+          if (n === 'number') return '1';
+          if (n === 'room') return 'general';
+          return 'probe';
+        }
+      }
+    };
+    const leaves = [];
+    for (const c of byName.values()) {
+      if (c.contextMenu) continue;   // Edit (DDice) is a message context menu, not a slash leaf
+      const subs = [...(c.subcommands || []).map(sc => ({ group: null, sub: sc })),
+                    ...(c.groups || []).flatMap(g => (g.subcommands || []).map(sc => ({ group: g.name, sub: sc })))];
+      if (!subs.length) leaves.push({ cmd: c.name, group: null, sub: null, opts: c.options || [] });
+      for (const { group, sub } of subs) leaves.push({ cmd: c.name, group, sub: sub.name, opts: sub.options || [] });
+    }
+    const dead = [];
+    let answered = 0;
+    for (const leaf of leaves) {
+      const options = { _group: leaf.group ?? undefined, _sub: leaf.sub ?? undefined };
+      for (const o of leaf.opts) { const v = dummy(o, leaf.cmd, leaf.sub); if (v !== null && v !== undefined) options[o.name] = v; }
+      logged.length = 0;
+      let r;
+      try { r = await fire({ commandName: leaf.cmd, options }); }
+      catch (e) { dead.push(`/${leaf.cmd}${leaf.group ? ' ' + leaf.group : ''}${leaf.sub ? ' ' + leaf.sub : ''}: THREW ${String(e?.message || e).slice(0, 80)}`); continue; }
+      const said = r.replies.map(x => JSON.stringify(x)).join(' ');
+      const label = `/${leaf.cmd}${leaf.group ? ' ' + leaf.group : ''}${leaf.sub ? ' ' + leaf.sub : ''}`;
+      if (VERBOSE) console.log(`      ${label.padEnd(34)} → ${(r.replies[0]?.content || JSON.stringify(r.replies[0] || {})).replace(/\s+/g, ' ').slice(0, 200)}`);
+      const threw = logged.find(l => /Error|error|TypeError|ReferenceError/.test(l) && !/\[(temp-npcs|npcforum|quest|feedback-threads|setup|docs|backup)\]/.test(l));
+      if (threw) dead.push(`${label}: THREW ${threw.slice(0, 100)}`);
+      else if (!r.replies.length && !r.i.deferred) dead.push(`${label}: SILENT`);
+      else if (/Something went wrong|hit an error/.test(said)) dead.push(`${label}: THREW ${said.slice(0, 100)}`);
+      else answered++;
+    }
+    console.error = realErr;
+    globalThis.setTimeout = realTimeout;
+    ok(`every registered leaf answers (${answered} of ${leaves.length})`, dead.length === 0, dead.join('\n        '));
   }
 
   report();

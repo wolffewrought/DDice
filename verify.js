@@ -321,10 +321,18 @@ function scanStructure(src, ast) {
 // Builders are fluent chains of arrow callbacks. For any arrow passed to
 // addSubcommand/addSubcommandGroup/add*Option, the name is the argument of
 // the first .setName() applied to that arrow's own parameter.
+// A builder arrow may hand its chain to a shared helper — `s=>withX(s.setName…)`
+// — whose own arrow adds more options. Those count as this builder's.
+let builderHelpers = new Map();
 function readBuilder(fn) {
   if (!fn || !/Function/.test(fn.type) || !fn.params[0]) return null;
   const param = fn.params[0].name;
   const out = { name: null, desc: null, line: lineOf(fn), choices: [], options: [], subs: [], groups: [] };
+  const root = rootOf(fn.body);
+  if (root && root.type === 'Identifier' && builderHelpers.has(root.name)) {
+    const helped = readBuilder(builderHelpers.get(root.name));
+    if (helped) { out.options.push(...helped.options); out.choices.push(...helped.choices); }
+  }
   walk(fn.body, (n, parents) => {
     if (n.type !== 'CallExpression' || n.callee.type !== 'MemberExpression') return;
     const m = n.callee.property.name;
@@ -348,6 +356,11 @@ function readBuilder(fn) {
 
 function commandTree(ast) {
   const cmds = [];
+  builderHelpers = new Map();
+  for (const st of ast.body) {
+    if (st.type !== 'VariableDeclaration') continue;
+    for (const d of st.declarations) if (d.id.type === 'Identifier' && d.init && d.init.type === 'ArrowFunctionExpression' && d.init.params[0]?.type === 'Identifier') builderHelpers.set(d.id.name, d.init);
+  }
   walk(ast, (node, parents) => {
     if (node.type !== 'NewExpression' || !node.callee || node.callee.name !== 'SlashCommandBuilder') return;
     let top = node;
@@ -399,6 +412,10 @@ function scanWiring(src, ast) {
     }
     if (node.type === 'SwitchCase' && node.test && node.test.type === 'Literal' &&
         typeof node.test.value === 'string') compared.add(node.test.value);
+    // /gm check routes its leaves through a local `opt('name')` compare; the
+    // literal handed to it is a comparison like any other.
+    if (node.type === 'CallExpression' && node.callee.type === 'Identifier' && node.callee.name === 'opt' &&
+        node.arguments[0] && node.arguments[0].type === 'Literal' && typeof node.arguments[0].value === 'string') compared.add(node.arguments[0].value);
     if (node.type === 'CallExpression' && node.callee.type === 'MemberExpression' &&
         node.callee.property.name === 'includes' && node.callee.object.type === 'ArrayExpression') {
       for (const el of node.callee.object.elements) {
@@ -738,6 +755,331 @@ function scanRulesets(src) {
       lib.start);
   }
 
+  return out;
+}
+
+// ── 2.6 Scopes ──────────────────────────────────────────────────────
+// Everything the other scanners could not see because they look at the
+// file as one bag of names. These are scope-aware, or per-command, or
+// read the SQL against the schema. Added 2026-10-11 after a pass found
+// five ReferenceErrors and two misrouted command families that every
+// global check had passed for weeks: a name read in a function that was
+// only ever declared in its caller; an option declared on one command
+// and read by the handler of another; a column that no table has.
+const JS_GLOBALS = new Set(['require', 'module', 'exports', '__dirname', '__filename', 'console', 'process', 'Math', 'JSON',
+  'Object', 'Array', 'String', 'Number', 'Boolean', 'Date', 'Error', 'TypeError', 'RangeError', 'SyntaxError', 'Promise', 'Set',
+  'Map', 'WeakMap', 'WeakSet', 'Symbol', 'BigInt', 'RegExp', 'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'setTimeout',
+  'setInterval', 'clearTimeout', 'clearInterval', 'setImmediate', 'Buffer', 'fetch', 'structuredClone', 'encodeURIComponent',
+  'decodeURIComponent', 'encodeURI', 'decodeURI', 'queueMicrotask', 'AbortController', 'AbortSignal', 'TextEncoder', 'TextDecoder',
+  'URL', 'URLSearchParams', 'Intl', 'globalThis', 'undefined', 'NaN', 'Infinity', 'arguments', 'Function', 'Float32Array',
+  'Float64Array', 'Uint8Array', 'Int32Array', 'ArrayBuffer', 'Atomics', 'Reflect', 'Proxy', 'performance', 'crypto', 'Blob',
+  'FormData', 'Headers', 'Response', 'Request', 'AggregateError', 'escape', 'unescape']);
+
+const patternNames = (p, out = []) => {
+  if (!p) return out;
+  if (p.type === 'Identifier') out.push(p.name);
+  else if (p.type === 'ObjectPattern') for (const q of p.properties) patternNames(q.type === 'RestElement' ? q.argument : q.value, out);
+  else if (p.type === 'ArrayPattern') for (const e of p.elements) patternNames(e, out);
+  else if (p.type === 'AssignmentPattern') patternNames(p.left, out);
+  else if (p.type === 'RestElement') patternNames(p.argument, out);
+  return out;
+};
+const isFnNode = (n) => /Function/.test(n.type);
+const isScopeNode = (n) => n.type === 'Program' || isFnNode(n) || n.type === 'BlockStatement' || n.type === 'CatchClause' ||
+  /^For(In|Of)?Statement$/.test(n.type) || n.type === 'SwitchStatement' || n.type === 'ClassDeclaration' || n.type === 'ClassExpression';
+
+// Is this Identifier a reference (as opposed to a declaration, a property
+// name, a label)? Shared by the undefined and unused checks.
+function isReference(node, parents) {
+  const p = parents[parents.length - 1];
+  if (!p) return true;
+  if (p.type === 'Property' && p.key === node && !p.computed && !p.shorthand) return false;
+  if (p.type === 'Property' && p.value === node && parents[parents.length - 2]?.type === 'ObjectPattern') return false;
+  if (p.type === 'MemberExpression' && p.property === node && !p.computed) return false;
+  if (p.type === 'MethodDefinition' && p.key === node) return false;
+  if (p.type === 'PropertyDefinition' && p.key === node && !p.computed) return false;
+  if (/^(FunctionDeclaration|FunctionExpression|ClassDeclaration|ClassExpression)$/.test(p.type) && p.id === node) return false;
+  if (p.type === 'VariableDeclarator' && p.id === node) return false;
+  if (p.type === 'LabeledStatement' || p.type === 'BreakStatement' || p.type === 'ContinueStatement') return false;
+  if (p.type === 'CatchClause' && p.param === node) return false;
+  if (isFnNode(p) && p.params.includes(node)) return false;
+  if (p.type === 'ArrayPattern' || p.type === 'RestElement' || (p.type === 'AssignmentPattern' && p.left === node)) return false;
+  return true;
+}
+
+function scanScopes(src, ast) {
+  const { out, err, warn } = collector();
+
+  // ── undefined identifiers: build the scope tree, then resolve every reference ──
+  const scopes = new Map();
+  (function build(node, parentScope, fnScope) {
+    let scope = parentScope, fscope = fnScope;
+    if (isScopeNode(node)) {
+      scope = { parent: parentScope, names: new Set() };
+      scopes.set(node, scope);
+      if (node.type === 'Program' || isFnNode(node)) fscope = scope;
+      if (isFnNode(node)) {
+        for (const p of node.params) for (const nm of patternNames(p)) scope.names.add(nm);
+        if (node.type === 'FunctionExpression' && node.id) scope.names.add(node.id.name);
+      }
+      if (node.type === 'CatchClause' && node.param) for (const nm of patternNames(node.param)) scope.names.add(nm);
+      if ((node.type === 'ClassDeclaration' || node.type === 'ClassExpression') && node.id) scope.names.add(node.id.name);
+    }
+    if (node.type === 'VariableDeclaration') {
+      const target = node.kind === 'var' ? fscope : scope;
+      for (const d of node.declarations) for (const nm of patternNames(d.id)) target.names.add(nm);
+    }
+    if (node.type === 'FunctionDeclaration' && node.id) {
+      if (parentScope) parentScope.names.add(node.id.name);
+      if (fnScope) fnScope.names.add(node.id.name);
+    }
+    if (node.type === 'ClassDeclaration' && node.id && parentScope) parentScope.names.add(node.id.name);
+    for (const key of Object.keys(node)) {
+      if (key === 'loc' || key === 'start' || key === 'end') continue;
+      const val = node[key];
+      if (Array.isArray(val)) { for (const c of val) if (c && typeof c.type === 'string') build(c, scope, fscope); }
+      else if (val && typeof val.type === 'string') build(val, scope, fscope);
+    }
+  })(ast, null, null);
+  const resolves = (name, scope) => { for (let s = scope; s; s = s.parent) if (s.names.has(name)) return true; return JS_GLOBALS.has(name); };
+  const seenUndef = new Set();
+  (function check(node, parents, scope) {
+    if (isScopeNode(node)) scope = scopes.get(node);
+    if (node.type === 'Identifier' && isReference(node, parents) && !resolves(node.name, scope)) {
+      const key = `${node.name}@${lineOf(node)}`;
+      if (!seenUndef.has(key)) { seenUndef.add(key); err('undefined-identifier', `"${node.name}" is read here but declared in no enclosing scope — a ReferenceError the moment this line runs`, lineOf(node)); }
+    }
+    const chain = parents.concat(node);
+    for (const key of Object.keys(node)) {
+      if (key === 'loc' || key === 'start' || key === 'end') continue;
+      const val = node[key];
+      if (Array.isArray(val)) { for (const c of val) if (c && typeof c.type === 'string') check(c, chain, scope); }
+      else if (val && typeof val.type === 'string') check(val, chain, scope);
+    }
+  })(ast, [], null);
+
+  // ── unused locals: a const/let/function declared inside a function and never read in it ──
+  walk(ast, (fn) => {
+    if (!isFnNode(fn) || !fn.body || fn.body.type !== 'BlockStatement') return;
+    const decls = [], declIds = new Set();
+    walk(fn.body, (n, ps) => {
+      if (ps.some(p => p !== fn && isFnNode(p))) return;   // a nested function keeps its own scope
+      if (n.type === 'VariableDeclarator') for (const id of patternNames(n.id)) { decls.push({ name: id, line: lineOf(n), pattern: n.id.type !== 'Identifier' }); }
+      if (n.type === 'FunctionDeclaration' && n.id) decls.push({ name: n.id.name, line: lineOf(n), fn: true });
+    });
+    if (!decls.length) return;
+    const refs = new Set();
+    walk(fn.body, (n, ps) => { if (n.type === 'Identifier' && isReference(n, ps)) refs.add(n.name); });
+    for (const d of decls) {
+      if (d.pattern && /^_/.test(d.name)) continue;   // a deliberate skip is spelt with an underscore
+      if (!refs.has(d.name)) warn('unused-local', `${d.fn ? 'function' : 'const'} ${d.name} in ${fn.id?.name || '(anonymous)'} is declared and never read`, d.line);
+    }
+  });
+
+  // ── short calls: a declared function called with fewer arguments than it reads unguarded ──
+  const fnSigs = new Map();
+  walk(ast, (n, ps) => {
+    if (ps.some(isFnNode)) return;
+    let fn = null, name = null;
+    if (n.type === 'FunctionDeclaration' && n.id) { fn = n; name = n.id.name; }
+    if (n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && n.init && isFnNode(n.init)) { fn = n.init; name = n.id.name; }
+    if (!fn) return;
+    const params = [];
+    for (const p of fn.params) { if (p.type === 'Identifier') params.push(p.name); else break; }
+    const used = new Set(), guarded = new Set();
+    const direct = (t) => {
+      if (!t) return;
+      if (t.type === 'Identifier') guarded.add(t.name);
+      else if (t.type === 'UnaryExpression' && t.operator === '!') direct(t.argument);
+      else if (t.type === 'LogicalExpression') { direct(t.left); direct(t.right); }
+      else if (t.type === 'BinaryExpression' && /^[!=]==?$/.test(t.operator)) for (const s of [t.left, t.right]) if (s.type === 'Identifier') guarded.add(s.name);
+    };
+    walk(fn.body, (m) => {
+      if (m.type === 'Identifier' && params.includes(m.name)) used.add(m.name);
+      if (m.type === 'IfStatement' || m.type === 'ConditionalExpression') direct(m.test);
+      if (m.type === 'LogicalExpression') direct(m.left);
+      if (m.type === 'AssignmentPattern' && m.left.type === 'Identifier') guarded.add(m.left.name);
+      if (m.type === 'ChainExpression') walk(m, (t) => { if (t.type === 'MemberExpression' && t.object.type === 'Identifier') guarded.add(t.object.name); });
+    });
+    fnSigs.set(name, { params, used, guarded, line: lineOf(fn) });
+  });
+  walk(ast, (n) => {
+    if (n.type !== 'CallExpression' || n.callee.type !== 'Identifier') return;
+    const f = fnSigs.get(n.callee.name); if (!f) return;
+    if (n.arguments.some(a => a.type === 'SpreadElement')) return;
+    const bad = f.params.slice(n.arguments.length).filter(p => f.used.has(p) && !f.guarded.has(p));
+    if (bad.length) err('short-call', `${n.callee.name}() is called with ${n.arguments.length} argument${n.arguments.length === 1 ? '' : 's'} but reads ${bad.join(', ')} unguarded (declared L${f.line})`, lineOf(n));
+  });
+
+  // ── per-command routing: the handlers a command's dispatch reaches, transitively ──
+  const cmds = commandTree(ast);
+  const fnByName = new Map();
+  walk(ast, (n, ps) => { if (n.type === 'FunctionDeclaration' && n.id && !ps.some(isFnNode)) fnByName.set(n.id.name, n); });
+  const callees = (fn) => { const s = new Set(); walk(fn.body, (c) => { if (c.type === 'CallExpression' && c.callee.type === 'Identifier' && fnByName.has(c.callee.name)) s.add(c.callee.name); }); return s; };
+  const HANDLER_RE = /^(handle|run|show|render|open|post|gm|build|finish|request)[A-Z]/;
+  const ownersOf = new Map();   // function name -> Set(command names whose dispatch reaches it)
+  walk(ast, (node) => {
+    if (node.type !== 'IfStatement') return;
+    let cmdName = null;
+    walk(node.test, (t) => { if (t.type === 'BinaryExpression' && t.operator === '===') { const [l, r] = [t.left, t.right]; if (l.type === 'MemberExpression' && l.property.name === 'commandName' && r.type === 'Literal') cmdName = r.value; } });
+    if (!cmdName || !cmds.some(c => c.name === cmdName)) return;
+    const seen = new Set();
+    const stack = [];
+    walk(node.consequent, (c) => { if (c.type === 'CallExpression' && c.callee.type === 'Identifier' && fnByName.has(c.callee.name)) stack.push(c.callee.name); });
+    while (stack.length) {
+      const name = stack.pop();
+      if (seen.has(name)) continue;
+      seen.add(name);
+      if (!ownersOf.has(name)) ownersOf.set(name, new Set());
+      ownersOf.get(name).add(cmdName);
+      // follow only handler-shaped delegation, so data helpers do not drag every command in
+      for (const m of callees(fnByName.get(name))) if (HANDLER_RE.test(m)) stack.push(m);
+    }
+  });
+  const optionsOf = (c) => new Set([...c.options, ...allSubs(c).flatMap(s => s.options)].map(o => o.name));
+  const groupsOf = (c) => new Set(c.groups.map(g => g.name));
+  const subsOf = (c) => new Set(allSubs(c).map(s => s.name));
+  for (const [fname, owners] of ownersOf) {
+    const fn = fnByName.get(fname);
+    const cmdsOwning = cmds.filter(c => owners.has(c.name));
+    walk(fn.body, (n) => {
+      if (n.type === 'CallExpression' && n.callee.type === 'MemberExpression' && GETTERS.test(n.callee.property.name)) {
+        const a = n.arguments[0];
+        if (a && a.type === 'Literal' && typeof a.value === 'string' && !cmdsOwning.some(c => optionsOf(c).has(a.value)))
+          err('phantom-option-read', `${fname}() reads options.${n.callee.property.name}('${a.value}') but none of the commands routed to it (${[...owners].map(o => '/' + o).join(', ')}) declares that option — it is always null`, lineOf(n));
+      }
+      if (n.type === 'BinaryExpression' && /^[!=]==?$/.test(n.operator)) {
+        const [l, r] = [n.left, n.right];
+        const lit = r.type === 'Literal' && typeof r.value === 'string' ? r : l.type === 'Literal' && typeof l.value === 'string' ? l : null;
+        const idn = lit === r ? l : r;
+        if (!lit || idn.type !== 'Identifier') return;
+        if (/^(sg|cg|group|grp|subGroup|subgroup)$/.test(idn.name) && !cmdsOwning.some(c => groupsOf(c).has(lit.value)))
+          err('phantom-group-branch', `${fname}() compares ${idn.name} === '${lit.value}' but none of (${[...owners].map(o => '/' + o).join(', ')}) registers a group called "${lit.value}"`, lineOf(n));
+      }
+    });
+  }
+  // The dispatch itself: a group compared under one command's block must be registered on that command.
+  walk(ast, (node) => {
+    if (node.type !== 'IfStatement') return;
+    let cmdName = null;
+    walk(node.test, (t) => { if (t.type === 'BinaryExpression' && t.operator === '===') { const [l, r] = [t.left, t.right]; if (l.type === 'MemberExpression' && l.property.name === 'commandName' && r.type === 'Literal') cmdName = r.value; } });
+    const c = cmds.find(x => x.name === cmdName);
+    if (!c) return;
+    walk(node.consequent, (n) => {
+      if (n.type !== 'BinaryExpression' || n.operator !== '===') return;
+      const [l, r] = [n.left, n.right];
+      if (l.type !== 'Identifier' || r.type !== 'Literal' || typeof r.value !== 'string') return;
+      if (/^(sg|cg|group|grp)$/.test(l.name) && !groupsOf(c).has(r.value)) err('phantom-group-branch', `/${c.name}'s dispatch compares ${l.name} === '${r.value}' but /${c.name} registers no group "${r.value}"`, lineOf(n));
+      if (/^[a-z]*[sS]ub$/.test(l.name) && !subsOf(c).has(r.value)) err('phantom-sub-branch', `/${c.name}'s dispatch compares ${l.name} === '${r.value}' but /${c.name} registers no subcommand "${r.value}"`, lineOf(n));
+    });
+  });
+
+  // ── autocomplete options nobody answers ──
+  const acOptions = [];
+  walk(ast, (node, parents) => {
+    if (node.type !== 'NewExpression' || !node.callee || node.callee.name !== 'SlashCommandBuilder') return;
+    let top = node;
+    for (let i = parents.length - 1; i >= 0; i--) { const p = parents[i]; if ((p.type === 'CallExpression' || p.type === 'MemberExpression') && rootOf(p) === node) top = p; else break; }
+    let cmdName = null;
+    walk(top, (n) => { if (n.type === 'CallExpression' && n.callee.type === 'MemberExpression' && n.callee.property.name === 'setName' && rootOf(n.callee.object) === node && cmdName === null) cmdName = staticText(n.arguments[0]); });
+    walk(top, (n) => {
+      if (n.type !== 'CallExpression' || n.callee.type !== 'MemberExpression' || n.callee.property.name !== 'setAutocomplete' || n.arguments[0]?.value !== true) return;
+      let m = n.callee.object, optName = null;
+      while (m && (m.type === 'CallExpression' || m.type === 'MemberExpression')) {
+        if (m.type === 'CallExpression' && m.callee.type === 'MemberExpression' && m.callee.property.name === 'setName') { optName = staticText(m.arguments[0]); break; }
+        m = m.type === 'CallExpression' ? m.callee : m.object;
+      }
+      if (optName) acOptions.push({ cmd: cmdName, opt: optName, line: lineOf(n) });
+    });
+  });
+  const branches = [];
+  walk(ast, (n) => {
+    if (n.type !== 'IfStatement') return;
+    const bc = new Set(), bo = new Set();
+    let onFocused = false;
+    walk(n.test, (t) => {
+      if (t.type === 'BinaryExpression' && /^[!=]==?$/.test(t.operator)) {
+        const [a, b] = [t.left, t.right];
+        const lit = b.type === 'Literal' ? b : a.type === 'Literal' ? a : null; const other = lit === b ? a : b;
+        if (!lit) return;
+        if (other.type === 'MemberExpression' && other.property.name === 'commandName') bc.add(lit.value);
+        if (other.type === 'MemberExpression' && other.property.name === 'name' && other.object.type === 'Identifier' && /focused/i.test(other.object.name)) { bo.add(lit.value); onFocused = true; }
+      }
+      if (t.type === 'CallExpression' && t.callee.type === 'MemberExpression' && t.callee.property.name === 'includes' && t.callee.object.type === 'ArrayExpression') {
+        const arg = t.arguments[0];
+        if (arg?.type === 'MemberExpression' && arg.property.name === 'commandName') for (const e of t.callee.object.elements) bc.add(e.value);
+        if (arg?.type === 'MemberExpression' && arg.property.name === 'name' && /focused/i.test(arg.object?.name || '')) { for (const e of t.callee.object.elements) bo.add(e.value); onFocused = true; }
+      }
+    });
+    if (onFocused) branches.push({ cmds: bc, opts: bo });
+  });
+  for (const o of acOptions) {
+    if (!branches.some(b => b.opts.has(o.opt) && (b.cmds.size === 0 || b.cmds.has(o.cmd)))) err('autocomplete-unanswered', `/${o.cmd} option "${o.opt}" asks for autocomplete but no branch answers (${o.cmd}, ${o.opt}) — Discord shows "loading options failed"`, o.line);
+  }
+
+  // ── SQL against the schema ──
+  const schema = new Map();
+  const RESERVED = new Set(['PRIMARY', 'UNIQUE', 'FOREIGN', 'CHECK', 'CONSTRAINT']);
+  for (const m of src.matchAll(/CREATE TABLE IF NOT EXISTS (\w+)\s*\(/g)) {
+    let i = m.index + m[0].length, depth = 1, j = i;
+    while (j < src.length && depth) { if (src[j] === '(') depth++; else if (src[j] === ')') depth--; j++; }
+    const cols = new Set();
+    let d = 0, cur = ''; const parts = [];
+    for (const ch of src.slice(i, j - 1)) { if (ch === '(') d++; if (ch === ')') d--; if (ch === ',' && d === 0) { parts.push(cur); cur = ''; } else cur += ch; }
+    parts.push(cur);
+    for (const p of parts) { const w = p.trim().split(/\s+/)[0]; if (w && !RESERVED.has(w.toUpperCase())) cols.add(w); }
+    schema.set(m[1], cols);
+  }
+  for (const m of src.matchAll(/ALTER TABLE (\w+) ADD COLUMN (\w+)/g)) { if (!schema.has(m[1])) schema.set(m[1], new Set()); schema.get(m[1]).add(m[2]); }
+  const SQLKW = new Set('SELECT FROM WHERE AND OR NOT NULL IS IN LIKE ORDER BY ASC DESC LIMIT OFFSET GROUP HAVING COUNT SUM MAX MIN AVG COALESCE INSERT INTO VALUES UPDATE SET DELETE ON CONFLICT DO NOTHING REPLACE AS DISTINCT JOIN LEFT INNER OUTER CASE WHEN THEN ELSE END EXISTS BETWEEN CAST INTEGER TEXT REAL COLLATE NOCASE LOWER UPPER LENGTH TRIM IFNULL NULLIF ABS ROUND RANDOM TOTAL EXCLUDED STRFTIME DATETIME ROWID GLOB ESCAPE UNION ALL TRUE FALSE WITH RECURSIVE SUBSTR INSTR PRINTF IGNORE ABORT FAIL ROLLBACK'.split(' '));
+  const usedTables = new Set();
+  walk(ast, (n) => {
+    let text = null;
+    if (n.type === 'Literal' && typeof n.value === 'string') text = n.value;
+    else if (n.type === 'TemplateLiteral') text = n.quasis.map(q => q.value.cooked ?? '').join(' ⁂ ');
+    if (!text || !/^\s*(SELECT|INSERT|UPDATE|DELETE)\b/i.test(text)) return;
+    if (/\bJOIN\b|\(\s*SELECT/i.test(text)) { for (const t of text.matchAll(/\b(?:FROM|JOIN|INTO|UPDATE)\s+(\w+)/gi)) usedTables.add(t[1]); return; }
+    const tm = /\b(?:FROM|INTO|UPDATE)\s+(\w+)/i.exec(text);
+    if (!tm) return;
+    const table = tm[1]; usedTables.add(table);
+    const cols = schema.get(table);
+    if (!cols) { if (!/^(sqlite_master|the|SET)$/.test(table)) warn('unknown-table', `SQL names table "${table}" that no schema creates`, lineOf(n)); return; }
+    const body = text.replace(/'[^']*'/g, "''").replace(/⁂/g, ' ').replace(/\$\{[^}]*\}/g, ' ').replace(/\bAS\s+\w+/gi, ' ');
+    for (const m of body.matchAll(/\b([A-Za-z_]\w*)\b/g)) {
+      const w = m[1];
+      if (SQLKW.has(w.toUpperCase()) || w === table || cols.has(w) || schema.has(w) || w.length === 1) continue;
+      if (body[m.index + w.length] === '.') continue;
+      err('unknown-column', `"${w}" is not a column of ${table} — SQLite will refuse this statement at run time`, lineOf(n));
+    }
+  });
+  for (const t of schema.keys()) if (!usedTables.has(t)) warn('table-never-queried', `${t} is created but no statement reads or writes it`, 0);
+  const BUILDERS = { upsertChar: 'characters', updateQuest: 'quests', setConfig: 'guild_config', setRun: 'story_runs', upsertNpc: 'npcs', upsertFight: 'fights', standDownFight: 'fights' };
+  walk(ast, (n) => {
+    if (n.type !== 'CallExpression' || n.callee.type !== 'Identifier' || !BUILDERS[n.callee.name]) return;
+    const obj = n.arguments[n.arguments.length - 1];
+    if (!obj || obj.type !== 'ObjectExpression') return;
+    for (const p of obj.properties) {
+      if (p.type !== 'Property' || p.computed) continue;
+      const k = p.key.type === 'Identifier' ? p.key.name : String(p.key.value);
+      if (!schema.get(BUILDERS[n.callee.name])?.has(k)) err('builder-key-not-column', `${n.callee.name}({ ${k} }) — ${BUILDERS[n.callee.name]} has no column "${k}"`, lineOf(p));
+    }
+  });
+
+  // ── comments that name identifiers no longer in the code ──
+  const comments = [];
+  acorn.parse(src, { ecmaVersion: 'latest', sourceType: 'script', locations: true, allowReturnOutsideFunction: true, onComment: comments });
+  let codeOnly = src;
+  for (const c of [...comments].sort((a, b) => b.start - a.start)) codeOnly = codeOnly.slice(0, c.start) + ' '.repeat(c.end - c.start) + codeOnly.slice(c.end);
+  const staleSeen = new Set();
+  for (const c of comments) {
+    for (const m of c.value.matchAll(/\b([a-z][a-z0-9]*[A-Z][A-Za-z0-9]+)\b/g)) {
+      const w = m[1];
+      if (staleSeen.has(w) || /^(e\.g|i\.e)/.test(w)) continue;
+      if (!new RegExp(`\\b${w}\\b`).test(codeOnly)) { staleSeen.add(w); warn('stale-comment', `a comment names "${w}", which appears nowhere in code`, src.slice(0, c.start).split('\n').length); }
+    }
+  }
+
+  out.summary = `${scopes.size} scopes · ${cmds.length} commands routed`;
   return out;
 }
 
@@ -1400,7 +1742,7 @@ function testBuilders(src) {
       /CHAR_TAG_CLASSES = \['Vanguard','Defender','Siege Knight'\]/.test(src) &&
       /CHAR_TAG_FALLEN = 'Fallen'/.test(src));
     ok('the char starter is the living sheet — hash-skipped on sweeps, immediate on events',
-      /const starter = await thread\.messages\.fetch\(row\.message_id \|\| thread\.id\)/.test(src) &&
+      /const starter = await thread\.messages\.fetch\(thread\.id\)/.test(src) &&
       /ensureCharBlocks\(client, guild, uid, thread, body\)/.test(src) &&
       /function charPageBody\(gid, ch, displayName\)/.test(src));
     ok('every sheet edit re-mirrors through done',
@@ -1603,26 +1945,15 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
           return /effect_state: '\{\}'/.test(end > 0 ? win.slice(0, end) : win);
         });
       })());
-    ok('every fight end drops them too \u2014 all five paths',
+    ok('every fight end stands down through one helper \u2014 six paths, no idle written elsewhere',
       (() => {
-        // Count the transitions themselves; a fifth path (the quest-thread
-        // stand-down) was missed by counting matches instead.
-        const ends = [...src.matchAll(/state: 'idle'/g)];
-        return ends.length >= 5 && ends.every(m => {
-          const win = src.slice(m.index, m.index + 300);
-          const cut = win.indexOf('});');
-          return /effect_state: '\{\}'/.test(cut > 0 ? win.slice(0, cut) : win);
-        });
+        const idles = [...src.matchAll(/state: 'idle'/g)];
+        const inHelper = idles.filter(m => /function standDownFight\(gid, cid, client, fields = \{\}\) \{[^\n]*\n[^\n]*state: 'idle'/.test(src.slice(m.index - 400, m.index + 40)));
+        return idles.length === 1 && inHelper.length === 1 && (src.match(/standDownFight\(/g) || []).length === 7 &&
+          /standDownFight\(gid, cid2, interaction\.client\);/.test(src) &&
+          /standDownFight\(gid, quest\.run_thread_id, client\);/.test(src) &&
+          /const swept = sweepTempNpcs\(gid, \{ client \}\);/.test(src) && !/sweepTempFighters/.test(src);
       })());
-    // Rests land on the hour, not on the minute a schedule was created.
-    // The worked-examples pair: GM channel gets both, player channel gets
-    // the player one, and neither belongs to a ruleset.
-    // Letting go is one tap from the refusal that mentions it, and the
-    // press walks the same release path the command does.
-    // The attacker's turn had no buttons at all: you could answer a blow by
-    // tapping but never throw one (T, 2026-08-22).
-// (2026-09-12: Grapple and Feint open the attack; Deflect and Disarm
-    // answer one, so they moved to the defence row.)
     ok('opening abilities sit with the attack, answering ones with the defence',
       /B\('fact:grapple'/.test(src) && /B\('fact:feint'/.test(src) &&
       (() => {
@@ -2256,11 +2587,12 @@ function testPins(src) {
       /client\.on\('channelCreate'[\s\S]{0,700}?DDice self-repair \(new channel\)/.test(src));
     ok('status audits without writing',
       /Permissions correct in every channel/.test(src));
-    ok('the check fold: seven leaves, shimmed dispatch, routed group',
+    ok('the check fold: seven leaves, routed as a group, no boolean shim left',
       /g\.setName\('check'\)/.test(src) &&
       ['status','run','build','restart','order','migrations','portraits'].every(l => new RegExp(String.raw`g\.addSubcommand\(s=>s\.setName\('${l}'\)`).test(src)) &&
-      /const opt = \(name\) => checkLeaf \? checkLeaf === name : !!interaction\.options\?\.getBoolean\?\.\(name\);/.test(src) &&
-      /getSubcommandGroup\(false\) === 'check'\) return await handleCheck/.test(src) &&
+      /const opt = \(name\) => checkLeaf === name;/.test(src) &&
+      /if \(interaction\.options\.getSubcommandGroup\(false\) === 'check'\) return await handleCheck/.test(src) &&
+      !/gmSub === 'check'/.test(src) &&
       /opt\('portraits'\)/.test(src));
     ok('expired faces are recovered from channel history',
       /const recover = async \(parsed\)[\s\S]{0,900}?a\.id === parsed\.attachmentId/.test(src));
@@ -2370,9 +2702,9 @@ function testPins(src) {
       /const DND5E_ONLY = \['dnd', 'spell', 'library'\];/.test(src) &&
       /const KNIGHTFALL_ONLY = \['duel', 'deception', 'standing'\];/.test(src) &&
       /commands = commands\.filter\(cmd => !hidden\.includes\(cmd\.name\)\);/.test(src));
-    ok('the choice-injection map chains after the filter, not around it',
-      /commands = commands\.map\(cmd => \{/.test(src) &&
-      !/commands = slashCommands\.map\(cmd => \{/.test(src));
+    ok('registration filters the picker per ruleset and injects nothing — the /pr choice map is gone',
+      /commands = commands\.filter\(cmd => !hidden\.includes\(cmd\.name\)\);/.test(src) &&
+      !/cmd\.name !== 'pr'/.test(src) && !/getUncategorisedNpcs\(guildId\)/.test(src));
     ok('changing the ruleset re-registers the picker',
       /setConfig\(gid, \{ ruleset: want \}\);[\s\S]{0,300}?registerSlashCommands\(gid\)\.catch/.test(src));
 
@@ -2521,6 +2853,7 @@ function main() {
       ['limits', scanLimits(src, ast)],
       ['rulesets', scanRulesets(src)],
       ['habits', scanHabits(src, ast)],
+      ['scopes', scanScopes(src, ast)],
     ];
     for (const [name, found] of scans) {
       const errs = found.filter(f => f.sev === 'ERROR');
