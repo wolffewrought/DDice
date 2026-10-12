@@ -51,7 +51,7 @@ node --expose-internals verify.js -v     # list every warning
 
 Green means every assertion passed (1076 as of 2026-10-12) and no scanner
 found an ERROR. Then run the probe: `node --experimental-sqlite probe.js`
-(71 probes: the fight, encounter, override, autocomplete and every-leaf
+(73 probes: the fight, encounter, override, autocomplete and every-leaf
 walks, the GM-gate walk, chat shorthands, scheduled ticks, junk-id lanes,
 SQL compile, forum seeding and sweep, and a double-ack check).
 
@@ -75,7 +75,7 @@ no network in the sandbox, so npm cannot supply a parser.
 ### Severity means something
 
 ERROR fails the run and is provably wrong. WARN reports and does not fail:
-it needs a human. Do not silence a WARN to get a green run — the fifteen
+it needs a human. Do not silence a WARN to get a green run — the fourteen
 standing ones are all correct-by-design and are listed in §6.
 
 ## 4 · House conventions
@@ -161,7 +161,7 @@ with the statement beneath them.
 |---|---|
 | structure · `buildMemorial`, `renderDuel` neither await nor delegate | Both build strings. Harmless. |
 | wiring · `/gm clean`, `/npc clear` never compared | `/gm test clean` falls through, §4; `/npc temp clear` is compared as the composed `tempclear`. The seven `/gm check` leaves used to sit here too; the scanner now reads `opt('leaf')` as a compare. |
-| wiring · `/config` groups, `/npc manage` never compared | The leaves route by name; the group is not consulted. |
+| wiring · `/config` channels group, `/npc manage` never compared | The leaves route by name; the group is not consulted (the mechanics group is now compared by the autocomplete lane, which is why it dropped off). |
 | habits · three triplicated strings | Always the three most-repeated literals left; a rolling list, not a defect. |
 | limits · `/npc` at 24/25, `/quest` at 23/25 | Real headroom warning. See §7. |
 | limits · two modals at 5/5 rows | LIMITS.md §2. No sixth field is possible. |
@@ -531,6 +531,37 @@ twenty!". The harness has the three new cases (lower attack lands for 2,
 higher attack the same, a 19 against a defending 20 still parried). RULES
 `defence-nat20` reworded; the books' damage table has the row. 1076
 assertions.
+
+**`/char set value:` autocompletes by field (T, 2026-10-12, 17:49):** the
+value option was a bare text box whatever the field, so an emoji field had
+nothing to pick. The autocomplete branch reads the chosen `field` from the
+same interaction and answers with the orders, the classes, the server
+weapon list (free text kept as the first choice), or the weapon emojis —
+`WEAPON_EMOJI_CHOICES`, one frozen list now shared by the three pickers
+that each carried a copy — plus the guild's custom emojis as `<:name:id>`;
+a stat field echoes a typed number. Probed for all five field kinds. 72
+probes.
+
+**Lists everywhere (T, 2026-10-12, 17:54: "the dropdown must work for
+everything that needs it"):** of 134 free-text string options, 27 had a
+known set behind them and no list. All flagged `setAutocomplete(true)`
+and answered at the top of the autocomplete lane by small shared helpers:
+`acShape(names, {free, label})` (dedupe, filter, typed text first when a
+new name is allowed) and `acLastOf(pool)` (comma lists: complete the last
+item, keep the rest). Covered: `/activity set name|scene|value`,
+`/char profile save|load slotname`, `/char weapon add|stats atk|def`,
+`/char weaponemoji custom`, `/char tag custom emoji`, `/dnd create
+saves|skills`, `/spell cast name` / `prepare add|drop`, `/standing rank
+add name`, `title grant|revoke title`, `association add|remove group`
+(revoke/remove read the subject from `user:`/`npc:` on the same
+interaction), `/quest run complete title`, `/encounter end title`,
+`/encounter preset save name|npcs`, `/config mechanics rest|autorest
+hp|rerolls|heal`, `/gm search name`, `/gm backup auto channel`. The 107
+left are prose, dice, mentions or new names by design. verify's
+`autocomplete-unanswered` keeps every flag answered; the probe fires
+thirteen with content. One standing warning cleared on the way (the
+autocomplete lane now compares `/config`'s mechanics group) — 14 left.
+73 probes.
 
 **Recipe:** the re-lay was done by a script (relay_books.py, scratch) that
 takes every original item and row by AST span and asserts each is used

@@ -8939,6 +8939,9 @@ function removeWeapon(gid, name) {
 
 // ── Weapon emoji validation ───────────────────────────────────────────────────
 const STANDARD_WEAPON_EMOJIS = ['⚔️', '🗡️', '🏹', '🔱', '⛏️', '🛡️', '🪄'];
+// The same seven as picker choices — /char create, /char weaponemoji, and the
+// list /char set offers once an emoji field is chosen (T, 2026-10-12).
+const WEAPON_EMOJI_CHOICES = Object.freeze([{name:'⚔️ Swords',value:'⚔️'},{name:'🗡️ Dagger',value:'🗡️'},{name:'🏹 Bow',value:'🏹'},{name:'🔱 Trident',value:'🔱'},{name:'⛏️ Pickaxe',value:'⛏️'},{name:'🛡️ Shield',value:'🛡️'},{name:'🪄 Wand',value:'🪄'}]);
 // Accept a standard emoji, OR a custom emoji tag (<:name:id> / <a:name:id>) that
 // belongs to this guild. Returns the cleaned value to store, or null if invalid.
 function validateWeaponEmoji(guild, value) {
@@ -19772,6 +19775,8 @@ async function sweepOldUpdatePosts(client, gid) {
 
 const CHANGELOG = [
   { key: '2026-10-12', gm: [
+      { line: 'A list everywhere a field has one to offer: `/char set value:`, saved sheets, weapon stats, 5e saves and skills, spells, ranks, titles, groups, preset monsters, rest amounts, emojis, `/gm search`, the backup channel',
+        detail: '`/char set field:Weapon 2 Emoji` used to leave `value:` as a bare text box, so there was nothing to pick from and no way to know what would be accepted. Every field whose answer comes from a known set now autocompletes from it: `/char set value:` follows the field (emojis, orders, classes, weapons, a number handed back); `/char profile save|load slotname:` your saves; `/char weapon add|stats atk:|def:` the stat combinations and `any`; `/dnd create saves:|skills:` complete the next item of a comma list; `/spell cast|prepare` the library and what you have prepared; `/standing rank add`, `title grant|revoke`, `association add|remove` the ranks, titles and groups the server has (revoke and remove list only what that person holds); `/quest run complete title:` and `/encounter end title:` the titles already given; `/encounter preset save npcs:` the library and your NPCs, item by item; `/config mechanics rest|autorest` the amounts (100%, 50%, +25%, 0%); `/char weaponemoji custom:` and `/char tag custom emoji:` the server\'s own emojis; `/activity set` the activities, their scenes and the NPCs; `/gm search name:` every character and NPC; `/gm backup auto channel:` off or a channel. Where a new name is the point, what you typed leads the list, so free entry still works.' },
       { line: 'Twenty meets twenty: a natural 20 attack against a natural 20 defence lands whatever the totals, for 2, and the defender still banks the riposte',
         detail: 'When both dice show 20 the parry used to be cancelled and the totals decided, so a 20+1 attack could be turned by a 20+5 defence. Now the attack wins however the totals fall: it lands for 2 (the usual 1, plus 1 for the attacking 20) and the defender still banks +2 to hit on their next attack. The auto fight had been withholding that riposte on a mutual 20 while the manual fight paid it \u2014 both pay it now. The card says "Twenty meets twenty!" when it happens.' },
       { line: 'A natural 20 passes and a natural 1 fails every check against a DC — and a target beaten by a 20 falls without asking you',
@@ -19779,6 +19784,7 @@ const CHANGELOG = [
       { line: 'What\'s new for GMs now carries the detail beneath the summary — every entry since September re-posted in that shape',
         detail: 'A What\'s new thread opens with the one-line bullets, as before, and continues with **In detail**: each bullet again, and under it what changed, why it was wrong or missing, what you do now and where it lands. The old threads in gm-updates were removed and the whole catalogue posted again, oldest first, so the forum reads 25/09 to today in order. The players\' updates forum keeps the short form.' },
     ], player: [
+      'A list appears wherever a field has one to offer: `/char set` once you pick the field, your saved sheets, weapon stats, 5e saves and skills, spells, titles and groups',
       'Twenty meets twenty: a natural 20 attack against a natural 20 defence lands whatever the totals, for 2 \u2014 and the defender still banks the +2 riposte',
       'A natural 20 passes and a natural 1 fails any check against a DC — a called check, a planted button, a group check or a target — whatever the total. A natural 20 on a target beats it outright',
     ] },
@@ -22495,8 +22501,8 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('delete').setDescription('Delete an activity (GM)')
       .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('set').setDescription('Tweak one line of one scene without re-pasting (GM)')
-      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true))
-      .addStringOption(o=>o.setName('scene').setDescription('Scene name').setRequired(true))
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('scene').setDescription('Scene name').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('field').setDescription('What to change').setRequired(true)
         .addChoices(
           {name:'Narration (SAY)',value:'say'},
@@ -22512,7 +22518,7 @@ const slashCommands = [
           {name:'Tally gain on arrival',value:'gain'},
           {name:'Merits on ending',value:'merits'},
           {name:'Rewards text',value:'rewards'}))
-      .addStringOption(o=>o.setName('value').setDescription('New value').setRequired(true))),
+      .addStringOption(o=>o.setName('value').setDescription('New value \u2014 a list appears for the NPC, roll and DC fields').setRequired(true).setAutocomplete(true))),
 
   new SlashCommandBuilder()
     .setName('duel').setDescription('Raise a duel for a GM to sign off')
@@ -22530,7 +22536,7 @@ const slashCommands = [
       .addStringOption(o=>o.setName('who').setDescription('Players, NPCs, or both (default both)').setRequired(false)
         .addChoices({name:'Players',value:'players'},{name:'NPCs',value:'npcs'},{name:'Both',value:'both'}))
       .addBooleanOption(o=>o.setName('fallen').setDescription('Include the fallen (default no)').setRequired(false))
-      .addStringOption(o=>o.setName('name').setDescription('Part of a name').setRequired(false)))
+      .addStringOption(o=>o.setName('name').setDescription('Part of a name').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('queue').setDescription('Everything waiting on a GM, in one place'))
     .addSubcommand(s=>s.setName('kill').setDescription('Mark a character as fallen and post their memorial')
       .addUserOption(o=>o.setName('user').setDescription('The player whose character has fallen').setRequired(false))
@@ -22646,7 +22652,7 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('now').setDescription('Export the database to this channel')
       .addBooleanOption(o=>o.setName('verify').setDescription('Open the snapshot read-only: integrity check + row counts vs live').setRequired(false)));
       g.addSubcommand(s=>s.setName('auto').setDescription('Toggle daily automatic backups')
-        .addStringOption(o=>o.setName('channel').setDescription('Channel for backups (or type off to disable)').setRequired(true))
+        .addStringOption(o=>o.setName('channel').setDescription('Channel for backups (or type off to disable)').setRequired(true).setAutocomplete(true))
         .addIntegerOption(o=>o.setName('hours').setDescription('How often, in hours (default 24)').setRequired(false).setMinValue(1).setMaxValue(720)));
       return g;
     })
@@ -22746,18 +22752,18 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('rest').setDescription('Set how much a rest restores (e.g. 50% or a flat number like 3)')
       .addStringOption(o=>o.setName('type').setDescription('Which rest to configure').setRequired(true)
         .addChoices({name:'Long Rest',value:'lrest'},{name:'Short Rest',value:'srest'}))
-      .addStringOption(o=>o.setName('hp').setDescription('HP restored — "50%" of max, or a flat number like "3"').setRequired(false))
-      .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored — "50%" of max, or a flat number like "1"').setRequired(false))
-      .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored — "50%" of max, or a flat number like "2"').setRequired(false)));
+      .addStringOption(o=>o.setName('hp').setDescription('HP restored — "50%" of max, or a flat number like "3"').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored — "50%" of max, or a flat number like "1"').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored — "50%" of max, or a flat number like "2"').setRequired(false).setAutocomplete(true)));
       g.addSubcommand(s=>s.setName('autorest').setDescription('Scheduled recovery: named schedules, each with its own timing and strength')
       .addStringOption(o=>o.setName('action').setDescription('What to do').setRequired(false)
         .addChoices({name:'List',value:'list'},{name:'Add or update',value:'set'},{name:'Remove',value:'remove'},
                     {name:'Run now',value:'run'},{name:'Pause',value:'pause'},{name:'Resume',value:'resume'},{name:'Who is excluded',value:'who'}))
       .addStringOption(o=>o.setName('name').setDescription('Schedule name, e.g. Breather or Full Recovery').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('hours').setDescription('How often, in hours (default 6)').setRequired(false).setMinValue(1).setMaxValue(720))
-      .addStringOption(o=>o.setName('hp').setDescription('HP restored: 100%, 50%, a flat number, or 0% to skip').setRequired(false))
-      .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored: 100%, 50%, a number, or 0%').setRequired(false))
-      .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored: 100%, 50%, a number, or 0%').setRequired(false))
+      .addStringOption(o=>o.setName('hp').setDescription('HP restored: 100%, 50%, a flat number, or 0% to skip').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('rerolls').setDescription('Rerolls restored: 100%, 50%, a number, or 0%').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('heal').setDescription('Heal charges restored: 100%, 50%, a number, or 0%').setRequired(false).setAutocomplete(true))
       .addChannelOption(o=>o.setName('channel').setDescription('Announce this schedule here (optional)').setRequired(false)));
       g.addSubcommand(s=>s.setName('activities').setDescription('Who may start an activity — GMs only, or anyone')
       .addBooleanOption(o=>o.setName('players').setDescription('true = players can start them too (writing stays GM-only)').setRequired(false)));
@@ -22791,7 +22797,7 @@ const slashCommands = [
           {name:'Class',value:'class'},{name:'Weapon 1',value:'weapon1'},{name:'Weapon 2',value:'weapon2'},
           {name:'Weapon 1 Emoji',value:'weapon1emoji'},{name:'Weapon 2 Emoji',value:'weapon2emoji'}
         ))
-      .addStringOption(o=>o.setName('value').setDescription('Value to set').setRequired(true))
+      .addStringOption(o=>o.setName('value').setDescription('Value to set \u2014 pick the field first and a list appears').setRequired(true).setAutocomplete(true))
       .addUserOption(o=>o.setName('user').setDescription('Target user (GM only)').setRequired(false)))
     .addSubcommand(s=>s.setName('create').setDescription('Set up a full character at once')
       .addIntegerOption(o=>o.setName('str').setDescription('Strength').setRequired(false))
@@ -22804,10 +22810,10 @@ const slashCommands = [
       .addStringOption(o=>o.setName('class').setDescription('Character class').setRequired(false)
         .addChoices({name:'Vanguard',value:'Vanguard'},{name:'Defender',value:'Defender'},{name:'Siege Knight',value:'Siege Knight'}))
       .addStringOption(o=>o.setName('weapon1emoji').setDescription('Emoji for weapon slot 1').setRequired(false)
-        .addChoices({name:'⚔️ Swords',value:'⚔️'},{name:'🗡️ Dagger',value:'🗡️'},{name:'🏹 Bow',value:'🏹'},{name:'🔱 Trident',value:'🔱'},{name:'⛏️ Pickaxe',value:'⛏️'},{name:'🛡️ Shield',value:'🛡️'},{name:'🪄 Wand',value:'🪄'}))
+        .addChoices(...WEAPON_EMOJI_CHOICES))
       .addStringOption(o=>o.setName('weapon1').setDescription('Weapon slot 1 — pick from list or type your own').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('weapon2emoji').setDescription('Emoji for weapon slot 2').setRequired(false)
-        .addChoices({name:'⚔️ Swords',value:'⚔️'},{name:'🗡️ Dagger',value:'🗡️'},{name:'🏹 Bow',value:'🏹'},{name:'🔱 Trident',value:'🔱'},{name:'⛏️ Pickaxe',value:'⛏️'},{name:'🛡️ Shield',value:'🛡️'},{name:'🪄 Wand',value:'🪄'}))
+        .addChoices(...WEAPON_EMOJI_CHOICES))
       .addStringOption(o=>o.setName('weapon2').setDescription('Weapon slot 2 — pick from list or type your own').setRequired(false).setAutocomplete(true))
       .addUserOption(o=>o.setName('user').setDescription('Target player (GM only)').setRequired(false))
       .addBooleanOption(o=>o.setName('temp').setDescription('true = a throwaway: no page, no roster seat, swept after the fight').setRequired(false)))
@@ -22815,8 +22821,8 @@ const slashCommands = [
       .addStringOption(o=>o.setName('slot').setDescription('Which weapon slot').setRequired(true)
         .addChoices({name:'Weapon 1',value:'weapon1emoji'},{name:'Weapon 2',value:'weapon2emoji'}))
       .addStringOption(o=>o.setName('emoji').setDescription('Pick a standard emoji').setRequired(false)
-        .addChoices({name:'⚔️ Swords',value:'⚔️'},{name:'🗡️ Dagger',value:'🗡️'},{name:'🏹 Bow',value:'🏹'},{name:'🔱 Trident',value:'🔱'},{name:'⛏️ Pickaxe',value:'⛏️'},{name:'🛡️ Shield',value:'🛡️'},{name:'🪄 Wand',value:'🪄'}))
-      .addStringOption(o=>o.setName('custom').setDescription('Or paste a server custom emoji (overrides the dropdown)').setRequired(false))
+        .addChoices(...WEAPON_EMOJI_CHOICES))
+      .addStringOption(o=>o.setName('custom').setDescription('Or a server custom emoji \u2014 the list offers them (overrides the dropdown)').setRequired(false).setAutocomplete(true))
       .addUserOption(o=>o.setName('user').setDescription('Target player (GM only)').setRequired(false)))
     .addSubcommand(s=>s.setName('page').setDescription('Link a character to their forum page, or make one (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Whose character').setRequired(true))
@@ -22890,21 +22896,21 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('on').setDescription('Enable profile embed, max HP and rerolls'));
       g.addSubcommand(s=>s.setName('off').setDescription('Disable profile embed'));
       g.addSubcommand(s=>s.setName('show').setDescription('Preview your profile without rolling'));
-      g.addSubcommand(s=>s.setName('save').setDescription('Snapshot current tracker state').addStringOption(o=>o.setName('slotname').setDescription('Name for this save').setRequired(true)));
-      g.addSubcommand(s=>s.setName('load').setDescription('Restore a saved snapshot').addStringOption(o=>o.setName('slotname').setDescription('Name of the save to load').setRequired(true)));
+      g.addSubcommand(s=>s.setName('save').setDescription('Snapshot current tracker state').addStringOption(o=>o.setName('slotname').setDescription('Name for this save').setRequired(true).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('load').setDescription('Restore a saved snapshot').addStringOption(o=>o.setName('slotname').setDescription('Name of the save to load').setRequired(true).setAutocomplete(true)));
       g.addSubcommand(s=>s.setName('saves').setDescription('List all your saved snapshots'));
       return g;
     })
     .addSubcommandGroup(g=>g.setName('weapon').setDescription('The server weapon list (GM)')
       .addSubcommand(s=>s.setName('add').setDescription('Add a weapon to the server list')
         .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true))
-        .addStringOption(o=>o.setName('atk').setDescription('Stats it can attack with — e.g. wis, or str|dex. Blank = any').setRequired(false))
-        .addStringOption(o=>o.setName('def').setDescription('Stats it can defend with. Blank = any').setRequired(false))
+        .addStringOption(o=>o.setName('atk').setDescription('Stats it can attack with — e.g. wis, or str|dex. Blank = any').setRequired(false).setAutocomplete(true))
+        .addStringOption(o=>o.setName('def').setDescription('Stats it can defend with. Blank = any').setRequired(false).setAutocomplete(true))
         .addStringOption(o=>o.setName('note').setDescription('How it handles, for the list').setRequired(false)))
       .addSubcommand(s=>s.setName('stats').setDescription('Set or clear what a weapon can fight with (GM)')
         .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true).setAutocomplete(true))
-        .addStringOption(o=>o.setName('atk').setDescription('Attack stats — e.g. wis, or str|dex. "any" clears it').setRequired(false))
-        .addStringOption(o=>o.setName('def').setDescription('Defence stats. "any" clears it').setRequired(false))
+        .addStringOption(o=>o.setName('atk').setDescription('Attack stats — e.g. wis, or str|dex. "any" clears it').setRequired(false).setAutocomplete(true))
+        .addStringOption(o=>o.setName('def').setDescription('Defence stats. "any" clears it').setRequired(false).setAutocomplete(true))
         .addStringOption(o=>o.setName('note').setDescription('How it handles').setRequired(false)))
       .addSubcommand(s=>s.setName('remove').setDescription('Remove a weapon from the server list')
         .addStringOption(o=>o.setName('name').setDescription('Weapon name').setRequired(true).setAutocomplete(true)))
@@ -22921,7 +22927,7 @@ const slashCommands = [
       .addSubcommand(s=>s.setName('custom').setDescription('Manage custom tags')
         .addStringOption(o=>o.setName('action').setDescription('Action').setRequired(true)
           .addChoices({name:'Create',value:'create'},{name:'Delete',value:'delete'},{name:'List',value:'list'}))
-        .addStringOption(o=>o.setName('emoji').setDescription('Emoji for the tag (create only)').setRequired(false))
+        .addStringOption(o=>o.setName('emoji').setDescription('Emoji for the tag (create only)').setRequired(false).setAutocomplete(true))
         .addStringOption(o=>o.setName('name').setDescription('Tag name (create/delete)').setRequired(false).setAutocomplete(true)))),
 
   new SlashCommandBuilder()
@@ -22964,8 +22970,8 @@ const slashCommands = [
                     {name:'Sorcerer (d6)',value:'Sorcerer'},{name:'Wizard (d6)',value:'Wizard'}))
       .addIntegerOption(o=>o.setName('level').setDescription('Level (1–20, default 1)').setRequired(false).setMinValue(1).setMaxValue(20))
       .addIntegerOption(o=>o.setName('ac').setDescription('Armour Class — left out, it is 10 + your DEX modifier').setRequired(false).setMinValue(1).setMaxValue(30))
-      .addStringOption(o=>o.setName('saves').setDescription('Saving throws you are proficient in, e.g. str, con').setRequired(false))
-      .addStringOption(o=>o.setName('skills').setDescription('Skills you are proficient in, e.g. athletics, perception').setRequired(false))),
+      .addStringOption(o=>o.setName('saves').setDescription('Saving throws you are proficient in, e.g. str, con').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('skills').setDescription('Skills you are proficient in, e.g. athletics, perception').setRequired(false).setAutocomplete(true))),
 
   new SlashCommandBuilder()
     .setName('library').setDescription('Monsters and spells kept once and drawn on for ever (GM)')
@@ -22994,11 +23000,11 @@ const slashCommands = [
       .addUserOption(o=>o.setName('user').setDescription('Whose (defaults to you)').setRequired(false)))
     .addSubcommand(s=>s.setName('cast').setDescription('Spend a slot')
       .addIntegerOption(o=>o.setName('level').setDescription('Which spell level to spend').setRequired(true).setMinValue(0).setMaxValue(9))
-      .addStringOption(o=>o.setName('name').setDescription('What you are casting').setRequired(false))
+      .addStringOption(o=>o.setName('name').setDescription('What you are casting').setRequired(false).setAutocomplete(true))
       .addBooleanOption(o=>o.setName('concentration').setDescription('true = it needs your concentration').setRequired(false)))
     .addSubcommand(s=>s.setName('prepare').setDescription('The spells you have ready — add one, drop one, or read the list')
-      .addStringOption(o=>o.setName('add').setDescription('A spell to prepare').setRequired(false))
-      .addStringOption(o=>o.setName('drop').setDescription('A spell to let go').setRequired(false))
+      .addStringOption(o=>o.setName('add').setDescription('A spell to prepare').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('drop').setDescription('A spell to let go').setRequired(false).setAutocomplete(true))
       .addBooleanOption(o=>o.setName('clear').setDescription('true = forget them all and start again').setRequired(false)))
     .addSubcommand(s=>s.setName('concentration').setDescription('What you are holding together — or let it go')
       .addBooleanOption(o=>o.setName('drop').setDescription('true = stop concentrating').setRequired(false))),
@@ -23351,7 +23357,7 @@ const slashCommands = [
       .addSubcommand(s=>s.setName('leaderboard').setDescription('Show the server merit leaderboard')))
     .addSubcommandGroup(g=>g.setName('rank').setDescription('Ranks — thresholds, promotion and eligibility')
       .addSubcommand(s=>s.setName('add').setDescription('Create or update a rank with a merit threshold (GM)')
-        .addStringOption(o=>o.setName('name').setDescription('Rank name, e.g. Knight').setRequired(true))
+        .addStringOption(o=>o.setName('name').setDescription('Rank name, e.g. Knight').setRequired(true).setAutocomplete(true))
         .addIntegerOption(o=>o.setName('threshold').setDescription('Merits required to be eligible').setRequired(true).setMinValue(0).setMaxValue(99999))
         .addIntegerOption(o=>o.setName('order').setDescription('Sort order (low = junior). Defaults to threshold order').setRequired(false).setMinValue(0).setMaxValue(999)))
       .addSubcommand(s=>s.setName('remove').setDescription('Delete a rank (GM)')
@@ -23367,12 +23373,12 @@ const slashCommands = [
     // alike, so `user:` or `npc:` names the subject either way.
     .addSubcommandGroup(g => { g.setName('title').setDescription('Titles \u2014 earned on quests or granted by a GM');
       g.addSubcommand(x=>x.setName('grant').setDescription('Grant a title (GM)')
-        .addStringOption(o=>o.setName('title').setDescription('The title itself').setRequired(true))
+        .addStringOption(o=>o.setName('title').setDescription('The title itself').setRequired(true).setAutocomplete(true))
         .addUserOption(o=>o.setName('user').setDescription('Which player').setRequired(false))
         .addStringOption(o=>o.setName('npc').setDescription('Or which NPC').setRequired(false).setAutocomplete(true))
         .addStringOption(o=>o.setName('source').setDescription('Where it came from, e.g. Sirens Redoubt').setRequired(false)));
       g.addSubcommand(x=>x.setName('revoke').setDescription('Take a title back (GM)')
-        .addStringOption(o=>o.setName('title').setDescription('Which title').setRequired(true))
+        .addStringOption(o=>o.setName('title').setDescription('Which title').setRequired(true).setAutocomplete(true))
         .addUserOption(o=>o.setName('user').setDescription('Which player').setRequired(false))
         .addStringOption(o=>o.setName('npc').setDescription('Or which NPC').setRequired(false).setAutocomplete(true)));
       g.addSubcommand(x=>x.setName('list').setDescription('Every title someone holds')
@@ -23381,12 +23387,12 @@ const slashCommands = [
       return g; })
     .addSubcommandGroup(g => { g.setName('association').setDescription('The groups someone stands with');
       g.addSubcommand(x=>x.setName('add').setDescription('Associate them with a group (GM)')
-        .addStringOption(o=>o.setName('group').setDescription('The company, order or cause').setRequired(true))
+        .addStringOption(o=>o.setName('group').setDescription('The company, order or cause').setRequired(true).setAutocomplete(true))
         .addUserOption(o=>o.setName('user').setDescription('Which player').setRequired(false))
         .addStringOption(o=>o.setName('npc').setDescription('Or which NPC').setRequired(false).setAutocomplete(true))
         .addStringOption(o=>o.setName('note').setDescription('Their part in it, e.g. Quartermaster').setRequired(false)));
       g.addSubcommand(x=>x.setName('remove').setDescription('Part ways with a group (GM)')
-        .addStringOption(o=>o.setName('group').setDescription('Which group').setRequired(true))
+        .addStringOption(o=>o.setName('group').setDescription('Which group').setRequired(true).setAutocomplete(true))
         .addUserOption(o=>o.setName('user').setDescription('Which player').setRequired(false))
         .addStringOption(o=>o.setName('npc').setDescription('Or which NPC').setRequired(false).setAutocomplete(true)));
       g.addSubcommand(x=>x.setName('list').setDescription('Everyone standing with a group')
@@ -23516,7 +23522,7 @@ const slashCommands = [
 g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — award merits to the party (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('summary').setDescription('Your telling of it, for the players\' chronicle').setRequired(false))
-      .addStringOption(o=>o.setName('title').setDescription('A title every survivor earns, e.g. Siren\'s Bane').setRequired(false)));
+      .addStringOption(o=>o.setName('title').setDescription('A title every survivor earns, e.g. Siren\'s Bane').setRequired(false).setAutocomplete(true)));
       return g;
     })
     .addSubcommand(s=>s.setName('handoff').setDescription('Hand this quest to another GM — they become its DM (GM)')
@@ -23618,13 +23624,13 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
       .addUserOption(o=>o.setName('user').setDescription('Who').setRequired(true)))
     .addSubcommand(s=>s.setName('end').setDescription('Finish it \u2014 payout, chronicle, review button (GM)')
       .addStringOption(o=>o.setName('summary').setDescription('Your telling of it').setRequired(false))
-      .addStringOption(o=>o.setName('title').setDescription('A title every survivor earns').setRequired(false)))
+      .addStringOption(o=>o.setName('title').setDescription('A title every survivor earns').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('list').setDescription('Encounters running right now'))
     .addSubcommandGroup(g => { g.setName('preset').setDescription('Saved scenes \u2014 start one in a single command (GM)');
       g.addSubcommand(x=>x.setName('save').setDescription('Save a scene: name, merits, and the monsters it summons (GM)')
-        .addStringOption(o=>o.setName('name').setDescription('The scene, e.g. Bandits on the ridge').setRequired(true))
+        .addStringOption(o=>o.setName('name').setDescription('The scene, e.g. Bandits on the ridge').setRequired(true).setAutocomplete(true))
         .addIntegerOption(o=>o.setName('merits').setDescription('Merits each at the end').setRequired(false).setMinValue(0))
-        .addStringOption(o=>o.setName('npcs').setDescription('Library monsters to summon, e.g. Goblin x3, Orc').setRequired(false)));
+        .addStringOption(o=>o.setName('npcs').setDescription('Library monsters or NPCs to summon, e.g. Hollow x3, Hollow tank').setRequired(false).setAutocomplete(true)));
       g.addSubcommand(x=>x.setName('list').setDescription('Every saved scene'));
       g.addSubcommand(x=>x.setName('remove').setDescription('Forget a scene (GM)')
         .addStringOption(o=>o.setName('name').setDescription('Which scene').setRequired(true).setAutocomplete(true)));
@@ -24588,6 +24594,98 @@ client.on('interactionCreate', async interaction => {
       const focusedOption = interaction.options.getFocused(true);
       console.log(`Autocomplete: cmd=${interaction.commandName} sub=${interaction.options.getSubcommand(false)} focused=${focusedOption.name} value=${focusedOption.value}`);
 
+      // ── Lists for the fields that used to be bare text (T, 2026-10-12:
+      // "the dropdown must work for everything that needs it"). Each
+      // answers from what the server actually has; where a new name is the
+      // point, the typed text leads the list so free entry still works.
+      const acTyped = String(focusedOption.value ?? '');
+      const acLc = acTyped.trim().toLowerCase();
+      const acShape = (names, { free = false, label = null } = {}) => {
+        const seen = new Set(); const out = [];
+        for (const n of names) {
+          const v = String(n ?? '').trim(); if (!v || seen.has(v.toLowerCase())) continue; seen.add(v.toLowerCase());
+          if (!acLc || v.toLowerCase().includes(acLc)) out.push({ name: (label ? label(v) : v).slice(0, 100), value: v.slice(0, 100) });
+        }
+        if (free && acLc && !seen.has(acLc)) out.unshift({ name: `\u270F\uFE0F Use: ${acTyped.trim().slice(0, 80)}`, value: acTyped.trim().slice(0, 100) });
+        return out.slice(0, 25);
+      };
+      // Comma-separated sets: complete the last item, keep the ones before it.
+      const acLastOf = (pool) => {
+        const parts = acTyped.split(','); const last = parts.pop().trim().toLowerCase();
+        const head = parts.map(x => x.trim()).filter(Boolean);
+        const taken = new Set(head.map(h => h.toLowerCase().replace(/\s*x\d+$/, '')));
+        return pool.filter(x => !taken.has(x.toLowerCase()) && (!last || x.toLowerCase().includes(last))).slice(0, 25)
+          .map(x => { const v = [...head, x].join(', '); return { name: v.slice(0, 100), value: v.slice(0, 100) }; });
+      };
+      const acCmd = interaction.commandName, acSub = interaction.options.getSubcommand(false), acGrp = interaction.options.getSubcommandGroup(false), acGid = interaction.guild.id;
+      const acStr = (n) => String(interaction.options.getString(n) || '');
+      const acNpcNames = () => db.prepare('SELECT name FROM npcs WHERE guild_id=? ORDER BY name').all(acGid).map(r => r.name);
+      const acSubject = () => { const u = interaction.options.get('user')?.value; if (u) return String(u); const n = acStr('npc'); return n ? npcFighterId(n) : interaction.user.id; };
+      const STAT_COMBOS = ['str', 'con', 'dex', 'wis', 'lck', 'str|dex', 'str|con', 'dex|wis', 'str|dex|wis', 'con|wis', 'any'];
+      const REST_AMOUNTS = ['100%', '50%', '25%', '0%', '+25%', '+10%', '+1'];
+      const serverEmojis = () => [...(interaction.guild?.emojis?.cache?.values?.() || [])].map(e => ({ name: `:${e.name}:`.slice(0, 100), value: `<${e.animated ? 'a' : ''}:${e.name}:${e.id}>`.slice(0, 100) }));
+
+      if (acCmd === 'activity' && acSub === 'set') {
+        if (focusedOption.name === 'name') return await interaction.respond(acShape(db.prepare('SELECT name FROM stories WHERE guild_id=? ORDER BY name').all(acGid).map(r => r.name))).catch(() => {});
+        if (focusedOption.name === 'scene') return await interaction.respond(acShape(db.prepare('SELECT scene FROM story_scenes WHERE guild_id=? AND story=? COLLATE NOCASE ORDER BY scene').all(acGid, acStr('name')).map(r => r.scene))).catch(() => {});
+        if (focusedOption.name === 'value') {
+          const f = acStr('field');
+          if (f === 'npc') return await interaction.respond(acShape(acNpcNames())).catch(() => {});
+          if (f === 'roll') return await interaction.respond(acShape(STAT_COMBOS.filter(x => x !== 'any'), { free: true })).catch(() => {});
+          if (f === 'dc') return await interaction.respond(acShape(['none', '10', '12', '14', '16', '18'], { free: /^\d+$/.test(acLc) })).catch(() => {});
+          return await interaction.respond([]).catch(() => {});
+        }
+      }
+      if (acCmd === 'char' && acGrp === 'profile' && focusedOption.name === 'slotname') {
+        const slots = db.prepare('SELECT slot_name FROM profile_saves WHERE guild_id=? AND user_id=? ORDER BY saved_at DESC').all(acGid, interaction.user.id).map(r => r.slot_name);
+        return await interaction.respond(acShape(slots, { free: acSub === 'save' })).catch(() => {});
+      }
+      if (acCmd === 'char' && acGrp === 'weapon' && (focusedOption.name === 'atk' || focusedOption.name === 'def'))
+        return await interaction.respond(acShape(STAT_COMBOS, { free: true })).catch(() => {});
+      if (acCmd === 'char' && ((acSub === 'weaponemoji' && focusedOption.name === 'custom') || (acGrp === 'tag' && focusedOption.name === 'emoji'))) {
+        const std = acSub === 'weaponemoji' ? [] : WEAPON_EMOJI_CHOICES.filter(c => !acLc || c.name.toLowerCase().includes(acLc));
+        return await interaction.respond([...std, ...serverEmojis().filter(c => !acLc || c.name.toLowerCase().includes(acLc))].slice(0, 25)).catch(() => {});
+      }
+      if (acCmd === 'dnd' && acSub === 'create' && focusedOption.name === 'saves') return await interaction.respond(acLastOf(DND_STATS)).catch(() => {});
+      if (acCmd === 'dnd' && acSub === 'create' && focusedOption.name === 'skills') return await interaction.respond(acLastOf(Object.keys(DND_SKILLS))).catch(() => {});
+      if (acCmd === 'spell' && (focusedOption.name === 'name' || focusedOption.name === 'add' || focusedOption.name === 'drop')) {
+        let prepared = []; try { prepared = JSON.parse(getChar(acGid, interaction.user.id)?.prepared_spells || '[]') || []; } catch {}
+        const library = db.prepare('SELECT name, level FROM library_spells WHERE guild_id=? ORDER BY level, name').all(acGid);
+        const lvl = new Map(library.map(r => [r.name.toLowerCase(), r.level]));
+        const tag = (n) => (lvl.has(n.toLowerCase()) ? `${n} (level ${lvl.get(n.toLowerCase())})` : n);
+        const pool = focusedOption.name === 'drop' ? prepared : focusedOption.name === 'add' ? library.map(r => r.name) : [...prepared, ...library.map(r => r.name)];
+        return await interaction.respond(acShape(pool, { free: focusedOption.name !== 'drop', label: tag })).catch(() => {});
+      }
+      if (acCmd === 'standing' && acGrp === 'rank' && acSub === 'add' && focusedOption.name === 'name')
+        return await interaction.respond(acShape(getRanks(acGid).map(r => r.name), { free: true, label: (n) => { const r = getRanks(acGid).find(x => x.name === n); return r ? `${n} (${r.threshold})` : n; } })).catch(() => {});
+      if (acCmd === 'standing' && acGrp === 'title' && focusedOption.name === 'title') {
+        const pool = acSub === 'revoke' ? getTitles(acGid, acSubject()).map(t => t.title)
+          : db.prepare('SELECT DISTINCT title FROM subject_titles WHERE guild_id=? ORDER BY title').all(acGid).map(r => r.title);
+        return await interaction.respond(acShape(pool, { free: acSub === 'grant' })).catch(() => {});
+      }
+      if (acCmd === 'standing' && acGrp === 'association' && acSub === 'remove' && focusedOption.name === 'group')
+        return await interaction.respond(acShape(getAssocs(acGid, acSubject()).map(a => a.name))).catch(() => {});
+      if (acCmd === 'standing' && acGrp === 'association' && acSub === 'add' && focusedOption.name === 'group')
+        return await interaction.respond(acShape(db.prepare('SELECT DISTINCT name FROM subject_assocs WHERE guild_id=? ORDER BY name').all(acGid).map(r => r.name), { free: true })).catch(() => {});
+      if (focusedOption.name === 'title' && ((acCmd === 'quest' && acSub === 'complete') || (acCmd === 'encounter' && acSub === 'end')))
+        return await interaction.respond(acShape(db.prepare('SELECT DISTINCT title FROM subject_titles WHERE guild_id=? ORDER BY title').all(acGid).map(r => r.title), { free: true })).catch(() => {});
+      if (acCmd === 'encounter' && acGrp === 'preset' && acSub === 'save' && focusedOption.name === 'npcs') {
+        const mons = db.prepare('SELECT name FROM library_monsters WHERE guild_id=? ORDER BY name').all(acGid).map(r => r.name);
+        return await interaction.respond(acLastOf([...mons, ...acNpcNames()])).catch(() => {});
+      }
+      if (acCmd === 'config' && acGrp === 'mechanics' && (acSub === 'rest' || acSub === 'autorest') && ['hp', 'rerolls', 'heal'].includes(focusedOption.name))
+        return await interaction.respond(acShape(REST_AMOUNTS, { free: /^[+]?\d+%?$/.test(acLc) })).catch(() => {});
+      if (acCmd === 'gm' && acSub === 'search' && focusedOption.name === 'name') {
+        const cache = new Map(); const names = [];
+        for (const ch of allChars(acGid).slice(0, 60)) names.push(await getDisplayNameCached(interaction.guild, ch.user_id, cache));
+        return await interaction.respond(acShape([...names, ...acNpcNames()], { free: true })).catch(() => {});
+      }
+      if (acCmd === 'gm' && acGrp === 'backup' && acSub === 'auto' && focusedOption.name === 'channel') {
+        const chans = [...(interaction.guild?.channels?.cache?.values?.() || [])].filter(c => c.type === 0 || c.type === 5)
+          .map(c => ({ name: `#${c.name}`.slice(0, 100), value: String(c.id) }));
+        return await interaction.respond([{ name: 'off \u2014 stop automatic backups', value: 'off' }, ...chans.filter(c => !acLc || c.name.toLowerCase().includes(acLc))].slice(0, 25)).catch(() => {});
+      }
+
       // Quest number autocomplete — shows "#001-Goblin Cave" filtered by status per subcommand
       // Any weapon slot, on any command, offers what the server actually has —
       // so an NPC can only be handed a weapon whose stat rules are known.
@@ -24662,8 +24760,11 @@ client.on('interactionCreate', async interaction => {
       if (interaction.commandName === 'encounter' && (focusedOption.name === 'preset' || (focusedOption.name === 'name' && interaction.options.getSubcommandGroup(false) === 'preset'))) {
         const v = String(focusedOption.value || '').toLowerCase();
         const rows = db.prepare('SELECT name FROM encounter_presets WHERE guild_id=? ORDER BY name').all(interaction.guild.id);
-        return await interaction.respond(rows.filter(r => !v || r.name.toLowerCase().includes(v)).slice(0, 25)
-          .map(r => ({ name: r.name.slice(0, 100), value: r.name }))).catch(() => {});
+        const out = rows.filter(r => !v || r.name.toLowerCase().includes(v)).slice(0, 24).map(r => ({ name: r.name.slice(0, 100), value: r.name }));
+        // `preset save name:` may be a new scene: the typed name leads the list.
+        if (interaction.options.getSubcommand(false) === 'save' && v.trim() && !rows.some(r => r.name.toLowerCase() === v.trim()))
+          out.unshift({ name: `\u270F\uFE0F New: ${String(focusedOption.value).trim().slice(0, 80)}`, value: String(focusedOption.value).trim().slice(0, 100) });
+        return await interaction.respond(out.slice(0, 25)).catch(() => {});
       }
       if (focusedOption.name === 'campaign' && ['campaign', 'encounter', 'quest'].includes(interaction.commandName)) {
         const v = String(focusedOption.value || '').toLowerCase();
@@ -24933,6 +25034,31 @@ client.on('interactionCreate', async interaction => {
         return await interaction.respond(filtered);
       }
       // Weapon name autocomplete — server weapon list + whatever the user is typing
+      // /char set value: — what the list holds depends on the field already
+      // chosen: the orders, the three classes, the server's weapons, the
+      // weapon emojis (standard ones first, then this server's own). A
+      // number field just hands the typed number back (T, 2026-10-12).
+      if (interaction.commandName === 'char' && focusedOption.name === 'value' && interaction.options.getSubcommand(false) === 'set') {
+        const field = interaction.options.getString('field') || '';
+        const focused = (focusedOption.value || '').toString();
+        const lc = focused.toLowerCase();
+        let choices = [];
+        if (field === 'order') choices = KNIGHT_ORDER_CHOICES.filter(c => c.name.toLowerCase().includes(lc));
+        else if (field === 'class') choices = CHAR_TAG_CLASSES.filter(c => c.toLowerCase().includes(lc)).map(c => ({ name: c, value: c }));
+        else if (field === 'weapon1' || field === 'weapon2') {
+          const weapons = getWeapons(interaction.guild.id);
+          choices = weapons.filter(w => w.toLowerCase().includes(lc)).slice(0, 24).map(w => ({ name: w, value: w }));
+          if (focused.trim() && !weapons.some(w => w.toLowerCase() === lc)) choices.unshift({ name: `\u270F\uFE0F Use: ${focused.slice(0, 80)}`, value: focused.slice(0, 100) });
+        } else if (field === 'weapon1emoji' || field === 'weapon2emoji') {
+          choices = WEAPON_EMOJI_CHOICES.filter(c => !lc || c.name.toLowerCase().includes(lc) || c.value === focused);
+          for (const e of interaction.guild?.emojis?.cache?.values?.() || []) {
+            if (choices.length >= 25) break;
+            if (lc && !e.name.toLowerCase().includes(lc)) continue;
+            choices.push({ name: `:${e.name}:`.slice(0, 100), value: `<${e.animated ? 'a' : ''}:${e.name}:${e.id}>`.slice(0, 100) });
+          }
+        } else if (/^(str|con|dex|wis|lck)$/.test(field) && /^\d{1,3}$/.test(focused.trim())) choices = [{ name: focused.trim(), value: focused.trim() }];
+        return await interaction.respond(choices.slice(0, 25));
+      }
       if (interaction.commandName === 'char' && (focusedOption.name === 'weapon1' || focusedOption.name === 'weapon2')) {
         const focused = (focusedOption.value || '').toString();
         const weapons = getWeapons(interaction.guild.id);

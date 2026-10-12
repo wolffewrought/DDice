@@ -511,6 +511,33 @@ async function fire(over) {
     const choices = ac.replies.find(r => r.autocomplete)?.autocomplete || [];
     ok('the room autocomplete lists the rooms', choices.length > 0 && choices.every(c => typeof c.name === 'string' && !/object/.test(c.name)),
       `got ${choices.length}: ${choices.slice(0, 3).map(c => c.name).join(' | ')}`);
+    // /char set value: offers a list that follows the field (T, 2026-10-12: the emoji field had nothing to pick from).
+    const acOf = async (field, typed = '') => (await press(`/char set ${field} value autocomplete`, { commandName: 'char', isAutocomplete: true, options: { _sub: 'set', field, _focused: 'value', _focusedValue: typed } })).replies.find(r => r.autocomplete)?.autocomplete || [];
+    const acEmoji = await acOf('weapon2emoji'), acOrder = await acOf('order'), acClass = await acOf('class'), acStat = await acOf('str', '4'), acOrderTyped = await acOf('order', 'gre');
+    ok('/char set value: lists the weapon emojis for an emoji field, the orders for order, the classes for class, and echoes a number for a stat',
+      acEmoji.length >= 7 && acEmoji.some(c => c.value === '⚔️') && acOrder.length === 8 && acClass.length === 3 && acClass.some(c => c.value === 'Siege Knight')
+        && acStat.length === 1 && acStat[0].value === '4' && acOrderTyped.length === 2 && acOrderTyped.every(c => /Green|Grey/.test(c.name)),
+      `emoji ${acEmoji.length} · order ${acOrder.length} · class ${acClass.length} · stat ${JSON.stringify(acStat)} · 'gre' ${acOrderTyped.map(c => c.name).join(',')}`);
+    // Every field that used to be bare text now answers with a list (T, 2026-10-12).
+    const acAny = async (commandName, options) => (await press(`${commandName} ${options._focused} autocomplete`, { commandName, isAutocomplete: true, options })).replies.find(r => r.autocomplete)?.autocomplete;
+    await fire({ commandName: 'char', options: { _group: 'profile', _sub: 'save', slotname: 'vault' }, userId: 'U1' });
+    const acCases = [
+      ['char profile load slotname', await acAny('char', { _group: 'profile', _sub: 'load', _focused: 'slotname', _focusedValue: '' }), (c) => c.some(x => x.value === 'vault')],
+      ['char weapon add atk', await acAny('char', { _group: 'weapon', _sub: 'add', _focused: 'atk', _focusedValue: '' }), (c) => c.some(x => x.value === 'str|dex') && c.some(x => x.value === 'any')],
+      ['dnd create saves', await acAny('dnd', { _sub: 'create', _focused: 'saves', _focusedValue: 'str, ' }), (c) => c.length === 5 && c.every(x => x.value.startsWith('str, '))],
+      ['dnd create skills', await acAny('dnd', { _sub: 'create', _focused: 'skills', _focusedValue: 'perc' }), (c) => c.length === 1 && c[0].value === 'perception'],
+      ['config mechanics rest hp', await acAny('config', { _group: 'mechanics', _sub: 'rest', _focused: 'hp', _focusedValue: '' }), (c) => c.some(x => x.value === '100%')],
+      ['gm backup auto channel', await acAny('gm', { _group: 'backup', _sub: 'auto', _focused: 'channel', _focusedValue: '' }), (c) => c[0]?.value === 'off'],
+      ['standing title grant title (free)', await acAny('standing', { _group: 'title', _sub: 'grant', _focused: 'title', _focusedValue: 'Siren', user: 'U2' }), (c) => c.some(x => x.value === 'Siren')],
+      ['char weaponemoji custom', await acAny('char', { _sub: 'weaponemoji', _focused: 'custom', _focusedValue: '' }), (c) => Array.isArray(c)],
+      ['char tag custom emoji', await acAny('char', { _group: 'tag', _sub: 'custom', _focused: 'emoji', _focusedValue: '' }), (c) => c.some(x => x.value === '⚔️')],
+      ['activity set value (roll)', await acAny('activity', { _sub: 'set', name: 'Probe', scene: 'start', field: 'roll', _focused: 'value', _focusedValue: '' }), (c) => c.some(x => x.value === 'str|dex|wis')],
+      ['encounter preset save npcs', await acAny('encounter', { _group: 'preset', _sub: 'save', _focused: 'npcs', _focusedValue: 'Gob' }), (c) => Array.isArray(c)],
+      ['gm search name', await acAny('gm', { _sub: 'search', _focused: 'name', _focusedValue: '' }), (c) => c.length > 0],
+      ['spell prepare add', await acAny('spell', { _sub: 'prepare', _focused: 'add', _focusedValue: 'Fire' }), (c) => c.some(x => x.value === 'Fire')],
+    ];
+    const acBad = acCases.filter(([, c, test]) => !Array.isArray(c) || !test(c)).map(([n, c]) => `${n}: ${JSON.stringify(c)?.slice(0, 80)}`);
+    ok(`every field that used to be bare text answers with a list (${acCases.length} checked)`, acBad.length === 0, acBad.join(' | '));
     // Edit (DDice): a bot message opens a prefilled modal; the save edits it.
     const botMsg = await chan.send({ content: 'after much effort and some accidents, the party would make it' });
     const e1 = await press('Edit (DDice) on a bot message', { isContextMenu: true, commandName: 'Edit (DDice)', targetMessage: botMsg });
