@@ -764,6 +764,7 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN updates_forum TEXT'); } catch
 try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_updates_forum TEXT'); } catch {}    // GMs: What's new and Deploy mend
 try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_digest_forum TEXT'); } catch {}     // GMs: the weekly digest, a thread per week
 try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_digest_seeded_at INTEGER'); } catch {} // the boot that posted the first digest into it
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_updates_reseeded_at INTEGER'); } catch {} // the boot that re-posted What's new with the detail beneath
 try { db.exec('ALTER TABLE guild_config ADD COLUMN updates_seeded_at INTEGER'); } catch {} // the boot that opened the forums and posted the back-catalogue
 try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_routes TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_cats TEXT'); } catch {}
@@ -19672,18 +19673,25 @@ async function postDatedThread(client, forumId, kind, ms, content, extra = {}) {
 // (T, 2026-10-11: the seeding boot had made its Deploy mend first).
 const DATED_TITLE_RE = /^\[(\d\d)\/(\d\d)\/(\d{4})\] \[WEEK \d+\] .+ \u00b7 (.+)$/;
 const DATED_KIND_RANK = { 'What\'s new': 0, 'Deploy mend': 1 };
+// The bot's own dated threads in a forum, live and archived alike.
+async function datedThreadsOf(client, forum) {
+  const seen = new Map();
+  for (const fetch of [() => forum.threads.fetchActive(), () => forum.threads.fetchArchived?.({ limit: 100 })]) {
+    const got = await Promise.resolve().then(fetch).catch(() => null);
+    for (const t of got?.threads?.values?.() || []) {
+      if (t.ownerId && t.ownerId !== client.user.id) continue;
+      const m = DATED_TITLE_RE.exec(t.name || '');
+      if (!m) continue;
+      seen.set(t.id, { t, key: `${m[3]}${m[2]}${m[1]}`, rank: DATED_KIND_RANK[m[4]] ?? 2, kind: m[4] });
+    }
+  }
+  return [...seen.values()];
+}
 async function tidyDatedForum(client, forumId) {
   if (!forumId) return [];
   const forum = await client.channels.fetch(forumId).catch(() => null);
   if (!forum?.threads?.fetchActive) return [];
-  const active = await forum.threads.fetchActive().catch(() => null);
-  const mine = [];
-  for (const t of active?.threads?.values?.() || []) {
-    if (t.ownerId && t.ownerId !== client.user.id) continue;
-    const m = DATED_TITLE_RE.exec(t.name || '');
-    if (!m) continue;
-    mine.push({ t, key: `${m[3]}${m[2]}${m[1]}`, rank: DATED_KIND_RANK[m[4]] ?? 2 });
-  }
+  const mine = await datedThreadsOf(client, forum);
   if (mine.length < 2) return [];
   const later = (a, b) => (BigInt(a.t.id) < BigInt(b.t.id) ? -1 : 1);
   const wanted = [...mine].sort((a, b) => a.key.localeCompare(b.key) || a.rank - b.rank || later(a, b));
@@ -19699,14 +19707,30 @@ async function tidyDatedForum(client, forumId) {
       out.push(`${forum.name}: \u201c${t.name}\u201d sits out of date order but someone has written in it \u2014 left where it is`);
       continue;
     }
+    // Delete first: a thread that will not go is reported, never doubled.
+    const gone = await t.delete().then(() => true).catch((e) => { console.error('[dated-thread]', 'delete', e?.message || e); return false; });
+    if (!gone) { out.push(`${forum.name}: \u201c${t.name}\u201d sits out of date order and could not be deleted \u2014 left where it is`); continue; }
     const fresh = await forum.threads.create({ name: t.name, autoArchiveDuration: 10080,
       message: { content: msgs[0].content || '\u200b', allowedMentions: { parse: [] } } }).catch((e) => { console.error('[dated-thread]', 'tidy', e?.message || e); return null; });
     if (!fresh) continue;
     for (const m of msgs.slice(1)) await fresh.send({ content: m.content || '\u200b', allowedMentions: { parse: [] } }).catch(() => {});
-    await t.delete().catch(() => {});
     out.push(`${forum.name}: \u201c${t.name}\u201d re-posted into date order`);
   }
   return out;
+}
+// The one-time clean slate (T, 2026-10-12): every What's new thread the bot
+// made in gm-updates is removed so the catalogue can be posted again with
+// the detail beneath. Deploy mend threads stay; the tidy pass re-orders them.
+async function wipeGmWhatsNew(client, forumId) {
+  if (!forumId) return 0;
+  const forum = await client.channels.fetch(forumId).catch(() => null);
+  if (!forum?.threads?.fetchActive) return 0;
+  let n = 0;
+  for (const { t, kind } of await datedThreadsOf(client, forum)) {
+    if (kind !== 'What\'s new') continue;
+    if (await t.delete().then(() => true).catch(() => false)) n++;
+  }
+  return n;
 }
 // The headers the bot's own update posts began with while they lived in
 // gm-quest-log and player-pdf. The one-time sweep removes exactly these,
@@ -19742,48 +19766,76 @@ async function sweepOldUpdatePosts(client, gid) {
 }
 
 const CHANGELOG = [
+  { key: '2026-10-12', gm: [
+      { line: 'What\'s new for GMs now carries the detail beneath the summary — every entry since September re-posted in that shape',
+        detail: 'A What\'s new thread opens with the one-line bullets, as before, and continues with **In detail**: each bullet again, and under it what changed, why it was wrong or missing, what you do now and where it lands. The old threads in gm-updates were removed and the whole catalogue posted again, oldest first, so the forum reads 25/09 to today in order. The players\' updates forum keeps the short form.' },
+    ], player: [] },
   { key: '2026-10-11', gm: [
-      'Fixed, having never worked: `/gm dc` (flavours, sanctions and `hold:` were lost after the card posted) \u00b7 `/gm override skip` \u00b7 `/npc temp keep|clear|list` \u00b7 `/npc reroll` \u00b7 `/npc manage sync|create5e`',
-      '`/standing title` and `/standing association` exist now \u2014 they had been registered under /char and routed under /standing, so neither answered; `npc:` and `group:` autocomplete',
-      'Temporary NPCs leave when the fight ends \u2014 every ending, not only `/fight end`, which itself never swept',
-      'Fresh installs: four migrations (hero flag, weapon emoji flags) ran before their tables existed; `/char hero` and `/npc hero` threw on a new database',
-      'The sheet in a character\'s thread now refreshes on every stat edit, not on the next hourly sweep',
-      'index.js laid out by family \u2014 twenty parts, a map at the top; nothing inside a function changed',
-      'Three forums, made on this boot: **updates** (players), **gm-updates** (What\'s new and Deploy mend) and **gm-digest** (the weekly digest) \u2014 one dated thread each. gm-quest-log is for quests again; its old update posts were cleared',
-      '`/encounter preset … npcs:` now clones an NPC of that name when the library has no such monster \u2014 on Knightfall the library never existed, so presets could not summon at all',
-      '`/npc give|take|npclore` were open to any player; `/npc sheet` showed hidden stats to players; `/config` had no check of its own. All gated',
-      '`/standing` registers on 5e servers too \u2014 quests paid merits and titles there with no way to manage them',
-      'Dated threads keep date order: one posted out of turn is re-posted on the next boot, the Deploy mend goes up last so it tops the day, and the first boot with **gm-digest** posts the week\'s digest at once \u2014 a quiet week says so',
+      { line: 'Fixed, having never worked: `/gm dc` (flavours, sanctions and `hold:` were lost after the card posted) · `/gm override skip` · `/npc temp keep|clear|list` · `/npc reroll` · `/npc manage sync|create5e`',
+        detail: '`/gm dc` posted its card and then threw: the flavour text, the stat sanctions and `hold:` were read by code that was never handed them, so every check ran bare. `/gm override skip` called a helper that did not exist. `/npc temp keep` and `clear` checked a variable nobody declared, `/npc temp list` called a method a Set does not have, and `/npc reroll`, `/npc manage sync` and `/npc manage create5e` were never routed to the code that answers them — a silent timeout each time. All of them now do what the books say; nothing to set up.' },
+      { line: '`/standing title` and `/standing association` exist now — they had been registered under /char and routed under /standing, so neither answered; `npc:` and `group:` autocomplete',
+        detail: 'The title and association groups were registered on `/char` but answered under `/standing`, so neither path worked since August. They live on `/standing` now — `title grant|revoke|list` and `association add|remove|list` — with autocomplete on `npc:` and `group:`. A title earned on a quest (`/quest run complete … title:`) shows on the character page, the NPC sheet and the roll card.' },
+      { line: 'Temporary NPCs leave when the fight ends — every ending, not only `/fight end`, which itself never swept',
+        detail: 'A temporary NPC was only ever swept by `/fight end`, and that sweep read a variable out of scope, so nothing was ever swept — temps piled up in `/npc temp list`. Every way a fight can end (knockout, forfeit, kick, `/fight end`, quest completion, a full auto bout) now goes through one stand-down that clears the fight and sweeps them. `/npc temp keep name:` still rescues one you want to keep.' },
+      { line: 'Fresh installs: four migrations (hero flag, weapon emoji flags) ran before their tables existed; `/char hero` and `/npc hero` threw on a new database',
+        detail: 'Four migrations — the Hero flag on characters and on NPCs, and the two weapon-emoji flags — ran before their tables were created, so a brand-new database never got the columns and `/char hero`, `/npc hero` and every weapon-emoji write threw "no such column". Live servers already had the columns, which is why it went unseen. The order is fixed; nothing to do on an existing server.' },
+      { line: 'The sheet in a character\'s thread now refreshes on every stat edit, not on the next hourly sweep',
+        detail: 'The sheet post in a character\'s thread was meant to refresh on every stat edit; the code read a row it never fetched and failed silently, so the hourly sweep did the work late. It refreshes the moment a stat changes now, from `/char set`, `/char create`, a rest or a GM edit alike.' },
+      { line: 'index.js laid out by family — twenty parts, a map at the top; nothing inside a function changed',
+        detail: 'Housekeeping, not behaviour: the file is in twenty named parts (database, dice, rulesets, characters, NPCs, fights, quests and so on) with a map at the top. Mentioned so a diff that looks enormous is understood for what it is.' },
+      { line: 'Three forums, made on this boot: **updates** (players), **gm-updates** (What\'s new and Deploy mend) and **gm-digest** (the weekly digest) — one dated thread each. gm-quest-log is for quests again; its old update posts were cleared',
+        detail: 'The three forums are made on boot like the rest of the setup plan. What\'s new lands as one dated thread per release — the full back-catalogue was posted on the first boot, oldest first — the Deploy mend as a dated thread beside it, and the weekly digest as one thread per week, titled by its Monday. gm-quest-log goes back to being the quest record: timings, events, payouts and final words; the bot\'s old update posts there and in player-pdf were removed. Titles read `[DD/MM/YYYY] [WEEK n] Weekday Nth of Month YYYY · kind`.' },
+      { line: '`/encounter preset … npcs:` now clones an NPC of that name when the library has no such monster — on Knightfall the library never existed, so presets could not summon at all',
+        detail: 'A preset\'s `npcs:` summoned from the 5e library; a Knightfall server has no library, so a preset could never summon. Now, where no library monster matches, an NPC of that name is cloned as temporary fighters — make a Hollow once and `npcs:Hollow x3` works, three temps that leave when the fight ends.' },
+      { line: '`/npc give|take|npclore` were open to any player; `/npc sheet` showed hidden stats to players; `/config` had no check of its own. All gated',
+        detail: '`/npc give`, `/npc take` and `/npc npclore` answered any player; `/npc sheet` showed a hidden stat block to anyone who asked; `/config` relied on Discord\'s own permission and had no check of its own. All now refuse anyone without the GM role (or Manage Server), and `/npc sheet` masks the stats unless `/config mechanics npcstats` is on.' },
+      { line: '`/standing` registers on 5e servers too — quests paid merits and titles there with no way to manage them',
+        detail: '`/standing` was left off 5e servers, so quests paid merits and titles there with no command to view, award or strip them. It registers on both systems now; only `/duel` and `/deception` stay Knightfall-only.' },
+      { line: 'Dated threads keep date order: one posted out of turn is re-posted on the next boot, the Deploy mend goes up last so it tops the day, and the first boot with **gm-digest** posts the week\'s digest at once — a quiet week says so',
+        detail: 'Discord orders a forum by when each thread was made, never by its title, and the first seeding boot had posted its Deploy mend before the back-catalogue. A dated thread found out of turn is now re-posted on the next boot (unless someone has written in it), the Deploy mend goes up after What\'s new so it tops the day, and the first boot with gm-digest posts the week\'s digest at once; a week with nothing waiting posts "Nothing is waiting on a GM this week" rather than staying silent.' },
     ], player: [
-      '`/roll save:` and `/roll skill:` (5e) work \u2014 they had been registered on the GM\'s roll, where nothing read them',
+      '`/roll save:` and `/roll skill:` (5e) work — they had been registered on the GM\'s roll, where nothing read them',
       'Your sheet in your character thread updates the moment a stat changes',
-      'A new **updates** forum: what changed, one dated thread each \u2014 this is the first',
+      'A new **updates** forum: what changed, one dated thread each — this is the first',
     ] },
   { key: '2026-10-08', gm: [
-      '`/encounter start` now lists the roster \u2014 tick the party, press **Open the encounter**, and it opens its own thread in quest-instances',
-      'No Join button on an encounter: `/encounter add user:` and `/encounter remove user:` are the GM\'s, in its thread',
+      { line: '`/encounter start` now lists the roster — tick the party, press **Open the encounter**, and it opens its own thread in quest-instances',
+        detail: '`/encounter start name: [merits:] [campaign:] [preset:]` no longer takes a players list. It answers with a private roster — every living character with their HP and what holds them, free, on a quest, resting or in a fight, up to a hundred — tick who is in and press **Open the encounter**. It opens its own thread in quest-instances exactly as a quest run does, the party pulled in by mention, the card posted there, and one pointer line where you ran it. With no instances forum it runs where it was called and says so. The draft waits fifteen minutes for the press.' },
+      { line: 'No Join button on an encounter: `/encounter add user:` and `/encounter remove user:` are the GM\'s, in its thread',
+        detail: 'An encounter\'s seats belong to the GM: there is no Join or Step out. `/encounter add user:` and `/encounter remove user:`, run in the encounter\'s thread, seat and unseat; a player already out on a quest can still be seated, since an encounter does not count as their one quest. The fallen and anyone without a sheet are refused.' },
     ], player: [
-      'An encounter\'s seats are the GM\'s \u2014 you are pulled into its thread when seated, not asked to press Join',
+      'An encounter\'s seats are the GM\'s — you are pulled into its thread when seated, not asked to press Join',
     ] },
   { key: '2026-09-29', gm: [
-      '\u21A9\uFE0F **Reopen** \u2014 a completion can be taken back within five minutes',
-      '`/gm check stalled` \u2014 what is waiting on a GM; a weekly digest lands here',
-      '`/encounter preset` \u2014 saved scenes that summon their own monsters',
-      '`/quest archive` \u2014 invites a final word; a completed quest stays completed',
-      'A kick during winding-down keeps the player\'s share; a winding-down seat no longer blocks other quests',
-      'Edit (DDice) \u2014 long-press any bot or NPC message \u2192 Apps to fix it',
-      '`/gm check usage` \u2014 which commands are actually used \u00b7 `/gm check rehearse` \u2014 a private sparring thread \u00b7 `/help category:rules` \u2014 the live table rules',
-      'Fixed: `/library summon temp:true` never made a temp and lost 5e stats',
+      { line: '↩️ **Reopen** — a completion can be taken back within five minutes',
+        detail: 'Every completion message carries ↩️ Reopen for five minutes. Pressing it reverses the payout, revokes the titles that run granted and releases the party, so a wrong number or a forgotten summary can be fixed and the run completed again. After five minutes it is `/standing merit` and `/quest edit` by hand.' },
+      { line: '`/gm check stalled` — what is waiting on a GM; a weekly digest lands here',
+        detail: 'One report of everything waiting on a GM: runs winding down and not completed, encounters gone quiet, parties staged and never launched, campaigns with nothing new in a month, and the reviews of the last seven days. The same report is posted weekly without asking — since 11/10 as a dated thread in gm-digest, titled by its Monday.' },
+      { line: '`/encounter preset` — saved scenes that summon their own monsters',
+        detail: '`/encounter preset save name: merits: npcs:` keeps a scene; `/encounter start … preset:` runs it with the merits set and the monsters summoned as temporary NPCs that leave when the fight ends; `preset list` and `preset remove` manage them.' },
+      { line: '`/quest archive` — invites a final word; a completed quest stays completed',
+        detail: '`/quest archive number:` with no summary opens a box for the final word; it goes on the record, into the run\'s thread and the GM quest log, and marks the campaign card. Archiving no longer touches the status, so a completed quest stays completed on everyone\'s record.' },
+      { line: 'A kick during winding-down keeps the player\'s share; a winding-down seat no longer blocks other quests',
+        detail: 'A player kicked while a run is winding down is still paid at completion — the story was over when they left — and a seat on a winding-down run no longer counts as their one quest, so they can apply for and be approved onto another while the rewards are settled.' },
+      { line: 'Edit (DDice) — long-press any bot or NPC message → Apps to fix it',
+        detail: 'Long-press any message the bot posted → Apps → Edit (DDice): the text opens prefilled, save replaces it, and the roll audit records what changed. It covers NPC speech sent through `/npc say` as well, so a typo in a villain\'s line is fixed in place rather than re-said.' },
+      { line: '`/gm check usage` — which commands are actually used · `/gm check rehearse` — a private sparring thread · `/help category:rules` — the live table rules',
+        detail: '`/gm check usage` lists sixty days of command use, quietest first — a report only; nothing is ever removed by it. `/gm check rehearse` opens a private sparring thread against a Sparring Dummy the bot runs, so every button can be tried before the table sees it. `/help category:rules` prints the live table rules as the bot enforces them, readable by everyone, in the same words the books use.' },
+      { line: 'Fixed: `/library summon temp:true` never made a temp and lost 5e stats',
+        detail: '`/library summon … temp:true` made a permanent NPC and dropped its armour class, attack and damage on the way. It makes a temporary one now, with the 5e numbers intact, swept when the fight ends.' },
     ], player: [
       'A pause now rounds the clock up to the quarter-hour',
       'Your seat on a quest that is winding down no longer stops you joining another',
     ] },
   { key: '2026-09-25', gm: [
-      '`/gm check roster` \u2014 where every player is, and what holds them',
-      'Campaigns (`/campaign`) and encounters (`/encounter`)',
-      'The campaigns forum is built on boot if missing',
+      { line: '`/gm check roster` — where every player is, and what holds them',
+        detail: 'Every player at a glance: HP, and whether a quest or a fight is holding them — red means the next scheduled rest will pass them over. `busy:true` shows only those tied up.' },
+      { line: 'Campaigns (`/campaign`) and encounters (`/encounter`)',
+        detail: '`/campaign create` names the long arc: a GM-only thread and a live card; `add` links a quest that already exists, `note` records a beat between runs, `status` says where things stand, `recap` drafts a previously-on across every linked run, `complete` closes it, and `campaign:` on `/quest create` links at birth. `/campaign show` gives players the premise, what is done and their own part. `/encounter` is a session on the fly — no board, no applications — that pays out like a run.' },
+      { line: 'The campaigns forum is built on boot if missing',
+        detail: 'The campaigns forum is part of the setup plan: a boot that finds it missing makes it, points the config at it and reports it in the Deploy mend, like every other channel the bot needs.' },
     ], player: [
-      '`/feedback send room:` \u2014 name the room to go straight to the form',
+      '`/feedback send room:` — name the room to go straight to the form',
     ] },
 ];
 
@@ -19792,25 +19844,54 @@ const CHANGELOG = [
 // the whole back-catalogue, oldest first, so the forum opens with the
 // history in order; every boot after that posts only what is new. Markers
 // are written BEFORE posting, so a crash mid-way cannot double-post.
-async function announceChangelog(client, guild) {
+// A GM entry is { line, detail }: the line is the bullet in the summary,
+// the detail the paragraph under it in the thread's "In detail" section.
+// Player entries stay plain lines (T, 2026-10-12).
+const changelogLine = (x) => (typeof x === 'string' ? x : x.line);
+async function postChangelogDetail(thread, items) {
+  const blocks = items.filter(x => typeof x === 'object' && x.detail)
+    .map(x => `\u00b7 ${x.line}\n${x.detail.split('\n').map(l => '> ' + l).join('\n')}`);
+  if (!thread || !blocks.length) return;
+  const messages = [];
+  let buf = '**In detail**';
+  for (const b of blocks) {
+    if (b.length > 1900) { if (buf) messages.push(buf); messages.push(...chunkLines(b, 1900)); buf = ''; continue; }
+    if (buf.length + 2 + b.length > 1900) { messages.push(buf); buf = b; }
+    else buf = buf ? buf + '\n\n' + b : b;
+  }
+  if (buf) messages.push(buf);
+  for (const m of messages) await thread.send({ content: m, allowedMentions: { parse: [] } }).catch(() => {});
+}
+async function postChangelogEntry(client, forums, e) {
+  // The key is a date (YYYY-MM-DD); noon UTC lands on that calendar date in the table's zone.
+  const [ky, km, kd] = e.key.split('-').map(Number);
+  const at = Date.UTC(ky, km - 1, kd, 12);
+  if (e.gm.length && forums.gm) {
+    const t = await postDatedThread(client, forums.gm, 'What\'s new', at,
+      ['\u{1F4F0} **What\'s new for GMs**', '', ...e.gm.map(x => `\u00b7 ${changelogLine(x)}`)]);
+    await postChangelogDetail(t, e.gm);
+  }
+  if (e.player.length && forums.player) await postDatedThread(client, forums.player, 'What\'s new', at,
+    ['\u{1F4F0} **What\'s new**', '', ...e.player.map(l => `\u00b7 ${l}`)]);
+}
+// opts.gmAll: post every GM entry again (the catalogue was just wiped),
+// while the players' forum still gets only what it has not seen.
+async function announceChangelog(client, guild, opts = {}) {
   const gid = guild.id;
   const cfg = getConfig(gid) || {};
   const forums = { gm: cfg.gm_updates_forum || null, player: cfg.updates_forum || null };
   if (!forums.gm && !forums.player) return;
   const seeding = !cfg.updates_seeded_at;
   const seen = cfg.changelog_seen || '';
-  const entries = (seeding ? [...CHANGELOG] : CHANGELOG.filter(e => e.key > seen)).reverse();   // oldest first
-  if (!entries.length) { if (seeding) setConfig(gid, { updates_seeded_at: Date.now() }); return; }
-  setConfig(gid, { changelog_seen: CHANGELOG[0].key, updates_seeded_at: cfg.updates_seeded_at || Date.now() });
-  for (const e of entries) {
-    // The key is a date (YYYY-MM-DD); noon UTC lands on that calendar date in the table's zone.
-    const [ky, km, kd] = e.key.split('-').map(Number);
-    const at = Date.UTC(ky, km - 1, kd, 12);
-    if (e.gm.length) await postDatedThread(client, forums.gm, 'What\'s new', at,
-      ['\u{1F4F0} **What\'s new for GMs**', '', ...e.gm.map(l => `\u00b7 ${l}`)]);
-    if (e.player.length) await postDatedThread(client, forums.player, 'What\'s new', at,
-      ['\u{1F4F0} **What\'s new**', '', ...e.player.map(l => `\u00b7 ${l}`)]);
-  }
+  const unseen = (seeding ? [...CHANGELOG] : CHANGELOG.filter(e => e.key > seen)).reverse();   // oldest first
+  if (!unseen.length && !opts.gmAll) { if (seeding) setConfig(gid, { updates_seeded_at: Date.now(), gm_updates_reseeded_at: Date.now() }); return; }
+  // A fresh server never needs the re-seed; a server mid re-seed is marked by bootMend once it is done.
+  setConfig(gid, { changelog_seen: CHANGELOG[0].key, updates_seeded_at: cfg.updates_seeded_at || Date.now(),
+    ...(seeding ? { gm_updates_reseeded_at: Date.now() } : {}) });
+  const entries = opts.gmAll ? [...CHANGELOG].reverse() : unseen;
+  const unseenKeys = new Set(unseen.map(e => e.key));
+  for (const e of entries)
+    await postChangelogEntry(client, { gm: forums.gm, player: unseenKeys.has(e.key) ? forums.player : null }, e);
 }
 
 async function bootMend(client) {
@@ -19831,8 +19912,16 @@ async function bootMend(client) {
         const swept = await sweepOldUpdatePosts(client, gid).catch(e => { console.error('[updates-sweep]', e?.message || e); return []; });
         made.push(...swept);
       }
+      // Once: the catalogue re-posted with the detail beneath each line.
+      let reseed = false;
+      if (after.gm_updates_forum && after.updates_seeded_at && !after.gm_updates_reseeded_at) {
+        const wiped = await wipeGmWhatsNew(client, after.gm_updates_forum).catch(e => { console.error('[updates-reseed]', e?.message || e); return 0; });
+        reseed = true;
+        made.push(`gm-updates: ${wiped} What\u2019s new thread(s) removed and the catalogue re-posted with the detail beneath (${CHANGELOG.length} entries)`);
+      }
       // What changed, if anything is new since the last boot.
-      await announceChangelog(client, guild).catch(e => console.error('[changelog]', e?.message || e));
+      await announceChangelog(client, guild, { gmAll: reseed }).catch(e => console.error('[changelog]', e?.message || e));
+      if (reseed) setConfig(gid, { gm_updates_reseeded_at: Date.now() });
       // The first boot with a digest forum posts this week's digest at once
       // rather than leaving the forum empty until the cycle comes round.
       if (after.gm_digest_forum && !after.gm_digest_seeded_at) {
@@ -23806,7 +23895,7 @@ const HELP_CATEGORIES = {
       '`/encounter preset save name:... [merits:] [npcs:Hollow x3, Hollow tank]` \u2014 a saved scene; `/encounter start ... preset:` runs it with the merits set and the monsters summoned as temps \u00b7 `/encounter preset list|remove` (GM)',
       '`/gm check stalled` \u2014 what is waiting on a GM: winding-down runs, quiet encounters, staged parties never launched, idle campaigns, reviews this week. Once a week the same report is posted as a dated thread in the **gm-digest** forum, titled by its Monday (GM)',
       '`/gm check usage` \u2014 sixty days of command use, quietest first \u2014 a report only; nothing is removed by it \u00b7 `/gm check rehearse` \u2014 a private sparring thread against a dummy the bot runs, to try new buttons before the table sees them (GM)',
-      '`/help category:rules` \u2014 the live table rules, as the bot enforces them, for everyone. Every deploy posts **What\'s new** and **Deploy mend** as dated threads in the **gm-updates** forum, and the player half of the news in **updates** \u2014 the whole back-catalogue is there from the first boot',
+      '`/help category:rules` \u2014 the live table rules, as the bot enforces them, for everyone. Every deploy posts **What\'s new** (the summary, then **In detail** beneath it) and **Deploy mend** as dated threads in the **gm-updates** forum, and the player half of the news in **updates** \u2014 the whole back-catalogue is there from the first boot',
       '`/instance add|kick|rally|note|pause|resume|complete|show|thread name:...` \u2014 the same by NAME rather than number; leave `name:` blank inside a run\'s own thread (GM)',
       '_One quest at a time: approving someone already seated on a live run prompts for a second press to override (audited), and a launch leaves them an applicant rather than double-booking them._',
       '`/encounter start name:... [merits:] [campaign:] [preset:]` \u2014 a short session run on the fly: no board, no applications. The bot lists every living character with HP and what is holding them; tick who is in it and press **Open the encounter** \u2014 it opens its own thread in quest-instances (where it was called if no forum is set), the party pulled in by mention. Nobody can join by themselves: `/encounter add user:` and `/encounter remove user:` are the GM\'s, run in the encounter\'s thread. `/encounter end [summary:] [title:]` pays out, writes the chronicle and posts the review button. Encounters do not count toward one-quest-at-a-time; one left quiet six hours reminds the room and pings the GMs (GM)',

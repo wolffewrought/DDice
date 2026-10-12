@@ -122,7 +122,8 @@ class FakeChannel {
         return t;
       },
       // The forum's live threads, as discord.js hands them back.
-      fetchActive: async () => ({ threads: new FakeCollection(threads.filter(t => t.parentId === this.id && !deleted.includes(t.id)).map(t => [t.id, t])), hasMore: false }),
+      fetchActive: async () => ({ threads: new FakeCollection(threads.filter(t => t.parentId === this.id && !deleted.includes(t.id) && !t.archived).map(t => [t.id, t])), hasMore: false }),
+      fetchArchived: async () => ({ threads: new FakeCollection(threads.filter(t => t.parentId === this.id && !deleted.includes(t.id) && t.archived).map(t => [t.id, t])), hasMore: false }),
       cache: new Map(),
     };
     this.permissionOverwrites = { edit: async () => {} };
@@ -849,7 +850,7 @@ async function fire(over) {
     const cfgU = dbHandle.prepare("SELECT updates_forum, gm_updates_forum, gm_digest_forum, updates_seeded_at, changelog_seen FROM guild_config WHERE guild_id='G1'").get() || {};
     ok('the boot makes the updates, gm-updates and gm-digest forums', !!(cfgU.updates_forum && cfgU.gm_updates_forum && cfgU.gm_digest_forum), JSON.stringify(cfgU));
     const entries = [...src.matchAll(/\{ key: '(\d{4}-\d{2}-\d{2})', gm: \[/g)].map(m => m[1]);
-    const inForum = (fid) => threads.filter(t => t.parentId === fid);
+    const inForum = (fid) => threads.filter(t => t.parentId === fid && !deleted.includes(t.id));   // the tidy pass re-posts; the old copy is gone
     const DATE_RE = /^\[\d{2}\/\d{2}\/\d{4}\] \[WEEK \d{1,2}\] (Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) \d{1,2}(st|nd|rd|th) of [A-Z][a-z]+ \d{4} · /;
     const gmAll = inForum(cfgU.gm_updates_forum), plT = inForum(cfgU.updates_forum);
     const gmT = gmAll.filter(t => / · What's new$/.test(t.name));
@@ -865,6 +866,56 @@ async function fire(over) {
       const stray = sent.filter(x => x.channel === qlog && /What's new|Deploy mend|Weekly digest/.test(x.content) && x.msg.author?.id === 'BOT' && !deleted.includes(x.msg.id));
       ok('no What\'s new, Deploy mend or Weekly digest remains in gm-quest-log', stray.length === 0, stray.map(x => x.content.slice(0, 60)).join(' | '));
     }
+  }
+
+  // ── The clean slate: a fourth boot re-posts What's new with the detail beneath ──
+  if (dbHandle) {
+    const bad = [];
+    const cfgR = dbHandle.prepare("SELECT gm_updates_forum, updates_forum FROM guild_config WHERE guild_id='G1'").get() || {};
+    const gmForum = cfgR.gm_updates_forum ? channelsById.get(cfgR.gm_updates_forum) : null;
+    const live = (fid) => threads.filter(t => t.parentId === fid && !deleted.includes(t.id));
+    const msgsOf = (t) => sent.filter(x => x.channel === t.id && !deleted.includes(x.msg.id)).map(x => x.content);
+    // Every What's new thread already carries the detail: a seeding boot posts the new shape from the start.
+    const whatsNew = live(cfgR.gm_updates_forum).filter(t => / · What's new$/.test(t.name));
+    const entries = [...src.matchAll(/\{ key: '(\d{4}-\d{2}-\d{2})', gm: \[/g)].map(m => m[1]);
+    const gmEntryCount = (() => { const i = src.indexOf('const CHANGELOG = ['); const j = src.indexOf('\n];', i); return (src.slice(i, j).match(/\{ line: /g) || []).length; })();
+    const detailed = whatsNew.filter(t => msgsOf(t).some(c => c.startsWith('**In detail**')));
+    const bulletsMatch = whatsNew.every(t => { const ms = msgsOf(t); const bullets = (ms[0] || '').split('\n').filter(l => l.startsWith('· ')); const detail = ms.slice(1).join('\n'); return bullets.every(b => detail.includes(b)) && (detail.match(/^> /gm) || []).length >= bullets.length; });
+    ok(`every GM What's new thread carries In detail beneath the bullets — each bullet repeated, a quoted paragraph under it (${gmEntryCount} entries)`,
+      whatsNew.length === entries.length && detailed.length === whatsNew.length && bulletsMatch && gmEntryCount === 25,
+      `${whatsNew.length} threads, ${detailed.length} detailed, bullets ${bulletsMatch}, ${gmEntryCount} entry lines`);
+    // A server seeded in the old shape: an old-form What's new thread (one archived, as a week-old one would be),
+    // the re-seed marker unset. The fourth boot removes them and posts the catalogue again.
+    const before = live(cfgR.gm_updates_forum).map(t => t.id);
+    let oldA = null, oldB = null;
+    if (gmForum) {
+      oldA = await gmForum.threads.create({ name: '[25/09/2026] [WEEK 39] Friday 25th of September 2026 · What\'s new', message: { content: '📰 **What\'s new for GMs**\n\n· old shape, no detail' } });
+      oldB = await gmForum.threads.create({ name: '[29/09/2026] [WEEK 40] Tuesday 29th of September 2026 · What\'s new', message: { content: '📰 **What\'s new for GMs**\n\n· old shape, archived' } });
+      oldB.archived = true;
+    }
+    dbHandle.prepare("UPDATE guild_config SET gm_updates_reseeded_at=NULL WHERE guild_id='G1'").run();
+    const realTimeoutR = globalThis.setTimeout; globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
+    for (const fn of listeners.clientReady || listeners.ready || []) await fn().catch(e => bad.push('ready: ' + e.message));
+    await (lastClient?.mendDone || null);
+    globalThis.setTimeout = realTimeoutR;
+    const afterR = dbHandle.prepare("SELECT gm_updates_reseeded_at, changelog_seen FROM guild_config WHERE guild_id='G1'").get() || {};
+    const nowNew = live(cfgR.gm_updates_forum).filter(t => / · What's new$/.test(t.name));
+    const oldGone = !!oldA && !!oldB && deleted.includes(oldA.id) && deleted.includes(oldB.id) && before.filter(id => threads.find(t => t.id === id && / · What's new$/.test(t.name))).every(id => deleted.includes(id));
+    const allNew = nowNew.every(t => !before.includes(t.id) && t.id !== oldA?.id && t.id !== oldB?.id);
+    ok('the clean slate: old-shape What\'s new threads, archived ones included, are removed and the catalogue posted again, oldest first, detail beneath',
+      bad.length === 0 && oldGone && allNew && nowNew.length === entries.length && nowNew.every(t => msgsOf(t).some(c => c.startsWith('**In detail**')))
+        && nowNew.sort((a, b) => Number(a.id) - Number(b.id)).map(t => t.name.slice(1, 11)).join(',') === [...entries].reverse().map(k => k.split('-').reverse().join('/')).join(',')
+        && !!afterR.gm_updates_reseeded_at && afterR.changelog_seen === entries[0],
+      `${bad.join(' | ')} old gone ${oldGone} · all new ${allNew} · ${nowNew.length}/${entries.length} · marker ${afterR.gm_updates_reseeded_at}`);
+    const plThreads = live(cfgR.updates_forum).filter(t => / · What's new$/.test(t.name));
+    ok('the players\' forum is untouched by the clean slate — no thread removed, none posted twice',
+      plThreads.length > 0 && plThreads.every(t => before.includes(t.id) || t.parentId !== cfgR.gm_updates_forum) && new Set(plThreads.map(t => t.name)).size === plThreads.length,
+      plThreads.map(t => t.name).join(' | '));
+    const mends = live(cfgR.gm_updates_forum).filter(t => / · Deploy mend$/.test(t.name)).sort((a, b) => Number(a.id) - Number(b.id));
+    const last = live(cfgR.gm_updates_forum).sort((a, b) => Number(a.id) - Number(b.id)).pop();
+    ok('the reseed boot\'s Deploy mend reports the clean slate and tops the forum',
+      !!last && / · Deploy mend$/.test(last.name) && msgsOf(last).some(c => /What.s new thread\(s\) removed and the catalogue re-posted/.test(c)) && mends.length >= 1,
+      last ? `${last.name}: ${msgsOf(last)[0]?.slice(0, 160)}` : 'no threads');
   }
 
   // ── No button, modal or select id throws on a junk payload ──────────

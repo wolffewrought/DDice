@@ -49,9 +49,9 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1070 as of 2026-10-11) and no scanner
+Green means every assertion passed (1072 as of 2026-10-12) and no scanner
 found an ERROR. Then run the probe: `node --experimental-sqlite probe.js`
-(64 probes: the fight, encounter, override, autocomplete and every-leaf
+(68 probes: the fight, encounter, override, autocomplete and every-leaf
 walks, the GM-gate walk, chat shorthands, scheduled ticks, junk-id lanes,
 SQL compile, forum seeding and sweep, and a double-ack check).
 
@@ -480,6 +480,31 @@ Garrick (now a Vendor, with Ally as his second tag) and Mystery Stranger
 they are real SRD entries `/library srd` loads. Zeus joins the three
 list-shaped fight rows and the group-check example. The 5e example
 character is Artorius.
+
+**What's new, in detail (T, 2026-10-12, 01:22, "clean slate"):** a GM
+changelog entry is `{ line, detail }` — the line is the bullet in the
+thread's starter message (what the forum card previews), the detail goes
+beneath as `**In detail**`: the bullet again, then the paragraph as a
+quote (`> `), packed so no block splits across a message
+(`postChangelogDetail`). Player entries stay plain lines. All 25 GM items
+back to 25/09 carry detail, written from the HANDOFF notes and checked
+against the code (the roster picker's hundred and fifteen-minute draft,
+the encounter add rules, the five-minute Reopen, the six quiet hours, the
+red roster mark). A 2026-10-12 entry announces the shape. The one-time
+re-seed: a boot with `updates_seeded_at` set and `gm_updates_reseeded_at`
+unset wipes the bot's What's new threads in gm-updates (`wipeGmWhatsNew`,
+active and archived — `datedThreadsOf` reads both now, for the tidy too),
+calls `announceChangelog(client, guild, { gmAll: true })` which posts every
+GM entry again oldest-first while the players' forum still gets only the
+unseen, then sets the marker — after, so a boot that dies midway tries
+again. The tidy pass then moves the three Deploy mends of 11/10 back below
+the 11/10 What's new (re-posting the 12/10 one with them, by the suffix
+rule), and today's mend goes up last. Tidy now deletes before it
+re-creates, so a thread that will not go is reported, never doubled.
+Probe: a fourth boot with two old-shape threads planted (one archived)
+must come back with every What's new carrying In detail, the old ones
+gone, the catalogue in order, the players' forum untouched. 1072
+assertions, 68 probes.
 
 **Recipe:** the re-lay was done by a script (relay_books.py, scratch) that
 takes every original item and row by AST span and asserts each is used

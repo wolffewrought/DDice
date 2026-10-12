@@ -1460,13 +1460,38 @@ function testBuilders(src) {
       /Math\.round\(QUARTER_MS \/ 60000\)/.test(src) && /Math\.round\(ENCOUNTER_IDLE_MS \/ 3600000\)/.test(src));
     // The rest of the batch
     ok('the changelog is data; the first boot with a forum posts the whole back-catalogue, later boots the unseen, each a dated thread',
-      /const CHANGELOG = \[/.test(src) && /async function announceChangelog\(client, guild\)/.test(src) &&
+      /const CHANGELOG = \[/.test(src) && /async function announceChangelog\(client, guild, opts = \{\}\)/.test(src) &&
       /const seeding = !cfg\.updates_seeded_at;/.test(src) &&
-      /const entries = \(seeding \? \[\.\.\.CHANGELOG\] : CHANGELOG\.filter\(e => e\.key > seen\)\)\.reverse\(\);/.test(src) &&
-      /setConfig\(gid, \{ changelog_seen: CHANGELOG\[0\]\.key, updates_seeded_at: cfg\.updates_seeded_at \|\| Date\.now\(\) \}\);/.test(src) &&
+      /const unseen = \(seeding \? \[\.\.\.CHANGELOG\] : CHANGELOG\.filter\(e => e\.key > seen\)\)\.reverse\(\);/.test(src) &&
+      /setConfig\(gid, \{ changelog_seen: CHANGELOG\[0\]\.key, updates_seeded_at: cfg\.updates_seeded_at \|\| Date\.now\(\),/.test(src) &&
       /postDatedThread\(client, forums\.gm, 'What\\'s new', at,/.test(src) &&
       /postDatedThread\(client, forums\.player, 'What\\'s new', at,/.test(src) &&
       !/quest_log_gm[^\n]*What\\'s new/.test(src));
+    ok('every GM changelog entry is { line, detail }, and the detail is posted beneath the bullets as In detail',
+      (() => {
+        const i = src.indexOf('const CHANGELOG = ['); const j = src.indexOf('\n];', i);
+        const block = src.slice(i, j);
+        // inside every `gm: [` … `], player: [` span, each item opens with `{ line:` and carries `detail:`
+        let ok = true, items = 0;
+        for (const m of block.matchAll(/gm: \[([\s\S]*?)\], player: \[/g)) {
+          const inner = m[1].trim();
+          if (!inner) continue;
+          for (const item of inner.split(/\},\s*(?=\{ line:)/)) {
+            items++;
+            if (!/^\{ line: '/.test(item.trim()) || !/detail: '/.test(item)) ok = false;
+          }
+        }
+        return ok && items >= 20 && /const changelogLine = \(x\) => \(typeof x === 'string' \? x : x\.line\);/.test(src)
+          && /async function postChangelogDetail\(thread, items\)/.test(src) && /let buf = '\*\*In detail\*\*';/.test(src)
+          && /await postChangelogDetail\(t, e\.gm\);/.test(src);
+      })());
+    ok('the clean slate runs once: What\'s new threads wiped, the catalogue re-posted with gmAll, the marker set after, the players\' forum left alone',
+      /async function wipeGmWhatsNew\(client, forumId\)/.test(src) && /if \(kind !== 'What\\'s new'\) continue;/.test(src) &&
+      /if \(after\.gm_updates_forum && after\.updates_seeded_at && !after\.gm_updates_reseeded_at\)/.test(src) &&
+      /await announceChangelog\(client, guild, \{ gmAll: reseed \}\)/.test(src) &&
+      /if \(reseed\) setConfig\(gid, \{ gm_updates_reseeded_at: Date\.now\(\) \}\);/.test(src) &&
+      /player: unseenKeys\.has\(e\.key\) \? forums\.player : null/.test(src) &&
+      /async function datedThreadsOf\(client, forum\)/.test(src) && /fetchArchived\?\.\(\{ limit: 100 \}\)/.test(src));
     ok('the date line is T\'s format, ISO weeks, the table\'s time zone; every dated thread goes through one helper',
       /const BOT_TZ = 'Europe\/London';/.test(src) &&
       /return `\[\$\{String\(d\)\.padStart\(2, '0'\)\}\/\$\{String\(m\)\.padStart\(2, '0'\)\}\/\$\{y\}\] \[WEEK \$\{isoWeek\(y, m, d\)\}\] \$\{weekday\} \$\{ordinalDay\(d\)\} of \$\{MONTH_NAMES\[m - 1\]\} \$\{y\}`;/.test(src) &&
@@ -1482,9 +1507,10 @@ function testBuilders(src) {
       /function mondayOf\(ms\)/.test(src) && (src.match(/await postWeeklyDigest\(client, guild\)/g) || []).length === 2 &&
       /!after\.gm_digest_seeded_at/.test(src));
     ok('the deploy mend thread is posted after the changelog and the tidy pass, so the day\'s report tops gm-updates',
-      (() => { const i = src.indexOf("'Deploy mend', Date.now()"); const c = src.indexOf('await announceChangelog(client, guild)'); const t = src.indexOf('tidyDatedForum(client, fid)'); return i > 0 && c > 0 && t > 0 && c < t && t < i; })());
-    ok('a dated thread out of date order is re-posted; one anyone else wrote in is left alone',
-      /function tidyDatedForum\(client, forumId\)/.test(src) && /msgs\.some\(m => m\.author\?\.id !== client\.user\.id\)/.test(src) && /DATED_TITLE_RE\.exec\(t\.name/.test(src));
+      (() => { const i = src.indexOf("'Deploy mend', Date.now()"); const c = src.indexOf('await announceChangelog(client, guild, { gmAll: reseed })'); const t = src.indexOf('tidyDatedForum(client, fid)'); return i > 0 && c > 0 && t > 0 && c < t && t < i; })());
+    ok('a dated thread out of date order is re-posted, deleted before it is re-created; one anyone else wrote in is left alone',
+      /function tidyDatedForum\(client, forumId\)/.test(src) && /msgs\.some\(m => m\.author\?\.id !== client\.user\.id\)/.test(src) && /DATED_TITLE_RE\.exec\(t\.name/.test(src) &&
+      (() => { const d = src.indexOf('const gone = await t.delete()'); const c = src.indexOf('const fresh = await forum.threads.create({ name: t.name'); return d > 0 && c > d; })());
     ok('usage is counted on every command and only ever reported',
       /INSERT INTO command_uses \(guild_id, command, leaf, count, last_at\)/.test(src) &&
       /report only; nothing is removed by this/.test(src) &&
