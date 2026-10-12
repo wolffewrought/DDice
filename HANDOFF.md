@@ -49,9 +49,9 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1072 as of 2026-10-12) and no scanner
+Green means every assertion passed (1076 as of 2026-10-12) and no scanner
 found an ERROR. Then run the probe: `node --experimental-sqlite probe.js`
-(68 probes: the fight, encounter, override, autocomplete and every-leaf
+(71 probes: the fight, encounter, override, autocomplete and every-leaf
 walks, the GM-gate walk, chat shorthands, scheduled ticks, junk-id lanes,
 SQL compile, forum seeding and sweep, and a double-ack check).
 
@@ -505,6 +505,32 @@ Probe: a fourth boot with two old-shape threads planted (one archived)
 must come back with every What's new carrying In detail, the old ones
 gone, the catalogue in order, the players' forum untouched. 1072
 assertions, 68 probes.
+
+**Natural 20 / natural 1 on every DC check (T, 2026-10-12, 17:25):**
+`dcVerdict(nat, sides, total, dc)` is the one verdict — a d20's 20 passes
+and 1 fails whatever the total, else total against DC, null with no DC —
+read by rollDcCheck (`/gm dc`, planted stat buttons), the planted dice
+button, the group check (which had judged on the total alone) and the
+target strike. A target struck with a 20 is settled on the spot by
+`settleTarget` (dead, button retired, quest log told) and a 1 holds, with
+no GM prompt; anything else asks, with the buttons renamed earlier that
+hour to **The player passes the check** / **The player fails the check**.
+RULES gained `check-nat`, pinned to all four call sites. Probe: three
+planted targets struck with Math.random forced to a 20, a 1 and an 11.
+Changelog 2026-10-12 carries it for GMs and players. 1073 assertions, 71
+probes.
+
+**Twenty meets twenty (T, 2026-10-12, 17:36):** a natural 20 attack against
+a natural 20 defence now lands whatever the totals — `clash` in the
+Knightfall damage model, hit forced, the ladder paying the attacking 20's
++1 (so 2) — and the defender still banks the riposte. The auto fight had
+been withholding that riposte on a mutual 20 (`d.nat === 20 && a.nat !==
+20`) while the manual fight paid it; both pay it now, and verify pins
+both sites. The manual card and the auto round say "Twenty meets
+twenty!". The harness has the three new cases (lower attack lands for 2,
+higher attack the same, a 19 against a defending 20 still parried). RULES
+`defence-nat20` reworded; the books' damage table has the row. 1076
+assertions.
 
 **Recipe:** the re-lay was done by a script (relay_books.py, scratch) that
 takes every original item and row by AST span and asserts each is used

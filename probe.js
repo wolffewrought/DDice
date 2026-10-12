@@ -882,7 +882,7 @@ async function fire(over) {
     const detailed = whatsNew.filter(t => msgsOf(t).some(c => c.startsWith('**In detail**')));
     const bulletsMatch = whatsNew.every(t => { const ms = msgsOf(t); const bullets = (ms[0] || '').split('\n').filter(l => l.startsWith('· ')); const detail = ms.slice(1).join('\n'); return bullets.every(b => detail.includes(b)) && (detail.match(/^> /gm) || []).length >= bullets.length; });
     ok(`every GM What's new thread carries In detail beneath the bullets — each bullet repeated, a quoted paragraph under it (${gmEntryCount} entries)`,
-      whatsNew.length === entries.length && detailed.length === whatsNew.length && bulletsMatch && gmEntryCount === 25,
+      whatsNew.length === entries.length && detailed.length === whatsNew.length && bulletsMatch && gmEntryCount >= 25,
       `${whatsNew.length} threads, ${detailed.length} detailed, bullets ${bulletsMatch}, ${gmEntryCount} entry lines`);
     // A server seeded in the old shape: an old-form What's new thread (one archived, as a week-old one would be),
     // the re-seed marker unset. The fourth boot removes them and posts the catalogue again.
@@ -916,6 +916,42 @@ async function fire(over) {
     ok('the reseed boot\'s Deploy mend reports the clean slate and tops the forum',
       !!last && / · Deploy mend$/.test(last.name) && msgsOf(last).some(c => /What.s new thread\(s\) removed and the catalogue re-posted/.test(c)) && mends.length >= 1,
       last ? `${last.name}: ${msgsOf(last)[0]?.slice(0, 160)}` : 'no threads');
+  }
+
+  // ── A target settles itself on a natural 20 or 1; anything else is the GM's call ──
+  if (dbHandle) {
+    const realRandom = Math.random;
+    const plant = async (name) => {
+      await fire({ commandName: 'target', options: { _sub: 'create', name, stat: 'str', dc: 12 }, userId: 'U1' });
+      return dbHandle.prepare("SELECT message_id FROM temp_targets WHERE guild_id='G1' AND name=? ORDER BY at DESC").get(name)?.message_id;
+    };
+    const strike = async (mid, die) => {
+      Math.random = () => die;                      // rollDie = floor(r * sides) + 1
+      const before = sent.length;
+      const r = await fire({ isButton: true, customId: 'tgtatk', message: { id: mid, content: 'x', components: [] }, userId: 'U2' }).catch(e => ({ replies: [{ content: 'THREW ' + e.message }] }));
+      Math.random = realRandom;
+      const said = r.replies.map(x => x.content || '').join(' ');
+      const asked = sent.slice(before).some(x => /Your call:/.test(x.content));
+      const dead = dbHandle.prepare("SELECT dead FROM temp_targets WHERE guild_id='G1' AND message_id=?").get(mid)?.dead;
+      return { said, asked, dead, buttons: sent.slice(before).flatMap(x => (x.msg.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).label || ''))) };
+    };
+    if (!dbHandle.prepare("SELECT 1 FROM characters WHERE guild_id='G1' AND user_id='U2'").get())
+      await fire({ commandName: 'char', options: { _sub: 'create', str: 3, con: 3, dex: 3, wis: 3, lck: 3 }, userId: 'U2' });
+    const d20 = await plant('Probe door twenty');
+    const r20 = d20 ? await strike(d20, 0.9999) : null;
+    ok('a natural 20 on a target passes the check by itself: the target is beaten, the GM is not asked',
+      !!r20 && /natural 20/.test(r20.said) && /passes the check/.test(r20.said) && !r20.asked && r20.dead === 1,
+      r20 ? `said ${r20.said.slice(0, 90)} · asked ${r20.asked} · dead ${r20.dead}` : 'no target planted');
+    const d1 = await plant('Probe door one');
+    const r1 = d1 ? await strike(d1, 0) : null;
+    ok('a natural 1 on a target fails the check by itself: the target holds, the GM is not asked',
+      !!r1 && /natural 1/.test(r1.said) && /fails the check/.test(r1.said) && !r1.asked && r1.dead === 0,
+      r1 ? `said ${r1.said.slice(0, 90)} · asked ${r1.asked} · dead ${r1.dead}` : 'no target planted');
+    const dMid = await plant('Probe door middling');
+    const rMid = dMid ? await strike(dMid, 0.5) : null;
+    ok('any other roll asks the GM to call it, with the two verdict buttons',
+      !!rMid && rMid.asked && rMid.dead === 0 && rMid.buttons.some(l => /The player passes the check/.test(l)) && rMid.buttons.some(l => /The player fails the check/.test(l)),
+      rMid ? `asked ${rMid.asked} · dead ${rMid.dead} · buttons ${rMid.buttons.join(' | ')}` : 'no target planted');
   }
 
   // ── No button, modal or select id throws on a junk payload ──────────

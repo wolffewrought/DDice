@@ -1447,6 +1447,15 @@ function testBuilders(src) {
     ok('the rules table exists and is printed by /help',
       /const RULES = \[/.test(src) && /getString\?\.\('category'\) === 'rules'/.test(src) &&
       /\{name:'The Rules',value:'rules'\}/.test(src));
+    ok('RULES: a natural 20 passes and a natural 1 fails every DC check — one verdict helper, read by the called check, the planted button, the group check and the target',
+      /key: 'check-nat'/.test(src) && /function dcVerdict\(nat, sides, total, dc\)/.test(src) &&
+      /const passed = dcVerdict\(nat, sides, total, dc\);/.test(src) &&
+      /const passedDice = dcVerdict\(rolled\.rolls\[0\] \?\? null, rolled\.sides, rolled\.total, pressDc \|\| null\);/.test(src) &&
+      /if \(g\.dc\) passed = dcVerdict\(nat, sidesG, total, g\.dc\) \? 1 : 0;/.test(src) &&
+      /passed = dcVerdict\(natT, sidesT, total, t\.dc \|\| null\);/.test(src) &&
+      /const decided = sidesT === 20 && \(natT === 20 \|\| natT === 1\);/.test(src) &&
+      /if \(passed\) await settleTarget\(interaction\.client, gidT, t, interaction\.message\.id, uidT\);/.test(src) &&
+      !/passed = total >= g\.dc \? 1 : 0/.test(src) && !/rolled\.total >= pressDc \?/.test(src));
     ok('RULES: attacking 1 auto-fails and flat-d20s the next defence',
       /key: 'attack-nat1'/.test(src) && /fumbles the attack/.test(src) && /flat d20 \\u2014 fumbled last attack|fumbled last attack/.test(src));
     ok('RULES: defending 20 parries and banks +2',
@@ -1563,7 +1572,7 @@ function testBuilders(src) {
       /noteQuestActivity\(gid, cid, 'roll', `\$\{whoDc\}: \$\{faceDc\} \$\{total\} vs DC \$\{dc\}/.test(src));
     ok('summoned monsters and targets are logged too',
       /summoned\$\{interaction\.options\.getBoolean\('temp'\) \? ' \(temporary\)' : ''\}: \$\{made\.join\(', '\)\}/.test(src) &&
-      /stands as a target/.test(src) && /falls after \$\{t\.hits\}/.test(src));
+      /stands as a target/.test(src) && /is beaten after \$\{hits\}/.test(src));
     ok('every schema ALTER lives below the whole schema',
       (() => {
         const lastCreate = src.lastIndexOf('CREATE TABLE IF NOT EXISTS');
@@ -1875,14 +1884,17 @@ function testBuilders(src) {
       /delete slot\.gmAdj; delete slot\.gmAdjNote;/.test(src));
     ok('the card speaks the interjection, npc or player alike',
       /GM interjection: \$\{amt\} to \$\{who\}'s roll/.test(src));
-    ok('a nat-1 attack fails automatically; a nat-20 defence auto-parries unless mutual',
+    ok('a nat-1 attack fails automatically; a nat-20 defence auto-parries unless twenty meets twenty, when the attack wins whatever the totals',
       /if \(atkNat === 1\) return \{ hit: false, dmg: 0, detail: 'fumbled' \};/.test(src) &&
-      /if \(defNat === defSides && atkNat !== atkSides\) return \{ hit: false, dmg: 0, detail: 'parried' \};/.test(src));
+      /const clash = atkNat === atkSides && defNat === defSides;/.test(src) &&
+      /if \(defNat === defSides && !clash\) return \{ hit: false, dmg: 0, detail: 'parried' \};/.test(src) &&
+      /const hit = clash \|\| atkRoll >= defRoll;/.test(src) && /Twenty meets twenty!/.test(src));
     ok('the damage numbers are untouched: 1, +1, +1, 4',
       /let dmg = 1;\s*\n\s*if \(atkNat === atkSides\) dmg \+= 1;\s*\n\s*if \(defNat === 1\) dmg \+= 1;\s*\n\s*if \(atkNat === atkSides && defNat === 1\) dmg \+= 1;/.test(src));
-    ok('the riposte banks on every defending 20 — the carry has no mutual exception',
+    ok('the riposte banks on every defending 20 — the carry has no mutual exception, in the manual fight or the auto one',
       /if \(defNat === 20\) \{\s*\n\s*ensure\(defenderId\)\.rollBonus = 2;/.test(src) &&
-      !/defNat === 20 && atkNat !== 20/.test(src));
+      !/defNat === 20 && atkNat !== 20/.test(src) && !/d\.nat === 20 && a\.nat !== 20/.test(src) &&
+      /if \(d\.nat === 20\) \{ \(fxState\[defenderId\] = fxState\[defenderId\] \|\| \{\}\)\.atkBonus = 2;/.test(src));
     ok('no attacker-side next-roll carry exists',
       !/ensure\(attackerId\)\.rollBonus/.test(src));
     ok('the parry and the fumble speak on the card',
@@ -2455,6 +2467,11 @@ function testRules(mod) {
     // the best moment in a fight worse.
     eq('KF both criticals reach four', K.damage(20, 20, 20, 1, 1, 20), { hit: true, dmg: 4 });
     ok('KF ties go to the attacker', K.damage(12, 6, 20, 12, 6, 20).hit === true);
+    // Twenty meets twenty: the attack wins however the totals fall, and
+    // the attacking 20 still pays its +1 (T, 2026-10-12).
+    eq('KF twenty meets twenty: the lower attack still lands, for two', K.damage(21, 20, 20, 25, 20, 20), { hit: true, dmg: 2, clash: true });
+    eq('KF twenty meets twenty: the higher attack lands the same', K.damage(25, 20, 20, 21, 20, 20), { hit: true, dmg: 2, clash: true });
+    ok('KF a defending 20 against a lesser die still parries', K.damage(25, 19, 20, 21, 20, 20).hit === false && K.damage(25, 19, 20, 21, 20, 20).detail === 'parried');
     eq('KF stat is added whole', K.statBonus({ str: 4 }, 'str'), 4);
     eq('KF absent stat reads zero', K.statBonus({}, 'str'), 0);
     eq('KF HP is CON plus the floor', K.maxHp({ con: 5 }, 10), 15);

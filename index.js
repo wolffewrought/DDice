@@ -1769,8 +1769,9 @@ async function handleRollSlash(interaction) {
 // enforces it, so a rule cannot change on one side only (T, 2026-09-29).
 // Values that ARE constants are read from the constants.
 const RULES = [
+  { key: 'check-nat',      text: 'On any check against a DC \u2014 a called check, a planted button, a group check, a target \u2014 a natural 20 passes and a natural 1 fails, whatever the total. A target beaten by a 20 falls without the GM being asked.' },
   { key: 'attack-nat1',    text: 'A natural 1 on an attack fails outright, and your next defence is a flat d20.' },
-  { key: 'defence-nat20',  text: 'A natural 20 on a defence is a perfect parry (unless the attacker also rolled 20 \u2014 then totals decide), and banks +2 to hit on your next attack.' },
+  { key: 'defence-nat20',  text: 'A natural 20 on a defence is a perfect parry and banks +2 to hit on your next attack. Twenty meets twenty: the attack lands whatever the totals, for 2, and the defender still banks the riposte.' },
   { key: 'damage',         text: 'A hit deals 1. An attacking 20 adds 1; a defending 1 adds 1; both together deal 4.' },
   { key: 'grapple',        text: 'Grapple is STR against a STR save; meeting the save takes the hold. Held: immobile, 1 wound at the end of each of your turns, actions on a flat d20, and you may strike anyone but your grappler.' },
   { key: 'grapple-hold',   text: 'Keeping a hold costs an opposed STR roll each turn, or release it for free. Escape is an opposed STR roll on your turn. Ties keep the hold, every time.' },
@@ -1810,18 +1811,21 @@ const RULES_KNIGHTFALL = {
     // original damage table:
     //   nat-1 attack  -> fails automatically, whatever the totals say.
     //   nat-20 defence -> parries automatically — UNLESS the attack was
-    //     also a nat 20, in which case the totals decide as ever.
+    //     also a nat 20: twenty meets twenty and the ATTACK WINS whatever
+    //     the totals, both bonuses paid — +1 damage here, the riposte
+    //     banked in applyExchangeEffects (T, 2026-10-12).
     //   Damage when a hit lands: 1, +1 for an attacking 20, +1 for a
     //     defending 1, 4 when both — unchanged.
     if (atkNat === 1) return { hit: false, dmg: 0, detail: 'fumbled' };
-    if (defNat === defSides && atkNat !== atkSides) return { hit: false, dmg: 0, detail: 'parried' };
-    const hit = atkRoll >= defRoll;
+    const clash = atkNat === atkSides && defNat === defSides;
+    if (defNat === defSides && !clash) return { hit: false, dmg: 0, detail: 'parried' };
+    const hit = clash || atkRoll >= defRoll;
     if (!hit) return { hit, dmg: 0 };
     let dmg = 1;
     if (atkNat === atkSides) dmg += 1;
     if (defNat === 1) dmg += 1;
     if (atkNat === atkSides && defNat === 1) dmg += 1;
-    return { hit, dmg };
+    return clash ? { hit, dmg, clash } : { hit, dmg };
   },
   // Two rolls decide a blow between them; nobody has a target number.
   defence: 'opposed',
@@ -6814,7 +6818,7 @@ function groupRoster(entries) {
 // working after a restart with no state to lose; the only stored thing is
 // who has pressed, and only when `once` is asked for (T, 2026-08-16).
 // Temporary targets: a thing in a channel to swing at, with no sheet and
-// no roster entry. It has no HP — every hit asks the GM whether it falls,
+// no roster entry. It has no HP — every hit asks the GM to call the check,
 // which is both simpler and truer to how a table actually plays (T,
 // 2026-08-16). `secret` sends that question to the GM channel instead.
 // Titles and associations, for players and NPCs through one door. The
@@ -10537,7 +10541,7 @@ async function resolveExchange(guild, gid, cid, fight) {
     }
     if (effDirty) upsertFight(gid, cid, { effect_state: JSON.stringify(eff) });
   }
-  const { hit, dmg, crit: atkCrit, detail: dmgDetail } = resolveDamage(
+  const { hit, dmg, crit: atkCrit, detail: dmgDetail, clash } = resolveDamage(
     fight.atk_roll, fight.atk_nat, 20,
     fight.def_roll, fight.def_nat, 20, gid, dmgCtx
   );
@@ -10624,6 +10628,7 @@ async function resolveExchange(guild, gid, cid, fight) {
     const newHp = applyFightDamage(prevHp, dealt, floor);
     hpState[defenderId] = newHp;
     setFighterHp(gid, defenderId, newHp);           // persist to character or NPC
+    if (clash) lines.push(`⚡ **Twenty meets twenty!** ${defName}'s parry breaks — the blow lands through it, whatever the totals.`);
     lines.push(`💥 **${atkName}** hits **${defName}** for **${dmg}** damage!`);
     lines.push(hpChangeLine(gid, defF.isNpc, defName, prevHp, newHp, defF.maxHp, floor));
     for (const l of effectNoteLines(effNotes, atkName, defName)) lines.push(l);
@@ -12582,7 +12587,7 @@ async function handleFight(interaction, forced) {
       // Set carry-over effects from this exchange (in-memory mirror of applyExchangeEffects)
       const fxNotes = [];
       if (a.nat === 1) { (fxState[attackerId] = fxState[attackerId] || {}).flatDef = true; fxNotes.push('flat_def'); }
-      if (d.nat === 20 && a.nat !== 20) { (fxState[defenderId] = fxState[defenderId] || {}).atkBonus = 2; fxNotes.push('atk_bonus'); }
+      if (d.nat === 20) { (fxState[defenderId] = fxState[defenderId] || {}).atkBonus = 2; fxNotes.push('atk_bonus'); }   // every defending 20, mutual or not
 
       // Outcome (system line)
       let outcome;
@@ -12590,7 +12595,7 @@ async function handleFight(interaction, forced) {
         const wasHp = hp[defenderId];
         hp[defenderId] = applyFightDamage(hp[defenderId], dmg, floor);
         setFighterHp(gid, defenderId, hp[defenderId]); // keep sheets live so the next card is accurate
-        outcome = `💥 Hit for **${dmg}**! ` + (defF.isNpc && !npcStatsVisible(gid)
+        outcome = (a.nat === 20 && d.nat === 20 ? `⚡ **Twenty meets twenty!** The parry breaks. ` : '') + `💥 Hit for **${dmg}**! ` + (defF.isNpc && !npcStatsVisible(gid)
           ? `${defF.name}: ${hpCondition(hp[defenderId], defF.maxHp, floor)}`
           : `${defF.name} HP: **${wasHp} → ${hp[defenderId]}**`);
         if (hp[defenderId] <= floor) outcome += `\n${W.icon} **${defF.name}** ${W.out}!`;
@@ -19767,9 +19772,16 @@ async function sweepOldUpdatePosts(client, gid) {
 
 const CHANGELOG = [
   { key: '2026-10-12', gm: [
+      { line: 'Twenty meets twenty: a natural 20 attack against a natural 20 defence lands whatever the totals, for 2, and the defender still banks the riposte',
+        detail: 'When both dice show 20 the parry used to be cancelled and the totals decided, so a 20+1 attack could be turned by a 20+5 defence. Now the attack wins however the totals fall: it lands for 2 (the usual 1, plus 1 for the attacking 20) and the defender still banks +2 to hit on their next attack. The auto fight had been withholding that riposte on a mutual 20 while the manual fight paid it \u2014 both pay it now. The card says "Twenty meets twenty!" when it happens.' },
+      { line: 'A natural 20 passes and a natural 1 fails every check against a DC — and a target beaten by a 20 falls without asking you',
+        detail: 'One verdict now serves every check: `/gm dc`, a planted `/button roll`, a `/button group` and a `/target` strike. On a d20 a natural 20 passes and a natural 1 fails whatever the total; otherwise the total against the DC decides. Group checks had been judging on the total alone. A target struck with a natural 20 is beaten on the spot — its button retires, the quest log is told — and a natural 1 holds, with no verdict asked of you either way; every other hit still asks you to call it, with the buttons now reading **The player passes the check** and **The player fails the check**. The live rule is in `/help category:rules`.' },
       { line: 'What\'s new for GMs now carries the detail beneath the summary — every entry since September re-posted in that shape',
         detail: 'A What\'s new thread opens with the one-line bullets, as before, and continues with **In detail**: each bullet again, and under it what changed, why it was wrong or missing, what you do now and where it lands. The old threads in gm-updates were removed and the whole catalogue posted again, oldest first, so the forum reads 25/09 to today in order. The players\' updates forum keeps the short form.' },
-    ], player: [] },
+    ], player: [
+      'Twenty meets twenty: a natural 20 attack against a natural 20 defence lands whatever the totals, for 2 \u2014 and the defender still banks the +2 riposte',
+      'A natural 20 passes and a natural 1 fails any check against a DC — a called check, a planted button, a group check or a target — whatever the total. A natural 20 on a target beats it outright',
+    ] },
   { key: '2026-10-11', gm: [
       { line: 'Fixed, having never worked: `/gm dc` (flavours, sanctions and `hold:` were lost after the card posted) · `/gm override skip` · `/npc temp keep|clear|list` · `/npc reroll` · `/npc manage sync|create5e`',
         detail: '`/gm dc` posted its card and then threw: the flavour text, the stat sanctions and `hold:` were read by code that was never handed them, so every check ran bare. `/gm override skip` called a helper that did not exist. `/npc temp keep` and `clear` checked a variable nobody declared, `/npc temp list` called a method a Set does not have, and `/npc reroll`, `/npc manage sync` and `/npc manage create5e` were never routed to the code that answers them — a silent timeout each time. All of them now do what the books say; nothing to set up.' },
@@ -21229,6 +21241,16 @@ async function runGmReroll(interaction) {
 // marks, which is the same graceful dark a pressed button always had.
 // One check roll under the called conditions — shared by player presses and
 // the instant NPC rolls. `subject` carries stats; `sig` a signature row or null.
+// The one verdict for a roll against a DC: on a d20 a natural 20 passes
+// and a natural 1 fails whatever the total; otherwise the total decides,
+// or nothing does when there is no DC. Every check — called, planted,
+// group, target — reads it from here (T, 2026-10-12).
+function dcVerdict(nat, sides, total, dc) {
+  if (sides === 20 && nat === 20) return true;
+  if (sides === 20 && nat === 1) return false;
+  const dcNum = Number.isFinite(dc) ? dc : null;
+  return dcNum === null ? null : total >= dcNum;
+}
 function rollDcCheck({ stat, notation, dc, gmMode, flat, modifier, subject, sig }) {
   const useNotation = notation || (flat || !stat ? '1d20+0' : `1d20+${subject?.[stat] ?? 0}`);
   const mode = (notation || flat || !stat) ? gmMode : applySignatureMode(sig ?? subject, stat, gmMode);
@@ -21242,10 +21264,8 @@ function rollDcCheck({ stat, notation, dc, gmMode, flat, modifier, subject, sig 
   const sides = result.sides ?? 20;
   const total = result.total + modifier;
   // A DC that never parsed is no DC at all; judging against NaN turns a
-  // passing total into a failure.
-  const dcNum = Number.isFinite(dc) ? dc : null;
-  const passed = (sides === 20 && nat === 20) ? true : (sides === 20 && nat === 1) ? false
-               : (dcNum === null ? null : total >= dcNum);
+  // passing total into a failure. dcVerdict treats it as absent.
+  const passed = dcVerdict(nat, sides, total, dc);
   const critType = sides === 20 ? (nat === 20 ? 'crit' : nat === 1 ? 'fail' : null) : null;
   const band = critType === 'crit' ? '🌟 **Critical Success**' : critType === 'fail' ? '💀 **Critical Fail**'
              : passed ? '✅ **Success**' : '❌ **Fail**';
@@ -21899,7 +21919,18 @@ async function handleTarget(interaction) {
               VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
     .run(gid, msg.id, interaction.channel.id, name, dc || null, stat || null, dice || null, secret, forUser?.id || null, interaction.user.id, Date.now());
   try { noteQuestActivity(gid, interaction.channel.id, 'combat', `${name} stands as a target`, interaction.user.id); } catch {}
-  return interaction.reply({ ephemeral: true, content: `\u2705 **${name}** is standing. Every hit will ask you whether it falls.` });
+  return interaction.reply({ ephemeral: true, content: `\u2705 **${name}** is standing. A natural 20 beats it and a natural 1 fails on its own; every other hit asks you to call it: the player passes the check, or fails it.` });
+}
+
+// A target beaten — by the GM's call or by a natural 20: marked dead, its
+// own button retired so nobody swings at a corpse, the quest log told.
+async function settleTarget(client, gid, t, msgId, byUserId) {
+  db.prepare('UPDATE temp_targets SET dead=1 WHERE guild_id=? AND message_id=?').run(gid, msgId);
+  const hits = (db.prepare('SELECT hits FROM temp_targets WHERE guild_id=? AND message_id=?').get(gid, msgId)?.hits) ?? t.hits;
+  const ch = await client.channels.fetch(t.channel_id).catch(() => null);
+  const m = ch ? await ch.messages.fetch(msgId).catch(() => null) : null;
+  if (m?.editable) await m.edit({ content: `\u{1FAA6} ~~**${t.name}**~~ \u2014 beaten after ${hits} hit${hits === 1 ? '' : 's'}.`, components: [] }).catch(() => {});
+  try { noteQuestActivity(gid, t.channel_id, 'combat', `${t.name} is beaten after ${hits} hit${hits === 1 ? '' : 's'}`, byUserId); } catch {}
 }
 
 async function handleButton(interaction) {
@@ -24004,7 +24035,7 @@ const HELP_CATEGORIES = {
       '_Things a GM plants in the channel for the table to press, and the ways players talk back._',
       '`/button roll stat:dex dc:12 reason:...` \u2014 plant a check anyone may press; `dice:2d6+1` instead of a stat, `for:@Players` to address one person, `once:true` for one press each',
       '`/button group stat:wis dc:12 reason:...` \u2014 one check the whole party rolls; the message keeps the tally and \u2696\uFE0F Call it closes it with how many got through (GM)',
-      '`/target create name:Barricade stat:str dc:12` \u2014 something to strike, with no sheet; each hit asks the GM \u{1FAA6} It falls / \u{1F6E1}\uFE0F It holds; `secret:true` asks in the GM log instead \u00b7 `/target list`',
+      '`/target create name:Barricade stat:str dc:12` \u2014 something to strike, with no sheet; a natural 20 beats it and a natural 1 fails on its own, every other hit asks the GM to call it \u2014 **The player passes the check** / **The player fails the check**; `secret:true` asks in the GM log instead \u00b7 `/target list`',
       '`/dd message:... [header:] [user:@Players] [channels:#one #two]` \u2014 speak AS THE BOT: plain words by default, a bold header only if you write one, in every channel you name (or here); who said it goes to the roll-audit, not the room (GM)',
       '**Edit (DDice)** \u2014 long-press any message the bot sent \u2192 Apps \u2192 Edit (DDice): the text opens prefilled, save replaces it, the roll-audit records what changed. Covers the bot\'s own messages and NPC speech from `/npc say` alike (GM)',
       '`/feedback send [room:] [quest:]` \u2014 name a room to go straight to the form, or leave it blank for a menu; score it out of ten, say your piece; only GMs see it. Name a run you were on (or ran) and the card says which',
@@ -24345,11 +24376,11 @@ async function routeButton(interaction) {
       const had = db.prepare('SELECT 1 FROM group_check_rolls WHERE guild_id=? AND message_id=? AND user_id=?').get(gidG, mid, uidG);
       if (had) return interaction.reply({ ephemeral: true, content: '\u274C You have had your roll \u2014 one each.' });
 
-      let total, nat = null, passed = null;
+      let total, nat = null, passed = null, sidesG = 20;
       if (g.dice) {
         const r = rollNotation(g.dice);
         if (!r) return interaction.reply({ ephemeral: true, content: '\u274C That expression no longer reads.' });
-        total = r.total; nat = r.rolls[0] ?? null;
+        total = r.total; nat = r.rolls[0] ?? null; sidesG = r.sides;
       } else {
         const ch = getChar(gidG, uidG);
         if (!ch) return interaction.reply({ ephemeral: true, content: '\u274C You need a character sheet \u2014 `/char create`.' });
@@ -24357,7 +24388,7 @@ async function routeButton(interaction) {
         if (!r) return interaction.reply({ ephemeral: true, content: '\u274C That check would not roll.' });
         total = r.total; nat = r.nat;
       }
-      if (g.dc) passed = total >= g.dc ? 1 : 0;
+      if (g.dc) passed = dcVerdict(nat, sidesG, total, g.dc) ? 1 : 0;
       db.prepare(`INSERT INTO group_check_rolls (guild_id, message_id, user_id, total, nat, passed, at)
                   VALUES (?,?,?,?,?,?,?)`).run(gidG, mid, uidG, total, nat, passed, Date.now());
       await logButtonPress(interaction, gidG, uidG, `group ${g.dice || (g.stat === 'x' ? 'flat d20' : STAT_LABELS[g.stat])} ${total}${g.dc ? ` vs DC ${g.dc}` : ''}`, passed === null ? null : !!passed);
@@ -24372,11 +24403,11 @@ async function routeButton(interaction) {
       if (t.dead) return interaction.reply({ ephemeral: true, content: `\u274C **${t.name}** has already fallen.` });
       if (t.owner && t.owner !== uidT) return interaction.reply({ ephemeral: true, content: '\u274C That one is not addressed to you.' });
 
-      let line, total, passed = null;
+      let line, total, passed = null, natT = null, sidesT = 20;
       if (t.dice) {
         const rolled = rollNotation(t.dice);
         if (!rolled) return interaction.reply({ ephemeral: true, content: '\u274C That expression no longer reads.' });
-        total = rolled.total;
+        total = rolled.total; natT = rolled.rolls[0] ?? null; sidesT = rolled.sides;
         const mod = rolled.modifier ? ` ${rolled.modifier > 0 ? '+' : ''}${rolled.modifier}` : '';
         line = `**${t.dice}** \u2014 [${rolled.rolls.join(', ')}]${mod} = **${total}**`;
       } else {
@@ -24384,10 +24415,13 @@ async function routeButton(interaction) {
         if (!ch) return interaction.reply({ ephemeral: true, content: '\u274C You need a character sheet \u2014 `/char create`.' });
         const r = rollDcCheck({ stat: t.stat === 'x' ? null : t.stat, dc: t.dc || 10, flat: t.stat === 'x', subject: ch, sig: ch });
         if (!r) return interaction.reply({ ephemeral: true, content: '\u274C That check would not roll.' });
-        total = r.total; passed = t.dc ? r.passed : null;
+        total = r.total; natT = r.nat; sidesT = r.result?.sides ?? 20;
         line = r.rollLine;
       }
-      if (t.dc && passed === null) passed = total >= t.dc;
+      passed = dcVerdict(natT, sidesT, total, t.dc || null);
+      // A natural 20 or 1 on a d20 settles the check by itself; the GM is
+      // asked only when the die left it open (T, 2026-10-12).
+      const decided = sidesT === 20 && (natT === 20 || natT === 1);
       db.prepare('UPDATE temp_targets SET hits=hits+1 WHERE guild_id=? AND message_id=?').run(gidT, interaction.message.id);
 
       const nmT = await getDisplayName(interaction.guild, uidT).catch(() => 'Someone');
@@ -24395,16 +24429,21 @@ async function routeButton(interaction) {
       await interaction.reply({ content: [
         `\u2694\uFE0F <@${uidT}> strikes at **${t.name}**`,
         line,
-        t.dc ? (passed ? '\u2705 **A telling blow.**' : '\u274C **It glances off.**') : '',
+        decided ? (passed ? `\u2705 **A natural 20 \u2014 the player passes the check. ${t.name} is beaten.**` : `\u274C **A natural 1 \u2014 the player fails the check. ${t.name} holds.**`)
+          : t.dc ? (passed ? '\u2705 **A telling blow.**' : '\u274C **It glances off.**') : '',
       ].filter(Boolean).join('\n'), allowedMentions: { users: [uidT] } });
+      if (decided) {
+        if (passed) await settleTarget(interaction.client, gidT, t, interaction.message.id, uidT);
+        return;
+      }
 
       // The GM's verdict — the only death check there is. In the channel by
       // default so the table feels it; in the GM channel when `secret`.
       const { ActionRowBuilder: TR, ButtonBuilder: TB, ButtonStyle: TS } = require('discord.js');
-      const ask = [`\u{1F5E1}\uFE0F **${t.name}** \u2014 struck by ${nmT} for **${total}**${t.dc ? ` vs DC ${t.dc}` : ''}. Does it fall?`];
+      const ask = [`\u{1F5E1}\uFE0F **${t.name}** \u2014 struck by ${nmT} for **${total}**${t.dc ? ` vs DC ${t.dc}` : ''}. Your call:`];
       const rowT = new TR().addComponents(
-        new TB().setCustomId(`tgtdie:${interaction.message.id}:1`).setLabel('\u{1FAA6} It falls').setStyle(TS.Danger),
-        new TB().setCustomId(`tgtdie:${interaction.message.id}:0`).setLabel('\u{1F6E1}\uFE0F It holds').setStyle(TS.Secondary));
+        new TB().setCustomId(`tgtdie:${interaction.message.id}:1`).setLabel('\u2705 The player passes the check').setStyle(TS.Success),
+        new TB().setCustomId(`tgtdie:${interaction.message.id}:0`).setLabel('\u274C The player fails the check').setStyle(TS.Secondary));
       const gmChId = t.secret ? auditDestination(gidT, 'checks') : null;
       const dest = gmChId ? await interaction.client.channels.fetch(gmChId).catch(() => null) : interaction.channel;
       await (dest || interaction.channel).send({ content: ask.join('\n'), components: [rowT], allowedMentions: { parse: [] } }).catch(() => {});
@@ -24419,15 +24458,8 @@ async function routeButton(interaction) {
       const t = db.prepare('SELECT * FROM temp_targets WHERE guild_id=? AND message_id=?').get(gidT, msgId);
       if (!t) return interaction.reply({ ephemeral: true, content: '\u274C That target is long gone.' });
       const fell = fellS === '1';
-      if (fell) {
-        db.prepare('UPDATE temp_targets SET dead=1 WHERE guild_id=? AND message_id=?').run(gidT, msgId);
-        // Its own button dies with it, so nobody swings at a corpse.
-        const ch = await interaction.client.channels.fetch(t.channel_id).catch(() => null);
-        const m = ch ? await ch.messages.fetch(msgId).catch(() => null) : null;
-        if (m?.editable) await m.edit({ content: `\u{1FAA6} ~~**${t.name}**~~ \u2014 fallen after ${t.hits} hit${t.hits === 1 ? '' : 's'}.`, components: [] }).catch(() => {});
-        try { noteQuestActivity(gidT, t.channel_id, 'combat', `${t.name} falls after ${t.hits} hit${t.hits === 1 ? '' : 's'}`, interaction.user.id); } catch {}
-      }
-      await interaction.update({ content: `${interaction.message.content}\n${fell ? '\u{1FAA6} **It falls.**' : '\u{1F6E1}\uFE0F **It holds.**'}`, components: [] }).catch(() => {});
+      if (fell) await settleTarget(interaction.client, gidT, t, msgId, interaction.user.id);
+      await interaction.update({ content: `${interaction.message.content}\n${fell ? `\u2705 **The player passes the check \u2014 ${t.name} is beaten.**` : `\u274C **The player fails the check \u2014 ${t.name} holds.**`}`, components: [] }).catch(() => {});
       return;
     }
 
@@ -24477,7 +24509,8 @@ async function routeButton(interaction) {
       if (!rolled) return interaction.reply({ ephemeral: true, content: '\u274C That expression no longer reads.' });
       const faces = rolled.rolls.join(', ');
       const mod = rolled.modifier ? ` ${rolled.modifier > 0 ? '+' : ''}${rolled.modifier}` : '';
-      const verdict = pressDc ? (rolled.total >= pressDc ? '\n\u2705 **Passed.**' : '\n\u274C **Failed.**') : '';
+      const passedDice = dcVerdict(rolled.rolls[0] ?? null, rolled.sides, rolled.total, pressDc || null);
+      const verdict = passedDice === null ? '' : (passedDice ? '\n\u2705 **Passed.**' : '\n\u274C **Failed.**');
       await logButtonPress(interaction, gidB, uidB, `${dice} = ${rolled.total}${pressDc ? ` vs DC ${pressDc}` : ''}`, pressDc ? rolled.total >= pressDc : null);
       return interaction.reply({ content: `\u{1F3B2} <@${uidB}> rolled **${dice}**${pressDc ? ` vs **DC ${pressDc}**` : ''} \u2014 [${faces}]${mod} = **${rolled.total}**${verdict}`,
         allowedMentions: { users: [uidB] } });
