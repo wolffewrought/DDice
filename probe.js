@@ -338,7 +338,9 @@ function makeInteraction(over = {}) {
     deferReply: async () => { if (i.replied || i.deferred) throw already(over, 'defer after ack'); i.deferred = true; },
     deferUpdate: async () => { if (i.replied || i.deferred) throw already(over, 'deferUpdate after ack'); i.deferred = true; },
     update: async (p) => { if (i.replied) throw already(over, 'update after reply'); i.replied = true; replies.push(norm(p)); },
-    showModal: async (m) => { if (i.replied || i.deferred) throw already(over, 'showModal after ack'); i.replied = true; replies.push({ modal: m?._d?.customId ?? 'modal' }); },
+    showModal: async (m) => { if (i.replied || i.deferred) throw already(over, 'showModal after ack'); i.replied = true;
+      const modalFields = {}; for (const row of m?._d?.components || []) for (const c of (row._d || row).components || []) { const d = c._d || c; if (d.customId) modalFields[d.customId] = d.value; }
+      replies.push({ modal: m?._d?.customId ?? 'modal', modalFields }); },
     respond: async (c) => { replies.push({ autocomplete: c }); },
   };
   return i;
@@ -991,39 +993,137 @@ async function fire(over) {
   }
 
   // ── A target settles itself on a natural 20 or 1; anything else is the GM's call ──
+  // Since 2026-10-13 a press opens the roleplay form and the form strikes;
+  // nothing named is a d20 with every stat a button; stat: lists as few or
+  // as many as the GM likes; a verdict opens the What-happens form,
+  // prefilled with the flavour set at creation; a fail brings the card back
+  // with a counter.
   if (dbHandle) {
     const realRandom = Math.random;
-    const plant = async (name) => {
-      await fire({ commandName: 'target', options: { _sub: 'create', name, stat: 'str', dc: 12 }, userId: 'U1' });
-      return dbHandle.prepare("SELECT message_id FROM temp_targets WHERE guild_id='G1' AND name=? ORDER BY at DESC").get(name)?.message_id;
+    const plant = async (name, opts = { stat: 'str', dc: 12 }) => {
+      await fire({ commandName: 'target', options: { _sub: 'create', name, ...opts }, userId: 'U1' });
+      return dbHandle.prepare("SELECT * FROM temp_targets WHERE guild_id='G1' AND name=? ORDER BY at DESC").get(name);
     };
-    const strike = async (mid, die) => {
+    const rowOf = (t) => dbHandle.prepare("SELECT * FROM temp_targets WHERE guild_id='G1' AND message_id=?").get(t.message_id);
+    const cardOf = (t) => sentById.get(rowOf(t)?.card_id || t.card_id || t.message_id);
+    const labelsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).label || ''));
+    const idsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+    // Press a button on the live card, fill the form, read what came of it.
+    const strike = async (t, die, { stat = null, action = '', speech = '', userId = 'U2' } = {}) => {
+      const card = cardOf(t);
+      const press = await fire({ isButton: true, customId: stat ? `tgtatk:${stat}` : (idsOf(card)[0] || 'tgtatk'), message: card, userId }).catch(e => ({ replies: [{ content: 'THREW ' + e.message }] }));
+      const modalId = press.replies.find(x => x.modal)?.modal;
+      if (!modalId) return { said: press.replies.map(x => x.content || '').join(' '), modal: null, asked: false, dead: null, buttons: [] };
       Math.random = () => die;                      // rollDie = floor(r * sides) + 1
       const before = sent.length;
-      const r = await fire({ isButton: true, customId: 'tgtatk', message: { id: mid, content: 'x', components: [] }, userId: 'U2' }).catch(e => ({ replies: [{ content: 'THREW ' + e.message }] }));
+      const r = await fire({ isModal: true, fromMessage: true, customId: modalId, fields: { action, speech }, message: card, userId }).catch(e => ({ replies: [{ content: 'THREW ' + e.message }] }));
       Math.random = realRandom;
       const said = r.replies.map(x => x.content || '').join(' ');
       const asked = sent.slice(before).some(x => /Your call:/.test(x.content));
-      const dead = dbHandle.prepare("SELECT dead FROM temp_targets WHERE guild_id='G1' AND message_id=?").get(mid)?.dead;
-      return { said, asked, dead, buttons: sent.slice(before).flatMap(x => (x.msg.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).label || ''))) };
+      const row = rowOf(t);
+      return { said, modal: modalId, asked, dead: row?.dead, hits: row?.hits, cardId: row?.card_id, buttons: sent.slice(before).flatMap(x => labelsOf(x.msg)), verdictIds: sent.slice(before).flatMap(x => idsOf(x.msg)), prompt: sent.slice(before).find(x => /Your call:/.test(x.content))?.msg };
+    };
+    // The GM's call: press a verdict, fill (or leave) the What-happens form.
+    const call = async (strikeR, fell, what = undefined) => {
+      const id = strikeR?.verdictIds.find(x => new RegExp(`^tgtdie:.*:${fell ? 1 : 0}$`).test(x));
+      if (!id) return null;
+      const press = await fire({ isButton: true, customId: id, message: strikeR.prompt, userId: 'U1' }).catch(e => ({ replies: [{ content: 'THREW ' + e.message }] }));
+      const modalId = press.replies.find(x => x.modal)?.modal;
+      const prefill = press.replies.find(x => x.modal)?.modalFields?.what;
+      if (!modalId) return { press, modal: null };
+      const before = sent.length;
+      // A real client submits the prefilled text unless the GM changes it: undefined = sent as is, '' = cleared.
+      const r = await fire({ isModal: true, fromMessage: true, customId: modalId, fields: { what: what === undefined ? (prefill || '') : what }, message: strikeR.prompt, userId: 'U1' }).catch(e => ({ replies: [{ content: 'THREW ' + e.message }] }));
+      return { press, modal: modalId, prefill, replies: r.replies, posted: sent.slice(before).map(x => x.content) };
     };
     if (!dbHandle.prepare("SELECT 1 FROM characters WHERE guild_id='G1' AND user_id='U2'").get())
       await fire({ commandName: 'char', options: { _sub: 'create', str: 3, con: 3, dex: 3, wis: 3, lck: 3 }, userId: 'U2' });
-    const d20 = await plant('Probe door twenty');
-    const r20 = d20 ? await strike(d20, 0.9999) : null;
-    ok('a natural 20 on a target passes the check by itself: the target is beaten, the GM is not asked',
-      !!r20 && /natural 20/.test(r20.said) && /passes the check/.test(r20.said) && !r20.asked && r20.dead === 1,
-      r20 ? `said ${r20.said.slice(0, 90)} · asked ${r20.asked} · dead ${r20.dead}` : 'no target planted');
-    const d1 = await plant('Probe door one');
+    const d20 = await plant('Probe door twenty', { stat: 'str', dc: 12, success_flavour: 'The door bursts inward.' });
+    const r20 = d20 ? await strike(d20, 0.9999, { action: 'kicks the door', speech: 'Open, damn you' }) : null;
+    ok('a press opens the action/speech form; the form strikes with the words above the roll',
+      !!r20 && /^tgtrp:/.test(r20.modal || '') && /\*kicks the door\*/.test(r20.said) && /\u201COpen, damn you\u201D/.test(r20.said) && /with \*\*STR\*\*/.test(r20.said),
+      r20 ? `modal ${r20.modal} · ${r20.said.slice(0, 120)}` : 'no target planted');
+    ok('a natural 20 passes on its own — "Roll critically succeeds", the success flavour posted with it, the target beaten, the GM not asked',
+      !!r20 && /Roll critically succeeds/.test(r20.said) && /\*The door bursts inward\.\*/.test(r20.said) && !r20.asked && r20.dead === 1,
+      r20 ? `said ${r20.said.slice(0, 160)} · asked ${r20.asked} · dead ${r20.dead}` : 'no target planted');
+    const d1 = await plant('Probe door one', { stat: 'str', dc: 12, fail_flavour: 'Not so much as a groan.' });
     const r1 = d1 ? await strike(d1, 0) : null;
-    ok('a natural 1 on a target fails the check by itself: the target holds, the GM is not asked',
-      !!r1 && /natural 1/.test(r1.said) && /fails the check/.test(r1.said) && !r1.asked && r1.dead === 0,
-      r1 ? `said ${r1.said.slice(0, 90)} · asked ${r1.asked} · dead ${r1.dead}` : 'no target planted');
-    const dMid = await plant('Probe door middling');
+    const d1row = d1 ? rowOf(d1) : null;
+    ok('a natural 1 fails on its own — "Roll critically fails", the fail flavour with it — and the card comes back below with its buttons and a counter',
+      !!r1 && /Roll critically fails/.test(r1.said) && /\*Not so much as a groan\.\*/.test(r1.said) && !r1.asked && r1.dead === 0
+        && !!d1row?.card_id && d1row.card_id !== d1.message_id && idsOf(sentById.get(d1row.card_id)).length === 1
+        && /Reposted 1\u00d7/.test(sentById.get(d1row.card_id)?.content || '') && /1 swing so far/.test(sentById.get(d1row.card_id)?.content || '')
+        && (sentById.get(d1.message_id)?.components || []).length === 0 && /continues below/.test(sentById.get(d1.message_id)?.content || ''),
+      r1 ? `said ${r1.said.slice(0, 120)} · dead ${r1.dead} · card ${d1.message_id}→${d1row?.card_id} · ${(sentById.get(d1row?.card_id)?.content || '').slice(0, 120)}` : 'no target planted');
+    const dMid = await plant('Probe door middling', { stat: 'str', dc: 12, success_flavour: 'It gives.', fail_flavour: 'It holds.' });
     const rMid = dMid ? await strike(dMid, 0.5) : null;
-    ok('any other roll asks the GM to call it, with the two verdict buttons',
-      !!rMid && rMid.asked && rMid.dead === 0 && rMid.buttons.some(l => /The player passes the check/.test(l)) && rMid.buttons.some(l => /The player fails the check/.test(l)),
-      rMid ? `asked ${rMid.asked} · dead ${rMid.dead} · buttons ${rMid.buttons.join(' | ')}` : 'no target planted');
+    ok('any other roll says "The roll succeeds/fails" and asks the GM, naming the swing, with the two verdict buttons',
+      !!rMid && rMid.asked && rMid.dead === 0 && /The roll (succeeds|fails)\./.test(rMid.said) && !/telling blow|glances off/.test(rMid.said)
+        && /\(swing 1\)\. Your call:/.test(rMid.prompt?.content || '')
+        && rMid.buttons.some(l => /The player passes the check/.test(l)) && rMid.buttons.some(l => /The player fails the check/.test(l)),
+      rMid ? `asked ${rMid.asked} · ${rMid.said.slice(0, 80)} · ${(rMid.prompt?.content || '').slice(0, 80)} · buttons ${rMid.buttons.join(' | ')}` : 'no target planted');
+    // The GM calls a fail: the form opens prefilled with the fail flavour; sent as is → the verdict line, the words, the card again.
+    const failCall = rMid ? await call(rMid, false, 'It holds. Dust falls.') : null;
+    const midRow = dMid ? rowOf(dMid) : null;
+    ok('the GM\'s fail opens the What-happens form prefilled with the fail flavour; submit posts "Roll fails" with the words under it and brings the card back',
+      !!failCall && /^tgtnar:.*:0$/.test(failCall.modal || '') && failCall.prefill === 'It holds.'
+        && failCall.replies.some(r => /The player fails the check \\?\u2014? ?Roll fails\./.test(r.content || '') || /Roll fails\./.test(r.content || ''))
+        && failCall.replies.some(r => /\*It holds\. Dust falls\.\*/.test(r.content || ''))
+        && !!midRow && midRow.card_id !== dMid.message_id && midRow.dead === 0 && /Reposted 1\u00d7/.test(sentById.get(midRow.card_id)?.content || ''),
+      `${failCall?.modal} · prefill ${JSON.stringify(failCall?.prefill)} · ${JSON.stringify(failCall?.replies).slice(0, 160)} · card ${dMid?.message_id}→${midRow?.card_id}`);
+    const again = midRow ? await strike(midRow, 0.5) : null;
+    ok('the next swing lands on the new card, hits carried, the prompt naming swing 2', !!again && again.asked && again.hits === 2 && /\(swing 2\)/.test(again.prompt?.content || ''), `asked ${again?.asked} hits ${again?.hits} · ${(again?.prompt?.content || '').slice(0, 80)}`);
+    // The GM calls a pass with the form left blank: the bare verdict, the target beaten.
+    const passCall = again ? await call(again, true, '') : null;
+    const midRow2 = dMid ? rowOf(dMid) : null;
+    ok('the GM\'s pass with the form cleared still posts "Roll succeeds", nothing under it, and beats the target',
+      !!passCall && /^tgtnar:.*:1$/.test(passCall.modal || '') && passCall.prefill === 'It gives.' && passCall.replies.some(r => /Roll succeeds\./.test(r.content || '') && !/\*It gives\.\*/.test(r.content || '')) && midRow2?.dead === 1
+        && /beaten after 2 hits/.test(sentById.get(midRow2.card_id)?.content || ''),
+      `${passCall?.modal} · ${JSON.stringify(passCall?.replies).slice(0, 120)} · dead ${midRow2?.dead} · ${(sentById.get(midRow2?.card_id)?.content || '').slice(0, 60)}`);
+    // Nothing named: a d20, every stat a button, no DC — the GM calls each blow.
+    const dAny = await plant('Probe door bare', {});
+    const anyCard = dAny ? cardOf(dAny) : null;
+    const anyIds = idsOf(anyCard);
+    ok('/target create with nothing but a name posts a d20 target with the five stat buttons and no DC',
+      !!dAny && dAny.dc === null && dAny.stat === null && dAny.dice === null && anyIds.join(',') === 'tgtatk:str,tgtatk:con,tgtatk:dex,tgtatk:wis,tgtatk:lck'
+        && /any stat/.test(anyCard?.content || '') && /the GM calling each blow/.test(anyCard?.content || ''),
+      dAny ? `dc ${dAny.dc} stat ${dAny.stat} dice ${dAny.dice} · ${anyIds.join(',')} · ${(anyCard?.content || '').slice(0, 80)}` : 'no target planted');
+    const rDex = dAny ? await strike(dAny, 0.5, { stat: 'dex' }) : null;
+    ok('pressing a stat button swings with that stat, and with no DC the GM is asked',
+      !!rDex && /with \*\*DEX\*\*/.test(rDex.said) && rDex.asked && !/The roll (succeeds|fails)/.test(rDex.said),
+      rDex ? `${rDex.said.slice(0, 100)} · asked ${rDex.asked}` : 'no target planted');
+    // A listed set: as few or as many as the GM likes, Flat d20 among them, in the order typed.
+    const dTwo = await plant('Probe door two', { stat: 'Flat d20, STR, dex', dc: 10 });
+    const twoCard = dTwo ? cardOf(dTwo) : null;
+    ok('stat: lists stats — "Flat d20, STR, dex" gives three buttons in that order, the card naming them',
+      !!dTwo && dTwo.stat === 'x,str,dex' && idsOf(twoCard).join(',') === 'tgtatk:x,tgtatk:str,tgtatk:dex' && /a flat d20\*\*, \*\*STR\*\* or \*\*DEX/.test(twoCard?.content || ''),
+      `stat ${dTwo?.stat} · ${idsOf(twoCard).join(',')} · ${(twoCard?.content || '').slice(0, 100)}`);
+    const rFlat = dTwo ? await strike(dTwo, 0.5, { stat: 'x' }) : null;
+    ok('the flat button rolls a bare d20', !!rFlat && /with a flat d20/.test(rFlat.said), rFlat?.said.slice(0, 80));
+    const acT = await fire({ commandName: 'target', isAutocomplete: true, options: { _sub: 'create', _focused: 'stat', _focusedValue: 'Flat d20, s' } });
+    const acTc = acT.replies.find(r => r.autocomplete)?.autocomplete || [];
+    ok('stat: autocompletes item by item, Flat d20 first in the full list', acTc.some(c => c.value === 'Flat d20, STR') && !acTc.some(c => /Flat d20, Flat/.test(c.value)),
+      JSON.stringify(acTc).slice(0, 120));
+    const acT0 = await fire({ commandName: 'target', isAutocomplete: true, options: { _sub: 'create', _focused: 'stat', _focusedValue: '' } });
+    const acT0c = acT0.replies.find(r => r.autocomplete)?.autocomplete || [];
+    ok('an empty stat: offers Flat d20 then the five stats', acT0c.map(c => c.value).join('|') === 'Flat d20|STR|CON|DEX|WIS|LCK', acT0c.map(c => c.value).join('|'));
+    const bad = await fire({ commandName: 'target', options: { _sub: 'create', name: 'Probe door bad', stat: 'str, charisma' }, userId: 'U1' });
+    ok('a word that is not a stat is refused with the list', /Stats I know/.test(JSON.stringify(bad.replies)), JSON.stringify(bad.replies).slice(0, 100));
+    const dDice = await plant('Probe door dice', { dice: '2d6+1' });
+    const diceCard = dDice ? cardOf(dDice) : null;
+    ok('dice named: one attack button, the roll is the dice', !!dDice && idsOf(diceCard).join(',') === 'tgtatk' && /\*\*2d6\+1\*\*/.test(diceCard?.content || ''), idsOf(diceCard).join(','));
+    // secret: the prompt goes to the checks shelf, the players get their own line with the words.
+    const chk = new FakeChannel(nextId(), 0, 'gm-checks', guild); channelsById.set(chk.id, chk);
+    dbHandle.prepare("INSERT INTO guild_config (guild_id, roll_audit_channel_id) VALUES ('G1', ?) ON CONFLICT(guild_id) DO UPDATE SET roll_audit_channel_id=excluded.roll_audit_channel_id").run(chk.id);
+    const dSec = await plant('Probe door secret', { stat: 'str', dc: 12, secret: true, success_flavour: 'The lock clicks.' });
+    const rSec = dSec ? await strike(dSec, 0.5) : null;
+    const secPrompt = sent.slice().reverse().find(x => /Probe door secret.*Your call:/.test(x.content));
+    const secCall = rSec ? await call({ ...rSec, prompt: secPrompt?.msg, verdictIds: idsOf(secPrompt?.msg) }, true) : null;
+    const playersLine = sent.slice().reverse().find(x => x.channel === 'C1' && /^\u2705 \*\*Roll succeeds\.\*\*/.test(x.content));
+    ok('secret: the prompt leaves the channel and the players still get "Roll succeeds" with the words in theirs',
+      !!rSec && !!secPrompt && secPrompt.channel !== 'C1' && !sent.some(x => x.channel === 'C1' && /Probe door secret.*Your call:/.test(x.content))
+        && !!secCall?.modal && secCall.prefill === 'The lock clicks.' && !!playersLine && /\*The lock clicks\.\*/.test(playersLine.content),
+      `asked-here ${rSec?.asked} · prompt in ${secPrompt?.channel} · modal ${secCall?.modal} · ${playersLine?.content?.slice(0, 80)}`);
   }
 
   // ── One NPC, one page ───────────────────────────────────────────────

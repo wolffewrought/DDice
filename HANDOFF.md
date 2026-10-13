@@ -49,9 +49,9 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1086 as of 2026-10-13) and no scanner
+Green means every assertion passed (1090 as of 2026-10-13) and no scanner
 found an ERROR. Then run the probe: `node --experimental-sqlite probe.js`
-(85 probes: the fight, encounter, override, autocomplete and every-leaf
+(98 probes: the fight, encounter, override, autocomplete and every-leaf
 walks, the GM-gate walk, chat shorthands, scheduled ticks, junk-id lanes,
 SQL compile, forum seeding and sweep, one NPC one page, and a double-ack
 check).
@@ -94,6 +94,10 @@ standing ones are all correct-by-design and are listed in §6.
   `DDICE_PDF_OUT=<dir> python3 make_pdfs.py`; the default writes to
   /mnt/user-data/outputs.
 - **Ask before architectural changes.** Questions first, build after.
+- **Every write is proposed and waits for T's "Build"** (T, 2026-10-13:
+  "always plan first before building and always ask me to build — always").
+  Diagnosis and reads are free; nothing else is. A direct ask is still a
+  plan to confirm, not a licence to build.
 - **Plain language in user-facing text.** Every refusal explains what to do
   instead.
 - **Ask whether the last build was pushed before writing a CHANGELOG entry**
@@ -644,6 +648,74 @@ receipt; `link:` opens the modal directly and refuses a foreign server.
 Books (GM chapter, GM examples) and /help carry it; the 2026-10-13
 CHANGELOG entry absorbed it because T had not pushed the morning build —
 hence the new house rule in §4. 1086 assertions, 85 probes.
+
+**`/target` reworked (T, 20:31–20:38, four asks and a fifth):** a d20 by
+default, every stat a button when none is named, an action/speech form on
+every press, a fail brings the card back, and no DC means the GM calls
+each blow (already so; now the card says it). The card is built by
+`targetHead(t)` + `targetButtons(t)` (`postTargetCard`): `dice:` → one
+`tgtatk` button; `stat:x` → `tgtatk:x` 🎲; a stat → `tgtatk:<stat>`; nothing
+→ five `tgtatk:<stat>` buttons (`TARGET_STATS`). The press handler
+(`tgtatk` or `tgtatk:*`) validates and opens a modal
+`tgtrp:<message_id>:<stat|->` with `action` (Short, 200) and `speech`
+(Paragraph, 500), both optional; the modal lane routes `tgtrp:` to
+`strikeTarget(interaction, msgId, pick)`, the old press body moved there —
+the stat pressed wins over the row's, a blank form is a plain swing, the
+card shows `*action*` and `“speech”` above the roll line. `temp_targets`
+gained `card_id` (the card now carrying the buttons) and `reason` (ALTERs
+in the migration block, after the last CREATE); the row stays keyed by the
+first card's id, `targetByCard(gid, cardId)` finds it from either, the
+verdict buttons and the modal carry the stable id, `settleTarget` strikes
+through the live card. `repostTarget(client, gid, t)` posts a fresh card,
+moves `card_id`, and strips the old card's buttons with "↓ still stands —
+continues below"; called on the GM's fail verdict and on a natural 1.
+Probe: the form carries the words; nat 20 beats; nat 1 fails and re-posts
+(new card has the button, old has none); the GM's fail re-posts and the
+next swing lands on the new card with hits carried; a bare `/target
+create` is a d20 with the five buttons and no DC; a stat press says "with
+DEX" and asks; dice and flat targets get their one button. Pins updated
+(the verdict id and settle call use `t.message_id`) and three added. Help,
+both books (player Targets section, GM row, GM example) and the 13/10
+entry (GM detail + a player line) updated. Found on the way: `/char
+create` declared a `temp:` option nothing read (a stray of `/npc
+create`'s); removed in the next build. 1089 assertions, 91 probes.
+
+**`/target`, second pass (T, 21:11–21:33, planned line by line, built on
+"Build"):** both verdict buttons open a *What happens?* form (`tgtnar:<id>:<1|0>`,
+one Paragraph field `what`, optional, ≤1000) prefilled with
+`success_text` / `fail_text` — two new columns set from `success_flavour:`
+/ `fail_flavour:` on create — and `settleTargetVerdict(interaction, msgId,
+fell)` does what the `tgtdie` press used to: the prompt is updated with the
+verdict line and `*what*` beneath (`interaction.update` on the
+from-message modal; a reply if that fails), the quest log gets the words,
+a pass settles, a fail reposts. A natural 20 or 1 posts the matching
+flavour on its own, since no form opens for it. Wording, T's: with a DC
+the strike card says **The roll succeeds** / **The roll fails** (was
+"telling blow" / "glances off"); naturals say **Roll critically succeeds**
+/ **Roll critically fails**; verdicts **The player passes the check — Roll
+succeeds** / **fails the check — Roll fails**; the prompt carries
+`(swing N)`. `secret:` targets post `✅ **Roll succeeds.**` / `❌ **Roll
+fails.**` + the words into the target's channel, since the prompt lives
+in the checks shelf. `stat:` is now a free-text list with autocomplete
+(`acLastOf(TARGET_STAT_CHOICES)`, Flat d20 first then the five);
+`parseTargetStats` accepts labels, keys and full names, returns `[]` for
+nothing and `null` for a stranger (refused with the list); the row stores
+`x,str,dex`; `targetStatList(t)` is the list or all five; the card shows
+one button per listed stat in the order typed (a single stat keeps the
+long "Attack X — STR" label, several the short `💪 STR` style, Flat d20
+`🎲`); the strike honours the pressed stat only if the card offers it. The
+old `Flat d20` choice value `x` is kept as the flat token. `reposts`
+column: `repostTarget` bumps it and the fresh card carries
+`🔁 **Reposted N×** — M swings so far`. `targetById` and the two shared
+refusals (`TARGET_GONE`, `targetFallen`) hoisted so the habits scanner
+stays at eleven. Probe: the full walk — form words, nat 20 with flavour,
+nat 1 with flavour and counter, the prompt naming the swing, a GM fail
+with a prefilled form sent as is, the next swing on the new card, a GM
+pass with the form cleared, the bare card, a `Flat d20, STR, dex` card
+with three buttons in order and the flat swing, the autocomplete, the
+refusal, dice, and a secret target whose words reach the players. The
+fake modal now records prefilled values (`modalFields`). 1090 assertions,
+98 probes.
 
 ## 10k · The dead-end pass: eight bugs, a scope scanner, a leaf walk, the re-lay (2026-10-11)
 

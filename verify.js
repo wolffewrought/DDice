@@ -1465,7 +1465,7 @@ function testBuilders(src) {
       /if \(g\.dc\) passed = dcVerdict\(nat, sidesG, total, g\.dc\) \? 1 : 0;/.test(src) &&
       /passed = dcVerdict\(natT, sidesT, total, t\.dc \|\| null\);/.test(src) &&
       /const decided = sidesT === 20 && \(natT === 20 \|\| natT === 1\);/.test(src) &&
-      /if \(passed\) await settleTarget\(interaction\.client, gidT, t, interaction\.message\.id, uidT\);/.test(src) &&
+      /if \(passed\) await settleTarget\(interaction\.client, gidT, t, t\.message_id, uidT\);/.test(src) &&
       !/passed = total >= g\.dc \? 1 : 0/.test(src) && !/rolled\.total >= pressDc \?/.test(src));
     ok('RULES: attacking 1 auto-fails and flat-d20s the next defence',
       /key: 'attack-nat1'/.test(src) && /fumbles the attack/.test(src) && /flat d20 \\u2014 fumbled last attack|fumbled last attack/.test(src));
@@ -1594,8 +1594,49 @@ function testBuilders(src) {
       /CREATE TABLE IF NOT EXISTS temp_targets/.test(src) &&
       /SELECT \* FROM temp_targets WHERE guild_id=\? AND message_id=\?/.test(src));
     ok('every hit asks the GM, and only a GM may answer',
-      /setCustomId\(`tgtdie:\$\{interaction\.message\.id\}:1`\)/.test(src) &&
+      /setCustomId\(`tgtdie:\$\{t\.message_id\}:1`\)/.test(src) &&
       /That call is the GM\\'s/.test(src));
+    // /target, 2026-10-13: a d20 unless dice are named, every stat a button
+    // when none is, a roleplay form on every press, a fail brings the card
+    // back below. The row stays keyed by the first card; card_id follows.
+    ok('/target: nothing named is a d20 with every stat a button; a listed stat set gets one each, in order; dice get one',
+      !/Give dice \(`2d6\+1`\) or a stat to swing with/.test(src) &&
+      /const TARGET_STATS = \['str', 'con', 'dex', 'wis', 'lck'\];/.test(src) &&
+      /const TARGET_STAT_CHOICES = \['Flat d20', 'STR', 'CON', 'DEX', 'WIS', 'LCK'\];/.test(src) &&
+      /function parseTargetStats\(raw\)/.test(src) && /return list\.length \? list : \[\.\.\.TARGET_STATS\];/.test(src) &&
+      /list\.slice\(0, 5\)\.map\(st => btn\(`tgtatk:\$\{st\}`, /.test(src) &&
+      /btn\('tgtatk', `\\u2694\\uFE0F Attack \$\{t\.name\}`\)/.test(src) &&
+      /acCmd === 'target' && acSub === 'create' && focusedOption\.name === 'stat'\) return await interaction\.respond\(acLastOf\(TARGET_STAT_CHOICES\)\)/.test(src));
+    ok('/target: a press opens the action/speech form and the form strikes; the stat pressed rides the modal id',
+      /customId === 'tgtatk' \|\| interaction\.customId\.startsWith\('tgtatk:'\)/.test(src) &&
+      /setCustomId\(`tgtrp:\$\{t\.message_id\}:\$\{pick\}`\)/.test(src) &&
+      /setCustomId\('action'\)\.setLabel\('What do you do\? \(optional\)'\)[\s\S]{0,80}?setRequired\(false\)/.test(src) &&
+      /setCustomId\('speech'\)\.setLabel\('What do you say\? \(optional\)'\)[\s\S]{0,80}?setRequired\(false\)/.test(src) &&
+      /customId\.startsWith\('tgtrp:'\)\) \{\s*const \[, msgId, pick\] = interaction\.customId\.split\(':'\);\s*return strikeTarget\(interaction, msgId, pick\)/.test(src) &&
+      /action \? `\*\$\{action\}\*` : null,\s*speech \? `\\u201C\$\{speech\}\\u201D` : null,/.test(src));
+    ok('/target: both verdicts open the What-happens form, prefilled with the flavour set at creation; blank still sends the verdict; secret tells the players on its own line',
+      /setCustomId\(`tgtnar:\$\{t\.message_id\}:\$\{fell \? 1 : 0\}`\)/.test(src) &&
+      /const preset = String\(\(fell \? t\.success_text : t\.fail_text\) \|\| ''\)\.slice\(0, 1000\);/.test(src) &&
+      /if \(preset\) input\.setValue\(preset\);/.test(src) &&
+      /customId\.startsWith\('tgtnar:'\)\) \{\s*const \[, msgId, fellS\] = interaction\.customId\.split\(':'\);\s*return settleTargetVerdict\(interaction, msgId, fellS === '1'\)/.test(src) &&
+      /const verdict = fell \? '\\u2705 \*\*The player passes the check \\u2014 Roll succeeds\.\*\*' : '\\u274C \*\*The player fails the check \\u2014 Roll fails\.\*\*';/.test(src) &&
+      /\[verdict, what \? `\*\$\{what\}\*` : null\]\.filter\(Boolean\)/.test(src) &&
+      /if \(t\.secret\) \{[\s\S]{0,300}?'\\u2705 \*\*Roll succeeds\.\*\*' : '\\u274C \*\*Roll fails\.\*\*'/.test(src) &&
+      /'\\u2705 \*\*A natural 20 \\u2014 the player passes the check\. Roll critically succeeds\.\*\*'/.test(src) &&
+      /'\\u274C \*\*A natural 1 \\u2014 the player fails the check\. Roll critically fails\.\*\*'/.test(src) &&
+      /'\\u2705 \*\*The roll succeeds\.\*\*' : '\\u274C \*\*The roll fails\.\*\*'/.test(src) &&
+      /const flavour = decided \? \(passed \? t\.success_text : t\.fail_text\) : null;/.test(src) &&
+      /\(swing \$\{swing\}\)\. Your call:/.test(src) &&
+      !/A telling blow|It glances off/.test(src));
+    ok('/target: a fail — the GM\'s call or a natural 1 — posts the card again below, the old one keeps the scene and loses its buttons',
+      /async function repostTarget\(client, gid, t\)/.test(src) &&
+      /if \(!fell\) await repostTarget\(interaction\.client, gidT, t\);/.test(src) &&
+      /Reposted \$\{t\.reposts\}\\u00d7/.test(src) &&
+      /else await repostTarget\(interaction\.client, gidT, t\);/.test(src) &&
+      /UPDATE temp_targets SET card_id=\?, reposts=COALESCE\(reposts,0\)\+1 WHERE guild_id=\? AND message_id=\?/.test(src) &&
+      /still stands \\u2014 continues below\._`, components: \[\] \}\)/.test(src) &&
+      /WHERE guild_id=\? AND \(message_id=\? OR card_id=\?\)/.test(src) &&
+      /ALTER TABLE temp_targets ADD COLUMN card_id TEXT/.test(src) && /ALTER TABLE temp_targets ADD COLUMN reason TEXT/.test(src));
     ok('a fallen target stops taking swings',
       /UPDATE temp_targets SET dead=1/.test(src) &&
       /has already fallen/.test(src) && /components: \[\] \}\)\.catch/.test(src));

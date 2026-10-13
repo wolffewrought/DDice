@@ -765,6 +765,14 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_updates_forum TEXT'); } ca
 try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_digest_forum TEXT'); } catch {}     // GMs: the weekly digest, a thread per week
 try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_digest_seeded_at INTEGER'); } catch {} // the boot that posted the first digest into it
 try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_updates_reseeded_at INTEGER'); } catch {} // the boot that re-posted What's new with the detail beneath
+// A target's row stays keyed by its first card; card_id is the card now
+// carrying the buttons (a fail posts a fresh one below), reason the scene
+// text that card repeats (T, 2026-10-13).
+try { db.exec('ALTER TABLE temp_targets ADD COLUMN card_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE temp_targets ADD COLUMN reason TEXT'); } catch {}
+try { db.exec('ALTER TABLE temp_targets ADD COLUMN success_text TEXT'); } catch {}   // what happens on a pass, prewritten
+try { db.exec('ALTER TABLE temp_targets ADD COLUMN fail_text TEXT'); } catch {}      // and on a fail
+try { db.exec('ALTER TABLE temp_targets ADD COLUMN reposts INTEGER NOT NULL DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN updates_seeded_at INTEGER'); } catch {} // the boot that opened the forums and posted the back-catalogue
 try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_routes TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN feedback_cats TEXT'); } catch {}
@@ -19853,11 +19861,15 @@ const CHANGELOG = [
   { key: '2026-10-13', gm: [
       { line: 'One NPC, one page: the boot no longer makes a second copy of every NPC page, and copies already made are folded back to one on the next boot',
         detail: 'Every NPC page in npc-character-sheets appeared twice, both the same age. Two of the boot\u2019s own tasks (the page migration and the Deploy mend) were writing the forum at the same moment, and a page whose record had gone was simply made again rather than found. Three changes: the boot runs its tasks one after another; a page is written by one writer at a time; and before making a page the bot looks for a thread already bearing the NPC\u2019s exact name and adopts it. The boot mend then folds any duplicates: the recorded thread stays (else the oldest), the rest are deleted unless someone other than the bot has written in them, and the count lands in the Deploy mend \u2014 \u201c2 duplicate NPC page(s) removed\u201d, or \u201cduplicate NPC page left in place: \u2026\u201d for one it would not touch.' },
+      { line: '`/target`: a d20 by default, the stats you list as buttons (all five when none), a form on every press and on every verdict, prewritten flavour, and a fail brings the card back below with a counter',
+        detail: '`/target create name:Door` now stands on its own: no `dice:` means a d20, no `dc:` means every blow is your call, and `stat:` is a list \u2014 as few or as many as you like, Flat d20 first in the picker then STR, CON, DEX, WIS, LCK \u2014 giving one button each in the order typed; nothing listed gives all five (each a d20 plus that stat, signature advantage applying as on `/gm dc`); `dice:2d6+1` gives one \u2694\uFE0F button. Every press opens a short form \u2014 what they do, what they say, both optional \u2014 and the strike card shows the action in italics and the speech in quotes above the roll line. The wording is new: with a DC the roll line is followed by **The roll succeeds** or **The roll fails**; a natural 20 says **Roll critically succeeds** and beats the target on the spot, a natural 1 **Roll critically fails**; your verdicts read **The player passes the check \u2014 Roll succeeds** / **The player fails the check \u2014 Roll fails**, and your prompt names the swing. Pressing either verdict opens a *What happens?* form, prefilled with `success_flavour:` / `fail_flavour:` if you set them at creation \u2014 send as is, edit, or clear; blank still sends the verdict \u2014 and the words post in italics under it, into the quest log too; on a natural 20 or 1 the matching flavour posts on its own. A fail posts the card again at the bottom with its buttons and \u201c\u{1F501} Reposted N\u00d7 \u2014 M swings so far\u201d; the old card keeps the scene, loses its buttons and says \u201ccontinues below\u201d. With `secret:` the prompt and your form stay in the GM checks shelf and the players get **Roll succeeds** / **Roll fails** with your words in their channel. `for:` is unchanged.' },
       { line: '`/edit` \u2014 the Edit (DDice) box without the Apps menu: a private dropdown of the last 25 lines the bot and its NPCs said here; pick one, it opens prefilled. Nothing the table sees',
         detail: 'Long-press \u2192 Apps \u2192 DDice \u2192 Edit (DDice) is three taps on a phone, and any reply-based shortcut would have put a button in the channel for everyone. `/edit` answers you alone with a dropdown of the last 25 lines the bot and its NPCs said in this channel or thread, newest first, each labelled by who said it; pick one and the same prefilled box opens, save replaces the text, the dropdown turns into \u201cEdited\u201d, and the roll audit records before and after. `link:` takes a message link or id and skips the list. Lines carrying buttons are not offered, since their text is the bot\u2019s to manage.' },
       { line: 'Edit (DDice) on NPC speech: a line said through a webhook the table had forgotten can be edited again; one said through a webhook that no longer exists says so and what to do',
         detail: 'Long-press an NPC\u2019s line \u2192 Apps \u2192 Edit (DDice) used to answer \u201cI can only edit what I posted\u201d whenever the bot\u2019s own record of the channel\u2019s webhook was missing \u2014 after a webhook clean-up, a restore from backup, or a thread whose parent was not to hand \u2014 though the hook was still the bot\u2019s. The channel is now asked for its webhooks before refusing; the bot\u2019s own is remembered and the edit goes through. A line said through a hook that has since been deleted cannot be edited by anyone \u2014 Discord ties the edit to the hook \u2014 so the answer says that plainly: delete it and have the NPC say it again with `/npc say`.' },
-    ], player: [] },
+    ], player: [
+      'Targets: the card offers the stats the GM allows as buttons \u2014 all five when they named none \u2014 so you pick the one you swing with. Pressing opens a short form for what you do and what you say (both optional); your words land above the roll. The verdict reads Roll succeeds / Roll fails (critically on a natural 20 or 1), and the GM\'s words on what happens follow it. A fail brings the card back below, counting its returns',
+    ] },
   { key: '2026-10-12', gm: [
       { line: 'A list everywhere a field has one to offer: `/char set value:`, saved sheets, weapon stats, 5e saves and skills, spells, ranks, titles, groups, preset monsters, rest amounts, emojis, `/gm search`, the backup channel',
         detail: '`/char set field:Weapon 2 Emoji` used to leave `value:` as a bare text box, so there was nothing to pick from and no way to know what would be accepted. Every field whose answer comes from a known set now autocompletes from it: `/char set value:` follows the field (emojis, orders, classes, weapons, a number handed back); `/char profile save|load slotname:` your saves; `/char weapon add|stats atk:|def:` the stat combinations and `any`; `/dnd create saves:|skills:` complete the next item of a comma list; `/spell cast|prepare` the library and what you have prepared; `/standing rank add`, `title grant|revoke`, `association add|remove` the ranks, titles and groups the server has (revoke and remove list only what that person holds); `/quest run complete title:` and `/encounter end title:` the titles already given; `/encounter preset save npcs:` the library and your NPCs, item by item; `/config mechanics rest|autorest` the amounts (100%, 50%, +25%, 0%); `/char weaponemoji custom:` and `/char tag custom emoji:` the server\'s own emojis; `/activity set` the activities, their scenes and the NPCs; `/gm search name:` every character and NPC; `/gm backup auto channel:` off or a channel. Where a new name is the point, what you typed leads the list, so free entry still works.' },
@@ -22071,46 +22083,222 @@ async function handleTarget(interaction) {
 
   const name = interaction.options.getString('name').trim();
   const dice = (interaction.options.getString('dice') || '').trim();
-  const stat = interaction.options.getString('stat');
+  const statRaw = (interaction.options.getString('stat') || '').trim();
   const dc = interaction.options.getInteger('dc');
   const reason = (interaction.options.getString('reason') || '').trim();
   const forUser = interaction.options.getUser('for');
   const secret = interaction.options.getBoolean('secret') ? 1 : 0;
-  if (dice && stat) return interaction.reply({ ephemeral: true, content: '\u274C Dice or a stat, not both.' });
-  if (!dice && !stat) return interaction.reply({ ephemeral: true, content: '\u274C Give dice (`2d6+1`) or a stat to swing with.' });
+  const successText = (interaction.options.getString('success_flavour') || '').trim().slice(0, 1000);
+  const failText = (interaction.options.getString('fail_flavour') || '').trim().slice(0, 1000);
+  if (dice && statRaw) return interaction.reply({ ephemeral: true, content: '\u274C Dice or stats, not both.' });
+  // Nothing named means a d20: every stat offered as a button, the GM
+  // calling each blow when there is no DC (T, 2026-10-13).
   if (dice && !/^\d{0,2}d\d{1,3}([+-]\d{1,3})?$/i.test(dice))
     return interaction.reply({ ephemeral: true, content: '\u274C That is not dice I can read \u2014 try `2d6+1`.' });
+  const stats = parseTargetStats(statRaw);
+  if (stats === null)
+    return interaction.reply({ ephemeral: true, content: '\u274C Stats I know: Flat d20, STR, CON, DEX, WIS, LCK \u2014 as few or as many as you like, comma-separated.' });
 
-  const face = dice || (stat === 'x' ? 'Flat d20' : STAT_LABELS[stat]);
-  const head = [`\u2694\uFE0F **${name}** stands${dc ? ` \u2014 **${face}** against **DC ${dc}**` : ` \u2014 swing with **${face}**`}.`];
-  if (reason) head.unshift(reason, '');
-  if (forUser) head.unshift(`<@${forUser.id}> \u2014`);
-  const msg = await interaction.channel.send({
-    content: head.join('\n'),
-    components: [new ActionRowBuilder().addComponents(new ButtonBuilder()
-      .setCustomId('tgtatk').setLabel(`\u2694\uFE0F Attack ${name}`.slice(0, 80)).setStyle(ButtonStyle.Danger))],
-    allowedMentions: forUser ? { users: [forUser.id] } : { parse: [] },
-  }).catch(() => null);
+  const t = { name, dc: dc || null, stat: stats.length ? stats.join(',') : null, dice: dice || null, reason: reason || null, owner: forUser?.id || null,
+    success_text: successText || null, fail_text: failText || null, reposts: 0, hits: 0 };
+  const msg = await postTargetCard(interaction.channel, t).catch(() => null);
   if (!msg) return interaction.reply({ ephemeral: true, content: '\u274C I could not post it here.' });
 
-  // The button carries no state: the row keyed by its own message is the
-  // target, so a restart loses nothing.
-  db.prepare(`INSERT INTO temp_targets (guild_id, message_id, channel_id, name, dc, stat, dice, secret, owner, created_by, at)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(gid, msg.id, interaction.channel.id, name, dc || null, stat || null, dice || null, secret, forUser?.id || null, interaction.user.id, Date.now());
+  // The buttons carry no state beyond the stat pressed: the row keyed by
+  // the first card is the target, so a restart loses nothing.
+  db.prepare(`INSERT INTO temp_targets (guild_id, message_id, card_id, channel_id, name, dc, stat, dice, reason, secret, owner, success_text, fail_text, created_by, at)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(gid, msg.id, msg.id, interaction.channel.id, name, t.dc, t.stat, t.dice, t.reason, secret, t.owner, t.success_text, t.fail_text, interaction.user.id, Date.now());
   try { noteQuestActivity(gid, interaction.channel.id, 'combat', `${name} stands as a target`, interaction.user.id); } catch {}
-  return interaction.reply({ ephemeral: true, content: `\u2705 **${name}** is standing. A natural 20 beats it and a natural 1 fails on its own; every other hit asks you to call it: the player passes the check, or fails it.` });
+  return interaction.reply({ ephemeral: true, content: `\u2705 **${name}** is standing${t.stat || t.dice ? '' : ' \u2014 every stat is a button'}. A natural 20 beats it and a natural 1 fails on its own; ${t.dc ? 'every other hit asks you to call it' : 'with no DC every other blow is your call'}: the player passes the check, or fails it, each with a form for what happens. A fail posts the card again below.` });
+}
+
+// The card: the scene, the face it is swung with, and the buttons \u2014 one
+// per stat the GM listed (as few or as many as they like, Flat d20 among
+// them), all five when none was, one for dice. A card posted again after
+// a fail counts its returns (T, 2026-10-13).
+const TARGET_STATS = ['str', 'con', 'dex', 'wis', 'lck'];
+const TARGET_STAT_CHOICES = ['Flat d20', 'STR', 'CON', 'DEX', 'WIS', 'LCK'];
+const TARGET_GONE = '\u274C That target is long gone.';
+const targetFallen = (t) => `\u274C **${t.name}** has already fallen.`;
+// "Flat d20, STR, dex" \u2192 ['x','str','dex']; [] for nothing; null for a word
+// that is not a stat.
+function parseTargetStats(raw) {
+  const out = [];
+  for (const part of String(raw || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean)) {
+    const k = /^(x|flat|flat d20|bare|d20)$/.test(part) ? 'x'
+      : /^(str|strength)$/.test(part) ? 'str' : /^(con|constitution)$/.test(part) ? 'con'
+      : /^(dex|dexterity)$/.test(part) ? 'dex' : /^(wis|wisdom)$/.test(part) ? 'wis' : /^(lck|luck)$/.test(part) ? 'lck' : null;
+    if (!k) return null;
+    if (!out.includes(k)) out.push(k);
+  }
+  return out;
+}
+function targetStatList(t) {
+  const list = String(t.stat || '').split(',').map(x => x.trim()).filter(Boolean);
+  return list.length ? list : [...TARGET_STATS];
+}
+const targetStatName = (st) => st === 'x' ? 'a flat d20' : STAT_LABELS[st] || st;
+const targetStatEmoji = (st) => st === 'x' ? '\u{1F3B2}' : STAT_EMOJIS[st] || '\u2694\uFE0F';
+function targetFace(t) {
+  if (t.dice) return `**${t.dice}**`;
+  if (!t.stat) return '**any stat**';
+  const names = targetStatList(t).map(st => `**${targetStatName(st)}**`);
+  return names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} or ${names[names.length - 1]}`;
+}
+function targetHead(t) {
+  const head = [`\u2694\uFE0F **${t.name}** stands \u2014 ${targetFace(t)}${t.dc ? ` against **DC ${t.dc}**` : ', the GM calling each blow'}.`];
+  if (t.reposts > 0) head.push(`\u{1F501} **Reposted ${t.reposts}\u00d7** \u2014 ${t.hits || 0} swing${t.hits === 1 ? '' : 's'} so far`);
+  if (t.reason) head.unshift(t.reason, '');
+  if (t.owner) head.unshift(`<@${t.owner}> \u2014`);
+  return head.join('\n');
+}
+function targetButtons(t) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  const btn = (id, label) => new ButtonBuilder().setCustomId(id).setLabel(label.slice(0, 80)).setStyle(ButtonStyle.Danger);
+  if (t.dice) return [new ActionRowBuilder().addComponents(btn('tgtatk', `\u2694\uFE0F Attack ${t.name}`))];
+  const list = targetStatList(t);
+  if (list.length === 1) return [new ActionRowBuilder().addComponents(btn(`tgtatk:${list[0]}`, `${targetStatEmoji(list[0])} Attack ${t.name} \u2014 ${list[0] === 'x' ? 'flat d20' : STAT_LABELS[list[0]]}`))];
+  return [new ActionRowBuilder().addComponents(...list.slice(0, 5).map(st => btn(`tgtatk:${st}`, `${targetStatEmoji(st)} ${st === 'x' ? 'Flat d20' : STAT_LABELS[st]}`)))];
+}
+function postTargetCard(channel, t) {
+  return channel.send({ content: targetHead(t), components: targetButtons(t), allowedMentions: t.owner ? { users: [t.owner] } : { parse: [] } });
+}
+// The row, by the id every button and form carries (the first card's).
+function targetById(gid, msgId) {
+  return db.prepare('SELECT * FROM temp_targets WHERE guild_id=? AND message_id=?').get(gid, msgId);
+}
+// A press finds its target by whichever card it sits on \u2014 the first, or
+// one posted again after a fail.
+function targetByCard(gid, cardId) {
+  return db.prepare('SELECT * FROM temp_targets WHERE guild_id=? AND (message_id=? OR card_id=?)').get(gid, cardId, cardId);
+}
+// A fail keeps the target standing, so the card comes back at the bottom
+// with its buttons; the old one keeps the scene but loses the buttons.
+async function repostTarget(client, gid, t) {
+  const ch = await client.channels.fetch(t.channel_id).catch(() => null);
+  if (!ch?.send) return null;
+  const old = await ch.messages.fetch(t.card_id || t.message_id).catch(() => null);
+  const now = db.prepare('SELECT hits, reposts FROM temp_targets WHERE guild_id=? AND message_id=?').get(gid, t.message_id) || {};
+  const fresh = await postTargetCard(ch, { ...t, hits: now.hits ?? t.hits ?? 0, reposts: (now.reposts ?? t.reposts ?? 0) + 1 }).catch(() => null);
+  if (!fresh) return null;
+  db.prepare('UPDATE temp_targets SET card_id=?, reposts=COALESCE(reposts,0)+1 WHERE guild_id=? AND message_id=?').run(fresh.id, gid, t.message_id);
+  if (old?.editable) await old.edit({ content: `${old.content}\n\u2193 _${t.name} still stands \u2014 continues below._`, components: [] }).catch(() => {});
+  return fresh;
 }
 
 // A target beaten — by the GM's call or by a natural 20: marked dead, its
 // own button retired so nobody swings at a corpse, the quest log told.
 async function settleTarget(client, gid, t, msgId, byUserId) {
   db.prepare('UPDATE temp_targets SET dead=1 WHERE guild_id=? AND message_id=?').run(gid, msgId);
-  const hits = (db.prepare('SELECT hits FROM temp_targets WHERE guild_id=? AND message_id=?').get(gid, msgId)?.hits) ?? t.hits;
+  const row = db.prepare('SELECT hits, card_id FROM temp_targets WHERE guild_id=? AND message_id=?').get(gid, msgId);
+  const hits = row?.hits ?? t.hits;
   const ch = await client.channels.fetch(t.channel_id).catch(() => null);
-  const m = ch ? await ch.messages.fetch(msgId).catch(() => null) : null;
+  const m = ch ? await ch.messages.fetch(row?.card_id || t.card_id || msgId).catch(() => null) : null;
   if (m?.editable) await m.edit({ content: `\u{1FAA6} ~~**${t.name}**~~ \u2014 beaten after ${hits} hit${hits === 1 ? '' : 's'}.`, components: [] }).catch(() => {});
   try { noteQuestActivity(gid, t.channel_id, 'combat', `${t.name} is beaten after ${hits} hit${hits === 1 ? '' : 's'}`, byUserId); } catch {}
+}
+
+// The swing, off the roleplay form: the stat pressed (or the target's
+// own dice / stat / flat d20), the action in italics and the speech in
+// quotes above the roll, then the verdict — a natural 20 beats it, a
+// natural 1 fails and brings the card back, anything else is the GM's call.
+async function strikeTarget(interaction, msgId, pick) {
+  const gidT = interaction.guild.id, uidT = interaction.user.id;
+  const t = targetById(gidT, msgId);
+  if (!t) return interaction.reply({ ephemeral: true, content: TARGET_GONE });
+  if (t.dead) return interaction.reply({ ephemeral: true, content: targetFallen(t) });
+  if (t.owner && t.owner !== uidT) return interaction.reply({ ephemeral: true, content: '\u274C That one is not addressed to you.' });
+  const action = String(interaction.fields?.getTextInputValue?.('action') || '').trim().slice(0, 200);
+  const speech = String(interaction.fields?.getTextInputValue?.('speech') || '').trim().slice(0, 500);
+  // The stat pressed, as long as the card offers it; else the card's own
+  // (one listed), else a flat d20.
+  const offered = t.dice ? [] : targetStatList(t);
+  const stat = pick && pick !== '-' && offered.includes(pick) ? pick : (offered.length === 1 ? offered[0] : (pick && pick !== '-' ? pick : null));
+
+  let line, total, natT = null, sidesT = 20, withText;
+  if (t.dice) {
+    const rolled = rollNotation(t.dice);
+    if (!rolled) return interaction.reply({ ephemeral: true, content: '\u274C That expression no longer reads.' });
+    total = rolled.total; natT = rolled.rolls[0] ?? null; sidesT = rolled.sides;
+    const mod = rolled.modifier ? ` ${rolled.modifier > 0 ? '+' : ''}${rolled.modifier}` : '';
+    line = `**${t.dice}** \u2014 [${rolled.rolls.join(', ')}]${mod} = **${total}**`;
+    withText = `**${t.dice}**`;
+  } else {
+    const ch = getChar(gidT, uidT);
+    if (!ch) return interaction.reply({ ephemeral: true, content: '\u274C You need a character sheet \u2014 `/char create`.' });
+    const flat = !stat || stat === 'x' || !TARGET_STATS.includes(stat);
+    const r = rollDcCheck({ stat: flat ? null : stat, dc: t.dc || 10, flat, subject: ch, sig: ch });
+    if (!r) return interaction.reply({ ephemeral: true, content: '\u274C That check would not roll.' });
+    total = r.total; natT = r.nat; sidesT = r.result?.sides ?? 20;
+    line = r.rollLine;
+    withText = flat ? 'a flat d20' : `**${STAT_LABELS[stat]}**`;
+  }
+  const passed = dcVerdict(natT, sidesT, total, t.dc || null);
+  // A natural 20 or 1 on a d20 settles the check by itself; the GM is
+  // asked only when the die left it open (T, 2026-10-12).
+  const decided = sidesT === 20 && (natT === 20 || natT === 1);
+  db.prepare('UPDATE temp_targets SET hits=hits+1 WHERE guild_id=? AND message_id=?').run(gidT, t.message_id);
+  const swing = (t.hits || 0) + 1;
+
+  const nmT = await getDisplayName(interaction.guild, uidT).catch(() => 'Someone');
+  await logButtonPress(interaction, gidT, uidT, `${t.name}: ${total}${t.dc ? ` vs DC ${t.dc}` : ''}`, passed);
+  // The die's own verdicts carry the GM's prewritten flavour, since no
+  // form will be opened for them.
+  const flavour = decided ? (passed ? t.success_text : t.fail_text) : null;
+  await interaction.reply({ content: [
+    `\u2694\uFE0F <@${uidT}> strikes at **${t.name}** with ${withText}`,
+    action ? `*${action}*` : null,
+    speech ? `\u201C${speech}\u201D` : null,
+    line,
+    decided ? (passed ? '\u2705 **A natural 20 \u2014 the player passes the check. Roll critically succeeds.**' : '\u274C **A natural 1 \u2014 the player fails the check. Roll critically fails.**')
+      : t.dc ? (passed ? '\u2705 **The roll succeeds.**' : '\u274C **The roll fails.**') : '',
+    flavour ? `*${flavour}*` : null,
+  ].filter(Boolean).join('\n'), allowedMentions: { users: [uidT] } });
+  if (decided) {
+    if (flavour) { try { noteQuestActivity(gidT, t.channel_id, 'combat', `${t.name}: ${flavour.slice(0, 200)}`, uidT); } catch {} }
+    if (passed) await settleTarget(interaction.client, gidT, t, t.message_id, uidT);
+    else await repostTarget(interaction.client, gidT, t);
+    return;
+  }
+
+  // The GM's verdict — the only death check there is. In the channel by
+  // default so the table feels it; in the GM channel when `secret`.
+  const { ActionRowBuilder: TR, ButtonBuilder: TB, ButtonStyle: TS } = require('discord.js');
+  const ask = [`\u{1F5E1}\uFE0F **${t.name}** \u2014 struck by ${nmT} for **${total}**${t.dc ? ` vs DC ${t.dc}` : ''} (swing ${swing}). Your call:`];
+  const rowT = new TR().addComponents(
+    new TB().setCustomId(`tgtdie:${t.message_id}:1`).setLabel('\u2705 The player passes the check').setStyle(TS.Success),
+    new TB().setCustomId(`tgtdie:${t.message_id}:0`).setLabel('\u274C The player fails the check').setStyle(TS.Secondary));
+  const gmChId = t.secret ? auditDestination(gidT, 'checks') : null;
+  const dest = gmChId ? await interaction.client.channels.fetch(gmChId).catch(() => null) : interaction.channel;
+  await (dest || interaction.channel).send({ content: ask.join('\n'), components: [rowT], allowedMentions: { parse: [] } }).catch(() => {});
+}
+
+// The GM's verdict, off the What-happens form: the prompt gains the
+// verdict line and the narration; with `secret` the players' channel is
+// told on its own line; the quest log keeps the words; a pass beats the
+// target, a fail brings the card back.
+async function settleTargetVerdict(interaction, msgId, fell) {
+  const gidT = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ ephemeral: true, content: '\u274C That call is the GM\'s.' });
+  const t = targetById(gidT, msgId);
+  if (!t) return interaction.reply({ ephemeral: true, content: TARGET_GONE });
+  if (t.dead) return interaction.reply({ ephemeral: true, content: targetFallen(t) });
+  const what = String(interaction.fields.getTextInputValue('what') || '').trim().slice(0, 1000);
+  const verdict = fell ? '\u2705 **The player passes the check \u2014 Roll succeeds.**' : '\u274C **The player fails the check \u2014 Roll fails.**';
+  if (fell) await settleTarget(interaction.client, gidT, t, msgId, interaction.user.id);
+  const lines = [verdict, what ? `*${what}*` : null].filter(Boolean).join('\n');
+  const promptText = interaction.message?.content ? `${interaction.message.content}\n${lines}` : lines;
+  const updated = interaction.isFromMessage?.() ? await interaction.update({ content: promptText, components: [] }).then(() => true).catch(() => false) : false;
+  if (!updated) await interaction.reply({ ephemeral: true, content: lines }).catch(() => {});
+  if (t.secret) {
+    const ch = await interaction.client.channels.fetch(t.channel_id).catch(() => null);
+    if (ch?.send) await ch.send({ content: [fell ? '\u2705 **Roll succeeds.**' : '\u274C **Roll fails.**', what ? `*${what}*` : null].filter(Boolean).join('\n'), allowedMentions: { parse: [] } }).catch(() => {});
+  }
+  if (what) { try { noteQuestActivity(gidT, t.channel_id, 'combat', `${t.name}: ${what.slice(0, 200)}`, interaction.user.id); } catch {} }
+  // Still standing: the card comes back below with its buttons.
+  if (!fell) await repostTarget(interaction.client, gidT, t);
 }
 
 async function handleButton(interaction) {
@@ -22989,8 +23177,7 @@ const slashCommands = [
       .addStringOption(o=>o.setName('weapon2emoji').setDescription('Emoji for weapon slot 2').setRequired(false)
         .addChoices(...WEAPON_EMOJI_CHOICES))
       .addStringOption(o=>o.setName('weapon2').setDescription('Weapon slot 2 — pick from list or type your own').setRequired(false).setAutocomplete(true))
-      .addUserOption(o=>o.setName('user').setDescription('Target player (GM only)').setRequired(false))
-      .addBooleanOption(o=>o.setName('temp').setDescription('true = a throwaway: no page, no roster seat, swept after the fight').setRequired(false)))
+      .addUserOption(o=>o.setName('user').setDescription('Target player (GM only)').setRequired(false)))
     .addSubcommand(s=>s.setName('weaponemoji').setDescription('Set the emoji for a weapon slot')
       .addStringOption(o=>o.setName('slot').setDescription('Which weapon slot').setRequired(true)
         .addChoices({name:'Weapon 1',value:'weapon1emoji'},{name:'Weapon 2',value:'weapon2emoji'}))
@@ -23767,15 +23954,16 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
 
   new SlashCommandBuilder()
     .setName('target').setDescription('Something for the party to swing at \u2014 no sheet, no roster (GM)')
-    .addSubcommand(s=>s.setName('create').setDescription('Plant a target with an attack button (GM)')
+    .addSubcommand(s=>s.setName('create').setDescription('Plant a target with attack buttons \u2014 a d20 unless you say otherwise (GM)')
       .addStringOption(o=>o.setName('name').setDescription('What it is').setRequired(true))
-      .addStringOption(o=>o.setName('dice').setDescription('Roll dice against it, e.g. 2d6+1').setRequired(false))
-      .addIntegerOption(o=>o.setName('dc').setDescription('The number to beat').setRequired(false).setMinValue(1).setMaxValue(40))
-      .addStringOption(o=>o.setName('stat').setDescription('Roll this stat instead of dice').setRequired(false)
-        .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'},{name:'Flat d20',value:'x'}))
+      .addStringOption(o=>o.setName('dice').setDescription('Set dice instead of the d20, e.g. 2d6+1').setRequired(false))
+      .addIntegerOption(o=>o.setName('dc').setDescription('The number to beat \u2014 leave it out and every blow is your call').setRequired(false).setMinValue(1).setMaxValue(40))
+      .addStringOption(o=>o.setName('stat').setDescription('Stats to swing with, as few or as many as you like \u2014 blank means all five').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('reason').setDescription('The scene \u2014 shown above it').setRequired(false))
       .addUserOption(o=>o.setName('for').setDescription('Only they may swing').setRequired(false))
-      .addBooleanOption(o=>o.setName('secret').setDescription('true = ask me in the GM channel, not here').setRequired(false)))
+      .addBooleanOption(o=>o.setName('secret').setDescription('true = ask me in the GM channel, not here').setRequired(false))
+      .addStringOption(o=>o.setName('success_flavour').setDescription('What happens on a pass \u2014 offered in your form, posted on a natural 20').setRequired(false))
+      .addStringOption(o=>o.setName('fail_flavour').setDescription('What happens on a fail \u2014 offered in your form, posted on a natural 1').setRequired(false)))
     .addSubcommand(s=>s.setName('list').setDescription('Targets still standing in this channel (GM)')),
 
   new SlashCommandBuilder()
@@ -24222,7 +24410,7 @@ const HELP_CATEGORIES = {
       '_Things a GM plants in the channel for the table to press, and the ways players talk back._',
       '`/button roll stat:dex dc:12 reason:...` \u2014 plant a check anyone may press; `dice:2d6+1` instead of a stat, `for:@Players` to address one person, `once:true` for one press each',
       '`/button group stat:wis dc:12 reason:...` \u2014 one check the whole party rolls; the message keeps the tally and \u2696\uFE0F Call it closes it with how many got through (GM)',
-      '`/target create name:Barricade stat:str dc:12` \u2014 something to strike, with no sheet; a natural 20 beats it and a natural 1 fails on its own, every other hit asks the GM to call it \u2014 **The player passes the check** / **The player fails the check**; `secret:true` asks in the GM log instead \u00b7 `/target list`',
+      '`/target create name:Barricade [dc:12] [stat:Flat d20, STR, DEX] [dice:2d6+1] [success_flavour:] [fail_flavour:]` \u2014 something to strike, with no sheet. A d20 unless `dice:` says otherwise; `stat:` lists as few or as many stats as you like, one button each in that order \u2014 leave it out and all five are buttons; leave `dc:` out and every blow is your call. A press opens a short form \u2014 what they do, what they say, both optional \u2014 and the words land above the roll. A natural 20 beats it (**Roll critically succeeds**) and a natural 1 fails (**Roll critically fails**) on their own, each posting your flavour if set; anything else says **The roll succeeds / fails** and asks you \u2014 **The player passes the check** / **The player fails the check** \u2014 each opening a *What happens?* form prefilled with your flavour (blank still sends the verdict). A fail posts the card again below with its buttons and a counter; `secret:true` asks in the GM log and tells the players **Roll succeeds / fails** in theirs \u00b7 `/target list`',
       '`/dd message:... [header:] [user:@Players] [channels:#one #two]` \u2014 speak AS THE BOT: plain words by default, a bold header only if you write one, in every channel you name (or here); who said it goes to the roll-audit, not the room (GM)',
       '**Edit (DDice)** \u2014 long-press any message the bot sent \u2192 Apps \u2192 Edit (DDice): the text opens prefilled, save replaces it, the roll-audit records what changed. Covers the bot\'s own messages and NPC speech from `/npc say` alike; a line said through a webhook that has since been deleted cannot be edited by anyone \u2014 delete it and say it again (GM)',
       '`/edit` \u2014 the same box without the Apps menu: a dropdown only you see lists the last 25 lines the bot and its NPCs said here, newest first; pick one and the text opens prefilled. `link:` a message link or id goes straight to it. Nothing shows in the channel (GM)',
@@ -24584,58 +24772,22 @@ async function routeButton(interaction) {
       return interaction.update({ content: groupCheckBody(interaction.guild, gidG, mid), components: interaction.message.components });
     }
 
-    if (interaction.customId === 'tgtatk') {
+    if (interaction.customId === 'tgtatk' || interaction.customId.startsWith('tgtatk:')) {
+      // The press opens the roleplay form; the roll happens when it is
+      // submitted (T, 2026-10-13). Both fields are optional — a blank form
+      // is a plain swing.
       const gidT = interaction.guild.id, uidT = interaction.user.id;
-      const t = db.prepare('SELECT * FROM temp_targets WHERE guild_id=? AND message_id=?').get(gidT, interaction.message.id);
-      if (!t) return interaction.reply({ ephemeral: true, content: '\u274C That target is long gone.' });
-      if (t.dead) return interaction.reply({ ephemeral: true, content: `\u274C **${t.name}** has already fallen.` });
+      const t = targetByCard(gidT, interaction.message.id);
+      if (!t) return interaction.reply({ ephemeral: true, content: TARGET_GONE });
+      if (t.dead) return interaction.reply({ ephemeral: true, content: targetFallen(t) });
       if (t.owner && t.owner !== uidT) return interaction.reply({ ephemeral: true, content: '\u274C That one is not addressed to you.' });
-
-      let line, total, passed = null, natT = null, sidesT = 20;
-      if (t.dice) {
-        const rolled = rollNotation(t.dice);
-        if (!rolled) return interaction.reply({ ephemeral: true, content: '\u274C That expression no longer reads.' });
-        total = rolled.total; natT = rolled.rolls[0] ?? null; sidesT = rolled.sides;
-        const mod = rolled.modifier ? ` ${rolled.modifier > 0 ? '+' : ''}${rolled.modifier}` : '';
-        line = `**${t.dice}** \u2014 [${rolled.rolls.join(', ')}]${mod} = **${total}**`;
-      } else {
-        const ch = getChar(gidT, uidT);
-        if (!ch) return interaction.reply({ ephemeral: true, content: '\u274C You need a character sheet \u2014 `/char create`.' });
-        const r = rollDcCheck({ stat: t.stat === 'x' ? null : t.stat, dc: t.dc || 10, flat: t.stat === 'x', subject: ch, sig: ch });
-        if (!r) return interaction.reply({ ephemeral: true, content: '\u274C That check would not roll.' });
-        total = r.total; natT = r.nat; sidesT = r.result?.sides ?? 20;
-        line = r.rollLine;
-      }
-      passed = dcVerdict(natT, sidesT, total, t.dc || null);
-      // A natural 20 or 1 on a d20 settles the check by itself; the GM is
-      // asked only when the die left it open (T, 2026-10-12).
-      const decided = sidesT === 20 && (natT === 20 || natT === 1);
-      db.prepare('UPDATE temp_targets SET hits=hits+1 WHERE guild_id=? AND message_id=?').run(gidT, interaction.message.id);
-
-      const nmT = await getDisplayName(interaction.guild, uidT).catch(() => 'Someone');
-      await logButtonPress(interaction, gidT, uidT, `${t.name}: ${total}${t.dc ? ` vs DC ${t.dc}` : ''}`, passed);
-      await interaction.reply({ content: [
-        `\u2694\uFE0F <@${uidT}> strikes at **${t.name}**`,
-        line,
-        decided ? (passed ? `\u2705 **A natural 20 \u2014 the player passes the check. ${t.name} is beaten.**` : `\u274C **A natural 1 \u2014 the player fails the check. ${t.name} holds.**`)
-          : t.dc ? (passed ? '\u2705 **A telling blow.**' : '\u274C **It glances off.**') : '',
-      ].filter(Boolean).join('\n'), allowedMentions: { users: [uidT] } });
-      if (decided) {
-        if (passed) await settleTarget(interaction.client, gidT, t, interaction.message.id, uidT);
-        return;
-      }
-
-      // The GM's verdict — the only death check there is. In the channel by
-      // default so the table feels it; in the GM channel when `secret`.
-      const { ActionRowBuilder: TR, ButtonBuilder: TB, ButtonStyle: TS } = require('discord.js');
-      const ask = [`\u{1F5E1}\uFE0F **${t.name}** \u2014 struck by ${nmT} for **${total}**${t.dc ? ` vs DC ${t.dc}` : ''}. Your call:`];
-      const rowT = new TR().addComponents(
-        new TB().setCustomId(`tgtdie:${interaction.message.id}:1`).setLabel('\u2705 The player passes the check').setStyle(TS.Success),
-        new TB().setCustomId(`tgtdie:${interaction.message.id}:0`).setLabel('\u274C The player fails the check').setStyle(TS.Secondary));
-      const gmChId = t.secret ? auditDestination(gidT, 'checks') : null;
-      const dest = gmChId ? await interaction.client.channels.fetch(gmChId).catch(() => null) : interaction.channel;
-      await (dest || interaction.channel).send({ content: ask.join('\n'), components: [rowT], allowedMentions: { parse: [] } }).catch(() => {});
-      return;
+      const pick = interaction.customId.split(':')[1] || '-';
+      const { ModalBuilder: TM, TextInputBuilder: TI, TextInputStyle: TIS, ActionRowBuilder: TAR } = require('discord.js');
+      const m = new TM().setCustomId(`tgtrp:${t.message_id}:${pick}`).setTitle(`Strike at ${t.name}`.slice(0, 45));
+      m.addComponents(
+        new TAR().addComponents(new TI().setCustomId('action').setLabel('What do you do? (optional)').setStyle(TIS.Short).setRequired(false).setMaxLength(200)),
+        new TAR().addComponents(new TI().setCustomId('speech').setLabel('What do you say? (optional)').setStyle(TIS.Paragraph).setRequired(false).setMaxLength(500)));
+      return interaction.showModal(m);
     }
 
     if (interaction.customId.startsWith('tgtdie:')) {
@@ -24643,12 +24795,19 @@ async function routeButton(interaction) {
         return interaction.reply({ ephemeral: true, content: '\u274C That call is the GM\'s.' });
       const [, msgId, fellS] = interaction.customId.split(':');
       const gidT = interaction.guild.id;
-      const t = db.prepare('SELECT * FROM temp_targets WHERE guild_id=? AND message_id=?').get(gidT, msgId);
-      if (!t) return interaction.reply({ ephemeral: true, content: '\u274C That target is long gone.' });
+      const t = targetById(gidT, msgId);
+      if (!t) return interaction.reply({ ephemeral: true, content: TARGET_GONE });
+      if (t.dead) return interaction.reply({ ephemeral: true, content: targetFallen(t) });
+      // The call opens a form for what happens, prefilled with the flavour
+      // set at creation; blank sends the bare verdict (T, 2026-10-13).
       const fell = fellS === '1';
-      if (fell) await settleTarget(interaction.client, gidT, t, msgId, interaction.user.id);
-      await interaction.update({ content: `${interaction.message.content}\n${fell ? `\u2705 **The player passes the check \u2014 ${t.name} is beaten.**` : `\u274C **The player fails the check \u2014 ${t.name} holds.**`}`, components: [] }).catch(() => {});
-      return;
+      const { ModalBuilder: VM, TextInputBuilder: VI, TextInputStyle: VIS, ActionRowBuilder: VAR } = require('discord.js');
+      const preset = String((fell ? t.success_text : t.fail_text) || '').slice(0, 1000);
+      const input = new VI().setCustomId('what').setLabel('What happens? (optional)').setStyle(VIS.Paragraph).setRequired(false).setMaxLength(1000);
+      if (preset) input.setValue(preset);
+      const vm = new VM().setCustomId(`tgtnar:${t.message_id}:${fell ? 1 : 0}`).setTitle(`${fell ? 'Pass' : 'Fail'} \u2014 ${t.name}`.slice(0, 45));
+      vm.addComponents(new VAR().addComponents(input));
+      return interaction.showModal(vm);
     }
 
     if (interaction.customId === 'btnfb') {
@@ -24829,6 +24988,7 @@ client.on('interactionCreate', async interaction => {
         return await interaction.respond([...std, ...serverEmojis().filter(c => !acLc || c.name.toLowerCase().includes(acLc))].slice(0, 25)).catch(() => {});
       }
       if (acCmd === 'dnd' && acSub === 'create' && focusedOption.name === 'saves') return await interaction.respond(acLastOf(DND_STATS)).catch(() => {});
+      if (acCmd === 'target' && acSub === 'create' && focusedOption.name === 'stat') return await interaction.respond(acLastOf(TARGET_STAT_CHOICES)).catch(() => {});
       if (acCmd === 'dnd' && acSub === 'create' && focusedOption.name === 'skills') return await interaction.respond(acLastOf(Object.keys(DND_SKILLS))).catch(() => {});
       if (acCmd === 'spell' && (focusedOption.name === 'name' || focusedOption.name === 'add' || focusedOption.name === 'drop')) {
         let prepared = []; try { prepared = JSON.parse(getChar(acGid, interaction.user.id)?.prepared_spells || '[]') || []; } catch {}
@@ -25407,6 +25567,14 @@ client.on('interactionCreate', async interaction => {
       return handleQuest(interaction, { sub: 'archive', number: numA, summary: text, skipSummary: true });
     }
     if (interaction.customId.startsWith('botedit:')) return saveBotEdit(interaction);
+    if (interaction.customId.startsWith('tgtrp:')) {
+      const [, msgId, pick] = interaction.customId.split(':');
+      return strikeTarget(interaction, msgId, pick).catch(e => console.error('[target]', e?.message || e));
+    }
+    if (interaction.customId.startsWith('tgtnar:')) {
+      const [, msgId, fellS] = interaction.customId.split(':');
+      return settleTargetVerdict(interaction, msgId, fellS === '1').catch(e => console.error('[target]', e?.message || e));
+    }
 
     if (interaction.customId.startsWith('fightfeint:')) {
       const targetId = interaction.customId.split(':')[1];
