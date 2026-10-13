@@ -992,6 +992,54 @@ async function fire(over) {
       last ? `${last.name}: ${msgsOf(last)[0]?.slice(0, 160)}` : 'no threads');
   }
 
+  // ── An entry that grew after its thread was posted (two pushes in a day) ──
+  // The newest entry's threads are made to look older than the entry: the
+  // GM one loses its last bullet in the starter and its ledger row (as a
+  // thread from before the ledger would); the players' one loses a bullet
+  // too but has a GM's reply in it. A fifth boot re-posts the first whole
+  // and appends beneath the second.
+  if (dbHandle) {
+    const bad = [];
+    const cfgG = dbHandle.prepare("SELECT gm_updates_forum, updates_forum FROM guild_config WHERE guild_id='G1'").get() || {};
+    const live = (fid) => threads.filter(t => t.parentId === fid && !deleted.includes(t.id));
+    const msgsOf = (t) => sent.filter(x => x.channel === t.id && !deleted.includes(x.msg.id)).map(x => x.msg);
+    const newest = [...src.matchAll(/\{ key: '(\d{4}-\d{2}-\d{2})', gm: \[/g)].map(m => m[1]).sort().pop();
+    const title = (fid) => live(fid).find(t => t.name.startsWith(`[${newest.split('-').reverse().join('/')}]`) && / · What's new$/.test(t.name));
+    const gmT = title(cfgG.gm_updates_forum), plT = title(cfgG.updates_forum);
+    const dropLast = (t) => { const starter = msgsOf(t)[0]; const ls = starter.content.split('\n'); const last = ls.filter(l => l.startsWith('· ')).pop(); starter.content = ls.filter(l => l !== last).join('\n'); return last; };
+    const gmLost = gmT ? dropLast(gmT) : null;
+    dbHandle.prepare("DELETE FROM changelog_posted WHERE guild_id='G1' AND key=? AND audience='gm'").run(newest);
+    const plLost = plT ? dropLast(plT) : null;
+    const plRow = plT ? dbHandle.prepare("SELECT lines FROM changelog_posted WHERE guild_id='G1' AND key=? AND audience='player'").get(newest) : null;
+    if (plT && plRow) dbHandle.prepare("UPDATE changelog_posted SET lines=? WHERE guild_id='G1' AND key=? AND audience='player'").run(JSON.stringify(JSON.parse(plRow.lines).filter(l => l !== plLost.slice(2))), newest);
+    let human = null;
+    if (plT) { human = await plT.send('thanks for this'); human.author = { id: 'U1' }; }
+    const beforeMends = live(cfgG.gm_updates_forum).filter(t => / · Deploy mend$/.test(t.name)).length;
+    const realTimeoutG = globalThis.setTimeout; globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
+    for (const fn of listeners.clientReady || listeners.ready || []) await fn().catch(e => bad.push('ready: ' + e.message));
+    await (lastClient?.mendDone || null);
+    globalThis.setTimeout = realTimeoutG;
+    const gmNow = title(cfgG.gm_updates_forum);
+    const gmRow = dbHandle.prepare("SELECT thread_id, lines FROM changelog_posted WHERE guild_id='G1' AND key=? AND audience='gm'").get(newest);
+    const mendsNow = live(cfgG.gm_updates_forum).filter(t => / · Deploy mend$/.test(t.name)).sort((a, b) => Number(a.id) - Number(b.id));
+    const mendText = mendsNow.length ? msgsOf(mendsNow[mendsNow.length - 1]).map(m => m.content).join('\n') : '';
+    ok('a GM What\'s new thread that lacks a line the entry now has (and no ledger row) is deleted and posted again whole, the ledger written, the Deploy mend saying so',
+      bad.length === 0 && !!gmT && !!gmLost && deleted.includes(gmT.id) && !!gmNow && gmNow.id !== gmT.id
+        && msgsOf(gmNow)[0]?.content.includes(gmLost) && msgsOf(gmNow).some(m => m.content.startsWith('**In detail**'))
+        && gmRow?.thread_id === gmNow.id && JSON.parse(gmRow?.lines || '[]').includes(gmLost.slice(2))
+        && new RegExp(`What.s new ${newest.slice(8, 10)}/${newest.slice(5, 7)} re-posted with 1 new line\\(s\\)`).test(mendText),
+      `${bad.join(' | ')} lost "${(gmLost || '').slice(0, 50)}" · old deleted ${gmT && deleted.includes(gmT.id)} · new ${gmNow?.id} · row ${gmRow?.thread_id} · mend: ${mendText.slice(0, 200)}`);
+    const plNow = title(cfgG.updates_forum);
+    const plMsgs = plT ? msgsOf(plT) : [];
+    ok('a players\' thread someone has written in stays and gains "Added since this was posted" with the missing line',
+      !!plT && !!plLost && !deleted.includes(plT.id) && plNow?.id === plT.id && !deleted.includes(human?.id)
+        && plMsgs.some(m => m.content.startsWith('**Added since this was posted**') && m.content.includes(plLost))
+        && /gained 1 line\(s\) beneath/.test(mendText),
+      `kept ${plT && !deleted.includes(plT.id)} · ${plMsgs.map(m => m.content.slice(0, 40)).join(' | ')}`);
+    ok('the Deploy mend of a boot that grew nothing says nothing about What\'s new',
+      mendsNow.length === beforeMends + 1 && !/re-posted with 0 new|gained 0 line/.test(mendText), `${mendsNow.length} mends (was ${beforeMends})`);
+  }
+
   // ── A target settles itself on a natural 20 or 1; anything else is the GM's call ──
   // Since 2026-10-13 a press opens the roleplay form and the form strikes;
   // nothing named is a d20 with every stat a button; stat: lists as few or

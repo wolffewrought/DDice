@@ -1628,6 +1628,15 @@ function testBuilders(src) {
       /const flavour = decided \? \(passed \? t\.success_text : t\.fail_text\) : null;/.test(src) &&
       /\(swing \$\{swing\}\)\. Your call:/.test(src) &&
       !/A telling blow|It glances off/.test(src));
+    ok('What\'s new keeps a ledger of posted lines; a grown entry is deleted before it is posted again, or appended beneath when someone has written in it',
+      /CREATE TABLE IF NOT EXISTS changelog_posted/.test(src) &&
+      /function recordChangelogPost\(gid, key, audience, threadId, lines\)/.test(src) &&
+      /async function growChangelog\(client, gid, forums\)/.test(src) &&
+      /const added = lines\.filter\(l => !posted\.includes\(l\)\);/.test(src) &&
+      /const gone = foreign \? false : await thread\.delete\(\)\.then\(\(\) => true\)\.catch\(\(\) => false\);/.test(src) &&
+      /\*\*Added since this was posted\*\*/.test(src) &&
+      /made\.push\(\.\.\.await growChangelog\(client, gid, /.test(src) &&
+      (src.match(/recordChangelogPost\(gid, e\.key, /g) || []).length >= 3);
     ok('/target: a fail — the GM\'s call or a natural 1 — posts the card again below, the old one keeps the scene and loses its buttons',
       /async function repostTarget\(client, gid, t\)/.test(src) &&
       /if \(!fell\) await repostTarget\(interaction\.client, gidT, t\);/.test(src) &&

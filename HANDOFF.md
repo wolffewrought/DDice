@@ -49,9 +49,9 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1090 as of 2026-10-13) and no scanner
+Green means every assertion passed (1091 as of 2026-10-13) and no scanner
 found an ERROR. Then run the probe: `node --experimental-sqlite probe.js`
-(98 probes: the fight, encounter, override, autocomplete and every-leaf
+(101 probes: the fight, encounter, override, autocomplete and every-leaf
 walks, the GM-gate walk, chat shorthands, scheduled ticks, junk-id lanes,
 SQL compile, forum seeding and sweep, one NPC one page, and a double-ack
 check).
@@ -716,6 +716,34 @@ with three buttons in order and the flat swing, the autocomplete, the
 refusal, dice, and a secret target whose words reach the players. The
 fake modal now records prefilled values (`modalFields`). 1090 assertions,
 98 probes.
+
+**What's new grows (T, 22:28, screenshot: the 22:03 boot posted a Deploy
+mend and no What's new):** `announceChangelog` announces a key once
+(`changelog_seen`), so a second push on the same day — more lines under
+the same key, exactly what folding a day's work into one entry produces —
+said nothing. The §4 "ask whether pushed" rule only moves the problem; the
+bot now handles it. Table `changelog_posted (guild_id, key, audience,
+thread_id, lines JSON, at)` — `recordChangelogPost` written by
+`postChangelogEntry` (which now takes `gid`) for each thread it makes.
+`growChangelog(client, gid, forums)`, run by bootMend after
+announceChangelog, walks every entry and audience: the row's thread, or —
+no row, thread gone (a tidy re-post, the clean slate) — the thread by its
+title via `datedThreadsOf`, its oldest message's `· ` bullets read back as
+the record; `added` = current lines not in the record. A grown entry is
+deleted and posted again whole through postChangelogEntry (delete before
+create, as the tidy rule says; the forum then shows it on top and the
+tidy pass keeps the Deploy mend above it); a thread someone else has
+written in, or one that will not delete, stays and gets `**Added since
+this was posted**` + the bullets + their In detail (GM) and the row is
+brought up to date. Notes land in the Deploy mend: "gm-updates: What's
+new 13/10 re-posted with 2 new line(s)" / "… gained 1 line(s) beneath —
+someone has written in the thread". The 13/10 entry carries its own line,
+so the first boot after this deploy re-posts the 13/10 threads with
+`/edit`, `/target` and this. Probe: a fifth boot with the newest GM
+thread shorn of its last bullet and its row, and the players' thread
+shorn of a bullet but holding a GM's reply — the first comes back whole
+with the ledger written, the second stays and gains the line beneath, the
+Deploy mend names both. 1091 assertions, 101 probes.
 
 ## 10k · The dead-end pass: eight bugs, a scope scanner, a leaf walk, the re-lay (2026-10-11)
 

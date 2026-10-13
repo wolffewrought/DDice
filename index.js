@@ -181,6 +181,16 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS temp_targets (
   PRIMARY KEY (guild_id, message_id)
 )`); } catch (e) { console.error('temp_targets schema', e); }
 
+// Which lines of each What's new entry a server has been shown, per
+// audience, and the thread that holds them. An entry can grow between two
+// pushes on one day (T, 2026-10-13: the second boot found its date already
+// announced and said nothing); the boot compares and re-posts.
+try { db.exec(`CREATE TABLE IF NOT EXISTS changelog_posted (
+  guild_id TEXT NOT NULL, key TEXT NOT NULL, audience TEXT NOT NULL,
+  thread_id TEXT, lines TEXT NOT NULL, at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, key, audience)
+)`); } catch (e) { console.error('changelog_posted schema', e); }
+
 // A group check: one button, everyone rolls once, the bot tallies. The
 // point is a skill-challenge scene that reads as ONE result rather than
 // twelve separate rolls nobody can hold in their head (T, 2026-08-20).
@@ -19863,6 +19873,8 @@ const CHANGELOG = [
         detail: 'Every NPC page in npc-character-sheets appeared twice, both the same age. Two of the boot\u2019s own tasks (the page migration and the Deploy mend) were writing the forum at the same moment, and a page whose record had gone was simply made again rather than found. Three changes: the boot runs its tasks one after another; a page is written by one writer at a time; and before making a page the bot looks for a thread already bearing the NPC\u2019s exact name and adopts it. The boot mend then folds any duplicates: the recorded thread stays (else the oldest), the rest are deleted unless someone other than the bot has written in them, and the count lands in the Deploy mend \u2014 \u201c2 duplicate NPC page(s) removed\u201d, or \u201cduplicate NPC page left in place: \u2026\u201d for one it would not touch.' },
       { line: '`/target`: a d20 by default, the stats you list as buttons (all five when none), a form on every press and on every verdict, prewritten flavour, and a fail brings the card back below with a counter',
         detail: '`/target create name:Door` now stands on its own: no `dice:` means a d20, no `dc:` means every blow is your call, and `stat:` is a list \u2014 as few or as many as you like, Flat d20 first in the picker then STR, CON, DEX, WIS, LCK \u2014 giving one button each in the order typed; nothing listed gives all five (each a d20 plus that stat, signature advantage applying as on `/gm dc`); `dice:2d6+1` gives one \u2694\uFE0F button. Every press opens a short form \u2014 what they do, what they say, both optional \u2014 and the strike card shows the action in italics and the speech in quotes above the roll line. The wording is new: with a DC the roll line is followed by **The roll succeeds** or **The roll fails**; a natural 20 says **Roll critically succeeds** and beats the target on the spot, a natural 1 **Roll critically fails**; your verdicts read **The player passes the check \u2014 Roll succeeds** / **The player fails the check \u2014 Roll fails**, and your prompt names the swing. Pressing either verdict opens a *What happens?* form, prefilled with `success_flavour:` / `fail_flavour:` if you set them at creation \u2014 send as is, edit, or clear; blank still sends the verdict \u2014 and the words post in italics under it, into the quest log too; on a natural 20 or 1 the matching flavour posts on its own. A fail posts the card again at the bottom with its buttons and \u201c\u{1F501} Reposted N\u00d7 \u2014 M swings so far\u201d; the old card keeps the scene, loses its buttons and says \u201ccontinues below\u201d. With `secret:` the prompt and your form stay in the GM checks shelf and the players get **Roll succeeds** / **Roll fails** with your words in their channel. `for:` is unchanged.' },
+      { line: 'What\'s new keeps up with a day of several pushes: an entry that gains lines after its thread was posted is posted again whole on the next boot',
+        detail: 'The bot announced an entry once per date, so a second push on the same day \u2014 with more lines under that date \u2014 said nothing: the 22:03 boot posted a Deploy mend and no What\'s new. It now keeps a record of which lines each thread holds (a thread older than the record is read back from its own bullets). On boot, an entry that has grown is deleted and posted again complete, with every line and its In detail, so it rises to the top of the forum; if someone other than the bot has written in the thread it stays and gains **Added since this was posted** beneath. The Deploy mend says which entry grew and by how many lines. The players\' forum works the same way.' },
       { line: '`/edit` \u2014 the Edit (DDice) box without the Apps menu: a private dropdown of the last 25 lines the bot and its NPCs said here; pick one, it opens prefilled. Nothing the table sees',
         detail: 'Long-press \u2192 Apps \u2192 DDice \u2192 Edit (DDice) is three taps on a phone, and any reply-based shortcut would have put a button in the channel for everyone. `/edit` answers you alone with a dropdown of the last 25 lines the bot and its NPCs said in this channel or thread, newest first, each labelled by who said it; pick one and the same prefilled box opens, save replaces the text, the dropdown turns into \u201cEdited\u201d, and the roll audit records before and after. `link:` takes a message link or id and skips the list. Lines carrying buttons are not offered, since their text is the bot\u2019s to manage.' },
       { line: 'Edit (DDice) on NPC speech: a line said through a webhook the table had forgotten can be edited again; one said through a webhook that no longer exists says so and what to do',
@@ -19976,7 +19988,14 @@ async function postChangelogDetail(thread, items) {
   if (buf) messages.push(buf);
   for (const m of messages) await thread.send({ content: m, allowedMentions: { parse: [] } }).catch(() => {});
 }
-async function postChangelogEntry(client, forums, e) {
+function recordChangelogPost(gid, key, audience, threadId, lines) {
+  try {
+    db.prepare(`INSERT INTO changelog_posted (guild_id, key, audience, thread_id, lines, at) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(guild_id, key, audience) DO UPDATE SET thread_id=excluded.thread_id, lines=excluded.lines, at=excluded.at`)
+      .run(gid, key, audience, threadId || null, JSON.stringify(lines), Date.now());
+  } catch {}
+}
+async function postChangelogEntry(client, gid, forums, e) {
   // The key is a date (YYYY-MM-DD); noon UTC lands on that calendar date in the table's zone.
   const [ky, km, kd] = e.key.split('-').map(Number);
   const at = Date.UTC(ky, km - 1, kd, 12);
@@ -19984,9 +20003,65 @@ async function postChangelogEntry(client, forums, e) {
     const t = await postDatedThread(client, forums.gm, 'What\'s new', at,
       ['\u{1F4F0} **What\'s new for GMs**', '', ...e.gm.map(x => `\u00b7 ${changelogLine(x)}`)]);
     await postChangelogDetail(t, e.gm);
+    if (t) recordChangelogPost(gid, e.key, 'gm', t.id, e.gm.map(changelogLine));
   }
-  if (e.player.length && forums.player) await postDatedThread(client, forums.player, 'What\'s new', at,
-    ['\u{1F4F0} **What\'s new**', '', ...e.player.map(l => `\u00b7 ${l}`)]);
+  if (e.player.length && forums.player) {
+    const t = await postDatedThread(client, forums.player, 'What\'s new', at,
+      ['\u{1F4F0} **What\'s new**', '', ...e.player.map(l => `\u00b7 ${l}`)]);
+    if (t) recordChangelogPost(gid, e.key, 'player', t.id, [...e.player]);
+  }
+}
+// An entry that gained lines after its thread was posted: the thread is
+// deleted and posted again whole (the tidy rule: delete before creating),
+// unless someone other than the bot has written in it, in which case it
+// stays and the new lines go beneath. A thread older than the ledger is
+// read back from its own bullets first (T, 2026-10-13).
+async function growChangelog(client, gid, forums) {
+  const notes = [];
+  for (const e of CHANGELOG) {
+    const dayKey = e.key.replace(/-/g, '');
+    const shown = `${e.key.slice(8, 10)}/${e.key.slice(5, 7)}`;
+    for (const aud of ['gm', 'player']) {
+      const forumId = forums[aud];
+      const items = aud === 'gm' ? e.gm : e.player;
+      const lines = items.map(changelogLine);
+      if (!forumId || !lines.length) continue;
+      const forum = await client.channels.fetch(forumId).catch(() => null);
+      if (!forum?.threads?.fetchActive) continue;
+      let row = null;
+      try { row = db.prepare('SELECT thread_id, lines FROM changelog_posted WHERE guild_id=? AND key=? AND audience=?').get(gid, e.key, aud); } catch {}
+      let thread = row?.thread_id ? await client.channels.fetch(row.thread_id).catch(() => null) : null;
+      if (thread && !thread.isThread?.()) thread = null;
+      let posted = null;
+      if (thread && row) { try { posted = JSON.parse(row.lines || '[]'); } catch { posted = null; } }
+      if (!thread || !posted) {
+        // Before the ledger, or after a tidy moved it: the thread by its title, its bullets as the record.
+        const mine = (await datedThreadsOf(client, forum)).filter(x => x.kind === 'What\'s new' && x.key === dayKey)
+          .sort((a, b) => (BigInt(a.t.id) < BigInt(b.t.id) ? -1 : 1));
+        thread = mine[0]?.t || null;
+        if (!thread) continue;                       // never posted here: nothing to grow
+        const fetched = await thread.messages.fetch({ limit: 100 }).catch(() => null);
+        const msgs = [...(fetched?.values?.() || [])].sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+        posted = String(msgs[0]?.content || '').split('\n').filter(l => l.startsWith('\u00b7 ')).map(l => l.slice(2));
+        recordChangelogPost(gid, e.key, aud, thread.id, posted);
+      }
+      const added = lines.filter(l => !posted.includes(l));
+      if (!added.length) continue;
+      const fetched = await thread.messages.fetch({ limit: 100 }).catch(() => null);
+      const foreign = [...(fetched?.values?.() || [])].some(m => m.author?.id && m.author.id !== client.user.id);
+      const gone = foreign ? false : await thread.delete().then(() => true).catch(() => false);
+      if (gone) {
+        await postChangelogEntry(client, gid, { gm: aud === 'gm' ? forumId : null, player: aud === 'player' ? forumId : null }, e);
+        notes.push(`${forum.name}: What\u2019s new ${shown} re-posted with ${added.length} new line(s)`);
+      } else {
+        await thread.send({ content: ['**Added since this was posted**', ...added.map(l => `\u00b7 ${l}`)].join('\n'), allowedMentions: { parse: [] } }).catch(() => {});
+        if (aud === 'gm') await postChangelogDetail(thread, items.filter(x => added.includes(changelogLine(x))));
+        recordChangelogPost(gid, e.key, aud, thread.id, lines);
+        notes.push(`${forum.name}: What\u2019s new ${shown} gained ${added.length} line(s) beneath \u2014 ${foreign ? 'someone has written in the thread' : 'the old thread would not delete'}`);
+      }
+    }
+  }
+  return notes;
 }
 // opts.gmAll: post every GM entry again (the catalogue was just wiped),
 // while the players' forum still gets only what it has not seen.
@@ -20005,7 +20080,7 @@ async function announceChangelog(client, guild, opts = {}) {
   const entries = opts.gmAll ? [...CHANGELOG].reverse() : unseen;
   const unseenKeys = new Set(unseen.map(e => e.key));
   for (const e of entries)
-    await postChangelogEntry(client, { gm: forums.gm, player: unseenKeys.has(e.key) ? forums.player : null }, e);
+    await postChangelogEntry(client, gid, { gm: forums.gm, player: unseenKeys.has(e.key) ? forums.player : null }, e);
 }
 
 async function bootMend(client) {
@@ -20036,6 +20111,9 @@ async function bootMend(client) {
       // What changed, if anything is new since the last boot.
       await announceChangelog(client, guild, { gmAll: reseed }).catch(e => console.error('[changelog]', e?.message || e));
       if (reseed) setConfig(gid, { gm_updates_reseeded_at: Date.now() });
+      // An entry that grew since its thread was posted is posted again whole.
+      made.push(...await growChangelog(client, gid, { gm: after.gm_updates_forum || null, player: after.updates_forum || null })
+        .catch(e => { console.error('[changelog-grow]', e?.message || e); return []; }));
       // The first boot with a digest forum posts this week's digest at once
       // rather than leaving the forum empty until the cycle comes round.
       if (after.gm_digest_forum && !after.gm_digest_seeded_at) {
@@ -24301,7 +24379,7 @@ const HELP_CATEGORIES = {
       '`/encounter preset save name:... [merits:] [npcs:Hollow x3, Hollow tank]` \u2014 a saved scene; `/encounter start ... preset:` runs it with the merits set and the monsters summoned as temps \u00b7 `/encounter preset list|remove` (GM)',
       '`/gm check stalled` \u2014 what is waiting on a GM: winding-down runs, quiet encounters, staged parties never launched, idle campaigns, reviews this week. Once a week the same report is posted as a dated thread in the **gm-digest** forum, titled by its Monday (GM)',
       '`/gm check usage` \u2014 sixty days of command use, quietest first \u2014 a report only; nothing is removed by it \u00b7 `/gm check rehearse` \u2014 a private sparring thread against a dummy the bot runs, to try new buttons before the table sees them (GM)',
-      '`/help category:rules` \u2014 the live table rules, as the bot enforces them, for everyone. Every deploy posts **What\'s new** (the summary, then **In detail** beneath it) and **Deploy mend** as dated threads in the **gm-updates** forum, and the player half of the news in **updates** \u2014 the whole back-catalogue is there from the first boot',
+      '`/help category:rules` \u2014 the live table rules, as the bot enforces them, for everyone. Every deploy posts **What\'s new** (the summary, then **In detail** beneath it) and **Deploy mend** as dated threads in the **gm-updates** forum, and the player half of the news in **updates** \u2014 the whole back-catalogue is there from the first boot; a day\'s entry that grows between two pushes is posted again whole',
       '`/instance add|kick|rally|note|pause|resume|complete|show|thread name:...` \u2014 the same by NAME rather than number; leave `name:` blank inside a run\'s own thread (GM)',
       '_One quest at a time: approving someone already seated on a live run prompts for a second press to override (audited), and a launch leaves them an applicant rather than double-booking them._',
       '`/encounter start name:... [merits:] [campaign:] [preset:]` \u2014 a short session run on the fly: no board, no applications. The bot lists every living character with HP and what is holding them; tick who is in it and press **Open the encounter** \u2014 it opens its own thread in quest-instances (where it was called if no forum is set), the party pulled in by mention. Nobody can join by themselves: `/encounter add user:` and `/encounter remove user:` are the GM\'s, run in the encounter\'s thread. `/encounter end [summary:] [title:]` pays out, writes the chronicle and posts the review button. Encounters do not count toward one-quest-at-a-time; one left quiet six hours reminds the room and pings the GMs (GM)',
