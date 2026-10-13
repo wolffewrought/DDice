@@ -128,6 +128,9 @@ class FakeChannel {
     };
     this.permissionOverwrites = { edit: async () => {} };
     this.availableTags = [];
+    // The channel's webhooks, as Discord hands them back: the bot's own carry a token.
+    this._hooks = [];
+    this.fetchWebhooks = async () => new FakeCollection(this._hooks.map(h => [h.id, h]));
   }
   isThread() { return !!this._isThread; }
   isTextBased() { return true; }
@@ -313,6 +316,7 @@ function makeInteraction(over = {}) {
     isAutocomplete: () => !!over.isAutocomplete,
     isMessageContextMenuCommand: () => !!over.isContextMenu,
     targetMessage: over.targetMessage,
+    isFromMessage: () => !!over.fromMessage,
     isCommand: () => !!over.commandName,
     options: {
       getSubcommand: (req) => opts._sub ?? (req === false ? null : null),
@@ -554,6 +558,47 @@ async function fire(over) {
     ok('the NPC edit lands through the webhook', /^That's/.test(npcMsg.content), `content: ${npcMsg.content}`);
     const notMine = { id: 'X1', content: 'hi', author: { id: 'U2' }, channelId: 'C1', components: [] };
     await press('Edit (DDice) on a player message → refusal', { isContextMenu: true, commandName: 'Edit (DDice)', targetMessage: notMine });
+    // A hook the table has forgotten (a clean-up, a restore from backup) that the
+    // channel still carries: the channel is asked, the hook remembered, the edit lands.
+    chan._hooks = [{ id: 'WH2', token: 'tok2', owner: { id: 'BOT' } }, { id: 'WHX', token: 'tokx', owner: { id: 'SOMEONE' } }];
+    const npcMsg2 = await chan.send({ content: 'The road is closed' });
+    npcMsg2.author = { id: 'WH2' }; npcMsg2.webhookId = 'WH2';
+    const e4 = await press('Edit (DDice) on NPC speech through a forgotten hook', { isContextMenu: true, commandName: 'Edit (DDice)', targetMessage: npcMsg2 });
+    ok('NPC speech through a hook the table forgot still opens the modal — the channel is asked for it', /botedit:C1:/.test(JSON.stringify(e4.replies)), JSON.stringify(e4.replies).slice(0, 140));
+    ok('the forgotten hook is remembered once found', !!dbHandle.prepare("SELECT 1 FROM npc_webhooks WHERE guild_id='G1' AND channel_id='C1' AND webhook_id='WH2' AND webhook_token='tok2'").get());
+    await press('botedit modal through the remembered hook → saved', { isModal: true, customId: `botedit:C1:${npcMsg2.id}`, fields: { text: 'The road is open' } });
+    ok('the edit lands through the remembered hook', /^The road is open/.test(npcMsg2.content), npcMsg2.content);
+    // Someone else's hook, and one gone from Discord altogether: refused, with the reason and the remedy.
+    const npcMsgX = await chan.send({ content: 'Not ours' }); npcMsgX.author = { id: 'WHX' }; npcMsgX.webhookId = 'WHX';
+    const e5 = await press('Edit (DDice) on speech through another app\'s hook → refusal', { isContextMenu: true, commandName: 'Edit (DDice)', targetMessage: npcMsgX });
+    const npcMsg3 = await chan.send({ content: 'Said through a hook that is gone' }); npcMsg3.author = { id: 'WH3' }; npcMsg3.webhookId = 'WH3';
+    const e6 = await press('Edit (DDice) on speech through a hook that no longer exists → refusal', { isContextMenu: true, commandName: 'Edit (DDice)', targetMessage: npcMsg3 });
+    ok('speech through a hook that is not the bot\'s, or no longer exists, is refused with the reason and the remedy',
+      [e5, e6].every(e => /no longer hold/.test(JSON.stringify(e.replies)) && /\/npc say/.test(JSON.stringify(e.replies)) && !/botedit:/.test(JSON.stringify(e.replies)))
+        && !dbHandle.prepare("SELECT 1 FROM npc_webhooks WHERE guild_id='G1' AND webhook_id IN ('WHX','WH3')").get(),
+      JSON.stringify([e5.replies, e6.replies]).slice(0, 200));
+    // /edit: the same box from a private dropdown — no Apps menu, nothing the table sees (T, 2026-10-13).
+    const withButtons = await chan.send({ content: 'a card with buttons', components: [{ _d: { components: [] } }] });
+    const edL = await press('/edit lists the last lines here', { commandName: 'edit', options: {} });
+    const edMenu = edL.replies[0]?.components?.[0]?._d?.components?.[0]?._d;
+    const edOpts = edMenu?.options || [];
+    ok('/edit answers privately with a dropdown of the bot\'s and NPCs\' lines here, newest first, buttons left out',
+      edL.replies[0]?.ephemeral === true && edMenu?.customId === 'editpick' && edOpts.length > 0 && edOpts.length <= 25
+        && edOpts.some(o => o.value === npcMsg2.id) && edOpts.some(o => o.value === botMsg.id)
+        && !edOpts.some(o => o.value === notMine.id) && !edOpts.some(o => o.value === withButtons.id)
+        && edOpts.every(o => o.label.length <= 100 && o.label.length > 0)
+        && edOpts.map(o => o.value).join(',') === [...edOpts].sort((a, b) => (BigInt(a.value) < BigInt(b.value) ? 1 : -1)).map(o => o.value).join(','),
+      `${edOpts.length} option(s): ${JSON.stringify(edOpts.slice(0, 3))}`);
+    const edP = await press('editpick → modal', { isSelect: true, customId: 'editpick', values: [npcMsg2.id], message: edL.replies[0] });
+    ok('picking a line opens the box prefilled', /botedit:C1:/.test(JSON.stringify(edP.replies)), JSON.stringify(edP.replies).slice(0, 120));
+    const edS = await press('botedit modal from the dropdown → saved', { isModal: true, fromMessage: true, customId: `botedit:C1:${npcMsg2.id}`, fields: { text: 'The road is open again' } });
+    ok('a save from the dropdown edits the line and turns the dropdown into the receipt',
+      /^The road is open again/.test(npcMsg2.content) && edS.replies.some(r => /Edited/.test(r.content || '') && Array.isArray(r.components) && r.components.length === 0),
+      `${npcMsg2.content} · ${JSON.stringify(edS.replies).slice(0, 120)}`);
+    const edLink = await press('/edit link: → modal straight away', { commandName: 'edit', options: { link: `https://discord.com/channels/G1/C1/${botMsg.id}` } });
+    ok('/edit link: opens the box for that message without the list', /botedit:C1:/.test(JSON.stringify(edLink.replies)), JSON.stringify(edLink.replies).slice(0, 120));
+    const edBad = await press('/edit link: from another server → refusal', { commandName: 'edit', options: { link: `https://discord.com/channels/G9/C1/${botMsg.id}` } });
+    ok('/edit link: refuses a link from another server', /not a message link or id from this server/.test(JSON.stringify(edBad.replies)), JSON.stringify(edBad.replies).slice(0, 120));
     // Archive: a bare archive opens the final-word box; the modal replays it.
     dbHandle.prepare(`INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at) VALUES ('G1', 903, 'Done Run', 'completed', 'quest', 0)`).run();
     const a1 = await press('archive without summary → modal', { commandName: 'quest', options: { _sub: 'archive', number: 903 } });
@@ -979,6 +1024,43 @@ async function fire(over) {
     ok('any other roll asks the GM to call it, with the two verdict buttons',
       !!rMid && rMid.asked && rMid.dead === 0 && rMid.buttons.some(l => /The player passes the check/.test(l)) && rMid.buttons.some(l => /The player fails the check/.test(l)),
       rMid ? `asked ${rMid.asked} · dead ${rMid.dead} · buttons ${rMid.buttons.join(' | ')}` : 'no target planted');
+  }
+
+  // ── One NPC, one page ───────────────────────────────────────────────
+  // T's screenshot (2026-10-13): every NPC page twice, sixteen minutes old —
+  // two boot tasks writing the forum at once, and a page whose row was lost
+  // being made again. Three guards: one writer per page at a time, adoption
+  // of the thread already bearing the name, and the mend folding copies back.
+  if (dbHandle) {
+    let npcForum = [...channelsById.values()].find(c => c.type === 15 && c.name === 'npc-character-sheets');
+    if (!npcForum) { npcForum = new FakeChannel(nextId(), 15, 'npc-character-sheets', guild); channelsById.set(npcForum.id, npcForum); }
+    dbHandle.prepare("UPDATE guild_config SET npc_forum=? WHERE guild_id='G1'").run(npcForum.id);
+    const NAME = 'Probe Hollow';
+    dbHandle.prepare("INSERT OR REPLACE INTO npcs (guild_id, name, str, con, dex, wis, lck, hp_current) VALUES ('G1', ?, 3, 3, 3, 3, 3, 7)").run(NAME);
+    dbHandle.prepare("DELETE FROM npc_pages WHERE guild_id='G1' AND name=?").run(NAME);
+    const pages = () => threads.filter(t => t.parentId === npcForum.id && !deleted.includes(t.id) && t.name === NAME);
+    const rowOf = () => dbHandle.prepare("SELECT thread_id, message_id FROM npc_pages WHERE guild_id='G1' AND name=?").get(NAME);
+    const sync = () => fire({ commandName: 'npc', options: { _group: 'manage', _sub: 'sync', name: NAME }, userId: 'U1' }).catch(() => null);
+    const realTimeoutN = globalThis.setTimeout; globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
+    const realErrN = console.error; const loggedN = []; console.error = (...a) => { loggedN.push(a.map(String).join(' ')); };
+    await Promise.all([sync(), sync()]);
+    ok('two writers making one NPC\'s page at once make one thread, not two', pages().length === 1 && rowOf()?.thread_id === pages()[0]?.id, `${pages().length} page(s) · row ${rowOf()?.thread_id} · ${loggedN[0] || ''}`);
+    const firstId = pages()[0]?.id;
+    dbHandle.prepare("DELETE FROM npc_pages WHERE guild_id='G1' AND name=?").run(NAME);
+    await sync();
+    ok('a page whose row was lost is adopted by its name, not made again', pages().length === 1 && pages()[0].id === firstId && rowOf()?.thread_id === firstId, `${pages().length} page(s) · row ${rowOf()?.thread_id} · first ${firstId}`);
+    // Two stray copies, one archived, and a third someone wrote in: the mend folds the first two, reports the third.
+    const dup1 = await npcForum.threads.create({ name: NAME, message: { content: 'copy one' } });
+    const dup2 = await npcForum.threads.create({ name: NAME, message: { content: 'copy two' } }); dup2.archived = true;
+    const dup3 = await npcForum.threads.create({ name: NAME, message: { content: 'copy three' } });
+    const human = await dup3.send('a GM wrote here'); human.author = { id: 'U1' };
+    const mendR = await fire({ commandName: 'gm', options: { _group: 'check', _sub: 'run' }, userId: 'U1' }).catch(() => ({ replies: [] }));
+    const mendSaid = mendR.replies.map(x => x.content || JSON.stringify(x)).join(' ') + ' ' + sent.slice(-40).map(x => x.content).join(' ');
+    ok('the mend folds duplicate pages back to the recorded one, leaves a copy someone wrote in, and reports both',
+      deleted.includes(dup1.id) && deleted.includes(dup2.id) && !deleted.includes(dup3.id) && !deleted.includes(firstId) && pages().length === 2 && rowOf()?.thread_id === firstId
+        && /2 duplicate NPC page\(s\) removed/.test(mendSaid) && /duplicate NPC page left in place: Probe Hollow \(someone wrote in the copy\)/.test(mendSaid),
+      `dup1 ${deleted.includes(dup1.id)} dup2 ${deleted.includes(dup2.id)} dup3 kept ${!deleted.includes(dup3.id)} · ${pages().length} page(s) · row ${rowOf()?.thread_id} · ${mendSaid.replace(/\s+/g, ' ').slice(0, 200)}`);
+    globalThis.setTimeout = realTimeoutN; console.error = realErrN;
   }
 
   // ── No button, modal or select id throws on a junk payload ──────────

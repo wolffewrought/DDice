@@ -7867,7 +7867,35 @@ async function ensureCategoryThread(client, forum, gid, category, tagMap, kind =
 
 // Make the entry, or bring it up to date. Best-effort throughout: an NPC is
 // saved whether or not the forum takes them.
+// Every thread the bot owns in a forum, live and archived, by name — so a
+// page whose row was lost (or never written) is found again rather than
+// made twice (T's screenshot, 2026-10-13: every NPC twice, 16 minutes old).
+async function botThreadsNamed(client, forum) {
+  const byName = new Map();
+  for (const fetch of [() => forum.threads.fetchActive(), () => forum.threads.fetchArchived?.({ limit: 100 })]) {
+    const got = await Promise.resolve().then(fetch).catch(() => null);
+    for (const t of got?.threads?.values?.() || []) {
+      if (t.ownerId && t.ownerId !== client.user.id) continue;
+      const k = String(t.name || '').toLowerCase();
+      if (!byName.has(k)) byName.set(k, []);
+      if (!byName.get(k).some(x => x.id === t.id)) byName.get(k).push(t);
+    }
+  }
+  return byName;
+}
+
+// One writer per NPC page at a time: two callers in flight at once (a
+// migration beside the boot mend, say) share the first one's promise
+// instead of each making a thread.
+const npcPageInFlight = new Map();
 async function mirrorNpcSheet(client, gid, name) {
+  const key = `${gid}\u0000${String(name).toLowerCase()}`;
+  if (npcPageInFlight.has(key)) return npcPageInFlight.get(key);
+  const p = mirrorNpcSheetNow(client, gid, name).finally(() => npcPageInFlight.delete(key));
+  npcPageInFlight.set(key, p);
+  return p;
+}
+async function mirrorNpcSheetNow(client, gid, name) {
   const forumId = getConfig(gid)?.npc_forum;
   if (!forumId) return null;
   const npc = getNpc(gid, name);
@@ -7894,6 +7922,22 @@ async function mirrorNpcSheet(client, gid, name) {
   // mismatch reads as "no thread yet": build theirs, overwrite the row.
   if (thread && thread.name !== name.slice(0, 100)) thread = null;
 
+  // No usable row: before making a thread, look for the NPC's own already in
+  // the forum — the oldest one the bot made with exactly this name — and
+  // adopt it. A lost row must never cost a second page.
+  if (!thread) {
+    const found = (await botThreadsNamed(client, forum)).get(name.slice(0, 100).toLowerCase()) || [];
+    const oldest = found.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1))[0];
+    if (oldest) {
+      thread = oldest;
+      db.prepare(`INSERT INTO npc_pages (guild_id, name, thread_id, message_id, at) VALUES (?,?,?,?,?)
+                  ON CONFLICT(guild_id, name) DO UPDATE SET thread_id=excluded.thread_id,
+                    message_id=excluded.message_id, at=excluded.at`)
+        .run(gid, name, thread.id, thread.id, Date.now());
+      row = { thread_id: thread.id, message_id: thread.id };
+    }
+  }
+
   if (!thread) {
     thread = await forum.threads.create({
       name: name.slice(0, 100),
@@ -7913,11 +7957,43 @@ async function mirrorNpcSheet(client, gid, name) {
   if (thread.name !== name.slice(0, 100)) await thread.setName(name.slice(0, 100)).catch(() => {});
   const haveTags = [...(thread.appliedTags || [])].sort().join(',');
   if (haveTags !== [...applied].sort().join(',')) await thread.setAppliedTags(applied).catch(() => {});
-  const msg = await thread.messages.fetch(row.message_id || thread.id).catch(() => null);
+  const msg = await thread.messages.fetch(row?.message_id || thread.id).catch(() => null);
   if (msg) { await msg.edit({ content: body, allowedMentions: { parse: [] } }).catch(() => {}); return thread; }
   const m = await thread.send({ content: body, allowedMentions: { parse: [] } }).catch(() => null);
   if (m) db.prepare('UPDATE npc_pages SET message_id=?, at=? WHERE guild_id=? AND name=?').run(m.id, Date.now(), gid, name);
   return thread;
+}
+
+// Duplicate pages — two or more bot threads with one NPC's name — are
+// folded back to one: the recorded thread stays (else the oldest), the rest
+// go unless someone other than the bot has written in them. Run by the
+// boot mend, reported in the Deploy mend.
+async function dedupeNpcPages(client, gid) {
+  const forumId = getConfig(gid)?.npc_forum;
+  if (!forumId) return { removed: 0, kept: [] };
+  const forum = await client.channels.fetch(forumId).catch(() => null);
+  if (!forum?.threads?.fetchActive) return { removed: 0, kept: [] };
+  const byName = await botThreadsNamed(client, forum);
+  let removed = 0; const kept = [];
+  for (const npc of getAllNpcs(gid)) {
+    const list = byName.get(npc.name.slice(0, 100).toLowerCase()) || [];
+    if (list.length < 2) continue;
+    const row = db.prepare('SELECT thread_id FROM npc_pages WHERE guild_id=? AND name=?').get(gid, npc.name);
+    const sorted = [...list].sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+    const keep = sorted.find(t => t.id === row?.thread_id) || sorted[0];
+    if (keep.id !== row?.thread_id)
+      db.prepare(`INSERT INTO npc_pages (guild_id, name, thread_id, message_id, at) VALUES (?,?,?,?,?)
+                  ON CONFLICT(guild_id, name) DO UPDATE SET thread_id=excluded.thread_id, message_id=excluded.message_id, at=excluded.at`)
+        .run(gid, npc.name, keep.id, keep.id, Date.now());
+    for (const t of sorted) {
+      if (t.id === keep.id) continue;
+      const fetched = await t.messages.fetch({ limit: 100 }).catch(() => null);
+      const foreign = [...(fetched?.values?.() || [])].some(m => m.author?.id && m.author.id !== client.user.id);
+      if (foreign) { kept.push(`${npc.name} (someone wrote in the copy)`); continue; }
+      if (await t.delete().then(() => true).catch(() => false)) removed++;
+    }
+  }
+  return { removed, kept };
 }
 
 // The portrait forum, laid out to match the page forum: a thread per
@@ -19774,6 +19850,14 @@ async function sweepOldUpdatePosts(client, gid) {
 }
 
 const CHANGELOG = [
+  { key: '2026-10-13', gm: [
+      { line: 'One NPC, one page: the boot no longer makes a second copy of every NPC page, and copies already made are folded back to one on the next boot',
+        detail: 'Every NPC page in npc-character-sheets appeared twice, both the same age. Two of the boot\u2019s own tasks (the page migration and the Deploy mend) were writing the forum at the same moment, and a page whose record had gone was simply made again rather than found. Three changes: the boot runs its tasks one after another; a page is written by one writer at a time; and before making a page the bot looks for a thread already bearing the NPC\u2019s exact name and adopts it. The boot mend then folds any duplicates: the recorded thread stays (else the oldest), the rest are deleted unless someone other than the bot has written in them, and the count lands in the Deploy mend \u2014 \u201c2 duplicate NPC page(s) removed\u201d, or \u201cduplicate NPC page left in place: \u2026\u201d for one it would not touch.' },
+      { line: '`/edit` \u2014 the Edit (DDice) box without the Apps menu: a private dropdown of the last 25 lines the bot and its NPCs said here; pick one, it opens prefilled. Nothing the table sees',
+        detail: 'Long-press \u2192 Apps \u2192 DDice \u2192 Edit (DDice) is three taps on a phone, and any reply-based shortcut would have put a button in the channel for everyone. `/edit` answers you alone with a dropdown of the last 25 lines the bot and its NPCs said in this channel or thread, newest first, each labelled by who said it; pick one and the same prefilled box opens, save replaces the text, the dropdown turns into \u201cEdited\u201d, and the roll audit records before and after. `link:` takes a message link or id and skips the list. Lines carrying buttons are not offered, since their text is the bot\u2019s to manage.' },
+      { line: 'Edit (DDice) on NPC speech: a line said through a webhook the table had forgotten can be edited again; one said through a webhook that no longer exists says so and what to do',
+        detail: 'Long-press an NPC\u2019s line \u2192 Apps \u2192 Edit (DDice) used to answer \u201cI can only edit what I posted\u201d whenever the bot\u2019s own record of the channel\u2019s webhook was missing \u2014 after a webhook clean-up, a restore from backup, or a thread whose parent was not to hand \u2014 though the hook was still the bot\u2019s. The channel is now asked for its webhooks before refusing; the bot\u2019s own is remembered and the edit goes through. A line said through a hook that has since been deleted cannot be edited by anyone \u2014 Discord ties the edit to the hook \u2014 so the answer says that plainly: delete it and have the NPC say it again with `/npc say`.' },
+    ], player: [] },
   { key: '2026-10-12', gm: [
       { line: 'A list everywhere a field has one to offer: `/char set value:`, saved sheets, weapon stats, 5e saves and skills, spells, ranks, titles, groups, preset monsters, rest amounts, emojis, `/gm search`, the backup channel',
         detail: '`/char set field:Weapon 2 Emoji` used to leave `value:` as a bare text box, so there was nothing to pick from and no way to know what would be accepted. Every field whose answer comes from a known set now autocompletes from it: `/char set value:` follows the field (emojis, orders, classes, weapons, a number handed back); `/char profile save|load slotname:` your saves; `/char weapon add|stats atk:|def:` the stat combinations and `any`; `/dnd create saves:|skills:` complete the next item of a comma list; `/spell cast|prepare` the library and what you have prepared; `/standing rank add`, `title grant|revoke`, `association add|remove` the ranks, titles and groups the server has (revoke and remove list only what that person holds); `/quest run complete title:` and `/encounter end title:` the titles already given; `/encounter preset save npcs:` the library and your NPCs, item by item; `/config mechanics rest|autorest` the amounts (100%, 50%, +25%, 0%); `/char weaponemoji custom:` and `/char tag custom emoji:` the server\'s own emojis; `/activity set` the activities, their scenes and the NPCs; `/gm search name:` every character and NPC; `/gm backup auto channel:` off or a channel. Where a new name is the point, what you typed leads the list, so free entry still works.' },
@@ -20128,6 +20212,11 @@ async function mendEverything(client, guild, { log = () => {} } = {}) {
     }
   } catch {}
   if (npcs) made.push(`${npcs} NPC page(s)`);
+  try {
+    const d = await dedupeNpcPages(client, gid);
+    if (d.removed) made.push(`${d.removed} duplicate NPC page(s) removed`);
+    for (const k of d.kept) made.push(`duplicate NPC page left in place: ${k}`);
+  } catch (e) { console.error('[mend] npc dedupe', e?.message || e); }
 
   // Campaign cards: a card per campaign in the campaigns forum.
   let camps = 0;
@@ -21784,17 +21873,97 @@ function ownWebhookFor(gid, channel, webhookId) {
     return new WebhookClient({ id: hit.webhook_id, token: hit.webhook_token });
   } catch { return null; }
 }
+// The stored row can be gone (a webhook clean-up, a reshuffle, a message
+// older than the shared hook) while the hook itself still exists on the
+// channel and is the bot's. Discord hands the bot its own hooks' tokens,
+// so ask the channel before refusing; a hit is remembered for next time.
+async function ownWebhookForAsync(client, gid, channel, webhookId) {
+  const quick = ownWebhookFor(gid, channel, webhookId);
+  if (quick) return quick;
+  try {
+    const host = webhookHost(channel) || (channel?.parentId ? await client.channels.fetch(channel.parentId).catch(() => null) : null);
+    if (!host?.fetchWebhooks) return null;
+    const hooks = await host.fetchWebhooks();
+    const own = hooks.find(h => h.id === webhookId && h.owner?.id === client.user.id && h.token);
+    if (!own) return null;
+    setNpcWebhookFor(gid, host.id, `\u0000hook:${own.id}`, own.id, own.token, null);
+    const { WebhookClient } = require('discord.js');
+    return new WebhookClient({ id: own.id, token: own.token });
+  } catch { return null; }
+}
 
+const EDIT_GM_ONLY = '\u274C Only GMs can edit what the bot said.';
 async function openBotEdit(interaction) {
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ ephemeral: true, content: EDIT_GM_ONLY });
+  const msg = interaction.targetMessage;
+  const channel = interaction.channel || await interaction.client.channels.fetch(interaction.channelId).catch(() => null);
+  return openEditModal(interaction, msg, channel);
+}
+
+// The same box, reached privately: /edit lists the last lines the bot and
+// its NPCs said here in a dropdown only the GM sees, and a pick opens the
+// box prefilled; link: goes straight to one message. Nothing lands in the
+// channel — the Apps menu was three taps and a reply route would have
+// shown the table a button (T, 2026-10-13).
+const EDIT_LIST_FETCH = 100;
+function editLineLabel(m) {
+  const who = m.webhookId ? (m.author?.username || 'NPC') : 'DDice';
+  const text = String(m.content || '').replace(/\s+/g, ' ').trim();
+  return `${who}: ${text}`.slice(0, 100);
+}
+async function handleEdit(interaction) {
   const gid = interaction.guild.id;
   if (!(await isGm(interaction.guild, interaction.user.id)))
-    return interaction.reply({ ephemeral: true, content: '\u274C Only GMs can edit what the bot said.' });
-  const msg = interaction.targetMessage;
+    return interaction.reply({ ephemeral: true, content: EDIT_GM_ONLY });
+  const link = (interaction.options.getString('link') || '').trim();
+  if (link) {
+    const m = /channels\/([^/\s]+)\/([^/\s]+)\/(\d+)/.exec(link);
+    const channelId = m ? m[2] : interaction.channelId;
+    const messageId = m ? m[3] : (/^\d{15,22}$/.test(link) ? link : null);
+    if (!messageId || (m && m[1] !== gid))
+      return interaction.reply({ ephemeral: true, content: '\u274C That is not a message link or id from this server.' });
+    const ch = await interaction.client.channels.fetch(channelId).catch(() => null);
+    const msg = ch ? await ch.messages.fetch(messageId).catch(() => null) : null;
+    if (!msg) return interaction.reply({ ephemeral: true, content: '\u274C I cannot see that message.' });
+    return openEditModal(interaction, msg, ch);
+  }
+  const channel = interaction.channel || await interaction.client.channels.fetch(interaction.channelId).catch(() => null);
+  const fetched = channel?.messages ? await channel.messages.fetch({ limit: EDIT_LIST_FETCH }).catch(() => null) : null;
+  const mine = [...(fetched?.values?.() || [])]
+    .filter(m => (m.author?.id === interaction.client.user.id || m.webhookId) && String(m.content || '').trim() && !(m.components?.length))
+    .sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? 1 : -1))
+    .slice(0, 25);
+  if (!mine.length)
+    return interaction.reply({ ephemeral: true, content: `\u274C Nothing of mine to edit in the last ${EDIT_LIST_FETCH} messages here.` });
+  const { ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
+  const row = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId('editpick').setPlaceholder('Which line?')
+      .addOptions(mine.map(m => ({ label: editLineLabel(m), value: m.id, emoji: m.webhookId ? '\u{1F3AD}' : '\u{1F3B2}' }))));
+  return interaction.reply({ ephemeral: true, components: [row],
+    content: `\u270F\uFE0F **Which line?** The last ${mine.length} the bot and its NPCs said here, newest first \u2014 pick one and the text opens for editing.` });
+}
+async function pickEditTarget(interaction) {
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ ephemeral: true, content: EDIT_GM_ONLY });
+  const id = interaction.values?.[0];
+  const channel = interaction.channel || await interaction.client.channels.fetch(interaction.channelId).catch(() => null);
+  const msg = id && channel?.messages ? await channel.messages.fetch(id).catch(() => null) : null;
+  if (!msg) return interaction.reply({ ephemeral: true, content: '\u274C That message is gone.' });
+  return openEditModal(interaction, msg, channel);
+}
+
+async function openEditModal(interaction, msg, channel) {
+  const gid = interaction.guild.id;
   // NPC speech is posted by a webhook the bot owns; the message's author is
   // the webhook, and the bot keeps its id and token per channel. So a
-  // webhook message counts as ours when the hook is ours (T, 2026-09-29).
-  const hook = msg?.webhookId ? ownWebhookFor(gid, interaction.channel, msg.webhookId) : null;
-  if (!msg || (msg.author?.id !== interaction.client.user.id && !hook))
+  // webhook message counts as ours when the hook is ours (T, 2026-09-29) —
+  // asked of the channel itself when the stored row has gone (2026-10-13).
+  const hook = msg?.webhookId ? await ownWebhookForAsync(interaction.client, gid, channel, msg.webhookId) : null;
+  if (!msg) return interaction.reply({ ephemeral: true, content: '\u274C I cannot see that message.' });
+  if (msg.webhookId && !hook)
+    return interaction.reply({ ephemeral: true, content: '\u274C That was said through a webhook I no longer hold, so Discord will not let anyone edit it. Delete it and have the NPC say it again with `/npc say`.' });
+  if (msg.author?.id !== interaction.client.user.id && !hook)
     return interaction.reply({ ephemeral: true, content: '\u274C I can only edit what I posted \u2014 my own messages and my NPCs\u2019 speech.' });
   if (msg.components?.length)
     return interaction.reply({ ephemeral: true, content: '\u274C That message carries buttons; its text is managed by the bot and should not be hand-edited.' });
@@ -21810,17 +21979,17 @@ async function saveBotEdit(interaction) {
   const [, channelId, messageId] = interaction.customId.split(':');
   const gid = interaction.guild.id;
   if (!(await isGm(interaction.guild, interaction.user.id)))
-    return interaction.reply({ ephemeral: true, content: '\u274C Only GMs can edit what the bot said.' });
+    return interaction.reply({ ephemeral: true, content: EDIT_GM_ONLY });
   const text = interaction.fields.getTextInputValue('text');
   if (!text.trim()) return interaction.reply({ ephemeral: true, content: '\u274C Nothing to save \u2014 the message cannot be emptied.' });
   const ch = await interaction.client.channels.fetch(channelId).catch(() => null);
   const msg = ch ? await ch.messages.fetch(messageId).catch(() => null) : null;
-  if (!msg || (msg.author?.id !== interaction.client.user.id && !(msg.webhookId && ownWebhookFor(gid, ch, msg.webhookId))))
+  const hook = msg?.webhookId ? await ownWebhookForAsync(interaction.client, gid, ch, msg.webhookId) : null;
+  if (!msg || (msg.author?.id !== interaction.client.user.id && !hook))
     return interaction.reply({ ephemeral: true, content: '\u274C That message is gone, or not mine.' });
   const before = String(msg.content || '');
   let ok2;
   if (msg.webhookId) {
-    const hook = ownWebhookFor(gid, ch, msg.webhookId);
     if (!hook) return interaction.reply({ ephemeral: true, content: '\u274C That was said through a webhook I no longer hold.' });
     const inThread = typeof ch.isThread === 'function' && ch.isThread();
     ok2 = await hook.editMessage(messageId, { content: text.slice(0, 2000), ...(inThread ? { threadId: ch.id } : {}) })
@@ -21832,6 +22001,11 @@ async function saveBotEdit(interaction) {
   const gmName = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'a GM');
   sendRollAudit(interaction.client, gid,
     `\u270F\uFE0F Edit \u2014 **${gmName}** in <#${channelId}>: \u201c${before.slice(0, 80)}${before.length > 80 ? '\u2026' : ''}\u201d \u2192 \u201c${text.slice(0, 80)}${text.length > 80 ? '\u2026' : ''}\u201d`);
+  // Opened from /edit's dropdown: that private message becomes the receipt.
+  if (interaction.isFromMessage?.()) {
+    const swapped = await interaction.update({ content: '\u2705 Edited.', components: [] }).then(() => true).catch(() => false);
+    if (swapped) return;
+  }
   return interaction.reply({ ephemeral: true, content: '\u2705 Edited.' });
 }
 
@@ -23611,6 +23785,13 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
     .addUserOption(o=>o.setName('user').setDescription('Someone to address by name').setRequired(false))
     .addStringOption(o=>o.setName('channels').setDescription('Where to say it \u2014 #one #two #three; blank means here').setRequired(false)),
 
+  // /edit — the Edit (DDice) box without the Apps menu: a dropdown only the
+  // GM sees of the last lines the bot and its NPCs said here; a pick opens
+  // the box prefilled. Nothing lands in the channel (T, 2026-10-13).
+  new SlashCommandBuilder()
+    .setName('edit').setDescription('Fix a line the bot or an NPC said here \u2014 a private list, the text opens prefilled (GM)')
+    .addStringOption(o=>o.setName('link').setDescription('A message link or id to go straight to it \u2014 blank lists the last 25 here').setRequired(false)),
+
   new SlashCommandBuilder()
     .setName('encounter').setDescription('A short session run on the fly \u2014 no board, no applications (GM)')
     .addSubcommand(s=>s.setName('start').setDescription('Begin one \u2014 pick the party; it opens its own thread (GM)')
@@ -24043,7 +24224,8 @@ const HELP_CATEGORIES = {
       '`/button group stat:wis dc:12 reason:...` \u2014 one check the whole party rolls; the message keeps the tally and \u2696\uFE0F Call it closes it with how many got through (GM)',
       '`/target create name:Barricade stat:str dc:12` \u2014 something to strike, with no sheet; a natural 20 beats it and a natural 1 fails on its own, every other hit asks the GM to call it \u2014 **The player passes the check** / **The player fails the check**; `secret:true` asks in the GM log instead \u00b7 `/target list`',
       '`/dd message:... [header:] [user:@Players] [channels:#one #two]` \u2014 speak AS THE BOT: plain words by default, a bold header only if you write one, in every channel you name (or here); who said it goes to the roll-audit, not the room (GM)',
-      '**Edit (DDice)** \u2014 long-press any message the bot sent \u2192 Apps \u2192 Edit (DDice): the text opens prefilled, save replaces it, the roll-audit records what changed. Covers the bot\'s own messages and NPC speech from `/npc say` alike (GM)',
+      '**Edit (DDice)** \u2014 long-press any message the bot sent \u2192 Apps \u2192 Edit (DDice): the text opens prefilled, save replaces it, the roll-audit records what changed. Covers the bot\'s own messages and NPC speech from `/npc say` alike; a line said through a webhook that has since been deleted cannot be edited by anyone \u2014 delete it and say it again (GM)',
+      '`/edit` \u2014 the same box without the Apps menu: a dropdown only you see lists the last 25 lines the bot and its NPCs said here, newest first; pick one and the text opens prefilled. `link:` a message link or id goes straight to it. Nothing shows in the channel (GM)',
       '`/feedback send [room:] [quest:]` \u2014 name a room to go straight to the form, or leave it blank for a menu; score it out of ten, say your piece; only GMs see it. Name a run you were on (or ran) and the card says which',
       '`/feedback category add|remove|list` \u2014 the rooms feedback lands in (GM) \u00b7 `/button feedback` plants a standing feedback button',
       '_A completed run posts its own \u{1F4DD} review button in its thread; `/quest show` then carries the count, the average \u2b50 and the latest lines._',
@@ -25291,6 +25473,9 @@ client.on('interactionCreate', async interaction => {
   if (interaction.isStringSelectMenu?.() && interaction.customId.startsWith('encpick:')) {
     return handleEncounterPick(interaction).catch(e => console.error('[encpick]', e?.message || e));
   }
+  if (interaction.isStringSelectMenu?.() && interaction.customId === 'editpick') {
+    return pickEditTarget(interaction).catch(e => console.error('[editpick]', e?.message || e));
+  }
   if (interaction.isStringSelectMenu?.() && (interaction.customId === 'fbcat' || interaction.customId?.startsWith('fbcat:'))) {
     const key = interaction.values[0];
     const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
@@ -25447,6 +25632,7 @@ client.on('interactionCreate', async interaction => {
     }
     if (interaction.commandName === 'instance') return await handleInstance(interaction);
     if (interaction.commandName === 'dd') return await handleDd(interaction);
+    if (interaction.commandName === 'edit') return await handleEdit(interaction);
     if (interaction.commandName === 'encounter') return await handleEncounter(interaction);
     if (interaction.commandName === 'campaign') return await handleCampaign(interaction);
     if (interaction.commandName === 'target') return await handleTarget(interaction);
@@ -25661,13 +25847,17 @@ client.once('clientReady', async () => {  // 'ready' is deprecated in favour of 
     await registerSlashCommands(guild.id).catch(console.error);
   }
   // One-time reshapes run here, in the room actually named ready — not
-  // riding registration, where they first landed by a bad anchor.
-  runRenameMigration(client).catch(err => console.error('[run-rename]', err?.message || err));
-  npcThreadMigration(client).catch(err => console.error('[npc-threads]', err?.message || err));
-  forumSetupMigration(client).catch(err => console.error('[gm-forum]', err?.message || err));
-  // Kept on the client so a harness can await the mend; the bot itself never waits on it.
-  client.mendDone = bootMend(client).catch(err => console.error('[mend]', err?.message || err));
-  charThreadMigration(client).catch(err => console.error('[char-threads]', err?.message || err));
+  // riding registration, where they first landed by a bad anchor. They run
+  // one after another: two of them writing the same forum at once is how a
+  // page gets made twice (T, 2026-10-13). Kept on the client so a harness
+  // can await the lot; the bot itself never waits on it.
+  client.mendDone = (async () => {
+    await runRenameMigration(client).catch(err => console.error('[run-rename]', err?.message || err));
+    await npcThreadMigration(client).catch(err => console.error('[npc-threads]', err?.message || err));
+    await forumSetupMigration(client).catch(err => console.error('[gm-forum]', err?.message || err));
+    await bootMend(client).catch(err => console.error('[mend]', err?.message || err));
+    await charThreadMigration(client).catch(err => console.error('[char-threads]', err?.message || err));
+  })();
   startCharBlockSweep(client);
   startBackupScheduler();
   console.log('✅ Backup scheduler started');

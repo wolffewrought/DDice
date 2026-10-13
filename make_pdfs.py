@@ -59,7 +59,7 @@ PARTS['start'] = [
           ('/help category:start', 'the new-player guide — the whole game in one page'),
           ('/help category:dice', 'detail on a specific group'),
           ('/help category:rules', 'the live table rules as the bot enforces them \u2014 the same\nwords the books use, readable by everyone')]),
-('note', 'Anywhere a command asks for something that already exists — an NPC, a quest, a weapon, a tag, an activity, a category, a recovery schedule, an item someone is carrying — a <b>dropdown appears as you type</b>, and you can still type past it freely. Options that name something NEW (create, add) stay free text on purpose.'),
+('note', 'Anywhere a command asks for something that already exists — an NPC, a quest, a weapon, a tag, an activity and its scenes, a category, a recovery schedule, an item someone is carrying, a title, a group, a spell, a saved sheet, a rest amount — a <b>dropdown appears as you type</b>, and you can still type past it freely. Where a new name is the point (create, add, save) what you typed leads the list.'),
 ('h2', 'Where the News Lands'),
 ('p', 'A forum called <b>updates</b> carries one dated thread for every change the bot has had — titled by the day it landed, newest at the top — and every entry the bot has ever announced is there from the first. When something in this book looks different from what the bot does, the updates forum says what changed and when.'),
 ]
@@ -187,7 +187,8 @@ PARTS['char'] = [
          'unaffected entirely.'),
 ('h2', 'Changing One Field Later'),
 ('p', 'Use <b>/char set</b> to adjust a single thing after the fact \u2014 a stat that went up, a weapon you '
-      'swapped. It is a touch-up tool, not the way to build a character from nothing.'),
+      'swapped. It is a touch-up tool, not the way to build a character from nothing. Pick the <b>field</b> first: '
+      '<b>value</b> then offers what fits it \u2014 the orders, the classes, the weapon list, the weapon emojis.'),
 ('code', [('/char set field:str value:14', 'one field at a time', 'player'),
           ('/char set field:con value:12', 'HP auto-maxes to CON + 2', 'player'),
           ('/char set field:lck value:3', 'rerolls auto-max to LCK', 'player'),
@@ -1503,8 +1504,9 @@ PARTS['scrolls'] = [
 ('h2', 'Speaking as the Bot'),
 ('code', [('/dd message:\u2026 header:\u2026 user:@Players channels:#one #two', 'speak AS THE BOT \u2014 so a GM who also plays a character\nnever blurs the two. Plain words by default; a bold\nheader only if you write one; posted in every channel\nyou name, or here. Who said it goes to the roll-audit,\nnot the room (GM)')]),
 ('h2', 'Fixing What Was Said'),
-('code', [('Edit (DDice)  \u2014 long-press a message \u2192 Apps', 'edit anything the bot posted \u2014 its own messages and NPC\nspeech from /npc say alike. The text opens prefilled,\nsave replaces it, and the roll-audit records what\nchanged (GM)')]),
-('p', 'Only messages the bot itself posted — its own, and NPC speech sent through <b>/npc say</b>. The roll audit records what changed.'),
+('code', [('Edit (DDice)  \u2014 long-press a message \u2192 Apps', 'edit anything the bot posted \u2014 its own messages and NPC\nspeech from /npc say alike. The text opens prefilled,\nsave replaces it, and the roll-audit records what\nchanged (GM)'),
+          ('/edit [link:\u2026]', 'the same box without the Apps menu: a dropdown only\nyou see lists the last 25 lines the bot and its NPCs\nsaid here, newest first; pick one and the text opens\nprefilled. link: a message link or id goes straight\nto it. Nothing shows in the channel (GM)')]),
+('p', 'Only messages the bot itself posted — its own, and NPC speech sent through <b>/npc say</b>. The roll audit records what changed. A line said through a webhook that has since been deleted cannot be edited by anyone — Discord ties the edit to the webhook — so the bot says so: delete it and have the NPC say it again.'),
 ]
 
 PARTS['keeping'] = [
@@ -1551,7 +1553,7 @@ PARTS['keeping'] = [
          '<b>DDice-Commands-Parchment.pdf</b> for Knightfall, the same three prefixed <b>DnD5e-</b> for 5e, and the two '
          '<b>DDice-Examples</b> books. A table is handed the set for the rules it plays by, and the Examples either way.'),
 ('h2', 'Updates and the Deploy Mend'),
-('p', 'Every deploy writes two dated threads into the <b>gm-updates</b> forum: <b>What’s new</b> — the one-line summary of each change first, then <b>In detail</b> beneath it: the line again, and under it what changed, why, what you do now and where it lands — and <b>Deploy mend</b>, what the boot built or repaired. The player half of the same news goes to the <b>updates</b> forum. Each thread is titled by its date, <i>[11/10/2026] [WEEK 41] Sunday 11th of October 2026 · What’s new</i>, so the newest sits at the top and the week is readable at a glance. The first boot with the forums in place posts the whole back-catalogue, oldest first, and clears the old update posts out of gm-quest-log. Discord orders a forum by when each thread was made, so the Deploy mend goes up last and a dated thread found out of turn is re-posted into order on the next boot — unless someone has written in it.'),
+('p', 'Every deploy writes two dated threads into the <b>gm-updates</b> forum: <b>What’s new</b> — the one-line summary of each change first, then <b>In detail</b> beneath it: the line again, and under it what changed, why, what you do now and where it lands — and <b>Deploy mend</b>, what the boot built or repaired. The player half of the same news goes to the <b>updates</b> forum. Each thread is titled by its date, <i>[11/10/2026] [WEEK 41] Sunday 11th of October 2026 · What’s new</i>, so the newest sits at the top and the week is readable at a glance. The first boot with the forums in place posts the whole back-catalogue, oldest first, and clears the old update posts out of gm-quest-log. Discord orders a forum by when each thread was made, so the Deploy mend goes up last and a dated thread found out of turn is re-posted into order on the next boot — unless someone has written in it. The mend also keeps the NPC forum to one page per NPC: a duplicate page is folded back into the recorded one and counted in the Deploy mend, unless someone other than the bot has written in it, in which case it is named and left alone.'),
 ('h2', 'Checks and Reports'),
 ('code', [('/gm check roster busy:true', 'every player at a glance \u2014 HP, and whether a quest or a\nfight is holding them (red means the next rest will pass\nthem over); busy:true shows only those tied up (GM)'),
           ('/gm check usage', 'sixty days of command use, quietest first \u2014 a report\nonly; nothing is ever removed by it (GM)'),
@@ -1928,8 +1930,13 @@ def build(edition, outfile, subtitle, module=None, items=None):
             story.append(CondPageBreak(92)); story.append(Paragraph(item[1],h2))
         else:
             story+=render(item)
-    story+=[Spacer(1,6),HRFlowable(width='30%',color=GOLD_LT,thickness=0.8,hAlign='CENTER',spaceBefore=10,spaceAfter=2),
+    # The sign-off travels with the last block, so it never sits alone on
+    # a page of its own (the GM book did exactly that, 2026-10-13).
+    tail=[Spacer(1,6),HRFlowable(width='30%',color=GOLD_LT,thickness=0.8,hAlign='CENTER',spaceBefore=10,spaceAfter=2),
         Paragraph('Penned by the DDice Scriptorium · May your rolls be ever in your favour',foot_st)]
+    j=len(story)-1
+    while j>0 and isinstance(story[j],Spacer): j-=1
+    story[j:]=[KeepTogether(story[j:]+tail)]
     doc.multiBuild(story)
     print(f'built {edition} → {outfile}  ({doc.page} pages)')
 
@@ -2051,7 +2058,8 @@ EXAMPLES = [
           ('/gm check stalled', 'What is waiting on a GM: winding-down runs, quiet encounters, staged parties never launched. A weekly digest of the same lands in the gm-digest forum, one thread a week.')]),
 
 ('sec', 'Fixing what was said'),
-('code', [('(long-press a bot message \u2192 Apps \u2192 Edit (DDice))', 'The text opens already filled in. Fix the spelling, save. Works on NPC speech too.')]),
+('code', [('(long-press a bot message \u2192 Apps \u2192 Edit (DDice))', 'The text opens already filled in. Fix the spelling, save. Works on NPC speech too.'),
+          ('/edit', 'The same from a private list: the last lines the bot and its NPCs said here. Pick one, fix it, save. The table sees only the corrected line.')]),
 ('p', 'Only messages the bot itself posted. The roll-audit records what changed.'),
 
 ('aud', 'all'),

@@ -49,11 +49,12 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1076 as of 2026-10-12) and no scanner
+Green means every assertion passed (1086 as of 2026-10-13) and no scanner
 found an ERROR. Then run the probe: `node --experimental-sqlite probe.js`
-(73 probes: the fight, encounter, override, autocomplete and every-leaf
+(85 probes: the fight, encounter, override, autocomplete and every-leaf
 walks, the GM-gate walk, chat shorthands, scheduled ticks, junk-id lanes,
-SQL compile, forum seeding and sweep, and a double-ack check).
+SQL compile, forum seeding and sweep, one NPC one page, and a double-ack
+check).
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -95,6 +96,12 @@ standing ones are all correct-by-design and are listed in §6.
 - **Ask before architectural changes.** Questions first, build after.
 - **Plain language in user-facing text.** Every refusal explains what to do
   instead.
+- **Ask whether the last build was pushed before writing a CHANGELOG entry**
+  (T, 2026-10-13). What's new is dated by key and posted on the boot that
+  carries it, so an entry for a build T never deployed would announce
+  changes the server does not have. If the previous build is still unpushed,
+  the new work joins that entry under its key; only a deployed build earns a
+  new date.
 
 ### The fall-through convention
 
@@ -568,6 +575,75 @@ takes every original item and row by AST span and asserts each is used
 exactly once or dropped with a written reason — 445 items whole, 156 rows
 re-dealt, 29 items and 22 rows dropped. The docs scanner passed before and
 after.
+
+**Every NPC page twice (T, 2026-10-13, 19:15, screenshot):** the ready
+handler had fired its five reshapes in parallel (`runRenameMigration`,
+`npcThreadMigration`, `forumSetupMigration`, `bootMend`,
+`charThreadMigration`), two of which write the NPC forum, and
+`mirrorNpcSheet` trusted only its `npc_pages` row — so a row that was
+missing or pointed at an unfetchable thread meant a fresh thread per
+caller, and the boot made every page twice at the same minute. Three
+guards, all pinned: the ready handler awaits the five in order inside
+`client.mendDone`; `mirrorNpcSheet` is a per-`${gid}\0${name}` promise
+lock over `mirrorNpcSheetNow` (a second caller in flight shares the first's
+promise); and before creating, `mirrorNpcSheetNow` adopts the oldest
+bot-owned thread with the exact name (`botThreadsNamed(client, forum)` —
+active and archived, lowercase name → threads) and re-points the row. The
+mend then runs `dedupeNpcPages(client, gid)` after the page loop: for each
+NPC with two or more same-name bot threads it keeps the recorded one (else
+the oldest), re-points the row, and deletes the rest unless someone other
+than the bot has written in them — `N duplicate NPC page(s) removed` /
+`duplicate NPC page left in place: name (someone wrote in the copy)` in
+the Deploy mend. Probe: two `/npc manage sync` fired at once with no row
+make one thread; a deleted row is re-adopted by name; three planted
+copies (one archived, one with a GM's message) come back as one page plus
+the written-in copy, both reported. Each probe was shown to fail with its
+guard removed.
+
+**Edit (DDice) on NPC speech (T, 19:17, "unable to"):** `ownWebhookFor`
+only matched a stored `npc_webhooks` row for the host channel, so a line
+said through a hook the table had forgotten (`cleanwebhooks` deletes
+every non-shared row, a backup restore, a thread whose `parent` was not
+cached so `webhookHost` returned null) was refused as "not mine" though
+the hook was the bot's. `ownWebhookForAsync(client, gid, channel,
+webhookId)` — used by both `openBotEdit` and `saveBotEdit` — tries the row,
+then fetches the host (by `parentId` for a thread) and its webhooks and
+accepts `h.id === webhookId && h.owner.id === bot && h.token`, storing it
+as `\0hook:<id>` so the next edit is a row hit. A webhook message whose
+hook is neither stored nor on the channel gets the honest answer: said
+through a webhook the bot no longer holds, Discord lets nobody edit it,
+delete and `/npc say` again. `openBotEdit` fetches the channel by
+`channelId` when `interaction.channel` is null. Books and /help carry the
+note. Probe: a forgotten hook opens the modal and the edit lands through
+the remembered hook; another app's hook and a vanished hook are refused
+with the remedy and nothing stored. CHANGELOG 2026-10-13 carries both for
+GMs. 1079 assertions, 80 probes.
+
+**`/edit` (T, 20:03–20:14):** T had been looking for Discord's own Edit on
+an NPC line (there is none on a message you did not write); Apps → Edit
+(DDice) works but is three taps on a phone, and a reply-triggered route
+cannot be private (an ephemeral message only answers a press or a
+command), so a reply would have left the table a button to see. `/edit`
+is the private route: `handleEdit` reads the last hundred messages of the
+channel or thread, keeps the bot's own and webhook lines with text and no
+components, newest first, 25 at most, and answers ephemerally with a
+`StringSelectMenu` (`editpick`, label `who: text` ≤100, 🎭 for NPC speech,
+🎲 for the bot); `pickEditTarget` fetches the chosen message and calls
+`openEditModal(interaction, msg, channel)` — the refusal chain and modal
+lifted out of `openBotEdit`, which now only reads `targetMessage` and
+delegates, so the context menu, the dropdown and `link:` (a message link
+or id; another server's link refused) open the one `botedit:` modal and
+the one `saveBotEdit` answers all three. A save whose modal came off the
+dropdown (`interaction.isFromMessage()`) updates that ephemeral message to
+"✅ Edited." instead of replying. The GM refusal is one constant
+(`EDIT_GM_ONLY`) across the four gates. Twenty-four commands now; the
+count pin says so. Probe: the list holds the bot and NPC lines, not a
+player's nor a card with buttons, in id order; a pick opens the modal; a
+save from the dropdown edits the line and swaps the dropdown for the
+receipt; `link:` opens the modal directly and refuses a foreign server.
+Books (GM chapter, GM examples) and /help carry it; the 2026-10-13
+CHANGELOG entry absorbed it because T had not pushed the morning build —
+hence the new house rule in §4. 1086 assertions, 85 probes.
 
 ## 10k · The dead-end pass: eight bugs, a scope scanner, a leaf walk, the re-lay (2026-10-11)
 

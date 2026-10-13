@@ -1421,8 +1421,19 @@ function testBuilders(src) {
                      'help', 'library', 'npc', 'quest', 'quiz', 'roll', 'spell', 'standing']) {
       ok(`/${n} is registered`, !!by[n]);
     }
-    ok('twenty-three commands registered \\u2014 /encounter and /campaign joined 2026-09-24',
-      cmds.length === 23 && cmds.some(c => c.name === 'encounter') && cmds.some(c => c.name === 'campaign'));
+    ok('twenty-four commands registered \\u2014 /encounter and /campaign joined 2026-09-24, /edit 2026-10-13',
+      cmds.length === 24 && cmds.some(c => c.name === 'encounter') && cmds.some(c => c.name === 'campaign') && cmds.some(c => c.name === 'edit'));
+    // /edit: the private route to the Edit (DDice) box. The list is the
+    // bot's own and NPC lines only, buttons excluded, newest first, and a
+    // pick opens the very same modal id the save lane already answers.
+    ok('/edit lists only the bot\'s own and NPC lines, without buttons, newest first, 25 at most',
+      /m\.author\?\.id === interaction\.client\.user\.id \|\| m\.webhookId\) && String\(m\.content \|\| ''\)\.trim\(\) && !\(m\.components\?\.length\)/.test(src) &&
+      /BigInt\(a\.id\) < BigInt\(b\.id\) \? 1 : -1/.test(src) && /\.slice\(0, 25\);\s*if \(!mine\.length\)/.test(src));
+    ok('/edit, its dropdown and Edit (DDice) all open one modal, saved by one lane',
+      (src.match(/return openEditModal\(interaction, msg, /g) || []).length === 3 &&
+      (src.match(/botedit:\$\{msg\.channelId\}:\$\{msg\.id\}/g) || []).length === 1 &&
+      /customId === 'editpick'\) \{\s*return pickEditTarget\(interaction\)/.test(src) &&
+      /interaction\.isFromMessage\?\.\(\)\) \{\s*const swapped = await interaction\.update\(\{ content: '\\u2705 Edited\.', components: \[\] \}\)/.test(src));
     // A GM writing as the bot: always says who it is, and the audit book
     // keeps the attribution even when the message does not.
     // (rewritten 2026-08-22: T asked for /dd to speak in the room, not in DMs.)
@@ -2181,8 +2192,22 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /resolveFighter\(guild, gid, fid\)\.catch\(\(\) => null\)/.test(src) &&
       /A departed adventurer/.test(src));
     ok('both migrations live in the clientReady handler, not in registration',
-      /client\.once\('clientReady'[\s\S]{0,700}?runRenameMigration\(client\)[\s\S]{0,200}?npcThreadMigration\(client\)/.test(src) &&
+      /client\.once\('clientReady'[\s\S]{0,1400}?runRenameMigration\(client\)[\s\S]{0,200}?npcThreadMigration\(client\)/.test(src) &&
       !/registerSlashCommands\(guildId\) \{[\s\S]{0,4000}?npcThreadMigration/.test(src));
+    ok('the boot reshapes run one after another, never two on the same forum at once',
+      /client\.mendDone = \(async \(\) => \{\s*await runRenameMigration\(client\)[\s\S]{0,200}?await npcThreadMigration\(client\)[\s\S]{0,200}?await forumSetupMigration\(client\)[\s\S]{0,200}?await bootMend\(client\)[\s\S]{0,200}?await charThreadMigration\(client\)/.test(src) &&
+      !/Promise\.all\(\[\s*runRenameMigration/.test(src));
+    ok('an NPC page is made under a lock and adopts a thread of its name before making another',
+      /const npcPageInFlight = new Map\(\);/.test(src) &&
+      /async function mirrorNpcSheet\(client, gid, name\) \{[\s\S]{0,600}?npcPageInFlight\.get\(/.test(src) &&
+      /botThreadsNamed\(client, forum\)/.test(src) &&
+      /async function dedupeNpcPages\(client, gid\)/.test(src) &&
+      /duplicate NPC page\(s\) removed/.test(src));
+    ok('Edit (DDice) asks the channel for a webhook the table has forgotten',
+      /async function ownWebhookForAsync\(client, gid, channel, webhookId\)/.test(src) &&
+      /h\.id === webhookId && h\.owner\?\.id === client\.user\.id && h\.token/.test(src) &&
+      (src.match(/await ownWebhookForAsync\(interaction\.client, gid, /g) || []).length === 2 &&
+      /a webhook I no longer hold, so Discord will not let anyone edit it/.test(src));
     ok('the restructure migration is one-time',
       /npc_threads_2/.test(src));
 
