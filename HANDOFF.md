@@ -49,12 +49,15 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1091 as of 2026-10-13) and no scanner
-found an ERROR. Then run the probe: `node --experimental-sqlite probe.js`
-(101 probes: the fight, encounter, override, autocomplete and every-leaf
-walks, the GM-gate walk, chat shorthands, scheduled ticks, junk-id lanes,
-SQL compile, forum seeding and sweep, one NPC one page, and a double-ack
-check).
+Green means every assertion passed (1118 as of 2026-10-15, build B) and no
+scanner found an ERROR. Then run the probe: `node --experimental-sqlite
+probe.js` (145 probes: the fight, encounter, override, autocomplete and
+every-leaf walks, the GM-gate walk, chat shorthands, scheduled ticks,
+junk-id lanes, SQL compile, forum seeding and sweep, one NPC one page, the
+A2 walk, the undo walk, and a double-ack check). The probe carries a paper-thin fake
+`@napi-rs/canvas` since A2 (text measures by length, drawing is a no-op, a
+buffer comes back) so the parchment paths run end to end; verify.js keeps
+the canvas absent on purpose, which is the other path.
 
 `--expose-internals` is not decoration: the scanners parse real JavaScript
 with node's bundled acorn at `internal/deps/acorn/acorn/dist/acorn`. There is
@@ -87,11 +90,11 @@ standing ones are all correct-by-design and are listed in §6.
 - **Deliver only what changed.** Code-only turn: `index.js` alone. Content
   change: the PDFs too. Never zips. Build scripts (`make_pdfs.py`) only when
   asked.
-- **PDFs:** eight books — Knightfall and DnD5e, each in Player / GameMaster /
-  Parchment, plus the two Examples books. Since 2026-10-11 the Game Master's
-  edition carries the table's half as well as the GM's, so the GM book and
-  Parchment hold the same content under different covers (§10l). Build with
-  `DDICE_PDF_OUT=<dir> python3 make_pdfs.py`; the default writes to
+- **PDFs:** six books — Knightfall and DnD5e, each in Player / GameMaster,
+  plus the two Examples books. Since 2026-10-11 the Game Master's edition
+  carries the table's half as well as the GM's; the Parchment edition (the
+  same pages under another cover) was retired 2026-10-14 with T (§10n). Build
+  with `DDICE_PDF_OUT=<dir> python3 make_pdfs.py`; the default writes to
   /mnt/user-data/outputs.
 - **Ask before architectural changes.** Questions first, build after.
 - **Every write is proposed and waits for T's "Build"** (T, 2026-10-13:
@@ -359,6 +362,250 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 10o · /gm undo — the channel's journal (2026-10-15, build B)
+
+The last of T's list of twenty (§10m A1, §10n A2). T's ask, 14/10: "if a
+player mistakenly resolves a round can a GM back track" and "if a GM keeps
+rewinding the fight state then the bot can follow it, or if /gm undo just
+rewinds the instance in general so that this can be used in a broader
+sense". Built as the broader thing. Pristine before B:
+`/tmp/claude-0/index.pre-b.js`.
+
+**The journal.** `undo_journal(id, guild_id, channel_id, at, actor, label,
+changes)`. The `interactionCreate` listener is now a bracket around
+`handleInteraction` (the old body, renamed): `undoFrameOpen` reads the
+channel's rewindable state before the handler, `undoFrameClose` reads it
+again in `finally` and writes the difference — per section, the rows
+created, deleted or changed, with `before` and `after` — under a label
+(`undoLabel`: the slash path, or a button in words via `UNDO_WORDS`). Ten
+rows per channel, a day at most. Autocomplete, DMs and the rewind itself
+(`isUndoInteraction`: `/gm undo` and `gmbar:undo`) open no frame, so two
+undos are two steps back and never a redo.
+
+**What is read** — `UNDO_SECTIONS`: the channel's `fights` row less its
+idle stamps (`last_at`, `nudged`); every sheet's and NPC's `hp_current`,
+`rerolls_current`, `next_mark`, `deception_spent`, dying tallies and the
+five stats (a called check's sanction moves a stat), `keepRows` so a sheet
+made mid-step is never deleted by a rewind; `heal_charges`; this channel's
+`temp_targets` and `group_checks`; and the day's `group_check_rolls`,
+`button_presses` and `dc_cards` (`recent` bounds the three guild-wide
+ledgers to the journal's own day — they pile up for months, and the read
+happens twice an interaction). `undoPrepare` filters `only` lists to the
+columns the table really has, once. Two interactions overlapping in one
+channel can each see the other's partial changes; a rewind then lands on
+the state before the earlier of them — acceptable for a GM's hand, noted
+here rather than locked.
+
+**The rewind.** `gmUndo(interaction, steps)`: GM-gated; the newest `steps`
+rows (1–10); a row whose `fight` section ends in a state other than active,
+or any fight row once the fight here is no longer active, stops the walk
+with "The fight here has ended — it is not rewound"; otherwise each section
+is written back by `undoRestoreSection` (created → deleted, deleted →
+re-inserted, changed → only the columns that differed), the row leaves the
+journal, and the table is told what moved (HP and rerolls on sheets and
+NPCs, targets' swings and standing, group rolls withdrawn, presses
+reopened, called checks withdrawn). Cards: a card the step made is deleted;
+a reposted target card is taken down and the standing card re-drawn with
+its buttons; a group check is re-drawn through `groupCheckBody`. Then, if
+a fight was touched and still stands, `fightStatusLines` (the `/fight
+status` body, now one renderer shared with the command) and
+`fightTurnPrompt` (whose move it is, with their buttons — the defence
+prompt if an attack is pending) are posted. `mirrorRoll(… kind: 'gms',
+context: 'rewind')` carries it to the audit and `noteQuestActivity` to the
+quest. `/gm bar` gained ⏪ Undo (one step). The `/gm` builder is at 6310;
+the tripwire moved 6200→6400 with its reason in the pin (the only fold
+left would rename commands, which is T's call).
+
+**Pins and probes.** Four pins (the bracket, the sections, the never-a-step
+rule, the command) and the toolbar pin counts five buttons. The undo walk
+(ten probes): an exchange with forced dice (attack nat 20, defence nat 1)
+resolved, then `/gm undo` — HP back, the row back to the pre-resolve
+defence phase, the status and the defence prompt with `fdef:` buttons
+posted; `steps:2` back to a clean attack phase with no redo; a fight ended
+through its confirm button refusing the rewind; a natural-1 strike's repost
+taken down and the first card's buttons back; a group roll off the tally
+and the card re-drawn; a once-only press reopened and pressed again; a
+called check with `fail_damage:3` costing 3 HP and the rewind giving it
+back; "Nothing to rewind here" in a quiet channel, the same from the
+toolbar, a plain player refused (the fake guild answers admin for everyone,
+so `members.fetch` is overridden for the call as the gate walk does), and
+twelve plantings leaving ten rows. 1118 assertions, 145 probes.
+
+## 10n · Reports, tools and the chronicle (2026-10-14, build A2)
+
+The second half of T's list of twenty (§10m has the first; B, `/gm undo`,
+is still to come). Nothing here changed a rule; everything is a new door
+or a new report. Sandbox pristine before A2: `/tmp/claude-0/index.pre-a2.js`.
+
+**Audiences (10).** `parseAudience(str)` reads `<@id>` and `<@&id>` into
+`u:<id>` / `r:<id>` tokens; `audienceAllows(owner, interaction)` is the one
+check (bare id = that user; `any`/empty = open; a list = user listed or
+member holds a listed role); `audienceMentions(owner)` names them on the
+card and `audienceMentionsAllowed(owner)` is the allowedMentions shape.
+`/target create audience:` stores the list in `temp_targets.owner` (a lone
+`for:` stays a bare id, the two combine); `/button roll audience:` cannot
+ride a customId, so the id slot says `list` and the list sits in
+`button_audience(guild_id, message_id, owners)`. The refusal text is
+unchanged. Mentions are numeric in Discord and the parsers hold them to
+that — the probe's mention-driven cases use numeric ids (the fake guild
+answers any id).
+
+**The GM toolbar (11).** `/gm bar` → `handleGmBar` posts `GM_BAR_TEXT` with
+`gmBarRows()` (`gmbar:target|dc|fight|status`) and pins it
+(`Promise.resolve().then(() => msg.pin())` so a message without `pin`
+cannot throw). `pressGmBar(interaction, which)`: `dc` → `showDcForm`
+(which now reads its options with `?.` guards — a button has none);
+`target` → modal `gmbartgt` (name, a free `check` line parsed by
+`finishGmBarTarget` — a 1–2 digit number is the DC, dice notation is dice,
+the rest are stats through `parseTargetStats` — scene, hp, `for` mentions
+through `parseAudience`) → `createTarget`; `fight` → modal `gmbarfight`
+(players, npcs, practice yes/no) → `handleFight(interaction, { sub:
+'start', players, npcs, practice })` — the start branch reads `practice`
+off `forced` now; `status` → ephemeral: the fight and whose move with
+`fightHpLine`, the standing targets, `stalledReport` (sync — the first
+probe run caught `.catch` on it). The three forms gate on submit, as `/gm
+dc` does. `/gm`'s builder is at 6196 of the 6200 tripwire after trimming
+seven descriptions; B moved the tripwire to 6400 with its reason (§10o).
+Undo joined the bar in B.
+
+**The weekly chronicle (15).** `week_ledger(guild_id, at, kind, text)` keeps
+what no table dates — `announceFightEnd` writes the victor's headline when
+it carries 🏆; quests come from `quest_runs.completed_at`, titles from
+`subject_titles.at`, the fallen from `characters.died_at` / `npcs.died_at`.
+`weekTaleLines(guild, since)` builds the four sections; `postWeekTale`
+stamps `guild_config.week_tale_at`, posts nothing on a quiet week, and
+`questTick` calls it when seven days have passed (the first boot after this
+update posts the last seven days). The thread is dated by its posting day
+(`postDatedThread(…, 'Weekly chronicle', Date.now(), …)`) so the tidy pass
+never has to move it; it is the sixth `postDatedThread` caller (pin
+updated), and the probe's players'-forum count now filters to What's new.
+
+**The story scroll (18).** `makeImagesPdf(pages)` is `makeImagePdf` over
+several sheets; `renderScrollBook({family, title, body})` paginates the
+scroll at the 2600-px sheet; `runStoryScroll(gid, quest, {runnerName,
+partyNames, runMs, events, tale})` writes the body (run by / party / ran
+for, then every beat but remind/recap as `0h 05m  text` with mentions and
+markdown stripped, then the tale), weaves it with `embedScrollData` so
+`/gm scroll file:` reads it back, and the completion handler hangs it on
+the home-channel post or the reply (`files: storyFiles`, twice).
+`hasCanvas()` asks once; without the module the card goes out bare and
+nothing is logged.
+
+**The ready check (19).** `quest_ready(guild_id, number, user_id, at)`;
+`/quest run ready number:` wipes the rows and posts `questReadyCard` with
+one `qready:<number>` button; a press by a seated player inserts and
+`update`s the card, the last press mentions the GM; a stranger is told the
+check is for the seated.
+
+**Chronicle words (5), idle nudge (8), stalled targets (9), registration
+(12), next steps (14).** The `frp:` lane and `strikeTarget` log the form's
+words as an `rp` quest event (`who: action · “speech”`); Resolve logs its
+What-happens. `fights.last_at` / `fights.nudged`: `upsertFight` stamps
+every write except a `{nudged}`-only one; `fightIdleTick` (on the quest
+clock's minute) pings the waited-on player, or the GM role for an NPC, once
+per turn after `FIGHT_IDLE_MS`. `stalledReport` ends with targets standing
+over a day. `registerSlashCommands` records `registerStatus` per guild;
+`registerStatusLine(gid)` is the one line the Deploy mend and `/gm check
+status` both carry. `/char create` replies end with `nextSteps`.
+
+**Retired (20).** The Parchment editions: gone from `DOC_FILES` (six files),
+from `make_pdfs.py`'s build loop (the `full` key stays known), and from the
+book's own publishing paragraph. HANDOFF §4 updated.
+
+**What's new.** The 2026-10-14 entry grew by eleven GM items and eight
+player lines — the same key as A1, which the grow ledger re-posts whole.
+The summary bullets of that entry run over one Discord message, so
+`growChangelog`'s read-back of an un-ledgered thread now takes bullets from
+every message up to **In detail** (it read only the first; a long day would
+have been re-posted once for nothing).
+
+Pins: one per item, plus the audience check (`audienceAllows` replaces the
+bare-id test in the planted-button pin). Probe: the A2 walk (fourteen
+probes) — audiences on a button and a target with numeric ids, the toolbar
+and its three boxes, the ready check, the strike words in the timeline, the
+completion scroll read back through its weave, the registration line, the
+next-steps line, the stalled target, the chronicle and the nudge from the
+ticks, run twice to prove once. The fake builder learned
+`setChannelTypes` (the check report's pickers had been failing silently in
+the fake) and fake interactions carry an `id` (the DC form keys its draft
+by it). `/gm scroll` joined OPEN_ON_PURPOSE in the GM-gate walk — its window
+opens before any await by design — with a new probe that its submit refuses
+a plain player. 1112 assertions, 135 probes.
+
+## 10m · Forms on every fight button, NPC turns by button, targets with hit points (2026-10-14, build A1)
+
+T's evening of planning (19:01–19:28) produced a list of twenty; A1 is the
+fight and target half, A2 the reports, tools and chronicle, B `/gm undo`.
+Every write waited for "Build all" (19:28).
+
+**The forms.** `pendingFightRp` (token → `{at, kind, …payload}`, pruned at
+fifteen minutes) holds what a press decided, because an NPC fighter id
+(`npc:Name`) does not fit a customId; `fightRpModal(token, {title, claim,
+what})` builds the modal (`frp:<token>`; fields `action` Short 200 and
+`speech` Paragraph 500, both optional; `claim` first for a feint; `what`
+alone for Resolve); `openFightRp(interaction, kind, payload, opts)` stashes
+and shows; `rpWords(interaction)` shapes the submit (`*action*` /
+`“speech”`); `withWords(lines, flavour)` slips `_flavour_` after a runner's
+header; `forcedOf(forced, key)` reads a forced field. The button lane
+gates lightly (fight active; attack: your turn and phase attack; defence:
+phase defend and you are the target; maintain: your turn and holding;
+escape: held) and opens the form; `fatk:` with one foe standing goes
+through the branch with `fromButton: true`, which opens the form instead of
+the old "say who you are attacking" refusal, with several foes the picker
+(`fighttarget:<encodeURIComponent(actorId)>:…`, the actor encoded since an
+NPC's id carries a colon) and a pick with no flavour opens the form; the
+`frp:` modal lane dispatches by kind to `handleFight` with `forced.flavour`
+(and `targetId`, `npc`, `mode`, `feintText`), or to `runFightMaintain(
+interaction, {flavour})` / `runFightRelease({…, flavour})`. Every branch
+reads `forcedOf(forced, 'flavour')` before the option; Insight,
+GrappleSave, Escape, Maintain and Release gained a `flavour` and show it;
+the resolve branch splices `_what_` before the `🎯` hand-over line. The
+old `grpfree` body (its own release) is gone: the press opens the form and
+the one release path runs it, now logging to the quest.
+
+**NPC turns.** `fightAnswerRows(kind, {forNpc, held, auto})`: for an NPC
+it returns five `fnatk:<stat>` / `fndef:<stat>` 🎭 buttons unless the bot
+is piloting (`auto`); the announcer gives an NPC's turn `atk` rows, the
+three defence-prompt sites pass `auto`. The lane GM-gates them and walks
+the same path with `forced.npc`. The picker's follow-up for a player used
+to post without the defence buttons — fixed on the way.
+
+**HP line and conditions.** `fightHpLine` lists every standing fighter's
+HP (an NPC's only when `npcStatsVisible`), appended to the turn line
+before the state line. Conditions live in `effect_state[fid].conditions`
+`[{text, turns|null}]`: `/gm override condition user:|npc: text: [turns:]
+[clear:]` (`gmCondition`), shown by `fighterStateLine`, ticked by
+`tickConditions` when the fighter's turn is announced, lifted at 0 with
+"🕒 X lifts from Y". Eight per fighter, text ≤60.
+
+**Targets.** `hp` / `hp_left` columns; `createTarget(interaction, spec)`
+is the one maker, used by the slash path and by `finishTargetWrite` (the
+`write:true` box: `tgtwrite:<token>`, fields scene/success/fail, the rest
+of the command stashed under the token); `woundTarget` takes one off and
+re-edits the live card (`❤️ **N of M** left`), settling at 0;
+`retireTarget` strikes through "retired by the GM"; `/target list` carries
+`tgtretire:<message_id>` buttons; with `hp` and a DC the strike path
+settles itself (pass → wound, fail → repost, no prompt); with `hp` and no
+DC the verdict's pass wounds and only the last one beats.
+
+**Found on the way.** Sixteen double-quoted `ALTER TABLE` lines sat above
+the CREATE of their own tables; eight of those columns are not in the
+CREATEs (`guild_config.lrest_*`/`srest_*`, `fights.rr_state`/`log_state`),
+so a fresh database never had them and the first resolved exchange died in
+`bumpFightLog` — the fight walk had never resolved one. Moved below the
+last CREATE; verify's phantom pin and the probe's ALTER census read both
+quote styles now.
+
+Probe: the fight walk is a sequence — press, read the modal id back,
+submit with words, check the words on the card and the buttons that
+follow — for attack, defence, Resolve (the GM's words above the hand-over;
+every fake member is an admin, so a "player's" press opens the form too),
+feint (U1 given WIS 5 for the bar), grapple and Save, the three hold
+refusals, a three-fighter picker-then-form, the NPC defence by 🎭 button,
+the NPC attack by 🎭 button, conditions set/refused/ticked/cleared with the
+HP line, hp targets with and without a DC, the retire button, the write
+box. 1097 assertions, 120 probes.
 
 ## 10l · Update forums, dated threads, and the books re-laid as journeys (2026-10-11)
 
@@ -744,6 +991,26 @@ thread shorn of its last bullet and its row, and the players' thread
 shorn of a bullet but holding a GM's reply — the first comes back whole
 with the ledger written, the second stays and gains the line beneath, the
 Deploy mend names both. 1091 assertions, 101 probes.
+
+**NaN (T, 23:25, screenshot "struck by Elara Haven for NaN") and `d20`
+(00:14, "That expression no longer reads"):** `rollDcCheck` computed
+`total = result.total + modifier`, and three callers never passed a
+modifier — the target strike, the planted `btnchk` press and the group
+check — so their totals were NaN: shown in the target prompt, stored in
+`group_check_rolls`, and judged by `dcVerdict` as `NaN >= dc` = false, so
+every such roll below a natural 20 read as a fail since `/gm dc` gained
+`modifier:`. The roll line never showed it because `buildRollLine` reads
+`result` and the `modifier ?` suffix is skipped for undefined. Fixed at
+the source: `gmMode = 'normal', flat = false, modifier = 0` defaults in
+the destructuring. Separately, the three creation checks accept
+`\d{0,2}d…` while `parseNotation` demanded `(\d+)d`, so `dice:d20` posted
+a card no press could roll; `parseNotation` now reads a missing count as
+one die, everywhere notation is rolled. Pinned. Probe: the middling target
+now asserts the real total in the prompt and "The roll succeeds" (the
+expected total is read from U2's sheet, since the leaf walk changes it);
+a `dice:d20` target rolls; a planted stat button says Passed; a group
+check stores the total and a pass — all four shown to fail on the unfixed
+roller. 1092 assertions, 104 probes.
 
 ## 10k · The dead-end pass: eight bugs, a scope scanner, a leaf walk, the re-lay (2026-10-11)
 

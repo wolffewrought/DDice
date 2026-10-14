@@ -69,6 +69,7 @@ function recorder(kind) {
     setMinLength(v) { this._d.minLength = v; return this; }
     setMinValues(v) { this._d.min = v; return this; }
     setMaxValues(v) { this._d.max = v; return this; }
+    setChannelTypes(...t) { this._d.channelTypes = t.flat(); return this; }
     addComponents(...c) { this._d.components.push(...c.flat()); return this; }
     addSubcommand(fn) { this._d.subcommands.push(fn(new (recorder('sub'))())._d ?? fn); return this; }
     addSubcommandGroup(fn) { const g = fn(new (recorder('group'))()); this._d.groups.push(g._d ?? g); return this; }
@@ -131,6 +132,7 @@ class FakeChannel {
     // The channel's webhooks, as Discord hands them back: the bot's own carry a token.
     this._hooks = [];
     this.fetchWebhooks = async () => new FakeCollection(this._hooks.map(h => [h.id, h]));
+    this.createWebhook = async ({ name } = {}) => { const h = { id: nextId(), token: 'tok', owner: { id: 'BOT' }, name: name || 'DDice', delete: async () => {} }; this._hooks.push(h); return h; };
   }
   isThread() { return !!this._isThread; }
   isTextBased() { return true; }
@@ -147,6 +149,7 @@ class FakeChannel {
       author: { id: 'BOT' }, editable: true,
       edit: async (p) => { msg.content = typeof p === 'string' ? p : (p?.content ?? msg.content); if (typeof p === 'object' && 'components' in p) msg.components = p.components; return msg; },
       delete: async () => { deleted.push(msg.id); },
+      pin: async () => { msg.pinned = true; pinned.push(msg.id); },
     };
     sent.push({ channel: this.id, content, msg });
     sentById.set(msg.id, msg);
@@ -160,6 +163,7 @@ const nextId = () => String(idSeq++);
 const sentById = new Map();
 const threads = [];
 const deleted = [];
+const pinned = [];
 
 let lastClient = null;      // the instance index.js made — the one the ready handler walks
 class FakeClient {
@@ -232,9 +236,25 @@ function makeSqliteShim() {
 }
 
 // ── load index.js under the fakes ───────────────────────────────────────
+// A paper-thin canvas (2026-10-14): enough for the parchment paths to run
+// end to end — text measures by length, every drawing call is a no-op, a
+// buffer comes back — so the run's story scroll can be probed on the
+// completion card. (verify.js keeps the canvas absent on purpose; that is
+// the Railway-without-the-module path, and this is the other one.)
+const fakeCanvas = (() => {
+  const ctxOf = () => new Proxy({ measureText: (t) => ({ width: String(t).length * 20 }) }, {
+    get: (o, k) => (k in o ? o[k] : (typeof k === 'string' && /^(create|get)/.test(k)) ? () => ({ addColorStop() {} }) : () => {}),
+    set: () => true,
+  });
+  return {
+    createCanvas: (w, h) => ({ width: w, height: h, getContext: () => ctxOf(), toBuffer: () => Buffer.from(`fake-image-${w}x${h}`) }),
+    GlobalFonts: { registerFromPath: () => true, has: () => true },
+  };
+})();
 const realLoad = Module._load;
 Module._load = function (request, parent, isMain) {
   if (request === 'discord.js') return fakeDiscord;
+  if (request === '@napi-rs/canvas') return fakeCanvas;
   if (request === 'better-sqlite3') return makeSqliteShim();
   if (request === 'dotenv') return { config: () => ({}) };
   if (request === 'node-fetch') return async () => ({ ok: true, json: async () => ({}) });
@@ -300,6 +320,7 @@ const already = (over, what) => { doubleAcks.push(`${over.commandName || over.cu
 function makeInteraction(over = {}) {
   const opts = over.options || {};
   const i = {
+    id: over.id || nextId(),   // a real interaction has one; the DC form keys its draft by it
     guild, guildId: GID, channel: over.channel || chan, channelId: (over.channel || chan).id,
     user: { id: over.userId || 'U1', tag: 'u1#1', username: 'u1' },
     member: over.member || { id: over.userId || 'U1', roles: { cache: new Map() }, permissions: { has: () => true } },
@@ -370,7 +391,7 @@ async function fire(over) {
     // Every column an ALTER adds must be present — the phantom-table class.
     // Only ALTERs that run at load — ones inside functions fire later by
     // design, so counting them here would be a lie.
-    const alters = [...src.matchAll(/^try \{ db\.exec\('ALTER TABLE (\w+) ADD COLUMN (\w+)/gm)];
+    const alters = [...src.matchAll(/^try \{ db\.exec\(['"]ALTER TABLE (\w+) ADD COLUMN (\w+)/gm)];
     const badCols = [];
     for (const [, table, col] of alters) {
       if (!live.has(table)) { badCols.push(`${table}.${col} (no such table)`); continue; }
@@ -464,35 +485,125 @@ async function fire(over) {
       if (/Something went wrong/.test(said)) return 'THREW';
       return null;
     };
-    const walk = [
-      ['fatk:str  (attack, no target → picker)', { isButton: true, customId: 'fatk:str' }],
-      ['fact:feint (opens target picker)',       { isButton: true, customId: 'fact:feint' }],
-      ['fact:grapple (opens target picker)',     { isButton: true, customId: 'fact:grapple' }],
-      ['fightact:feint select → modal',          { isSelect: true, customId: 'fightact:feint:U1', values: ['U2'] }],
-      ['fightfeint modal → runs the feint',      { isModal: true, customId: 'fightfeint:U2', fields: { claim: 'a lunge at the knee' } }],
-      ['fightact:grapple select → runs it',      { isSelect: true, customId: 'fightact:grapple:U1', values: ['U2'] }],
-      ['fighttarget select → attack lands',      { isSelect: true, customId: 'fighttarget:U1:str:normal:', values: ['U2'] }],
-      ['fdef:dex (defend after that attack)',    { isButton: true, customId: 'fdef:dex', userId: 'U2', keepState: true }],
-      ['fact:maintain (not holding → refusal)',  { isButton: true, customId: 'fact:maintain' }],
-      ['grpfree (not holding → refusal)',        { isButton: true, customId: 'grpfree' }],
-      ['fact:escape (not held → refusal)',       { isButton: true, customId: 'fact:escape' }],
-    ];
+    // Since 2026-10-14 every press opens the roleplay form (a modal whose id
+    // carries a token) and the submit does the deed; the walk presses, reads
+    // the modal id back, submits it with words, and checks the words landed.
     const broken = [];
-    for (const [label, over] of walk) {
-      // reset to a clean attack phase before each press
-      if (!over.keepState)
-        dbHandle.prepare(`UPDATE fights SET phase='attack', current_target=NULL, effect_state='{}', turn_index=0 WHERE guild_id='G1' AND channel_id='C1'`).run();
+    const say = (label, r) => { if (VERBOSE) { const first = r.replies[0] || {}; console.log(`      ${label.padEnd(42)} → ${(first.content || (first.modal ? `modal ${first.modal}` : '') || JSON.stringify(first)).replace(/\s+/g, ' ').slice(0, 88)}`); } };
+    const step = async (label, over, { expectModal = false } = {}) => {
       logged = [];
-      const r = await fire({ ...over, userId: over.userId || 'U1', message: { id: 'M9', content: '', components: [] } });
+      const sentBefore = sent.length;
+      const r = await fire({ ...over, userId: over.userId || 'U1', message: over.message || { id: 'M9', content: '', components: [] } });
       const bad = silentOrThrew(r);
       if (bad) broken.push(`${label}: ${bad}`);
-      if (VERBOSE) {
-        const first = r.replies[0] || {};
-        const gist = (first.content || (first.modal ? `modal ${first.modal}` : '') || JSON.stringify(first)).replace(/\s+/g, ' ').slice(0, 88);
-        console.log(`      ${label.padEnd(42)} → ${gist}`);
-      }
+      const modal = r.replies.find(x => x.modal)?.modal || null;
+      if (expectModal && !/^frp:/.test(modal || '')) broken.push(`${label}: expected the roleplay form, got ${JSON.stringify(r.replies[0] || {}).slice(0, 80)}`);
+      say(label, r);
+      const said = r.replies.map(x => x.content || '').join('\n') + '\n' + sent.slice(sentBefore).map(x => x.content).join('\n');
+      return { r, modal, said, posted: sent.slice(sentBefore) };
+    };
+    const submit = async (label, modal, fields, over = {}) => {
+      if (!modal) { broken.push(`${label}: no form to submit`); return { r: { replies: [] }, said: '' }; }
+      logged = [];
+      const sentBefore = sent.length;
+      const r = await fire({ isModal: true, fromMessage: true, customId: modal, fields, userId: over.userId || 'U1', message: over.message || { id: 'M9', content: '', components: [] } });
+      const bad = silentOrThrew(r);
+      if (bad) broken.push(`${label}: ${bad}`);
+      const said = r.replies.map(x => x.content || '').join('\n') + '\n' + sent.slice(sentBefore).map(x => x.content).join('\n');
+      say(label, r);
+      return { r, said, posted: sent.slice(sentBefore) };
+    };
+    const reset = () => dbHandle.prepare(`UPDATE fights SET phase='attack', current_target=NULL, effect_state='{}', grapples='{}', turn_index=0, turn_order='["U1","U2"]', atk_roll=NULL, def_roll=NULL, atk_kind=NULL WHERE guild_id='G1' AND channel_id='C1'`).run();
+    // 1 · attack: one opponent → the form at once; the words ride the card; the defender gets buttons.
+    reset();
+    const a1 = await step('fatk:str (one opponent → form)', { isButton: true, customId: 'fatk:str' }, { expectModal: true });
+    const a2 = await submit('attack form → the card', a1.modal, { action: 'lunges low', speech: 'Have at you' });
+    ok('an attack press opens the form and the submit posts the card with the words and the defence buttons',
+      /\*lunges low\*/.test(a2.said) && /\u201CHave at you\u201D/.test(a2.said) && /Attacks .* with STR/.test(a2.said)
+        && a2.r.replies.some(x => (x.components || []).some(row => ((row._d || row).components || []).some(b => (b._d || b).customId === 'fdef:str'))),
+      a2.said.replace(/\s+/g, ' ').slice(0, 200));
+    // 2 · defence: the form, the card, the Resolve button.
+    const d1 = await step('fdef:dex (defend → form)', { isButton: true, customId: 'fdef:dex', userId: 'U2' }, { expectModal: true });
+    const d2 = await submit('defence form → the card', d1.modal, { action: 'ducks under it' }, { userId: 'U2' });
+    ok('a defence press opens the form and the submit posts the card with the words and Resolve',
+      /\*ducks under it\*/.test(d2.said) && /Defends with DEX/.test(d2.said)
+        && d2.r.replies.some(x => (x.components || []).some(row => ((row._d || row).components || []).some(b => (b._d || b).customId === 'fresolve'))),
+      d2.said.replace(/\s+/g, ' ').slice(0, 160));
+    // 3 · resolve: a GM's press asks what happens; the words sit under the outcome, above the hand-over.
+    const r1 = await step('fresolve as GM → what-happens form', { isButton: true, customId: 'fresolve' }, { expectModal: true });
+    const r2 = await submit('resolve form → the outcome', r1.modal, { what: 'Steel rings off the wall.' });
+    ok('a GM\'s Resolve opens What happens? and the words land under the outcome, above the next turn',
+      /_Steel rings off the wall\._/.test(r2.said) && r2.said.indexOf('_Steel rings off the wall._') < r2.said.indexOf("'s turn to attack") && /turn to attack/.test(r2.said),
+      r2.said.replace(/\s+/g, ' ').slice(0, 220));
+    // 4 · feint: picker → form with the claim → the feint runs with the words.
+    reset();
+    dbHandle.prepare("UPDATE characters SET wis=5 WHERE guild_id='G1' AND user_id='U1'").run();   // deception needs WIS 4+
+    await step('fact:feint (opens target picker)', { isButton: true, customId: 'fact:feint' });
+    const f1 = await step('fightact:feint select → form', { isSelect: true, customId: 'fightact:feint:U1', values: ['U2'] }, { expectModal: true });
+    const f2 = await submit('feint form → the feint', f1.modal, { claim: 'a lunge at the knee', action: 'drops a shoulder' });
+    ok('a feint pick opens the form with the claim; the submit runs it with the words', /lunge at the knee/.test(f2.said) && /drops a shoulder/.test(f2.said), f2.said.replace(/\s+/g, ' ').slice(0, 160));
+    // 5 · grapple: picker → form → the hold is attempted; the captive's Save opens its form.
+    reset();
+    await step('fact:grapple (opens target picker)', { isButton: true, customId: 'fact:grapple' });
+    const g1 = await step('fightact:grapple select → form', { isSelect: true, customId: 'fightact:grapple:U1', values: ['U2'] }, { expectModal: true });
+    const g2 = await submit('grapple form → the attempt', g1.modal, { speech: 'Got you' });
+    ok('a grapple pick opens the form; the submit makes the attempt with the words', /\u201CGot you\u201D/.test(g2.said) && /grapple|Grapple|hold/i.test(g2.said), g2.said.replace(/\s+/g, ' ').slice(0, 160));
+    const sv1 = await step('fsave (captive → form)', { isButton: true, customId: 'fsave', userId: 'U2' }, { expectModal: true });
+    const sv2 = await submit('save form → the save', sv1.modal, { action: 'twists away' }, { userId: 'U2' });
+    ok('the Save press opens the form and the submit rolls it with the words', /_\*twists away\*_/.test(sv2.said) || /\*twists away\*/.test(sv2.said), sv2.said.replace(/\s+/g, ' ').slice(0, 160));
+    // 6 · holds without a hold: refused before any form.
+    reset();
+    for (const [label, id] of [['fact:maintain (not holding → refusal)', 'fact:maintain'], ['grpfree (not holding → refusal)', 'grpfree'], ['fact:escape (not held → refusal)', 'fact:escape']]) {
+      const x = await step(label, { isButton: true, customId: id });
+      if (x.modal) broken.push(`${label}: opened a form with no hold`);
     }
-    console.error = realErr;
+    // 7 · three fighters: the picker comes first, then the form. An NPC's turn offers the GM its own buttons.
+    dbHandle.prepare("INSERT OR REPLACE INTO npcs (guild_id, name, str, con, dex, wis, lck, hp_current) VALUES ('G1', 'Probe Hollow', 3, 3, 3, 3, 3, 7)").run();
+    dbHandle.prepare(`UPDATE fights SET phase='attack', current_target=NULL, effect_state='{}', grapples='{}', turn_index=0, turn_order='["U1","U2","npc:Probe Hollow"]', hp_state='{"U1":7,"U2":7,"npc:Probe Hollow":7}', atk_roll=NULL, def_roll=NULL, atk_kind=NULL WHERE guild_id='G1' AND channel_id='C1'`).run();
+    const p1 = await step('fatk:str (two opponents → picker)', { isButton: true, customId: 'fatk:str' });
+    const pickId = p1.r.replies[0]?.components?.[0]?._d?.components?.[0]?._d?.customId || '';
+    const p2 = await step('fighttarget select → form', { isSelect: true, customId: pickId || 'fighttarget:U1:str:normal:', values: ['npc:Probe Hollow'] }, { expectModal: true });
+    const p3 = await submit('attack form (NPC target) → the card', p2.modal, { action: 'swings high' });
+    ok('with two opponents the picker comes first, then the form; the NPC defender\'s prompt carries the GM\'s 🎭 buttons',
+      /^fighttarget:U1:str:normal:/.test(pickId) && /\*swings high\*/.test(p3.said)
+        && [...p3.posted.map(x => x.msg), ...p3.r.replies].some(m => (m.components || []).some(row => ((row._d || row).components || []).some(b => (b._d || b).customId === 'fndef:str'))),
+      `pick ${pickId} · ${p3.said.replace(/\s+/g, ' ').slice(0, 120)}`);
+    const nd1 = await step('fndef:con as GM → form', { isButton: true, customId: 'fndef:con' }, { expectModal: true });
+    const nd2 = await submit('NPC defence form → the card', nd1.modal, { action: 'raises a claw' });
+    ok('the GM defends for the NPC by button: form, then the card as the NPC', /Defended as \*\*Probe Hollow\*\*/.test(nd2.said), nd2.said.replace(/\s+/g, ' ').slice(0, 120));
+    const np0 = await step('fndef by a player → refused', { isButton: true, customId: 'fndef:con', userId: 'U2' });
+    dbHandle.prepare(`UPDATE fights SET phase='attack', current_target=NULL, turn_index=2, atk_roll=NULL, def_roll=NULL, atk_kind=NULL WHERE guild_id='G1' AND channel_id='C1'`).run();
+    const na1 = await step('fnatk:str on the NPC\'s turn (GM) → picker', { isButton: true, customId: 'fnatk:str' });
+    const npick = na1.r.replies[0]?.components?.[0]?._d?.components?.[0]?._d?.customId || '';
+    const na2 = await step('fighttarget select (GM for the NPC) → form', { isSelect: true, customId: npick || 'fighttarget:npc%3AProbe%20Hollow:str:normal:', values: ['U2'] }, { expectModal: true });
+    const na3 = await submit('NPC attack form → the card', na2.modal, { speech: 'Rrraagh' });
+    ok('on an NPC\'s turn the GM attacks by button: picker, form, then the card as the NPC and the player\'s defence buttons',
+      /^fighttarget:npc%3AProbe%20Hollow:str:normal:/.test(npick) && /Attacked as \*\*Probe Hollow\*\*/.test(na3.said)
+        && na3.posted.some(x => (x.msg.components || []).some(row => ((row._d || row).components || []).some(b => (b._d || b).customId === 'fdef:str'))),
+      `pick ${npick} · ${na3.said.replace(/\s+/g, ' ').slice(0, 120)}`);
+    dbHandle.prepare(`UPDATE fights SET turn_order='["U1","U2"]', hp_state='{"U1":7,"U2":7}', turn_index=0, phase='attack', current_target=NULL WHERE guild_id='G1' AND channel_id='C1'`).run();
+    // 8 · conditions with a clock, and everyone's HP on the turn line.
+    reset();
+    const c1 = await step('/gm override condition (poisoned, 2 turns)', { commandName: 'gm', options: { _group: 'override', _sub: 'condition', user: 'U2', text: 'poisoned', turns: 2 } });
+    const c1said = c1.r.replies.map(x => x.content || '').join(' ');
+    const c2 = await step('/gm override condition on someone not in the fight', { commandName: 'gm', options: { _group: 'override', _sub: 'condition', user: 'U7', text: 'dazed' } });
+    // an exchange: U1 attacks U2, U2 defends, resolve → U2's turn comes round: poisoned ticks to 1 and shows on the line with the HP of both
+    const x1 = await step('fatk:str (→ form)', { isButton: true, customId: 'fatk:str' }, { expectModal: true });
+    await submit('attack form', x1.modal, {});
+    const x2 = await step('fdef:con (→ form)', { isButton: true, customId: 'fdef:con', userId: 'U2' }, { expectModal: true });
+    await submit('defence form', x2.modal, {}, { userId: 'U2' });
+    // Every fake member is an admin, so the Resolve press opens the GM's form; a blank one resolves.
+    const x3p = await step('fresolve → form (everyone is a GM here)', { isButton: true, customId: 'fresolve', userId: 'U2' }, { expectModal: true });
+    const x3 = await submit('resolve form, blank → the outcome', x3p.modal, { what: '' }, { userId: 'U2' });
+    const x3said = x3.said;
+    ok('a condition is set with its clock, refused for someone not in the fight, and on the fighter\'s next turn line it has ticked and sits beside everyone\'s HP',
+      /\*\*userU2\*\* is \*\*poisoned\*\* \u2014 2 turns/.test(c1said) && /is not in this fight/.test(c2.r.replies.map(x => x.content || '').join(' '))
+        && /\u{1FA79} \*\*poisoned\*\* \u2014 1 turn left/u.test(x3said) && /\u2764\uFE0F userU1 \d+\/\d+ \u00b7 userU2 \d+\/\d+/.test(x3said),
+      `${c1said.slice(0, 80)} · ${x3said.replace(/\s+/g, ' ').slice(0, 220)}`);
+    const c3 = await step('/gm override condition clear', { commandName: 'gm', options: { _group: 'override', _sub: 'condition', user: 'U2', text: 'poisoned', clear: true } });
+    ok('a condition can be cleared by hand', /\*\*poisoned\*\* lifts from \*\*userU2\*\*/.test(c3.r.replies.map(x => x.content || '').join(' ')), JSON.stringify(c3.r.replies).slice(0, 100));
+    dbHandle.prepare(`UPDATE fights SET turn_order='["U1","U2"]', hp_state='{"U1":7,"U2":7}', turn_index=0, phase='attack', current_target=NULL, effect_state='{}' WHERE guild_id='G1' AND channel_id='C1'`).run();
+    const walk = { length: 25 };
     ok(`every fight button answers (${walk.length} presses)`, broken.length === 0, broken.join('\n        '));
   }
 
@@ -793,7 +904,9 @@ async function fire(over) {
   // reads that are open on purpose. Three write leaves and all of /config
   // were open until 2026-10-11; nothing had ever tested the gate.
   if (dbHandle && registered.length) {
-    const OPEN_ON_PURPOSE = new Set(['/encounter list', '/encounter preset list', '/campaign show', '/campaign list', '/npc sheet']);
+    // /gm scroll opens its writing window before any await (a deferred
+    // interaction cannot show a modal), so its gate is on the submit — probed below.
+    const OPEN_ON_PURPOSE = new Set(['/encounter list', '/encounter preset list', '/campaign show', '/campaign list', '/npc sheet', '/gm scroll']);
     const byName = new Map();
     for (const body of registered) for (const c of body) byName.set(c.name, c);
     const plain = 'U7';
@@ -829,6 +942,8 @@ async function fire(over) {
     const sheetR = await fire({ commandName: 'npc', options: { _sub: 'sheet', name: 'Goblin' }, userId: plain, member: plainMember }).catch(() => ({ replies: [] }));
     const sheetSaid = sheetR.replies.map(x => x.content || '').join(' ');
     ok('a player reading an NPC sheet does not see hidden stats', /Stats are the GM/.test(sheetSaid) && !/STR\s+\d/.test(sheetSaid), sheetSaid.slice(0, 120));
+    const scrollSub = await fire({ isModal: true, customId: 'scrollwrite', fields: { body: 'By order of the crown' }, userId: plain, member: plainMember }).catch(() => ({ replies: [] }));
+    ok('the scroll\'s writing window gates on the submit: a plain player\'s submit is refused', /Only GMs can unfurl props/.test(scrollSub.replies.map(x => x.content || '').join(' ')), JSON.stringify(scrollSub.replies).slice(0, 120));
     guild.members.fetch = realFetch; globalThis.setTimeout = realTimeoutG; console.error = realErrG;
     ok(`every GM-marked leaf refuses a plain player (${checked} checked)`, open.length === 0, open.join('\n        '));
   }
@@ -926,7 +1041,8 @@ async function fire(over) {
     const entries = [...src.matchAll(/\{ key: '(\d{4}-\d{2}-\d{2})', gm: \[/g)].map(m => m[1]);
     const inForum = (fid) => threads.filter(t => t.parentId === fid && !deleted.includes(t.id));   // the tidy pass re-posts; the old copy is gone
     const DATE_RE = /^\[\d{2}\/\d{2}\/\d{4}\] \[WEEK \d{1,2}\] (Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) \d{1,2}(st|nd|rd|th) of [A-Z][a-z]+ \d{4} · /;
-    const gmAll = inForum(cfgU.gm_updates_forum), plT = inForum(cfgU.updates_forum);
+    // The players' forum also carries the weekly chronicle (2026-10-14); only What's new is counted here.
+    const gmAll = inForum(cfgU.gm_updates_forum), plT = inForum(cfgU.updates_forum).filter(t => / \u00b7 What's new$/.test(t.name));
     const gmT = gmAll.filter(t => / · What's new$/.test(t.name));
     ok('the deploy mend is a dated thread in gm-updates, reporting what the boot built', gmAll.some(t => / · Deploy mend$/.test(t.name) && DATE_RE.test(t.name)), gmAll.map(t => t.name).join(' | '));
     ok(`the back-catalogue is seeded once, oldest first, one dated thread per entry (${entries.length} entries)`,
@@ -1025,7 +1141,7 @@ async function fire(over) {
     const mendText = mendsNow.length ? msgsOf(mendsNow[mendsNow.length - 1]).map(m => m.content).join('\n') : '';
     ok('a GM What\'s new thread that lacks a line the entry now has (and no ledger row) is deleted and posted again whole, the ledger written, the Deploy mend saying so',
       bad.length === 0 && !!gmT && !!gmLost && deleted.includes(gmT.id) && !!gmNow && gmNow.id !== gmT.id
-        && msgsOf(gmNow)[0]?.content.includes(gmLost) && msgsOf(gmNow).some(m => m.content.startsWith('**In detail**'))
+        && msgsOf(gmNow).some(m => m.content.includes(gmLost)) && msgsOf(gmNow).some(m => m.content.startsWith('**In detail**'))
         && gmRow?.thread_id === gmNow.id && JSON.parse(gmRow?.lines || '[]').includes(gmLost.slice(2))
         && new RegExp(`What.s new ${newest.slice(8, 10)}/${newest.slice(5, 7)} re-posted with 1 new line\\(s\\)`).test(mendText),
       `${bad.join(' | ')} lost "${(gmLost || '').slice(0, 50)}" · old deleted ${gmT && deleted.includes(gmT.id)} · new ${gmNow?.id} · row ${gmRow?.thread_id} · mend: ${mendText.slice(0, 200)}`);
@@ -1103,11 +1219,13 @@ async function fire(over) {
         && /Reposted 1\u00d7/.test(sentById.get(d1row.card_id)?.content || '') && /1 swing so far/.test(sentById.get(d1row.card_id)?.content || '')
         && (sentById.get(d1.message_id)?.components || []).length === 0 && /continues below/.test(sentById.get(d1.message_id)?.content || ''),
       r1 ? `said ${r1.said.slice(0, 120)} · dead ${r1.dead} · card ${d1.message_id}→${d1row?.card_id} · ${(sentById.get(d1row?.card_id)?.content || '').slice(0, 120)}` : 'no target planted');
-    const dMid = await plant('Probe door middling', { stat: 'str', dc: 12, success_flavour: 'It gives.', fail_flavour: 'It holds.' });
+    const strU2 = dbHandle.prepare("SELECT str FROM characters WHERE guild_id='G1' AND user_id='U2'").get()?.str ?? 0;
+    const midTotal = 11 + strU2;   // a die of 11 plus the stat: meets DC 12 only with the real total, never with NaN
+    const dMid = await plant('Probe door middling', { stat: 'str', dc: Math.min(12, midTotal), success_flavour: 'It gives.', fail_flavour: 'It holds.' });
     const rMid = dMid ? await strike(dMid, 0.5) : null;
-    ok('any other roll says "The roll succeeds/fails" and asks the GM, naming the swing, with the two verdict buttons',
-      !!rMid && rMid.asked && rMid.dead === 0 && /The roll (succeeds|fails)\./.test(rMid.said) && !/telling blow|glances off/.test(rMid.said)
-        && /\(swing 1\)\. Your call:/.test(rMid.prompt?.content || '')
+    ok('a roll that meets the DC says "The roll succeeds" and asks the GM with the number and the swing \u2014 never NaN \u2014 with the two verdict buttons',
+      !!rMid && rMid.asked && rMid.dead === 0 && /\u2705 \*\*The roll succeeds\.\*\*/.test(rMid.said) && !/telling blow|glances off|NaN/.test(rMid.said)
+        && new RegExp(`for \\*\\*${midTotal}\\*\\* vs DC ${Math.min(12, midTotal)} \\(swing 1\\)\\. Your call:`).test(rMid.prompt?.content || '')
         && rMid.buttons.some(l => /The player passes the check/.test(l)) && rMid.buttons.some(l => /The player fails the check/.test(l)),
       rMid ? `asked ${rMid.asked} · ${rMid.said.slice(0, 80)} · ${(rMid.prompt?.content || '').slice(0, 80)} · buttons ${rMid.buttons.join(' | ')}` : 'no target planted');
     // The GM calls a fail: the form opens prefilled with the fail flavour; sent as is → the verdict line, the words, the card again.
@@ -1160,6 +1278,56 @@ async function fire(over) {
     const dDice = await plant('Probe door dice', { dice: '2d6+1' });
     const diceCard = dDice ? cardOf(dDice) : null;
     ok('dice named: one attack button, the roll is the dice', !!dDice && idsOf(diceCard).join(',') === 'tgtatk' && /\*\*2d6\+1\*\*/.test(diceCard?.content || ''), idsOf(diceCard).join(','));
+    // hp: with a DC the die decides every blow — a pass takes one off, no call; it falls at 0 (T, 2026-10-14).
+    const dHp = await plant('Probe door hp', { stat: 'str', dc: 10, hp: 2 });
+    const h1 = dHp ? await strike(dHp, 0.5) : null;
+    const hpRow1 = dHp ? rowOf(dHp) : null;
+    ok('an hp target with a DC: a pass takes one off with no call, and the card says how many are left',
+      !!h1 && !h1.asked && hpRow1?.hp_left === 1 && hpRow1?.dead === 0 && /1 of 2 left/.test(h1.said) && /\*\*1 of 2\*\* left/.test(cardOf(dHp)?.content || ''),
+      `asked ${h1?.asked} · left ${hpRow1?.hp_left} · ${h1?.said.replace(/\s+/g, ' ').slice(0, 120)} · card ${(cardOf(dHp)?.content || '').slice(0, 80)}`);
+    const h2 = dHp ? await strike(dHp, 0.5) : null;
+    const hpRow2 = dHp ? rowOf(dHp) : null;
+    ok('the last hit beats it', !!h2 && !h2.asked && hpRow2?.dead === 1 && /falls/.test(h2.said) && /beaten after 2 hits/.test(cardOf(dHp)?.content || ''), `dead ${hpRow2?.dead} · ${h2?.said.replace(/\s+/g, ' ').slice(0, 100)}`);
+    // hp: with no DC each pass you call takes one off.
+    const dHpCall = await plant('Probe door hp call', { stat: 'str', hp: 2 });
+    const hc1 = dHpCall ? await strike(dHpCall, 0.5) : null;
+    const hcCall = hc1 ? await call(hc1, true, '') : null;
+    const hcRow = dHpCall ? rowOf(dHpCall) : null;
+    ok('an hp target with no DC: your pass takes one off and says what is left; the target stands', !!hc1 && hc1.asked && !!hcCall?.modal && hcRow?.hp_left === 1 && hcRow?.dead === 0 && hcCall.replies.some(r => /1 of 2\*\* left/.test(r.content || '')), `${JSON.stringify(hcCall?.replies).slice(0, 120)} · left ${hcRow?.hp_left}`);
+    // The list offers a 🪦 button per standing target; pressing retires it.
+    const lst = await fire({ commandName: 'target', options: { _sub: 'list' }, userId: 'U1' });
+    const retireIds = (lst.replies[0]?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+    const retireMine = retireIds.find(id => id === `tgtretire:${dHpCall.message_id}`);
+    const ret = retireMine ? await fire({ isButton: true, customId: retireMine, message: lst.replies[0], userId: 'U1' }) : null;
+    const retRow = dHpCall ? rowOf(dHpCall) : null;
+    ok('/target list carries a 🪦 button per standing target and pressing it retires the target', !!retireMine && retRow?.dead === 1 && /retired/.test(JSON.stringify(ret?.replies)) && /retired by the GM/.test(cardOf(dHpCall)?.content || ''), `${retireIds.length} button(s) · ${JSON.stringify(ret?.replies).slice(0, 80)}`);
+    // write:true opens the box; its submit makes the target with the words.
+    const wr = await fire({ commandName: 'target', options: { _sub: 'create', name: 'Probe door written', dc: 11, write: true }, userId: 'U1' });
+    const wrModal = wr.replies.find(x => x.modal)?.modal;
+    const wr2 = wrModal ? await fire({ isModal: true, customId: wrModal, fields: { scene: 'A door, iron-banded.', success: 'It gives.', fail: 'It holds.' }, userId: 'U1' }) : null;
+    const wrRow = dbHandle.prepare("SELECT * FROM temp_targets WHERE guild_id='G1' AND name='Probe door written'").get();
+    ok('write:true opens a box for the scene and the two flavours; the submit plants the target with them', /^tgtwrite:/.test(wrModal || '') && !!wrRow && wrRow.reason === 'A door, iron-banded.' && wrRow.success_text === 'It gives.' && wrRow.fail_text === 'It holds.' && wrRow.dc === 11 && /A door, iron-banded\./.test(cardOf(wrRow)?.content || ''), `${wrModal} · ${JSON.stringify(wrRow || {}).slice(0, 120)}`);
+    // A bare `d20` passed the creation check and failed every press (T, 2026-10-14: "That expression no longer reads").
+    const dBare = await plant('Probe door d20', { dice: 'd20', dc: 10 });
+    const rBare = dBare ? await strike(dBare, 0.5) : null;
+    ok('dice:d20 with no count rolls as one die', !!rBare && /with \*\*d20\*\*/.test(rBare.said) && /= \*\*11\*\*/.test(rBare.said) && !/no longer reads/.test(rBare.said) && rBare.asked, rBare?.said.slice(0, 100));
+    // The same NaN bit the planted stat button and the group check: an 11 + 3 against DC 10 must pass.
+    const sentBeforeBtn = sent.length;
+    await fire({ commandName: 'button', options: { _sub: 'roll', stat: 'str', dc: 10 }, userId: 'U1' });
+    const planted = sent.slice(sentBeforeBtn).map(x => x.msg).find(m => idsOf(m).some(id => /^btnchk:/.test(id)));
+    Math.random = () => 0.5;
+    const pressed = planted ? await fire({ isButton: true, customId: idsOf(planted)[0], message: planted, userId: 'U2' }).catch(e => ({ replies: [{ content: 'THREW ' + e.message }] })) : null;
+    Math.random = realRandom;
+    const pressedSaid = pressed ? pressed.replies.map(x => x.content || '').join(' ') : '';
+    ok('a planted stat button: a die of 11 plus the stat against DC 10 is "Passed", not a NaN fail', !!planted && /\*\*Passed\.\*\*/.test(pressedSaid) && !/NaN/.test(pressedSaid), pressedSaid.slice(0, 120) || 'no planted button');
+    const sentBeforeGrp = sent.length;
+    await fire({ commandName: 'button', options: { _sub: 'group', stat: 'str', dc: 10, reason: 'Probe ford' }, userId: 'U1' });
+    const grpMsg = sent.slice(sentBeforeGrp).map(x => x.msg).find(m => idsOf(m).includes('grproll'));
+    Math.random = () => 0.5;
+    const grpPress = grpMsg ? await fire({ isButton: true, customId: 'grproll', message: grpMsg, userId: 'U2' }).catch(e => ({ replies: [{ content: 'THREW ' + e.message }] })) : null;
+    Math.random = realRandom;
+    const grpRow = grpMsg ? dbHandle.prepare("SELECT total, passed FROM group_check_rolls WHERE guild_id='G1' AND message_id=? AND user_id='U2'").get(grpMsg.id) : null;
+    ok('a group check: a die of 11 plus the stat against DC 10 is stored as a pass with its total, not NaN', !!grpPress && grpRow?.total === midTotal && grpRow?.passed === 1, `row ${JSON.stringify(grpRow)} expected ${midTotal} · ${JSON.stringify(grpPress?.replies).slice(0, 80)}`);
     // secret: the prompt goes to the checks shelf, the players get their own line with the words.
     const chk = new FakeChannel(nextId(), 0, 'gm-checks', guild); channelsById.set(chk.id, chk);
     dbHandle.prepare("INSERT INTO guild_config (guild_id, roll_audit_channel_id) VALUES ('G1', ?) ON CONFLICT(guild_id) DO UPDATE SET roll_audit_channel_id=excluded.roll_audit_channel_id").run(chk.id);
@@ -1209,6 +1377,262 @@ async function fire(over) {
         && /2 duplicate NPC page\(s\) removed/.test(mendSaid) && /duplicate NPC page left in place: Probe Hollow \(someone wrote in the copy\)/.test(mendSaid),
       `dup1 ${deleted.includes(dup1.id)} dup2 ${deleted.includes(dup2.id)} dup3 kept ${!deleted.includes(dup3.id)} · ${pages().length} page(s) · row ${rowOf()?.thread_id} · ${mendSaid.replace(/\s+/g, ' ').slice(0, 200)}`);
     globalThis.setTimeout = realTimeoutN; console.error = realErrN;
+  }
+
+  // ── Build A2 (2026-10-14): audiences, the GM toolbar, the ready check, the
+  // story scroll, the weekly chronicle, the idle nudge, the stalled targets,
+  // the registration line, the next-steps line ─────────────────────────
+  if (dbHandle) {
+    const realErrA = console.error; const loggedA = [];
+    console.error = (...a) => { loggedA.push(a.map(String).join(' ')); };
+    const idsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+    const saidOf = (r) => r.replies.map(x => x.content || '').join(' ');
+    const withRole = (uid, role) => ({ id: uid, roles: { cache: new Map([[role, { id: role }]]) }, permissions: { has: () => true } });
+    const seed = (uid) => dbHandle.prepare(`INSERT OR REPLACE INTO characters (guild_id, user_id, str, con, dex, wis, lck, hp_current) VALUES ('G1', ?, 3, 3, 3, 3, 3, 7)`).run(uid);
+    // Mentions carry Discord's numeric ids, and the parsers hold them to that;
+    // the fake guild answers any id, so these two are members like U1.
+    const P2 = '100000000000000002', P4 = '100000000000000004', R9 = '900000000000000009';
+    seed('U2'); seed(P2); seed(P4);
+    // 1 · a planted button for two players or a role
+    let before = sent.length;
+    await fire({ commandName: 'button', options: { _sub: 'roll', stat: 'str', dc: 10, audience: `<@${P2}> <@&${R9}>` }, userId: 'U1' });
+    const planted = sent.slice(before).find(x => /\*\*STR\*\*/.test(x.content))?.msg;
+    const pid = planted ? idsOf(planted)[0] : '';
+    const rowA = planted ? dbHandle.prepare("SELECT owners FROM button_audience WHERE guild_id='G1' AND message_id=?").get(planted.id) : null;
+    const pU3 = planted ? saidOf(await fire({ isButton: true, customId: pid, message: planted, userId: 'U3' })) : '';
+    const pU2 = planted ? saidOf(await fire({ isButton: true, customId: pid, message: planted, userId: P2 })) : '';
+    const pRole = planted ? saidOf(await fire({ isButton: true, customId: pid, message: planted, userId: P4, member: withRole(P4, R9) })) : '';
+    ok('a planted button can be addressed to several players or a role: the list sits under the message, the card names them all, a stranger is turned away, a listed player and a role-holder roll',
+      !!planted && planted.content.startsWith(`<@${P2}> <@&${R9}> — `) && /:list$/.test(pid) && rowA?.owners === `u:${P2},r:${R9}`
+        && /not addressed to you/.test(pU3) && !/not addressed/.test(pU2) && /\d/.test(pU2) && !/not addressed/.test(pRole) && /\d/.test(pRole),
+      `${(planted?.content || '').slice(0, 60)} · id ${pid} · owners ${rowA?.owners} · U3 ${pU3.slice(0, 40)} · U2 ${pU2.replace(/\s+/g, ' ').slice(0, 40)} · role ${pRole.replace(/\s+/g, ' ').slice(0, 40)}`);
+    await fire({ commandName: 'target', options: { _sub: 'create', name: 'Probe gate', stat: 'str', dc: 10, audience: `<@${P2}> <@&${R9}>` }, userId: 'U1' });
+    const tRow = dbHandle.prepare("SELECT * FROM temp_targets WHERE guild_id='G1' AND name='Probe gate' ORDER BY at DESC").get();
+    const tCard = tRow ? sentById.get(tRow.card_id || tRow.message_id) : null;
+    const tU3 = tCard ? await fire({ isButton: true, customId: 'tgtatk:str', message: tCard, userId: 'U3' }) : { replies: [] };
+    const tRole = tCard ? await fire({ isButton: true, customId: 'tgtatk:str', message: tCard, userId: P4, member: withRole(P4, R9) }) : { replies: [] };
+    ok('a target takes the same audience: kept as the owner list, named on the card, a stranger turned away, a role-holder offered the form',
+      tRow?.owner === `u:${P2},r:${R9}` && (tCard?.content || '').startsWith(`<@${P2}> <@&${R9}> —`) && /not addressed to you/.test(saidOf(tU3)) && /^tgtrp:/.test(tRole.replies.find(x => x.modal)?.modal || ''),
+      `owner ${tRow?.owner} · ${(tCard?.content || '').slice(0, 50)} · U3 ${saidOf(tU3).slice(0, 40)} · role ${JSON.stringify(tRole.replies[0] || {}).slice(0, 60)}`);
+    // 2 · the GM toolbar (a live fight in C1 so Status has something to say)
+    dbHandle.prepare(`UPDATE fights SET state='active', turn_order='["U1","U2"]', turn_index=0, phase='attack', current_target=NULL, hp_state='{"U1":7,"U2":7}' WHERE guild_id='G1' AND channel_id='C1'`).run();
+    before = sent.length;
+    const barR = await fire({ commandName: 'gm', options: { _sub: 'bar' }, userId: 'U1' });
+    const bar = sent.slice(before).find(x => /GM toolbar/.test(x.content))?.msg;
+    const barIds = bar ? idsOf(bar) : [];
+    const bSt = bar ? await fire({ isButton: true, customId: 'gmbar:status', message: bar, userId: 'U1' }) : { replies: [] };
+    const bTg = bar ? await fire({ isButton: true, customId: 'gmbar:target', message: bar, userId: 'U1' }) : { replies: [] };
+    const bDc = bar ? await fire({ isButton: true, customId: 'gmbar:dc', message: bar, userId: 'U1' }) : { replies: [] };
+    const bFt = bar ? await fire({ isButton: true, customId: 'gmbar:fight', message: bar, userId: 'U1' }) : { replies: [] };
+    ok('/gm bar pins one message with five buttons; Status answers at once, three open their forms, Undo rewinds',
+      !!bar && pinned.includes(bar.id) && /Toolbar pinned/.test(saidOf(barR)) && barIds.join(',') === 'gmbar:target,gmbar:dc,gmbar:fight,gmbar:status,gmbar:undo'
+        && /Where things stand here/.test(saidOf(bSt)) && /A fight is on \u2014 \*\*userU1\*\* to act\./.test(saidOf(bSt)) && /userU1 7\/\d+/.test(saidOf(bSt)) && /Standing: \*\*Probe gate\*\*/.test(saidOf(bSt)) && bTg.replies[0]?.modal === 'gmbartgt' && /^dcform:/.test(bDc.replies[0]?.modal || '') && bFt.replies[0]?.modal === 'gmbarfight',
+      `bar ${!!bar} pinned ${bar && pinned.includes(bar.id)} · ${barIds.join(',')} · status ${saidOf(bSt).replace(/\s+/g, ' ').slice(0, 60)} · ${bTg.replies[0]?.modal} ${bDc.replies[0]?.modal} ${bFt.replies[0]?.modal}`);
+    const tgtSub = await fire({ isModal: true, customId: 'gmbartgt', fields: { name: 'Probe portcullis', check: '14 str dex', scene: 'Iron bars, rusted.', hp: '2', for: '' }, userId: 'U1' });
+    const pcRow = dbHandle.prepare("SELECT * FROM temp_targets WHERE guild_id='G1' AND name='Probe portcullis' ORDER BY at DESC").get();
+    const pcCard = pcRow ? sentById.get(pcRow.message_id) : null;
+    ok('the toolbar\'s Plant target box makes the target /target create would: DC, stats, scene and hits read off the box',
+      pcRow?.dc === 14 && pcRow?.stat === 'str,dex' && pcRow?.reason === 'Iron bars, rusted.' && pcRow?.hp === 2 && /is standing/.test(saidOf(tgtSub)) && idsOf(pcCard).join(',') === 'tgtatk:str,tgtatk:dex',
+      `${JSON.stringify(pcRow || {}).slice(0, 160)} · ${saidOf(tgtSub).slice(0, 60)} · ${idsOf(pcCard).join(',')}`);
+    const chanF = new FakeChannel('C8', 0, 'toolbar-fight', guild); channelsById.set(chanF.id, chanF);
+    const ftSub = await fire({ isModal: true, customId: 'gmbarfight', fields: { players: `<@${P2}> <@${P4}>`, npcs: '', practice: 'no' }, userId: 'U1', channel: chanF });
+    const fRow = dbHandle.prepare("SELECT state, turn_order FROM fights WHERE guild_id='G1' AND channel_id='C8'").get();
+    ok('the toolbar\'s Start fight box starts the fight the slash command would, the players read off the box',
+      fRow?.state === 'active' && (fRow?.turn_order || '').includes(P2) && (fRow?.turn_order || '').includes(P4), `${JSON.stringify(fRow || {})} · ${saidOf(ftSub).replace(/\s+/g, ' ').slice(0, 80)}`);
+    // 3 · the ready check
+    dbHandle.prepare(`INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, gm_id, started_at) VALUES ('G1', 910, 'Probe Tale', 'active', 'quest', ?, 'C1', 'U1', ?)`).run(Date.now(), Date.now());
+    for (const u of ['U1', 'U2']) dbHandle.prepare("INSERT OR REPLACE INTO quest_members (guild_id, number, user_id, state) VALUES ('G1', 910, ?, 'party')").run(u);
+    const rdy = await fire({ commandName: 'quest', options: { _group: 'run', _sub: 'ready', number: 910 }, userId: 'U1' });
+    const rdyCard = rdy.replies[0] || {};
+    const rdyMsg = { id: nextId(), content: rdyCard.content || '', components: rdyCard.components || [], edit: async () => {} };
+    const q3 = await fire({ isButton: true, customId: 'qready:910', message: rdyMsg, userId: 'U3' });
+    const q2 = await fire({ isButton: true, customId: 'qready:910', message: rdyMsg, userId: 'U2' });
+    const q1 = await fire({ isButton: true, customId: 'qready:910', message: rdyMsg, userId: 'U1' });
+    ok('/quest run ready: a tick per seated player, a stranger turned away, each press re-draws the card, the last says all ready and names the GM',
+      /ready check/.test(rdyCard.content || '') && ((rdyCard.content || '').match(/⬜ <@U/g) || []).length === 2 && idsOf(rdyCard).includes('qready:910')
+        && /seated party/.test(saidOf(q3)) && /✅ <@U2>/.test(saidOf(q2)) && /1 of 2/.test(saidOf(q2)) && /All 2 ready/.test(saidOf(q1)) && /<@U1>/.test(saidOf(q1)),
+      `${(rdyCard.content || '').replace(/\s+/g, ' ').slice(0, 80)} · U3 ${saidOf(q3).slice(0, 40)} · U2 ${saidOf(q2).replace(/\s+/g, ' ').slice(0, 70)} · U1 ${saidOf(q1).replace(/\s+/g, ' ').slice(-70)}`);
+    // 4 · a strike's words reach the running quest's chronicle; the story scroll rides the completion card
+    await fire({ commandName: 'target', options: { _sub: 'create', name: 'Probe idol', stat: 'str', dc: 5 }, userId: 'U1' });
+    const idol = dbHandle.prepare("SELECT * FROM temp_targets WHERE guild_id='G1' AND name='Probe idol' ORDER BY at DESC").get();
+    const idolCard = idol ? sentById.get(idol.message_id) : null;
+    const ip = idolCard ? await fire({ isButton: true, customId: 'tgtatk:str', message: idolCard, userId: 'U2' }) : { replies: [] };
+    const ipModal = ip.replies.find(x => x.modal)?.modal;
+    if (ipModal) await fire({ isModal: true, fromMessage: true, customId: ipModal, fields: { action: 'topples the idol', speech: 'Down you go' }, message: idolCard, userId: 'U2' });
+    const rpRows = dbHandle.prepare("SELECT text FROM quest_events WHERE guild_id='G1' AND number=910 AND kind='rp'").all().map(r => r.text);
+    ok('the words from a target strike go into the running quest\'s chronicle as story',
+      rpRows.some(t => /topples the idol/.test(t) && /“Down you go”/.test(t)), rpRows.join(' | ').slice(0, 160) || 'no rp rows');
+    const done = await fire({ commandName: 'quest', options: { _group: 'run', _sub: 'complete', number: 910, summary: 'They toppled the idol and went home.' }, userId: 'U1' });
+    const storyAtt = done.replies.flatMap(x => x.files || []).find(f => /story\.pdf$/.test(f?.b?.name || ''));
+    const storyBuf = storyAtt?.a;
+    let woven = null; try { woven = JSON.parse(storyBuf.slice(storyBuf.indexOf('DDICESCROLLv1') + 13).toString('utf8')); } catch {}
+    ok('the completion card carries the run\'s story as a woven scroll PDF: the party, the length, every beat with its words, the tale',
+      !!storyAtt && /^%PDF-1\.4/.test(storyBuf.toString('latin1', 0, 8)) && /\/Count \d+/.test(storyBuf.toString('latin1')) && woven?.kind === 'scroll' && /Probe Tale/.test(woven?.title || '')
+        && /The party: userU1, userU2/.test(woven?.body || '') && /topples the idol/.test(woven?.body || '') && /They toppled the idol/.test(woven?.body || '') && /rides below as a scroll/.test(saidOf(done)),
+      `att ${storyAtt?.b?.name} · ${(woven?.body || '').replace(/\s+/g, ' ').slice(0, 160)} · ${saidOf(done).replace(/\s+/g, ' ').slice(0, 80)}`);
+    // 5 · the registration line, the next-steps line, the stalled targets
+    const stR = await fire({ commandName: 'gm', options: { _group: 'check', _sub: 'status' }, userId: 'U1' });
+    ok('/gm check status says whether the commands registered on this boot, and the Deploy mend said the same',
+      /commands: \d+ registered on this boot/.test(saidOf(stR)) && sent.some(x => /commands: \d+ registered on this boot/.test(x.content)), saidOf(stR).replace(/\s+/g, ' ').slice(-120));
+    const newSheet = await fire({ commandName: 'char', options: { _sub: 'create', str: 3, con: 3, dex: 3, wis: 3, lck: 3 }, userId: 'U5' });
+    ok('a new sheet is told where to go next', /\u{1F9ED} \*\*Next:\*\*/u.test(saidOf(newSheet)) && /`\/help`/.test(saidOf(newSheet)), saidOf(newSheet).replace(/\s+/g, ' ').slice(-160));
+    dbHandle.prepare("UPDATE temp_targets SET at=? WHERE guild_id='G1' AND name='Probe gate'").run(Date.now() - 2 * 86400000);
+    const stalled = await fire({ commandName: 'gm', options: { _group: 'check', _sub: 'stalled' }, userId: 'U1' });
+    ok('a target standing over a day is in the stalled report', /Targets standing over a day/.test(saidOf(stalled)) && /Probe gate in <#C1> \(2d\)/.test(saidOf(stalled)), saidOf(stalled).replace(/\s+/g, ' ').slice(0, 160));
+    // 6 · the weekly chronicle and the idle nudge, from the ticks
+    dbHandle.prepare("INSERT OR IGNORE INTO subject_titles (guild_id, subject_id, title, source, granted_by, at) VALUES ('G1', 'U2', 'Idol-breaker', 'probe', 'U1', ?)").run(Date.now());
+    dbHandle.prepare("INSERT INTO week_ledger (guild_id, at, kind, text) VALUES ('G1', ?, 'fight', 'userU1 wins!')").run(Date.now());
+    dbHandle.prepare("UPDATE characters SET died_at=? WHERE guild_id='G1' AND user_id=?").run(Date.now(), P4);
+    dbHandle.prepare("UPDATE guild_config SET week_tale_at=0 WHERE guild_id='G1'").run();
+    dbHandle.prepare(`UPDATE fights SET state='active', turn_order='["U1","U2"]', turn_index=0, phase='attack', current_target=NULL, nudged=0, last_at=? WHERE guild_id='G1' AND channel_id='C1'`).run(Date.now() - 11 * 60 * 1000);
+    const updForum = dbHandle.prepare("SELECT updates_forum FROM guild_config WHERE guild_id='G1'").get()?.updates_forum;
+    const talesBefore = threads.filter(t => t.parentId === updForum && / · Weekly chronicle$/.test(t.name)).length;   // the tick walk above posted the first
+    const nudgesBefore = sent.filter(x => /Ten minutes quiet/.test(x.content)).length;
+    for (const t of ticks) { try { await t.fn(); } catch (e) { loggedA.push(`tick: ${e.message}`); } }
+    const tales = threads.filter(t => t.parentId === updForum && / · Weekly chronicle$/.test(t.name));
+    const taleText = tales.length ? sent.filter(x => x.channel === tales[tales.length - 1].id).map(x => x.content).join('\n') : '';
+    ok('the players\' weekly chronicle is a dated thread in updates: quests completed, titles granted, fights won, the fallen',
+      tales.length === talesBefore + 1 && /Quests completed/.test(taleText) && /\*\*#910-Probe Tale\*\* — userU1, userU2 \(GM userU1\)/.test(taleText)
+        && /Titles granted/.test(taleText) && /\*\*userU2\*\* — Idol-breaker/.test(taleText) && /Fights won/.test(taleText) && /userU1 wins!/.test(taleText)
+        && /The fallen/.test(taleText) && taleText.includes(`**user${P4}**`),
+      `${tales.length} thread(s) · ${taleText.replace(/\s+/g, ' ').slice(0, 300)}`);
+    const nudges = sent.filter(x => /Ten minutes quiet/.test(x.content));
+    const nudgedRow = dbHandle.prepare("SELECT nudged FROM fights WHERE guild_id='G1' AND channel_id='C1'").get();
+    for (const t of ticks) { try { await t.fn(); } catch {} }
+    const nudgesAgain = sent.filter(x => /Ten minutes quiet/.test(x.content)).length;
+    const talesAgain = threads.filter(t => t.parentId === updForum && / · Weekly chronicle$/.test(t.name)).length;
+    ok('a fight quiet for ten minutes nudges whoever it waits on, once; a second tick nudges nobody and posts no second chronicle',
+      nudges.length === nudgesBefore + 1 && /⏳ Ten minutes quiet — \*\*userU1\*\* is up to attack\. <@U1>/.test(nudges[nudges.length - 1]?.content || '') && nudgedRow?.nudged === 1
+        && nudgesAgain === nudges.length && talesAgain === talesBefore + 1,
+      `${nudges.length - nudgesBefore} nudge(s): ${(nudges[nudges.length - 1]?.content || '').slice(0, 80)} · nudged ${nudgedRow?.nudged} · again ${nudgesAgain - nudges.length} · chronicles ${talesAgain}`);
+    dbHandle.prepare("UPDATE characters SET died_at=NULL WHERE guild_id='G1' AND user_id=?").run(P4);
+    const threwA = loggedA.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
+    console.error = realErrA;
+    ok('nothing in the A2 walk threw', threwA.length === 0, threwA.slice(0, 3).join('\n        '));
+  }
+
+  // ── Build B (2026-10-15): /gm undo, the channel's journal ─────────────
+  if (dbHandle) {
+    const realErrB = console.error; const loggedB = [];
+    console.error = (...a) => { loggedB.push(a.map(String).join(' ')); };
+    const idsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+    const saidOf = (r) => r.replies.map(x => x.content || '').join(' ');
+    const realRandom = Math.random;
+    const journal = (cid) => dbHandle.prepare("SELECT id, label, actor FROM undo_journal WHERE guild_id='G1' AND channel_id=? ORDER BY id DESC").all(cid);
+    const fightRow = () => dbHandle.prepare("SELECT state, phase, turn_index, atk_roll, def_roll, hp_state FROM fights WHERE guild_id='G1' AND channel_id='C1'").get();
+    const hpOf = (uid) => dbHandle.prepare("SELECT hp_current FROM characters WHERE guild_id='G1' AND user_id=?").get(uid)?.hp_current;
+    const modalOf = (r) => r.replies.find(x => x.modal)?.modal || null;
+    // 1 · an exchange, then the rewind: resolve first, then the two rolls
+    dbHandle.prepare("UPDATE characters SET hp_current=7 WHERE guild_id='G1' AND user_id IN ('U1','U2')").run();
+    dbHandle.prepare(`UPDATE fights SET state='active', turn_order='["U1","U2"]', turn_index=0, phase='attack', current_target=NULL, hp_state='{"U1":7,"U2":7}', effect_state='{}', grapples='{}', atk_roll=NULL, def_roll=NULL, atk_kind=NULL WHERE guild_id='G1' AND channel_id='C1'`).run();
+    dbHandle.prepare("DELETE FROM undo_journal WHERE guild_id='G1' AND channel_id='C1'").run();
+    const msgF = { id: 'M9', content: '', components: [] };
+    const a1 = await fire({ isButton: true, customId: 'fatk:str', message: msgF, userId: 'U1' });
+    Math.random = () => 0.9999;
+    await fire({ isModal: true, fromMessage: true, customId: modalOf(a1), fields: { action: 'swings for the head' }, message: msgF, userId: 'U1' });
+    const d1 = await fire({ isButton: true, customId: 'fdef:con', message: msgF, userId: 'U2' });
+    Math.random = () => 0;
+    await fire({ isModal: true, fromMessage: true, customId: modalOf(d1), fields: {}, message: msgF, userId: 'U2' });
+    Math.random = realRandom;
+    const beforeResolve = fightRow();
+    const r1 = await fire({ isButton: true, customId: 'fresolve', message: msgF, userId: 'U2' });
+    await fire({ isModal: true, fromMessage: true, customId: modalOf(r1), fields: { what: '' }, message: msgF, userId: 'U2' });
+    const afterResolve = fightRow(), hpHit = hpOf('U2');
+    const j1 = journal('C1');
+    ok('every fight step is journaled under a readable label, newest first, and the rewind itself never is',
+      j1.length >= 3 && j1[0].label === 'fight form' && j1[0].actor === 'U2' && j1.some(r => r.label === 'fight form' && r.actor === 'U1') && !j1.some(r => /undo/.test(r.label))
+        && beforeResolve?.phase === 'defend' && afterResolve?.phase === 'attack' && hpHit < 7,
+      `${j1.map(r => r.label + '/' + r.actor).join(' | ')} · before ${JSON.stringify(beforeResolve)} · after ${JSON.stringify(afterResolve)} · U2 hp ${hpHit}`);
+    let before = sent.length;
+    const u1 = await fire({ commandName: 'gm', options: { _sub: 'undo' }, userId: 'U1' });
+    const postedU1 = sent.slice(before).map(x => x.msg);
+    const rowU1 = fightRow();
+    ok('/gm undo rewinds the resolve: the HP comes back, the fight row stands as it did before the press, the table is told what moved, the status and the defence prompt are posted again',
+      new RegExp(`⏪ \\*\\*Rewound one step\\*\\* by <@U1>: \\*\\*fight form\\*\\* by <@U2>`).test(saidOf(u1)) && new RegExp(`❤️ userU2 ${hpHit}→7`).test(saidOf(u1))
+        && hpOf('U2') === 7 && rowU1?.phase === 'defend' && rowU1?.def_roll === beforeResolve.def_roll && rowU1?.hp_state === beforeResolve.hp_state
+        && postedU1.some(m => /\*\*Fight Status\*\*/.test(m.content)) && postedU1.some(m => /attacks \*\*userU2\*\* with STR/.test(m.content) && idsOf(m).includes('fdef:con')),
+      `${saidOf(u1).replace(/\s+/g, ' ').slice(0, 160)} · row ${JSON.stringify(rowU1)} · posted ${postedU1.map(m => m.content.replace(/\s+/g, ' ').slice(0, 40)).join(' | ')}`);
+    const u2 = await fire({ commandName: 'gm', options: { _sub: 'undo', steps: 2 }, userId: 'U1' });
+    const rowU2 = fightRow();
+    ok('steps:2 takes the defence and the attack back together: the fight waits for an attack again, no rolls on it, and a third rewind is not a redo',
+      /Rewound 2 steps/.test(saidOf(u2)) && rowU2?.phase === 'attack' && rowU2?.atk_roll === null && rowU2?.def_roll === null && !journal('C1').some(r => /undo/.test(r.label)),
+      `${saidOf(u2).replace(/\s+/g, ' ').slice(0, 120)} · row ${JSON.stringify(rowU2)}`);
+    // 2 · a fight that has ended is not rewound (the toolbar's fight in C8)
+    const chanF = channelsById.get('C8');
+    const endAsk = await fire({ commandName: 'fight', options: { _sub: 'end' }, userId: 'U1', channel: chanF });
+    const endConfirm = idsOf(endAsk.replies[0]).find(id => /^confirm:/.test(id));
+    if (endConfirm) await fire({ isButton: true, customId: endConfirm, message: { id: nextId(), content: '', components: [] }, userId: 'U1', channel: chanF });
+    const endedRow = dbHandle.prepare("SELECT state FROM fights WHERE guild_id='G1' AND channel_id='C8'").get();
+    const uEnd = await fire({ commandName: 'gm', options: { _sub: 'undo' }, userId: 'U1', channel: chanF });
+    ok('a fight that has ended is not rewound — not the step that ended it',
+      endedRow?.state !== 'active' && /The fight here has ended/.test(saidOf(uEnd)) && dbHandle.prepare("SELECT state FROM fights WHERE guild_id='G1' AND channel_id='C8'").get()?.state !== 'active',
+      `state ${endedRow?.state} · ${saidOf(uEnd).replace(/\s+/g, ' ').slice(0, 120)}`);
+    // 3 · a target strike: a natural 1 reposts the card; the rewind takes the repost down and gives the first card its buttons back
+    await fire({ commandName: 'target', options: { _sub: 'create', name: 'Probe wall', stat: 'str', dc: 10 }, userId: 'U1' });
+    const wall = dbHandle.prepare("SELECT * FROM temp_targets WHERE guild_id='G1' AND name='Probe wall' ORDER BY at DESC").get();
+    const wallCard = wall ? sentById.get(wall.message_id) : null;
+    const wp = wallCard ? await fire({ isButton: true, customId: 'tgtatk:str', message: wallCard, userId: 'U2' }) : { replies: [] };
+    Math.random = () => 0;
+    if (modalOf(wp)) await fire({ isModal: true, fromMessage: true, customId: modalOf(wp), fields: { action: 'shoulders it' }, message: wallCard, userId: 'U2' });
+    Math.random = realRandom;
+    const wallHit = dbHandle.prepare("SELECT hits, reposts, card_id, dead FROM temp_targets WHERE guild_id='G1' AND message_id=?").get(wall?.message_id);
+    const uW = await fire({ commandName: 'gm', options: { _sub: 'undo' }, userId: 'U1' });
+    const wallBack = dbHandle.prepare("SELECT hits, reposts, card_id, dead FROM temp_targets WHERE guild_id='G1' AND message_id=?").get(wall?.message_id);
+    ok('a target strike rewinds: the swing and the repost come off the row, the reposted card is taken down, the first card gets its buttons back',
+      wallHit?.hits === 1 && wallHit?.reposts === 1 && wallHit?.card_id !== wall?.message_id
+        && /\*\*target strike\*\* by <@U2>/.test(saidOf(uW)) && /\*\*Probe wall\*\* — 0 swings/.test(saidOf(uW))
+        && wallBack?.hits === 0 && wallBack?.reposts === 0 && wallBack?.card_id === wall?.message_id && deleted.includes(wallHit?.card_id)
+        && idsOf(sentById.get(wall?.message_id)).join(',') === 'tgtatk:str' && !/continues below/.test(sentById.get(wall?.message_id)?.content || ''),
+      `hit ${JSON.stringify(wallHit)} · back ${JSON.stringify(wallBack)} · ${saidOf(uW).replace(/\s+/g, ' ').slice(0, 120)} · card ids ${idsOf(sentById.get(wall?.message_id)).join(',')}`);
+    // 4 · a group roll and a once-only press rewind: the roll comes off the tally, the press is open again
+    before = sent.length;
+    await fire({ commandName: 'button', options: { _sub: 'group', stat: 'str', dc: 10 }, userId: 'U1' });
+    const grp = sent.slice(before).find(x => /A check for everyone/.test(x.content))?.msg;
+    if (grp) await fire({ isButton: true, customId: 'grproll', message: grp, userId: 'U2' });
+    const rolled = grp ? dbHandle.prepare("SELECT COUNT(*) AS c FROM group_check_rolls WHERE guild_id='G1' AND message_id=?").get(grp.id).c : -1;
+    const uG = await fire({ commandName: 'gm', options: { _sub: 'undo' }, userId: 'U1' });
+    const rolledBack = grp ? dbHandle.prepare("SELECT COUNT(*) AS c FROM group_check_rolls WHERE guild_id='G1' AND message_id=?").get(grp.id).c : -1;
+    ok('a group roll rewinds: the roll comes off the tally, the card is re-drawn with its buttons, the roller may roll again',
+      rolled === 1 && rolledBack === 0 && new RegExp(`🎲 userU2`).test(saidOf(uG)) && /Nobody has rolled yet/.test(grp?.content || '') && idsOf(grp).includes('grproll'),
+      `rolled ${rolled}→${rolledBack} · ${saidOf(uG).replace(/\s+/g, ' ').slice(0, 120)} · ${(grp?.content || '').replace(/\s+/g, ' ').slice(-60)}`);
+    before = sent.length;
+    await fire({ commandName: 'button', options: { _sub: 'roll', stat: 'str', dc: 10, once: true }, userId: 'U1' });
+    const once = sent.slice(before).find(x => /\*\*STR\*\*/.test(x.content))?.msg;
+    const onceId = once ? idsOf(once)[0] : '';
+    const p1 = once ? saidOf(await fire({ isButton: true, customId: onceId, message: once, userId: 'U2' })) : '';
+    const p2 = once ? saidOf(await fire({ isButton: true, customId: onceId, message: once, userId: 'U2' })) : '';
+    const uP = await fire({ commandName: 'gm', options: { _sub: 'undo' }, userId: 'U1' });
+    const p3 = once ? saidOf(await fire({ isButton: true, customId: onceId, message: once, userId: 'U2' })) : '';
+    ok('a once-only press rewinds: the gate comes off and the player may press again',
+      /\d/.test(p1) && /had your go/.test(p2) && new RegExp(`🔘 userU2 may press again`).test(saidOf(uP)) && /\d/.test(p3) && !/had your go/.test(p3),
+      `first ${p1.replace(/\s+/g, ' ').slice(0, 30)} · second ${p2.slice(0, 30)} · ${saidOf(uP).replace(/\s+/g, ' ').slice(0, 80)} · third ${p3.replace(/\s+/g, ' ').slice(0, 30)}`);
+    // 5 · a called check that cost HP rewinds the HP
+    dbHandle.prepare("UPDATE characters SET hp_current=7 WHERE guild_id='G1' AND user_id='U2'").run();
+    const dcAsk = await fire({ commandName: 'gm', options: { _sub: 'dc', stat: 'str', dc: 40, target: 'U2', fail_damage: 3 }, userId: 'U1' });
+    const dcCard = dcAsk.replies.find(x => idsOf(x).some(id => /^dcroll:U2:/.test(id)));
+    const dcId = dcCard ? idsOf(dcCard).find(id => /^dcroll:U2:/.test(id)) : '';
+    if (dcCard) await fire({ isButton: true, customId: dcId, message: { id: nextId(), content: dcCard.content || '', components: dcCard.components.map(r => ({ components: ((r._d || r).components || []).map(b => ({ customId: (b._d || b).customId, label: (b._d || b).label, style: (b._d || b).style, disabled: false })) })) }, userId: 'U2' });
+    const hpAfterDc = hpOf('U2');
+    const uD = await fire({ commandName: 'gm', options: { _sub: 'undo' }, userId: 'U1' });
+    ok('a called check that cost HP rewinds: the sheet is back where it was and the table is told',
+      !!dcId && hpAfterDc === 4 && hpOf('U2') === 7 && new RegExp(`❤️ userU2 4→7`).test(saidOf(uD)) && /\*\*check roll\*\* by <@U2>/.test(saidOf(uD)),
+      `id ${dcId} · hp ${hpAfterDc}→${hpOf('U2')} · ${saidOf(uD).replace(/\s+/g, ' ').slice(0, 120)}`);
+    // 6 · nothing to rewind, the toolbar's Undo, the journal's depth
+    const chanN = new FakeChannel('C9', 0, 'quiet', guild); channelsById.set(chanN.id, chanN);
+    const uN = await fire({ commandName: 'gm', options: { _sub: 'undo' }, userId: 'U1', channel: chanN });
+    const barMsg = sent.find(x => /GM toolbar/.test(x.content))?.msg;
+    const uBar = barMsg ? await fire({ isButton: true, customId: 'gmbar:undo', message: barMsg, userId: 'U1', channel: chanN }) : { replies: [] };
+    const realFetchB = guild.members.fetch;
+    guild.members.fetch = async (uid) => { const mb = await realFetchB(uid); if (uid === 'U7') { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+    const uPlayer = await fire({ commandName: 'gm', options: { _sub: 'undo' }, userId: 'U7', member: { id: 'U7', roles: { cache: new Map() }, permissions: { has: () => false } } });
+    guild.members.fetch = realFetchB;
+    for (let i = 0; i < 12; i++) await fire({ commandName: 'target', options: { _sub: 'create', name: `Probe straw ${i}`, stat: 'str', dc: 10 }, userId: 'U1' });
+    ok('an untouched channel answers "Nothing to rewind here", the toolbar\'s Undo is the same rewind, a plain player is refused, and the journal keeps ten steps',
+      /Nothing to rewind here/.test(saidOf(uN)) && /Nothing to rewind here/.test(saidOf(uBar)) && /Rewinding is for GMs/.test(saidOf(uPlayer)) && journal('C1').length === 10,
+      `${saidOf(uN).slice(0, 40)} · bar ${saidOf(uBar).slice(0, 40)} · player ${saidOf(uPlayer).slice(0, 40)} · depth ${journal('C1').length}`);
+    const threwB = loggedB.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column|\[undo\]/.test(l));
+    console.error = realErrB;
+    ok('nothing in the undo walk threw', threwB.length === 0, threwB.slice(0, 3).join('\n        '));
   }
 
   // ── No button, modal or select id throws on a junk payload ──────────

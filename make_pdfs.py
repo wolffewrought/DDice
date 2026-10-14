@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""DDice — Chronicle of Commands. Parchment design, three editions per system:
+"""DDice — Chronicle of Commands. Parchment design, two editions per system:
 
   player → DDice-Commands-Player.pdf      (the player's journey; nothing a player cannot run)
   gm     → DDice-Commands-GameMaster.pdf  (the GM's journey; the table's half, then the GM's, chapter by chapter)
-  full   → DDice-Commands-Parchment.pdf   (the GM journey with nothing left out)
+
+(The 'full' Parchment edition — the GM book under another cover — was retired
+2026-10-14 with T; the 'full' key stays known so nothing else has to change.)
 
 Content lives in PARTS (bundles by subject) and each edition walks them in the
 order BOOKS gives. Items carry an audience via ('aud', ...) markers; individual
@@ -124,7 +126,7 @@ PARTS['roll2'] = [
            ['Total 2–9', 'Fail']]),
 ('note', 'The same holds for every check against a DC \u2014 a Game Master\u2019s called check, a planted button, a group check, a target: a natural 20 passes and a natural 1 fails, whatever the total. A natural 20 on a target beats it outright.'),
 ('h2', 'Targets'),
-('p', 'A target is something the Game Master plants in the channel for the party to swing at \u2014 a door, a barricade, a Hollow with no sheet. Its card carries the buttons: one for each stat the Game Master allows, all five when they named none, so you pick the stat you swing with. Pressing opens a short form \u2014 what you do, what you say, both optional \u2014 and your words land above the roll. A natural 20 beats the target outright (<i>Roll critically succeeds</i>) and a natural 1 fails (<i>Roll critically fails</i>); anything else reads <i>The roll succeeds</i> or <i>The roll fails</i> and is the Game Master\u2019s call \u2014 <i>The player passes the check \u2014 Roll succeeds</i>, or <i>fails</i> \u2014 with their words on what happens beneath. When a swing fails, the card comes back at the bottom of the channel with its buttons, counting its returns, ready for the next.'),
+('p', 'A target is something the Game Master plants in the channel for the party to swing at \u2014 a door, a barricade, a Hollow with no sheet. Its card carries the buttons: one for each stat the Game Master allows, all five when they named none, so you pick the stat you swing with. Pressing opens a short form \u2014 what you do, what you say, both optional \u2014 and your words land above the roll. A natural 20 beats the target outright (<i>Roll critically succeeds</i>) and a natural 1 fails (<i>Roll critically fails</i>); anything else reads <i>The roll succeeds</i> or <i>The roll fails</i> and is the Game Master\u2019s call \u2014 <i>The player passes the check \u2014 Roll succeeds</i>, or <i>fails</i> \u2014 with their words on what happens beneath. A target can take several hits: the card says how many are left, and with a DC set a roll that meets it takes one off with no call. When a swing fails, the card comes back at the bottom of the channel with its buttons, counting its returns, ready for the next.'),
 ('h2', 'Critical Hits & Fails (all rolls)'),
 ('p', 'Natural max on any die → gold label + result.<br/>Natural 1 on any die → red label + result.'),
 ('h2', 'One Reroll Per Roll'),
@@ -346,7 +348,7 @@ PARTS['fight'] = [
           ('/fight act action:Escape', 'on your turn while held: a live STR contest \u2014 you\nroll 1d20+STR, the grappler\u2019s hold rolls its own\n1d20+STR back (signature advantage honoured), and\nties keep the hold. Break free by beating it; the\nstrain of the struggle lands whether you slip it\nor not', 'player'),
           ('/fight act action:Escape npc:Hollow tank', GM + ' breaks a held NPC free on its turn \u2014 a live\nSTR contest against the holder\u2019s own roll, ties to\nthe grappler; the strain of the struggle lands\neither way', 'gm'),
           ('/fight act action:Release', 'the holder lets go — a free action, the turn stands;\nGMs may part any hold with target:', 'player'),
-          ('(the buttons)', 'on your turn: five stat buttons to attack with, then\nGrapple \u00b7 Feint beneath (both ask whom; Feint then asks\nwhat you pretend) \u2014 no Grapple while you are held. When\nan NPC attacks you, the defence row adds Deflect \u00b7 Disarm. Holding someone adds Maintain the hold (an\nopposed STR roll each turn) and Release; being held adds\nBreak free. Save and Insight sit on the card that asks'),
+          ('(the buttons)', 'on your turn: five stat buttons to attack with, then\nGrapple \u00b7 Feint beneath (both ask whom; Feint then asks\nwhat you pretend) \u2014 no Grapple while you are held. When\nan NPC attacks you, the defence row adds Deflect \u00b7 Disarm. Holding someone adds Maintain the hold (an\nopposed STR roll each turn) and Release; being held adds\nBreak free. Save and Insight sit on the card that asks. Every one of them opens a short form first \u2014 what you do, what you say, both optional \u2014 and your words sit on the card; a blank form is a plain roll. With one foe standing, an attack press goes straight to the form'),
           ('/fight act action:Release npc:Hollow tank', GM + ' releases AS the NPC holder; add target: to\nforce-part any hold from the outside', 'gm'),
           ('/fight act action:Deflect', 'shield deflection against a PvE strike — needs a\nshield equipped and STR 4+ (the gate holds whichever\nstat rolls), once per round, and a natural 20 cannot\nbe turned. Roll STR or DEX (stat:) to beat the attack\nroll; optionally redirect_npc: sends the blow into\nanother enemy for 1 damage. Fall short and it lands\non you for 1. Either way your next attack roll is a\nflat d20', 'player'),
           ('/fight act action:Disarm', 'disarm a PvE attacker — needs a blade equipped\n(swords, polearms, daggers; not maces, shields or\nfirearms) and DEX 4+, once per round. Roll DEX to\nbeat the attack roll — no damage, but the enemy\nspends their next turn retrieving the weapon. Fall\nshort and the strike lands on you for 1. Either way\nyour next defence roll is a flat d20', 'player'),
@@ -359,7 +361,8 @@ PARTS['fight'] = [
           ('/fight atk stat:str target_npc:Hollow tank', 'attack an NPC', 'player'),
           ('/fight atk stat:str npc:Hollow target:@Players', GM + ' attacks AS the NPC', 'gm'),
           ('/fight def stat:dex', 'defend', 'player'),
-          ('(buttons)', 'every prompt carries its answer: the attack card\noffers five DEFEND stat buttons, the grapple card\na Save, the feint card an Insight, the defence\ncard Resolve \u2014 and Reroll rides along. One press,\nsame rules, same audit trail', 'player'),
+          ('(buttons)', 'every prompt carries its answer: the attack card\noffers five DEFEND stat buttons, the grapple card\na Save, the feint card an Insight, the defence\ncard Resolve \u2014 and Reroll rides along. One press,\nsame rules, same audit trail. Every turn line lists everyone standing with their HP, and any condition the Game Master has marked you with, counting down. Ten quiet minutes and the bot pings whoever the fight is waiting on, once a turn', 'player'),
+          ('(the GM\u2019s NPC buttons)', 'an NPC\u2019s turn line and its defence prompt carry five stat buttons only a GM may press \u2014 the target is asked for if there is more than one, the form opens, and the blow is struck as the NPC. Pressing Resolve as a GM asks what happens; the words post under the outcome', 'gm'),
           ('/fight def stat:dex npc:Hollow', GM + ' defends AS the NPC', 'gm'),
           ('/fight rr', 'reroll last fight roll — 1 token', 'player'),
           ('/fight resolve', 'resolve the exchange', 'player'),
@@ -540,7 +543,7 @@ PARTS['gmquest'] = [
          'and the matching quests appear as \u201c#012 \u2014 Hollow Cave (open)\u201d.'),
 ('h2', 'The Pipeline'),
 ('code', [('/config channels questforum channel:#forum', 'make the quest board a forum \u2014 one thread per\nposted quest (Admin)'),
-          ('/config channels questthreads channel:#forum', 'optional split: per-quest planning threads open in\nthis secondary forum instead, and the pipeline\nstage tags ride along with them \u2014 so the planning\nforum holds only the six books and the DM roster.\nDisable to fold threads back (existing threads\nstay where they are either way) (Admin)'),
+          ('/config channels questthreads channel:#forum', 'optional split: per-quest planning threads open in\nthis secondary forum instead, and the pipeline\nstage tags ride along with them \u2014 so the planning\nforum holds only the books and the DM roster.\nDisable to fold threads back (existing threads\nstay where they are either way) (Admin)'),
           ('/config channels questinstances', 'a forum where every STARTED quest opens its own\nthread for party \u2014 the DM and each member pulled in\nby mention, the clock and reminders following\nthem there. Optional: without it a quest runs in\nits run channel as before'),
           ('/config channels questplanning channel:#gm-forum', 'a private GM forum: /quest create opens a planning\nthread there with the full quest record, and every\napplication and lifecycle event mirrors into it;\n/quest post is the flip that opens the public board\nthread. Setup also creates the seven pinned\npipeline BOOKS \u2014 Concept, Awaiting Approval,\nApproved, In Progress, DMs Available,\nArchived, Completed \u2014 the same way the\nroll-audit forum builds its books, plus the matching\nstage tags. Every quest keeps one index entry (name,\nGM, party, links to its planning thread, board post\nand the party\u2019s room) that moves between books as it\ngoes; a live run shows how long its clock has been\ngoing, anything sitting still for days says so,\nCompleted entries carry the run counter, and the\nDMs book is the roster (Admin)'),
           ('/quest stage number:1 stage:approved', 'move a quest through the hand-set stages \u2014 or just\npress the advance button at the bottom of its\nplanning thread (\u2192\u2192, one press each; at Approved\nit points to /quest post). Posting, archiving and\ncompleting re-tag automatically \u2014 each stage line in the planning\nthread REPLACES the last, so the walk never piles\nup; posting leaves exactly one line: the board link'),
@@ -580,6 +583,7 @@ PARTS['gmquest'] = [
 ('code', [('/quest run start number:1', 'the clock begins'),
           ('/quest run note number:1 text:They bribed the gatekeeper kind:Roleplay', 'mark a moment'),
           ('/quest run timeline number:1', 'the whole log so far'),
+          ('/quest run ready number:1', 'a ready check: one card with a tick per seated\nplayer and a Ready button \u2014 each press turns their\ntick, the last says all ready and names you'),
           ('/quest run pause number:1', 'stop the clock, keep the time'),
           ('/quest run resume number:1', 'carry on where it left off'),
           ('/quest run complete number:1', 'stop, award, and write it up')]),
@@ -614,7 +618,7 @@ PARTS['gmquest'] = [
       'write-up, with how long it took and how long ago it was.'),
 ('h2', 'Ending a Run'),
 ('code', [('/quest run winddown number:1', 'the story is over but the rewards are not settled:\nthe run stays live, its party is released to the rests\nand free to join other quests, and anyone kicked now is\nstill paid at completion. resume:true puts it back (GM)'),
-          ('/quest run complete number:1', 'finish — auto-award merits, list rewards'),
+          ('/quest run complete number:1', 'finish — auto-award merits, list rewards. The run\u2019s\nstory rides on the card as a scroll PDF in the server\u2019s\nscroll font: the party, the length, every logged beat\nwith its roleplay words, your tale \u2014 woven, so /gm\nscroll can unfurl it again anywhere'),
           ('/quest run complete number:1 summary:\u2026', 'add your telling \u2014 it lands in each adventurer\u2019s thread in\nquest-chronicle; timings, events and payouts go to the\nGM-only gm-quest-log instead'),
           ('/quest run log number:1 text:\u2026', 'write or rewrite the tale afterwards \u2014 it is mirrored into\nevery adventurer\u2019s own chronicle thread, and rewriting edits\neach copy in place (GM)'),
           ('(\u21A9 Reopen, on a completion message)', 'five minutes to take a completion back: payout reversed,\nthis run\u2019s titles revoked, party released; fix it and\ncomplete again (GM)'),
@@ -648,7 +652,7 @@ PARTS['gmquest'] = [
           ('/campaign complete campaign:…', 'close the arc'),
           ('/campaign show campaign:\u2026', 'players see the premise, what is done and their own part;\nGMs see everything')]),
 ('h2', 'Stalled Work and the Weekly Digest'),
-('code', [('/gm check stalled', 'what is waiting on a GM: winding-down runs, quiet encounters, staged parties never launched, idle campaigns, reviews this week (GM)')]),
+('code', [('/gm check stalled', 'what is waiting on a GM: winding-down runs, quiet encounters, staged parties never launched, idle campaigns, reviews this week, targets standing over a day (GM)')]),
 ('p', 'Once a week the same report is posted on its own, as a thread in the <b>gm-digest</b> forum titled by the Monday of the week it covers — so nothing depends on somebody remembering to ask. A quiet week posts too, saying so; the first boot with the forum posts the week’s digest at once.'),
 ('h2', 'Feedback Rooms'),
 ('code', [('/button feedback', 'plant a feedback button in this channel (GM)'),
@@ -1096,7 +1100,8 @@ PARTS['setup'] = [
 ('code', [('/gm check build', 'the one-command setup: makes every channel and forum the bot needs in the two categories, points the config at each, then fills them with the audit shelves, pipeline books and tags. Needs Manage Channels, for you and for the bot (GM)'),
           ('(pickers)', 'the check report offers channel pickers for unset\nconfigs \u2014 up to five at a time; a pick runs the\nreal config branch, tags and books included\n(Manage Server required)'),
           ('/gm check run', 'build anything missing — audit shelves, pipeline books, pipeline tags — and sweep every channel’s permissions, repairing what it can; never moves or renames anything, and names what only you can grant. Surviving threads are adopted by id, never remade, so run it as often as you like, and after any update that adds a book (GM)'),
-          ('/gm check status', 'which channels are set, which await'),
+          ('/gm check status', 'which channels are set, which await; the last line\nsays whether the slash commands registered on this\nboot, and the Deploy mend says the same'),
+          ('/gm bar', 'pin a GM toolbar in this channel: Plant target, Call\ncheck, Start fight, Status, Undo \u2014 each opens the box\nits command would (a target by name, DC and stats,\nscene, hits, who may swing; the check window; players\nand NPCs for a fight). Status is the channel at a\nglance: the fight and everyone\u2019s HP, the targets\nstanding, what waits on a GM. Undo is /gm undo'),
           ('/gm check restart', 'DELETE the whole setup and build it fresh — asks first, and the threads inside do not come back (GM)'),
           ('/gm check order', 'sidebar diagnostic — asks first: apply the plan order, or keep your layout and just report (GM)')]),
 ('h2', 'What Gets Made'),
@@ -1160,13 +1165,15 @@ PARTS['gmroll'] = [
           ('/gm dc target:@Players npcs:Hollow tank', 'leave dc: out and a WRITING WINDOW opens \u2014 the\ncheck as a form: the scene \u00b7 the check line (e.g.\n\u201cdex 14 hidden\u201d, or \u201c2d6+1 8 bare adv -2\u201d) \u00b7 on\nsuccess \u00b7 on failure \u00b7 targets. Each outcome box takes\na tag line first \u2014 [adv] [dis] [bare] [dex-1] [-3hp],\nany order, either outcome \u2014 then the words the\nplayers read. Targets\npicked on the command carry into the form; the last\nbox adds any you missed. Naming dc: keeps the fast\npath with every option instead'),
           ('/gm dc \u2026 hold:true skipfail:true', 'bind the check to the fight: the target\u2019s actions\nwait on the card, and a failed check passes their turn')]),
 ('h2', 'Buttons and Targets'),
-('code', [('/button roll dice:2d6+1 dc:9 reason:\u2026 for:@Players once:true', 'plant a roll: dice OR a stat, an optional DC, the reason\nshown above it, and who it is for \u2014 anyone if left open.\nPressed inside a quest, it joins that quest\u2019s timeline and\nthe GM log (GM)'),
+('code', [('/button roll dice:2d6+1 dc:9 reason:\u2026 for:@Players once:true', 'plant a roll: dice OR a stat, an optional DC, the reason\nshown above it, and who it is for \u2014 anyone if left open.\naudience:@Ari @Bo @Guards addresses several players\nand/or a role: only they may press, and the card names\nthem all. Pressed inside a quest, it joins that quest\u2019s\ntimeline and the GM log (GM)'),
           ('/button group stat:wis dc:12 reason:\u2026', 'one check the whole party rolls \u2014 each presses once, the\nmessage keeps the tally, and Call it closes the scene\nwith how many got through. A natural 20 passes and a\nnatural 1 fails, whatever the total (GM)'),
-          ('/target create name:Barricade [dc:12] [stat:Flat d20, STR, DEX] [dice:2d6+1] [success_flavour:\u2026] [fail_flavour:\u2026]', 'plant something to swing at \u2014 no sheet, no roster. A d20 unless dice: says otherwise; stat: lists as few or as many stats as you like, one button each in that order \u2014 leave it out and all five are buttons; leave dc: out and every blow is your call. A press opens a short form \u2014 what they do, what they say, both optional \u2014 and the words land above the roll. A natural 20 beats it (Roll critically succeeds) and a natural 1 fails (Roll critically fails) on their own, posting your flavour if set; anything else says The roll succeeds / fails and asks YOU \u2014 the player passes the check, or fails it \u2014 each opening a What happens? form prefilled with your flavour (blank still sends the verdict). A fail posts the card again below with its buttons and a counter; secret:true asks in the GM channel and tells the players Roll succeeds / fails in theirs (GM)'),
-          ('/target list', 'what still stands in this channel (GM)')]),
+          ('/target create name:Barricade [dc:12] [stat:Flat d20, STR, DEX] [dice:2d6+1] [hp:3] [for:@Players] [audience:@Ari @Bo @Guards] [success_flavour:\u2026] [fail_flavour:\u2026] [write:true]', 'plant something to swing at \u2014 no sheet, no roster. for: addresses one player, audience: several and/or a role \u2014 only they may swing, and the card names them. hp: is the hits it takes: with a DC a roll that meets it takes one off with no call, with no DC each pass you call does; it falls at 0. write:true opens a box for the scene and the two flavours. A d20 unless dice: says otherwise; stat: lists as few or as many stats as you like, one button each in that order \u2014 leave it out and all five are buttons; leave dc: out and every blow is your call. A press opens a short form \u2014 what they do, what they say, both optional \u2014 and the words land above the roll. A natural 20 beats it (Roll critically succeeds) and a natural 1 fails (Roll critically fails) on their own, posting your flavour if set; anything else says The roll succeeds / fails and asks YOU \u2014 the player passes the check, or fails it \u2014 each opening a What happens? form prefilled with your flavour (blank still sends the verdict). A fail posts the card again below with its buttons and a counter; secret:true asks in the GM channel and tells the players Roll succeeds / fails in theirs (GM)'),
+          ('/target list', 'what still stands in this channel, with a Retire button per target to take it down without a swing (GM)')]),
 ('h2', 'Overrides'),
+('code', [('/gm undo [steps:1-10]', 'rewind the last step in this channel: a fight exchange\n(attack, defence, Resolve, a reroll, an action), a target\nstrike or verdict, a group roll, a once-only press, a\ncalled check that cost HP \u2014 and the HP, rerolls, marks\nand stats those changed on sheets and NPCs. The table\nsees what was rewound and what moved; a fight gets its\nstatus and whose move it is posted again. Ten steps per\nchannel, a day at most; a fight that has ended is not\nrewound; the rewind is never a step itself, so two undos\nare two steps back. Audited and noted on the quest (GM)')]),
 ('code', [('/gm override skip [reason:]', 'pass the current turn in this channel\u2019s fight \u2014\nannounced as a GM ruling'),
           ('/gm override interject user:@Players amount:2 note:\u2026', 'bend a player\u2019s roll mid-fight, any combination: force their\nstat, adjust the total (\u00b110, stacks), set advantage/dis/flat,\nor DECLARE THE DIE (1\u201320) \u2014 the one lever that rewrites a roll\nalready cast; the total recomputes around their modifier and\nevery automatic honors the declared face; announced, audited (GM)'),
+          ('/gm override condition user:@Players text:poisoned turns:3', 'a word the table agreed on and, if you like, a clock: shown on their turn line, counting down when their turn comes round, lifting at 0 with a line. Leave turns: off for one that lasts until clear:true. npc:Name for an NPC. No mechanics ride on it (GM)'),
           ('/gm reroll target:@Players stat:dex mode:dis flat:true', 'interrupt and correct a mistaken roll by decree \u2014\nwrong stat, wrong footing, or a bonus they never\nhad. If they hold the pending attack or defence in\na live fight here, the corrected roll REPLACES it\nin the fight (resolve sees the new number);\notherwise their last roll in this channel is\nrerolled on the corrected terms. flat:true forces\na bare d20; signature advantage is honoured unless\nflat; carried riposte/fumble modifiers drop \u2014 the\nGM is re-declaring the terms. NO reroll token is\nspent and the player\u2019s own once-per-roll right\nstays untouched. Mirrors to the audit as a GM\ncorrection')]),
 ('h2', 'The Roll Audit'),
 ('code', [('/config channels rollaudit channel:#gm-rolls', 'mirror every roll — raw input,\nresult and jump link'),
@@ -1533,8 +1540,8 @@ PARTS['keeping'] = [
 ('note', 'Destructive actions (/npc delete, /fight end, /quest delete, /char weapon remove) ask for '
          'Confirm / Cancel before running.'),
 ('h2', 'Publishing These Books'),
-('p', 'The three books are built outside the bot and committed to a repository. Point the bot at that '
-      'repository and it will keep <b>one current post</b> of all three in a channel of your choosing \u2014 '
+('p', 'The books are built outside the bot and committed to a repository. Point the bot at that '
+      'repository and it will keep <b>one current post</b> of them in a channel of your choosing \u2014 '
       'when a new build lands, the old post is deleted and replaced rather than the channel filling up with '
       'stale copies.'),
 ('code', [('/config channels docs channel:#gm-books repo:owner/name', 'set it up'),
@@ -1550,12 +1557,12 @@ PARTS['keeping'] = [
       'posted <b>silently</b>, with no role pinged and no notification raised, so a reference channel stays up '
       'to date without nagging anyone. It replaces its own previous post the same way.'),
 ('note', 'The new post goes up <b>before</b> the old one comes down, so a failure part-way leaves the channel '
-         'with a copy rather than none at all. The repository must be public and hold the eight books under the '
-         'names this script gives them: <b>DDice-Commands-Player.pdf</b>, <b>DDice-Commands-GameMaster.pdf</b> and '
-         '<b>DDice-Commands-Parchment.pdf</b> for Knightfall, the same three prefixed <b>DnD5e-</b> for 5e, and the two '
+         'with a copy rather than none at all. The repository must be public and hold the six books under the '
+         'names this script gives them: <b>DDice-Commands-Player.pdf</b> and <b>DDice-Commands-GameMaster.pdf</b> '
+         'for Knightfall, the same two prefixed <b>DnD5e-</b> for 5e, and the two '
          '<b>DDice-Examples</b> books. A table is handed the set for the rules it plays by, and the Examples either way.'),
 ('h2', 'Updates and the Deploy Mend'),
-('p', 'Every deploy writes two dated threads into the <b>gm-updates</b> forum: <b>What’s new</b> — the one-line summary of each change first, then <b>In detail</b> beneath it: the line again, and under it what changed, why, what you do now and where it lands — and <b>Deploy mend</b>, what the boot built or repaired. The player half of the same news goes to the <b>updates</b> forum. Each thread is titled by its date, <i>[11/10/2026] [WEEK 41] Sunday 11th of October 2026 · What’s new</i>, so the newest sits at the top and the week is readable at a glance. The first boot with the forums in place posts the whole back-catalogue, oldest first, and clears the old update posts out of gm-quest-log. Discord orders a forum by when each thread was made, so the Deploy mend goes up last and a dated thread found out of turn is re-posted into order on the next boot — unless someone has written in it. The mend also keeps the NPC forum to one page per NPC: a duplicate page is folded back into the recorded one and counted in the Deploy mend, unless someone other than the bot has written in it, in which case it is named and left alone. A day with two deploys gets one What’s new: an entry that has grown since its thread was posted is deleted and posted again whole — or, if someone has written in the thread, kept and given the new lines beneath — and the Deploy mend says so.'),
+('p', 'Every deploy writes two dated threads into the <b>gm-updates</b> forum: <b>What’s new</b> — the one-line summary of each change first, then <b>In detail</b> beneath it: the line again, and under it what changed, why, what you do now and where it lands — and <b>Deploy mend</b>, what the boot built or repaired. The player half of the same news goes to the <b>updates</b> forum, and once a week so does the players’ <b>Weekly chronicle</b>: quests completed, titles granted, fights won, the fallen — nothing on a quiet week. Each thread is titled by its date, <i>[11/10/2026] [WEEK 41] Sunday 11th of October 2026 · What’s new</i>, so the newest sits at the top and the week is readable at a glance. The first boot with the forums in place posts the whole back-catalogue, oldest first, and clears the old update posts out of gm-quest-log. Discord orders a forum by when each thread was made, so the Deploy mend goes up last and a dated thread found out of turn is re-posted into order on the next boot — unless someone has written in it. The mend also keeps the NPC forum to one page per NPC: a duplicate page is folded back into the recorded one and counted in the Deploy mend, unless someone other than the bot has written in it, in which case it is named and left alone. A day with two deploys gets one What’s new: an entry that has grown since its thread was posted is deleted and posted again whole — or, if someone has written in the thread, kept and given the new lines beneath — and the Deploy mend says so.'),
 ('h2', 'Checks and Reports'),
 ('code', [('/gm check roster busy:true', 'every player at a glance \u2014 HP, and whether a quest or a\nfight is holding them (red means the next rest will pass\nthem over); busy:true shows only those tied up (GM)'),
           ('/gm check usage', 'sixty days of command use, quietest first \u2014 a report\nonly; nothing is ever removed by it (GM)'),
@@ -1693,8 +1700,8 @@ PART_SYSTEM = {
 
 # The journeys. A player meets things in the order they happen to them; a GM
 # sets the table first, then meets the same things with their own half added
-# after each. The full ("Parchment") edition is the GM journey with nothing
-# left out.
+# after each. (The full "Parchment" edition, the GM journey under another
+# cover, was retired 2026-10-14.)
 BOOKS = {
 
   'player': [
@@ -1945,7 +1952,7 @@ def build(edition, outfile, subtitle, module=None, items=None):
 # CI (or any caller) can point the build elsewhere; default is the
 # interactive-session output directory.
 OUT = _os.path.join(_os.environ.get('DDICE_PDF_OUT', '/mnt/user-data/outputs'), '')
-# Six books: one set per system, each complete on its own — the shared half
+# Four books: one set per system, each complete on its own — the shared half
 # (quests, NPCs, scrolls, activities, quizzes) bound in with the rules that
 # server actually plays by. Knightfall keeps the names it has always had; the
 # 5e set is prefaced so both can sit in one folder.
@@ -2057,7 +2064,7 @@ EXAMPLES = [
           ('/quest run complete number:1 summary:\u2026 title:\u2026', 'Pays everyone seated when the story ended \u2014 even someone kicked during the winddown.'),
           ('(press \u21A9 Reopen within five minutes)', 'Wrong number? The payout is reversed and the party released. Fix it, complete again.'),
           ('/quest archive number:1', 'A box opens for the final word. It goes on the record, into the thread, and the GM quest log.'),
-          ('/gm check stalled', 'What is waiting on a GM: winding-down runs, quiet encounters, staged parties never launched. A weekly digest of the same lands in the gm-digest forum, one thread a week.')]),
+          ('/gm check stalled', 'What is waiting on a GM: winding-down runs, quiet encounters, staged parties never launched, targets standing over a day. A weekly digest of the same lands in the gm-digest forum, one thread a week.')]),
 
 ('sec', 'Fixing what was said'),
 ('code', [('(long-press a bot message \u2192 Apps \u2192 Edit (DDice))', 'The text opens already filled in. Fix the spelling, save. Works on NPC speech too.'),
@@ -2084,8 +2091,6 @@ build_examples('gm', OUT + 'DDice-Examples-GameMaster.pdf',
                'Worked Examples \u00b7 Everything, including the GM\u2019s side')
 
 for _sys, _prefix, _name in [('knightfall', '', 'Knightfall'), ('dnd5e', 'DnD5e-', 'D&D 5e (SRD)')]:
-    build('full',   OUT + _prefix + 'DDice-Commands-Parchment.pdf',
-          f'A Chronicle of Commands \u00b7 {_name}', _sys)
     build('player', OUT + _prefix + 'DDice-Commands-Player.pdf',
           f'{_name} \u00b7 Player\u2019s Edition', _sys)
     build('gm',     OUT + _prefix + 'DDice-Commands-GameMaster.pdf',

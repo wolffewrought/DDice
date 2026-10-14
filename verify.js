@@ -1516,7 +1516,9 @@ function testBuilders(src) {
       /const BOT_TZ = 'Europe\/London';/.test(src) &&
       /return `\[\$\{String\(d\)\.padStart\(2, '0'\)\}\/\$\{String\(m\)\.padStart\(2, '0'\)\}\/\$\{y\}\] \[WEEK \$\{isoWeek\(y, m, d\)\}\] \$\{weekday\} \$\{ordinalDay\(d\)\} of \$\{MONTH_NAMES\[m - 1\]\} \$\{y\}`;/.test(src) &&
       /async function postDatedThread\(client, forumId, kind, ms, content, extra = \{\}\)/.test(src) &&
-      (src.match(/postDatedThread\(/g) || []).length === 5);
+      // Six callers since 2026-10-14: the players' weekly chronicle joined
+      // What's new (×2), Deploy mend, the weekly digest and the helper itself.
+      (src.match(/postDatedThread\(/g) || []).length === 6);
     ok('a deploy mend is a dated thread in gm-updates, and the forum-opening boot sweeps the old posts once',
       /postDatedThread\(client, after\.gm_updates_forum, 'Deploy mend', Date\.now\(\),/.test(src) &&
       /async function sweepOldUpdatePosts\(client, gid\)/.test(src) &&
@@ -1588,7 +1590,8 @@ function testBuilders(src) {
       (() => {
         const lastCreate = src.lastIndexOf('CREATE TABLE IF NOT EXISTS');
         const end = src.indexOf(')`);', lastCreate);
-        return ![...src.matchAll(/^try \{ db\.exec\('ALTER TABLE/gm)].some(m => m.index < end);
+        // Both quote styles: the double-quoted ones hid eight phantom columns until 2026-10-14.
+        return ![...src.matchAll(/^try \{ db\.exec\(['"]ALTER TABLE/gm)].some(m => m.index < end);
       })());
     ok('a target is a row keyed by its own message, not button state',
       /CREATE TABLE IF NOT EXISTS temp_targets/.test(src) &&
@@ -1619,7 +1622,7 @@ function testBuilders(src) {
       /const preset = String\(\(fell \? t\.success_text : t\.fail_text\) \|\| ''\)\.slice\(0, 1000\);/.test(src) &&
       /if \(preset\) input\.setValue\(preset\);/.test(src) &&
       /customId\.startsWith\('tgtnar:'\)\) \{\s*const \[, msgId, fellS\] = interaction\.customId\.split\(':'\);\s*return settleTargetVerdict\(interaction, msgId, fellS === '1'\)/.test(src) &&
-      /const verdict = fell \? '\\u2705 \*\*The player passes the check \\u2014 Roll succeeds\.\*\*' : '\\u274C \*\*The player fails the check \\u2014 Roll fails\.\*\*';/.test(src) &&
+      /let verdict = fell \? '\\u2705 \*\*The player passes the check \\u2014 Roll succeeds\.\*\*' : '\\u274C \*\*The player fails the check \\u2014 Roll fails\.\*\*';/.test(src) &&
       /\[verdict, what \? `\*\$\{what\}\*` : null\]\.filter\(Boolean\)/.test(src) &&
       /if \(t\.secret\) \{[\s\S]{0,300}?'\\u2705 \*\*Roll succeeds\.\*\*' : '\\u274C \*\*Roll fails\.\*\*'/.test(src) &&
       /'\\u2705 \*\*A natural 20 \\u2014 the player passes the check\. Roll critically succeeds\.\*\*'/.test(src) &&
@@ -1628,6 +1631,10 @@ function testBuilders(src) {
       /const flavour = decided \? \(passed \? t\.success_text : t\.fail_text\) : null;/.test(src) &&
       /\(swing \$\{swing\}\)\. Your call:/.test(src) &&
       !/A telling blow|It glances off/.test(src));
+    ok('the check roller defaults modifier and mode, so a caller that passes neither cannot make a NaN total; a bare d20 is one die',
+      /function rollDcCheck\(\{ stat, notation, dc, gmMode = 'normal', flat = false, modifier = 0, subject, sig \}\)/.test(src) &&
+      /const m = String\(n \?\? ''\)\.trim\(\)\.match\(\/\^\(\\d\*\)d\(\\d\+\)\(\[\+-\]\\d\+\)\?\$\/i\);/.test(src) &&
+      /const dice = m\[1\] \? parseInt\(m\[1\]\) : 1, sides = parseInt\(m\[2\]\);/.test(src));
     ok('What\'s new keeps a ledger of posted lines; a grown entry is deleted before it is posted again, or appended beneath when someone has written in it',
       /CREATE TABLE IF NOT EXISTS changelog_posted/.test(src) &&
       /function recordChangelogPost\(gid, key, audience, threadId, lines\)/.test(src) &&
@@ -1636,7 +1643,18 @@ function testBuilders(src) {
       /const gone = foreign \? false : await thread\.delete\(\)\.then\(\(\) => true\)\.catch\(\(\) => false\);/.test(src) &&
       /\*\*Added since this was posted\*\*/.test(src) &&
       /made\.push\(\.\.\.await growChangelog\(client, gid, /.test(src) &&
+      // A long day's summary runs over more than one message (14/10 did): the read-back takes bullets up to the detail.
+      /posted = summary\.flatMap\(c => c\.split\('\\n'\)\)\.filter\(l => l\.startsWith\('\\u00b7 '\)\)/.test(src) &&
       (src.match(/recordChangelogPost\(gid, e\.key, /g) || []).length >= 3);
+    ok('/target: hit points tick down on each pass and the target falls at 0; a 🪦 button on the list retires one; write:true opens the box',
+      /ALTER TABLE temp_targets ADD COLUMN hp INTEGER/.test(src) && /ALTER TABLE temp_targets ADD COLUMN hp_left INTEGER/.test(src) &&
+      /async function woundTarget\(client, gid, t, byUserId\)/.test(src) && /if \(t\.hp && t\.dc\) \{\s*if \(passed\) \{\s*const fell = await woundTarget/.test(src) &&
+      /if \(t\.hp\) \{\s*const gone = await woundTarget\(interaction\.client, gidT, t, interaction\.user\.id\);/.test(src) &&
+      /async function retireTarget\(client, gid, t, byUserId\)/.test(src) && /setCustomId\(`tgtretire:\$\{r\.message_id\}`\)/.test(src) &&
+      /customId\.startsWith\('tgtretire:'\)/.test(src) &&
+      /async function createTarget\(interaction, spec\)/.test(src) && /async function finishTargetWrite\(interaction, token\)/.test(src) &&
+      /setCustomId\(`tgtwrite:\$\{token\}`\)/.test(src) && /customId\.startsWith\('tgtwrite:'\)\) return finishTargetWrite/.test(src) &&
+      /if \(t\.hp\) head\.push\(`\\u2764\\uFE0F \*\*\$\{t\.hp_left \?\? t\.hp\} of \$\{t\.hp\}\*\* left`\);/.test(src));
     ok('/target: a fail — the GM\'s call or a natural 1 — posts the card again below, the old one keeps the scene and loses its buttons',
       /async function repostTarget\(client, gid, t\)/.test(src) &&
       /if \(!fell\) await repostTarget\(interaction\.client, gidT, t\);/.test(src) &&
@@ -1664,8 +1682,8 @@ function testBuilders(src) {
       /async function logButtonPress\(interaction, gid, uid, detail, passed\)/.test(src) &&
       /logQuestEvent\(gid, q\.number, 'roll'/.test(src) &&
       /roll: '\\u\{1F3B2\}'/.test(src));
-    ok('an addressed button turns away everyone else',
-      /if \(owner && owner !== 'any' && owner !== uidB\)/.test(src) &&
+    ok('an addressed button turns away everyone else \u2014 one player, several, or a role, through one check',
+      /if \(!audienceAllows\(owner, interaction\)\)/.test(src) &&
       /not addressed to you/.test(src));
     ok('the check button rides the shared DC resolver',
       /rollDcCheck\(\{ stat: stat === 'x' \? null : stat, dc, flat: stat === 'x', subject: ch, sig: ch \}\)/.test(src));
@@ -2056,7 +2074,12 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /async function fighterStateLine\(guild, gid, cid, fid\)/.test(src) &&
       /held by \$\{await nameOf\(gmap\[fid\]\)\}/.test(src) &&
       /holding \$\{await nameOf\(c\)\}/.test(src) &&
-      /\$\{turnPing\(gid, nextF\)\}\$\{state\}/.test(src));
+      /\$\{turnPing\(gid, nextF\)\}\$\{hpLine\}\$\{state\}/.test(src));
+    ok('every turn line carries everyone\'s HP (NPCs only when the table may see their stats) and the fighter\'s conditions tick when their turn comes round',
+      /async function fightHpLine\(guild, gid, cid, order\)/.test(src) && /const show = npcStatsVisible\(gid\);/.test(src) &&
+      /function tickConditions\(gid, cid, fid, name\)/.test(src) && /for \(const l of tickConditions\(gid, cid, order\[index\], nextF\.name\)\) lines\.push\(l\);/.test(src) &&
+      /async function gmCondition\(interaction\)/.test(src) && /if \(gmSub === 'condition'\) return await gmCondition\(interaction\);/.test(src) &&
+      /slot\.conditions = \[\.\.\.others, \{ text, turns: turns \|\| null \}\]\.slice\(0, 8\);/.test(src));
     ok('the state line names every carried mark',
       /next defence is a flat d20/.test(src) && /to hit\*\* on the next attack/.test(src) &&
       /taken in by a feint/.test(src));
@@ -2128,17 +2151,18 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('opening abilities sit with the attack, answering ones with the defence',
       /B\('fact:grapple'/.test(src) && /B\('fact:feint'/.test(src) &&
       (() => {
-        const d = src.indexOf("if (kind === 'def') return [");
-        const a = src.indexOf("if (kind === 'atk') return [");
+        // The player's rows come after the NPC's (GM-gated) rows in the same function.
+        const d = src.lastIndexOf("if (kind === 'def') return [");
+        const a = src.lastIndexOf("if (kind === 'atk') return [");
         const defBlock = src.slice(d, src.indexOf('];', d));
         const atkBlock = src.slice(a, src.indexOf('];', a));
         return /fact:deflect/.test(defBlock) && /fact:disarm/.test(defBlock)
             && !/fact:deflect/.test(atkBlock) && !/fact:disarm/.test(atkBlock);
       })() &&
-      /return handleFight\(interaction, \{ sub: 'act', action: which, targetId: pendingAttacker \}\);/.test(src) &&
+      /return handleFight\(interaction, \{ sub: 'act', action: p\.kind, targetId: pendingAttacker, flavour \}\);/.test(src) &&
       /\? String\(forced\.action\)\.toLowerCase\(\)/.test(src) &&
       /async function offerAbilityTarget\(interaction, which\)/.test(src) &&
-      /startsWith\('fightfeint:'\)/.test(src));
+      /startsWith\('frp:'\)/.test(src));
     // A button's path must pass through the same rules as the command's:
     // the feint modal goes via handleFight, and the grapple select never
     // double-acknowledges before the runner replies.
@@ -2149,7 +2173,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('a plain attack sets its own kind',
       (src.match(/atk_sides: 20,\s*\n\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*atk_kind: null,/g) || []).length >= 2);
     ok('the feint modal obeys the once-per-fight rule and the WIS bar',
-      /return handleFight\(interaction, \{ sub: 'act', action: 'feint', targetId, feintText: claim \}\);/.test(src) &&
+      /return handleFight\(interaction, \{ sub: 'act', action: 'feint', targetId: p\.targetId, feintText: claim, flavour \}\);/.test(src) &&
       /\? forced\.feintText : null\) \|\| interaction\.options\?\.getString\?\.\('feint'\)/.test(src));
     ok('the grapple select hands straight to the runner',
       !/Going for the hold/.test(src));
@@ -2158,7 +2182,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /if \(kind === 'escape'\) return/.test(src) && /Break free \(STR\)/.test(src));
     // (rewritten 2026-08-22: T asked for maintaining to cost a roll.)
     ok('maintaining a hold is an opposed STR roll, ties keeping the hold',
-      /async function runFightMaintain\(interaction\)/.test(src) &&
+      /async function runFightMaintain\(interaction, \{ flavour = null \} = \{\}\)/.test(src) &&
       /const kept = keep\.total >= slip\.total;/.test(src) &&
       /twists loose \\u2014 the hold is broken/.test(src) &&
       // Keeping a grip spends the turn; the first cut returned early and
@@ -2171,7 +2195,27 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('there is an attack button row, routed like the defence one',
       /if \(kind === 'atk'\) return \[/.test(src) &&
       /B\('fatk:str'/.test(src) &&
-      /startsWith\('fatk:'\)\) \{\s*\n\s*return handleFight\(interaction, \{ sub: 'atk'/.test(src));
+      // Since 2026-10-14 the press gates lightly, then the branch opens the form (fromButton) and its submit swings.
+      /startsWith\('fatk:'\) \|\| interaction\.customId\.startsWith\('fnatk:'\)\) \{/.test(src) &&
+      /return handleFight\(interaction, \{ sub: 'atk', stat, fromButton: true \}\);/.test(src) &&
+      /if \(forcedOf\(forced, 'fromButton'\)\)\s*return openFightRp\(interaction, 'atk', \{ stat, targetId: live\[0\], npc: npcActAs \|\| null, mode \}/.test(src) &&
+      /case 'atk':\s*return handleFight\(interaction, \{ sub: 'atk', stat: p\.stat, targetId: p\.targetId, npc: p\.npc \|\| null, mode: p\.mode \|\| 'normal', flavour \}\);/.test(src));
+    ok('every fight button opens the roleplay form, and the form walks the slash path with the words as flavour',
+      /const pendingFightRp = new Map\(\);/.test(src) && /function fightRpModal\(token, \{ title, claim = false, what = false \} = \{\}\)/.test(src) &&
+      /function rpWords\(interaction\)/.test(src) && /function withWords\(lines, flavour\)/.test(src) &&
+      /return openFightRp\(interaction, 'def', \{ stat \}, /.test(src) &&
+      /return openFightRp\(interaction, 'def', \{ stat, npc: npcNameFromFighter\(tgt\) \}, /.test(src) &&
+      /return openFightRp\(interaction, 'grapple', \{ targetId \}, \{ title: 'Grapple' \}\);/.test(src) &&
+      /return openFightRp\(interaction, 'feint', \{ targetId \}, \{ title: 'The feint', claim: true \}\);/.test(src) &&
+      /return openFightRp\(interaction, 'maintain', \{\}, /.test(src) && /return openFightRp\(interaction, 'escape', \{\}, /.test(src) &&
+      /return openFightRp\(interaction, which, \{\}, \{ title: which === 'deflect' \? 'Deflect' : 'Disarm' \}\);/.test(src) &&
+      /return openFightRp\(interaction, 'save', \{\}, /.test(src) && /return openFightRp\(interaction, 'insight', \{\}, /.test(src) &&
+      /return openFightRp\(interaction, 'release', \{\}, \{ title: 'Let go' \}\);/.test(src) &&
+      /if \(await isGm\(interaction\.guild, uidF\)\) return openFightRp\(interaction, 'resolve', \{\}, \{ title: 'Resolve \\u2014 what happens\?', what: true \}\);/.test(src) &&
+      /if \(!flavour\) return openFightRp\(interaction, 'atk', \{ stat, targetId, mode, npc: /.test(src) &&
+      (src.match(/forcedOf\(forced, 'flavour'\)/g) || []).length >= 10 &&
+      /N\('fnatk:str', /.test(src) && /N\('fndef:str', /.test(src) &&
+      /nextF\.answerRows = nextF\.isNpc\s*\? fightAnswerRows\('atk', \{ forNpc: true, auto: autoNpc \}\)/.test(src));
 // (2026-09-12: rows are now claimed by sendLong/replyLong themselves, so
     // no sender can forget — six had.)
     ok('turn buttons are universal: the announcer stashes, the senders claim',
@@ -2183,10 +2227,113 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('the grapple refusal carries a release button',
       /a grappler cannot strike their captive\. Let go and swing again/.test(src) &&
       /setCustomId\('grpfree'\)/.test(src));
-    ok('the release press finds the captive itself',
+    ok('the release press finds the captive itself, then opens the form; the one release path runs it',
       /const heldR = grappleHeldTargetOf\(fightR, interaction\.user\.id\);/.test(src) &&
       /You are not holding anyone/.test(src) &&
-      /setFightGrapples\(gidR, cidR, gmapR\)/.test(src));
+      /case 'release':\s*return runFightRelease\(\{ interaction, gid: gidM, cid: cidM, actorId: interaction\.user\.id, flavour \}\);/.test(src) &&
+      /async function runFightRelease\(\{ interaction, gid, cid, actorId, forceTargetId = null, flavour = null \}\)/.test(src));
+    // ── Build A2 (2026-10-14, T's "Build all") ──────────────────────────────
+    ok('the words from a fight form, a resolve and a target strike go into the chronicle as story, not dice',
+      /noteQuestActivity\(gidM, cidM, 'rp', `\$\{who\}: \$\{flavour\.replace\(\/\[\*_\]\+\/g, ''\)/.test(src) &&
+      /if \(what\) \{ try \{ noteQuestActivity\(gidM, cidM, 'rp', what\.replace/.test(src) &&
+      /if \(action \|\| speech\) \{ try \{ noteQuestActivity\(gidT, t\.channel_id, 'rp', `\$\{nmT\}: /.test(src));
+    ok('a new sheet is told where to go next: the thread, the board, /help',
+      /const nextSteps = \(\(\) => \{/.test(src) && /return `\\n\\n\\u\{1F9ED\} \*\*Next:\*\* \$\{bits\.join\(' \\u00b7 '\)\}`;/.test(src) &&
+      (src.match(/\$\{nextSteps\}/g) || []).length === 2 && /\? nextSteps : ''/.test(src));
+    ok('targets standing over a day are in the stalled report, with the way to retire them',
+      /Targets standing over a day/.test(src) && /\\`\/target list\\` there retires one/.test(src));
+    ok('the boot and /gm check status both say whether the commands registered, from one line',
+      /const registerStatus = new Map\(\);/.test(src) && /function registerStatusLine\(gid\)/.test(src) &&
+      /registerStatus\.set\(guildId, \{ ok: true, count: commands\.length, at: Date\.now\(\), error: null \}\)/.test(src) &&
+      /registerStatus\.set\(guildId, \{ ok: false, count: 0, at: Date\.now\(\), error: String\(err\?\.message \|\| err\)\.slice\(0, 300\) \}\)/.test(src) &&
+      /made\.push\(registerStatusLine\(gid\)\);/.test(src) && /`\\u\{1F4E1\} \$\{registerStatusLine\(interaction\.guild\.id\)\}`/.test(src));
+    ok('a fight quiet for ten minutes nudges whoever it waits on, once per turn',
+      /const FIGHT_IDLE_MS = 10 \* 60 \* 1000;/.test(src) && /async function fightIdleTick\(client\)/.test(src) &&
+      /ALTER TABLE fights ADD COLUMN last_at INTEGER/.test(src) && /ALTER TABLE fights ADD COLUMN nudged INTEGER DEFAULT 0/.test(src) &&
+      /if \(given\.length && !\(given\.length === 1 && given\[0\] === 'nudged'\)\) fields = \{ \.\.\.fields, last_at: Date\.now\(\), nudged: 0 \};/.test(src) &&
+      /setInterval\(\(\) => fightIdleTick\(client\)/.test(src) && /Ten minutes quiet/.test(src) &&
+      /UPDATE fights SET nudged=1 WHERE guild_id=\? AND channel_id=\?/.test(src));
+    ok('a target or a planted button can be addressed to several players or a role, through one audience check',
+      /function parseAudience\(str\)/.test(src) && /function audienceAllows\(owner, interaction\)/.test(src) &&
+      /function audienceMentions\(owner\)/.test(src) && /function audienceMentionsAllowed\(owner\)/.test(src) &&
+      /CREATE TABLE IF NOT EXISTS button_audience/.test(src) &&
+      /const owner = audience\.length \? 'list' : \(forUser\?\.id \|\| 'any'\);/.test(src) &&
+      /INSERT OR REPLACE INTO button_audience \(guild_id, message_id, owners\) VALUES \(\?, \?, \?\)/.test(src) &&
+      /const owner = ownerSlot === 'list'\s*\? \(db\.prepare\('SELECT owners FROM button_audience WHERE guild_id = \? AND message_id = \?'\)/.test(src) &&
+      (src.match(/if \(!audienceAllows\(t\.owner, interaction\)\)/g) || []).length === 2 &&
+      (src.match(/setName\('audience'\)/g) || []).length === 2 &&
+      /head\.unshift\(`\$\{audienceMentions\(t\.owner\)\} \\u2014`\)/.test(src) &&
+      /allowedMentions: audienceMentionsAllowed\(t\.owner\)/.test(src));
+    ok('the GM toolbar: one pinned message, five buttons, each opening the form its slash command would, Undo the rewind',
+      /const GM_BAR_TEXT = /.test(src) && /function gmBarRows\(\)/.test(src) && /async function handleGmBar\(interaction\)/.test(src) &&
+      /b\('gmbar:target', /.test(src) && /b\('gmbar:dc', /.test(src) && /b\('gmbar:fight', /.test(src) && /b\('gmbar:status', /.test(src) &&
+      /b\('gmbar:undo', /.test(src) && /if \(which === 'undo'\) return gmUndo\(interaction, 1\);/.test(src) &&
+      /if \(gmSub === 'bar'\) return await handleGmBar\(interaction\);/.test(src) &&
+      /startsWith\('gmbar:'\)\) return pressGmBar\(interaction, interaction\.customId\.slice\(6\)\);/.test(src) &&
+      /if \(which === 'dc'\) return showDcForm\(interaction\);/.test(src) &&
+      /const one = interaction\.options\?\.getUser\?\.\('target'\);/.test(src) &&
+      /customId === 'gmbartgt'\) return finishGmBarTarget\(interaction\);/.test(src) &&
+      /customId === 'gmbarfight'\) return finishGmBarFight\(interaction\);/.test(src) &&
+      /return createTarget\(interaction, \{ name, dc: dc && dc >= 1 && dc <= 40 \? dc : null/.test(src) &&
+      /return handleFight\(interaction, \{ sub: 'start', players, npcs, practice \}\);/.test(src) &&
+      /forced\.practice\) \|\| \(interaction\.options\?\.getBoolean\?\.\('practice'\) \?\? false\)\) \? PRACTICE_FLOOR : 0;/.test(src) &&
+      /Promise\.resolve\(\)\.then\(\(\) => msg\.pin\(\)\)/.test(src));
+    ok('the players\' weekly chronicle: quests, titles, fights won, the fallen \u2014 a dated thread in updates, nothing on a quiet week',
+      /CREATE TABLE IF NOT EXISTS week_ledger/.test(src) && /ALTER TABLE guild_config ADD COLUMN week_tale_at INTEGER/.test(src) &&
+      /async function weekTaleLines\(guild, since\)/.test(src) && /async function postWeekTale\(client, guild\)/.test(src) &&
+      /Quests completed\*\*/.test(src) && /Titles granted\*\*/.test(src) && /Fights won\*\*/.test(src) && /The fallen\*\*/.test(src) &&
+      /if \(!body\.length\) return null;/.test(src) &&
+      /postDatedThread\(client, cfg\.updates_forum, 'Weekly chronicle', Date\.now\(\),/.test(src) &&
+      /if \(cfgT\.updates_forum && Date\.now\(\) - \(Number\(cfgT\.week_tale_at\) \|\| 0\) >= 7 \* 86400000\)/.test(src) &&
+      /if \(headline && String\(headline\)\.includes\('\\u\{1F3C6\}'\)\) \{/.test(src));
+    ok('the run\'s story rides on the completion card as a scroll of several sheets, woven like /gm scroll',
+      /function makeImagesPdf\(pages\)/.test(src) && /function renderScrollBook\(\{ family, title, body \}\)/.test(src) &&
+      /function runStoryScroll\(gid, quest, \{ runnerName, partyNames, runMs, events, tale \}\)/.test(src) &&
+      /function hasCanvas\(\)/.test(src) && /if \(hasCanvas\(\)\) \{\s*try \{ storyFile = runStoryScroll\(gid, quest, /.test(src) &&
+      /embedScrollData\(renderScrollBook\(\{ family, title, body \}\), \{ v: 1, kind: 'scroll', title, body, name: stem \}\)/.test(src) &&
+      (src.match(/files: storyFiles/g) || []).length === 2);
+    ok('/quest run ready: a card with a tick per seated player, one press each, the GM told at the last',
+      /CREATE TABLE IF NOT EXISTS quest_ready/.test(src) && /setName\('ready'\)/.test(src) &&
+      /async function questReadyCard\(guild, gid, quest\)/.test(src) && /setCustomId\(`qready:\$\{quest\.number\}`\)/.test(src) &&
+      /startsWith\('qready:'\)\) \{/.test(src) && /That check is for the seated party/.test(src) &&
+      /INSERT OR IGNORE INTO quest_ready \(guild_id, number, user_id, at\)/.test(src) &&
+      /All \$\{party\.length\} ready\./.test(src));
+    ok('the Parchment edition is retired: two books per system plus the Examples pair, six in all',
+      !/^  '(DnD5e-)?DDice-Commands-Parchment\.pdf',$/m.test(src) &&
+      (src.match(/^  '(DnD5e-)?DDice-Commands-(GameMaster|Player)\.pdf',$/gm) || []).length === 4 &&
+      (() => { const pp = path.join(ROOT, 'make_pdfs.py'); const pdfSrc = fs.existsSync(pp) ? fs.readFileSync(pp, 'utf8') : ''; return !!pdfSrc && !/build\('full'/.test(pdfSrc) && !/Commands-Parchment\.pdf/.test(pdfSrc); })());
+    // ── Build B (2026-10-15): /gm undo ───────────────────────────────────────
+    ok('the undo journal brackets every interaction: the channel\'s state before and after, the difference kept, ten deep and a day',
+      /CREATE TABLE IF NOT EXISTS undo_journal/.test(src) && /const UNDO_DEPTH = 10, UNDO_MAX_AGE_MS = 24 \* 3600 \* 1000;/.test(src) &&
+      /const frame = undoFrameOpen\(interaction\);\s*try \{ return await handleInteraction\(interaction\); \}\s*finally \{ if \(frame\) \{ try \{ undoFrameClose\(frame, interaction\); \}/.test(src) &&
+      /async function handleInteraction\(interaction\)/.test(src) &&
+      /function undoSnapshot\(gid, cid\)/.test(src) && /function undoChanges\(before, after\)/.test(src) && /function undoRestoreSection\(name, rows\)/.test(src) &&
+      /ORDER BY id DESC LIMIT \?\)`\)\.run\(frame\.gid, frame\.cid, frame\.gid, frame\.cid, UNDO_DEPTH\);/.test(src) &&
+      /DELETE FROM undo_journal WHERE at < \?'\)\.run\(Date\.now\(\) - UNDO_MAX_AGE_MS\)/.test(src));
+    ok('what rewinds: the fight row bar its idle stamps, HP, rerolls, marks, dying tallies and stats on sheets and NPCs, heal charges, this channel\'s targets and group checks, the day\'s rolls, presses and called checks',
+      /fight:\s*\{ table: 'fights',\s*keys: \['guild_id', 'channel_id'\],\s*where: 'guild_id=\? AND channel_id=\?', skip: \['last_at', 'nudged'\] \}/.test(src) &&
+      /sheets:\s*\{ table: 'characters',[^\n]*only: \['hp_current', 'rerolls_current', 'next_mark', 'deception_spent', 'death_success', 'death_fail', 'str', 'con', 'dex', 'wis', 'lck'\], keepRows: true \}/.test(src) &&
+      /npcs:\s*\{ table: 'npcs',[^\n]*only: \['hp_current', 'rerolls_current', 'next_mark', 'str', 'con', 'dex', 'wis', 'lck'\], keepRows: true \}/.test(src) &&
+      /charges:\s*\{ table: 'heal_charges'/.test(src) && /targets:\s*\{ table: 'temp_targets',[^\n]*where: 'guild_id=\? AND channel_id=\?' \}/.test(src) &&
+      /groups:\s*\{ table: 'group_checks',[^\n]*where: 'guild_id=\? AND channel_id=\?' \}/.test(src) &&
+      /groupRolls:\s*\{ table: 'group_check_rolls',[^\n]*where: 'guild_id=\? AND at >= \?', recent: 'at' \}/.test(src) &&
+      /presses:\s*\{ table: 'button_presses',[^\n]*where: 'guild_id=\? AND at >= \?', recent: 'at' \}/.test(src) &&
+      /dcs:\s*\{ table: 'dc_cards',[^\n]*where: 'guild_id=\? AND created_at >= \?', recent: 'created_at' \}/.test(src) &&
+      /sec\.recent \? \[gid, Date\.now\(\) - UNDO_MAX_AGE_MS\] : \[gid\]/.test(src) &&
+      /if \(sec\.keepRows\) continue;/.test(src));
+    ok('the rewind itself is never a step: two undos are two steps back, not a redo',
+      /function isUndoInteraction\(interaction\)/.test(src) && /if \(isUndoInteraction\(interaction\)\) return null;/.test(src) &&
+      /interaction\.customId === 'gmbar:undo'/.test(src));
+    ok('/gm undo: GM-gated, steps 1\u201310, a fight that has ended is not rewound, the rows written back, the table told, the state landed on posted, the audit and the quest told',
+      /async function gmUndo\(interaction, steps = 1\)/.test(src) && /Rewinding is for GMs/.test(src) && /Nothing to rewind here/.test(src) &&
+      /if \(!now \|\| now\.state !== 'active' \|\| \(after && after\.state !== 'active'\)\) \{ stopped = 'The fight here has ended \\u2014 it is not rewound\.'; break; \}/.test(src) &&
+      /\\u23EA \*\*Rewound \$\{done\.length === 1 \? 'one step' : `\$\{done\.length\} steps`\}\*\* by <@\$\{uid\}>/.test(src) &&
+      /async function fightStatusLines\(guild, gid, cid, fight\)/.test(src) && /async function fightTurnPrompt\(guild, gid, cid\)/.test(src) &&
+      /const lines = await fightStatusLines\(interaction\.guild, gid, cid, fight\);/.test(src) &&
+      /input: '\/gm undo', rollLine: head\.join\('\\n'\)\.slice\(0, 1500\), context: 'rewind', kind: 'gms'/.test(src) &&
+      /noteQuestActivity\(gid, cid, 'note', `Rewound: /.test(src) &&
+      /if \(gmSub === 'undo'\) return await gmUndo\(interaction, interaction\.options\.getInteger\('steps'\) \|\| 1\);/.test(src) &&
+      /setName\('undo'\)/.test(src) && /setName\('steps'\)/.test(src));
     ok('both examples books are published',
       /'DDice-Examples-GameMaster\.pdf'/.test(src) && /'DDice-Examples-Player\.pdf'/.test(src));
     ok('the examples books survive the ruleset filter',
@@ -2515,8 +2662,12 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     // Raised 6000→6200 (2026-08-15): /gm override interject spent the old
     // margin on legible option prose — a fair tenant. Discord's true wall
     // is 8000; this stays the tripwire well short of it.
+    // Raised 6200→6400 (2026-10-15): /gm bar and /gm undo landed with the
+    // builder at 6196 after seven descriptions were trimmed for A2. The
+    // only fold left would rename commands (kill/revive/heal into a group),
+    // which is T's call, not a tripwire's; a quarter of the wall is still spare.
     ok('the largest command keeps clear headroom under the 8000 wall',
-      Math.max(...budget.map(([, sz]) => sz)) <= 6200);
+      Math.max(...budget.map(([, sz]) => sz)) <= 6400);
   });
 }
 
