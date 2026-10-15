@@ -417,6 +417,13 @@ quest. `/gm bar` gained ⏪ Undo (one step). The `/gm` builder is at 6310;
 the tripwire moved 6200→6400 with its reason in the pin (the only fold
 left would rename commands, which is T's call).
 
+**One update.** T pushes A1, A2 and B together (15/10, "combine the builds
+so I can push out as 1 update"): the 14/10 and 15/10 What's new entries were
+merged into one `2026-10-15` entry — 17 GM items and 12 player lines, in
+build order — so the boot posts one thread per forum. Production had seen
+neither key. (If a 14/10 thread ever does turn up on a server, it will be
+an orphan the ledger ignores; nothing re-posts it.)
+
 **Pins and probes.** Four pins (the bracket, the sections, the never-a-step
 rule, the command) and the toolbar pin counts five buttons. The undo walk
 (ten probes): an exchange with forced dice (attack nat 20, defence nat 1)

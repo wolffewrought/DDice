@@ -1,5 +1,5 @@
 {
-  "at": "2026-10-14T23:11:17.546Z",
+  "at": "2026-10-15T15:51:09.233Z",
   "verify": {
     "green": true,
     "assertions": 1118,
@@ -18,8 +18,8 @@
     "failures": []
   },
   "shape": {
-    "bytes": 1710606,
-    "lines": 27309,
+    "bytes": 1710551,
+    "lines": 27306,
     "tables": [
       "autorest_schedules",
       "button_audience",
