@@ -334,13 +334,13 @@ PARTS['fight'] = [
 ('aud', 'all'),
 ('p', 'Proper fights: everyone rolls to see who goes first, then takes turns. The bot keeps score.'),
 ('h2', 'Commands'),
-('code', [('/fight start players:@Artorius @Meliora @Zeus npcs:Hollow, Hollow tank', 'any number of each', 'player'),
+('code', [('/fight start players:@Artorius @Meliora @Zeus npcs:Hollow, Hollow tank', 'any number of each \u2014 DEX initiative; fighters on the\nsame total reroll among themselves until apart, and\nthe card says who rolled what', 'player'),
           ('/fight start ... manual:true', 'skip roll, keep listed order', 'player'),
           ('/fight start ... practice:true', 'friendly bout — fighters yield at 2 HP', 'player'),
           ('/fight addnpc npc:Hollow, Hollow tank', 'add NPC(s) mid-fight, ' + GM, 'gm'),
           ('/fight add user:@Players where:Next', 'bring a player into a running fight \u2014 HP from their\nsheet, initiative rolled for the record; Next puts them\nstraight after this turn, Last at the end, ' + GM, 'gm'),
           ('/fight order sequence:@Artorius, Hollow, @Meliora, @Zeus', 'reorder players + NPCs, ' + GM, 'gm'),
-          ('/fight atk stat:str target:@Players', 'attack a player', 'player'),
+          ('/fight atk stat:str target:@Players', 'attack a player \u2014 the form opens for your words\n(flavour: given, it swings at once); with one foe the\ntarget may be left off; /fight atk alone offers the\nstat buttons', 'player'),
           ('/fight act action:Grapple target:@Players', 'STR-only grapple attempt — the target answers with\n/fight act action:Save (STR only). If the attempt meets or\nexceeds the save, the hold takes: immobile, 1 strain\nof damage at the end of each of their turns, and any\naction on a flat d20. The grappler may release freely\nand can never strike their own captive', 'player'),
           ('/fight act action:Grapple npc:Hollow tank target:@Players', GM + ' grapples AS the NPC — same STR contest; the\nplayer answers with /fight act action:Save', 'gm'),
           ('/fight act action:Save', 'your STR save against the pending grapple — GMs\nsave for an NPC with npc:Name; auto NPCs save\nthemselves', 'player'),
@@ -360,14 +360,14 @@ PARTS['fight'] = [
           ('/fight act action:Insight npc:Hollow Lieutenant', GM + ' rolls the NPC\u2019s WIS insight against a player\u2019s\nfeint; auto NPCs check themselves', 'gm'),
           ('/fight atk stat:str target_npc:Hollow tank', 'attack an NPC', 'player'),
           ('/fight atk stat:str npc:Hollow target:@Players', GM + ' attacks AS the NPC', 'gm'),
-          ('/fight def stat:dex', 'defend', 'player'),
-          ('(buttons)', 'every prompt carries its answer: the attack card\noffers five DEFEND stat buttons, the grapple card\na Save, the feint card an Insight, the defence\ncard Resolve \u2014 and Reroll rides along. One press,\nsame rules, same audit trail. Every turn line lists everyone standing with their HP, and any condition the Game Master has marked you with, counting down. Ten quiet minutes and the bot pings whoever the fight is waiting on, once a turn', 'player'),
+          ('/fight def stat:dex', 'defend \u2014 the form opens (flavour: rolls at once);\n/fight def alone offers the stat buttons', 'player'),
+          ('(buttons)', 'every prompt carries its answer: the attack card\noffers five DEFEND stat buttons, the grapple card\na Save, the feint card an Insight, the defence\ncard Resolve \u2014 and Reroll rides along. One press,\nsame rules, same audit trail. Every turn line lists everyone standing with their HP, and any condition the Game Master has marked you with, counting down. A quiet spell (ten minutes unless the Game Master sets otherwise) and the bot pings whoever the fight is waiting on, once a turn', 'player'),
           ('(the GM\u2019s NPC buttons)', 'an NPC\u2019s turn line and its defence prompt carry five stat buttons only a GM may press \u2014 the target is asked for if there is more than one, the form opens, and the blow is struck as the NPC. Pressing Resolve as a GM asks what happens; the words post under the outcome', 'gm'),
           ('/fight def stat:dex npc:Hollow', GM + ' defends AS the NPC', 'gm'),
           ('/fight rr', 'reroll last fight roll — 1 token', 'player'),
           ('/fight resolve', 'resolve the exchange', 'player'),
           ('/fight status', 'show turn order and HP', 'player'),
-          ('/fight log', 'repost the recap of the last finished fight in\nthis channel \u2014 only the fighters who actually\ntook part, and only that fight: a new fight always\nstarts a fresh recap'),
+          ('/fight log [scroll:true]', 'repost the recap of the last finished fight in\nthis channel \u2014 only the fighters who actually\ntook part, and only that fight: a new fight always\nstarts a fresh recap. scroll:true hands it over as a\nparchment PDF in the scroll font'),
           ('/fight skip', 'skip the current turn — fighter stays in, ' + GM, 'gm'),
           ('/fight hp value:3 target_npc:Hollow tank', 'set HP mid-fight, sheet synced, ' + GM, 'gm'),
           ('/fight kick target_npc:Hollow tank', 'remove a fighter, fight continues, ' + GM, 'gm'),
@@ -500,6 +500,7 @@ PARTS['gmfight'] = [
 ('h2', 'Rehearsal, Fight Settings and the Big Red Button'),
 ('code', [('/gm check rehearse', 'a private sparring thread against a dummy the bot runs,\nso every button can be tried before the table sees it (GM)'),
           ('/config mechanics fightping enabled:true', '@-mention players on their turn — off by default'),
+          ('/config mechanics fightnudge minutes:10', 'how long a fight may sit quiet before the bot pings\nwhoever it waits on \u2014 10 by default, 0 turns it off\nfor a play-by-post table'),
           ('/config mechanics npcreroll threshold:8', 'NPC auto-reroll on nat ≤ N — 0 disables'),
           ('/fight end all:true', 'end every active fight on the server at once \u2014\nrecaps post in their channels; HP states persist')]),
 ]
@@ -529,6 +530,12 @@ PARTS['quest'] = [
 ('p', 'A campaign is the long arc — quests and encounters under one name. Its card shows the premise, what is done and your own part in it; the Game Master’s notes and status stay on their side.'),
 ('code', [('/campaign list', 'every campaign on the server'),
           ('/campaign show campaign:The Falconer’s War', 'the premise, what is done, and your part')]),
+('h2', 'Roleplay on the Record (/rp)'),
+('p', 'Outside a fight the same two boxes the fight buttons open are a command away: <b>/rp</b> opens them \u2014 what you do, what you say, at least one \u2014 and <b>/rp action:\u2026 speech:\u2026</b> skips the box. The line goes out in your own name and face, shaped as the cards are: <i>the action</i>, then \u201cthe speech\u201d. Inside a run it becomes a beat on the timeline, in the recap and in the story scroll that comes with the completion card. No dice are rolled.'),
+('code', [('/rp', 'opens the box'),
+          ('/rp action:draws her blade speech:Not one step closer.', 'posts at once'),
+          ('/edit', 'fix a line of yours \u2014 a private list of what you posted here'),
+          ('/edit delete:true', 'take one back')]),
 ('h2', 'The Chronicle and the Review'),
 ('p', 'When a run is completed, the Game Master’s telling of it lands in your own thread in <b>quest-chronicle</b> — one thread per adventurer, every quest they finished, told by whoever ran it — and the summary is linked on your standing page. The run’s thread then carries a review button: a score out of five and a line or two, for the Game Masters alone to read. <b>/quest record</b> lists what you have been on.'),
 ]
@@ -583,7 +590,7 @@ PARTS['gmquest'] = [
 ('code', [('/quest run start number:1', 'the clock begins'),
           ('/quest run note number:1 text:They bribed the gatekeeper kind:Roleplay', 'mark a moment'),
           ('/quest run timeline number:1', 'the whole log so far'),
-          ('/quest run ready number:1', 'a ready check: one card with a tick per seated\nplayer and a Ready button \u2014 each press turns their\ntick, the last says all ready and names you'),
+          ('/quest run ready number:1', 'a ready check: one card with a tick per seated\nplayer and a Ready button \u2014 each press turns their\ntick; the last says all ready and names you, and on a\nrun not yet started turns the button into Start the\nrun \u2014 your press is /quest run start'),
           ('/quest run pause number:1', 'stop the clock, keep the time'),
           ('/quest run resume number:1', 'carry on where it left off'),
           ('/quest run complete number:1', 'stop, award, and write it up')]),
@@ -736,25 +743,34 @@ PARTS['activities'] = [
       'results and loops until someone stops. Fishing, foraging, a gauntlet in the training yard \u2014 whatever '
       'you script. Only a ' + GM + ' can write one; whether players can <b>start</b> one is a setting.'),
 ('h2', 'Running One'),
-('code', [('/activity run name:Fishing [player:@Players]', 'start an activity here. Name a player and it runs\nfor THEM \u2014 their name on it, their buttons, their\nscore \u2014 which is how you set a quiz for someone\nto sit (GM only). Several runs can go at once in\none channel; each answers only to its own player'),
-          ('/activity list      /activity show name:Fishing', 'what exists, and read it back in full'),
-          ('/activity stop', 'abandon the run here'),
+('code', [('/activity run name:Fishing [player:@Players] [party:@A @B]', 'start an activity here. Name a player and it runs\nfor THEM \u2014 their name on it, their buttons, their\nscore \u2014 which is how you set a quiz for someone\nto sit. party: names several, who press in turn (GM only). Several runs can go at once in\none channel; each answers only to its own player'),
+          ('/activity list', 'what exists \u2014 and, if the server has one, the pinned\nboard lists them with a \u25b6 Play button each'),
+          ('/activity scores name:Fishing', 'best score per player, and how it has been played'),
+          ('/activity stop', 'abandon the run here \u2014 /activity run while mid-way\nshows you where you are instead'),
           ('/activity demo which:Kalidale Lore [player:@Players]', 'play a built-in activity \u2014 the fishing tale or a\nfive-question lore quiz. Name a player and it runs\nfor THEM, so you can hand someone a quiz to sit;\nnothing is awarded either way'),
           ('/activity create', 'write one \u2014 a paste window, or file: a .txt for\nlong scripts (' + GM + ')', 'gm'),
-          ('/activity set name:X scene:find field:Roll value:dex', 'tweak one line (' + GM + ')', 'gm'),
+          ('/activity show name:X   /activity edit name:X', 'the map of one, and a box to change a scene (' + GM + ')', 'gm'),
           ('/activity delete name:X', 'remove it (' + GM + ', asks first)', 'gm'),
-          ('/config mechanics activities players:true', 'let players start them too', 'gm')]),
+          ('/config mechanics activities players:true', 'let players start them too', 'gm'),
+          ('/config channels activityboard channel:#games', 'pin a board of them with Play buttons (' + GM + ')', 'gm')]),
 ('p', '<b>/activity demo</b> plays a ready-made fishing game so you can see the whole system working before '
       'writing anything: a difficulty check that loops with a different excuse each time, four sizes of catch '
       'chosen by the roll, a gauntlet per size, natural 20s and 1s, and buttons to keep going or head back. '
       'It awards <b>nothing</b> \u2014 no renown, no merits, no items \u2014 so it is safe to play with.'),
-('h2', 'One Run Each'),
+('h2', 'One Run Each \u2014 or a Party'),
 ('p', 'An activity run belongs to the person who started it. Several people can play in the same channel at '
       'once, each with their own prompts, their own progress and their own rewards \u2014 and one person stopping '
       'or wandering off does nothing to anyone else. Every post is tagged with whose run it is, and a button '
-      'only answers for its owner.'),
+      'only answers for its owner. A run left untouched for a week is put away on its own.'),
 ('code', [('/activity run name:Fishing', 'start your own run'),
+          ('/activity run name:Fishing party:@Meliora @Dain', 'one run for the three of you'),
           ('/activity stop', 'end yours \u2014 a ' + GM + ' with none running can clear the channel')]),
+('p', 'A <b>party</b> run is one tale for everyone named: you press <b>in turn</b> (the card says whose turn it is, '
+      'and a press out of turn is refused by name), the tally is one shared pot, and the ending pays <b>every</b> '
+      'member \u2014 merits, renown, a title, all of it. Each roll uses the presser\u2019s own sheet.'),
+('p', 'Some activities carry rules of their own: <b>once per day</b> or week per player, days of the week they '
+      'run on, a title or a standing you need to start them, and endings that pay <b>once</b> \u2014 a second '
+      'finish is still a finish, just not a payday. The refusal says which, and when you can go again.'),
 ('h2', 'Answering a Scene'),
 ('p', 'Press the button, or <b>type the stat and add your own flavour after it</b> \u2014 both roll the same '
       'thing, but typing lets you say what your character is doing.'),
@@ -779,11 +795,53 @@ PARTS['activities'] = [
 PARTS['gmactivities'] = [
 ('aud', 'gm'),
 ('h2', 'Writing One'),
-('p', '<b>/activity create</b> opens a paste window for your script; long scripts (over 4000 characters) '
-      'travel as an attached <b>.txt</b> on its <b>file:</b> option instead. Pasting the script straight into '
-      'any channel the bot can read works too. Every route is the same: the script starts with '
-      '<b>[ACTIVITY] Name</b>, re-using a name replaces that activity, and the whole thing is checked before '
-      'anything is saved.'),
+('p', '<b>/activity create</b> opens a box for your script \u2014 <b>template:</b> starts it from a worked example '
+      'with the guidance in comments; long scripts (over 4000 characters) travel as an attached <b>.txt</b> on '
+      'its <b>file:</b> option instead, or as the PDF from any shelf. Pasting the script straight into any channel '
+      'the bot can read works too, as does posting it in the activity\u2019s thread on the shelf. Every route is '
+      'the same: the script starts with <b>[ACTIVITY] Name</b>, re-using a name replaces that activity, and the '
+      'whole thing is checked before anything is saved. <b>/activity write name:</b> builds one scene by scene in '
+      'boxes instead, no grammar to learn; <b>/activity grammar</b> is the cheat sheet, a screen at a time.'),
+('h2', 'What Happens When You Save'),
+('p', 'Since 20/10 the bot <b>keeps the script</b>. A script that parses goes live at once \u2014 unless someone is '
+      'mid-run in it, when it waits as a <b>draft</b> until you press <b>Publish</b> (or they finish). A script '
+      'with problems is kept as a draft too, <b>every problem listed with its line and the fix</b>, so nothing '
+      'you typed is lost: open it on the shelf or with <b>/activity edit</b> and mend it. <b>draft:true</b> on '
+      'create holds a good script back on purpose, to practise first. The version before each publish is kept, '
+      'so <b>Revert</b> swaps back.'),
+('code', [('/activity edit name:X scene:find', 'that scene\u2019s block in a box; blank scene: the whole script'),
+          ('/activity practice name:X', 'a dry run \u2014 nothing paid, free rerolls, buttons\nthat force the die: nat 1, fail, pass, nat 20'),
+          ('/activity publish name:X   /activity revert name:X', 'the waiting draft goes live; back to the last version'),
+          ('/activity copy name:X as:Y   /activity rename name:X to:Y', 'a copy held as a draft; a new name'),
+          ('/activity export name:X', 'the script as a .txt and a parchment PDF that carries it'),
+          ('/activity show name:X [script:true]', 'the map: every scene, what it asks, where it goes,\nthe odds per roll for this table; script:true adds the text')]),
+('p', 'The parser also <b>notes</b> what will run but probably not as meant: a scene nothing reaches, a loop with '
+      'no way out, a roll with only half its outcomes, a tally never cashed, a DC nobody at the table could meet, a '
+      'voice that is not an NPC, and a line that <b>reads as narration but looks like a keyword mistyped</b> \u2014 '
+      '<i>PASSS -> ford</i> used to vanish silently into the story text. Notes do not stop a save; they sit on the '
+      'card. Lines beginning with <b>#</b> are comments and are ignored.'),
+('h2', 'The Shelf'),
+('p', 'Give the server a <b>Forum</b> and run <b>/config channels activityshelf channel:#activity-shelf</b>: every '
+      'activity gets a thread there \u2014 a card on top (state, scenes, the odds of each roll for this table, '
+      'notes, the figures from play), the script in code blocks under it, and a parchment PDF that carries the '
+      'script woven in, so dropping it into <b>/activity create file:</b> on any server brings the activity with '
+      'it. The card\u2019s buttons: <b>Edit scene</b>, <b>Edit all</b>, <b>Practice</b>, <b>Publish</b> and '
+      '<b>Discard draft</b> when one is waiting, <b>Revert</b>, <b>Retire</b> (off the board, runs ended, thread '
+      'archived; <b>Restore</b> brings it back). Post a script, a .txt or the PDF in the thread and it replaces the '
+      'activity; a new post in the forum starting <b>[ACTIVITY]</b> makes a new one. The three demos sit there '
+      'read-only as worked examples, the tutorial among them. Discord\u2019s tag filter sorts the shelf: live, '
+      'draft, retired, quiz, story, gauntlet, rewards, open, demo. GM eyes only \u2014 scripts hold the answers, '
+      'which is also why <b>/activity show</b> is a GM command now.'),
+('h2', 'The Board'),
+('p', '<b>/config channels activityboard channel:#games</b> pins a message listing every live activity with a '
+      '<b>\u25b6 Play</b> button each, redrawn as activities are published and retired. A press starts the activity '
+      'for whoever pressed \u2014 following the server\u2019s setting, so on a GM-led server it says to ask one.'),
+('h2', 'Figures From Play'),
+('p', 'Every run is logged \u2014 starts, rolls and their bands, choices, endings, quits \u2014 and kept ninety days. '
+      'The shelf card and <b>/activity show</b> read it back: runs and finishes, where players stopped, which rolls '
+      'fail more than six times in ten (the DC may be high). <b>/activity scores</b> ranks the best tally or quiz '
+      'score per player. The weekly chronicle ends with the week\u2019s activities and its best score; the GM digest '
+      'lists every draft still waiting on a GM.'),
 ('code', [('[ACTIVITY] Fishing', ''),
           ('TALLY renown', 'a running total, paid out at the end'),
           ('', ''),
@@ -832,23 +890,46 @@ PARTS['gmactivities'] = [
            ['CHOICE', 'Buttons instead of dice. Options are label -> scene.'],
            ['TALLY renown', 'Names a running total, declared once at the top.'],
            ['GAIN renown 3', 'Adds to the tally when a player arrives at this scene.'],
+           ['ROLL wis DC easy', 'The DC is set from this table\u2019s sheets: easy, normal, hard.'],
+           ['SET torch / UNSET torch', 'A flag remembered for the rest of the run.'],
+           ['IF torch -> scene', 'Checked on arrival; also not torch, tally>=5, merits>=10, title:X.'],
+           ['NEXT adv / NEXT dis', 'Tilts the next roll in this run.'],
+           ['RANDOM -> a|b|c', 'A scene that only routes, at random.'],
+           ['IMAGE https://.../pic.png', 'A picture on the card.'],
+           ['QUIZ FROM lore 5 -> next', 'Five questions drawn from the bank, as scenes.'],
            ['END', 'Finishes. END TALLY pays out, merits:2 awards merits,'],
-           ['', 'rewards:a silver key is announced for you to hand out.']]),
+           ['', 'rewards:a silver key is announced for you to hand out,'],
+           ['', 'title:Angler grants a title, heal:1 a heal charge, quest:text'],
+           ['', 'notes the running quest, once pays only the first finish.']]),
 ('p', 'Without a <b>DC</b> or ranges, outcomes fall back to the same bands a <b>?</b> check uses: <b>CRIT</b> a '
       'natural 20, <b>PASS</b> 15+, <b>PARTIAL</b> 10\u201314, <b>FAIL</b> under 10, <b>FUMBLE</b> a natural 1. '
       'You need not define all of them \u2014 a crit falls back to PASS, a fumble to FAIL.'),
-('note', 'Validation refuses a branch pointing at a scene that does not exist, a duplicate scene name, a scene '
-         'with no roll, choice or ending, a roll on something that is not a stat, a gauntlet longer than eight, '
-         'and a <b>GAIN</b> with no <b>TALLY</b> \u2014 each with the reason, so a run can never dead-end.'),
+('note', 'Validation refuses a branch pointing at a scene that does not exist (and suggests the nearest name), a '
+         'duplicate scene name, a scene with no roll, choice, route or ending, a roll on something that is not a '
+         'stat, more than five choices, a gauntlet longer than eight, and a <b>GAIN</b> with no <b>TALLY</b> \u2014 '
+         'every problem at once, each with its line and the fix, so a run can never dead-end. A refused script is '
+         'kept as a draft with the list on its card.'),
 ('h2', 'The Anatomy of a Script'),
 ('p', 'The table above is the quick reference; this is the long walk. Each part of a script, what it does at '
       'the table, and the shapes it can take \u2014 every example below is a working fragment you can lift.'),
 ('h2', 'The Header'),
 ('code', [('[ACTIVITY] Fishing', 'the first line \u2014 everything above it is ignored')]),
 ('p', 'A script begins at <b>[ACTIVITY] Name</b> and the name is how everything else refers to it \u2014 '
-      '<b>/activity run name:Fishing</b>, <b>/activity show</b>, <b>/activity set</b>. Writing a script with '
-      'a name already in use <b>replaces</b> that activity in one motion; there is no separate edit-and-save. '
-      '(<b>[STORY]</b> is accepted as an older spelling of the same header.)'),
+      '<b>/activity run name:Fishing</b>, <b>/activity show</b>, <b>/activity edit</b>. Writing a script with '
+      'a name already in use <b>replaces</b> that activity \u2014 at once, or as a waiting draft if someone is '
+      'mid-run. (<b>[STORY]</b> is accepted as an older spelling of the same header.)'),
+('code', [('TALLY renown', 'a running total, paid out by END TALLY'),
+          ('QUIZ tally', 'how questions are marked: tally, retry, silent'),
+          ('ONCE per day', 'a cooldown per player: day or week'),
+          ('AVAILABLE Fri-Sun', 'the days it can be started (UTC); weekends, weekdays'),
+          ('REQUIRE title:Angler', 'who may start it: a title, merits>=10, renown>=50'),
+          ('# a comment', 'ignored, anywhere in the script')]),
+('p', 'Those lines sit between the header and the first scene. <b>REQUIRE</b> gates starting; a scene-level test '
+      'is <b>IF</b>, below. Keywords are written in <b>capitals</b>: a keyword line in capitals must be well-formed '
+      '(a malformed one is a problem, with the fix); in lower case it counts only when it is exact \u2014 <i>end</i>, '
+      '<i>gain renown 1</i>, <i>set torch</i> \u2014 so a bare line beginning <i>As the sun sets</i> or <i>Roll with it</i> '
+      'stays narration, and under <b>CHOICE</b> any <i>label -> scene</i> is a button whatever it starts with. Scene '
+      'names are twenty characters at most.'),
 ('h2', 'SCENE \u2014 the Steps of the Tale'),
 ('code', [('SCENE find', 'a step, named'),
           ('  ...', ''),
@@ -954,12 +1035,63 @@ PARTS['gmactivities'] = [
       'times. The count is per-run and per-player, shown as it grows, and it pays out only if an ending '
       'says so; abandoning a run with <b>/activity stop</b> forfeits it. A <b>GAIN</b> without a declared '
       '<b>TALLY</b> is refused at validation.'),
+('h2', 'DC by Intent, and the Odds'),
+('code', [('ROLL wis DC easy', 'three in four sheets pass on an average roll'),
+          ('ROLL str DC normal', 'half'),
+          ('ROLL dex DC hard', 'one in four')]),
+('p', 'Write the DC as what you <b>mean</b> and the bot sets the number from this server\u2019s sheets when the '
+      'script is saved (a quarter, half, three-quarters of them, by 11 + their best offered stat), between 5 and '
+      '25. The map and the shelf card show the number it chose, and beside <b>every</b> DC roll the odds for this '
+      'table: <i>4 of 9 sheets pass on an average roll \u00b7 54% overall</i>. Republish and it is reckoned again.'),
+('h2', 'SET and IF \u2014 Flags, and Routing on Them'),
+('code', [('SCENE stair', ''),
+          ('SAY You lift a torch from its bracket.', ''),
+          ('SET torch', 'remembered for the rest of the run'),
+          ('CHOICE', ''),
+          ('  Onward -> hall', ''),
+          ('', ''),
+          ('SCENE hall', 'a scene of IF lines only routes'),
+          ('IF torch -> lit_hall', 'first match wins'),
+          ('IF not torch -> dark_hall', ''),
+          ('', ''),
+          ('SCENE vault', ''),
+          ('IF tally>=5 -> rich', 'the run\u2019s tally'),
+          ('IF title:Angler -> greet', 'a title the player holds'),
+          ('IF merits>=10 -> trusted', 'their standing')]),
+('p', 'A flag is a word a scene <b>SET</b>s (or <b>UNSET</b>s) on arrival and the run remembers. <b>IF</b> lines are '
+      'checked when a player arrives at the scene, top to bottom, first match wins; a scene with nothing but IF '
+      'lines routes straight through (its SAY, if any, is said on the way). A scene may test <b>tally</b>, '
+      '<b>merits</b> or <b>renown</b> with <b>>=</b>, <b><=</b>, <b><</b>, <b>></b> or <b>=</b>, or a <b>title:</b>. '
+      'Validation notes a flag tested that no scene ever sets.'),
+('h2', 'RANDOM, NEXT and IMAGE'),
+('code', [('SCENE cast', ''),
+          ('SAY You cast.', ''),
+          ('RANDOM -> shallows|reeds|deep', 'one of these, at random'),
+          ('', ''),
+          ('SCENE blessing', ''),
+          ('NEXT adv', 'the next roll in this run is tilted'),
+          ('IMAGE https://example.com/altar.png', 'a picture on the card')]),
+('p', 'A <b>RANDOM</b> scene only routes \u2014 the cure for a repeatable minigame playing the same every time \u2014 '
+      'and must not ask for anything else. <b>NEXT adv</b> or <b>NEXT dis</b> tilts the next roll in the run, '
+      'announced on the card, spent once; a choice can now change the odds, not only the path. <b>IMAGE</b> takes '
+      'a direct link to a picture.'),
+('h2', 'QUIZ FROM \u2014 the Bank, in a Script'),
+('code', [('SCENE bank', ''),
+          ('SAY The archivist opens the book.', ''),
+          ('QUIZ FROM lore 5 -> done', 'five from the lore category; any = the whole bank')]),
+('p', 'The scene becomes the way in \u2014 its narration, then a <b>Begin</b> button \u2014 and the questions are '
+      'written as scenes after it, the last pointing at <b>done</b>. They are drawn when the script is saved; '
+      'republish to draw again. Answers still land in the bank\u2019s memory of who has met what.'),
 ('h2', 'END \u2014 Finishing, and What It Pays'),
 ('code', [('END', 'the tale simply ends'),
           ('END TALLY', 'pays the counter out as renown'),
           ('END merits:2', 'awards 2 merits to the player'),
           ('END rewards:a silver key', 'announced for you to hand out'),
-          ('END TALLY merits:2 rewards:a fine rod', 'all three at once')]),
+          ('END title:Angler', 'grants a title; validation notes a new one'),
+          ('END heal:1', 'a heal charge, up to the server\u2019s cap'),
+          ('END quest:Crossed the ford', 'a note in the quest running in that channel'),
+          ('END once', 'pays only the first time each player finishes'),
+          ('END TALLY merits:2 title:Angler once rewards:a fine rod', 'they combine; rewards: always last')]),
 ('p', 'A scene with <b>END</b> stops the run \u2014 after its SAY, so an ending can still speak. What follows '
       'the word is the payout: <b>TALLY</b> converts the banked counter into renown, <b>merits:</b> awards '
       'merits <b>automatically</b>, with the activity\u2019s name on the record, and <b>rewards:</b> is free '
@@ -968,7 +1100,17 @@ PARTS['gmactivities'] = [
 ('note', 'The parts compose. A scene may SAY in an NPC\u2019s voice, ROLL with a choice of stats, override on '
          'the naturals, vary its failures with ONE OF, and GAIN on arrival \u2014 the fishing demo uses nearly '
          'every part in forty lines, and <b>/activity show name:Fishing (demo)</b> after running '
-         '<b>/activity demo</b> reads it back scene by scene as a worked answer key.'),
+         '<b>/activity demo</b> reads it back scene by scene as a worked answer key. <b>/activity demo '
+         'which:trial</b> plays <i>The Scribe\u2019s Trial</i>, a tutorial written in the grammar it teaches; its '
+         'script is on the shelf beside it.'),
+('h2', 'The Writer \u2014 Scene by Scene'),
+('p', '<b>/activity write name:Gate</b> asks for one scene at a time in a box: its name, what the player reads, '
+      'what it asks (<i>wis DC12</i>, <i>str|dex</i>, <i>gauntlet str 14 12</i>, <i>choice</i>, <i>ask</i>, '
+      '<i>end</i>), where each result goes (one per line, as you would write them under a ROLL or CHOICE), and '
+      'extras (<i>AS Name \u00b7 GAIN renown 1 \u00b7 SET torch \u00b7 END merits:2</i>). After each scene it names '
+      'the scenes you pointed at but have not written and offers a button for each; when every arrow resolves, '
+      '<b>Finish</b> composes the script and saves it through the same door as a paste. Problems in a scene are '
+      'shown as you go.'),
 ('h2', 'Quizzes & the Question Bank'),
 ('p', 'A quiz is an activity underneath, so everything here rides the machinery in <b>Activities</b> — buttons, scoring, handing a run to a named player. What is different is the <b>bank</b>: questions written once, kept, and drawn on for ever after. Read the walkthrough first; the rest is reference.'),
 ('h2', 'Running a Quiz — Step by Step'),
@@ -1027,13 +1169,13 @@ PARTS['gmactivities'] = [
 PARTS['fallen'] = [
 ('aud', 'all'),
 ('p', 'When a character is brought to 0 HP they are down, not gone \u2014 whether that is the end is the '
-      + GM + '\u2019s call. <b>/gm kill</b> makes it final and writes them up.'),
+      + GM + '\u2019s call. <b>/existence kill</b> makes it final and writes them up.'),
 ('aud', 'gm'),
 ('code', [('/config channels memorial channel:#gm-records public:#the-fallen', 'both halves'),
-          ('/gm kill user:@Players', 'call it, once they are down'),
-          ('/gm kill npc:Hollow tank', 'NPCs too'),
-          ('/gm kill user:@Players anyway:true', 'even while still standing'),
-          ('/gm revive user:@Players', 'bring them back')]),
+          ('/existence kill user:@Players', 'call it, once they are down'),
+          ('/existence kill npc:Hollow tank', 'NPCs too'),
+          ('/existence kill user:@Players anyway:true', 'even while still standing'),
+          ('/existence revive user:@Players', 'bring them back')]),
 ('p', 'It asks for a <b>cause of death</b>, optional <b>last words</b> and an optional <b>epitaph</b>. '
       'Everything else is already known: their name, order, rank at the moment they fell, merit, renown \u2014 '
       'and their <b>deeds</b>, which are not typed out but gathered from what the bot watched them do. Quests '
@@ -1070,7 +1212,7 @@ PARTS['reference'] = [
       'sort after those that have one, rather than jumping the queue.'),
 ('note', '<b>NPCs sit below the players</b>, however senior their order \u2014 the two are separate halves of '
          'a list rather than interleaved. Within the NPC half the same ordering applies. Mixed lists like '
-         '<b>/gm heal global:Everyone</b> print each group under its own heading.'),
+         '<b>/existence heal global:Everyone</b> print each group under its own heading.'),
 ]
 
 PARTS['reference-kf'] = [
@@ -1099,7 +1241,7 @@ PARTS['setup'] = [
 ('h2', 'The One-Command Setup'),
 ('code', [('/gm check build', 'the one-command setup: makes every channel and forum the bot needs in the two categories, points the config at each, then fills them with the audit shelves, pipeline books and tags. Needs Manage Channels, for you and for the bot (GM)'),
           ('(pickers)', 'the check report offers channel pickers for unset\nconfigs \u2014 up to five at a time; a pick runs the\nreal config branch, tags and books included\n(Manage Server required)'),
-          ('/gm check run', 'build anything missing — audit shelves, pipeline books, pipeline tags — and sweep every channel’s permissions, repairing what it can; never moves or renames anything, and names what only you can grant. Surviving threads are adopted by id, never remade, so run it as often as you like, and after any update that adds a book (GM)'),
+          ('/gm check run', 'build anything missing — audit shelves, pipeline books, pipeline tags — and sweep every channel’s permissions, repairing what it can; never moves or renames anything, and names what only you can grant. Surviving threads are adopted by id, never remade, so run it as often as you like, and after any update that adds a book. Trims the ledgers that only grow \u2014 /rp ownership past ninety days, the week\u2019s dice past fourteen \u2014 as every boot does (GM)'),
           ('/gm check status', 'which channels are set, which await; the last line\nsays whether the slash commands registered on this\nboot, and the Deploy mend says the same'),
           ('/gm bar', 'pin a GM toolbar in this channel: Plant target, Call\ncheck, Start fight, Status, Undo \u2014 each opens the box\nits command would (a target by name, DC and stats,\nscene, hits, who may swing; the check window; players\nand NPCs for a fight). Status is the channel at a\nglance: the fight and everyone\u2019s HP, the targets\nstanding, what waits on a GM. Undo is /gm undo'),
           ('/gm check restart', 'DELETE the whole setup and build it fresh — asks first, and the threads inside do not come back (GM)'),
@@ -1299,21 +1441,22 @@ PARTS['gmhp'] = [
           ('!rerolls @Players +1    !rerolls @Players -1', '')]),
 ('h2', GM + ' Rest Targeting'),
 ('code', [('lrest @Players   srest @Players   hpfull @Players   hphalf @Players', '')]),
-('h2', 'Restoring Resources (/gm heal)'),
-('code', [('/gm heal user:@Players', 'full HP \u2014 the default'),
-          ('/gm heal user:@Players restore:Everything', 'HP, rerolls and heal charges'),
-          ('/gm heal user:@Players amount:Half', 'restore half of maximum'),
-          ('/gm heal user:@Players amount:Add value:3', 'add 3, capped at max'),
-          ('/gm heal user:@Players amount:Exact value:1', 'set to an exact figure'),
-          ('/gm heal npc:Hollow', 'one NPC'),
-          ('/gm heal npc:all', 'every NPC at once')]),
+('h2', 'Restoring Resources (/existence heal)'),
+('p', 'Kill, revive and heal live under <b>/existence</b> since 15/10 \u2014 they used to sit under /gm, which was near Discord\u2019s 8000-character wall. Same options, same gates.'),
+('code', [('/existence heal user:@Players', 'full HP \u2014 the default'),
+          ('/existence heal user:@Players restore:Everything', 'HP, rerolls and heal charges'),
+          ('/existence heal user:@Players amount:Half', 'restore half of maximum'),
+          ('/existence heal user:@Players amount:Add value:3', 'add 3, capped at max'),
+          ('/existence heal user:@Players amount:Exact value:1', 'set to an exact figure'),
+          ('/existence heal npc:Hollow', 'one NPC'),
+          ('/existence heal npc:all', 'every NPC at once')]),
 ('p', 'One command for every restore. Works on a player or an NPC (or <b>all</b> NPCs), and HP changes '
       'sync straight into any active fight. NPCs only have HP; heal charges are skipped for anyone who '
       'isn\u2019t a White Knight with WIS 5+.'),
 ('p', '<b>global:</b> restores everyone at once instead of naming a target \u2014 <b>Players</b>, <b>NPCs</b>, '
       'or <b>Everyone</b> together. It takes the same <b>amount</b> and <b>restore</b> options as a single '
-      'target, so <b>/gm heal global:Everyone amount:Half</b> puts the whole server on half HP, and '
-      '<b>/gm heal global:Players restore:Everything</b> hands every character HP, rerolls and heal charges '
+      'target, so <b>/existence heal global:Everyone amount:Half</b> puts the whole server on half HP, and '
+      '<b>/existence heal global:Players restore:Everything</b> hands every character HP, rerolls and heal charges '
       'back. Pick exactly one of <b>user</b>, <b>npc</b> or <b>global</b>.'),
 ('note', 'Unlike scheduled recovery, a global heal does <b>not</b> skip players out on a quest. A '
          + GM + ' typing this has decided to heal the room, and a silent exclusion mid-session would be a '
@@ -1394,7 +1537,19 @@ PARTS['npcs'] = [
 ('code', [('/npc say name:Garrick speech:Fine steel, fair prices.', 'speech \u2014 in quote marks'),
           ('/npc say name:Garrick action:polishes a blade', 'action \u2014 italic emote'),
           ('/npc say name:Garrick action:polishes a blade\n  speech:Fine steel.', 'both, stacked'),
-          ('/npc say name:Garrick', 'opens a writing box')]),
+          ('/npc say name:Garrick', 'opens a writing box: action, speech, and a To picker'),
+          ('/npc say name:Garrick speech:Over here, @Aldric', '@Name in the text pings that person'),
+          ('/npc say name:Garrick speech:Mind the ropes. to:@Aldric', 'to: puts the mention first'),
+          ('/npc edit name:Garrick talk:Haggling', 'a Talk button under his lines starts that activity')]),
+('p', 'An NPC may call a player by name. The writing box has a <b>To</b> picker \u2014 up to three players, '
+      'mentioned first \u2014 and <b>@Aldric</b> written in the speech, in the box as well as on the command, becomes '
+      'a real mention by server nickname, display name or username, longest match first; <b>to:</b> does the same '
+      'from the command. Only <b>people</b> are ever pinged from an NPC\u2019s mouth: never a role, never everyone, '
+      'whatever is typed. Every line an NPC says carries an '
+      '<b>Interact</b> button \u2014 a player pressing it gets the roleplay box titled as a reply to that NPC, '
+      'a Game Master the speak-as box \u2014 and only the newest line in a channel keeps the button. Hang an '
+      'activity on an NPC with <b>talk:</b> and a <b>Talk</b> button sits beside it, starting that activity for '
+      'whoever pressed; the server\u2019s open/closed setting does not apply, since you chose to offer it.'),
 ('note', '<b>Works in threads and forum posts too.</b> A thread cannot own a webhook, so the NPC\u2019s voice is created on the parent channel instead and every message is routed back into the thread it was called from \u2014 several threads under one channel share the same NPC webhook.'),
 ('p', 'Posts as the NPC through their webhook \u2014 their name and avatar, no dice rolled. Fill '
       '<b>action</b>, <b>speech</b>, or both: the action is italicised and the speech is wrapped in quote '
@@ -1514,7 +1669,7 @@ PARTS['scrolls'] = [
 ('code', [('/dd message:\u2026 header:\u2026 user:@Players channels:#one #two', 'speak AS THE BOT \u2014 so a GM who also plays a character\nnever blurs the two. Plain words by default; a bold\nheader only if you write one; posted in every channel\nyou name, or here. Who said it goes to the roll-audit,\nnot the room (GM)')]),
 ('h2', 'Fixing What Was Said'),
 ('code', [('Edit (DDice)  \u2014 long-press a message \u2192 Apps', 'edit anything the bot posted \u2014 its own messages and NPC\nspeech from /npc say alike. The text opens prefilled,\nsave replaces it, and the roll-audit records what\nchanged (GM)'),
-          ('/edit [link:\u2026]', 'the same box without the Apps menu: a dropdown only\nyou see lists the last 25 lines the bot and its NPCs\nsaid here, newest first; pick one and the text opens\nprefilled. link: a message link or id goes straight\nto it. Nothing shows in the channel (GM)')]),
+          ('/edit [link:\u2026] [delete:true]', 'the same box without the Apps menu: a dropdown only\nyou see lists the last 25 lines the bot and its NPCs\nsaid here, newest first; pick one and the text opens\nprefilled; delete:true takes the picked line down\ninstead. link: a message link or id goes straight\nto it. Nothing shows in the channel. A player gets\nthe same for the lines they posted with /rp (GM)')]),
 ('p', 'Only messages the bot itself posted — its own, and NPC speech sent through <b>/npc say</b>. The roll audit records what changed. A line said through a webhook that has since been deleted cannot be edited by anyone — Discord ties the edit to the webhook — so the bot says so: delete it and have the NPC say it again.'),
 ]
 
@@ -1562,7 +1717,7 @@ PARTS['keeping'] = [
          'for Knightfall, the same two prefixed <b>DnD5e-</b> for 5e, and the two '
          '<b>DDice-Examples</b> books. A table is handed the set for the rules it plays by, and the Examples either way.'),
 ('h2', 'Updates and the Deploy Mend'),
-('p', 'Every deploy writes two dated threads into the <b>gm-updates</b> forum: <b>What’s new</b> — the one-line summary of each change first, then <b>In detail</b> beneath it: the line again, and under it what changed, why, what you do now and where it lands — and <b>Deploy mend</b>, what the boot built or repaired. The player half of the same news goes to the <b>updates</b> forum, and once a week so does the players’ <b>Weekly chronicle</b>: quests completed, titles granted, fights won, the fallen — nothing on a quiet week. Each thread is titled by its date, <i>[11/10/2026] [WEEK 41] Sunday 11th of October 2026 · What’s new</i>, so the newest sits at the top and the week is readable at a glance. The first boot with the forums in place posts the whole back-catalogue, oldest first, and clears the old update posts out of gm-quest-log. Discord orders a forum by when each thread was made, so the Deploy mend goes up last and a dated thread found out of turn is re-posted into order on the next boot — unless someone has written in it. The mend also keeps the NPC forum to one page per NPC: a duplicate page is folded back into the recorded one and counted in the Deploy mend, unless someone other than the bot has written in it, in which case it is named and left alone. A day with two deploys gets one What’s new: an entry that has grown since its thread was posted is deleted and posted again whole — or, if someone has written in the thread, kept and given the new lines beneath — and the Deploy mend says so.'),
+('p', 'Every deploy writes two dated threads into the <b>gm-updates</b> forum: <b>What’s new</b> — the one-line summary of each change first, then <b>In detail</b> beneath it: the line again, and under it what changed, why, what you do now and where it lands — and <b>Deploy mend</b>, what the boot built or repaired. The player half of the same news goes to the <b>updates</b> forum, and once a week so does the players’ <b>Weekly chronicle</b>: quests completed, titles granted, fights won, the fallen, and the dice of the week — natural 20s and 1s and who rolled them, the biggest d20 total — nothing on a quiet week. Each thread is titled by its date, <i>[11/10/2026] [WEEK 41] Sunday 11th of October 2026 · What’s new</i>, so the newest sits at the top and the week is readable at a glance. The first boot with the forums in place posts the whole back-catalogue, oldest first, and clears the old update posts out of gm-quest-log. Discord orders a forum by when each thread was made, so the Deploy mend goes up last and a dated thread found out of turn is re-posted into order on the next boot — unless someone has written in it. The mend also keeps the NPC forum to one page per NPC: a duplicate page is folded back into the recorded one and counted in the Deploy mend, unless someone other than the bot has written in it, in which case it is named and left alone. A day with two deploys gets one What’s new: an entry that has grown since its thread was posted is deleted and posted again whole — or, if someone has written in the thread, kept and given the new lines beneath — and the Deploy mend says so.'),
 ('h2', 'Checks and Reports'),
 ('code', [('/gm check roster busy:true', 'every player at a glance \u2014 HP, and whether a quest or a\nfight is holding them (red means the next rest will pass\nthem over); busy:true shows only those tied up (GM)'),
           ('/gm check usage', 'sixty days of command use, quietest first \u2014 a report\nonly; nothing is ever removed by it (GM)'),
@@ -1623,7 +1778,7 @@ PARTS['rules5e'] = [
           ('natural 1', 'always misses, whatever the total')]),
 ('p', 'Damage is the weapon\u2019s dice plus the ability modifier, and the card shows the working \u2014 <b>1d8 [5] +3</b> \u2014 so nobody has to take the total on trust. A weapon with no dice set swings 1d8.'),
 ('h2', 'Dying'),
-('p', 'At nought hit points a 5e character is dying, not dead. <b>/dnd deathsave</b> rolls a d20 \u2014 ten or better is a success, under ten a failure, a natural one counts as two failures, and a natural twenty is not a save at all \u2014 they come back on a single hit point. Three successes and they are stable; three failures and a GM records it with <b>/gm kill</b>, or a healer argues with it first.'),
+('p', 'At nought hit points a 5e character is dying, not dead. <b>/dnd deathsave</b> rolls a d20 \u2014 ten or better is a success, under ten a failure, a natural one counts as two failures, and a natural twenty is not a save at all \u2014 they come back on a single hit point. Three successes and they are stable; three failures and a GM records it with <b>/existence kill</b>, or a healer argues with it first.'),
 ('p', 'Any healing that lifts them above nought clears the tally, wherever it came from \u2014 a spell, a rest, or a GM\u2019s hand.'),
 ('h2', 'Saves, Skills and Initiative'),
 ('p', 'A saving throw or a skill check rides on <b>/roll</b>: <b>/roll save:dex</b> or <b>/roll skill:stealth</b>. The ability modifier is added, and your proficiency bonus on top when your class has that save or you have taken that skill \u2014 the card says so when it applies. All eighteen skills offer a dropdown as you type.'),
@@ -1984,7 +2139,7 @@ EXAMPLES = [
 
 ('sec', 'Fighting'),
 ('code', [('/fight start', 'Everyone rolls to see who goes first.'),
-          ('/fight atk stat:str target:@Artorius', 'You swing at Artorius using your strength.'),
+          ('/fight atk stat:str target:@Artorius', 'You swing at Artorius using your strength. A box asks what you do and say first \u2014 or type flavour: and it swings at once.'),
           ('/fight def stat:dex', 'You try to dodge, using how quick you are.'),
           ('/fight resolve', 'The bot compares the two rolls and says what happened.')]),
 ('p', 'If your attack roll shows a natural 1, the attack fails and your next defence is weaker \u2014 '
@@ -2068,7 +2223,8 @@ EXAMPLES = [
 
 ('sec', 'Fixing what was said'),
 ('code', [('(long-press a bot message \u2192 Apps \u2192 Edit (DDice))', 'The text opens already filled in. Fix the spelling, save. Works on NPC speech too.'),
-          ('/edit', 'The same from a private list: the last lines the bot and its NPCs said here. Pick one, fix it, save. The table sees only the corrected line.')]),
+          ('/edit', 'The same from a private list: the last lines the bot and its NPCs said here. Pick one, fix it, save. The table sees only the corrected line.'),
+          ('/edit delete:true', 'The list again; the pick comes down.')]),
 ('p', 'Only messages the bot itself posted. The roll-audit records what changed.'),
 
 ('aud', 'all'),

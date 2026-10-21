@@ -175,12 +175,25 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS undo_journal (
   actor TEXT, label TEXT NOT NULL, changes TEXT NOT NULL
 )`); } catch (e) { console.error('undo_journal schema', e); }
 
+// Lines players posted through /rp \u2014 whose each is, so they may fix or
+// take back their own through /edit (T, 2026-10-15).
+try { db.exec(`CREATE TABLE IF NOT EXISTS rp_lines (
+  guild_id TEXT NOT NULL, message_id TEXT NOT NULL, channel_id TEXT NOT NULL, user_id TEXT NOT NULL, at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, message_id)
+)`); } catch (e) { console.error('rp_lines schema', e); }
+
 // Who has pressed Ready on a run's ready check \u2014 one row per seat, the
 // card re-drawn on every press (T, 2026-10-14).
 try { db.exec(`CREATE TABLE IF NOT EXISTS quest_ready (
   guild_id TEXT NOT NULL, number INTEGER NOT NULL, user_id TEXT NOT NULL, at INTEGER NOT NULL,
   PRIMARY KEY (guild_id, number, user_id)
 )`); } catch (e) { console.error('quest_ready schema', e); }
+
+// Every player's d20, dated, for the chronicle's dice of the week \u2014 two
+// weeks kept, the tally table keeps the lifetime counts (T, 2026-10-15).
+try { db.exec(`CREATE TABLE IF NOT EXISTS week_dice (
+  guild_id TEXT NOT NULL, user_id TEXT NOT NULL, at INTEGER NOT NULL, nat INTEGER NOT NULL, total INTEGER
+)`); } catch (e) { console.error('week_dice schema', e); }
 
 // What the players' weekly chronicle tells that no other table dates:
 // a fight's victor (T, 2026-10-14). Quests, titles and the fallen are read
@@ -709,6 +722,37 @@ db.exec(`CREATE TABLE IF NOT EXISTS gm_profiles (
 // used to be interleaved above it, so on a fresh database an ALTER
 // could run before its own CREATE, fail silently into its catch, and
 // leave a column the code went on to query. probe.js found it.
+// One activity, one thread on the shelf; the head message carries the card.
+try { db.exec(`CREATE TABLE IF NOT EXISTS activity_pages (
+  guild_id TEXT NOT NULL, name TEXT NOT NULL,
+  thread_id TEXT, head_id TEXT, text_ids TEXT, file_id TEXT, at INTEGER,
+  PRIMARY KEY (guild_id, name)
+)`); } catch (e) { console.error('activity_pages schema', e); }
+// What happened in every run: starts, rolls, picks, endings, quits. Read
+// for the shelf's figures, the scores and the chronicle; trimmed at ninety days.
+try { db.exec(`CREATE TABLE IF NOT EXISTS story_run_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL, story TEXT NOT NULL, user_id TEXT NOT NULL, channel_id TEXT,
+  scene TEXT, kind TEXT NOT NULL, band TEXT, total INTEGER, score INTEGER,
+  at INTEGER NOT NULL, run_ms INTEGER
+)`); } catch (e) { console.error('story_run_log schema', e); }
+try { db.exec('CREATE INDEX IF NOT EXISTS story_run_log_story ON story_run_log (guild_id, story, at)'); } catch {}
+// `END once`: who has already been paid for an ending. Never pruned — that
+// is the point of it.
+try { db.exec(`CREATE TABLE IF NOT EXISTS story_claims (
+  guild_id TEXT NOT NULL, story TEXT NOT NULL, user_id TEXT NOT NULL, at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, story, user_id)
+)`); } catch (e) { console.error('story_claims schema', e); }
+// The guided writer's work in progress: one per GM per server.
+try { db.exec(`CREATE TABLE IF NOT EXISTS activity_drafts (
+  guild_id TEXT NOT NULL, user_id TEXT NOT NULL, name TEXT NOT NULL,
+  scenes TEXT NOT NULL DEFAULT '[]', pending TEXT NOT NULL DEFAULT '[]', at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, user_id)
+)`); } catch (e) { console.error('activity_drafts schema', e); }
+try { db.exec(`CREATE TABLE IF NOT EXISTS npc_lines (
+  guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT, at INTEGER,
+  PRIMARY KEY (guild_id, channel_id)
+)`); } catch (e) { console.error('npc_lines schema', e); }
 try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN rerolls_current INTEGER DEFAULT 0'); } catch {}
 // A temporary NPC is a real fighter in every way the engine cares about —
@@ -752,6 +796,7 @@ try { db.exec('ALTER TABLE fights ADD COLUMN def_sides INTEGER DEFAULT 20'); } c
 try { db.exec('ALTER TABLE fights ADD COLUMN auto_npc INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_rr_threshold INTEGER DEFAULT 8'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN fight_ping INTEGER DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN fight_nudge_min INTEGER'); } catch {}   // minutes before a quiet fight pings; NULL = 10, 0 = off
 try { db.exec('ALTER TABLE guild_config ADD COLUMN roll_audit_channel_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN signature_stat TEXT'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN class TEXT'); } catch {}
@@ -956,6 +1001,33 @@ try { db.exec('ALTER TABLE stories ADD COLUMN quiz_pass INTEGER'); } catch {}   
 try { db.exec('ALTER TABLE stories ADD COLUMN quiz_merit INTEGER'); } catch {}     // merits for passing
 try { db.exec('ALTER TABLE story_scenes ADD COLUMN qid INTEGER'); } catch {}       // which banked question this is
 try { db.exec('ALTER TABLE story_scenes ADD COLUMN explain TEXT'); } catch {}      // shown after the answer
+// ── Activities: the shelf, drafts, the ledger (2026-10-20) ───────────────────
+// A story keeps its script now. `source` is the live text, the rows under
+// story_scenes a cache of it; `draft_source` is what a GM is working on
+// (kept even when it does not parse, with its problems), `prev_source` the
+// version before, for Revert.
+try { db.exec('ALTER TABLE stories ADD COLUMN source TEXT'); } catch {}
+try { db.exec('ALTER TABLE stories ADD COLUMN draft_source TEXT'); } catch {}
+try { db.exec('ALTER TABLE stories ADD COLUMN draft_problems TEXT'); } catch {}   // JSON [{line,msg,fix}]
+try { db.exec('ALTER TABLE stories ADD COLUMN prev_source TEXT'); } catch {}
+try { db.exec('ALTER TABLE stories ADD COLUMN notes TEXT'); } catch {}            // JSON lint notes on the live script
+try { db.exec('ALTER TABLE stories ADD COLUMN published_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE stories ADD COLUMN cooldown TEXT'); } catch {}         // 'day' | 'week'  (ONCE per …)
+try { db.exec('ALTER TABLE stories ADD COLUMN available TEXT'); } catch {}        // 'fri,sat,sun'   (AVAILABLE …)
+try { db.exec('ALTER TABLE stories ADD COLUMN require_json TEXT'); } catch {}     // JSON [{title}|{cmp}]
+try { db.exec('ALTER TABLE stories ADD COLUMN retired INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN image TEXT'); } catch {}
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN logic TEXT'); } catch {}       // JSON {sets,unsets,ifs,nextmode,random,dcword}
+try { db.exec('ALTER TABLE story_scenes ADD COLUMN grants TEXT'); } catch {}      // JSON {title,heal,quest,once}
+try { db.exec('ALTER TABLE story_runs ADD COLUMN members TEXT'); } catch {}       // a party run: JSON [uid…]
+try { db.exec('ALTER TABLE story_runs ADD COLUMN turn INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE story_runs ADD COLUMN last_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE story_runs ADD COLUMN practice INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE story_runs ADD COLUMN started_by TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN activity_forum TEXT'); } catch {}      // the shelf
+try { db.exec('ALTER TABLE guild_config ADD COLUMN activity_board TEXT'); } catch {}      // the players' board channel
+try { db.exec('ALTER TABLE guild_config ADD COLUMN activity_board_msg TEXT'); } catch {}  // its pinned message
+try { db.exec('ALTER TABLE npcs ADD COLUMN talk_activity TEXT'); } catch {}               // Talk button → this activity
 try { db.exec('ALTER TABLE guild_config ADD COLUMN quiz_forum TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN npc_forum TEXT'); } catch {}
 try { db.exec('ALTER TABLE dc_cards ADD COLUMN s_mark TEXT'); } catch {}
@@ -1558,6 +1630,17 @@ function recordRoll(gid, opts) {
       for (const face of r.rolls) tallyRoll(gid, opts.userId, face, r.sides ?? 20);
     } else if (Number.isFinite(opts.nat)) {
       tallyRoll(gid, opts.userId, opts.nat, opts.sides ?? 20);
+    }
+    // The week's d20s, dated, for the players' chronicle: a player's own
+    // (a GM's hand on an NPC is the NPC's, `kind: 'npcs'`), one die or the
+    // chosen one of an advantage pair \u2014 never a 3d20 sum \u2014 with the
+    // total when the caller knows it (audit, 2026-10-15).
+    const sides = r?.sides ?? opts.sides ?? 20;
+    const single = !r || !Array.isArray(r.rolls) || r.rolls.length === 1 || r.chosen != null;
+    const nat = r && Array.isArray(r.rolls) && r.rolls.length ? (r.chosen ?? r.rolls[0]) : opts.nat;
+    if (sides === 20 && single && Number.isFinite(nat) && opts.kind !== 'npcs' && !opts.actor) {
+      const total = Number.isFinite(r?.total) ? r.total : Number.isFinite(opts.total) ? opts.total : null;
+      try { db.prepare('INSERT INTO week_dice (guild_id, user_id, at, nat, total) VALUES (?,?,?,?,?)').run(gid, opts.userId, Date.now(), nat, total); } catch {}
     }
   }
   mirrorRoll(gid, opts);
@@ -2332,6 +2415,17 @@ async function handleConfig(interaction, forced) {
     setConfig(gid, { fight_ping: v ? 1 : 0 });
     return interaction.reply({ content: v ? '🔔 Turn pings **on** — players get an @mention when it\'s their turn.' : '🔕 Turn pings **off**.' });
   }
+  if (sub === 'fightnudge') {
+    const v = interaction.options?.getInteger?.('minutes');
+    if (v === null) {
+      const cur = fightNudgeMinutes(gid);
+      return interaction.reply({ ephemeral: true, content: cur
+        ? `\u23F3 A quiet fight pings whoever it waits on after **${cur} minute${cur === 1 ? '' : 's'}**${getConfig(gid)?.fight_nudge_min == null ? ' (default)' : ''}. Set with \`/config mechanics fightnudge minutes:\` \u2014 0 turns it off.`
+        : '\u23F3 The quiet-fight nudge is **off**. `/config mechanics fightnudge minutes:10` turns it back on.' });
+    }
+    setConfig(gid, { fight_nudge_min: v });
+    return interaction.reply({ content: v ? `\u23F3 A quiet fight now pings after **${v} minute${v === 1 ? '' : 's'}**.` : '\u23F3 The quiet-fight nudge is **off** \u2014 a play-by-post table can take its time.' });
+  }
   if (sub === 'npcstats') {
     const v = interaction.options?.getBoolean?.('enabled');
     if (v === null) {
@@ -2737,6 +2831,50 @@ async function handleConfig(interaction, forced) {
     return;
   }
 
+  if (sub === 'activityshelf') {
+    if (interaction.options?.getBoolean?.('disable')) {
+      setConfig(gid, { activity_forum: null });
+      return interaction.reply({ content: '🎮 The shelf will no longer be kept. The threads already there stay where they are; the activities are untouched.' });
+    }
+    const channel = (forced?.channel ?? interaction.options?.getChannel?.('channel'));
+    if (!channel) {
+      const cur = getConfig(gid)?.activity_forum;
+      return interaction.reply({ ephemeral: true, content: cur
+        ? `🎮 The activity shelf is <#${cur}> — a thread per activity: its card, its script, a PDF, and the edit buttons.`
+        : '🎮 No shelf set. `/config channels activityshelf channel:#your-forum` gives every activity a thread to read and edit from.' });
+    }
+    if (channel.type !== 15) {
+      return interaction.reply({ ephemeral: true, content: `❌ <#${channel.id}> is not a forum channel. Make a **Forum** — each activity gets a thread there, tagged by what it is.` });
+    }
+    setConfig(gid, { activity_forum: channel.id });
+    await interaction.deferReply();
+    const made = await mendActivityPages(interaction.client, gid).catch(() => []);
+    return interaction.editReply({ content: `🎮 The shelf is <#${channel.id}> — a thread per activity, the demos as worked examples, GM eyes only (scripts hold the answers).`
+      + (made.length ? `\n${made.map(m => `• ${m}`).join('\n')}` : '') });
+  }
+  if (sub === 'activityboard') {
+    if (interaction.options?.getBoolean?.('disable')) {
+      const cfgB = getConfig(gid) || {};
+      if (cfgB.activity_board && cfgB.activity_board_msg) {
+        try { const ch = await interaction.client.channels.fetch(cfgB.activity_board); const m = await ch?.messages?.fetch(cfgB.activity_board_msg); await m?.delete(); } catch {}
+      }
+      setConfig(gid, { activity_board: null, activity_board_msg: null });
+      return interaction.reply({ content: '🎮 The board is down.' });
+    }
+    const channel = (forced?.channel ?? interaction.options?.getChannel?.('channel'));
+    if (!channel) {
+      const cur = getConfig(gid)?.activity_board;
+      return interaction.reply({ ephemeral: true, content: cur
+        ? `🎮 The activity board is pinned in <#${cur}>.`
+        : '🎮 No board set. `/config channels activityboard channel:#channel` pins a list of activities with Play buttons there.' });
+    }
+    if (!channel.isTextBased?.() || channel.type === 15) return interaction.reply({ content: MSG_PICK_TEXT, ephemeral: true });
+    setConfig(gid, { activity_board: channel.id, activity_board_msg: null });
+    await interaction.deferReply();
+    const msg = await redrawActivityBoard(interaction.client, gid).catch(() => null);
+    return interaction.editReply({ content: msg ? `🎮 The board is pinned in <#${channel.id}> — it redraws itself as activities are published and retired.` : `❌ I could not post in <#${channel.id}> — check my permissions there.` });
+  }
+
   if (sub === 'quizforum') {
     if (interaction.options?.getBoolean?.('disable')) {
       setConfig(gid, { quiz_forum: null });
@@ -3056,6 +3194,7 @@ async function handleConfig(interaction, forced) {
         : '🎮 Activities are **GM-led** — only a GM can start one. Open it up with `/config mechanics activities players:true`.' });
     }
     setConfig(gid, { activity_players: players ? 1 : 0 });
+    queueActivityBoard(gid);
     return interaction.reply({ content: players
       ? '🎮 Players can now start activities themselves. Writing and deleting them is still GM-only.'
       : '🎮 Activities are now **GM-led** — only a GM can start one.' });
@@ -4917,7 +5056,7 @@ async function handleMeritGive(interaction) {
   if (!mine) return interaction.reply({ content: MSG_NO_SHEET, ephemeral: true });
   // The fallen settle no debts. Receiving is allowed — an estate can still be
   // paid into — but a dead character cannot hand their merit away.
-  if (mine.died_at) return interaction.reply({ content: '🕯️ Your character has fallen and can no longer trade. A GM can bring them back with `/gm revive`.', ephemeral: true });
+  if (mine.died_at) return interaction.reply({ content: '🕯️ Your character has fallen and can no longer trade. A GM can bring them back with `/existence revive`.', ephemeral: true });
   if (!getChar(gid, to.id)) return interaction.reply({ content: `❌ **${await getDisplayName(interaction.guild, to.id)}** has no character sheet.`, ephemeral: true });
 
   // Checked now and again at approval — merit can be spent in between.
@@ -5518,7 +5657,7 @@ async function handleChar(interaction) {
       lines.push('', '🕊️ **Stable.** Still at nought, but no longer slipping away.');
     } else if (fail >= 3) {
       upsertChar(gid, callerId, { death_success: 0, death_fail: 0 });
-      lines.push('', '⚰️ **Three failures.** A GM records it with `/gm kill` — or a healer argues with it first.');
+      lines.push('', '⚰️ **Three failures.** A GM records it with `/existence kill` — or a healer argues with it first.');
     } else {
       upsertChar(gid, callerId, { death_success: succ, death_fail: fail });
     }
@@ -6292,8 +6431,8 @@ function deathGate(gid, id) {
   if (!subject?.died_at) return null;
   const fell = `<t:${Math.floor(Number(subject.died_at) / 1000)}:R>`;
   return isNpcFighter(id)
-    ? `🕯️ **${subject.name}** fell ${fell} and takes no further part. \`/gm revive npc:${subject.name}\` brings them back.`
-    : `🕯️ **${subject.displayName ?? 'That character'}** fell ${fell} and can no longer act. A GM can bring them back with \`/gm revive\`.`;
+    ? `🕯️ **${subject.name}** fell ${fell} and takes no further part. \`/existence revive npc:${subject.name}\` brings them back.`
+    : `🕯️ **${subject.displayName ?? 'That character'}** fell ${fell} and can no longer act. A GM can bring them back with \`/existence revive\`.`;
 }
 
 function isFallen(gid, id) {
@@ -6304,7 +6443,7 @@ function sheetGate(gid, uid) {
   const ch = getChar(gid, uid);
   if (!ch) return null;                            // "no sheet" handled by callers
   // The fallen take no more actions until a GM says otherwise.
-  if (ch.died_at) return '🕯️ Your character has fallen. A GM can bring them back with `/gm revive`.';
+  if (ch.died_at) return '🕯️ Your character has fallen. A GM can bring them back with `/existence revive`.';
   if (sheetApproved(gid, ch)) return null;         // single source of truth
   if (ch.approval_state === 'pending') return '⏳ Your character sheet is **awaiting GM approval** — you can\'t roll or fight until it\'s approved.';
   return '🚫 Your character sheet was **rejected** by a GM.'
@@ -6663,7 +6802,7 @@ async function ensureCharTags(forum) {
 // npcPageBody, edited in place forever after.
 function charPageBody(gid, ch, displayName) {
   const lines = [`📜 **${displayName}**${ch.order_name ? ` — ${KNIGHT_EMOJIS[ch.order_name] ?? ''} ${ch.order_name}` : ''}${ch.char_class ? ` · ${ch.char_class}` : ''}`];
-  if (isFallen(gid, ch.user_id)) lines.push(`⚰ **Fallen** — awaiting \`/gm revive\``);
+  if (isFallen(gid, ch.user_id)) lines.push(`⚰ **Fallen** — awaiting \`/existence revive\``);
   lines.push(`❤ HP **${ch.hp_current ?? 0}${ch.max_hp ? ` / ${ch.max_hp}` : ''}**`);
   const st = ['str','con','dex','wis','lck'].map(k => `${k.toUpperCase()} **${ch[k] ?? 0}**`).join(' · ');
   lines.push(st);
@@ -7620,6 +7759,9 @@ async function npcWebhookIn(channel, gid, npcName, imageUrl) {
       avatarURL: imageUrl ?? BLANK_AVATAR,
       ...(threadId ? { threadId } : {}),
     }),
+    // A line already posted can lose its buttons (the Interact row moves to
+    // the newest line); a thread's line needs the thread named on the edit.
+    edit: (messageId, payload) => client.editMessage(messageId, { ...payload, ...(threadId ? { threadId } : {}) }),
   });
 
   // 1 · the channel's shared hook, if we've already got one.
@@ -8244,14 +8386,101 @@ function noteNpcSpeech(gid, channel, npcName, said = '') {
   try { noteQuestActivity(gid, channel?.id, 'rp', beat); } catch {}
 }
 
-async function postAsNpc(channel, gid, npcName, content) {
+// ── NPC lines: who they may call, and the button under every one ─────────
+// `@Name` in an NPC's words becomes a real mention — by server nickname,
+// display name or username, longest match first — so the writing box can
+// address someone the way the slash popup can. Only people are ever pinged
+// from an NPC's mouth: never a role, never everyone (2026-10-20).
+async function resolveNameMentions(guild, text) {
+  let out = String(text || '');
+  const users = new Set([...out.matchAll(/<@!?(\d+)>/g)].map(m => m[1]));
+  if (!/(^|[^<\w])@[^\s@<>]/.test(out)) return { text: out, users: [...users] };
+  const re = /(^|[\s(“"'*_~>])@([^\s@<>,.!?;:)]+(?:[ \t][^\s@<>,.!?;:)]+){0,2})/g;
+  const cands = [...out.matchAll(re)].slice(0, 6);
+  const lookup = async (word) => {
+    const found = new Map();
+    const add = (mb) => { if (!mb || mb.user?.bot) return; for (const n of [mb.nickname, mb.displayName, mb.user?.globalName, mb.user?.username]) if (n) { const k = String(n).toLowerCase(); if (!found.has(k)) found.set(k, mb.id); } };
+    for (const mb of guild.members?.cache?.values?.() || []) add(mb);
+    if (typeof guild.members?.search === 'function') {
+      try { for (const mb of (await guild.members.search({ query: word, limit: 25 })).values()) add(mb); } catch {}
+    }
+    return found;
+  };
+  // Right to left, so earlier indexes stay valid as the text changes length.
+  for (const m of cands.reverse()) {
+    const words = m[2].split(/[ \t]/);
+    const found = await lookup(words[0].replace(/['\u2019"\u201d]s?$/, ''));
+    for (let n = words.length; n >= 1; n--) {
+      let tryName = words.slice(0, n).join(' ');
+      // A possessive or a closing quote on the last word is not part of the name.
+      tryName = tryName.replace(/(['\u2019]s|['\u2019"\u201d])$/, '');
+      const id = found.get(tryName.toLowerCase());
+      if (!id) continue;
+      const start = m.index + m[1].length, end = start + 1 + tryName.length;
+      out = out.slice(0, start) + `<@${id}>` + out.slice(end);
+      users.add(id);
+      break;
+    }
+  }
+  return { text: out, users: [...users] };
+}
+// A short key for an NPC, for button ids.
+function npcKey(name) {
+  return require('crypto').createHash('sha1').update(String(name).toLowerCase()).digest('hex').slice(0, 10);
+}
+function npcByKey(gid, key) {
+  return getAllNpcs(gid, { includeTemp: true }).find(n => npcKey(n.name) === key) || null;
+}
+// The row under an NPC's line: Interact for everyone (a player gets the
+// roleplay box addressed to the NPC, a GM the speak-as box), and Talk when
+// the NPC has an activity to offer.
+function npcInteractRow(gid, npc) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  const key = npcKey(npc.name);
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`npcx:${key}`).setLabel('🎭 Interact').setStyle(ButtonStyle.Secondary));
+  if (npc.talk_activity) row.addComponents(new ButtonBuilder().setCustomId(`npctalk:${key}`).setLabel(`💬 ${String(npc.talk_activity).slice(0, 60)}`).setStyle(ButtonStyle.Primary));
+  return row;
+}
+// Only the latest line in a channel carries the button: when the next one
+// posts, the one before loses its row.
+function noteNpcLine(gid, channel, messageId) {
+  try {
+    const prev = db.prepare('SELECT message_id FROM npc_lines WHERE guild_id=? AND channel_id=?').get(gid, channel.id)?.message_id || null;
+    db.prepare(`INSERT INTO npc_lines (guild_id, channel_id, message_id, at) VALUES (?,?,?,?)
+                ON CONFLICT(guild_id, channel_id) DO UPDATE SET message_id=excluded.message_id, at=excluded.at`).run(gid, channel.id, String(messageId), Date.now());
+    return prev;
+  } catch { return null; }
+}
+async function clearNpcLineButtons(channel, gid, npcName, messageId) {
+  if (!messageId) return;
+  try {
+    const hook = await npcWebhookIn(channel, gid, npcName, null);
+    if (hook?.edit) await hook.edit(messageId, { components: [] });
+  } catch {}
+}
+async function postAsNpc(channel, gid, npcName, content, { interact = false } = {}) {
   noteNpcSpeech(gid, channel, npcName, content);
   const npc = getNpc(gid, npcName);
+  const guild = channel.guild;
+  const resolved = guild ? await resolveNameMentions(guild, content).catch(() => ({ text: content, users: [] })) : { text: content, users: [] };
+  const payload = { content: resolved.text, allowedMentions: { parse: [], users: resolved.users.slice(0, 20) } };
+  const row = interact && npc ? npcInteractRow(gid, npc) : null;
+  const sendVia = async (hook) => {
+    if (row) {
+      try { return await hook.send({ ...payload, components: [row] }); }
+      catch (err) {
+        // A hook someone else made cannot carry buttons; the line still goes.
+        if (!/component|50006|owned|application/i.test(String(err?.message || ''))) throw err;
+      }
+    }
+    return hook.send(payload);
+  };
+  let sent = null;
   try {
     const face = npcFace(gid, npc);
     const webhookClient = await npcWebhookIn(channel, gid, npcName, face);
-    const sent = await webhookClient.send({ content, username: npcName, avatarURL: face ?? BLANK_AVATAR });
-    return sent ?? true;
+    sent = await sendVia(webhookClient);
   } catch (err) {
     // A stored webhook can be deleted server-side; drop it and retry once.
     console.error('postAsNpc webhook error:', err.message);
@@ -8259,14 +8488,65 @@ async function postAsNpc(channel, gid, npcName, content) {
       forgetChannelWebhook(gid, channel);
       const face2 = npcFace(gid, npc);
       const fresh = await npcWebhookIn(channel, gid, npcName, face2);
-      const sent2 = await fresh.send({ content, username: npcName, avatarURL: face2 ?? BLANK_AVATAR });
-      return sent2 ?? true;
+      sent = await sendVia(fresh);
     } catch (err2) {
       console.error('postAsNpc retry failed:', err2.message);
-      const plain = await channel.send(content).catch(()=>null);
-      return plain ?? false;
+      const plain = await channel.send({ ...payload, ...(row ? { components: [row] } : {}) }).catch(()=>null);
+      sent = plain;
     }
   }
+  if (sent?.id && row) {
+    const prev = noteNpcLine(gid, channel, sent.id);
+    if (prev && prev !== String(sent.id)) clearNpcLineButtons(channel, gid, npcName, prev).catch(() => {});
+  }
+  return sent ?? (sent === null ? false : true);
+}
+// The Interact button: a GM gets the speak-as box for that NPC, a player
+// the roleplay box titled as a reply to them.
+async function handleNpcInteractButton(interaction) {
+  const gid = interaction.guild.id;
+  const npc = npcByKey(gid, interaction.customId.split(':')[1]);
+  if (!npc) return interaction.reply({ content: '❌ That NPC is gone.', ephemeral: true });
+  if (await isGm(interaction.guild, interaction.user.id)) return interaction.showModal(npcSayModal(npc));
+  const m = rpModal();
+  m.setTitle(`Reply to ${npc.name}`.slice(0, 45));
+  return interaction.showModal(m);
+}
+// The Talk button: the NPC's activity, for whoever pressed. The GM chose
+// to hang it on the NPC, so the server's open/closed setting does not apply.
+async function handleNpcTalkButton(interaction) {
+  const gid = interaction.guild.id;
+  const npc = npcByKey(gid, interaction.customId.split(':')[1]);
+  if (!npc?.talk_activity) return interaction.reply({ content: '❌ That NPC has nothing to offer now.', ephemeral: true });
+  const story = getStory(gid, npc.talk_activity);
+  if (!story) return interaction.reply({ content: `❌ **${npc.name}**'s activity, **${npc.talk_activity}**, is gone.`, ephemeral: true });
+  return handleStory(interaction, { sub: 'run', name: story.name, viaButton: true });
+}
+// The speak-as box: action, speech, and a "To" picker of up to three
+// players, who are pinged first. Built in the label style discord.js 14.27
+// reads modals in (every field a label wrapping its component, nothing in
+// an action row) — `package.json` pins the floor at ^14.27.0 for it. The
+// other boxes keep the action-row style, which the library still takes;
+// this one is the only one that mixes a select into a modal.
+function npcSayModal(npc) {
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, LabelBuilder, UserSelectMenuBuilder } = require('discord.js');
+  const modal = new ModalBuilder()
+    .setCustomId(`npcsay:${npc.name}`.slice(0, 100))
+    .setTitle(`Speak as ${npc.name}`.slice(0, 45));
+  const actionInput = new TextInputBuilder()
+    .setCustomId('action').setPlaceholder('draws his blade').setStyle(TextInputStyle.Paragraph)
+    .setRequired(false).setMaxLength(900);
+  const speechInput = new TextInputBuilder()
+    .setCustomId('speech').setPlaceholder('Halt! Who goes there, @Aldric?').setStyle(TextInputStyle.Paragraph)
+    .setRequired(false).setMaxLength(900);
+  const toPicker = new UserSelectMenuBuilder()
+    .setCustomId('to').setPlaceholder('Pick who the NPC addresses').setMinValues(0).setMaxValues(3).setRequired(false);
+  modal.addLabelComponents(
+    new LabelBuilder().setLabel('Action (optional)').setTextInputComponent(actionInput),
+    new LabelBuilder().setLabel('Speech (optional)').setDescription('@Name in the words pings them too').setTextInputComponent(speechInput),
+    new LabelBuilder().setLabel('To (optional)').setDescription('They are mentioned first; only people are ever pinged').setUserSelectMenuComponent(toPicker),
+  );
+  return modal;
 }
 
 async function handleNpc(interaction) {
@@ -8469,6 +8749,16 @@ async function handleNpc(interaction) {
     // Mirrors the character rule: setting LCK sets the reroll pool.
     if (lck !== null) fields.rerolls_current = lck;
     if (order) fields.order_name = order;
+    // Talk: an activity hung on the NPC, started by a button under their lines.
+    const talk = interaction.options?.getString?.('talk');
+    if (talk != null) {
+      if (/^(none|clear|off|-)$/i.test(talk.trim())) fields.talk_activity = null;
+      else {
+        const st = isDraftName(talk.trim()) ? null : getStory(gid, talk.trim());
+        if (!st) return interaction.reply({ content: `❌ No activity called **${talk.trim()}** — \`/activity list\` shows what there is.`, ephemeral: true });
+        fields.talk_activity = st.name;
+      }
+    }
     upsertNpc(gid, name, fields);
     // And the White Knight gate mirrors too: order + WIS >= 5 grants the
     // server's heal charges under the fighter id; losing either zeroes
@@ -8894,35 +9184,19 @@ async function handlePr(interaction) {
     if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found. Create one with \`/npc create\`.`, ephemeral: true });
 
     // Nothing supplied → open a proper writing box with multi-line fields.
-    if (!action && !speech && !raw) {
-      const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
-      const modal = new ModalBuilder()
-        .setCustomId(`npcsay:${npc.name}`.slice(0, 100))
-        .setTitle(`Speak as ${npc.name}`.slice(0, 45));
-      const actionInput = new TextInputBuilder()
-        .setCustomId('action').setLabel('Action (optional)')
-        .setPlaceholder('draws his blade').setStyle(TextInputStyle.Paragraph)
-        .setRequired(false).setMaxLength(900);
-      const speechInput = new TextInputBuilder()
-        .setCustomId('speech').setLabel('Speech (optional)')
-        .setPlaceholder('Halt! Who goes there?').setStyle(TextInputStyle.Paragraph)
-        .setRequired(false).setMaxLength(900);
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(actionInput),
-        new ActionRowBuilder().addComponents(speechInput),
-      );
-      return interaction.showModal(modal);
-    }
+    if (!action && !speech && !raw) return interaction.showModal(npcSayModal(npc));
 
     const text = composeNpcSay({ action, speech, raw });
     if (!text) return interaction.reply({ content: '❌ Nothing to post.', ephemeral: true });
     if (text.length > 1800) return interaction.reply({ content: '❌ Message too long (max 1800 characters).', ephemeral: true });
 
-    const body = text;
+    // `to:` puts the mention first, unless the text already addresses them.
+    const to = interaction.options.getUser('to');
+    const body = to && !text.includes(`<@${to.id}>`) ? `<@${to.id}> ${text}` : text;
 
     const chan = await interactionChannel(interaction);
     if (!chan) return interaction.reply({ content: MSG_NO_ACCESS, ephemeral: true });
-    const said = await postAsNpc(chan, gid, npc.name, body);
+    const said = await postAsNpc(chan, gid, npc.name, body, { interact: true });
     if (!said) return interaction.reply({ content: `❌ I couldn't post in this channel — check my permissions here.`, ephemeral: true });
     mirrorNpcSay(gid, { gmId: interaction.user.id, npcName: npc.name, channelId: chan.id,
       messageId: said?.id ?? null, text: body });
@@ -9084,13 +9358,20 @@ async function handleNpcSayModal(interaction) {
 
   const action = interaction.fields.getTextInputValue('action');
   const speech = interaction.fields.getTextInputValue('speech');
-  const body = composeNpcSay({ action, speech });
+  let body = composeNpcSay({ action, speech });
   if (!body) return interaction.reply({ content: '❌ Both boxes were empty — nothing posted.', ephemeral: true });
+  // The To picker: those people are addressed first, unless the words
+  // already do it. Read loosely — a box opened before the deploy has no
+  // such field, and the library returns nothing rather than throwing.
+  let picked = [];
+  try { picked = [...(interaction.fields.getSelectedUsers?.('to', false)?.values?.() || [])].map(u => u.id); } catch { picked = []; }
+  const lead = picked.filter(id => !body.includes(`<@${id}>`)).map(id => `<@${id}>`).join(' ');
+  if (lead) body = `${lead} ${body}`;
   if (body.length > 1800) return interaction.reply({ content: '❌ Too long (max 1800 characters).', ephemeral: true });
 
   const chan = await interactionChannel(interaction);
   if (!chan) return interaction.reply({ content: MSG_NO_ACCESS, ephemeral: true });
-  const said = await postAsNpc(chan, gid, npc.name, body);
+  const said = await postAsNpc(chan, gid, npc.name, body, { interact: true });
   if (!said) return interaction.reply({ content: `❌ I couldn't post in this channel — check my permissions here.`, ephemeral: true });
   mirrorNpcSay(gid, { gmId: interaction.user.id, npcName: npc.name, channelId: chan.id,
     messageId: said?.id ?? null, text: body });
@@ -10641,6 +10922,57 @@ async function fightHpLine(guild, gid, cid, order) {
   return bits.length ? `\n\u2764\uFE0F ${bits.join(' \u00b7 ')}` : '';
 }
 
+// Initiative ties reroll among the tied (T, 2026-10-15: "whenever multiple
+// initiative rolls are the same end total have the bot reroll for those
+// players"). `inits` carry {id|fid, name, roll, dex, total}; fighters on one
+// total roll d20 + DEX again, only them, until apart \u2014 five rounds, then
+// the higher die as before. Their slots in the order stay where the shared
+// total put them; the reroll settles only who among them goes first.
+// Sorts `inits` in place and returns the lines that tell it.
+function settleInitiativeTies(inits, { gid, cid, nameOf }) {
+  const told = [];
+  const key = (x) => x.id ?? x.fid;
+  inits.sort((a, b) => b.total - a.total || b.roll - a.roll);
+  const rank = new Map();   // key -> [original total, then each reroll total]
+  for (const it of inits) rank.set(key(it), [it.total]);
+  // Everyone sharing a total rolls again; any who still share one roll
+  // again among themselves, round after round, five at most.
+  const settle = (pool, at, round) => {
+    if (pool.length < 2) return;
+    if (round > 5) {
+      // Five rounds level: the higher first die decides, and the card says so.
+      const byDie = [...pool].sort((a, b) => b.roll - a.roll);
+      told.push(`\u{1F501} still level after five rounds \u2014 the higher first die decides: ${byDie.map(it => `${nameOf(it)} [${it.roll}]`).join(' \u00b7 ')}`);
+      return;
+    }
+    const bits = pool.map(it => {
+      const r = rollDie(20), t = r + (it.dex ?? 0);
+      rank.get(key(it)).push(t);
+      try { mirrorAutoRoll(gid, cid, nameOf(it), '1d20', r, t, `initiative tie-break (round ${round})`); } catch {}
+      return { it, r, t };
+    });
+    const top = Math.max(...bits.map(b => b.t));
+    const leaders = bits.filter(b => b.t === top);
+    const names = pool.map(it => nameOf(it));
+    told.push(`\u{1F501} **Tie at ${at}** \u2014 ${names.length > 2 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : names.join(' and ')} reroll: `
+      + bits.map(b => `${nameOf(b.it)} \u{1F3B2} [${b.r}] + ${b.it.dex ?? 0} = ${b.t}`).join(' · ')
+      + (leaders.length === 1 ? ` → ${nameOf(leaders[0].it)} first` : ' → still tied'));
+    const byT = new Map();
+    for (const b of bits) { if (!byT.has(b.t)) byT.set(b.t, []); byT.get(b.t).push(b.it); }
+    for (const [t, grp] of byT) if (grp.length > 1) settle(grp, t, round + 1);
+  };
+  const groups = new Map();
+  for (const it of inits) { if (!groups.has(it.total)) groups.set(it.total, []); groups.get(it.total).push(it); }
+  for (const [total, tied] of groups) if (tied.length > 1) settle(tied, total, 1);
+  // Order: by the original total, then by each reroll round, then the first die.
+  inits.sort((a, b) => {
+    const ra = rank.get(key(a)), rb = rank.get(key(b));
+    for (let i = 0; i < Math.max(ra.length, rb.length); i++) { const d = (rb[i] ?? -1) - (ra[i] ?? -1); if (d) return d; }
+    return b.roll - a.roll;
+  });
+  return told;
+}
+
 async function announceNextTurn(guild, gid, cid, lines, order, index) {
   const nextF = await resolveFighter(guild, gid, order[index]);
   const autoOn = !!getFight(gid, cid)?.auto_npc;
@@ -11367,7 +11699,7 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     }
     recordRoll(gid, { userId: uid, channelId: cid, interaction, messageId: auditMsgId,
       kind: isNpcFighter(actorId) ? 'npcs' : null, card: auditCard,
-      input: `/fight atk stat:${stat}${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
+      input: `/fight atk stat:${stat}${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20, total,
       context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 attacks ${targetF.name}` : `fight · attacks ${targetF.name}` });
     // NPCs-only mode: the bot rolls the targeted NPC's defence and resolves.
     if (autoOn && targetF.isNpc) {
@@ -12429,8 +12761,8 @@ async function handleFight(interaction, forced) {
       initiatives.push({ id: fid, name: f.name, roll, dex, total, isNpc: f.isNpc });
     }
 
-    // Sort by total descending, ties broken by raw roll
-    initiatives.sort((a,b) => b.total - a.total || b.roll - a.roll);
+    // Sort by total descending; a shared total is rerolled among the tied.
+    const tieLines = settleInitiativeTies(initiatives, { gid, cid, nameOf: (it) => it.name });
 
     const turnOrder = initiatives.map(i => i.id);
     const npcCount = initiatives.filter(i => i.isNpc).length;
@@ -12440,8 +12772,12 @@ async function handleFight(interaction, forced) {
     initiatives.forEach((f,i) => {
       lines.push(`${i+1}. **${f.name}**${f.isNpc ? ' 🎭' : ''} — 🎲 [${f.roll}] + ⚡ ${f.dex} DEX = **${f.total} initiative**`);
     });
+    if (tieLines.length) lines.push('', ...tieLines);
     lines.push('');
     const first = initiatives[0];
+    // Tie lines can carry the card past Discord's 2000 characters; it is
+    // sent in pieces rather than lost (audit, 2026-10-15).
+    const startLong = tieLines.length > 0;
     lines.push(`🎯 **${first.name}** goes first!${turnPrompt(first)}${turnPing(gid, first)}`);
 
     upsertFight(gid, cid, {
@@ -12462,7 +12798,7 @@ async function handleFight(interaction, forced) {
       log_state: '{}',   // a new fight, a new recap
     });
 
-    return interaction.reply({ content: lines.join('\n') });
+    return startLong ? replyLong(interaction, lines) : interaction.reply({ content: lines.join('\n') });
   }
 
   // ── ADDNPC (add one or more GM NPCs to an active fight) ───────────────────
@@ -12767,12 +13103,12 @@ async function handleFight(interaction, forced) {
     }
 
     // Initiative for all
-    const inits = fighters.map(fid => ({ fid, roll: 0, total: 0 }));
+    const inits = fighters.map(fid => ({ fid, roll: 0, total: 0, dex: F[fid].stats.dex ?? 0 }));
     for (const it of inits) {
-      const r = rollDie(20); it.roll = r; it.total = r + (F[it.fid].stats.dex ?? 0);
+      const r = rollDie(20); it.roll = r; it.total = r + it.dex;
       mirrorAutoRoll(gid, cid, F[it.fid].name, '1d20', r, it.total, 'initiative (auto fight)');
     }
-    inits.sort((a,b) => b.total - a.total || b.roll - a.roll);
+    const tieLinesA = settleInitiativeTies(inits, { gid, cid, nameOf: (it) => F[it.fid].name });
     const order = inits.map(i => i.fid);
 
     // Live HP for each fighter (from their sheet's current HP)
@@ -12804,6 +13140,7 @@ async function handleFight(interaction, forced) {
       });
       const lines = [`⚔️ **${W.started} (NPCs auto-piloted)**`, ...(banner ? [banner] : []), '', '**Initiative:**'];
       inits.forEach((it,i)=>{ const f=F[it.fid]; lines.push(`${i+1}. **${f.name}${f.isNpc?' 🎭':''}** — 🎲 [${it.roll}] + ⚡ ${f.stats.dex} DEX = **${it.total}**`); });
+      if (tieLinesA.length) lines.push('', ...tieLinesA);
       const firstF = F[order[0]];
       lines.push('', firstF.isNpc
         ? `🤖 **${firstF.name}** is an NPC — the bot will take its turn automatically.`
@@ -12818,6 +13155,7 @@ async function handleFight(interaction, forced) {
     await interaction.reply({ content: `🎬 **Auto-resolving the ${W.noun}...**` });
     const lines0 = ['⚔️ **Initiative:**', ...(banner ? [banner] : [])];
     inits.forEach((it,i)=>{ const f=F[it.fid]; lines0.push(`${i+1}. **${f.name}${f.isNpc?' 🎭':''}** — 🎲 [${it.roll}] + ⚡ ${f.stats.dex} DEX = **${it.total}**`); });
+    if (tieLinesA.length) lines0.push('', ...tieLinesA);
     await sleep(800); await send(lines0.join('\n'));
 
     const alive = () => order.filter(fid => hp[fid] > floor);
@@ -13059,6 +13397,31 @@ async function handleFight(interaction, forced) {
     const targetNpc = interaction.options?.getString?.('target_npc');
     const flavour = forcedOf(forced, 'flavour') ?? interaction.options?.getString?.('flavour') ?? null;
     let mode = forcedOf(forced, 'mode') ?? interaction.options?.getString?.('roll') ?? 'normal';
+    // A typed command is one with no forced object behind it \u2014 a button,
+    // a picker and a form all carry one.
+    const typed = !(forced && typeof forced === 'object');
+    // What the swing would refuse, asked before the form so no words are
+    // lost to a refusal after it (audit, 2026-10-15): the weapon, the
+    // target's standing, a held captive.
+    const typedRefusal = (targetIdT) => {
+      const r = weaponStatRefusal(gid, pageSubject(gid, actorId), 'atk', stat);
+      if (r) return r;
+      const orderT = fightOrder(fight), hpT = fightHp(fight), floorT = fightFloor(fight);
+      if (!orderT.includes(targetIdT)) return '\u274C That target is not in this fight.';
+      if (targetIdT === actorId) return '\u274C You cannot target yourself.';
+      if (hpT[targetIdT] !== undefined && hpT[targetIdT] <= floorT) return floorT > 0 ? '\u274C That fighter has already yielded the bout.' : '\u274C That target is already down.';
+      if (grappleHolderOf(fight, targetIdT) === actorId) return '\u{1F93C} You are holding them \u2014 a grappler cannot strike their captive. Let go and swing again, or pick another target.';
+      return null;
+    };
+    // Typed with no stat: the same buttons the turn card carries, to you
+    // alone (T's table, 2026-10-15: "it's forcing me to roll with stat").
+    if (!stat) {
+      const gmapB = fightGrapples(fight);
+      const rowsFor = gmapB[actorId] ? ['escape', 'atk'] : Object.values(gmapB).includes(actorId) ? ['hold', 'atk'] : ['atk'];
+      const rows = npcActAs ? fightAnswerRows('atk', { forNpc: true, auto: false })
+        : rowsFor.flatMap(k => fightAnswerRows(k, { held: !!gmapB[actorId] })).slice(0, 5);
+      return interaction.reply({ ephemeral: true, content: '\u{1F3B2} Pick a stat to attack with:', components: rows });
+    }
     // A form's submit already knows its target.
     if (forcedOf(forced, 'targetId')) return await runFightAttack({ interaction, gid, cid, actorId, targetId: forced.targetId, stat, mode, flavour });
 
@@ -13071,14 +13434,16 @@ async function handleFight(interaction, forced) {
       const live = order.filter(fid => fid !== actorId && (hp[fid] ?? 0) > floor && !isFallen(gid, fid));
       if (!live.length) return interaction.reply({ content: '❌ Nobody left standing to attack.', ephemeral: true });
       if (live.length === 1) {
-        // One opponent: nothing to choose. A press goes straight to the
-        // form; a typed command is told whom it would have hit.
-        if (forcedOf(forced, 'fromButton'))
+        // One opponent: nothing to choose. A press, or a typed command with
+        // no flavour, goes straight to the form; typed with flavour swings
+        // (T's screenshot, 2026-10-15: the typed command used to refuse and
+        // name the only foe instead).
+        if (forcedOf(forced, 'fromButton') || (typed && !flavour)) {
+          const r = typed ? typedRefusal(live[0]) : null;
+          if (r) return interaction.reply({ content: r, ephemeral: true });
           return openFightRp(interaction, 'atk', { stat, targetId: live[0], npc: npcActAs || null, mode }, { title: `Attack \u2014 ${STAT_LABELS[stat] || stat}` });
-        const only = await resolveFighter(interaction.guild, gid, live[0]);
-        return interaction.reply({ ephemeral: true, content:
-          `❌ Say who you are attacking — there is only **${only.name}** left, so: \`/fight atk stat:${stat} `
-          + `${only.isNpc ? `target_npc:${only.name}` : `target:@${only.name}`}\`` });
+        }
+        return await runFightAttack({ interaction, gid, cid, actorId, targetId: live[0], stat, mode, flavour });
       }
       const { ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
       const opts = [];
@@ -13098,6 +13463,12 @@ async function handleFight(interaction, forced) {
     }
     if (targetUser && targetNpc) return interaction.reply({ content: '❌ Choose either a player target or an NPC target, not both.', ephemeral: true });
     const targetId = targetNpc ? npcFighterId(targetNpc) : targetUser.id;
+    // Typed with a target and no flavour: the form, as every button gives.
+    if (typed && !flavour) {
+      const r = typedRefusal(targetId);
+      if (r) return interaction.reply({ content: r, ephemeral: true });
+      return openFightRp(interaction, 'atk', { stat, targetId, npc: npcActAs || null, mode }, { title: `Attack \u2014 ${STAT_LABELS[stat] || stat}` });
+    }
     return await runFightAttack({ interaction, gid, cid, actorId, targetId, stat, mode, flavour });
   }
 
@@ -13131,12 +13502,26 @@ async function handleFight(interaction, forced) {
     }
 
     let stat = forcedStat ?? interaction.options?.getString?.('stat');
+    {
+      const typedD = !(forced && typeof forced === 'object');
+      const flavourD = forcedOf(forced, 'flavour') ?? interaction.options?.getString?.('flavour') ?? null;
+      // Typed with no stat: the defence buttons, to you alone.
+      if (!stat) return interaction.reply({ ephemeral: true, content: '\u{1F6E1}\uFE0F Pick a stat to defend with:',
+        components: fightAnswerRows('def', { forNpc: !!npcActAs, auto: false }) });
+      // Typed with no flavour: the form, as the button gives; the roll type
+      // rides along. The weapon's refusal comes first, so no words are lost.
+      if (typedD && !flavourD) {
+        const r = weaponStatRefusal(gid, pageSubject(gid, defenderId), 'def', stat);
+        if (r) return interaction.reply({ content: r, ephemeral: true });
+        return openFightRp(interaction, 'def', { stat, npc: npcActAs || null, mode: interaction.options?.getString?.('roll') ?? 'normal' }, { title: `Defend \u2014 ${STAT_LABELS[stat] || stat}` });
+      }
+    }
     const gmStatD = consumeGmStat(gid, cid, defenderId);
     let gmStatNoteD = '';
     if (gmStatD && gmStatD !== stat) { gmStatNoteD = ` \u2696\uFE0F stat set to ${STAT_LABELS[gmStatD]} by the GM`; stat = gmStatD; }
     else if (gmStatD) { gmStatNoteD = ` \u2696\uFE0F GM confirmed ${STAT_LABELS[gmStatD]}`; }
     const flavour = forcedOf(forced, 'flavour') ?? interaction.options?.getString?.('flavour') ?? null;
-    let mode = interaction.options?.getString?.('roll') ?? 'normal';
+    let mode = forcedOf(forced, 'mode') ?? interaction.options?.getString?.('roll') ?? 'normal';
 
     const defender = await resolveFighter(interaction.guild, gid, defenderId);
     {
@@ -13204,7 +13589,7 @@ async function handleFight(interaction, forced) {
     }
     recordRoll(gid, { userId: uid, channelId: cid, interaction, messageId: auditMsgId,
       kind: isNpcFighter(defenderId) ? 'npcs' : null, card: auditCard,
-      input: `/fight def stat:${stat}${isNpcFighter(defenderId) ? ` npc:${defender.name}` : ''}`, rollLine, nat, sides: 20,
+      input: `/fight def stat:${stat}${isNpcFighter(defenderId) ? ` npc:${defender.name}` : ''}`, rollLine, nat, sides: 20, total,
       context: isNpcFighter(defenderId) ? `fight · GM as ${defender.name} 🎭 defends` : 'fight · defends' });
     return;
   }
@@ -13482,14 +13867,36 @@ async function handleFight(interaction, forced) {
   if (sub === 'log') {
     const arch = getArchivedFight(gid, cid);
     if (!arch) return interaction.reply({ content: '📋 No finished fight recorded in this channel yet.', ephemeral: true });
+    // The parchment can take longer than Discord's three seconds: ack first.
+    const wantScroll = !!interaction.options?.getBoolean?.('scroll');
+    if (wantScroll) await interaction.deferReply();
     const log = JSON.parse(arch.log_state || '{}');
     const recap = await buildFightRecap(interaction.guild, gid, log);
-    if (!recap.length) return interaction.reply({ content: '📋 The last fight here ended before any exchanges were resolved.', ephemeral: true });
+    if (!recap.length) return wantScroll ? interaction.editReply({ content: '📋 The last fight here ended before any exchanges were resolved.' }) : interaction.reply({ content: '📋 The last fight here ended before any exchanges were resolved.', ephemeral: true });
     const archFloor = Number(arch.floor_hp ?? 0) > 0 ? Number(arch.floor_hp) : 0;
     // (recap already includes the roll tables and blow-by-blow)
     const lines = [`📜 **Last ${archFloor > 0 ? 'practice bout' : 'fight'} in this channel** — ended ${formatHistDate(arch.ended_at)}`,
                    ...(archFloor > 0 ? [`🏳️ Friendly sparring — fighters bowed out at ${archFloor} HP.`] : []),
                    ...recap.slice(1)];
+    // scroll:true \u2014 the same recap on parchment, for a fight outside a
+    // quest that would never get a story scroll (T, 2026-10-15).
+    if (wantScroll) {
+      if (!hasCanvas()) return interaction.editReply({ content: '\u274C The parchment needs the canvas module, which this bot has not got.' });
+      try {
+        let family; try { family = ensureScrollFont(gid) || 'standard'; } catch { family = 'standard'; }
+        const plain = (t) => String(t || '').replace(/<@[!&]?\d+>/g, 'someone').replace(/[*_`]+/g, '').replace(/[\p{Extended_Pictographic}\uFE0F]/gu, '').replace(/[ \t]+/g, ' ').trim();
+        const title = `${archFloor > 0 ? 'A practice bout' : 'A fight'} \u2014 ${dateLine(arch.ended_at).replace(/^\[[^\]]*\] \[[^\]]*\] /, '')}`;
+        const body = lines.slice(1).map(plain).join('\n').slice(0, 12000);
+        const stem = fileSlug(`fight ${dateLine(arch.ended_at).slice(1, 11).replace(/\//g, '-')}`, 'fight-recap');
+        const pdf = embedScrollData(renderScrollBook({ family, title, body }), { v: 1, kind: 'scroll', title, body, name: stem });
+        const { AttachmentBuilder } = require('discord.js');
+        return interaction.editReply({ content: `\u{1F4DC} **The last ${archFloor > 0 ? 'bout' : 'fight'} here, on parchment** \u2014 ended ${formatHistDate(arch.ended_at)}.`,
+          files: [new AttachmentBuilder(pdf, { name: `${stem}.pdf` })] });
+      } catch (err) {
+        console.error('[fight] log scroll -', err?.message || err);
+        return interaction.editReply({ content: `\u274C The scroll wouldn't take ink \u2014 ${String(err?.message || err).slice(0, 120)}` });
+      }
+    }
     return replyLong(interaction, lines);
   }
 
@@ -13803,6 +14210,21 @@ const QUARTER_MS = 15 * 60 * 1000;
 // the week it covers, posted whether or not anything is waiting, so a quiet
 // week still shows the bot looked. Called by the tick once a week and by the
 // first boot that has the forum (T, 2026-10-11).
+// The week in activities, for the digest: runs and finishes, the most
+// played, and every draft still waiting on a GM to fix or publish it.
+function activityDigestLines(gid) {
+  const since = Date.now() - 7 * 86400000;
+  const L = [];
+  try {
+    const starts = db.prepare(`SELECT COUNT(*) AS c FROM story_run_log WHERE guild_id=? AND at>=? AND kind='start'`).get(gid, since)?.c || 0;
+    const ends = db.prepare(`SELECT COUNT(*) AS c FROM story_run_log WHERE guild_id=? AND at>=? AND kind='end'`).get(gid, since)?.c || 0;
+    const top = db.prepare(`SELECT story, COUNT(*) AS c FROM story_run_log WHERE guild_id=? AND at>=? AND kind='start' GROUP BY story ORDER BY c DESC LIMIT 1`).get(gid, since);
+    if (starts) L.push(`\u{1F3AE} **Activities** \u2014 ${starts} run${starts === 1 ? '' : 's'}, ${ends} finished${top ? `; most played: **${top.story}** (${top.c})` : ''}`);
+  } catch {}
+  const drafts = listStories(gid).filter(st => st.draft_source && !st.retired);
+  if (drafts.length) L.push(`\u{1F4DD} **Drafts waiting:** ${drafts.map(st => { let n = 0; try { n = JSON.parse(st.draft_problems || '[]').length; } catch {} return `**${st.name}**${n ? ` (${n} problem${n === 1 ? '' : 's'})` : ' (ready to publish)'}`; }).join(', ')}`);
+  return L;
+}
 async function postWeeklyDigest(client, guild) {
   const gid = guild.id;
   const cfg = getConfig(gid) || {};
@@ -13810,9 +14232,11 @@ async function postWeeklyDigest(client, guild) {
   setConfig(gid, { gm_digest_at: Date.now() });
   const out = stalledReport(guild);
   const roles = getGmRoleIds(gid);
+  const acts = activityDigestLines(gid);
   return postDatedThread(client, cfg.gm_digest_forum, 'Weekly digest', mondayOf(Date.now()),
     ['\u{1F5DE}\uFE0F **Weekly digest \u2014 waiting on a GM** ' + roles.map(r => `<@&${r}>`).join(' '), '',
-     ...(out.length ? out : ['Nothing is waiting on a GM this week.'])],
+     ...(out.length ? out : ['Nothing is waiting on a GM this week.']),
+     ...(acts.length ? ['', ...acts] : [])],
     { allowedMentions: { roles } });
 }
 
@@ -13859,6 +14283,36 @@ async function weekTaleLines(guild, since) {
     for (const n of fallenNpcs.slice(0, 12)) out.push(`\u00b7 **${n.name}** \u{1F3AD}`);
     out.push('');
   }
+  // Dice of the week: the natural 20s and 1s and who rolled them, the
+  // biggest total \u2014 told only when the week had a story to tell; dice
+  // alone are not a chronicle (audit, 2026-10-15).
+  const story = out.length > 0;
+  const dice = story ? db.prepare('SELECT user_id, nat, total FROM week_dice WHERE guild_id=? AND at >= ?').all(gid, since) : [];
+  if (dice.length) {
+    const count = (n) => { const m = new Map(); for (const d of dice) if (d.nat === n) m.set(d.user_id, (m.get(d.user_id) || 0) + 1); return [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3); };
+    const twenties = count(20), ones = count(1);
+    const best = dice.filter(d => Number.isFinite(d.total)).sort((a, b) => b.total - a.total)[0];
+    const bits = [];
+    if (twenties.length) bits.push(`\u2728 natural 20s: ${(await Promise.all(twenties.map(async ([u, c]) => `**${await nameOf(u)}** \u00d7${c}`))).join(', ')}`);
+    if (ones.length) bits.push(`\u{1F4A5} natural 1s: ${(await Promise.all(ones.map(async ([u, c]) => `**${await nameOf(u)}** \u00d7${c}`))).join(', ')}`);
+    if (best) bits.push(`\u{1F3C6} biggest d20 total: **${best.total}** by **${await nameOf(best.user_id)}**`);
+    out.push(`\u{1F3B2} **Dice of the week** \u2014 ${dice.length} d20${dice.length === 1 ? '' : 's'} thrown`);
+    for (const b of bits) out.push(`\u00b7 ${b}`);
+    out.push('');
+  }
+  // The week's activities: how many played, and the best score — told, like
+  // the dice, only when the week had a story.
+  if (story) {
+    try {
+      const starts = db.prepare(`SELECT COUNT(*) AS c, COUNT(DISTINCT user_id) AS p FROM story_run_log WHERE guild_id=? AND at>=? AND kind='start'`).get(gid, since);
+      const best = db.prepare(`SELECT story, user_id, score FROM story_run_log WHERE guild_id=? AND at>=? AND kind='end' AND score IS NOT NULL ORDER BY score DESC LIMIT 1`).get(gid, since);
+      if (starts?.c) {
+        out.push(`\u{1F3AE} **Activities** \u2014 ${starts.c} run${starts.c === 1 ? '' : 's'} by ${starts.p} player${starts.p === 1 ? '' : 's'}`);
+        if (best) { const st = getStory(gid, best.story); out.push(`\u00b7 \u{1F3C6} best of the week: **${await nameOf(best.user_id)}** \u2014 ${best.score} ${st?.tally || 'points'} in **${best.story}**`); }
+        out.push('');
+      }
+    } catch {}
+  }
   while (out.length && out[out.length - 1] === '') out.pop();
   return out;
 }
@@ -13874,7 +14328,13 @@ async function postWeekTale(client, guild) {
     ['\u{1F4DC} **The week\u2019s chronicle**', '', ...body]);
 }
 
+let activityIdleAt = 0;
 async function questTick(client) {
+  // Activity runs nobody has touched for a week are put away, once an hour.
+  if (Date.now() - activityIdleAt > 3600000) {
+    activityIdleAt = Date.now();
+    try { await expireIdleRuns(client); } catch (e) { console.error('[activity] idle -', e?.message || e); }
+  }
   for (const guild of client.guilds.cache.values()) {
     try {
       const cfgT = getConfig(guild.id) || {};
@@ -13941,15 +14401,24 @@ function startQuestClock(client) {
   setInterval(() => questTick(client).catch(e => console.error('[quest] tick:', e?.message || e)), QUEST_TICK_MS);
   setInterval(() => fightIdleTick(client).catch(e => console.error('[fight] idle tick:', e?.message || e)), QUEST_TICK_MS);
 }
-// A fight quiet for ten minutes: the fighter whose turn it is gets one
-// ping (the GMs, for an NPC); nothing more until something happens.
-const FIGHT_IDLE_MS = 10 * 60 * 1000;
+// A quiet fight: the fighter whose turn it is gets one ping (the GMs, for
+// an NPC); nothing more until something happens.
+// How long a fight may sit quiet on this server before the nudge: the
+// configured minutes, ten by default, nought for never (T, 2026-10-15: a
+// play-by-post table would be nagged every turn).
+function fightNudgeMinutes(gid) {
+  const v = getConfig(gid)?.fight_nudge_min;
+  return v == null ? 10 : Math.max(0, Number(v) || 0);
+}
 async function fightIdleTick(client) {
   const now = Date.now();
   let rows = [];
-  try { rows = db.prepare("SELECT guild_id, channel_id, turn_order, turn_index, phase, current_target FROM fights WHERE state='active' AND COALESCE(nudged,0)=0 AND last_at IS NOT NULL AND last_at < ?").all(now - FIGHT_IDLE_MS); } catch { return; }
+  try { rows = db.prepare("SELECT guild_id, channel_id, turn_order, turn_index, phase, current_target, last_at FROM fights WHERE state='active' AND COALESCE(nudged,0)=0 AND last_at IS NOT NULL").all(); } catch { return; }
   for (const f of rows) {
     const gid = f.guild_id, cid = f.channel_id;
+    // Each server's own patience: ten minutes unless set, never when nought.
+    const mins = fightNudgeMinutes(gid);
+    if (!mins || now - Number(f.last_at) < mins * 60 * 1000) continue;
     db.prepare('UPDATE fights SET nudged=1 WHERE guild_id=? AND channel_id=?').run(gid, cid);
     const guild = client.guilds.cache.get(gid) || await client.guilds.fetch(gid).catch(() => null);
     const ch = await client.channels.fetch(cid).catch(() => null);
@@ -13960,7 +14429,7 @@ async function fightIdleTick(client) {
     const who = await resolveFighter(guild, gid, waitingOn).catch(() => null);
     if (!who) continue;
     const ping = who.isNpc ? (getConfig(gid)?.gm_role_id ? ` <@&${getConfig(gid).gm_role_id}>` : '') : ` <@${who.id}>`;
-    await ch.send({ content: `\u23F3 Ten minutes quiet \u2014 **${who.name}${who.isNpc ? ' \u{1F3AD}' : ''}** is ${f.phase === 'defend' ? 'defending' : 'up to attack'}.${ping}`,
+    await ch.send({ content: `\u23F3 ${mins} minute${mins === 1 ? '' : 's'} quiet \u2014 **${who.name}${who.isNpc ? ' \u{1F3AD}' : ''}** is ${f.phase === 'defend' ? 'defending' : 'up to attack'}.${ping}`,
       allowedMentions: who.isNpc ? { roles: getConfig(gid)?.gm_role_id ? [getConfig(gid).gm_role_id] : [] } : { users: [who.id] } }).catch(() => {});
   }
 }
@@ -15481,7 +15950,7 @@ async function handleQuest(interaction, forced) {
     // Withdrawing is always allowed — a fallen character should still be able to
     // come off a roster. Signing up for new work is not.
     if (sub === 'apply' && isFallen(gid, uid))
-      return interaction.reply({ content: '🕯️ Your character has fallen and cannot take on new work. A GM can bring them back with `/gm revive`.', ephemeral: true });
+      return interaction.reply({ content: '🕯️ Your character has fallen and cannot take on new work. A GM can bring them back with `/existence revive`.', ephemeral: true });
     const res = sub === 'apply' ? await questApply(interaction.guild, quest, uid) : await questWithdraw(interaction.guild, quest, uid);
     if (res.error) return interaction.reply({ content: res.error, ephemeral: true });
     await refreshQuestPost(interaction.client, interaction.guild, getQuest(gid, number));
@@ -15650,7 +16119,7 @@ async function handleQuest(interaction, forced) {
     // A GM can still do it — but knowingly, not by forgetting.
     if (isFallen(gid, target.id) && !force) {
       return interaction.reply({ ephemeral: true, content:
-        `🕯️ **${await getDisplayName(interaction.guild, target.id)}** has fallen. Bring them back with \`/gm revive\`, or re-run with \`force:true\` if they are joining as a ghost.` });
+        `🕯️ **${await getDisplayName(interaction.guild, target.id)}** has fallen. Bring them back with \`/existence revive\`, or re-run with \`force:true\` if they are joining as a ghost.` });
     }
     if (quest.party_size && quest.party_hard && party.length >= quest.party_size && !force) {
       return interaction.reply({ content: `❌ Party is at the hard cap (${quest.party_size}). Re-run with \`force:true\` to seat them anyway.` });
@@ -15802,7 +16271,7 @@ async function handleQuest(interaction, forced) {
   }
 
   if (sub === 'start') {
-    const quest = await requireQuest(interaction, gid);
+    const quest = await requireQuest(interaction, gid, (forced && typeof forced === 'object') ? forced.number : null);
     if (!quest) return;
     const number = quest.number;
     // Under spin-off, a board listing never starts ITSELF — starting it IS
@@ -16480,7 +16949,8 @@ function getStory(gid, name) {
   return db.prepare('SELECT * FROM stories WHERE guild_id=? AND name=? COLLATE NOCASE').get(gid, name);
 }
 function listStories(gid) {
-  return db.prepare('SELECT * FROM stories WHERE guild_id=? ORDER BY name').all(gid);
+  // Drafts live under a reserved name beside their activity; nobody lists them.
+  return db.prepare("SELECT * FROM stories WHERE guild_id=? AND name NOT LIKE '.draft.%' ORDER BY name").all(gid);
 }
 function getScene(gid, story, scene) {
   return db.prepare('SELECT * FROM story_scenes WHERE guild_id=? AND story=? COLLATE NOCASE AND scene=? COLLATE NOCASE').get(gid, story, scene);
@@ -16501,8 +16971,8 @@ function setRun(gid, cid, uid, fields) {
       .run(gid, cid, uid, fields.story ?? '', fields.scene ?? '');
   }
   const keys = Object.keys(fields || {});
-  if (keys.length) db.prepare(`UPDATE story_runs SET ${keys.map(k => `${k}=?`).join(',')} WHERE guild_id=? AND channel_id=? AND user_id=?`)
-    .run(...keys.map(k => fields[k]), gid, cid, uid);
+  if (keys.length) db.prepare(`UPDATE story_runs SET ${keys.map(k => `${k}=?`).join(',')}, last_at=? WHERE guild_id=? AND channel_id=? AND user_id=?`)
+    .run(...keys.map(k => fields[k]), Date.now(), gid, cid, uid);
   return getRun(gid, cid, uid);
 }
 // Claim a run before acting on it. Two clicks land as two separate handler
@@ -16533,20 +17003,301 @@ function runsIn(gid, cid) {
   return db.prepare('SELECT * FROM story_runs WHERE guild_id=? AND channel_id=?').all(gid, cid);
 }
 
-// Parse a pasted activity script. Returns { name, start, tally, scenes[] }
-// or { error }. The format grew out of a fishing loop, so it has to express:
-// difficulty classes, ranges on the natural die, a random pick between flavour
-// lines, a run of descending rolls, natural-20/1 overrides, plain button
-// choices with no roll at all, and a tally that accumulates across a loop and
-// cashes out at the end.
-// Parse + validate + store in one motion; every authoring route — chat
-// paste, /activity create modal, or an attached .txt — lands here.
-function storeActivityScript(gid, uid, text) {
-  const parsed = parseStoryScript(text);
-  if (parsed.error) return { error: parsed.error };
-  const count = saveStory(gid, uid, parsed);
-  return { name: parsed.name, saved: [`🎮 **${parsed.name}** saved — **${count}** scene${count === 1 ? '' : 's'}, starting at \`${parsed.start}\`.`,
-    `Run it with \`/activity run name:${parsed.name}\`, or read it back with \`/activity show name:${parsed.name}\`.`].join('\n') };
+// ── Scripts kept: source, drafts, publishing ───────────────────────────────
+// Since 2026-10-20 the script is the truth and the rows are its cache. A
+// draft that is still being written lives beside the live version, under
+// a reserved name nobody can type, so a GM can practise it before it goes
+// live and a player's run is never pulled from under them.
+const DRAFT_PREFIX = '.draft.';
+const draftName = (name) => DRAFT_PREFIX + name;
+const isDraftName = (name) => String(name || '').startsWith(DRAFT_PREFIX);
+const liveName = (name) => isDraftName(name) ? String(name).slice(DRAFT_PREFIX.length) : name;
+
+// One scene back into script text — canonical grammar, so an activity
+// written before scripts were kept can still be handed over and edited.
+function sceneToText(sc, story = null) {
+  const J = (v, d) => { try { return v == null ? d : (typeof v === 'string' ? JSON.parse(v) : v); } catch { return d; } };
+  const L = [`SCENE ${sc.scene}`];
+  if (sc.npc) L.push(`AS ${sc.npc}`);
+  if (sc.image) L.push(`IMAGE ${sc.image}`);
+  for (const part of String(sc.say || '').split('\n')) if (part.trim()) L.push(`SAY ${part}`);
+  const logic = J(sc.logic, {});
+  for (const f of logic.sets || []) L.push(`SET ${f}`);
+  for (const f of logic.unsets || []) L.push(`UNSET ${f}`);
+  for (const x of logic.ifs || []) L.push(`IF ${describeCondition(x).replace(/^title /, 'title:')} -> ${x.next}`);
+  if (logic.nextmode) L.push(`NEXT ${logic.nextmode}`);
+  if (logic.random?.length) L.push(`RANDOM -> ${logic.random.join('|')}`);
+  if (sc.gain) L.push(`GAIN ${story?.tally || 'tally'} ${sc.gain}`);
+  if (sc.qid) L.push(`QID ${sc.qid}`);
+  if (sc.explain) L.push(`EXPLAIN ${sc.explain}`);
+  const gauntlet = J(sc.gauntlet, null);
+  if (gauntlet?.length) {
+    const same = gauntlet.every(g => g.stats === gauntlet[0].stats);
+    L.push(same ? `GAUNTLET ${gauntlet[0].stats} ${gauntlet.map(g => g.dc).join(' ')}` : `GAUNTLET ${gauntlet.map(g => `${g.dc}:${g.stats}`).join(' ')}`);
+  } else if (sc.roll) {
+    L.push(`ROLL ${sc.roll}${logic.dcword ? ` DC ${logic.dcword}` : sc.dc ? ` DC${sc.dc}` : ''}`);
+  }
+  const nat20 = J(sc.nat20, null), nat1 = J(sc.nat1, null);
+  if (nat20) L.push(`  NAT20 ${nat20.text || ''} -> ${nat20.next}`.replace(/\s+->/, ' ->'));
+  if (nat1) L.push(`  NAT1 ${nat1.text || ''} -> ${nat1.next}`.replace(/\s+->/, ' ->'));
+  for (const r of J(sc.ranges, [])) L.push(`  ${r.lo}${r.hi >= 9999 ? '+' : `-${r.hi}`} ${r.text || ''} -> ${r.next}`.replace(/\s+->/, ' ->'));
+  for (const [band, o] of Object.entries(J(sc.outcomes, {}))) {
+    if (o.variants?.length) {
+      L.push(`  ${band} ONE OF`);
+      for (const v of o.variants) L.push(`    ${v}`);
+      if (o.next) L.push(`  ${band} -> ${o.next}`);
+    } else if (o.next) {
+      L.push(`  ${band} ${o.text || ''} -> ${o.next}`.replace(/\s+->/, ' ->'));
+    }
+  }
+  const choices = J(sc.choices, []);
+  if (choices.length) {
+    L.push('CHOICE');
+    for (const c of choices) L.push(`  ${c.correct ? '* ' : ''}${c.label} -> ${c.next}`);
+  }
+  if (sc.ask) {
+    L.push('ASK');
+    const answers = J(sc.answers, []);
+    if (answers.length) L.push(`ANSWER ${answers.join(' | ')}`);
+    if (sc.hint) L.push(`HINT ${sc.hint}`);
+    if (sc.right_to) L.push(`RIGHT -> ${sc.right_to}`);
+    if (sc.wrong_to) L.push(`WRONG -> ${sc.wrong_to}`);
+  }
+  if (sc.ending) {
+    const g = J(sc.grants, {});
+    const bits = ['END'];
+    if (sc.cash_tally) bits.push('TALLY');
+    if (sc.merits) bits.push(`merits:${sc.merits}`);
+    if (g.heal) bits.push(`heal:${g.heal}`);
+    if (g.once) bits.push('once');
+    if (g.title) bits.push(`title:${g.title}`);
+    if (g.quest) bits.push(`quest:${g.quest}`);
+    if (sc.rewards) bits.push(`rewards:${sc.rewards}`);
+    L.push(bits.join(' '));
+  }
+  return L.join('\n');
+}
+function storyToText(story, scenes) {
+  const J = (v, d) => { try { return v == null ? d : JSON.parse(v); } catch { return d; } };
+  const L = [`[ACTIVITY] ${liveName(story.name)}`];
+  if (story.tally) L.push(`TALLY ${story.tally}`);
+  if (story.quiz_mode) L.push(`QUIZ ${story.quiz_mode}`);
+  if (story.cooldown) L.push(`ONCE per ${story.cooldown}`);
+  if (story.available) L.push(`AVAILABLE ${String(story.available).split(',').map(d => d[0].toUpperCase() + d.slice(1)).join(',')}`);
+  for (const r of J(story.require_json, [])) L.push(`REQUIRE ${r.title ? `title:${r.title}` : `${r.cmp.what}${r.cmp.op}${r.cmp.n}`}`);
+  L.push('');
+  for (const sc of scenes) { L.push(sceneToText(sc, story)); L.push(''); }
+  return L.join('\n').trim() + '\n';
+}
+// The live script of an activity: what was kept, or what the rows say.
+function sourceOf(gid, name) {
+  const story = getStory(gid, name);
+  if (!story) return null;
+  if (story.source) return story.source;
+  const scenes = listScenes(gid, story.name);
+  return scenes.length ? storyToText(story, scenes) : null;
+}
+// Where a scene's block sits in a script: from its SCENE line to the line
+// before the next SCENE (blank lines between belong to the block).
+function sceneBlockRange(source, sceneName) {
+  const lines = String(source || '').split(/\r?\n/);
+  const re = new RegExp(`^\\s*SCENE\\s+${sceneName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i');
+  const start = lines.findIndex(l => re.test(l));
+  if (start === -1) return null;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) if (/^\s*SCENE\s+\S+/i.test(lines[i])) { end = i; break; }
+  while (end > start + 1 && !lines[end - 1].trim()) end--;
+  return { lines, start, end };
+}
+function sceneBlockText(source, sceneName) {
+  const r = sceneBlockRange(source, sceneName);
+  return r ? r.lines.slice(r.start, r.end).join('\n') : null;
+}
+function replaceSceneBlock(source, sceneName, block) {
+  const r = sceneBlockRange(source, sceneName);
+  const body = String(block || '').replace(/\s+$/, '');
+  if (!r) return String(source || '').replace(/\s+$/, '') + '\n\n' + body + '\n';
+  return [...r.lines.slice(0, r.start), body, ...r.lines.slice(r.end)].join('\n');
+}
+
+// ── DC by intent, and the odds for this table ───────────────────────────
+// A scene's roll is d20 + the best of the stats it offers. For every sheet
+// on the server, 11 + that stat is what an average roll reaches.
+function tableRollBase(gid, stats) {
+  const keys = String(stats || '').split('|').map(resolveStatWord).filter(Boolean);
+  if (!keys.length) return [];
+  let sheets = [];
+  try { sheets = allChars(gid); } catch { return []; }
+  return sheets.map(ch => 11 + Math.max(...keys.map(k => Number(ch[k]) || 0)));
+}
+// easy → three in four pass on an average roll; normal → half; hard → one in four.
+function dcFor(gid, stats, word) {
+  const base = tableRollBase(gid, stats).sort((a, b) => a - b);
+  if (!base.length) return STORY_DC_WORDS[word] ?? 13;
+  const at = (q) => base[Math.min(base.length - 1, Math.floor(q * base.length))];
+  const dc = word === 'easy' ? at(0.25) : word === 'hard' ? at(0.75) : at(0.5);
+  return Math.max(5, Math.min(25, dc));
+}
+// "4 of 9 sheets pass on an average roll (54% overall)".
+function passOdds(gid, stats, dc) {
+  const keys = String(stats || '').split('|').map(resolveStatWord).filter(Boolean);
+  if (!keys.length || !dc) return null;
+  let sheets = [];
+  try { sheets = allChars(gid); } catch { return null; }
+  if (!sheets.length) return null;
+  let pass = 0, pct = 0;
+  for (const ch of sheets) {
+    const mod = Math.max(...keys.map(k => Number(ch[k]) || 0));
+    if (11 + mod >= dc) pass++;
+    pct += Math.max(0, Math.min(1, (21 - (dc - mod)) / 20));
+  }
+  return { pass, of: sheets.length, pct: Math.round((pct / sheets.length) * 100) };
+}
+const oddsLine = (o) => o ? `${o.pass} of ${o.of} sheet${o.of === 1 ? '' : 's'} pass on an average roll · ${o.pct}% overall` : null;
+
+// ── QUIZ FROM: questions drawn from the bank at save time ───────────────
+// `QUIZ FROM lore 5 -> done` inside a scene turns that scene into the way
+// in (its narration, then a Begin button) and writes the five questions
+// as scenes after it, the last pointing at `done`. `any` draws from the
+// whole bank. Re-publish to draw again.
+function expandQuizFrom(gid, text) {
+  const lines = String(text || '').split(/\r?\n/);
+  const out = [], tail = [], problems = [];
+  let scene = null, pending = null;
+  const closeScene = () => {
+    if (!pending) return;
+    out.push('CHOICE', `  Begin -> q${pending.rows[0].id}`);
+    pending.rows.forEach((row, i) => {
+      const next = i + 1 < pending.rows.length ? `q${pending.rows[i + 1].id}` : pending.next;
+      const answers = JSON.parse(row.answers || '[]');
+      tail.push('', `SCENE q${row.id}`, `SAY · **Question ${i + 1} of ${pending.rows.length}**`);
+      for (const part of String(row.question).split('\n')) tail.push(`SAY ${part}`);
+      tail.push(`QID ${row.id}`);
+      if (row.explain) tail.push(`EXPLAIN ${row.explain}`);
+      if (answers.length <= 1) {
+        tail.push('ASK');
+        if (answers[0]?.text) tail.push(`ANSWER ${answers[0].text}`);
+        tail.push(`RIGHT -> ${next}`, `WRONG -> ${next}`);
+      } else {
+        tail.push('CHOICE');
+        for (const a of shuffled(answers)) tail.push(`  ${a.correct ? '* ' : ''}${String(a.text).replace(/\s*->\s*/g, ' → ')} -> ${next}`);
+      }
+    });
+    pending = null;
+  };
+  lines.forEach((raw, i) => {
+    const line = raw.trim();
+    let m;
+    if ((m = line.match(/^SCENE\s+(\S+)/i))) { closeScene(); scene = m[1]; out.push(raw); return; }
+    if (scene && (m = line.match(/^QUIZ\s+FROM\s+(\S+)\s+(\d+)\s*->\s*(\S+)\s*$/i))) {
+      const category = m[1].toLowerCase() === 'any' ? null : m[1];
+      const count = Math.max(1, Math.min(25, parseInt(m[2])));
+      const rows = drawQuizQuestions(gid, null, { category, count, pool: 'any' });
+      if (!rows.length) { problems.push({ line: i + 1, msg: `\`${line}\` — nothing in the bank${category ? ` under **${category}**` : ''}.`, fix: '`/quiz add` some first, or check `/quiz list`.' }); return; }
+      pending = { rows, next: m[3] };
+      return;
+    }
+    if (scene && /^QUIZ\s+FROM\b/i.test(line)) { problems.push({ line: i + 1, msg: `\`${line}\` — write it as \`QUIZ FROM category 5 -> next_scene\`.`, fix: '`QUIZ FROM any 3 -> done`' }); return; }
+    out.push(raw);
+  });
+  closeScene();
+  return { text: [...out, ...tail].join('\n'), problems };
+}
+
+// ── Save ─────────────────────────────────────────────────────────────────
+// Every authoring route lands here: paste, the box, a .txt, a PDF, the
+// scene box on the shelf, the writer, a post in the thread. A script that
+// parses goes live at once — unless someone is mid-run in it, when it waits
+// as a draft; one that does not parse is kept as a draft with its problems,
+// so nothing typed is ever lost. `publish: 'draft'` holds a good script
+// back on purpose, to practise first.
+function saveActivity(gid, uid, text, { publish = 'auto', via = 'paste' } = {}) {
+  const raw = String(text || '').replace(/^\s*```[a-z]*\s*\n?|\n?```\s*$/g, '').trim();
+  const expanded = expandQuizFrom(gid, raw);
+  const parsed = parseStoryScript(expanded.text, { gid });
+  if (expanded.problems.length) { parsed.problems = [...expanded.problems, ...(parsed.problems || [])]; parsed.error = problemsText(parsed.problems); }
+  // Draw the DCs that were written by intent from this table's sheets.
+  for (const sc of parsed.scenes || []) if (sc.dcword) sc.dc = dcFor(gid, sc.roll, sc.dcword);
+  const name = parsed.name;
+  if (!name) return { error: parsed.error || 'No `[ACTIVITY] Name` line found.' };
+  const existing = getStory(gid, name);
+  const out = { name, problems: parsed.problems || [], notes: parsed.notes || [] };
+
+  if (parsed.problems?.length) {
+    // Kept as a draft, problems and all. A story that never went live still
+    // gets its row so the shelf can show it and the edit box can open it.
+    if (!existing) {
+      db.prepare(`INSERT INTO stories (guild_id, name, author_id, start_scene, tally, created_at) VALUES (?,?,?,?,?,?)`)
+        .run(gid, name, uid, 'start', null, Date.now());
+    }
+    db.prepare('UPDATE stories SET draft_source=?, draft_problems=? WHERE guild_id=? AND name=? COLLATE NOCASE')
+      .run(raw, JSON.stringify(parsed.problems), gid, name);
+    try { deleteStory(gid, draftName(name)); } catch {}
+    queueActivityMirror(gid, name);
+    const n = parsed.problems.length;
+    out.status = 'draft';
+    // Eight problems, each clipped, keeps the reply inside one message.
+    out.saved = [`📝 **${name}** kept as a draft — **${n} problem${n === 1 ? '' : 's'}** to fix before it can run${existing?.source || (existing && listScenes(gid, name).length) ? '; the live version is untouched' : ''}.`,
+      ...parsed.problems.slice(0, 8).map(p => `• line ${p.line}: ${p.msg.slice(0, 140)}${p.fix ? `\n　 ↳ ${p.fix.slice(0, 80)}` : ''}`),
+      ...(n > 8 ? [`• …and ${n - 8} more — \`/activity show\` lists them all`] : []),
+      '_Fix it on the shelf (Edit scene / Edit all), or paste the whole script again._'].join('\n').slice(0, 1990);
+    return out;
+  }
+
+  const live = existing && (existing.source || listScenes(gid, name).length);
+  const running = live ? liveRunsOf(gid, name) : [];
+  // Held on purpose, or held because someone is mid-run: a draft stays a
+  // draft through later edits, until Publish — or the problems are fixed on
+  // an activity whose live version is what everyone plays.
+  const heldAlready = !!(existing?.draft_source && !existing.draft_problems);
+  const hold = publish === 'draft' || (publish === 'auto' && (running.length > 0 || heldAlready));
+  if (hold) {
+    // A good script, held: rows go under the draft name so Practice can play it.
+    const parsedDraft = { ...parsed, name: draftName(name) };
+    saveStory(gid, uid, parsedDraft);
+    if (!existing) {
+      db.prepare(`INSERT INTO stories (guild_id, name, author_id, start_scene, tally, created_at) VALUES (?,?,?,?,?,?)`)
+        .run(gid, name, uid, parsed.start, parsed.tally ?? null, Date.now());
+    }
+    db.prepare('UPDATE stories SET draft_source=?, draft_problems=NULL WHERE guild_id=? AND name=? COLLATE NOCASE').run(raw, gid, name);
+    queueActivityMirror(gid, name);
+    out.status = 'waiting';
+    const why = publish === 'draft' ? 'held back as a draft, as asked'
+      : `held as a draft — ${running.length} ${running.length === 1 ? 'run is' : 'runs are'} mid-way through the live version`;
+    out.saved = [`📝 **${name}** ${why}. **Practice** plays it; **Publish** on the shelf puts it live${running.length ? ' (or `/activity stop` the runs first)' : ''}.`,
+      ...noteLines(parsed.notes)].join('\n');
+    return out;
+  }
+
+  publishActivity(gid, uid, parsed, raw);
+  out.status = 'published';
+  const count = parsed.scenes.length;
+  out.saved = [`🎮 **${name}** ${live ? 'updated' : 'saved'} — **${count}** scene${count === 1 ? '' : 's'}, starting at \`${parsed.start}\`.`,
+    `Run it with \`/activity run name:${name}\`, read it with \`/activity show name:${name}\`${getConfig(gid)?.activity_forum ? ', or find it on the shelf' : ''}.`,
+    ...noteLines(parsed.notes)].join('\n');
+  return out;
+}
+function noteLines(notes) {
+  if (!notes?.length) return [];
+  return [`⚠️ ${notes.length} note${notes.length === 1 ? '' : 's'}:`, ...notes.slice(0, 8).map(n => `• ${n.line ? `line ${n.line}: ` : ''}${n.msg}`), ...(notes.length > 8 ? [`• …and ${notes.length - 8} more`] : [])];
+}
+// Rows replaced, source kept, the old source held for Revert, drafts cleared.
+function publishActivity(gid, uid, parsed, text) {
+  const existing = getStory(gid, parsed.name);
+  const prev = existing ? (existing.source || (listScenes(gid, parsed.name).length ? storyToText(existing, listScenes(gid, parsed.name)) : null)) : null;
+  saveStory(gid, uid, parsed);
+  try { deleteStory(gid, draftName(parsed.name)); } catch {}
+  db.prepare(`UPDATE stories SET source=?, prev_source=?, draft_source=NULL, draft_problems=NULL, notes=?, published_at=?,
+              cooldown=?, available=?, require_json=?, retired=0 WHERE guild_id=? AND name=? COLLATE NOCASE`)
+    .run(text, prev, JSON.stringify(parsed.notes || []), Date.now(),
+         parsed.cooldown || null, parsed.available ? parsed.available.join(',') : null,
+         parsed.require?.length ? JSON.stringify(parsed.require) : null, gid, parsed.name);
+  queueActivityMirror(gid, parsed.name);
+}
+// Every live run of an activity, anywhere on the server — practice runs aside.
+function liveRunsOf(gid, name) {
+  try { return db.prepare('SELECT * FROM story_runs WHERE guild_id=? AND story=? COLLATE NOCASE AND practice=0').all(gid, name); }
+  catch { return []; }
 }
 
 // A five-question test of Kalidale lore, built in beside the fishing tale.
@@ -16606,66 +17357,228 @@ const DEMO_QUIZ = [
 'END',
 ].join('\n');
 
-function parseStoryScript(text) {
+// Parse a pasted activity script. Returns { name, start, tally, scenes[],
+// problems[], notes[], … }; `error` carries every problem in one string so a
+// caller that only knows the old shape still reads the first failure. The
+// format grew out of a fishing loop, so it has to express: difficulty
+// classes, ranges on the natural die, a random pick between flavour lines, a
+// run of descending rolls, natural-20/1 overrides, plain button choices with
+// no roll at all, and a tally that accumulates across a loop and cashes out
+// at the end. Since 2026-10-20 it also carries flags (SET / IF), a random
+// fork, a tilt on the next roll, pictures, cooldowns, requirements, and
+// endings that grant titles, heal charges and quest notes.
+//
+// Every line that does not parse used to fall silently into the narration,
+// so `PASSS -> ford` became story text and the scene dead-ended. The parser
+// now reports every problem at once, with the line it is on and the fix,
+// and warns about lines that look like a keyword mistyped.
+const STORY_KEYWORDS = ['SCENE', 'SAY', 'AS', 'ROLL', 'GAUNTLET', 'CHOICE', 'GAIN', 'END', 'NAT20', 'NAT1', 'TALLY', 'QUIZ',
+  'ASK', 'ANSWER', 'HINT', 'RIGHT', 'WRONG', 'SET', 'UNSET', 'IF', 'NEXT', 'RANDOM', 'IMAGE', 'REQUIRE', 'ONCE', 'AVAILABLE',
+  'QID', 'EXPLAIN', ...STORY_BANDS];
+const STORY_DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+const STORY_DC_WORDS = { easy: 10, normal: 13, hard: 16 };
+function editDistance(a, b) {
+  a = String(a); b = String(b);
+  const dp = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+  for (let j = 1; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++)
+    dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return dp[a.length][b.length];
+}
+// The closest word in a pool, when it is close enough to be a slip of the
+// thumb rather than a different word.
+function nearestWord(word, pool, max = 2) {
+  const w = String(word || '').toLowerCase();
+  let best = null, bestD = max + 1;
+  for (const p of pool) {
+    const d = editDistance(w, String(p).toLowerCase());
+    if (d < bestD && d <= max && d < w.length) { best = p; bestD = d; }
+  }
+  return best;
+}
+// "Fri-Sun", "Sat,Sun", "weekends", "weekdays", "every day" → day list or null.
+function parseDayList(str) {
+  const s = String(str || '').trim().toLowerCase();
+  if (!s) return null;
+  if (/^(every ?day|daily|all)$/.test(s)) return [...STORY_DAYS];
+  if (/^weekends?$/.test(s)) return ['sat', 'sun'];
+  if (/^weekdays?$/.test(s)) return STORY_DAYS.slice(0, 5);
+  const day = (t) => STORY_DAYS.find(d => t.startsWith(d)) || null;
+  const out = new Set();
+  for (const part of s.split(/[,\s]+/).filter(Boolean)) {
+    const m = part.match(/^([a-z]+)[-–]([a-z]+)$/);
+    if (m) {
+      const a = STORY_DAYS.indexOf(day(m[1])), b = STORY_DAYS.indexOf(day(m[2]));
+      if (a < 0 || b < 0) return null;
+      for (let i = a; ; i = (i + 1) % 7) { out.add(STORY_DAYS[i]); if (i === b) break; }
+    } else {
+      const d = day(part);
+      if (!d) return null;
+      out.add(d);
+    }
+  }
+  return out.size ? STORY_DAYS.filter(d => out.has(d)) : null;
+}
+// `tally>=5`, `merits>=10`, `renown<3` → { what, op, n }.
+function parseCompare(str) {
+  const m = String(str || '').trim().match(/^(tally|merits|renown)\s*(>=|<=|=|==|<|>)\s*(-?\d+)$/i);
+  return m ? { what: m[1].toLowerCase(), op: m[2] === '==' ? '=' : m[2], n: parseInt(m[3]) } : null;
+}
+function compareOk(cmp, value) {
+  const v = Number(value) || 0;
+  switch (cmp.op) {
+    case '>=': return v >= cmp.n; case '<=': return v <= cmp.n; case '<': return v < cmp.n;
+    case '>': return v > cmp.n; default: return v === cmp.n;
+  }
+}
+// A condition after IF or REQUIRE: a flag, `not flag`, a comparison, or a title.
+function parseCondition(str) {
+  const s = String(str || '').trim();
+  let m;
+  if ((m = s.match(/^title:\s*(.+)$/i))) return { title: m[1].trim() };
+  const cmp = parseCompare(s);
+  if (cmp) return { cmp };
+  if ((m = s.match(/^not\s+([\w-]+)$/i))) return { flag: m[1].toLowerCase(), not: true };
+  if ((m = s.match(/^([\w-]+)$/))) return { flag: m[1].toLowerCase(), not: false };
+  return null;
+}
+const describeCondition = (c) => c.title ? `title ${c.title}` : c.cmp ? `${c.cmp.what} ${c.cmp.op} ${c.cmp.n}` : `${c.not ? 'not ' : ''}${c.flag}`;
+
+function parseStoryScript(text, ctx = {}) {
   const lines = String(text || '').split(/\r?\n/);
+  const problems = [], notes = [];
+  const problem = (line, msg, fix = null) => { problems.push({ line, msg, fix }); };
+  const note = (line, msg) => { notes.push({ line, msg }); };
+  const finish = (out) => {
+    out.problems = problems; out.notes = notes;
+    out.error = problems.length ? problemsText(problems) : null;
+    return out;
+  };
   const head = lines.findIndex(l => /^\s*\[(STORY|ACTIVITY)\]/i.test(l));
-  if (head === -1) return { error: 'No `[ACTIVITY] Name` line found.' };
+  if (head === -1) { problem(1, 'No `[ACTIVITY] Name` line found.', 'Start the script with `[ACTIVITY] Fishing`.'); return finish({}); }
   const name = lines[head].replace(/^\s*\[(STORY|ACTIVITY)\]\s*/i, '').trim();
-  if (!name) return { error: 'Give it a name on the `[ACTIVITY]` line.' };
+  if (!name) problem(head + 1, 'Give it a name on the `[ACTIVITY]` line.', '`[ACTIVITY] Fishing`');
+  if (/^\./.test(name)) problem(head + 1, 'An activity name cannot begin with a full stop.', 'Names starting with `.` are kept for drafts.');
 
   const scenes = [];
   let cur = null, tally = null, oneOfInto = null, quizMode = null;
+  let cooldown = null, available = null; const require_ = [];
   const flush = () => { if (cur) { cur.say = (cur.say || '').trim(); scenes.push(cur); } cur = null; oneOfInto = null; };
+  const newScene = (scene, line) => ({ scene, line, say: '', npc: null, roll: null, dc: null, dcword: null, gauntlet: null,
+    outcomes: {}, ranges: [], choices: [], gain: 0, nat20: null, nat1: null,
+    ending: 0, merits: 0, rewards: null, cashTally: 0,
+    ask: 0, answers: [], right: null, wrong: null, hint: null,
+    sets: [], unsets: [], ifs: [], nextmode: null, random: null, image: null,
+    title: null, heal: 0, quest: null, once: 0, qid: null, explain: null });
+  const bandRe = new RegExp(`^(${STORY_BANDS.join('|')})\\b`, 'i');
+  const anyKeyRe = new RegExp(`^(${STORY_KEYWORDS.join('|')})\\b`, 'i');
+  // Short keywords that are also ordinary English — AS, IF, END, SET and the
+  // like — count only when written in capitals, so a bare "As the sun sets"
+  // stays narration. The long distinctive ones are read in any case.
+  const WORDY = /^(AS|IF|SET|UNSET|END|NEXT|ASK|HINT|RIGHT|WRONG|ONCE|GAIN|EXPLAIN|QID|IMAGE)\b/;
+  const isKeywordLine = (l) => {
+    const kw = (l.match(/^[A-Za-z0-9]+/) || [''])[0];
+    if (WORDY.test(kw.toUpperCase()) && kw !== kw.toUpperCase()) return false;
+    if (anyKeyRe.test(l)) return true;
+    return false;
+  };
+  const upperStart = (l) => { const kw = (l.match(/^[A-Za-z0-9]+/) || [''])[0]; return kw === kw.toUpperCase(); };
 
-  for (const raw of lines.slice(head + 1)) {
-    const line = raw.trim();
+  // The case rule, in one sentence: a keyword line written in capitals must
+  // be well-formed (a malformed one is a problem); written in lower case it
+  // counts only when it is exact (`gain renown 1`, `end`, `set torch`),
+  // otherwise it is narration. So `PASSS -> ford` is caught and `As the sun
+  // sets` is left alone.
+  const bad = (ln, msg, fix) => { problem(ln, msg, fix); return true; };
+  // A malformed keyword line: a problem in capitals, narration otherwise.
+  const malformed = (ln, line, msg, fix) => upperStart(line) ? bad(ln, msg, fix) : false;
+  for (let i = head + 1; i < lines.length; i++) {
+    const ln = i + 1;
+    const line = lines[i].trim();
     if (!line) { oneOfInto = null; continue; }
+    if (/^#/.test(line)) continue;                      // a comment, the author's own
     let m;
 
-    if ((m = line.match(/^TALLY\s+(\w+)/i))) { tally = m[1].toLowerCase(); continue; }
+    if ((m = line.match(/^TALLY\s+(\w+)\s*$/i))) { tally = m[1].toLowerCase(); continue; }
     // QUIZ retry — a wrong answer sends them back to the same question.
     // QUIZ tally — wrong answers carry on, and the score is read out at the end.
     // QUIZ silent — say nothing as they go; mark the whole thing at the end.
-    if ((m = line.match(/^QUIZ\s+(retry|tally|silent)/i))) { quizMode = m[1].toLowerCase(); continue; }
+    if ((m = line.match(/^QUIZ\s+(retry|tally|silent)\s*$/i))) { quizMode = m[1].toLowerCase(); continue; }
+    if (/^QUIZ\b/i.test(line) && !/^QUIZ\s+FROM\b/i.test(line) && malformed(ln, line, `\`${line}\` — QUIZ takes one of \`retry\`, \`tally\` or \`silent\`.`, '`QUIZ tally`')) continue;
 
-    if ((m = line.match(/^SCENE\s+(\S+)/i))) {
-      flush();
-      cur = { scene: m[1], say: '', npc: null, roll: null, dc: null, gauntlet: null,
-              outcomes: {}, ranges: [], choices: [], gain: 0, nat20: null, nat1: null,
-              ending: 0, merits: 0, rewards: null, cashTally: 0,
-              ask: 0, answers: [], right: null, wrong: null, hint: null };
+    if ((m = line.match(/^ONCE\s+(?:per\s+|a\s+|every\s+)?(day|week)\s*$/i))) { cooldown = m[1].toLowerCase(); continue; }
+    if (/^ONCE\b/i.test(line) && malformed(ln, line, `\`${line}\` — ONCE is \`ONCE per day\` or \`ONCE per week\`.`, '`ONCE per day`')) continue;
+    if ((m = line.match(/^AVAILABLE\s+(.+)$/i))) {
+      const days = parseDayList(m[1]);
+      if (days) { available = days; continue; }
+      if (malformed(ln, line, `\`${line}\` — AVAILABLE wants days: \`Fri-Sun\`, \`Sat,Sun\`, \`weekends\`, \`weekdays\`.`, '`AVAILABLE Fri-Sun`')) continue;
+    }
+    if ((m = line.match(/^REQUIRE\s+(.+)$/i))) {
+      const c = parseCondition(m[1]);
+      if (!c) { if (malformed(ln, line, `\`${line}\` — REQUIRE wants \`title:Name\`, \`merits>=10\` or \`renown>=50\`.`, '`REQUIRE title:Angler`')) continue; }
+      else {
+        if (cur) { problem(ln, 'REQUIRE belongs above the first SCENE — inside a scene, use `IF … -> scene`.', 'Move it to the top, or write `IF not torch -> dark`.'); continue; }
+        if (c.flag) { problem(ln, `\`${line}\` — a flag is set during a run, so it cannot gate starting one.`, 'Use `title:`, `merits>=` or `renown>=`.'); continue; }
+        if (c.cmp && c.cmp.what === 'tally') { problem(ln, `\`${line}\` — the tally belongs to a run; REQUIRE takes \`merits>=\` or \`renown>=\`.`); continue; }
+        require_.push(c); continue;
+      }
+    }
+
+    if ((m = line.match(/^SCENE\s+(\S+)\s*$/i))) { flush(); cur = newScene(m[1], ln); continue; }
+    if (/^SCENE\b/i.test(line) && malformed(ln, line, `\`${line}\` — a scene needs one name with no spaces.`, '`SCENE find`')) continue;
+    if (!cur) {
+      if (isKeywordLine(line)) problem(ln, `\`${line.slice(0, 40)}\` comes before the first \`SCENE\` line.`, 'Only TALLY, QUIZ, ONCE, AVAILABLE and REQUIRE may sit above the first scene.');
+      else problem(ln, `\`${line.slice(0, 40)}\` is outside any scene.`, 'Put a `SCENE name` line above it.');
       continue;
     }
-    if (!cur) continue;
 
     // ─ a question the player types an answer to ─
-    if (/^ASK\b/i.test(line)) { cur.ask = 1; continue; }
+    if (/^ASK\s*$/i.test(line)) { cur.ask = 1; continue; }
     if ((m = line.match(/^ANSWER\s+(.+)$/i))) {
       cur.answers = m[1].split('|').map(x => x.trim()).filter(Boolean);
       cur.ask = 1;
       continue;
     }
-    if ((m = line.match(/^HINT\s+(.+)$/i))) { cur.hint = m[1].trim(); continue; }
-    if ((m = line.match(/^RIGHT\s*->\s*(\S+)/i))) { cur.right = m[1]; continue; }
-    if ((m = line.match(/^WRONG\s*->\s*(\S+)/i))) { cur.wrong = m[1]; continue; }
+    if ((m = line.match(/^HINT\s+(.+)$/i)) && (upperStart(line) || cur.ask)) { cur.hint = m[1].trim(); continue; }
+    if ((m = line.match(/^RIGHT\s*->\s*(\S+)\s*$/i))) { cur.right = m[1]; continue; }
+    if ((m = line.match(/^WRONG\s*->\s*(\S+)\s*$/i))) { cur.wrong = m[1]; continue; }
+    if ((m = line.match(/^QID\s+(\d+)\s*$/))) { cur.qid = parseInt(m[1]); continue; }
+    if ((m = line.match(/^EXPLAIN\s+(.+)$/))) { cur.explain = m[1].trim(); continue; }
 
-    // A bare line while collecting a ONE OF block is another flavour variant.
-    // A bare line inside a ONE OF block is another variant — but a band name
+    // A bare line inside a ONE OF block is another variant — but a keyword
     // ends the block, so `FAIL -> find` after `FAIL ONE OF` still branches.
-    if (oneOfInto && !new RegExp(`^(SAY|AS|ROLL|GAUNTLET|CHOICE|GAIN|END|NAT20|NAT1|SCENE|TALLY|${STORY_BANDS.join('|')}|\\d)\\b`, 'i').test(line)) {
-      oneOfInto.push(line); continue;
-    }
+    if (oneOfInto && !(isKeywordLine(line) && (!bandRe.test(line) || /->|ONE OF\s*$/i.test(line))) && !/^\d/.test(line)) { oneOfInto.push(line); continue; }
     oneOfInto = null;
 
-    if ((m = line.match(/^SAY\s+([\s\S]*)$/i)))  { cur.say += (cur.say ? '\n' : '') + m[1]; continue; }
-    if ((m = line.match(/^AS\s+(.+)$/i)))        { cur.npc = m[1].trim(); continue; }
+    // An option under CHOICE is `label -> scene`, whatever the label starts
+    // with — `Roll with it -> b` is a button, not a malformed ROLL. Only a
+    // keyword in capitals (`IF torch -> hall`) keeps its own meaning there.
+    if (cur.isChoice && !(upperStart(line) && isKeywordLine(line)) && (m = line.match(/^(.+?)\s*->\s*(\S+)\s*$/))) {
+      // A leading star marks the right answer: "* B — 7 -> q2". It is the
+      // author's mark, never the player's — stripped before the button.
+      let label = m[1].trim(), correct = 0;
+      if (/^\*\s*/.test(label)) { correct = 1; label = label.replace(/^\*\s*/, ''); }
+      cur.choices.push({ label, next: m[2], correct }); continue;
+    }
 
-    // ROLL str|dex|wis DC15   — the roller picks from the offered stats.
-    if ((m = line.match(/^ROLL\s+([a-z|]+)(?:\s+DC\s*(\d+))?\s*$/i))) {
-      cur.roll = m[1].toLowerCase();
-      if (m[2]) cur.dc = parseInt(m[2]);
+    if ((m = line.match(/^SAY\s+([\s\S]*)$/i)))  { cur.say += (cur.say ? '\n' : '') + m[1]; continue; }
+    // `AS Name`: in capitals, always; in lower case only when Name is an NPC here.
+    if ((m = line.match(/^AS\s+(.+)$/i)) && (upperStart(line) || (ctx.gid && typeof getNpc === 'function' && getNpc(ctx.gid, m[1].trim())))) { cur.npc = m[1].trim(); continue; }
+    if ((m = line.match(/^IMAGE\s+(\S+)\s*$/))) {
+      if (!/^https?:\/\/\S+\.(png|jpe?g|gif|webp)(\?\S*)?$/i.test(m[1])) problem(ln, `\`${m[1].slice(0, 60)}\` — IMAGE wants a direct link to a picture (.png, .jpg, .gif, .webp).`);
+      else cur.image = m[1];
       continue;
     }
+
+    // ROLL str|dex|wis DC15   — the roller picks from the offered stats.
+    // ROLL str DC easy        — the DC is set from this server's sheets.
+    if ((m = line.match(/^ROLL\s+([a-z|]+)(?:\s+DC\s*(\d+|easy|normal|hard))?\s*$/i))) {
+      cur.roll = m[1].toLowerCase();
+      if (m[2] && /^\d+$/.test(m[2])) cur.dc = parseInt(m[2]);
+      else if (m[2]) { cur.dcword = m[2].toLowerCase(); cur.dc = STORY_DC_WORDS[cur.dcword]; }
+      continue;
+    }
+    if (/^ROLL\b/i.test(line) && malformed(ln, line, `\`${line}\` — write the stats with \`|\` between, then an optional DC.`, '`ROLL str|dex DC12` or `ROLL wis DC easy`')) continue;
     // A run of rolls, each with its own DC. Two forms:
     //   GAUNTLET str|con 14 12 10           same stats every step
     //   GAUNTLET 14:str 12:str|con 10:dex   a different check each step
@@ -16685,41 +17598,77 @@ function parseStoryScript(text) {
       cur.roll = [...new Set(cur.gauntlet.flatMap(g => g.stats.split('|')))].join('|');
       continue;
     }
-    if ((m = line.match(/^GAIN\s+(\w+)\s+(-?\d+)/i))) {
-      if (tally && m[1].toLowerCase() !== tally) return { error: `\`GAIN ${m[1]}\` but the tally is called \`${tally}\`.` };
+    if (/^GAUNTLET\b/i.test(line) && malformed(ln, line, `\`${line}\` — a gauntlet is stats then DCs, or DC:stats pairs.`, '`GAUNTLET str|con 14 12 10` or `GAUNTLET 14:str 12:con`')) continue;
+    if ((m = line.match(/^GAIN\s+(\w+)\s+(-?\d+)\s*$/i))) {
+      if (tally && m[1].toLowerCase() !== tally) problem(ln, `\`GAIN ${m[1]}\` but the tally is called \`${tally}\`.`, `\`GAIN ${tally} ${m[2]}\``);
       cur.gain = parseInt(m[2]); continue;
     }
+    if (/^GAIN\b/i.test(line) && malformed(ln, line, `\`${line}\` — GAIN is the tally's name and a whole number.`, '`GAIN renown 1`')) continue;
     if (/^CHOICE\s*$/i.test(line)) { cur.isChoice = true; continue; }
-    if (cur.isChoice && (m = line.match(/^(.+?)\s*->\s*(\S+)\s*$/))) {
-      // A leading star marks the right answer: "* B — 7 -> q2". It is the
-      // author's mark, never the player's — stripped before the button.
-      let label = m[1].trim(), correct = 0;
-      if (/^\*\s*/.test(label)) { correct = 1; label = label.replace(/^\*\s*/, ''); }
-      cur.choices.push({ label, next: m[2], correct }); continue;
-    }
     if ((m = line.match(/^NAT20\s+(.*?)\s*->\s*(\S+)\s*$/i))) { cur.nat20 = { text: m[1].trim(), next: m[2] }; continue; }
     if ((m = line.match(/^NAT1\s+(.*?)\s*->\s*(\S+)\s*$/i)))  { cur.nat1  = { text: m[1].trim(), next: m[2] }; continue; }
+    if (/^NAT(20|1)\b/i.test(line) && malformed(ln, line, `\`${line}\` — needs \`-> scene\` at the end.`, '`NAT20 It leaps into your hands -> caught`')) continue;
 
-    if ((m = line.match(/^END\b\s*(.*)$/i))) {
+    // Flags and forks.
+    if ((m = line.match(/^SET\s+([\w-]+)\s*$/i))) { cur.sets.push(m[1].toLowerCase()); continue; }
+    if ((m = line.match(/^UNSET\s+([\w-]+)\s*$/i))) { cur.unsets.push(m[1].toLowerCase()); continue; }
+    if (/^(SET|UNSET)\b/i.test(line) && malformed(ln, line, `\`${line}\` — a flag is one word.`, '`SET torch`')) continue;
+    if ((m = line.match(/^IF\s+(.+?)\s*->\s*(\S+)\s*$/i))) {
+      const c = parseCondition(m[1]);
+      if (c) { cur.ifs.push({ ...c, next: m[2] }); continue; }
+      if (malformed(ln, line, `\`${line}\` — IF wants a flag, \`not flag\`, \`tally>=5\`, \`merits>=10\` or \`title:Name\`.`, '`IF torch -> lit_hall`')) continue;
+    }
+    if (/^IF\b/i.test(line) && malformed(ln, line, `\`${line}\` — needs \`-> scene\` at the end.`, '`IF not torch -> dark_hall`')) continue;
+    if ((m = line.match(/^NEXT\s+(adv|dis|advantage|disadvantage)\s*$/i))) { cur.nextmode = m[1].toLowerCase().startsWith('adv') ? 'adv' : 'dis'; continue; }
+    if (/^NEXT\b/i.test(line) && malformed(ln, line, `\`${line}\` — NEXT is \`NEXT adv\` or \`NEXT dis\`.`)) continue;
+    if ((m = line.match(/^RANDOM\s*->\s*(.+)$/i))) {
+      const targets = m[1].split('|').map(x => x.trim()).filter(Boolean);
+      if (!targets.length) problem(ln, '`RANDOM` needs scenes to pick from.', '`RANDOM -> shallows|reeds|deep`');
+      else cur.random = targets;
+      continue;
+    }
+    if (/^RANDOM\b/i.test(line) && malformed(ln, line, `\`${line}\` — RANDOM is \`RANDOM -> a|b|c\`.`)) continue;
+
+    // END, with what it pays. In lower case only the bare word or a form
+    // made of the keys counts — `end of the road` stays narration.
+    if ((m = line.match(/^END\b\s*(.*)$/i)) && (upperStart(line) || /^(\s*(TALLY\s*\w*|merits:\s*\d+|heal:\s*\d+|once|title:.*|quest:.*|rewards:.*))*$/i.test(m[1] || ''))) {
       cur.ending = 1;
       let rest = m[1] || '';
-      if (/TALLY/i.test(rest)) { cur.cashTally = 1; rest = rest.replace(/TALLY\s*\w*/i, ''); }
-      const mm = rest.match(/merits:\s*(\d+)/i);
-      if (mm) cur.merits = parseInt(mm[1]);
-      const rw = rest.replace(/merits:\s*\d+/i, '').replace(/^\s*rewards:\s*/i, '').trim();
-      if (rw) cur.rewards = rw;
+      // `END TALLY renown` names the tally again; the word after TALLY is
+      // eaten only when it is not one of the keys that may follow.
+      if (/\bTALLY\b/i.test(rest)) { cur.cashTally = 1; rest = rest.replace(/\bTALLY\b(?:\s+(?!(?:merits|heal|title|quest|rewards):|once\b)\w+)?/i, ''); }
+      const take = (key, re) => {
+        const mm = rest.match(new RegExp(`\\b${key}:\\s*(${re})`, 'i'));
+        if (!mm) return null;
+        rest = rest.replace(mm[0], '');
+        return mm[1].trim();
+      };
+      // The texts come out first, so a word inside them (`title:The Once and
+      // Future King`) is never read as a key.
+      // …except `once` as the last word, or right before another key, which is the flag.
+      const until = '[^]*?(?=\\s+(?:merits|heal|title|quest|rewards):|\\s+once(?:\\s+(?:merits|heal|title|quest|rewards):|\\s*$)|\\s*$)';
+      const title = take('title', until); if (title) cur.title = title;
+      const quest = take('quest', until); if (quest) cur.quest = quest;
+      const rewards = take('rewards', '[^]*$'); if (rewards) cur.rewards = rewards;
+      const mer = take('merits', '\\d+'); if (mer) cur.merits = parseInt(mer);
+      const heal = take('heal', '\\d+'); if (heal) cur.heal = parseInt(heal);
+      if (/\bonce\b/i.test(rest)) { cur.once = 1; rest = rest.replace(/\bonce\b/i, ''); }
+      if (rest.trim()) problem(ln, `\`END ${rest.trim().slice(0, 40)}\` — after END only TALLY, merits:, heal:, title:, quest:, once and rewards: are read.`, '`END TALLY merits:2 rewards: a fine rod`');
       continue;
     }
 
-    // Numeric range on the natural die: "1-5 Small fry. -> fight_small"
-    if ((m = line.match(/^(\d+)\s*(?:-|–|to)\s*(\d+|\+)?\s*(.*?)\s*->\s*(\S+)\s*$/i))
-        || (m = line.match(/^(\d+)\s*(\+)\s*(.*?)\s*->\s*(\S+)\s*$/))) {
+    // A number opens a range on the roll: "1-5 text -> scene", "16+ text -> scene".
+    if ((m = line.match(/^(\d+)\s*(?:-|–|to)?\s*(\d+|\+)?\s+([\s\S]*?)\s*->\s*(\S+)\s*$/))) {
       const lo = parseInt(m[1]);
       // 9999 rather than Infinity: this is stored as JSON, and JSON has no way
       // to represent Infinity — it serialises to null and the range dies.
       const hi = (!m[2] || m[2] === '+') ? 9999 : parseInt(m[2]);
       cur.ranges.push({ lo, hi, text: (m[3] || '').trim(), next: m[4] });
       continue;
+    }
+    if (/^\d+\s*(?:-|–|to)?\s*(\d+|\+)?\s*->/.test(line)) {
+      const mm = line.match(/^(\d+\s*(?:-|–|to)?\s*(?:\d+|\+)?)\s*->\s*(\S+)/);
+      if (mm) { const lo = parseInt(mm[1]); const hiM = mm[1].match(/(?:-|–|to)\s*(\d+|\+)/); cur.ranges.push({ lo, hi: (!hiM || hiM[1] === '+') ? 9999 : parseInt(hiM[1]), text: '', next: mm[2] }); continue; }
     }
 
     // Band outcome, optionally opening a ONE OF block of flavour variants.
@@ -16740,55 +17689,119 @@ function parseStoryScript(text) {
         { text: m[2].trim(), next: m[3] });
       continue;
     }
+    if (bandRe.test(line) && malformed(ln, line, `\`${line.slice(0, 50)}\` — an outcome needs \`-> scene\` at the end (or \`ONE OF\` to open variants).`, '`PASS You land it -> caught`')) continue;
+
+    // Nothing above claimed the line, so it is narration — unless it looks
+    // like a keyword mistyped, or carries an arrow that went nowhere.
+    const first = (line.match(/^[A-Za-z0-9]+/) || [''])[0];
+    const near = first.length >= 3 && first === first.toUpperCase() ? nearestWord(first, STORY_KEYWORDS, 1) : null;
+    if (near && near.toUpperCase() !== first.toUpperCase()) {
+      note(ln, `\`${line.slice(0, 40)}\` reads as narration — did you mean \`${near}\`?`);
+    } else if (/->\s*\S+\s*$/.test(line)) {
+      note(ln, `\`${line.slice(0, 40)}\` has an arrow but no keyword in front, so it reads as narration.`);
+    }
     cur.say += (cur.say ? '\n' : '') + line;
   }
   flush();
 
-  if (!scenes.length) return { error: 'No `SCENE` blocks found.' };
+  if (!scenes.length) { problem(head + 1, 'No `SCENE` blocks found.', 'Every activity needs at least one `SCENE name` block.'); return finish({ name }); }
   const names = scenes.map(sc => sc.scene.toLowerCase());
-  const dupe = names.find((v, i) => names.indexOf(v) !== i);
-  if (dupe) return { error: `Two scenes are both called \`${dupe}\`.` };
+  scenes.forEach((sc, i) => { if (names.indexOf(sc.scene.toLowerCase()) !== i) problem(sc.line, `Two scenes are both called \`${sc.scene}\`.`, 'Rename one of them.'); });
+  // A button id has a hundred characters and the reroll's carries two scene
+  // names beside two ids; twenty each keeps every id under the ceiling.
+  for (const sc of scenes) if (sc.scene.length > 20) problem(sc.line, `Scene \`${sc.scene}\` is ${sc.scene.length} characters long — twenty is the most.`, 'Shorten the name; button ids have a hundred characters to share.');
 
   const targets = (sc) => [
     ...Object.values(sc.outcomes).map(o => o.next),
     ...sc.ranges.map(r => r.next), ...sc.choices.map(c => c.next),
-    sc.nat20?.next, sc.nat1?.next,
+    sc.nat20?.next, sc.nat1?.next, sc.right, sc.wrong,
+    ...sc.ifs.map(x => x.next), ...(sc.random || []),
   ].filter(Boolean);
+  const known = (t) => names.includes(String(t).toLowerCase());
+  const suggest = (t) => { const n = nearestWord(t, scenes.map(s => s.scene), 2); return n ? ` Did you mean \`${n}\`?` : ''; };
+  const STAT_POOL = Object.keys(STAT_ALIASES);
+  const statFix = (st) => { const n = nearestWord(st, STAT_POOL, 1); return n ? ` Did you mean \`${n}\`?` : ''; };
 
   for (const sc of scenes) {
     for (const t of targets(sc)) {
-      if (!names.includes(String(t).toLowerCase())) {
-        return { error: `Scene \`${sc.scene}\` points at \`${t}\`, which doesn't exist.` };
-      }
+      if (!known(t)) problem(sc.line, `Scene \`${sc.scene}\` points at \`${t}\`, which doesn't exist.${suggest(t)}`);
     }
-    // ASK counts as asking — a typed question is a stopping point too.
+    // ASK counts as asking — a typed question is a stopping point too; an IF
+    // or RANDOM scene routes on arrival and may carry nothing else.
     const asks = sc.roll || sc.choices.length || sc.ask;
-    if (!sc.ending && !asks) return { error: `Scene \`${sc.scene}\` has no \`ROLL\`, \`CHOICE\`, \`ASK\` or \`END\` — a run would stop there.` };
-    if (sc.ask && !sc.right && !sc.wrong) return { error: `Scene \`${sc.scene}\` asks a question but nothing follows it — add \`RIGHT ->\` or \`WRONG ->\`.` };
-    if (sc.roll && !targets(sc).length) return { error: `Scene \`${sc.scene}\` asks for a roll but nothing follows it.` };
-    if (sc.isChoice && !sc.choices.length) return { error: `Scene \`${sc.scene}\` has a \`CHOICE\` with no options.` };
-    if (sc.gauntlet && sc.gauntlet.length > 8) return { error: `Scene \`${sc.scene}\` has a gauntlet of ${sc.gauntlet.length} rolls — 8 is the most.` };
+    const routes = sc.random || sc.ifs.length;
+    if (!sc.ending && !asks && !routes) problem(sc.line, `Scene \`${sc.scene}\` has no \`ROLL\`, \`CHOICE\`, \`ASK\` or \`END\` — a run would stop there.`, 'Add a roll, a choice, or `END`.');
+    if (sc.ask && !sc.right && !sc.wrong) problem(sc.line, `Scene \`${sc.scene}\` asks a question but nothing follows it — add \`RIGHT ->\` or \`WRONG ->\`.`);
+    if (sc.roll && !targets(sc).length) problem(sc.line, `Scene \`${sc.scene}\` asks for a roll but nothing follows it.`, 'Add `PASS -> scene` and `FAIL -> scene`, or ranges.');
+    if (sc.isChoice && !sc.choices.length) problem(sc.line, `Scene \`${sc.scene}\` has a \`CHOICE\` with no options.`, 'Each option is `Label -> scene` on its own line.');
+    if (sc.choices.length > 5) problem(sc.line, `Scene \`${sc.scene}\` offers ${sc.choices.length} choices — five is the most a row of buttons holds.`, 'Split them across two scenes.');
+    if (sc.gauntlet && sc.gauntlet.length > 8) problem(sc.line, `Scene \`${sc.scene}\` has a gauntlet of ${sc.gauntlet.length} rolls — 8 is the most.`);
     for (const g of (sc.gauntlet || [])) {
-      if (!Number.isFinite(g.dc)) return { error: `Scene \`${sc.scene}\` has a gauntlet step with no DC.` };
+      if (!Number.isFinite(g.dc)) problem(sc.line, `Scene \`${sc.scene}\` has a gauntlet step with no DC.`);
       for (const st of String(g.stats || '').split('|').filter(Boolean)) {
-        if (!resolveStatWord(st)) return { error: `Scene \`${sc.scene}\` rolls \`${st}\` in its gauntlet, which isn't a stat.` };
+        if (!resolveStatWord(st)) problem(sc.line, `Scene \`${sc.scene}\` rolls \`${st}\` in its gauntlet, which isn't a stat.${statFix(st)}`);
       }
     }
     for (const st of String(sc.roll || '').split('|').filter(Boolean)) {
-      if (!resolveStatWord(st) && !/^\d+d\d+/.test(st)) return { error: `Scene \`${sc.scene}\` rolls \`${st}\`, which isn't a stat.` };
+      if (!resolveStatWord(st) && !/^\d+d\d+/.test(st)) problem(sc.line, `Scene \`${sc.scene}\` rolls \`${st}\`, which isn't a stat.${statFix(st)}`);
     }
+    if (sc.random && (sc.roll || sc.choices.length || sc.ask)) problem(sc.line, `Scene \`${sc.scene}\` has a \`RANDOM\` fork and also asks for something — a random scene only routes.`, 'Put the roll or choice in the scenes it picks from.');
+    if (sc.ifs.some(x => x.cmp && x.cmp.what === 'tally') && !tally) problem(sc.line, `Scene \`${sc.scene}\` tests the tally but there is no \`TALLY\` line at the top.`);
   }
   if (scenes.some(sc => sc.cashTally || sc.gain) && !tally) {
-    return { error: 'Add a `TALLY renown` line at the top — a scene gains or cashes out a tally that has no name.' };
+    problem(scenes.find(sc => sc.cashTally || sc.gain).line, 'Add a `TALLY renown` line at the top — a scene gains or cashes out a tally that has no name.');
   }
-  return { name, start: scenes[0].scene, tally, quizMode, scenes };
+  // Notes: things that will run, but probably not as meant.
+  if (!problems.length) lintStory({ name, scenes, tally, quizMode }, note, ctx);
+  return finish({ name, start: scenes[0].scene, tally, quizMode, scenes, cooldown, available, require: require_ });
+}
+function problemsText(problems) {
+  return problems.map(p => `line ${p.line}: ${p.msg}${p.fix ? ` → ${p.fix}` : ''}`).join('\n');
+}
+
+// What will run but probably not as meant: unreachable scenes, a loop with
+// no way out, a roll with only half its outcomes, a tally never cashed, a
+// DC nobody at this table could meet, a voice that is not an NPC.
+function lintStory({ scenes, tally }, note, ctx = {}) {
+  const byName = new Map(scenes.map(sc => [sc.scene.toLowerCase(), sc]));
+  const outs = (sc) => [
+    ...Object.values(sc.outcomes).map(o => o.next), ...sc.ranges.map(r => r.next), ...sc.choices.map(c => c.next),
+    sc.nat20?.next, sc.nat1?.next, sc.right, sc.wrong, ...sc.ifs.map(x => x.next), ...(sc.random || []),
+  ].filter(Boolean).map(x => String(x).toLowerCase());
+  // Reachability from the first scene.
+  const seen = new Set([scenes[0].scene.toLowerCase()]); const stack = [scenes[0]];
+  while (stack.length) { const sc = stack.pop(); for (const t of outs(sc)) { if (!seen.has(t) && byName.has(t)) { seen.add(t); stack.push(byName.get(t)); } } }
+  for (const sc of scenes) if (!seen.has(sc.scene.toLowerCase())) note(sc.line, `Scene \`${sc.scene}\` can never be reached from \`${scenes[0].scene}\`.`);
+  // An ending somewhere ahead.
+  if (!scenes.some(sc => sc.ending && seen.has(sc.scene.toLowerCase()))) note(scenes[0].line, 'No `END` can be reached — a run only stops at the 200-scene cap.');
+  for (const sc of scenes) {
+    const bands = Object.keys(sc.outcomes);
+    if (sc.roll && !sc.gauntlet && !sc.ranges.length && bands.length) {
+      if (sc.dc && !bands.includes('FAIL') && !sc.nat1) note(sc.line, `Scene \`${sc.scene}\` rolls against DC ${sc.dc} but has no \`FAIL\` line — a miss goes nowhere.`);
+      if (sc.dc && !bands.includes('PASS')) note(sc.line, `Scene \`${sc.scene}\` rolls against DC ${sc.dc} but has no \`PASS\` line.`);
+      if (!sc.dc && !bands.includes('PASS') && !bands.includes('CRIT')) note(sc.line, `Scene \`${sc.scene}\` has no \`PASS\` line — a good roll goes nowhere.`);
+      if (!sc.dc && !bands.includes('FAIL') && !bands.includes('FUMBLE')) note(sc.line, `Scene \`${sc.scene}\` has no \`FAIL\` line — a poor roll goes nowhere.`);
+    }
+    if (sc.dc && !sc.dcword && (sc.dc < 5 || sc.dc > 25)) note(sc.line, `Scene \`${sc.scene}\` asks DC ${sc.dc} — on a d20 plus a stat that is ${sc.dc < 5 ? 'all but automatic' : 'out of anyone\'s reach'}.`);
+    if (sc.say && sc.say.length > 1800) note(sc.line, `Scene \`${sc.scene}\` narrates ${sc.say.length} characters — it will arrive in more than one message.`);
+    if (sc.ifs.some(x => x.flag) && !scenes.some(s => s.sets.length)) note(sc.line, `Scene \`${sc.scene}\` tests a flag, but no scene ever sets one.`);
+    for (const x of sc.ifs) if (x.flag && !scenes.some(s => s.sets.includes(x.flag) || s.unsets.includes(x.flag))) note(sc.line, `Scene \`${sc.scene}\` tests \`${x.flag}\`, which no scene sets.`);
+    if (sc.npc && ctx.gid && typeof getNpc === 'function' && !getNpc(ctx.gid, sc.npc)) note(sc.line, `Scene \`${sc.scene}\` speaks as *${sc.npc}*, who is not an NPC here — it will be said in the bot's voice.`);
+    if (sc.title && ctx.gid && typeof db !== 'undefined') {
+      let known = false;
+      try { known = !!db.prepare('SELECT 1 FROM subject_titles WHERE guild_id=? AND title=? COLLATE NOCASE LIMIT 1').get(ctx.gid, sc.title); } catch {}
+      if (!known) note(sc.line, `Scene \`${sc.scene}\` grants the title **${sc.title}**, which nobody holds yet — it will be a new one.`);
+    }
+  }
+  if (tally && scenes.some(sc => sc.gain) && !scenes.some(sc => sc.cashTally)) note(scenes[0].line, `The ${tally} tally is gained but no \`END TALLY\` ever pays it out.`);
+  if (scenes.length > 150) note(scenes[0].line, `${scenes.length} scenes — a run is capped at ${ACTIVITY_MAX_STEPS} steps.`);
 }
 
 // Change one part of one scene without re-pasting the whole activity. Values
 // use the same grammar as the script itself, so a GM edits with the syntax they
 // already wrote in — and every branch target is checked before anything saves,
 // exactly as a full paste is, so an edit can't strand a run.
-function applySceneEdit(gid, story, scene, field, raw) {
+function applySceneEdit(gid, story, scene, field, raw, opts = {}) {
   const sc = getScene(gid, story, scene);
   if (!sc) return { error: `**${story}** has no scene \`${scene}\`.` };
   const value = String(raw ?? '').trim();
@@ -16882,6 +17895,9 @@ function applySceneEdit(gid, story, scene, field, raw) {
   }
 
   const keys = Object.keys(upd);
+  // Since the script became the truth (2026-10-20) the rows are never written
+  // here: the caller renders the changed row back into the script and saves that.
+  if (opts.dry) return { scene: sc.scene, changed: keys, row: { ...sc, ...upd } };
   db.prepare(`UPDATE story_scenes SET ${keys.map(k => `${k}=?`).join(',')} WHERE guild_id=? AND story=? COLLATE NOCASE AND scene=? COLLATE NOCASE`)
     .run(...keys.map(k => upd[k]), gid, story, sc.scene);
   return { scene: sc.scene, changed: keys };
@@ -16894,15 +17910,33 @@ function saveStory(gid, uid, parsed) {
     .run(gid, parsed.name, uid, parsed.start, parsed.tally ?? null, Date.now());
   try { db.prepare('UPDATE stories SET quiz_mode=? WHERE guild_id=? AND name=?').run(parsed.quizMode ?? null, gid, parsed.name); } catch {}
   const ins = db.prepare(`INSERT INTO story_scenes
-    (guild_id, story, scene, say, npc, roll, dc, outcomes, ranges, choices, gauntlet, nat20, nat1, gain, cash_tally, ending, merits, rewards, ord, ask, answers, right_to, wrong_to, hint)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-  parsed.scenes.forEach((sc, i) => ins.run(gid, parsed.name, sc.scene, sc.say || null, sc.npc, sc.roll, sc.dc ?? null,
-    JSON.stringify(sc.outcomes), JSON.stringify(sc.ranges || []), JSON.stringify(sc.choices || []),
-    sc.gauntlet ? JSON.stringify(sc.gauntlet) : null,
-    sc.nat20 ? JSON.stringify(sc.nat20) : null, sc.nat1 ? JSON.stringify(sc.nat1) : null,
-    sc.gain || 0, sc.cashTally || 0, sc.ending, sc.merits, sc.rewards, i,
-    sc.ask ? 1 : 0, sc.answers?.length ? JSON.stringify(sc.answers) : null,
-    sc.right || null, sc.wrong || null, sc.hint || null));
+    (guild_id, story, scene, say, npc, roll, dc, outcomes, ranges, choices, gauntlet, nat20, nat1, gain, cash_tally, ending, merits, rewards, ord, ask, answers, right_to, wrong_to, hint, qid, explain, image, logic, grants)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  parsed.scenes.forEach((sc, i) => {
+    const logic = {};
+    if (sc.sets?.length) logic.sets = sc.sets;
+    if (sc.unsets?.length) logic.unsets = sc.unsets;
+    if (sc.ifs?.length) logic.ifs = sc.ifs;
+    if (sc.nextmode) logic.nextmode = sc.nextmode;
+    if (sc.random?.length) logic.random = sc.random;
+    if (sc.dcword) logic.dcword = sc.dcword;
+    const grants = {};
+    if (sc.title) grants.title = sc.title;
+    if (sc.heal) grants.heal = sc.heal;
+    if (sc.quest) grants.quest = sc.quest;
+    if (sc.once) grants.once = 1;
+    ins.run(gid, parsed.name, sc.scene, sc.say || null, sc.npc, sc.roll, sc.dc ?? null,
+      JSON.stringify(sc.outcomes), JSON.stringify(sc.ranges || []), JSON.stringify(sc.choices || []),
+      sc.gauntlet ? JSON.stringify(sc.gauntlet) : null,
+      sc.nat20 ? JSON.stringify(sc.nat20) : null, sc.nat1 ? JSON.stringify(sc.nat1) : null,
+      sc.gain || 0, sc.cashTally || 0, sc.ending, sc.merits, sc.rewards, i,
+      sc.ask ? 1 : 0, sc.answers?.length ? JSON.stringify(sc.answers) : null,
+      sc.right || null, sc.wrong || null, sc.hint || null,
+      sc.qid ?? null, sc.explain || null, sc.image || null,
+      Object.keys(logic).length ? JSON.stringify(logic) : null, Object.keys(grants).length ? JSON.stringify(grants) : null);
+  });
+  try { db.prepare('UPDATE stories SET cooldown=?, available=?, require_json=? WHERE guild_id=? AND name=?')
+    .run(parsed.cooldown || null, parsed.available ? parsed.available.join(',') : null, parsed.require?.length ? JSON.stringify(parsed.require) : null, gid, parsed.name); } catch {}
   return listScenes(gid, parsed.name).length;
 }
 
@@ -17123,12 +18157,88 @@ function sameAnswer(given, wanted) {
   return tidy(given) === tidy(wanted);
 }
 
+// ── Runs: solo and party ───────────────────────────────────────────────────
+// A run is one player's, keyed by their id — or a party's, keyed by the
+// word `party`: one per channel, everyone named in it pressing in turn,
+// one tally, every member paid at the end.
+const PARTY_KEY = 'party';
+const isPartyRun = (run) => !!run && run.user_id === PARTY_KEY;
+function partyMembers(run) {
+  if (!isPartyRun(run)) return run ? [run.user_id] : [];
+  try { return JSON.parse(run.members || '[]') || []; } catch { return []; }
+}
+// Whose turn it is in a party run; the lone player in their own.
+function whoseTurn(run) {
+  const m = partyMembers(run);
+  if (!m.length) return null;
+  return isPartyRun(run) ? m[(Number(run.turn) || 0) % m.length] : m[0];
+}
+// The tally's key: one shared pot for a party, their own for a player.
+const tallyKeyOf = (run) => isPartyRun(run) ? PARTY_KEY : run.user_id;
+// Flags and the next-roll tilt live in the same JSON as the tally, under
+// keys no user id can collide with.
+const flagsOf = (st) => (st && typeof st._flags === 'object' && st._flags) || {};
+
+// The ledger: what happened, for the shelf's figures and the chronicle.
+function logRun(gid, { story, uid, cid = null, scene = null, kind, band = null, total = null, score = null, runMs = null }) {
+  try {
+    db.prepare(`INSERT INTO story_run_log (guild_id, story, user_id, channel_id, scene, kind, band, total, score, at, run_ms)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(gid, liveName(story), String(uid), cid, scene, kind, band, total, score, Date.now(), runMs);
+  } catch {}
+}
+const runAge = (run) => Math.max(0, Date.now() - (Number(run?.started_at) || Date.now()));
+
+// What an ending hands out, to one person. `once` pays only the first time.
+function payEnding(gid, uid, run, sc, tallyName, banked, lines) {
+  const grants = (() => { try { return JSON.parse(sc.grants || '{}') || {}; } catch { return {}; } })();
+  const cashing = !!(sc.cash_tally && tallyName);
+  // Coming home empty-handed from a trip that pays out earns nothing at all —
+  // not the rewards, and not the merits for turning up. An ending that has no
+  // tally to cash still awards its merits, since there was nothing to catch.
+  const emptyHanded = cashing && banked === 0;
+  let claimed = false;
+  if (grants.once) {
+    try { claimed = !!db.prepare('SELECT 1 FROM story_claims WHERE guild_id=? AND story=? AND user_id=?').get(gid, liveName(run.story), uid); } catch {}
+    // The claim is spent only by an ending that pays — an empty pot leaves it.
+    if (!claimed && !emptyHanded) { try { db.prepare('INSERT OR IGNORE INTO story_claims (guild_id, story, user_id, at) VALUES (?,?,?,?)').run(gid, liveName(run.story), uid, Date.now()); } catch {} }
+  }
+  if (claimed) { lines.push(`🔁 <@${uid}> has finished this before — this ending pays once.`); return; }
+  if (sc.merits > 0 && !emptyHanded) {
+    addMerits(gid, uid, sc.merits);
+    lines.push(`🏅 **${sc.merits} merit${sc.merits === 1 ? '' : 's'}** to <@${uid}>.`);
+  }
+  if (cashing) {
+    if (banked) {
+      const bal = addRenown(gid, uid, banked, `${liveName(run.story)}`);
+      lines.push(`💠 **${tallyName}** earned — <@${uid}> **+${banked}**${bal !== null ? ` (now ${bal})` : ''}`);
+    } else {
+      lines.push(`💠 Nothing to show for it — no ${tallyName}${sc.merits > 0 ? ' and no merits' : ''} this time.`);
+    }
+  }
+  if (!emptyHanded) {
+    if (grants.title) { grantTitle(gid, uid, grants.title, { source: `activity: ${liveName(run.story)}` }); lines.push(`🏷️ <@${uid}> is now **${grants.title}**.`); }
+    if (grants.heal) {
+      const max = getConfig(gid)?.heal_charges ?? 3;
+      const cur = getHealCharges(gid, uid, max)?.current ?? 0;
+      setHealCharges(gid, uid, Math.min(max, cur + grants.heal));
+      lines.push(`💚 <@${uid}> gains ${grants.heal} heal charge${grants.heal === 1 ? '' : 's'} (${Math.min(max, cur + grants.heal)}/${max}).`);
+    }
+    if (sc.rewards) lines.push(`🎁 **For the GM to hand out:** ${sc.rewards}`);
+  }
+}
+
 // Render one scene: narration, then whatever it asks for — a roll (with the
-// stats it accepts), a plain choice of buttons, or an ending.
+// stats it accepts), a plain choice of buttons, a typed answer, or an ending.
 async function postScene(guild, cid, run, sc) {
   const gid = guild.id;
   const owner = run.user_id;
-  const ownerName = await getDisplayName(guild, owner);
+  const party = isPartyRun(run);
+  const members = partyMembers(run);
+  const turnUid = whoseTurn(run) || owner;
+  const ownerName = party
+    ? `Party — ${(await Promise.all(members.map(m => getDisplayName(guild, m)))).join(', ')}`
+    : await getDisplayName(guild, owner);
   const channel = await guild.client.channels.fetch(cid);
   const lines = [];
   if (sc.say) lines.push(sc.say);
@@ -17139,41 +18249,41 @@ async function postScene(guild, cid, run, sc) {
     try {
       const npc = getNpc(gid, sc.npc);
       const hook = await npcWebhookIn(channel, gid, sc.npc, npcFace(gid, npc));
-      if (hook) { await hook.send({ content: sc.say }); lines.length = 0; }
+      if (hook) { await hook.send({ content: sc.say, allowedMentions: { parse: [] } }); lines.length = 0; }
     } catch (err) { console.error('[activity] npc voice failed:', err?.message || err); }
   }
+  if (sc.image) lines.push(sc.image);
 
   const story = getStory(gid, run.story);
   const tallyName = story?.tally || null;
   const tallyState = JSON.parse(run.tally_state || '{}');
+  const practice = !!(run.practice || run.is_demo);
 
   if (sc.ending) {
     lines.push('', '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    // The tally belongs to whoever played this run.
-    const cashing = !!(sc.cash_tally && tallyName);
-    const banked = cashing ? (tallyState[owner] || 0) : 0;
-    // Coming home empty-handed from a trip that pays out earns nothing at all —
-    // not the rewards, and not the merits for turning up. An ending that has no
-    // tally to cash still awards its merits, since there was nothing to catch.
-    const emptyHanded = cashing && banked === 0;
-
-    if (sc.merits > 0 && !emptyHanded) {
-      addMerits(gid, owner, sc.merits);
-      lines.push(`🏅 **${sc.merits} merit${sc.merits === 1 ? '' : 's'}** to <@${owner}>.`);
-    }
-    if (cashing) {
-      if (banked) {
-        const bal = addRenown(gid, owner, banked, `${run.story}`);
-        lines.push(`💠 **${tallyName}** earned — <@${owner}> **+${banked}**${bal !== null ? ` (now ${bal})` : ''}`);
-      } else {
-        lines.push(`💠 Nothing to show for it — no ${tallyName}${sc.merits > 0 ? ' and no merits' : ''} this time.`);
+    const banked = (sc.cash_tally && tallyName) ? (tallyState[tallyKeyOf(run)] || 0) : 0;
+    if (practice) {
+      const bits = [];
+      if (sc.merits) bits.push(`${sc.merits} merits`);
+      if (sc.cash_tally && tallyName) bits.push(`${banked} ${tallyName}`);
+      const g = (() => { try { return JSON.parse(sc.grants || '{}') || {}; } catch { return {}; } })();
+      if (g.title) bits.push(`the title ${g.title}`);
+      if (g.heal) bits.push(`${g.heal} heal charge${g.heal === 1 ? '' : 's'}`);
+      if (sc.rewards) bits.push(sc.rewards);
+      lines.push(`🧪 **Practice** — nothing awarded${bits.length ? `; a real run would pay ${bits.join(', ')}` : ''}.`);
+    } else {
+      for (const uid of members) payEnding(gid, uid, run, sc, tallyName, banked, lines);
+      if (sc.grants) {
+        let g = {}; try { g = JSON.parse(sc.grants || '{}') || {}; } catch {}
+        if (g.quest) { try { noteQuestActivity(gid, cid, 'activity', `${liveName(run.story)}: ${g.quest}`, owner === PARTY_KEY ? null : owner); } catch {} }
       }
     }
-    if (sc.rewards && !emptyHanded) lines.push(`🎁 **For the GM to hand out:** ${sc.rewards}`);
     // A run that asked questions reads out its score.
+    let score = banked || null;
     if (run.quiz_asked) {
       const r = run.quiz_right ?? 0, n = run.quiz_asked;
       const pct = Math.round((r / n) * 100);
+      score = r;
       lines.push(`📝 **Score: ${r}/${n}** (${pct}%)${pct === 100 ? ' — not one wrong.' : pct >= 50 ? '' : ' — worth another go.'}`);
       // A silent quiz says nothing until now — so here is the whole paper,
       // marked: what was asked, what they said, and why.
@@ -17193,39 +18303,48 @@ async function postScene(guild, cid, run, sc) {
       if (st?.quiz_pass) {
         const passed = r >= st.quiz_pass;
         lines.push(passed ? `✅ **Passed** — ${st.quiz_pass} were needed.` : `❌ **Not this time** — ${st.quiz_pass} were needed.`);
-        if (passed && st.quiz_merit) {
-          addMerits(gid, owner, st.quiz_merit);
-          lines.push(`🏅 **${st.quiz_merit} merit${st.quiz_merit === 1 ? '' : 's'}** to <@${owner}> for passing.`);
+        if (passed && st.quiz_merit && !practice) {
+          for (const uid of members) { addMerits(gid, uid, st.quiz_merit); lines.push(`🏅 **${st.quiz_merit} merit${st.quiz_merit === 1 ? '' : 's'}** to <@${uid}> for passing.`); }
         }
       }
     }
+    if (!practice && !run.is_demo) for (const uid of members) logRun(gid, { story: run.story, uid, cid, scene: sc.scene, kind: 'end', score, runMs: runAge(run) });
     endRun(gid, cid, owner);
     await sendLong(channel, [`🎮 **${ownerName}**`, ...lines]);
     return;
   }
 
   const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  const turnLine = party ? `_<@${turnUid}> — your turn._` : null;
   // A question waits for a typed answer rather than a button of options.
   if (sc.ask) {
     const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`storyask:${run.user_id}:${sc.scene}`)
+      new ButtonBuilder().setCustomId(`storyask:${owner}:${sc.scene}`)
         .setLabel('✍️ Answer').setStyle(ButtonStyle.Primary));
     const q = [...lines];
     if (sc.hint) q.push(`_💡 ${sc.hint}_`);
-    await postWithButtons(channel, [`🎮 **${ownerName}**`, ...q], row);
+    if (turnLine) q.push(turnLine);
+    await postWithButtons(channel, [`🎮 **${ownerName}**`, ...q], [row]);
     return;
   }
   const choices = JSON.parse(sc.choices || '[]');
   if (choices.length) {
     const row = new ActionRowBuilder().addComponents(...choices.slice(0, 5).map((c, k) =>
       new ButtonBuilder().setCustomId(`storypick:${owner}:${sc.scene}:${k}`).setLabel(c.label.slice(0, 78)).setStyle(ButtonStyle.Secondary)));
-    await postWithButtons(channel, [`🎮 **${ownerName}**`, ...lines], row);
+    if (turnLine) lines.push('', turnLine);
+    await postWithButtons(channel, [`🎮 **${ownerName}**`, ...lines], [row]);
     return;
   }
 
   // A roll. Offer one button per stat the scene accepts, and say what's needed.
   const gauntlet = sc.gauntlet ? JSON.parse(sc.gauntlet) : null;
   let stepStats = String(sc.roll || '');
+  if (!stepStats && !gauntlet) {
+    // Nothing to ask — a scene that only routed and found nowhere to go.
+    endRun(gid, cid, owner);
+    await sendLong(channel, [`🎮 **${ownerName}**`, ...lines, '', `🛑 **${liveName(run.story)}** has nowhere to go from \`${sc.scene}\` — the run has stopped.`]);
+    return;
+  }
   if (gauntlet) {
     const step = Number(run.gauntlet_at) || 0;
     const g = gauntlet[step] || {};
@@ -17236,33 +18355,55 @@ async function postScene(guild, cid, run, sc) {
   } else {
     lines.push('', '🎲 Roll.');
   }
+  const tilt = tallyState._next;
+  if (tilt) lines.push(`_${tilt === 'adv' ? '⬆️ With advantage' : '⬇️ With disadvantage'} — the last scene tilted this roll._`);
+  if (turnLine) lines.push(turnLine);
   const stats = stepStats.split('|').filter(Boolean);
   const names = stats.map(x => (resolveStatWord(x) || x).toUpperCase());
-  lines.push(`_<@${owner}> — press a button, or type **${names[0].toLowerCase()}** and add your own flavour `
+  lines.push(`_<@${turnUid}> — press a button, or type **${names[0].toLowerCase()}** and add your own flavour `
     + `after it: \`${names[0].toLowerCase()} I cast into the deep pools\`._`
     + (names.length > 1 ? `\n_This step takes ${names.join(', ')}._` : ''));
-  const row = new ActionRowBuilder().addComponents(...stats.slice(0, 5).map(st =>
+  const rows = [new ActionRowBuilder().addComponents(...stats.slice(0, 5).map(st =>
     new ButtonBuilder().setCustomId(`storyroll:${owner}:${sc.scene}:${st}`)
-      .setLabel(`Roll ${(resolveStatWord(st) || st).toUpperCase()}`).setStyle(ButtonStyle.Primary)));
-  await postWithButtons(channel, [`🎮 **${ownerName}**`, ...lines], row);
+      .setLabel(`Roll ${(resolveStatWord(st) || st).toUpperCase()}`).setStyle(ButtonStyle.Primary)))];
+  // Practice proofs every band without waiting on luck.
+  if (run.practice) {
+    const st0 = stats[0] || 'str';
+    const forces = sc.dc || gauntlet ? ['nat1', 'fail', 'pass', 'nat20'] : JSON.parse(sc.ranges || '[]').length ? ['nat1', 'low', 'high', 'nat20'] : ['nat1', 'fail', 'partial', 'pass', 'nat20'];
+    const label = { nat1: '💀 Force nat 1', fail: '❌ Force fail', partial: '⚡ Force partial', pass: '✅ Force pass', nat20: '🌟 Force nat 20', low: '🔢 Lowest range', high: '🔢 Highest range' };
+    rows.push(new ActionRowBuilder().addComponents(...forces.map(f =>
+      new ButtonBuilder().setCustomId(`storyforce:${owner}:${sc.scene}:${st0}:${f}`).setLabel(label[f]).setStyle(ButtonStyle.Secondary))));
+  }
+  await postWithButtons(channel, [`🎮 **${ownerName}**`, ...lines], rows);
 }
 
 // Send the narration, hanging the buttons off the final chunk.
-async function postWithButtons(channel, lines, row) {
+async function postWithButtons(channel, lines, rows) {
   const chunks = chunkLines(lines.length ? lines : ['…']);
   for (const c of chunks.slice(0, -1)) await channel.send(c).catch(()=>{});
-  await channel.send({ content: chunks[chunks.length - 1], components: [row] }).catch(()=>{});
+  await channel.send({ content: chunks[chunks.length - 1], components: Array.isArray(rows) ? rows : [rows] }).catch(()=>{});
 }
 
 // Shared guard: is there a live run here, still on the scene this button came
-// from, and may this person take part?
+// from, and may this person take part? A party run answers to whoever's
+// turn it is; a player's run only to them.
 function activeSceneFor(interaction, owner, sceneName) {
   const gid = interaction.guild.id, cid = interactionChannelId(interaction), uid = interaction.user.id;
-  // Runs are per-player, so a button only answers for the person it belongs to.
-  // Everyone can watch; only its owner can act on it.
-  if (owner && owner !== uid) return { error: '🎮 That is someone else\'s run. Start your own with `/activity run`.' };
-  const run = getRun(gid, cid, uid);
-  if (!run) return { error: '❌ You have nothing running here. Start one with `/activity run`.' };
+  let run;
+  if (owner === PARTY_KEY) {
+    run = getRun(gid, cid, PARTY_KEY);
+    if (!run) return { error: '❌ The party run here has ended.' };
+    const members = partyMembers(run);
+    if (!members.includes(uid)) return { error: '🎮 That is the party\'s run, and you are not in it.' };
+    const turn = whoseTurn(run);
+    if (turn !== uid) return { error: `⏳ It is <@${turn}>'s turn.` };
+  } else {
+    // Runs are per-player, so a button only answers for the person it belongs to.
+    // Everyone can watch; only its owner can act on it.
+    if (owner && owner !== uid) return { error: '🎮 That is someone else\'s run. Start your own with `/activity run`.' };
+    run = getRun(gid, cid, uid);
+    if (!run) return { error: '❌ You have nothing running here. Start one with `/activity run`.' };
+  }
   if (String(run.scene).toLowerCase() !== String(sceneName).toLowerCase()) {
     return { error: '⏰ That moment has already passed.' };
   }
@@ -17271,14 +18412,16 @@ function activeSceneFor(interaction, owner, sceneName) {
   const ch = getChar(gid, uid);
   if (!ch) return { error: '❌ You need a character sheet to take part — `/char create`.' };
   const sc = getScene(gid, run.story, run.scene);
-  if (!sc) { endRun(gid, cid, uid); return { error: '❌ That scene has gone missing; the run has stopped.' }; }
-  return { gid, cid, uid, run, ch, sc };
+  if (!sc) { endRun(gid, cid, run.user_id); return { error: '❌ That scene has gone missing; the run has stopped.' }; }
+  return { gid, cid, uid, rk: run.user_id, run, ch, sc };
 }
 
-async function advance(io, ctx, nextName, tallyState, gauntletAt = 0) {
-  const { gid, cid, uid, run } = ctx;
+// Move to the next scene: the step cap, then arrival. The pause before the
+// post is here, not in arrival, so the first scene of a run comes at once.
+async function advance(io, ctx, nextName, tallyState, gauntletAt = 0, hops = 0, opts = {}) {
+  const { gid, cid, uid, rk, run } = ctx;
   const next = getScene(gid, run.story, nextName);
-  if (!next) { endRun(gid, cid, uid); return; }
+  if (!next) { endRun(gid, cid, rk); return; }
 
   // A looping activity is the point, but nothing loops for ever. Past the cap
   // the run is closed out where it stands — the tally still pays, so a long
@@ -17287,23 +18430,74 @@ async function advance(io, ctx, nextName, tallyState, gauntletAt = 0) {
   const steps = (Number(run.steps) || 0) + 1;
   if (steps > ACTIVITY_MAX_STEPS) {
     const story = getStory(gid, run.story);
-    const banked = tallyState[uid] || 0;
-    if (banked && story?.tally) addRenown(gid, uid, banked, `${run.story} (ran long)`);
-    endRun(gid, cid, uid);
+    const key = tallyKeyOf(run);
+    const banked = tallyState[key] || 0;
+    const members = partyMembers(run);
+    if (banked && story?.tally && !run.practice && !run.is_demo) for (const m of members) addRenown(gid, m, banked, `${liveName(run.story)} (ran long)`);
+    for (const m of members) logRun(gid, { story: run.story, uid: m, cid, scene: run.scene, kind: 'cap', runMs: runAge(run) });
+    endRun(gid, cid, rk);
     try {
       const ch = await io.guild.client.channels.fetch(cid);
-      await ch?.send(`🛑 **${run.story}** has run ${ACTIVITY_MAX_STEPS} scenes and been closed out.`
-        + (banked ? ` <@${uid}> keeps **${banked}** ${story.tally}.` : ''));
+      await ch?.send(`🛑 **${liveName(run.story)}** has run ${ACTIVITY_MAX_STEPS} scenes and been closed out.`
+        + (banked ? ` ${members.map(m => `<@${m}>`).join(', ')} keep${members.length === 1 ? 's' : ''} **${banked}** ${story.tally}.` : ''));
     } catch {}
     return;
   }
 
-  // Credit the arriving scene's GAIN to whoever got them there.
-  if (next.gain) tallyState[uid] = (tallyState[uid] || 0) + next.gain;
-  const updated = setRun(gid, cid, uid, { scene: next.scene,
-    tally_state: JSON.stringify(tallyState), gauntlet_at: gauntletAt, steps });
+  // The turn passes on a press; a retried question keeps it.
+  const turn = isPartyRun(run) ? (Number(run.turn) || 0) + (opts.keepTurn ? 0 : 1) : 0;
+  const stepped = setRun(gid, cid, rk, { steps, turn });
   await new Promise(r => setTimeout(r, 900));
+  return arrive(io, { ...ctx, run: stepped }, next, tallyState, gauntletAt, hops);
+}
+// Arrive at a scene: credit its GAIN, apply what it sets, follow an IF or a
+// RANDOM fork, and post it. Routing scenes chain, each a step toward the
+// cap. The first scene of a run comes through here too, so a script may
+// open on a fork, a flag or a gain.
+async function arrive(io, ctx, next, tallyState, gauntletAt = 0, hops = 0) {
+  const { gid, cid, uid, rk, run } = ctx;
+  // Credit the arriving scene's GAIN to the pot — the party's, or theirs —
+  // before any routing, so a fork that pays still pays.
+  if (next.gain) { const key = tallyKeyOf(run); tallyState[key] = (tallyState[key] || 0) + next.gain; }
+  // Flags, forks and tilts — the scene's logic, applied on arrival.
+  let logic = {};
+  try { logic = JSON.parse(next.logic || '{}') || {}; } catch {}
+  const flags = { ...flagsOf(tallyState) };
+  for (const f of logic.sets || []) flags[f] = 1;
+  for (const f of logic.unsets || []) delete flags[f];
+  tallyState._flags = flags;
+  if (logic.nextmode) tallyState._next = logic.nextmode;
+  const updated = setRun(gid, cid, rk, { scene: next.scene, tally_state: JSON.stringify(tallyState), gauntlet_at: gauntletAt });
+  const route = (() => {
+    for (const x of logic.ifs || []) if (conditionMet(gid, uid, x, tallyState, run)) return x.next;
+    if (logic.random?.length) return logic.random[Math.floor(Math.random() * logic.random.length)];
+    return null;
+  })();
+  if (route) {
+    // The scene's own words, if any, are said on the way through.
+    if (next.say && hops < 25) {
+      try { const ch = await io.guild.client.channels.fetch(cid); await sendLong(ch, [next.say]); } catch {}
+    }
+    if (hops >= 25) { endRun(gid, cid, rk); try { const ch = await io.guild.client.channels.fetch(cid); await ch?.send(`🛑 **${liveName(run.story)}** routed through twenty-five scenes without stopping and has been closed out.`); } catch {} return; }
+    const nextSc = getScene(gid, run.story, route);
+    if (!nextSc) { endRun(gid, cid, rk); return; }
+    const steps = (Number(updated.steps) || 0) + 1;
+    if (steps > ACTIVITY_MAX_STEPS) return advance(io, { ...ctx, run: updated }, route, tallyState, 0, hops + 1);
+    // The turn does not pass on a routing scene — nobody pressed anything.
+    return arrive(io, { ...ctx, run: setRun(gid, cid, rk, { steps }) }, nextSc, tallyState, 0, hops + 1);
+  }
   await postScene(io.guild, cid, updated, next);
+}
+// An IF or REQUIRE condition, for this person in this run.
+function conditionMet(gid, uid, c, tallyState = {}, run = null) {
+  if (c.title) return getTitles(gid, uid).some(t => t.title.toLowerCase() === String(c.title).toLowerCase());
+  if (c.cmp) {
+    const v = c.cmp.what === 'tally' ? (run ? (tallyState[tallyKeyOf(run)] || 0) : 0)
+            : c.cmp.what === 'merits' ? getMerits(gid, uid) : getRenown(gid, uid);
+    return compareOk(c.cmp, v);
+  }
+  if (c.flag) { const has = !!flagsOf(tallyState)[c.flag]; return c.not ? !has : has; }
+  return false;
 }
 
 // A plain choice — no dice, just a fork.
@@ -17311,10 +18505,10 @@ async function handleStoryPickButton(interaction) {
   const [, owner, sceneName, idx] = interaction.customId.split(':');
   const ctx = activeSceneFor(interaction, owner, sceneName);
   if (ctx.error) return interaction.reply({ content: ctx.error, ephemeral: true });
-  if (!claimRun(ctx.gid, ctx.cid, ctx.uid)) return interaction.reply({ content: '⏳ Still working on your last one.', ephemeral: true });
+  if (!claimRun(ctx.gid, ctx.cid, ctx.rk)) return interaction.reply({ content: '⏳ Still working on your last one.', ephemeral: true });
   const choices = JSON.parse(ctx.sc.choices || '[]');
   const pick = choices[Number(idx)];
-  if (!pick) return interaction.reply({ content: '❌ That option has gone.', ephemeral: true });
+  if (!pick) { releaseRun(ctx.gid, ctx.cid, ctx.rk); return interaction.reply({ content: '❌ That option has gone.', ephemeral: true }); }
   const name = await getDisplayName(interaction.guild, ctx.uid);
 
   // A question is any CHOICE with a right answer marked. Score it, say so,
@@ -17323,13 +18517,13 @@ async function handleStoryPickButton(interaction) {
   let next = pick.next, verdict = '';
   if (marked) {
     const right = !!pick.correct;
-    setRun(ctx.gid, ctx.cid, ctx.uid, {
+    setRun(ctx.gid, ctx.cid, ctx.rk, {
       quiz_asked: (ctx.run.quiz_asked ?? 0) + 1,
       quiz_right: (ctx.run.quiz_right ?? 0) + (right ? 1 : 0),
     });
     const quizMode = quizModeOf(ctx.gid, ctx.run.story);
     noteQuizSeen(ctx.gid, ctx.uid, ctx.sc, right);
-    noteQuizAnswer(ctx.gid, ctx.cid, ctx.uid, ctx.run,
+    noteQuizAnswer(ctx.gid, ctx.cid, ctx.rk, ctx.run,
       { question: ctx.sc.say, given: pick.label, right, explain: ctx.sc.explain });
     if (quizMode === 'silent') {
       // Nothing given away — not even by the shape of the reply.
@@ -17343,15 +18537,14 @@ async function handleStoryPickButton(interaction) {
       verdict += ' — _try that one again._';
     }
   }
+  if (!ctx.run.practice && !ctx.run.is_demo) logRun(ctx.gid, { story: ctx.run.story, uid: ctx.uid, cid: ctx.cid, scene: ctx.sc.scene, kind: 'pick', band: marked ? (pick.correct ? 'RIGHT' : 'WRONG') : pick.label.slice(0, 40) });
   await interaction.reply({ content: `➡️ **${name}** — ${pick.label}${verdict}` });
   try { await interaction.message.edit({ components: [] }); } catch {}
   try {
-    await advance({ guild: interaction.guild }, ctx, next, JSON.parse(ctx.run.tally_state || '{}'), 0);
-  } finally { releaseRun(ctx.gid, ctx.cid, ctx.uid); }
+    await advance({ guild: interaction.guild }, ctx, next, JSON.parse(ctx.run.tally_state || '{}'), 0, 0, { keepTurn: next === sceneName });
+  } finally { releaseRun(ctx.gid, ctx.cid, ctx.rk); }
 }
 
-// A roll. Anyone in the channel may answer; the only gate is that the run is
-// still on this scene.
 // The stats a scene will accept right now — a gauntlet narrows to the current
 // step, everything else offers whatever the ROLL line listed.
 function sceneStats(sc, run) {
@@ -17363,16 +18556,17 @@ function sceneStats(sc, run) {
 // Spend a reroll on the result just posted. One per roll — the reroll's own
 // result stands, so this button is never offered again for it.
 async function handleStoryRerollButton(interaction) {
-  const [, owner, scene, statWord] = interaction.customId.split(':');
+  const [, roller, owner, scene, statWord] = interaction.customId.split(':');
+  if (interaction.user.id !== roller) return interaction.reply({ content: '🎮 That roll was someone else\'s to reroll.', ephemeral: true });
   const ctx = activeSceneFor(interaction, owner, scene);
   if (ctx.error) return interaction.reply({ content: ctx.error, ephemeral: true });
-  const { gid, cid, uid, ch, run } = ctx;
-  if (!claimRun(gid, cid, uid)) return interaction.reply({ content: '⏳ Still working on your last one.', ephemeral: true });
-  // A demo is a dry run — it should not quietly drain a player's real rerolls
-  // just because they wanted to see what the button does.
-  const dry = !!run?.is_demo;
+  const { gid, cid, uid, rk, ch, run } = ctx;
+  if (!claimRun(gid, cid, rk)) return interaction.reply({ content: '⏳ Still working on your last one.', ephemeral: true });
+  // A demo or a practice is a dry run — it should not quietly drain a player's
+  // real rerolls just because they wanted to see what the button does.
+  const dry = !!(run?.is_demo || run?.practice);
   if (!dry) {
-    if ((ch.rerolls_current ?? 0) <= 0) return interaction.reply({ content: '❌ No rerolls remaining.', ephemeral: true });
+    if ((ch.rerolls_current ?? 0) <= 0) { releaseRun(gid, cid, rk); return interaction.reply({ content: '❌ No rerolls remaining.', ephemeral: true }); }
     upsertChar(gid, uid, { rerolls_current: ch.rerolls_current - 1 });
   }
   try { await interaction.message.edit({ components: [] }); } catch {}
@@ -17383,42 +18577,58 @@ async function handleStoryRerollButton(interaction) {
       reply: async (c) => { await interaction.reply(asPayload(c)); },
       interaction,
     }, true);
-  } finally { releaseRun(gid, cid, uid); }
+  } finally { releaseRun(gid, cid, rk); }
 }
 
 // Take the result as it stands and move on.
 async function handleStoryCarryOnButton(interaction) {
-  const [, owner, next, gaAt] = interaction.customId.split(':');
+  const [, roller, owner, next, gaAt] = interaction.customId.split(':');
   const gid = interaction.guild.id, cid = interactionChannelId(interaction), uid = interaction.user.id;
-  if (owner !== uid) return interaction.reply({ content: '🎮 That is someone else\'s run.', ephemeral: true });
-  const run = getRun(gid, cid, uid);
+  if (roller !== uid) return interaction.reply({ content: '🎮 That is someone else\'s roll to carry.', ephemeral: true });
+  const run = getRun(gid, cid, owner === PARTY_KEY ? PARTY_KEY : uid);
   if (!run) return interaction.reply({ content: '❌ You have nothing running here.', ephemeral: true });
   const sc = getScene(gid, run.story, run.scene);
-  if (!sc) { endRun(gid, cid, uid); return interaction.reply({ content: '❌ That scene has gone missing.', ephemeral: true }); }
+  if (!sc) { endRun(gid, cid, run.user_id); return interaction.reply({ content: '❌ That scene has gone missing.', ephemeral: true }); }
   // Carry on advances the tale, so it needs the same one-at-a-time guard the
   // other buttons have — a double tap would otherwise skip a scene and credit
   // an arriving GAIN twice.
-  if (!claimRun(gid, cid, uid)) return interaction.reply({ content: '⏳ Still working on your last one.', ephemeral: true });
+  if (!claimRun(gid, cid, run.user_id)) return interaction.reply({ content: '⏳ Still working on your last one.', ephemeral: true });
   try {
     await interaction.reply({ content: '▶️ Onward.' });
     try { await interaction.message.edit({ components: [] }); } catch {}
-    await advance({ guild: interaction.guild }, { gid, cid, uid, run, ch: getChar(gid, uid), sc },
+    await advance({ guild: interaction.guild }, { gid, cid, uid, rk: run.user_id, run, ch: getChar(gid, uid), sc },
       next, JSON.parse(run.tally_state || '{}'), Number(gaAt) || 0);
-  } finally { releaseRun(gid, cid, uid); }
+  } finally { releaseRun(gid, cid, run.user_id); }
 }
 
 async function handleStoryRollButton(interaction) {
   const [, owner, sceneName, statWord] = interaction.customId.split(':');
   const ctx = activeSceneFor(interaction, owner, sceneName);
   if (ctx.error) return interaction.reply({ content: ctx.error, ephemeral: true });
-  if (!claimRun(ctx.gid, ctx.cid, ctx.uid)) return interaction.reply({ content: '⏳ Still working on your last one.', ephemeral: true });
+  if (!claimRun(ctx.gid, ctx.cid, ctx.rk)) return interaction.reply({ content: '⏳ Still working on your last one.', ephemeral: true });
   try {
     return await resolveActivityRoll(ctx, statWord, null, {
       guild: interaction.guild,
       reply: async (c) => { await interaction.reply(asPayload(c)); try { await interaction.message.edit({ components: [] }); } catch {} },
       interaction,
     });
-  } finally { releaseRun(ctx.gid, ctx.cid, ctx.uid); }
+  } finally { releaseRun(ctx.gid, ctx.cid, ctx.rk); }
+}
+// Practice only: the die is told what to show, so every band's words can be
+// read without waiting on luck.
+async function handleStoryForceButton(interaction) {
+  const [, owner, sceneName, statWord, what] = interaction.customId.split(':');
+  const ctx = activeSceneFor(interaction, owner, sceneName);
+  if (ctx.error) return interaction.reply({ content: ctx.error, ephemeral: true });
+  if (!ctx.run.practice) return interaction.reply({ content: '❌ Forcing a die is for practice runs only.', ephemeral: true });
+  if (!claimRun(ctx.gid, ctx.cid, ctx.rk)) return interaction.reply({ content: '⏳ Still working on your last one.', ephemeral: true });
+  try {
+    return await resolveActivityRoll(ctx, statWord, null, {
+      guild: interaction.guild,
+      reply: async (c) => { await interaction.reply(asPayload(c)); try { await interaction.message.edit({ components: [] }); } catch {} },
+      interaction,
+    }, false, what);
+  } finally { releaseRun(ctx.gid, ctx.cid, ctx.rk); }
 }
 
 // Answer the scene by typing instead of pressing: "wis I cast into the deep
@@ -17426,7 +18636,11 @@ async function handleStoryRollButton(interaction) {
 // message isn't an answer, so the normal roll handling carries on.
 async function tryActivityTypedRoll(message, content) {
   const gid = message.guild.id, cid = message.channel.id, uid = message.author.id;
-  const run = getRun(gid, cid, uid);
+  let run = getRun(gid, cid, uid);
+  if (!run) {
+    const party = getRun(gid, cid, PARTY_KEY);
+    if (party && whoseTurn(party) === uid) run = party;
+  }
   if (!run) return false;
   const sc = getScene(gid, run.story, run.scene);
   if (!sc || !sc.roll) return false;
@@ -17440,11 +18654,13 @@ async function tryActivityTypedRoll(message, content) {
   if (gate) { await replyQuietly(message, gate); return true; }
   const ch = getChar(gid, uid);
   if (!ch) { await message.reply('❌ You need a character sheet to take part — `/char create`.').catch(()=>{}); return true; }
-
-  await resolveActivityRoll({ gid, cid, uid, run, ch, sc }, stat, (m[2] || '').trim() || null, {
-    guild: message.guild,
-    reply: async (c) => { await message.reply(asPayload(c)).catch(()=>{}); },
-  });
+  if (!claimRun(gid, cid, run.user_id)) { await replyQuietly(message, '⏳ Still working on your last one.'); return true; }
+  try {
+    await resolveActivityRoll({ gid, cid, uid, rk: run.user_id, run, ch, sc }, stat, (m[2] || '').trim() || null, {
+      guild: message.guild,
+      reply: async (c) => { await message.reply(asPayload(c)).catch(()=>{}); },
+    });
+  } finally { releaseRun(gid, cid, run.user_id); }
   return true;
 }
 
@@ -17453,81 +18669,98 @@ async function tryActivityTypedRoll(message, content) {
 // an object where a string was expected was what broke the roll buttons.
 const asPayload = (c) => (typeof c === 'string' ? { content: c } : c);
 
-async function resolveActivityRoll(ctx, statWord, flavour, io, rerolled = false) {
-  const { gid, cid, uid, run, ch, sc } = ctx;
+async function resolveActivityRoll(ctx, statWord, flavour, io, rerolled = false, force = null) {
+  const { gid, cid, uid, rk, run, ch, sc } = ctx;
   const say = io.reply;
 
   const stat = resolveStatWord(statWord);
   const mod = stat ? (ch[stat] ?? 0) : 0;
-  const mode = applyNextMark(gid, uid, stat ? applySignatureMode(ch, stat, 'normal') : 'normal');
-  if (stat) noteHonestRoll(gid, uid);   // an ordinary stat roll re-arms deception
-  const result = mode === 'adv' ? rollAdvantage(`1d20+${mod}`)
-               : mode === 'dis' ? rollDisadvantage(`1d20+${mod}`)
-               : rollNotation(`1d20+${mod}`);
+  const tallyState = JSON.parse(run.tally_state || '{}');
+  // A tilt left by the last scene is spent on this roll, then forgotten.
+  const tilt = tallyState._next || null;
+  if (tilt) delete tallyState._next;
+  const mode = tilt || applyNextMark(gid, uid, stat ? applySignatureMode(ch, stat, 'normal') : 'normal');
+  if (stat && !force) noteHonestRoll(gid, uid);   // an ordinary stat roll re-arms deception
+  let result = mode === 'adv' ? rollAdvantage(`1d20+${mod}`)
+             : mode === 'dis' ? rollDisadvantage(`1d20+${mod}`)
+             : rollNotation(`1d20+${mod}`);
   if (!result) return say(`❌ \`${statWord}\` isn't a stat.`);
-  const nat = mode === 'normal' ? result.rolls?.[0] : result.chosen;
+  const gauntlet = sc.gauntlet ? JSON.parse(sc.gauntlet) : null;
+  const ranges = JSON.parse(sc.ranges || '[]');
+  if (force) {
+    // The die told what to show: a natural, or a total that lands in a band.
+    const need = gauntlet ? (gauntlet[Number(run.gauntlet_at) || 0]?.dc ?? 10) : (sc.dc || null);
+    let nat = 10;
+    if (force === 'nat1') nat = 1;
+    else if (force === 'nat20') nat = 20;
+    else if (force === 'low') nat = Math.max(2, Math.min(19, (ranges[0]?.lo ?? 2) - mod));
+    else if (force === 'high') nat = Math.max(2, Math.min(19, (ranges[ranges.length - 1]?.lo ?? 19) - mod));
+    else if (need) nat = Math.max(2, Math.min(19, need - mod + (force === 'pass' ? 0 : -1)));
+    else nat = force === 'pass' ? 16 : force === 'partial' ? 11 : 4;
+    result = { total: nat + mod, rolls: [nat], sides: 20, notation: `1d20+${mod}` };
+  }
+  const nat = force ? result.rolls[0] : (mode === 'normal' ? result.rolls?.[0] : result.chosen);
   const sides = result.sides ?? 20;
   const name = await getDisplayName(io.guild, uid);
   const label = (stat || statWord).toUpperCase();
 
-  recordRoll(gid, { userId: uid, channelId: cid, interaction: io.interaction ?? null, result,
-    input: `${run.story} · ${run.scene}`, rollLine: buildRollLine(result, mode, detectCrit(result, mode), null),
-    context: `activity roll (${label})` });
+  if (!force && !run.practice) {
+    recordRoll(gid, { userId: uid, channelId: cid, interaction: io.interaction ?? null, result,
+      input: `${liveName(run.story)} · ${run.scene}`, rollLine: buildRollLine(result, force ? 'normal' : mode, detectCrit(result, force ? 'normal' : mode), null),
+      context: `activity roll (${label})` });
+  }
 
   // GAIN is credited on arrival by advance(), not here, or a scene reached by a
   // choice would never pay and a scene with a roll would pay twice.
-  const tallyState = JSON.parse(run.tally_state || '{}');
-
-  const gauntlet = sc.gauntlet ? JSON.parse(sc.gauntlet) : null;
-  const ranges = JSON.parse(sc.ranges || '[]');
   const outcomes = JSON.parse(sc.outcomes || '{}');
   const nat20 = sc.nat20 ? JSON.parse(sc.nat20) : null;
   const nat1 = sc.nat1 ? JSON.parse(sc.nat1) : null;
-  const lines = [`🎲 **${name}** rolls **${label}**${rerolled ? ' *(reroll)*' : ''} — ${fightTotalStr(result.total, nat, sides)}`,
+  const lines = [`🎲 **${name}** rolls **${label}**${rerolled ? ' *(reroll)*' : ''}${force ? ' *(forced — practice)*' : ''}${tilt ? (tilt === 'adv' ? ' ⬆️' : ' ⬇️') : ''} — ${fightTotalStr(result.total, nat, sides)}`,
                  statLine(ch, gid)];
   if (flavour) lines.push('', `*${flavour}*`);
+  const noteBand = (band) => { if (!run.practice && !run.is_demo) logRun(gid, { story: run.story, uid, cid, scene: sc.scene, kind: 'roll', band, total: result.total }); };
 
   // Offer a second chance before the tale moves on. One reroll per roll, and
   // only if they have one to spend — otherwise it advances as before.
   const finish = async (text, next, gaAt = 0) => {
     if (text) lines.push('', text);
-    const dryRun = !!run?.is_demo;
-    const canReroll = next && !rerolled && (dryRun || (ch.rerolls_current ?? 0) > 0);
+    const dryRun = !!(run?.is_demo || run?.practice);
+    const canReroll = next && !rerolled && !force && (dryRun || (ch.rerolls_current ?? 0) > 0);
     if (canReroll) {
       const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
       const token = `${sc.scene}:${statWord}:${next}:${gaAt}`;
       const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`storyrr:${uid}:${token}`)
-          .setLabel(dryRun ? 'Reroll (free — demo)' : `Reroll (${ch.rerolls_current} left)`)
+        new ButtonBuilder().setCustomId(`storyrr:${uid}:${rk}:${token}`)
+          .setLabel(dryRun ? 'Reroll (free — practice)' : `Reroll (${ch.rerolls_current} left)`)
           .setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId(`storygo:${uid}:${next}:${gaAt}`)
+        new ButtonBuilder().setCustomId(`storygo:${uid}:${rk}:${next}:${gaAt}`)
           .setLabel('Carry on').setStyle(ButtonStyle.Primary),
       );
-      setRun(gid, cid, uid, { tally_state: JSON.stringify(tallyState) });
+      setRun(gid, cid, rk, { tally_state: JSON.stringify(tallyState) });
       await say({ content: lines.join('\n'), components: [row] });
       return;
     }
     await say(lines.join('\n'));
-    if (next) await advance(io, ctx, next, tallyState, gaAt);
-    else setRun(gid, cid, uid, { tally_state: JSON.stringify(tallyState) });
+    if (next) await advance(io, { ...ctx, run: setRun(gid, cid, rk, { tally_state: JSON.stringify(tallyState) }) }, next, tallyState, gaAt);
+    else setRun(gid, cid, rk, { tally_state: JSON.stringify(tallyState) });
   };
-  // A ONE OF block picks a different line each time, so a loop doesn't repeat.
   // A ONE OF block picks a different line each time, so a loop doesn't repeat.
   const pickText = (o) => (o?.variants?.length ? o.variants[Math.floor(Math.random() * o.variants.length)] : (o?.text || ''));
 
   // Natural 20 / 1 override everything else where the script defines them.
-  if (nat === sides && nat20) return finish(nat20.text, nat20.next, 0);
-  if (nat === 1 && nat1) return finish(nat1.text, nat1.next, 0);
+  if (nat === sides && nat20) { noteBand('NAT20'); return finish(nat20.text, nat20.next, 0); }
+  if (nat === 1 && nat1) { noteBand('NAT1'); return finish(nat1.text, nat1.next, 0); }
 
   if (gauntlet) {
     const step = Number(run.gauntlet_at) || 0;
     const need = gauntlet[step]?.dc ?? 0;
     if (result.total >= need) {
       const last = step + 1 >= gauntlet.length;
+      noteBand('PASS');
       if (!last) {
         lines.push('', `✅ **${result.total}** beats DC ${need} — it's still fighting. ${gauntlet.length - step - 1} to go.`);
         await say(lines.join('\n'));
-        const updated = setRun(gid, cid, uid, {
+        const updated = setRun(gid, cid, rk, {
           tally_state: JSON.stringify(tallyState), gauntlet_at: step + 1 });
         await new Promise(r => setTimeout(r, 700));
         return postScene(io.guild, cid, updated, sc);
@@ -17535,18 +18768,21 @@ async function resolveActivityRoll(ctx, statWord, flavour, io, rerolled = false)
       const o = outcomes.PASS;
       return finish(`✅ **${result.total}** beats DC ${need}. ${pickText(o)}`, o?.next, 0);
     }
+    noteBand('FAIL');
     const o = outcomes.FAIL;
     return finish(`❌ **${result.total}** misses DC ${need}. ${pickText(o)}`, o?.next, 0);
   }
 
   if (ranges.length) {
     const hit = ranges.find(r => result.total >= r.lo && result.total <= r.hi);
+    noteBand(hit ? `${hit.lo}-${hit.hi >= 9999 ? '' : hit.hi}` : 'MISS');
     if (hit) return finish(hit.text, hit.next, 0);
     return finish('*Nothing in the script covers that total.*', null);
   }
 
   if (sc.dc) {
     const band = result.total >= sc.dc ? 'PASS' : 'FAIL';
+    noteBand(band);
     const o = outcomes[band];
     if (!o) return finish('*That branch is missing from the script.*', null);
     return finish(`${band === 'PASS' ? '✅' : '❌'} **${result.total}** vs DC ${sc.dc}. ${pickText(o)}`, o.next, 0);
@@ -17554,42 +18790,264 @@ async function resolveActivityRoll(ctx, statWord, flavour, io, rerolled = false)
 
   const { band, res } = storyBandFor(outcomes, result.total, nat, sides);
   lines[0] += `  ${res.emoji} **${res.label}**`;
+  noteBand(band || 'MISS');
   if (!band) return finish('*Nothing in the script answers to that.*', null);
   return finish(pickText(outcomes[band]), outcomes[band].next, 0);
 }
 
-async function handleStory(interaction) {
+// ── /activity ──────────────────────────────────────────────────────────────
+// A short key for an activity, for button ids: names can be long and
+// strange, a customId has a hundred characters.
+function activityKey(name) {
+  return require('crypto').createHash('sha1').update(String(liveName(name)).toLowerCase()).digest('hex').slice(0, 10);
+}
+function storyByKey(gid, key) {
+  return listStories(gid).find(st => activityKey(st.name) === key) || null;
+}
+// The rows a demo run writes under the demo's own name are not an activity
+// the server wrote: they stay off the shelf and the board.
+const DEMO_STORY_NAMES = new Set(['fishing (demo)', 'kalidale lore (quiz)', "the scribe's trial"]);
+const isDemoStory = (name) => DEMO_STORY_NAMES.has(String(liveName(name)).toLowerCase()) || /^Quiz \u00b7 /.test(String(liveName(name)));
+// Whether a story has a live version a player could run.
+function storyIsLive(gid, story) {
+  return !!story && !story.retired && !!(story.source || listScenes(gid, story.name).length);
+}
+function storyState(gid, story) {
+  if (!story) return null;
+  if (story.retired) return 'retired';
+  const live = storyIsLive(gid, story);
+  if (story.draft_problems) return live ? 'live+problems' : 'draft-problems';
+  if (story.draft_source) return live ? 'live+draft' : 'draft';
+  return live ? 'live' : 'empty';
+}
+const STATE_WORD = { retired: '🪦 retired', 'live+problems': '📝 draft with problems beside the live one', 'draft-problems': '📝 draft with problems — not yet runnable',
+  'live+draft': '📝 draft waiting to be published', draft: '📝 held as a draft — Practice, then Publish', live: '🎮 live', empty: '∅ empty' };
+
+// The lines of the map: every scene, what it asks, where it goes.
+function storyMapLines(gid, story, scenes) {
+  const statList = (r) => String(r || '').split('|').filter(Boolean).map(x => (resolveStatWord(x) || x).toUpperCase()).join('/');
+  const J = (v, d) => { try { return v == null ? d : JSON.parse(v); } catch { return d; } };
+  const endings = new Set(scenes.filter(s => s.ending).map(s => s.scene.toLowerCase()));
+  const seen = new Set();
+  const arrow = (t) => `\`${t}\`${endings.has(String(t).toLowerCase()) ? ' 🏁' : seen.has(String(t).toLowerCase()) ? ' ↺' : ''}`;
+  const lines = [];
+  for (const sc of scenes) {
+    seen.add(sc.scene.toLowerCase());
+    const logic = J(sc.logic, {});
+    let ask = '';
+    const gauntlet = J(sc.gauntlet, null);
+    if (gauntlet?.length) ask = `🎣 gauntlet ${gauntlet.map(g => `DC${g.dc} ${statList(g.stats)}`).join(' → ')}`;
+    else if (sc.roll) {
+      ask = `🎲 ${statList(sc.roll)}${sc.dc ? ` DC ${sc.dc}` : ''}`;
+      if (logic.dcword) ask += ` _(${logic.dcword})_`;
+      const odds = sc.dc ? passOdds(gid, sc.roll, sc.dc) : null;
+      if (odds) ask += ` · ${oddsLine(odds)}`;
+    }
+    else if (J(sc.choices, []).length) ask = '🔘 choice';
+    else if (sc.ask) ask = '✍️ typed answer';
+    else if (logic.random?.length) ask = '🎲 random fork';
+    else if (logic.ifs?.length) ask = '🔀 routes by flag';
+    else if (sc.ending) ask = '🏁 ending';
+    lines.push(`**\`${sc.scene}\`**${sc.npc ? ` · *${sc.npc}*` : ''}${sc.gain ? ` · 💠 +${sc.gain}` : ''}${logic.sets?.length ? ` · sets ${logic.sets.join(', ')}` : ''}${ask ? ` — ${ask}` : ''}`);
+    const edges = [];
+    for (const x of logic.ifs || []) edges.push(`if ${describeCondition(x)} → ${arrow(x.next)}`);
+    for (const t of logic.random || []) edges.push(`random → ${arrow(t)}`);
+    const nat20 = J(sc.nat20, null), nat1 = J(sc.nat1, null);
+    if (nat20) edges.push(`🌟 nat 20 → ${arrow(nat20.next)}`);
+    if (nat1) edges.push(`💀 nat 1 → ${arrow(nat1.next)}`);
+    for (const r of J(sc.ranges, [])) edges.push(`${r.lo}${r.hi >= 9999 ? '+' : `–${r.hi}`} → ${arrow(r.next)}`);
+    for (const [band, o] of Object.entries(J(sc.outcomes, {}))) if (o.next) edges.push(`${band.toLowerCase()} → ${arrow(o.next)}`);
+    for (const c of J(sc.choices, [])) edges.push(`${c.correct ? '★ ' : ''}${c.label} → ${arrow(c.next)}`);
+    if (sc.ask) { if (sc.right_to) edges.push(`right → ${arrow(sc.right_to)}`); if (sc.wrong_to) edges.push(`wrong → ${arrow(sc.wrong_to)}`); }
+    edges.forEach((e, i) => lines.push(`${i === edges.length - 1 ? '└' : '├'}─ ${e}`));
+    if (sc.ending) {
+      const g = J(sc.grants, {});
+      const bits = [];
+      if (sc.merits) bits.push(`🏅 ${sc.merits} merits`);
+      if (sc.cash_tally) bits.push(`💠 pays the ${story.tally || 'tally'}`);
+      if (g.title) bits.push(`🏷️ ${g.title}`);
+      if (g.heal) bits.push(`💚 ${g.heal} heal`);
+      if (g.quest) bits.push(`📜 ${g.quest}`);
+      if (g.once) bits.push('once');
+      if (sc.rewards) bits.push(`🎁 ${sc.rewards}`);
+      if (bits.length) lines.push(`　 ${bits.join(' · ')}`);
+    }
+  }
+  return lines;
+}
+
+// Figures from the ledger, for the shelf and /activity scores.
+function activityStats(gid, name, sinceMs = 0) {
+  const q = (sql, ...a) => { try { return db.prepare(sql).all(gid, liveName(name), sinceMs, ...a); } catch { return []; } };
+  const starts = q(`SELECT COUNT(*) AS c FROM story_run_log WHERE guild_id=? AND story=? COLLATE NOCASE AND at>=? AND kind='start'`)[0]?.c || 0;
+  const ends = q(`SELECT COUNT(*) AS c FROM story_run_log WHERE guild_id=? AND story=? COLLATE NOCASE AND at>=? AND kind='end'`)[0]?.c || 0;
+  const quits = q(`SELECT scene, COUNT(*) AS c FROM story_run_log WHERE guild_id=? AND story=? COLLATE NOCASE AND at>=? AND kind IN ('quit','expire','cap') GROUP BY scene ORDER BY c DESC LIMIT 3`);
+  const rolls = q(`SELECT scene, SUM(CASE WHEN band IN ('FAIL','NAT1','FUMBLE','MISS') THEN 1 ELSE 0 END) AS f, COUNT(*) AS n FROM story_run_log WHERE guild_id=? AND story=? COLLATE NOCASE AND at>=? AND kind='roll' GROUP BY scene HAVING n>=3 ORDER BY f*1.0/n DESC LIMIT 3`);
+  const players = q(`SELECT COUNT(DISTINCT user_id) AS c FROM story_run_log WHERE guild_id=? AND story=? COLLATE NOCASE AND at>=? AND kind='start'`)[0]?.c || 0;
+  return { starts, ends, quits, rolls, players };
+}
+function activityStatLines(gid, name) {
+  const s = activityStats(gid, name);
+  if (!s.starts && !s.ends) return [];
+  const L = [`📊 **${s.starts}** run${s.starts === 1 ? '' : 's'} by ${s.players} player${s.players === 1 ? '' : 's'}, **${s.ends}** finished${s.starts ? ` (${Math.round((s.ends / s.starts) * 100)}%)` : ''} — last ninety days`];
+  if (s.quits.length) L.push(`　 stopped at: ${s.quits.map(r => `\`${r.scene}\` ×${r.c}`).join(', ')}`);
+  for (const r of s.rolls) if (r.f / r.n >= 0.6) L.push(`　 \`${r.scene}\` fails ${Math.round((r.f / r.n) * 100)}% of the time (${r.n} rolls) — the DC may be high`);
+  return L;
+}
+
+// Is this person allowed to start this activity right now?
+function runGate(gid, uid, story) {
+  if (story.retired) return `🪦 **${story.name}** has been retired.`;
+  if (!storyIsLive(gid, story)) return `📝 **${story.name}** is still a draft${story.draft_problems ? ' with problems to fix' : ''} — a GM has to publish it first.`;
+  let req = [];
+  try { req = JSON.parse(story.require_json || '[]') || []; } catch {}
+  for (const c of req) if (!conditionMet(gid, uid, c)) {
+    return c.title ? `🔒 **${story.name}** is for those who hold the title **${c.title}**.`
+      : `🔒 **${story.name}** needs ${c.cmp.what} ${c.cmp.op} ${c.cmp.n}${c.cmp.what === 'merits' ? ` — <@${uid}> has ${getMerits(gid, uid)}` : c.cmp.what === 'renown' ? ` — <@${uid}> has ${getRenown(gid, uid)}` : ''}.`;
+  }
+  if (story.available) {
+    const days = String(story.available).split(',');
+    const today = STORY_DAYS[(new Date().getUTCDay() + 6) % 7];
+    if (!days.includes(today)) return `📅 **${story.name}** runs on ${days.map(d => d[0].toUpperCase() + d.slice(1)).join(', ')} (UTC) — not today.`;
+  }
+  if (story.cooldown) {
+    const win = story.cooldown === 'week' ? 7 * 86400000 : 86400000;
+    let last = null;
+    try { last = db.prepare(`SELECT MAX(at) AS at FROM story_run_log WHERE guild_id=? AND story=? COLLATE NOCASE AND user_id=? AND kind IN ('start','end')`).get(gid, story.name, uid)?.at; } catch {}
+    if (last && Date.now() - last < win) {
+      const left = win - (Date.now() - last);
+      const h = Math.floor(left / 3600000), m = Math.ceil((left % 3600000) / 60000);
+      return `⏳ **${story.name}** is once per ${story.cooldown} — <@${uid}> can go again in ${h ? `${h}h ` : ''}${m}m.`;
+    }
+  }
+  return null;
+}
+
+// Start a run: for one player, or a party. Returns { run, first, go } or
+// { error }; `go()` arrives at the first scene — logic, routing, the post —
+// once the caller has acknowledged the interaction.
+function startActivityRun(interaction, story, { owner, members = null, practice = false, demo = false, storyName = null }) {
   const gid = interaction.guild.id, cid = interactionChannelId(interaction);
-  const sub = interaction.options.getSubcommand();
+  const name = storyName || story.name;
+  const key = members ? PARTY_KEY : owner;
+  const first = getScene(gid, name, getStory(gid, name)?.start_scene || story.start_scene);
+  if (!first) return { error: `❌ **${story.name}** has no starting scene.` };
+  const run = setRun(gid, cid, key, { story: name, scene: first.scene, started_at: Date.now(), tally_state: '{}', gauntlet_at: 0, steps: 0,
+    is_demo: demo || practice ? 1 : 0, practice: practice ? 1 : 0, members: members ? JSON.stringify(members) : null, turn: 0,
+    started_by: interaction.user.id, quiz_asked: 0, quiz_right: 0, quiz_log: null });
+  if (!practice && !demo) for (const m of (members || [owner])) logRun(gid, { story: name, uid: m, cid, scene: first.scene, kind: 'start' });
+  const uid = members ? members[0] : owner;
+  const go = () => arrive({ guild: interaction.guild }, { gid, cid, uid, rk: key, run, ch: getChar(gid, uid), sc: first }, first, {}, 0, 0);
+  return { run, first, go };
+}
+
+// Runs nobody has touched for a week end quietly, so they stop blocking the
+// next one in that channel. Called from the quest tick.
+const ACTIVITY_IDLE_MS = 7 * 86400000;
+async function expireIdleRuns(client) {
+  let rows = [];
+  try { rows = db.prepare('SELECT * FROM story_runs WHERE COALESCE(last_at, started_at, 0) < ?').all(Date.now() - ACTIVITY_IDLE_MS); } catch { return; }
+  for (const run of rows) {
+    endRun(run.guild_id, run.channel_id, run.user_id);
+    if (!run.practice && !run.is_demo) for (const m of partyMembers(run)) logRun(run.guild_id, { story: run.story, uid: m, cid: run.channel_id, scene: run.scene, kind: 'expire', runMs: runAge(run) });
+    try {
+      const ch = await client.channels.fetch(run.channel_id).catch(() => null);
+      await ch?.send({ content: `💤 **${liveName(run.story)}** — ${partyMembers(run).map(m => `<@${m}>`).join(', ')}'s run sat untouched for a week and has been put away. \`/activity run\` starts afresh.`, allowedMentions: { parse: [] } }).catch(() => {});
+    } catch {}
+  }
+}
+
+// ── The grammar, in reach of a phone ───────────────────────────────────
+const ACTIVITY_GRAMMAR = {
+  top: ['**The top of a script**', '`[ACTIVITY] Fishing` — the name, first line. Then, before any scene:',
+    '`TALLY renown` — a pot that scenes add to (`GAIN renown 1`) and an ending pays out (`END TALLY`)',
+    '`QUIZ tally|retry|silent` — how questions are marked', '`ONCE per day` / `ONCE per week` — a cooldown per player',
+    '`AVAILABLE Fri-Sun` — the days it can be started (UTC)', '`REQUIRE title:Angler` · `REQUIRE merits>=10` · `REQUIRE renown>=50` — who may start it',
+    '`# a comment` — ignored, anywhere', '_Keywords are written in capitals: a keyword line in capitals must be well-formed; in lower case it counts only when exact (`end`, `gain renown 1`). Anything else is narration._'],
+  scenes: ['**Scenes**', '`SCENE find` — a block starts here; the first scene is where a run begins',
+    '`SAY 🎣 You survey the water…` — narration; several SAY lines stack', '`AS Dockmaster` — the narration is said in that NPC\'s voice',
+    '`IMAGE https://…/pic.png` — a picture on the card', '`GAIN renown 1` — add to the tally on arrival',
+    '_Every scene must ask something (ROLL, GAUNTLET, CHOICE, ASK), route (IF, RANDOM) or END._'],
+  rolls: ['**Rolls and what follows**', '`ROLL wis DC12` — d20 + the stat against a DC · `ROLL str|dex|wis` lets them pick · `ROLL wis DC easy|normal|hard` sets the DC from this table\'s sheets',
+    '`  PASS You land it -> caught` · `  FAIL -> find` — where each result goes; `CRIT`, `PARTIAL`, `FUMBLE` too when there is no DC',
+    '`  FAIL ONE OF` then one line per variant — a different line each time round', '`  1-5 Something small -> fight_small` · `  16+ The reel screams -> big` — ranges on the total instead of bands',
+    '`  NAT20 It leaps into your hands -> caught` · `  NAT1 The line snaps -> restring` — the naturals override everything',
+    '`GAUNTLET str|con 14 12 10` or `GAUNTLET 14:str 12:con` — a run of rolls, PASS at the end, FAIL at the first miss (8 at most)',
+    '`NEXT adv` / `NEXT dis` — tilt the next roll in this run'],
+  choices: ['**Choices and questions**', '`CHOICE` then `  Cast again -> cast` · `  Go home -> done` — buttons, five at most',
+    '`  * B — 8 -> q2` — a star marks the right answer; the scene becomes a question', '`ASK` · `ANSWER 8 | eight` · `HINT a single digit` · `RIGHT -> q2` · `WRONG -> q2` — a typed answer',
+    '`QUIZ FROM lore 5 -> done` — five questions drawn from the bank (`any` for all of it); redrawn when you publish'],
+  flags: ['**Flags and forks**', '`SET torch` · `UNSET torch` — remembered for the rest of the run',
+    '`IF torch -> lit_hall` · `IF not torch -> dark` · `IF tally>=5 -> rich` · `IF title:Angler -> greet` — checked on arrival, first match wins',
+    '`RANDOM -> shallows|reeds|deep` — a scene that only routes, at random', '_A routing scene may carry SAY lines; they are said on the way through._'],
+  endings: ['**Endings**', '`END` — the run stops here', '`END TALLY` — pays the tally out as renown', '`END merits:2` — merits for finishing',
+    '`END title:Angler` — grants a title · `END heal:1` — a heal charge · `END quest:Crossed the ford` — a note in the running quest',
+    '`END once` — pays only the first time each player finishes', '`END rewards: a fine rod` — free text for the GM to hand out, always last',
+    '_These combine: `END TALLY merits:1 title:Angler once rewards: a rod`. An ending that cashes an empty tally pays nothing._'],
+};
+function grammarPages(topic) {
+  if (topic && ACTIVITY_GRAMMAR[topic]) return ACTIVITY_GRAMMAR[topic];
+  return Object.values(ACTIVITY_GRAMMAR).flatMap(p => [...p, '']);
+}
+// Starting points for the box, with the guidance in comments.
+const ACTIVITY_TEMPLATES = {
+  check: ['[ACTIVITY] The Ford', '# One roll, two ways out. Rename the scenes as you like.', '', 'SCENE bank', 'SAY The river runs fast here. Wade it, or look for a better crossing?', 'ROLL str|wis DC normal',
+    '  PASS You find your footing and splash across. -> far_side', '  FAIL The current takes your legs. -> swept', '', 'SCENE swept', 'SAY You haul yourself out a way downstream, soaked.', 'END', '', 'SCENE far_side', 'SAY Dry boots and a story to tell.', 'END merits:1'].join('\n'),
+  story: ['[ACTIVITY] The Dark Hall', '# A branching tale with a flag: what you did earlier changes what you find.', '', 'SCENE door', 'SAY Two ways in: the lit stair, or the cellar hatch.', 'CHOICE', '  Take the stair -> stair', '  Drop through the hatch -> cellar', '',
+    'SCENE stair', 'SAY You lift a torch from its bracket as you climb.', 'SET torch', 'CHOICE', '  Onward -> hall', '', 'SCENE cellar', 'SAY Pitch black. You feel your way along the wall.', 'CHOICE', '  Onward -> hall', '',
+    'SCENE hall', 'IF torch -> lit_hall', 'IF not torch -> dark_hall', '', 'SCENE lit_hall', 'SAY Torchlight finds a mural, and a door behind it.', 'END merits:1', '', 'SCENE dark_hall', 'SAY Something moves in the dark. You back out the way you came.', 'END'].join('\n'),
+  quiz: ['[ACTIVITY] Lore Test', '# Star the right answer. QUIZ tally marks at the end; retry sends a wrong answer round again; silent says nothing until the end.', 'QUIZ tally', '', 'SCENE q1', 'SAY **Question 1 of 2** — How many knight orders are there?', 'CHOICE', '  5 -> q2', '  * 8 -> q2', '  12 -> q2', '',
+    'SCENE q2', 'SAY **Question 2 of 2** — Who crowned the first Knight King?', 'ASK', 'ANSWER the archivist | archivist', 'HINT A keeper of records', 'RIGHT -> done', 'WRONG -> done', '', '# Or draw from the bank instead of writing questions:', '# SCENE bank', '# SAY The archivist opens the book.', '# QUIZ FROM any 5 -> done', '', 'SCENE done', 'SAY The archivist totals your answers.', 'END merits:1'].join('\n'),
+  gauntlet: ['[ACTIVITY] The Climb', '# A gauntlet: every roll must pass; the first miss falls.', 'TALLY renown', '', 'SCENE foot', 'SAY The cliff goes up and up.', 'CHOICE', '  Climb -> climb', '', 'SCENE climb', 'GAIN renown 1', 'GAUNTLET str|dex 10 12 14',
+    '  NAT20 A hold where none should be. -> top', '  NAT1 The rock comes away in your hand. -> fall', '  PASS -> top', '  FAIL -> fall', '', 'SCENE fall', 'SAY You slide back to the foot, scraped but whole.', 'CHOICE', '  Try again -> climb', '  Enough -> done', '',
+    'SCENE top', 'SAY The valley opens below you.', 'END TALLY merits:1', '', 'SCENE done', 'SAY Another day.', 'END'].join('\n'),
+  blank: ['[ACTIVITY] Name', '# SCENE, SAY, ROLL, PASS/FAIL ->, CHOICE, END. /activity grammar for the rest.', '', 'SCENE start', 'SAY ', 'ROLL wis DC12', '  PASS -> done', '  FAIL -> start', '', 'SCENE done', 'SAY ', 'END'].join('\n'),
+};
+
+async function handleStory(interaction, forced = null) {
+  const gid = interaction.guild.id, cid = interactionChannelId(interaction);
+  const sub = forced?.sub || interaction.options.getSubcommand();
+  const opt = (k) => forced && k in forced ? forced[k] : null;
   const isGmUser = await isGm(interaction.guild, interaction.user.id);
-  // Writing, tweaking and deleting always need a GM. Running one is a separate
-  // question, and stays GM-only until a server opens it up.
-  const AUTHORING = ['create', 'delete', 'set', 'demo'];
+  // Writing, tweaking and deleting always need a GM; so does reading a
+  // script, since it holds the answers. Running one is a separate question,
+  // and stays GM-only until a server opens it up.
+  const AUTHORING = ['create', 'delete', 'set', 'demo', 'show', 'edit', 'copy', 'rename', 'write', 'publish', 'revert', 'practice', 'grammar', 'export'];
   if (AUTHORING.includes(sub) && !isGmUser)
-    return interaction.reply({ content: '❌ Only GMs can write or change activities.', ephemeral: true });
-  if (!isGmUser && !(getConfig(gid)?.activity_players))
+    return interaction.reply({ content: '❌ Only GMs can write, read or change activities.', ephemeral: true });
+  if (!isGmUser && !(getConfig(gid)?.activity_players) && !forced?.viaButton)
     return interaction.reply({ content: '❌ Activities are GM-led on this server for now. Ask a GM to start one.', ephemeral: true });
+
+  if (sub === 'grammar') {
+    return replyLong(interaction, ['📖 **Writing an activity**', '', ...grammarPages(interaction.options.getString('topic'))], { ephemeral: true });
+  }
 
   if (sub === 'create') {
     const file = interaction.options.getAttachment('file');
+    const hold = !!interaction.options.getBoolean('draft');
     if (file) {
-      // A long script arrives as a text file — same validation, same storage.
+      // A long script arrives as a text file — or a woven PDF from another
+      // server's shelf — same validation, same storage.
+      if ((file.size || 0) > 2 * 1024 * 1024) return interaction.reply({ content: '❌ That file is over two megabytes — a script is never that long.', ephemeral: true });
       await interaction.deferReply();
       try {
-        const bytes = await fetchBytes(file.url, 512 * 1024);
-        const r = storeActivityScript(gid, interaction.user.id, bytes.toString('utf8'));
+        const bytes = await fetchBytes(file.url);
+        const woven = extractActivityData(bytes);
+        const r = saveActivity(gid, interaction.user.id, woven?.source || bytes.toString('utf8'), { publish: hold ? 'draft' : 'auto', via: 'file' });
         return interaction.editReply({ content: r.error ? `❌ **Couldn't read that activity.** ${r.error}` : r.saved });
       } catch (err) {
         return interaction.editReply({ content: `❌ Couldn't read the file — ${err?.message || err}. Plain \`.txt\` works best.` });
       }
     }
     const { ModalBuilder, ActionRowBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
-    const modal = new ModalBuilder().setCustomId('activitycreate').setTitle('Write an activity').addComponents(
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('script')
-        .setLabel('Your script — over 4000? use file:')
-        .setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(4000)
-        .setPlaceholder('[ACTIVITY] Fishing\nSCENE find\nSAY 🎣 You survey the water...\nROLL wis DC12\n  PASS -> cast')),
-    );
+    const template = interaction.options.getString('template');
+    const input = new TextInputBuilder().setCustomId('script')
+      .setLabel('Your script — over 4000? use file:')
+      .setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(4000)
+      .setPlaceholder('[ACTIVITY] Fishing\nSCENE find\nSAY 🎣 You survey the water...\nROLL wis DC12\n  PASS -> cast');
+    if (template && ACTIVITY_TEMPLATES[template]) input.setValue(ACTIVITY_TEMPLATES[template]);
+    const modal = new ModalBuilder().setCustomId(hold ? 'activitycreate:draft' : 'activitycreate').setTitle('Write an activity').addComponents(
+      new ActionRowBuilder().addComponents(input));
     return interaction.showModal(modal);
   }
 
@@ -17603,42 +19061,51 @@ async function handleStory(interaction) {
     if (getRun(gid, cid, owner)) return interaction.reply({ content: owner === interaction.user.id
       ? '❌ You already have something running here. `/activity stop` first.'
       : `❌ <@${owner}> already has something running here.`, ephemeral: true });
-    const which = interaction.options?.getString?.('which') || 'fishing';
-    const parsed = parseStoryScript(which === 'quiz' ? DEMO_QUIZ : DEMO_FISHING);
+    const which = opt('which') || interaction.options?.getString?.('which') || 'fishing';
+    const parsed = parseStoryScript(which === 'quiz' ? DEMO_QUIZ : which === 'trial' ? DEMO_TRIAL : DEMO_FISHING);
     if (parsed.error) return interaction.reply({ content: `❌ The built-in demo failed to parse: ${parsed.error}`, ephemeral: true });
     saveStory(gid, interaction.user.id, parsed);
-    const first = getScene(gid, parsed.name, parsed.start);
-    const run = setRun(gid, cid, owner, { story: parsed.name, scene: first.scene,
-      started_at: Date.now(), tally_state: '{}', gauntlet_at: 0, is_demo: 1 });
+    const started = await startActivityRun(interaction, getStory(gid, parsed.name), { owner, demo: true });
+    if (started.error) return interaction.reply({ content: started.error, ephemeral: true });
     const handed = owner !== interaction.user.id ? `\n_Set going by <@${interaction.user.id}> — the buttons are yours, <@${owner}>._` : '';
     await interaction.reply({ content: (which === 'quiz'
       ? '🏰 **Kalidale Lore (demo)** — five questions, answered by button. The score is read out at the end; nothing is awarded.'
+      : which === 'trial'
+      ? '📜 **The Scribe\'s Trial** — a walk through the grammar, scene by scene. Nothing is awarded; the script is on the shelf and in `/activity show`.'
       : '🎣 **Fishing (demo)** — a dry run. Nothing you catch will be awarded, and rerolls here are free.\nThis one is yours; others can start their own alongside it.') + handed });
-    return postScene(interaction.guild, cid, run, first);
+    return started.go();
   }
 
   if (sub === 'list') {
-    const all = listStories(gid);
-    if (!all.length) return interaction.reply({ ephemeral: true, content:
-      '🎮 No activities yet. Write one and paste it into any channel I can read — start the message with `[ACTIVITY] Name`.' });
+    const all = listStories(gid).filter(st => isGmUser ? true : storyIsLive(gid, st));
+    if (!all.length) return interaction.reply({ ephemeral: true, content: isGmUser
+      ? '🎮 No activities yet. `/activity create` opens a box (try `template:`), `/activity write` builds one scene by scene, or paste a script that starts with `[ACTIVITY] Name` into any channel I can read.'
+      : '🎮 No activities yet.' });
     return replyLong(interaction, ['🎮 **Activities**', '',
-      ...all.map(st => `• **${st.name}** — ${listScenes(gid, st.name).length} scenes, starts at \`${st.start_scene}\``)], { ephemeral: true });
+      ...all.map(st => `• **${st.name}** — ${listScenes(gid, st.name).length} scenes, starts at \`${st.start_scene}\`${isGmUser ? ` · ${STATE_WORD[storyState(gid, st)]}` : ''}${st.cooldown ? ` · once per ${st.cooldown}` : ''}${st.available ? ` · ${st.available}` : ''}`)], { ephemeral: true });
   }
 
-  const name = interaction.options.getString('name');
+  if (sub === 'write') return startActivityWriter(interaction);
+
+  const name = opt('name') || interaction.options.getString('name');
+  if (isDraftName(name)) return interaction.reply({ content: '❌ That is a draft\'s working copy — use the activity\'s own name; **Practice** on the shelf plays the draft.', ephemeral: true });
 
   if (sub === 'stop') {
     const mine = getRun(gid, cid, interaction.user.id);
-    const others = runsIn(gid, cid).filter(r => r.user_id !== interaction.user.id);
-    if (!mine && !others.length) return interaction.reply({ content: '❌ Nothing is running here.', ephemeral: true });
-    if (mine) {
-      endRun(gid, cid, interaction.user.id);
+    const party = getRun(gid, cid, PARTY_KEY);
+    const inParty = party && partyMembers(party).includes(interaction.user.id);
+    const others = runsIn(gid, cid).filter(r => r.user_id !== interaction.user.id && !(inParty && r.user_id === PARTY_KEY));
+    if (!mine && !inParty && !others.length) return interaction.reply({ content: '❌ Nothing is running here.', ephemeral: true });
+    const quit = (r) => { if (!r.practice && !r.is_demo) for (const m of partyMembers(r)) logRun(gid, { story: r.story, uid: m, cid, scene: r.scene, kind: 'quit', runMs: runAge(r) }); endRun(gid, cid, r.user_id); };
+    if (mine || inParty) {
+      const r = mine || party;
+      quit(r);
       const note = others.length ? ` ${others.length} other run${others.length === 1 ? ' is' : 's are'} still going.` : '';
-      return interaction.reply({ content: `🛑 Stopped your run of **${mine.story}**.${note}` });
+      return interaction.reply({ content: `🛑 Stopped ${mine ? 'your' : 'the party\'s'} run of **${liveName(r.story)}**.${note}` });
     }
     // Only other people's runs are live — a GM may clear them, a player may not.
     if (!isGmUser) return interaction.reply({ content: '❌ You have nothing running here. Only a GM can stop someone else\'s.', ephemeral: true });
-    for (const r of others) endRun(gid, cid, r.user_id);
+    for (const r of others) quit(r);
     return interaction.reply({ content: `🛑 Stopped ${others.length} run${others.length === 1 ? '' : 's'} in this channel.` });
   }
 
@@ -17646,91 +19113,891 @@ async function handleStory(interaction) {
   if (!story) return interaction.reply({ content: `❌ No activity called **${name}**.`, ephemeral: true });
 
   if (sub === 'delete') {
-    return requestConfirm(interaction, `Delete the activity **${story.name}** and all its scenes?`, async () => {
+    return requestConfirm(interaction, `Delete the activity **${story.name}** and all its scenes? (Retire keeps it on the shelf; this removes it.)`, async () => {
+      for (const r of liveRunsOf(gid, story.name)) endRun(gid, r.channel_id, r.user_id);
       deleteStory(gid, story.name);
+      try { deleteStory(gid, draftName(story.name)); } catch {}
+      await retireActivityPage(interaction.client, gid, story.name, { deleted: true }).catch(() => {});
+      queueActivityBoard(gid);
       return `🗑️ Deleted **${story.name}**.`;
     });
   }
 
   if (sub === 'show') {
-    const statList = (r) => String(r || '').split('|').filter(Boolean)
-      .map(x => (resolveStatWord(x) || x).toUpperCase()).join(' / ');
-    const lines = [`🎮 **${story.name}** — starts at \`${story.start_scene}\``
-      + (story.tally ? ` · tally: **${story.tally}**` : ''), ''];
-    for (const sc of listScenes(gid, story.name)) {
-      lines.push(`**\`${sc.scene}\`**${sc.npc ? ` · spoken by *${sc.npc}*` : ''}${sc.gain ? ` · 💠 +${sc.gain}` : ''}`);
-      if (sc.say) lines.push(sc.say.split('\n').map(l => `> ${l}`).join('\n'));
-
-      const gauntlet = sc.gauntlet ? JSON.parse(sc.gauntlet) : null;
-      const ranges = JSON.parse(sc.ranges || '[]');
-      const choices = JSON.parse(sc.choices || '[]');
-      const outcomes = JSON.parse(sc.outcomes || '{}');
-
-      if (gauntlet) {
-        const same = gauntlet.every(g => g.stats === gauntlet[0].stats);
-        lines.push(same
-          ? `🎣 gauntlet **${statList(gauntlet[0].stats)}** — DC ${gauntlet.map(g => g.dc).join(' → ')}`
-          : `🎣 gauntlet — ${gauntlet.map(g => `DC ${g.dc} **${statList(g.stats)}**`).join(' → ')}`);
-      }
-      else if (sc.roll) lines.push(`🎲 roll **${statList(sc.roll)}**${sc.dc ? ` · DC ${sc.dc}` : ''}`);
-
-      if (sc.nat20) { const o = JSON.parse(sc.nat20); lines.push(`   🌟 nat 20 → \`${o.next}\`${o.text ? ` — ${o.text}` : ''}`); }
-      if (sc.nat1)  { const o = JSON.parse(sc.nat1);  lines.push(`   💀 nat 1 → \`${o.next}\`${o.text ? ` — ${o.text}` : ''}`); }
-      for (const r of ranges) {
-        lines.push(`   🔢 ${r.lo}${r.hi >= 9999 ? '+' : `–${r.hi}`} → \`${r.next}\`${r.text ? ` — ${r.text}` : ''}`);
-      }
-      for (const [band, o] of Object.entries(outcomes)) {
-        const label = sc.dc || gauntlet ? (band === 'PASS' ? '✅ pass' : band === 'FAIL' ? '❌ fail' : STORY_BAND_LABEL[band] ?? band)
-                                        : (STORY_BAND_LABEL[band] ?? band);
-        lines.push(`   ${label} → \`${o.next}\`${o.text ? ` — ${o.text}` : ''}`);
-        for (const v of (o.variants || [])) lines.push(`      • ${v}`);
-      }
-      for (const c of choices) lines.push(`   🔘 ${c.label} → \`${c.next}\``);
-
-      if (sc.ending) {
-        const bits = [];
-        if (sc.merits) bits.push(`🏅 ${sc.merits} merits`);
-        if (sc.cash_tally) bits.push(`💠 pays out the ${story.tally || 'tally'}`);
-        if (sc.rewards) bits.push(`🎁 ${sc.rewards}`);
-        lines.push(`🏁 ending${bits.length ? ` · ${bits.join(' · ')}` : ''}`);
-      }
-      lines.push('');
+    const scriptToo = !!interaction.options.getBoolean('script');
+    const scenes = listScenes(gid, story.name);
+    const state = storyState(gid, story);
+    const lines = [`🎮 **${story.name}** — ${STATE_WORD[state]}${scenes.length ? ` · starts at \`${story.start_scene}\`` : ''}`
+      + (story.tally ? ` · tally: **${story.tally}**` : '') + (story.cooldown ? ` · once per ${story.cooldown}` : '') + (story.available ? ` · ${story.available}` : ''), ''];
+    if (scenes.length) lines.push(...storyMapLines(gid, story, scenes));
+    let notes = [];
+    try { notes = JSON.parse(story.notes || '[]') || []; } catch {}
+    if (notes.length) lines.push('', ...noteLines(notes));
+    if (story.draft_problems) {
+      let probs = []; try { probs = JSON.parse(story.draft_problems) || []; } catch {}
+      lines.push('', `📝 **The draft has ${probs.length} problem${probs.length === 1 ? '' : 's'}:**`, ...probs.slice(0, 10).map(p => `• line ${p.line}: ${p.msg}${p.fix ? ` ↳ ${p.fix}` : ''}`));
     }
-    return replyLong(interaction, lines, { ephemeral: true });
+    lines.push(...activityStatLines(gid, story.name));
+    if (!scriptToo) return replyLong(interaction, lines, { ephemeral: true });
+    const src = story.draft_source || sourceOf(gid, story.name);
+    if (!src) return replyLong(interaction, [...lines, '', '_No script to show._'], { ephemeral: true });
+    const files = activityFiles(gid, story.name, src);
+    await replyLong(interaction, [...lines, '', story.draft_source ? '📝 **The draft script:**' : '📜 **The script:**', ...scriptCodeBlocks(src)], { ephemeral: true });
+    return interaction.followUp({ ephemeral: true, content: '📎 As a file, and on parchment:', files }).catch(() => {});
+  }
+  if (sub === 'export') {
+    const src = story.draft_source || sourceOf(gid, story.name);
+    if (!src) return interaction.reply({ content: '❌ Nothing to export.', ephemeral: true });
+    return interaction.reply({ ephemeral: true, content: `📜 **${story.name}** — the script as text, and as a parchment that carries it (drop either into \`/activity create file:\` anywhere).`, files: activityFiles(gid, story.name, src) });
   }
 
   if (sub === 'set') {
     const sceneName = interaction.options.getString('scene');
     const field = interaction.options.getString('field');
     const value = interaction.options.getString('value');
-    const res = applySceneEdit(gid, story.name, sceneName, field, value);
+    // A waiting draft is the working copy: its rows and its text are edited.
+    const draftRows = story.draft_source && !story.draft_problems && listScenes(gid, draftName(story.name)).length > 0;
+    if (story.draft_source && story.draft_problems) return interaction.reply({ content: `❌ The draft of **${story.name}** has problems — fix the text (\`/activity edit\`, or the shelf) before tweaking a line.`, ephemeral: true });
+    const res = applySceneEdit(gid, draftRows ? draftName(story.name) : story.name, sceneName, field, value, { dry: true });
     if (res.error) return interaction.reply({ content: `❌ ${res.error}`, ephemeral: true });
-    return interaction.reply({ content:
-      `✏️ **${story.name}** · \`${res.scene}\` — **${field}** updated.\n`
-      + `_Read it back with \`/activity show name:${story.name}\`._` });
+    if (field === 'dc') { try { const lg = JSON.parse(res.row.logic || '{}') || {}; delete lg.dcword; res.row.logic = Object.keys(lg).length ? JSON.stringify(lg) : null; } catch {} }
+    // The change is made to the script, and the script is saved — rows follow.
+    const base = draftRows ? story.draft_source : sourceOf(gid, story.name);
+    const next = replaceSceneBlock(base, res.scene, sceneToText(res.row, story));
+    const r = saveActivity(gid, interaction.user.id, next, { via: 'set' });
+    if (r.error) return interaction.reply({ content: `❌ ${r.error}`, ephemeral: true });
+    return interaction.reply({ content: `✏️ **${story.name}** · \`${res.scene}\` — **${field}** updated.\n${r.saved}` });
+  }
+
+  if (sub === 'edit') return openActivityEdit(interaction, story, interaction.options.getString('scene'));
+  if (sub === 'publish') return publishActivityDraft(interaction, story);
+  if (sub === 'revert') return revertActivity(interaction, story);
+  if (sub === 'practice') return startPractice(interaction, story);
+
+  if (sub === 'copy') {
+    const as = String(interaction.options.getString('as') || '').trim();
+    if (!as) return interaction.reply({ content: '❌ Give the copy a name with `as:`.', ephemeral: true });
+    if (getStory(gid, as)) return interaction.reply({ content: `❌ There is already an activity called **${as}**.`, ephemeral: true });
+    const src = sourceOf(gid, story.name) || story.draft_source;
+    if (!src) return interaction.reply({ content: '❌ Nothing to copy yet.', ephemeral: true });
+    const text = src.replace(/^(\s*\[(?:STORY|ACTIVITY)\]\s*).*$/im, `$1${as}`);
+    const r = saveActivity(gid, interaction.user.id, text, { publish: 'draft', via: 'copy' });
+    if (r.error) return interaction.reply({ content: `❌ ${r.error}`, ephemeral: true });
+    return interaction.reply({ content: `📋 Copied **${story.name}** as **${as}**.\n${r.saved}` });
+  }
+  if (sub === 'rename') {
+    const to = String(interaction.options.getString('to') || '').trim();
+    if (!to || /^\./.test(to)) return interaction.reply({ content: '❌ Give it a new name with `to:`.', ephemeral: true });
+    if (getStory(gid, to)) return interaction.reply({ content: `❌ There is already an activity called **${to}**.`, ephemeral: true });
+    if (liveRunsOf(gid, story.name).length) return interaction.reply({ content: `❌ Someone is mid-run in **${story.name}** — \`/activity stop\` first.`, ephemeral: true });
+    renameActivity(gid, story.name, to);
+    queueActivityMirror(gid, to); queueActivityBoard(gid);   // the page row was renamed too: the thread follows
+    return interaction.reply({ content: `✏️ **${story.name}** is now **${to}**.` });
+  }
+  if (sub === 'scores') {
+    let rows = [];
+    try { rows = db.prepare(`SELECT user_id, MAX(score) AS best, COUNT(*) AS n FROM story_run_log WHERE guild_id=? AND story=? COLLATE NOCASE AND kind='end' AND score IS NOT NULL GROUP BY user_id ORDER BY MAX(score) DESC, COUNT(*) DESC LIMIT 10`).all(gid, story.name); } catch {}
+    const s = activityStats(gid, story.name);
+    if (!rows.length) return interaction.reply({ ephemeral: true, content: `📊 **${story.name}** — ${s.ends ? `${s.ends} finish${s.ends === 1 ? '' : 'es'}, but no scores: it keeps no tally and asks no questions.` : 'nobody has finished it yet.'}` });
+    const names = await Promise.all(rows.map(r => getDisplayName(interaction.guild, r.user_id)));
+    return replyLong(interaction, [`🏆 **${story.name}** — best ${story.tally ? story.tally : 'score'} per player (ninety days)`, '',
+      ...rows.map((r, i) => `${['🥇', '🥈', '🥉'][i] || `${i + 1}.`} **${names[i]}** — ${r.best}${r.n > 1 ? ` _(${r.n} finishes)_` : ''}`),
+      '', ...activityStatLines(gid, story.name)]);
   }
 
   if (sub === 'run') {
     // A GM can set an activity running FOR someone — handy for a quiz you
     // want a particular player to sit. The run belongs to them: their name on
-    // it, their buttons, their score.
+    // it, their buttons, their score. `party:` names several, who press in turn.
     const who = await resolveRunOwner(interaction);
     if (who.error) return interaction.reply({ content: who.error, ephemeral: true });
     const owner = who.owner;
-    if (getRun(gid, cid, owner)) return interaction.reply({ content: owner === interaction.user.id
-      ? '❌ You already have an activity running here. `/activity stop` first.'
-      : `❌ <@${owner}> already has one running here.`, ephemeral: true });
-    const first = getScene(gid, story.name, story.start_scene);
-    if (!first) return interaction.reply({ content: `❌ **${story.name}** has no starting scene.`, ephemeral: true });
-    const run = setRun(gid, cid, owner, { story: story.name, scene: first.scene,
-      started_at: Date.now(), tally_state: '{}', gauntlet_at: 0 });
+    const partyStr = interaction.options?.getString?.('party') || null;
+    let members = null;
+    if (partyStr) {
+      members = [...new Set([owner, ...parsePlayerMentions(partyStr)])];
+      if (members.length < 2) return interaction.reply({ content: '❌ A party needs at least one other player — mention them in `party:`.', ephemeral: true });
+      if (members.length > 8) return interaction.reply({ content: '❌ Eight is the most a party can hold.', ephemeral: true });
+      if (getRun(gid, cid, PARTY_KEY)) return interaction.reply({ content: '❌ A party run is already going in this channel — `/activity stop` first.', ephemeral: true });
+      for (const m of members) { if (!getChar(gid, m)) return interaction.reply({ content: `❌ <@${m}> has no character sheet — everyone in a party needs one.`, ephemeral: true, allowedMentions: { parse: [] } }); }
+    } else {
+      const have = getRun(gid, cid, owner);
+      if (have) {
+        // Mid-run already: show them where they are rather than refuse.
+        const sc = getScene(gid, have.story, have.scene);
+        if (!sc) { endRun(gid, cid, owner); }
+        else {
+          await interaction.reply({ content: `🎮 <@${owner}> is mid-way through **${liveName(have.story)}** here — this is where things stand. (\`/activity stop\` to abandon it.)`, allowedMentions: { users: [owner] } });
+          return postScene(interaction.guild, cid, have, sc);
+        }
+      }
+    }
+    for (const m of (members || [owner])) { const g = runGate(gid, m, story); if (g) return interaction.reply({ content: g, ephemeral: true, allowedMentions: { parse: [] } }); }
+    const started = await startActivityRun(interaction, story, { owner, members });
+    if (started.error) return interaction.reply({ content: started.error, ephemeral: true });
     const alongside = runsIn(gid, cid).length - 1;
-    await interaction.reply({ content: `🎮 **${story.name}** begins for <@${owner}>…`
-      + (owner !== interaction.user.id ? ` _(set going by <@${interaction.user.id}> — the buttons are yours, <@${owner}>.)_` : '')
-      + (alongside > 0 ? `\n_${alongside} other run${alongside === 1 ? ' is' : 's are'} going in here too — each is its own._` : '') });
-    return postScene(interaction.guild, cid, run, first);
+    await interaction.reply({ content: members
+      ? `🎮 **${story.name}** begins for the party — ${members.map(m => `<@${m}>`).join(', ')}. You press in turn; the tally is shared and every one of you is paid at the end.`
+      : `🎮 **${story.name}** begins for <@${owner}>…`
+        + (owner !== interaction.user.id ? ` _(set going by <@${interaction.user.id}> — the buttons are yours, <@${owner}>.)_` : '')
+        + (alongside > 0 ? `\n_${alongside} other run${alongside === 1 ? ' is' : 's are'} going in here too — each is its own._` : '') });
+    return started.go();
   }
 }
+
+// The script as a text file and, when the parchment can be painted, a PDF
+// that carries the script woven after its EOF — the sheet trick.
+const ACTIVITY_WEAVE_MARK = 'DDICEACTIVITYv1';
+function extractActivityData(buf) {
+  if (!buf || !Buffer.isBuffer(buf)) return null;
+  const i = buf.indexOf(ACTIVITY_WEAVE_MARK);
+  if (i === -1) return null;
+  try { const o = JSON.parse(buf.slice(i + ACTIVITY_WEAVE_MARK.length).toString('utf8')); return o && typeof o === 'object' && typeof o.source === 'string' ? o : null; }
+  catch { return null; }
+}
+function activityFiles(gid, name, source) {
+  const { AttachmentBuilder } = require('discord.js');
+  const slug = String(liveName(name)).replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'activity';
+  const files = [new AttachmentBuilder(Buffer.from(source, 'utf8'), { name: `${slug}.txt` })];
+  if (hasCanvas()) {
+    try {
+      const pdf = renderScrollBook({ family: 'standard', title: liveName(name), body: source });
+      const woven = Buffer.concat([pdf, Buffer.from('\n' + ACTIVITY_WEAVE_MARK + JSON.stringify({ v: 1, name: liveName(name), source }), 'utf8')]);
+      files.push(new AttachmentBuilder(woven, { name: `${slug}.pdf` }));
+    } catch (err) { console.error('[activity] pdf failed:', err?.message || err); }
+  }
+  return files;
+}
+function scriptCodeBlocks(source, limit = 1850) {
+  const out = []; let cur = [];
+  let size = 0;
+  for (const line of String(source || '').split('\n')) {
+    const safe = line.replace(/```/g, "'''");
+    if (size + safe.length + 1 > limit && cur.length) { out.push('```\n' + cur.join('\n') + '\n```'); cur = []; size = 0; }
+    cur.push(safe); size += safe.length + 1;
+  }
+  if (cur.length) out.push('```\n' + cur.join('\n') + '\n```');
+  return out;
+}
+
+function renameActivity(gid, from, to) {
+  const fix = (src) => src ? src.replace(/^(\s*\[(?:STORY|ACTIVITY)\]\s*).*$/im, `$1${to}`) : src;
+  const st = getStory(gid, from);
+  db.prepare('UPDATE stories SET name=?, source=?, draft_source=?, prev_source=? WHERE guild_id=? AND name=? COLLATE NOCASE')
+    .run(to, fix(st.source), fix(st.draft_source), fix(st.prev_source), gid, from);
+  for (const [table, col] of [['story_scenes', 'story'], ['story_runs', 'story'], ['story_run_log', 'story'], ['story_claims', 'story'], ['activity_pages', 'name']]) {
+    try { db.prepare(`UPDATE ${table} SET ${col}=? WHERE guild_id=? AND ${col}=? COLLATE NOCASE`).run(to, gid, from); } catch {}
+  }
+  try { db.prepare('UPDATE stories SET name=? WHERE guild_id=? AND name=? COLLATE NOCASE').run(draftName(to), gid, draftName(from)); } catch {}
+  try { db.prepare('UPDATE story_scenes SET story=? WHERE guild_id=? AND story=? COLLATE NOCASE').run(draftName(to), gid, draftName(from)); } catch {}
+  try { db.prepare('UPDATE npcs SET talk_activity=? WHERE guild_id=? AND talk_activity=? COLLATE NOCASE').run(to, gid, from); } catch {}
+}
+
+// ── Editing on the shelf, or by command ────────────────────────────────
+// A scene's block in a box; or the whole script when it fits; or a pick
+// of scenes when it does not. The box saves through the one save path.
+async function openActivityEdit(interaction, story, sceneName = null, { pick = false } = {}) {
+  const gid = interaction.guild.id;
+  const { ModalBuilder, ActionRowBuilder, TextInputBuilder, TextInputStyle, StringSelectMenuBuilder } = require('discord.js');
+  const base = story.draft_source || sourceOf(gid, story.name);
+  if (!base) return interaction.reply({ content: `❌ **${story.name}** has no script to edit yet.`, ephemeral: true });
+  const key = activityKey(story.name);
+  const box = (id, title, label, value) => new ModalBuilder().setCustomId(id).setTitle(title.slice(0, 45)).addComponents(
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('script').setLabel(label.slice(0, 45))
+      .setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(4000).setValue(value.slice(0, 4000))));
+  if (sceneName) {
+    const block = sceneBlockText(base, sceneName);
+    if (!block) return interaction.reply({ content: `❌ **${story.name}** has no scene \`${sceneName}\`.`, ephemeral: true });
+    if (block.length > 4000) return interaction.reply({ content: `❌ Scene \`${sceneName}\` is longer than a box holds — edit the whole script as a file.`, ephemeral: true });
+    return interaction.showModal(box(`actvedit:${key}:${sceneName}`.slice(0, 100), `${story.name} · ${sceneName}`, `Scene ${sceneName} — this block only`, block));
+  }
+  if (!pick && base.length <= 4000) return interaction.showModal(box(`actvall:${key}`, `${story.name} — whole script`, 'The whole script', base));
+  const scenes = [...new Set((base.match(/^\s*SCENE\s+(\S+)/gim) || []).map(l => l.trim().split(/\s+/)[1]))].slice(0, 25);
+  if (!scenes.length) return interaction.reply({ content: '❌ No scenes found in the script.', ephemeral: true });
+  const menu = new StringSelectMenuBuilder().setCustomId(`actvscene:${key}`).setPlaceholder('Which scene?')
+    .addOptions(scenes.map(s => ({ label: s.slice(0, 100), value: s.slice(0, 100) })));
+  return interaction.reply({ ephemeral: true, content: pick ? `✏️ **${story.name}** — which scene?` : `✏️ **${story.name}** is longer than one box — pick a scene to edit.`,
+    components: [new ActionRowBuilder().addComponents(menu)] });
+}
+async function handleActivitySceneSelect(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ Only GMs can edit activities.', ephemeral: true });
+  const story = storyByKey(gid, interaction.customId.split(':')[1]);
+  if (!story) return interaction.reply({ content: '❌ That activity has gone.', ephemeral: true });
+  return openActivityEdit(interaction, story, interaction.values[0]);
+}
+async function handleActivityEditModal(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can edit activities.', ephemeral: true });
+  const [kind, key, ...rest] = interaction.customId.split(':');
+  const story = storyByKey(gid, key);
+  if (!story) return interaction.reply({ content: '❌ That activity has gone.', ephemeral: true });
+  const text = interaction.fields.getTextInputValue('script');
+  let next;
+  if (kind === 'actvall') next = text;
+  else {
+    const sceneName = rest.join(':');
+    const base = story.draft_source || sourceOf(gid, story.name) || '';
+    next = replaceSceneBlock(base, sceneName, text);
+  }
+  const r = saveActivity(gid, uid, next, { via: 'box' });
+  if (r.error) return interaction.reply({ content: `❌ ${r.error}`, ephemeral: true });
+  const rows = r.status === 'waiting' ? [publishRow(story.name)] : [];
+  return interaction.reply({ content: r.saved, ephemeral: true, components: rows });
+}
+function publishRow(name) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  const key = activityKey(name);
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`actv:practice:${key}`).setLabel('🧪 Practice').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`actv:publish:${key}`).setLabel('🚀 Publish').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`actv:discard:${key}`).setLabel('🗑️ Discard draft').setStyle(ButtonStyle.Danger));
+}
+// The draft goes live: its rows become the live rows, the old live script
+// is kept for Revert.
+async function publishActivityDraft(interaction, story) {
+  const gid = interaction.guild.id;
+  const fresh = getStory(gid, story.name);
+  if (!fresh?.draft_source) return interaction.reply({ content: `❌ **${story.name}** has no draft waiting.`, ephemeral: true });
+  if (fresh.draft_problems) {
+    let probs = []; try { probs = JSON.parse(fresh.draft_problems) || []; } catch {}
+    return interaction.reply({ ephemeral: true, content: `❌ The draft of **${story.name}** still has ${probs.length} problem${probs.length === 1 ? '' : 's'} — fix those first:\n${probs.slice(0, 8).map(p => `• line ${p.line}: ${p.msg}`).join('\n')}` });
+  }
+  const running = liveRunsOf(gid, story.name);
+  if (running.length) return interaction.reply({ ephemeral: true, content: `❌ ${running.length} ${running.length === 1 ? 'run is' : 'runs are'} mid-way through **${story.name}** — publishing would pull the scenes from under ${running.length === 1 ? 'it' : 'them'}. \`/activity stop\` in ${[...new Set(running.map(r => `<#${r.channel_id}>`))].join(', ')} first.`, allowedMentions: { parse: [] } });
+  const r = saveActivity(gid, interaction.user.id, fresh.draft_source, { publish: 'now', via: 'publish' });
+  if (r.error) return interaction.reply({ content: `❌ ${r.error}`, ephemeral: true });
+  if (r.status !== 'published') return interaction.reply({ content: `❌ **${story.name}** did not publish — read again, it has problems now (a bank question gone, perhaps):\n${r.saved}`, ephemeral: true });
+  return interaction.reply({ content: `🚀 **${story.name}** published.\n${r.saved}` });
+}
+async function discardActivityDraft(interaction, story) {
+  const gid = interaction.guild.id;
+  const fresh = getStory(gid, story.name);
+  if (!fresh?.draft_source) return interaction.reply({ content: `❌ **${story.name}** has no draft to discard.`, ephemeral: true });
+  db.prepare('UPDATE stories SET draft_source=NULL, draft_problems=NULL WHERE guild_id=? AND name=? COLLATE NOCASE').run(gid, story.name);
+  try { deleteStory(gid, draftName(story.name)); } catch {}
+  if (!storyIsLive(gid, fresh)) { deleteStory(gid, story.name); await retireActivityPage(interaction.client, gid, story.name, { deleted: true }).catch(() => {}); return interaction.reply({ content: `🗑️ The draft of **${story.name}** is gone — it had no live version, so the activity is gone with it.`, ephemeral: true }); }
+  queueActivityMirror(gid, story.name);
+  return interaction.reply({ content: `🗑️ The draft of **${story.name}** is gone; the live version stands.`, ephemeral: true });
+}
+async function revertActivity(interaction, story) {
+  const gid = interaction.guild.id;
+  const fresh = getStory(gid, story.name);
+  if (!fresh?.prev_source) return interaction.reply({ content: `❌ **${story.name}** has no earlier version to go back to.`, ephemeral: true });
+  if (fresh.draft_source) return interaction.reply({ content: `❌ **${story.name}** has a draft waiting — publish or discard it first, so Revert cannot throw it away.`, ephemeral: true });
+  if (liveRunsOf(gid, story.name).length) return interaction.reply({ content: `❌ Someone is mid-run in **${story.name}** — \`/activity stop\` first.`, ephemeral: true });
+  // Checked before anything is touched: an old version that no longer parses
+  // must not land as the draft and push out whatever was being worked on.
+  const probe = parseStoryScript(fresh.prev_source, { gid });
+  if (probe.error) return interaction.reply({ content: `❌ The earlier version no longer parses, so nothing was changed:\n${probe.error.slice(0, 1500)}`, ephemeral: true });
+  const r = saveActivity(gid, interaction.user.id, fresh.prev_source, { publish: 'now', via: 'revert' });
+  if (r.error) return interaction.reply({ content: `❌ ${r.error}`, ephemeral: true });
+  return interaction.reply({ content: `⏪ **${story.name}** is back on its earlier version (the one just replaced is kept, so Revert again swaps back).\n${r.saved}` });
+}
+// A practice run for a GM: the draft if there is a good one, else the live
+// script; nothing paid, rerolls free, and the die can be told what to show.
+async function startPractice(interaction, story) {
+  const gid = interaction.guild.id, cid = interactionChannelId(interaction), uid = interaction.user.id;
+  if (!getChar(gid, uid)) return interaction.reply({ content: '❌ Practice plays with your sheet — `/char create` yourself a test knight first.', ephemeral: true });
+  if (getRun(gid, cid, uid)) return interaction.reply({ content: '❌ You already have something running here. `/activity stop` first.', ephemeral: true });
+  const fresh = getStory(gid, story.name);
+  const draftRows = fresh.draft_source && !fresh.draft_problems && listScenes(gid, draftName(story.name)).length;
+  const useName = draftRows ? draftName(story.name) : story.name;
+  if (!draftRows && !storyIsLive(gid, fresh)) return interaction.reply({ content: `❌ **${story.name}** has nothing runnable yet${fresh.draft_problems ? ' — the draft has problems to fix' : ''}.`, ephemeral: true });
+  const started = await startActivityRun(interaction, fresh, { owner: uid, practice: true, storyName: useName });
+  if (started.error) return interaction.reply({ content: started.error, ephemeral: true });
+  await interaction.reply({ content: `🧪 **Practice — ${story.name}**${draftRows ? ' (the draft)' : ''}: nothing is awarded, rerolls are free, and each roll offers buttons to force the die. \`/activity stop\` ends it.` });
+  return started.go();
+}
+
+// ── The shelf: one activity, one thread ─────────────────────────────────────
+// A GM-only forum where every activity has a thread: the card and its
+// buttons on top, the script as code blocks under it, and a parchment PDF
+// that carries the script woven in. Discord's tag filter does the browsing.
+// The database is the truth; the shelf is a mirror, redrawn after every save
+// and mended on boot. A GM's post in the thread — a script, a .txt, the PDF —
+// is read as a resubmit.
+const ACTIVITY_TAGS = ['live', 'draft', 'retired', 'quiz', 'story', 'gauntlet', 'rewards', 'open', 'demo'];
+const DEMO_PAGES = { fishing: { title: 'Fishing (demo)', script: () => DEMO_FISHING }, quiz: { title: 'Kalidale Lore (quiz demo)', script: () => DEMO_QUIZ }, trial: { title: "The Scribe's Trial (tutorial)", script: () => DEMO_TRIAL } };
+const activityMirrorTimers = new Map();
+function queueActivityMirror(gid, name) {
+  if (typeof client === 'undefined' || !client?.channels) return;
+  if (isDemoStory(name)) return;
+  const key = `${gid}\u0000${String(liveName(name)).toLowerCase()}`;
+  clearTimeout(activityMirrorTimers.get(key));
+  const t = setTimeout(() => {
+    activityMirrorTimers.delete(key);
+    mirrorActivityPage(client, gid, liveName(name)).catch(err => console.error('[shelf] mirror -', err?.message || err));
+    redrawActivityBoard(client, gid).catch(err => console.error('[board] -', err?.message || err));
+  }, 1500);
+  t.unref?.();
+  activityMirrorTimers.set(key, t);
+}
+const activityBoardTimers = new Map();
+function queueActivityBoard(gid) {
+  if (typeof client === 'undefined' || !client?.channels) return;
+  clearTimeout(activityBoardTimers.get(gid));
+  const t = setTimeout(() => { activityBoardTimers.delete(gid); redrawActivityBoard(client, gid).catch(err => console.error('[board] -', err?.message || err)); }, 1500);
+  t.unref?.();
+  activityBoardTimers.set(gid, t);
+}
+async function ensureActivityTags(forum) {
+  const have = forum.availableTags || [];
+  const missing = ACTIVITY_TAGS.filter(c => !have.some(t => t.name.toLowerCase() === c));
+  if (missing.length && have.length + missing.length <= 20) {
+    try {
+      // The existing tags go back with their ids, or Discord makes new ones
+      // and every thread loses the old (ensurePlanTags learnt this first).
+      await forum.setAvailableTags([...have.map(t => ({ id: t.id, name: t.name, moderated: t.moderated,
+        emoji: t.emoji ? { id: t.emoji.id ?? null, name: t.emoji.name ?? null } : undefined })), ...missing.map(c => ({ name: c }))]);
+    } catch (err) { console.error('[shelf] tags -', err?.message || err); }
+  }
+  const map = {};
+  for (const t of (await forum.fetch().catch(() => forum)).availableTags || []) map[t.name.toLowerCase()] = t.id;
+  return map;
+}
+function activityPageRow(gid, name) {
+  try { return db.prepare('SELECT * FROM activity_pages WHERE guild_id=? AND name=? COLLATE NOCASE').get(gid, name) || null; } catch { return null; }
+}
+function activityPageByThread(gid, threadId) {
+  try { return db.prepare('SELECT * FROM activity_pages WHERE guild_id=? AND thread_id=?').get(gid, String(threadId)) || null; } catch { return null; }
+}
+function saveActivityPage(gid, name, fields) {
+  const row = activityPageRow(gid, name) || { thread_id: null, head_id: null, text_ids: '[]', file_id: null };
+  const next = { ...row, ...fields, at: Date.now() };
+  db.prepare(`INSERT INTO activity_pages (guild_id, name, thread_id, head_id, text_ids, file_id, at) VALUES (?,?,?,?,?,?,?)
+              ON CONFLICT(guild_id, name) DO UPDATE SET thread_id=excluded.thread_id, head_id=excluded.head_id, text_ids=excluded.text_ids, file_id=excluded.file_id, at=excluded.at`)
+    .run(gid, name, next.thread_id, next.head_id, typeof next.text_ids === 'string' ? next.text_ids : JSON.stringify(next.text_ids || []), next.file_id, next.at);
+}
+// The card at the top of a thread.
+function activityHeadLines(gid, story) {
+  const scenes = listScenes(gid, story.name);
+  const state = storyState(gid, story);
+  const L = [`🎮 **${story.name}** — ${STATE_WORD[state]}`];
+  const bits = [];
+  if (scenes.length) bits.push(`${scenes.length} scene${scenes.length === 1 ? '' : 's'}, starts at \`${story.start_scene}\``);
+  if (story.tally) bits.push(`tally **${story.tally}**`);
+  if (story.quiz_mode) bits.push(`quiz · ${story.quiz_mode}`);
+  if (story.cooldown) bits.push(`once per ${story.cooldown}`);
+  if (story.available) bits.push(`on ${story.available}`);
+  let req = []; try { req = JSON.parse(story.require_json || '[]') || []; } catch {}
+  for (const c of req) bits.push(`needs ${describeCondition(c)}`);
+  if (bits.length) L.push(bits.join(' · '));
+  if (story.author_id) L.push(`✍️ <@${story.author_id}>${story.published_at ? ` · published <t:${Math.floor(story.published_at / 1000)}:R>` : ''}`);
+  L.push(getConfig(gid)?.activity_players ? '🔓 players may start it themselves' : '🔒 GM-started (`/config mechanics activities players:true` opens it)');
+  const rolls = scenes.filter(sc => sc.roll && sc.dc && !sc.gauntlet).slice(0, 8);
+  if (rolls.length) {
+    L.push('', '🎲 **Rolls, for this table**');
+    for (const sc of rolls) { const o = passOdds(gid, sc.roll, sc.dc); L.push(`• \`${sc.scene}\` ${String(sc.roll).toUpperCase()} DC ${sc.dc}${o ? ` — ${oddsLine(o)}` : ''}`); }
+  }
+  const endings = scenes.filter(sc => sc.ending);
+  if (endings.length) {
+    const pays = endings.filter(sc => sc.merits || sc.cash_tally || sc.rewards || sc.grants).length;
+    L.push(`🏁 ${endings.length} ending${endings.length === 1 ? '' : 's'}${pays ? `, ${pays} that pay` : ''}`);
+  }
+  let notes = []; try { notes = JSON.parse(story.notes || '[]') || []; } catch {}
+  if (notes.length) L.push('', ...noteLines(notes));
+  if (story.draft_problems) {
+    let probs = []; try { probs = JSON.parse(story.draft_problems) || []; } catch {}
+    L.push('', `📝 **The draft has ${probs.length} problem${probs.length === 1 ? '' : 's'}:**`, ...probs.slice(0, 8).map(p => `• line ${p.line}: ${p.msg}${p.fix ? `\n　 ↳ ${p.fix}` : ''}`));
+  } else if (story.draft_source) {
+    L.push('', '📝 A draft is waiting — **Practice** plays it, **Publish** puts it live.');
+  }
+  const stats = activityStatLines(gid, story.name);
+  if (stats.length) L.push('', ...stats);
+  L.push('', '_Post a script, a `.txt` or the PDF in this thread to replace it; **Edit scene** opens one block in a box._');
+  return L;
+}
+function activityHeadRows(gid, story) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  const key = activityKey(story.name);
+  const b = (id, label, style = ButtonStyle.Secondary) => new ButtonBuilder().setCustomId(`actv:${id}:${key}`).setLabel(label).setStyle(style);
+  const row1 = new ActionRowBuilder().addComponents(b('edit', '✏️ Edit scene'), b('editall', '📝 Edit all'), b('practice', '🧪 Practice'));
+  const row2 = new ActionRowBuilder();
+  if (story.draft_source && !story.draft_problems) row2.addComponents(b('publish', '🚀 Publish', ButtonStyle.Success));
+  if (story.draft_source) row2.addComponents(b('discard', '🗑️ Discard draft', ButtonStyle.Danger));
+  if (story.prev_source) row2.addComponents(b('revert', '⏪ Revert'));
+  row2.addComponents(story.retired ? b('restore', '♻️ Restore', ButtonStyle.Success) : b('retire', '🪦 Retire', ButtonStyle.Danger));
+  return [row1, row2];
+}
+function activityTagNames(gid, story) {
+  const scenes = listScenes(gid, story.name);
+  const tags = [];
+  tags.push(story.retired ? 'retired' : storyIsLive(gid, story) ? 'live' : 'draft');
+  if (story.draft_source && !story.retired && storyIsLive(gid, story)) tags.push('draft');
+  if (story.quiz_mode || scenes.some(sc => sc.ask || JSON.parse(sc.choices || '[]').some(c => c.correct))) tags.push('quiz');
+  else tags.push('story');
+  if (scenes.some(sc => sc.gauntlet)) tags.push('gauntlet');
+  if (scenes.some(sc => sc.ending && (sc.merits || sc.cash_tally || sc.rewards || sc.grants))) tags.push('rewards');
+  if (getConfig(gid)?.activity_players) tags.push('open');
+  return [...new Set(tags)].slice(0, 5);
+}
+// One writer per page at a time; a call that lands while one is in flight
+// marks it dirty, and the page is drawn once more when the first finishes.
+const activityPageInFlight = new Map();
+const activityPageDirty = new Set();
+async function mirrorActivityPage(client, gid, name) {
+  const key = `${gid}\u0000${String(name).toLowerCase()}`;
+  if (activityPageInFlight.has(key)) { activityPageDirty.add(key); return activityPageInFlight.get(key); }
+  const p = mirrorActivityPageNow(client, gid, name).finally(() => {
+    activityPageInFlight.delete(key);
+    if (activityPageDirty.delete(key)) mirrorActivityPage(client, gid, name).catch(() => {});
+  });
+  activityPageInFlight.set(key, p);
+  return p;
+}
+async function shelfForum(client, gid) {
+  const forumId = getConfig(gid)?.activity_forum;
+  if (!forumId) return null;
+  const forum = await client.channels.fetch(forumId).catch(() => null);
+  return forum && forum.type === 15 ? forum : null;
+}
+async function mirrorActivityPageNow(client, gid, name) {
+  const forum = await shelfForum(client, gid);
+  if (!forum) return null;
+  const story = getStory(gid, name);
+  if (!story || isDemoStory(story.name)) return null;
+  const tagMap = await ensureActivityTags(forum);
+  const applied = activityTagNames(gid, story).map(t => tagMap[t]).filter(Boolean);
+  const head = chunkLines(activityHeadLines(gid, story))[0];
+  const rows = activityHeadRows(gid, story);
+  const src = story.draft_source || sourceOf(gid, story.name) || '';
+  const blocks = src ? scriptCodeBlocks(src) : ['_No script yet._'];
+
+  const row = activityPageRow(gid, story.name);
+  let thread = row?.thread_id ? await client.channels.fetch(row.thread_id).catch(() => null) : null;
+  if (thread && (!thread.isThread?.() || thread.parentId !== forum.id)) thread = null;
+  if (!thread) {
+    // Adopt a thread already named for it before making a second.
+    try {
+      const byName = await botThreadsNamed(client, forum);
+      // Never a demo's thread, and never one that was closed for a deleted
+      // activity of the same name — a new one is made instead.
+      const found = (byName.get(story.name.slice(0, 100).toLowerCase()) || []).find(t => !t.archived && !t.locked && !/^demo:/.test(activityPageByThread(gid, t.id)?.name || ''));
+      if (found) thread = found;
+    } catch {}
+  }
+  let headId = row?.head_id || null, textIds = [], fileId = row?.file_id || null;
+  try { textIds = JSON.parse(row?.text_ids || '[]') || []; } catch {}
+  if (!thread) {
+    thread = await forum.threads.create({ name: story.name.slice(0, 100), autoArchiveDuration: 10080,
+      message: { content: head, components: rows, allowedMentions: { parse: [] } }, appliedTags: applied });
+    headId = thread.id; textIds = []; fileId = null;
+  } else {
+    thread = await wakeThread(thread);
+    if (thread.name !== story.name.slice(0, 100)) await thread.setName(story.name.slice(0, 100)).catch(() => {});
+    try { await thread.setAppliedTags(applied); } catch {}
+    let headMsg = headId ? await thread.messages.fetch(headId).catch(() => null) : null;
+    if (headMsg && headMsg.author?.id === client.user.id) await headMsg.edit({ content: head, components: rows, allowedMentions: { parse: [] } }).catch(() => {});
+    else { const sent = await thread.send({ content: head, components: rows, allowedMentions: { parse: [] } }).catch(() => null); headId = sent?.id || headId; }
+  }
+  // The script, block by block: edit what is there, add what is missing,
+  // drop what is over — then the parchment, fresh each time.
+  const kept = [];
+  for (let i = 0; i < blocks.length; i++) {
+    const existing = textIds[i] ? await thread.messages.fetch(textIds[i]).catch(() => null) : null;
+    if (existing && existing.author?.id === client.user.id) {
+      if (existing.content !== blocks[i]) await existing.edit({ content: blocks[i], allowedMentions: { parse: [] } }).catch(() => {});
+      kept.push(existing.id);
+    } else {
+      const sent = await thread.send({ content: blocks[i], allowedMentions: { parse: [] } }).catch(() => null);
+      if (sent) kept.push(sent.id);
+    }
+  }
+  for (const extra of textIds.slice(blocks.length)) { const m = await thread.messages.fetch(extra).catch(() => null); if (m) await m.delete().catch(() => {}); }
+  if (fileId) { const m = await thread.messages.fetch(fileId).catch(() => null); if (m) await m.delete().catch(() => {}); fileId = null; }
+  if (src) {
+    try {
+      const sent = await thread.send({ content: '📎 The script as a file, and on parchment — drop either into `/activity create file:` to carry it elsewhere.', files: activityFiles(gid, story.name, src) }).catch(() => null);
+      fileId = sent?.id || null;
+    } catch {}
+  }
+  saveActivityPage(gid, story.name, { thread_id: thread.id, head_id: headId, text_ids: kept, file_id: fileId });
+  if (story.retired) { try { await thread.setArchived(true); } catch {} }
+  return thread;
+}
+// A thread for an activity that is gone, renamed, or retired: a closing
+// line, then locked and archived. The row goes when the activity does.
+async function retireActivityPage(client, gid, name, { deleted = false, renamedTo = null } = {}) {
+  const row = activityPageRow(gid, name);
+  if (!row?.thread_id) { if (deleted) try { db.prepare('DELETE FROM activity_pages WHERE guild_id=? AND name=? COLLATE NOCASE').run(gid, name); } catch {} return; }
+  const thread = await client.channels.fetch(row.thread_id).catch(() => null);
+  if (thread?.isThread?.()) {
+    const line = deleted ? `🗑️ **${name}** was deleted.` : renamedTo ? `✏️ **${name}** is now **${renamedTo}** — its thread is the new one.` : `🪦 **${name}** has been retired.`;
+    await wakeThread(thread).catch(() => {});
+    await thread.send({ content: line, allowedMentions: { parse: [] } }).catch(() => {});
+    if (deleted || renamedTo) { try { await thread.setLocked(true); } catch {} }
+    try { await thread.setArchived(true); } catch {}
+  }
+  if (deleted || renamedTo) { try { db.prepare('DELETE FROM activity_pages WHERE guild_id=? AND name=? COLLATE NOCASE').run(gid, name); } catch {} }
+}
+// The demos, read-only, so the grammar is always on the shelf as worked examples.
+async function mirrorDemoPages(client, gid) {
+  const forum = await shelfForum(client, gid);
+  if (!forum) return 0;
+  const tagMap = await ensureActivityTags(forum);
+  let made = 0;
+  for (const [which, demo] of Object.entries(DEMO_PAGES)) {
+    const pageName = `demo:${which}`;
+    const row = activityPageRow(gid, pageName);
+    let thread = row?.thread_id ? await client.channels.fetch(row.thread_id).catch(() => null) : null;
+    if (thread && (!thread.isThread?.() || thread.parentId !== forum.id)) thread = null;
+    if (thread) continue;
+    try { const byName = await botThreadsNamed(client, forum); thread = (byName.get(demo.title.toLowerCase()) || [])[0] || null; } catch {}
+    if (thread) { saveActivityPage(gid, pageName, { thread_id: thread.id, head_id: thread.id }); continue; }
+    const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+    const src = demo.script();
+    const head = [`📚 **${demo.title}** — a built-in example, read-only.`,
+      which === 'trial' ? 'Play it to be walked through the grammar; read it here to see how each piece is written.' : 'Copy any of it into your own script; `/activity copy` cannot take a demo, so paste instead.',
+      `\`/activity demo which:${which}\` plays it; nothing is awarded.`].join('\n');
+    const row1 = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`actv:demo:${which}`).setLabel('▶️ Play it here').setStyle(ButtonStyle.Primary));
+    thread = await forum.threads.create({ name: demo.title.slice(0, 100), autoArchiveDuration: 10080,
+      message: { content: head, components: [row1], allowedMentions: { parse: [] } }, appliedTags: ['demo', 'live'].map(t => tagMap[t]).filter(Boolean) }).catch(() => null);
+    if (!thread) continue;
+    const ids = [];
+    for (const block of scriptCodeBlocks(src)) { const m = await thread.send({ content: block, allowedMentions: { parse: [] } }).catch(() => null); if (m) ids.push(m.id); }
+    const f = await thread.send({ files: activityFiles(gid, demo.title, src) }).catch(() => null);
+    saveActivityPage(gid, pageName, { thread_id: thread.id, head_id: thread.id, text_ids: ids, file_id: f?.id || null });
+    made++;
+  }
+  return made;
+}
+// Boot mend: every activity has its thread, the demos are there, doubles
+// are folded. Returns lines for the Deploy mend.
+async function mendActivityPages(client, gid) {
+  const out = [];
+  const forum = await shelfForum(client, gid);
+  if (!forum) return out;
+  let made = 0;
+  for (const st of listStories(gid)) {
+    if (isDemoStory(st.name)) continue;
+    const row = activityPageRow(gid, st.name);
+    const thread = row?.thread_id ? await client.channels.fetch(row.thread_id).catch(() => null) : null;
+    if (thread?.isThread?.() && thread.parentId === forum.id && !st.retired) continue;
+    if (st.retired && thread) continue;
+    await mirrorActivityPage(client, gid, st.name).catch(() => {});
+    made++;
+  }
+  const demos = await mirrorDemoPages(client, gid).catch(() => 0);
+  // Doubles: two bot threads with one name — keep the one the row knows, or the oldest.
+  let removed = 0;
+  try {
+    const byName = await botThreadsNamed(client, forum);
+    for (const st of listStories(gid)) {
+      const list = byName.get(st.name.slice(0, 100).toLowerCase()) || [];
+      if (list.length < 2) continue;
+      const row = activityPageRow(gid, st.name);
+      const sorted = [...list].sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+      const keep = sorted.find(t => t.id === row?.thread_id) || sorted[0];
+      if (keep.id !== row?.thread_id) saveActivityPage(gid, st.name, { thread_id: keep.id, head_id: keep.id, text_ids: [], file_id: null });
+      for (const t of sorted) {
+        if (t.id === keep.id) continue;
+        let foreign = false;
+        try { const msgs = await t.messages.fetch({ limit: 50 }); foreign = msgs.some(m => m.author?.id !== client.user.id && !m.webhookId); } catch {}
+        if (foreign) continue;
+        await t.delete('DDice: duplicate activity page').catch(() => {}); removed++;
+      }
+    }
+  } catch {}
+  if (made) out.push(`activity shelf: ${made} page(s) written`);
+  if (demos) out.push(`activity shelf: ${demos} demo page(s) added`);
+  if (removed) out.push(`activity shelf: ${removed} duplicate thread(s) folded`);
+  return out;
+}
+
+// A GM's post in an activity's thread is a resubmit; a GM's new post in the
+// shelf forum is a new activity. Returns true when the message was taken.
+async function tryActivityShelfPost(message) {
+  const gid = message.guild?.id;
+  if (!gid || !message.channel?.isThread?.()) return false;
+  const forumId = getConfig(gid)?.activity_forum;
+  if (!forumId || message.channel.parentId !== forumId) return false;
+  const page = activityPageByThread(gid, message.channel.id);
+  const starter = message.id === message.channel.id;
+  if (!page && !starter) return false;
+  if (!(await isGm(message.guild, message.author.id))) return false;
+  // What was posted: a text file, a woven PDF, or the message itself. Ordinary
+  // talk in the thread — and a screenshot — is left alone.
+  let text = null;
+  const att = [...(message.attachments?.values?.() || [])].find(a => /\.(txt|md|pdf)$/i.test(a?.name || ''));
+  if (att) {
+    if ((att.size || 0) > 2 * 1024 * 1024) { await message.reply('❌ That file is over two megabytes — a script is never that long.').catch(() => {}); return true; }
+    try {
+      const bytes = await fetchBytes(att.url);
+      const woven = extractActivityData(bytes);
+      text = woven?.source || (/\.(txt|md)$/i.test(att.name || '') ? bytes.toString('utf8') : null);
+    } catch {}
+    if (!text) { await message.reply('❌ I could not read that file — a `.txt` of the script, or the PDF from a shelf, both work.').catch(() => {}); return true; }
+  } else {
+    text = String(message.content || '').replace(/^\s*```[a-z]*\s*\n?|\n?```\s*$/g, '').trim();
+  }
+  if (!text) return false;
+  if (!att && !/^\s*\[(STORY|ACTIVITY)\]/im.test(text) && !/^\s*SCENE\s+\S+/im.test(text)) return false;
+  if (page && /^demo:/.test(page.name)) { await message.reply('📚 The demos are read-only — paste what you want into `/activity create` and make it your own.').catch(() => {}); return true; }
+  if (page && !/^\s*\[(STORY|ACTIVITY)\]/im.test(text)) text = `[ACTIVITY] ${page.name}\n${text}`;
+  if (!/^\s*\[(STORY|ACTIVITY)\]/im.test(text)) return false;
+  const r = saveActivity(gid, message.author.id, text, { via: 'thread' });
+  if (r.error) { await message.reply(`❌ **Couldn't read that activity.** ${r.error.slice(0, 1900)}`).catch(() => {}); return true; }
+  if (page && r.name.toLowerCase() !== liveName(page.name).toLowerCase()) {
+    // Posted under one activity, named as another: it saved as the other.
+    await message.reply(`${r.saved}\n_That script names **${r.name}**, so it went there, not to **${page.name}**._`).catch(() => {});
+    return true;
+  }
+  if (starter && !page) {
+    // The GM's own post becomes the page: the card follows as the next message.
+    saveActivityPage(gid, r.name, { thread_id: message.channel.id, head_id: null, text_ids: [], file_id: null });
+  }
+  await message.reply({ content: r.saved, components: r.status === 'waiting' ? [publishRow(r.name)] : [] }).catch(() => {});
+  return true;
+}
+
+// The shelf's buttons.
+async function handleActivityShelfButton(interaction) {
+  const gid = interaction.guild.id;
+  const [, what, key] = interaction.customId.split(':');
+  if (what === 'demo') {
+    // Anyone on the shelf is a GM; a demo plays for whoever pressed.
+    if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ The shelf is for GMs.', ephemeral: true });
+    return handleStory(interaction, { sub: 'demo', which: key });
+  }
+  if (what === 'play') return handleActivityPlayButton(interaction, key);
+  if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ Only GMs can change activities.', ephemeral: true });
+  const story = storyByKey(gid, key);
+  if (!story) return interaction.reply({ content: '❌ That activity has gone — the shelf will tidy itself on the next boot.', ephemeral: true });
+  switch (what) {
+    case 'edit': return openActivityEdit(interaction, story, null, { pick: true });
+    case 'editall': return openActivityEdit(interaction, story, null);
+    case 'practice': return startPractice(interaction, story);
+    case 'publish': return publishActivityDraft(interaction, story);
+    case 'discard': return discardActivityDraft(interaction, story);
+    case 'revert': return revertActivity(interaction, story);
+    case 'retire': {
+      for (const r of liveRunsOf(gid, story.name)) endRun(gid, r.channel_id, r.user_id);
+      db.prepare('UPDATE stories SET retired=1 WHERE guild_id=? AND name=? COLLATE NOCASE').run(gid, story.name);
+      await retireActivityPage(interaction.client, gid, story.name).catch(() => {});
+      queueActivityMirror(gid, story.name);
+      return interaction.reply({ content: `🪦 **${story.name}** retired — off the board, its runs ended, its thread archived. **Restore** brings it back.`, ephemeral: true });
+    }
+    case 'restore': {
+      db.prepare('UPDATE stories SET retired=0 WHERE guild_id=? AND name=? COLLATE NOCASE').run(gid, story.name);
+      queueActivityMirror(gid, story.name);
+      return interaction.reply({ content: `♻️ **${story.name}** is back.`, ephemeral: true });
+    }
+    default: return interaction.reply({ content: '❌ Unknown button.', ephemeral: true });
+  }
+}
+
+// ── The board: a pinned message with Play buttons ───────────────────────
+async function redrawActivityBoard(client, gid) {
+  const cfg = getConfig(gid) || {};
+  if (!cfg.activity_board) return null;
+  const channel = await client.channels.fetch(cfg.activity_board).catch(() => null);
+  if (!channel?.send) return null;
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  const live = listStories(gid).filter(st => storyIsLive(gid, st) && !isDemoStory(st.name)).slice(0, 25);
+  const lines = ['🎮 **Activities** — press to play one here' + (cfg.activity_players ? '' : ' (a GM starts them on this server; ask)'), ''];
+  for (const st of live) lines.push(`• **${st.name}** — ${listScenes(gid, st.name).length} scenes${st.cooldown ? ` · once per ${st.cooldown}` : ''}${st.available ? ` · ${st.available}` : ''}`);
+  if (!live.length) lines.push('_Nothing on the board yet._');
+  const rows = [];
+  for (let i = 0; i < live.length; i += 5) {
+    rows.push(new ActionRowBuilder().addComponents(...live.slice(i, i + 5).map(st =>
+      new ButtonBuilder().setCustomId(`actv:play:${activityKey(st.name)}`).setLabel(`▶️ ${st.name}`.slice(0, 80)).setStyle(ButtonStyle.Primary))));
+  }
+  const payload = { content: chunkLines(lines)[0], components: rows, allowedMentions: { parse: [] } };
+  let msg = cfg.activity_board_msg ? await channel.messages.fetch(cfg.activity_board_msg).catch(() => null) : null;
+  if (msg && msg.author?.id === client.user.id) { await msg.edit(payload).catch(() => {}); return msg; }
+  msg = await channel.send(payload).catch(() => null);
+  if (!msg) return null;
+  setConfig(gid, { activity_board_msg: msg.id });
+  try { await msg.pin(); } catch {}
+  return msg;
+}
+async function handleActivityPlayButton(interaction, key) {
+  const gid = interaction.guild.id;
+  const story = storyByKey(gid, key);
+  if (!story) return interaction.reply({ content: '❌ That activity has gone from the board.', ephemeral: true });
+  const isGmUser = await isGm(interaction.guild, interaction.user.id);
+  if (!isGmUser && !getConfig(gid)?.activity_players) return interaction.reply({ content: '❌ A GM starts activities on this server — ask one to `/activity run` it for you.', ephemeral: true });
+  return handleStory(interaction, { sub: 'run', name: story.name, viaButton: true });
+}
+
+// ── The writer: one scene at a time, no grammar to learn ────────────────
+function writerRow(gid, uid) {
+  try { return db.prepare('SELECT * FROM activity_drafts WHERE guild_id=? AND user_id=?').get(gid, uid) || null; } catch { return null; }
+}
+function writerSave(gid, uid, name, scenes, pending) {
+  db.prepare(`INSERT INTO activity_drafts (guild_id, user_id, name, scenes, pending, at) VALUES (?,?,?,?,?,?)
+              ON CONFLICT(guild_id, user_id) DO UPDATE SET name=excluded.name, scenes=excluded.scenes, pending=excluded.pending, at=excluded.at`)
+    .run(gid, uid, name, JSON.stringify(scenes), JSON.stringify(pending), Date.now());
+}
+function writerDrop(gid, uid) { try { db.prepare('DELETE FROM activity_drafts WHERE guild_id=? AND user_id=?').run(gid, uid); } catch {} }
+function writerModal(name, sceneName, { prefill = {} } = {}) {
+  const { ModalBuilder, ActionRowBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+  const T = (id, label, style, ph, max, req = false, value = null) => {
+    const t = new TextInputBuilder().setCustomId(id).setLabel(label.slice(0, 45)).setStyle(style).setRequired(req).setMaxLength(max).setPlaceholder(ph.slice(0, 100));
+    if (value) t.setValue(String(value).slice(0, max));
+    return new ActionRowBuilder().addComponents(t);
+  };
+  return new ModalBuilder().setCustomId('actvw').setTitle(`${name} · scene ${sceneName}`.slice(0, 45)).addComponents(
+    T('scene', 'Scene name (one word)', TextInputStyle.Short, 'find', 40, true, sceneName),
+    T('say', 'What the player reads', TextInputStyle.Paragraph, 'You survey the water for a likely spot…', 1500, false, prefill.say),
+    T('ask', 'What it asks: a roll, a choice, or an ending', TextInputStyle.Short, 'wis DC12 · str|dex · gauntlet str 14 12 · choice · end', 80, false, prefill.ask),
+    T('outcomes', 'Where each result goes', TextInputStyle.Paragraph, 'PASS You land it -> caught\nFAIL -> find\n(or for a choice: Cast again -> cast)', 1500, false, prefill.outcomes),
+    T('extras', 'Extras (optional)', TextInputStyle.Short, 'AS Dockmaster · GAIN renown 1 · END merits:2 · SET torch', 200, false, prefill.extras),
+  );
+}
+async function startActivityWriter(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const name = String(interaction.options.getString('name') || '').trim();
+  if (!name || /^\./.test(name)) return interaction.reply({ content: '❌ Give the activity a name.', ephemeral: true });
+  const have = writerRow(gid, uid);
+  if (have && have.name.toLowerCase() !== name.toLowerCase()) {
+    let scenes = []; try { scenes = JSON.parse(have.scenes || '[]'); } catch {}
+    if (scenes.length) return interaction.reply({ ephemeral: true, content: `✍️ You are still writing **${have.name}** (${scenes.length} scene${scenes.length === 1 ? '' : 's'} so far). Finish or drop it first.`, components: [writerButtons(have)] });
+  }
+  writerSave(gid, uid, name, have?.name?.toLowerCase() === name.toLowerCase() ? JSON.parse(have.scenes || '[]') : [], have?.name?.toLowerCase() === name.toLowerCase() ? JSON.parse(have.pending || '[]') : ['start']);
+  const row = writerRow(gid, uid);
+  const pending = JSON.parse(row.pending || '[]');
+  return interaction.showModal(writerModal(name, pending[0] || 'start'));
+}
+// A scene's five boxes into script lines.
+function writerCompose(f) {
+  const L = [`SCENE ${f.scene}`];
+  const extras = String(f.extras || '').split(/\s+·\s+|\n|;\s*/).map(x => x.trim()).filter(Boolean);
+  const top = [], rest = [];
+  for (const x of extras) (/^(TALLY|QUIZ|ONCE|AVAILABLE|REQUIRE)\b/i.test(x) ? top : rest).push(x);
+  for (const x of rest) if (/^AS\b/i.test(x) || /^IMAGE\b/i.test(x)) L.push(x);
+  for (const part of String(f.say || '').split('\n')) if (part.trim()) L.push(`SAY ${part.trim()}`);
+  for (const x of rest) if (/^(SET|UNSET|GAIN|NEXT|IF)\b/i.test(x)) L.push(x);
+  const ask = String(f.ask || '').trim();
+  let m;
+  if (/^choice$/i.test(ask)) L.push('CHOICE');
+  else if (/^end\b/i.test(ask)) L.push(ask.toUpperCase().startsWith('END') ? ask.replace(/^end/i, 'END') : 'END');
+  else if ((m = ask.match(/^gauntlet\s+(.+)$/i))) L.push(`GAUNTLET ${m[1]}`);
+  else if ((m = ask.match(/^random\s*->?\s*(.+)$/i))) L.push(`RANDOM -> ${m[1]}`);
+  else if (/^ask$/i.test(ask)) L.push('ASK');
+  else if (ask) L.push(`ROLL ${ask.replace(/\s*dc\s*/i, ' DC ')}`);
+  for (const line of String(f.outcomes || '').split('\n').map(x => x.trim()).filter(Boolean)) {
+    const isBand = new RegExp(`^(${STORY_BANDS.join('|')}|NAT20|NAT1|RIGHT|WRONG|ANSWER|HINT|\\d)`, 'i').test(line);
+    L.push(`  ${isBand ? line.replace(/^(crit|pass|partial|fail|fumble|nat20|nat1|right|wrong|answer|hint)/i, w => w.toUpperCase()) : line}`);
+  }
+  for (const x of rest) if (/^END\b/i.test(x)) L.push(x.replace(/^end/i, 'END'));
+  return { block: L.join('\n'), top };
+}
+function writerButtons(row) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  let pending = []; try { pending = JSON.parse(row.pending || '[]'); } catch {}
+  const r = new ActionRowBuilder();
+  for (const p of pending.slice(0, 3)) r.addComponents(new ButtonBuilder().setCustomId(`actvw:next:${p}`.slice(0, 100)).setLabel(`✍️ Write ${p}`.slice(0, 80)).setStyle(ButtonStyle.Primary));
+  r.addComponents(new ButtonBuilder().setCustomId('actvw:done').setLabel(pending.length ? '✅ Finish anyway' : '✅ Finish').setStyle(ButtonStyle.Success));
+  r.addComponents(new ButtonBuilder().setCustomId('actvw:drop').setLabel('🗑️ Drop').setStyle(ButtonStyle.Danger));
+  return r;
+}
+async function handleWriterModal(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can write activities.', ephemeral: true });
+  const row = writerRow(gid, uid);
+  if (!row) return interaction.reply({ content: '❌ Nothing being written — `/activity write name:` starts one.', ephemeral: true });
+  const f = {};
+  for (const k of ['scene', 'say', 'ask', 'outcomes', 'extras']) f[k] = String(interaction.fields.getTextInputValue(k) || '').trim();
+  f.scene = f.scene.replace(/\s+/g, '_');
+  const { block, top } = writerCompose(f);
+  let scenes = [], pending = [];
+  try { scenes = JSON.parse(row.scenes || '[]'); pending = JSON.parse(row.pending || '[]'); } catch {}
+  scenes = scenes.filter(s => s.scene.toLowerCase() !== f.scene.toLowerCase());
+  scenes.push({ scene: f.scene, block, top });
+  const written = new Set(scenes.map(s => s.scene.toLowerCase()));
+  const wanted = [];
+  for (const s of scenes) for (const m of s.block.matchAll(/->\s*(\S+)/g)) { const t = m[1]; if (!written.has(t.toLowerCase()) && !wanted.some(w => w.toLowerCase() === t.toLowerCase())) wanted.push(t); }
+  for (const s of scenes) for (const m of s.block.matchAll(/RANDOM\s*->\s*(.+)$/gm)) for (const t of m[1].split('|').map(x => x.trim())) if (t && !written.has(t.toLowerCase()) && !wanted.some(w => w.toLowerCase() === t.toLowerCase())) wanted.push(t);
+  pending = wanted;
+  writerSave(gid, uid, row.name, scenes, pending);
+  // A quick parse of what there is so far, for problems in this scene alone.
+  const probe = parseStoryScript(`[ACTIVITY] ${row.name}\n${scenes.map(s => s.block).join('\n\n')}`, { gid });
+  const mine = (probe.problems || []).filter(p => !/points at `[^`]+`, which doesn't exist/.test(p.msg));
+  const lines = [`✍️ **${row.name}** · scene \`${f.scene}\` written — ${scenes.length} so far.`, '```\n' + block.slice(0, 1500) + '\n```'];
+  if (mine.length) lines.push(`⚠️ ${mine.slice(0, 4).map(p => p.msg).join('\n⚠️ ')}`);
+  lines.push(pending.length ? `Next: ${pending.map(p => `\`${p}\``).join(', ')} — scenes you pointed at but have not written.` : 'Every arrow resolves — **Finish** saves it.');
+  return interaction.reply({ ephemeral: true, content: lines.join('\n'), components: [writerButtons(writerRow(gid, uid))] });
+}
+async function handleWriterButton(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can write activities.', ephemeral: true });
+  const [, what, ...rest] = interaction.customId.split(':');
+  const row = writerRow(gid, uid);
+  if (!row) return interaction.reply({ content: '❌ Nothing being written — `/activity write name:` starts one.', ephemeral: true });
+  if (what === 'next') return interaction.showModal(writerModal(row.name, rest.join(':') || 'next'));
+  if (what === 'drop') { writerDrop(gid, uid); return interaction.reply({ content: `🗑️ Dropped the draft of **${row.name}**.`, ephemeral: true }); }
+  if (what === 'done') {
+    let scenes = []; try { scenes = JSON.parse(row.scenes || '[]'); } catch {}
+    if (!scenes.length) return interaction.reply({ content: '❌ No scenes written yet.', ephemeral: true });
+    const top = [...new Set(scenes.flatMap(s => s.top || []))];
+    const text = [`[ACTIVITY] ${row.name}`, ...top, '', ...scenes.map(s => s.block + '\n')].join('\n');
+    const r = saveActivity(gid, uid, text, { via: 'writer' });
+    if (r.error) return interaction.reply({ content: `❌ ${r.error}`, ephemeral: true });
+    if (r.status !== 'draft') writerDrop(gid, uid);
+    return interaction.reply({ ephemeral: true, content: r.saved + (r.status === 'draft' ? '\n_The writer still has your scenes — fix the problems with **Write** again, or on the shelf._' : ''),
+      components: r.status === 'waiting' ? [publishRow(r.name)] : r.status === 'draft' ? [writerButtons(row)] : [] });
+  }
+  return interaction.reply({ content: '❌ Unknown button.', ephemeral: true });
+}
+
+// ── The tutorial ─────────────────────────────────────────────────────────
+// A walk through the grammar that is itself written in it: read on the
+// shelf beside the play, each scene shows the piece it is made of.
+const DEMO_TRIAL = [
+"[ACTIVITY] The Scribe's Trial",
+'# A tutorial: every scene is also the lesson. Read this script on the shelf while you play.',
+'TALLY renown',
+'',
+'SCENE desk',
+'SAY 📜 **The Scribe\'s Trial.** This activity teaches the script it is written in. A `SCENE` is a block; `SAY` lines are what you read now. Every scene must ask for something — a roll, a choice, a typed answer — or end.',
+'SAY This one asks with `CHOICE`: one button per line, each `-> scene`.',
+'CHOICE',
+'  Show me a roll -> roll',
+'  Show me a question -> ask',
+'',
+'SCENE roll',
+'SAY 🎲 `ROLL wis DC easy` — a d20 plus your WIS against a DC the bot set from this server\'s sheets. `PASS` and `FAIL` say where each result goes; `NAT20` and `NAT1` override them. Try it.',
+'ROLL wis DC easy',
+'  NAT20 A natural twenty — the script can give that its own line. -> flags',
+'  NAT1 A natural one — likewise. -> flags',
+'  PASS You pass. `PASS text -> scene` is all it took. -> flags',
+'  FAIL ONE OF',
+'    You miss — and this line was picked at random from a `ONE OF` block.',
+'    You miss — a different line each time, so a loop does not repeat itself.',
+'  FAIL -> flags',
+'',
+'SCENE ask',
+'SAY ✍️ `ASK` waits for a typed answer; `ANSWER` lists what counts; `RIGHT ->` and `WRONG ->` route it. A `*` before a `CHOICE` option does the same with buttons.',
+'ASK',
+'ANSWER scene | a scene',
+'HINT The word for a block of the script',
+'RIGHT -> flags',
+'WRONG -> flags',
+'',
+'SCENE flags',
+'SAY 🚩 `SET torch` remembers something for the rest of the run; `IF torch -> somewhere` tests it on arrival. `GAIN renown 1` adds to the `TALLY` named at the top. You just gained one.',
+'GAIN renown 1',
+'SET lesson',
+'CHOICE',
+'  Onward -> fork',
+'',
+'SCENE fork',
+'SAY 🔀 This scene has only `IF` lines — it routes and says nothing more. You set `lesson`, so…',
+'IF lesson -> gauntlet',
+'IF not lesson -> desk',
+'',
+'SCENE gauntlet',
+'SAY 🎣 `GAUNTLET str|dex 8 10` — every roll must pass, DC by DC; the first miss falls. `NEXT adv` on the way in would tilt the first roll.',
+'GAUNTLET str|dex 8 10',
+'  PASS Through. -> end',
+'  FAIL Not this time — but the trial forgives. -> end',
+'',
+'SCENE end',
+'SAY 🏁 `END TALLY` pays the tally out as renown; `merits:`, `title:`, `heal:`, `quest:` and `once` can ride on the same line. In a demo, nothing is paid — but you have seen every piece. `/activity grammar` has the rest; the shelf has this script.',
+'END TALLY',
+].join('\n');
 
 async function handleQuiz(interaction) {
   const gid = interaction.guild.id, uid = interaction.user.id;
@@ -17828,7 +20095,8 @@ async function handleQuiz(interaction) {
     }
     const first = getScene(gid, parsed.name, parsed.start);
     const run = setRun(gid, cid, owner, { story: parsed.name, scene: first.scene,
-      started_at: Date.now(), tally_state: '{}', gauntlet_at: 0 });
+      started_at: Date.now(), tally_state: '{}', gauntlet_at: 0, steps: 0, is_demo: 0, practice: 0, members: null, turn: 0, quiz_asked: 0, quiz_right: 0, quiz_log: null });
+    logRun(gid, { story: parsed.name, uid: owner, cid, scene: first.scene, kind: 'start' });
     const bits = [`📚 **${drawn.length} question${drawn.length === 1 ? '' : 's'}** for <@${owner}>`];
     if (spec.pass) bits.push(`— **${spec.pass}** to pass${spec.merit ? `, worth **${spec.merit}** merit${spec.merit === 1 ? '' : 's'}` : ''}`);
     if (spec.mode === 'retry') bits.push('· wrong answers come round again');
@@ -17932,11 +20200,14 @@ async function handleQuizAddModal(interaction) {
 // from four. Nothing may await before showModal.
 function handleStoryAskButton(interaction) {
   const [, owner, sceneName] = interaction.customId.split(':');
-  if (interaction.user.id !== owner) {
+  if (owner === PARTY_KEY) {
+    const run = getRun(interaction.guild.id, interactionChannelId(interaction), PARTY_KEY);
+    if (!run || whoseTurn(run) !== interaction.user.id) return interaction.reply({ content: run ? `⏳ It is <@${whoseTurn(run)}>'s turn.` : '❌ The party run here has ended.', ephemeral: true, allowedMentions: { parse: [] } });
+  } else if (interaction.user.id !== owner) {
     return interaction.reply({ content: '🎮 That is someone else\'s run. Start your own with `/activity run`.', ephemeral: true });
   }
   const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
-  const modal = new ModalBuilder().setCustomId(`storyans:${sceneName}`).setTitle('Your answer');
+  const modal = new ModalBuilder().setCustomId(`storyans:${owner}:${sceneName}`).setTitle('Your answer');
   modal.addComponents(new ActionRowBuilder().addComponents(
     new TextInputBuilder().setCustomId('answer').setLabel('Answer').setStyle(TextInputStyle.Short)
       .setRequired(true).setMaxLength(200).setPlaceholder('Type it as you would say it')));
@@ -17946,22 +20217,24 @@ function handleStoryAskButton(interaction) {
 // The answer comes back: judge it, keep the score, and walk on.
 async function handleStoryAnswerModal(interaction) {
   const gid = interaction.guild.id, cid = interactionChannelId(interaction), uid = interaction.user.id;
-  const sceneName = interaction.customId.split(':').slice(1).join(':');
-  const found = activeSceneFor(interaction, uid, sceneName);
+  const [, owner, ...restId] = interaction.customId.split(':');
+  const sceneName = restId.join(':');
+  const found = activeSceneFor(interaction, owner, sceneName);
   if (found.error) return interaction.reply({ content: found.error, ephemeral: true });
-  const { run, sc } = found;
+  const { run, sc, rk } = found;
   const given = interaction.fields.getTextInputValue('answer');
   const wanted = JSON.parse(sc.answers || '[]');
   const right = wanted.length ? wanted.some(w => sameAnswer(given, w)) : true;
 
-  setRun(gid, cid, uid, {
+  setRun(gid, cid, rk, {
     quiz_asked: (run.quiz_asked ?? 0) + 1,
     quiz_right: (run.quiz_right ?? 0) + (right ? 1 : 0),
   });
+  if (!run.practice && !run.is_demo) logRun(gid, { story: run.story, uid, cid, scene: sc.scene, kind: 'pick', band: right ? 'RIGHT' : 'WRONG' });
   let next = right ? (sc.right_to || sc.wrong_to) : (sc.wrong_to || sc.right_to);
   if (!right && quizModeOf(gid, run.story) === 'retry') next = sc.scene;   // round again
   noteQuizSeen(gid, uid, sc, right);
-  noteQuizAnswer(gid, cid, uid, run, { question: sc.say, given, right, explain: sc.explain });
+  noteQuizAnswer(gid, cid, rk, run, { question: sc.say, given, right, explain: sc.explain });
   const silent = quizModeOf(gid, run.story) === 'silent';
   const head = silent
     ? `· **${given}** — _answer recorded._`
@@ -17971,11 +20244,10 @@ async function handleStoryAnswerModal(interaction) {
         + (sc.explain ? `\n_${sc.explain}_` : '');
   await interaction.reply({ content: head });
   if (!next) return;
-  const nextSc = getScene(gid, run.story, next);
-  if (!nextSc) return;
-  setRun(gid, cid, uid, { scene: next });
-  const channel = await interactionChannel(interaction);
-  if (channel) await postScene(interaction.guild, cid, getRun(gid, cid, uid), nextSc);
+  if (!claimRun(gid, cid, rk)) return;
+  try {
+    await advance({ guild: interaction.guild }, { gid, cid, uid, rk, run, ch: found.ch, sc }, next, JSON.parse(run.tally_state || '{}'), 0);
+  } finally { releaseRun(gid, cid, rk); }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -19301,6 +21573,8 @@ const SETUP_PLAN = [
     about: 'A planning thread per quest, so the books keep the planning forum to themselves.' },
   { key: 'quiz_forum',            name: 'question-bank',    forum: true,  gm: true,  essential: false,
     about: 'The quiz bank, a thread per category.' },
+  { key: 'activity_forum',        name: 'activity-shelf',   forum: true,  gm: true,  essential: false,
+    about: 'A thread per activity \u2014 its card, its script, a parchment PDF, and the buttons that edit it. GM eyes only: scripts hold the answers.' },
   { key: 'scroll_archive_id',     name: 'scroll-archive',   forum: true,  gm: true,  essential: false,
     about: 'Every prop written, kept.' },
   { key: 'memorial_channel',      name: 'memorial',         forum: false, gm: true,  essential: false,
@@ -20253,6 +22527,50 @@ const CHANGELOG = [
         detail: 'Since 11/10 the Game Master\'s edition has carried the whole book, so the Parchment edition was the same pages under another cover. The bot no longer looks for or posts `DDice-Commands-Parchment.pdf` or its 5e twin; the docs channel keeps the six. The old files can stay in the repository or go.' },
       { line: '`/gm undo` \u2014 rewind the last step in a channel: a fight exchange, a strike, a verdict, a group roll, a once-only press, a called check that cost HP \u2014 ten deep, a day at most; a \u23EA Undo button on the toolbar',
         detail: 'Every interaction in a channel is now bracketed: what the channel\'s rewindable state looked like before the press and after it, with the difference kept in a journal \u2014 ten steps per channel, for a day. `/gm undo` writes the newest step back, only the rows and columns that step changed, and tells the table what moved: \u201c\u23EA **Rewound one step** by Cal: **Resolve** by Meliora \u00b7 \u2764\uFE0F Artorius 4\u21927\u201d. `steps:3` takes three at once. What rewinds: the fight row (whose move, the rolls on it, HP, holds, conditions), the HP, rerolls, marks, dying tallies and stats of every sheet and NPC, heal charges, this channel\'s targets (a strike, a verdict, a repost, a retirement) and group checks (a roll, a Call it), a once-only planted press, and a called check that cost HP or changed a stat. After a fight step the fight\'s status is posted again with whose move it is and their buttons, so play picks up where it stood; a reposted target card is taken down and the first card gets its buttons back; a group check is re-drawn. A fight that has ended is not rewound \u2014 not the step that ended it, not a step inside it once it is over. The rewind is never a step itself, so two undos are two steps back, never a redo. Each rewind goes to the roll audit and the running quest\'s log, as overrides do. \u23EA Undo on `/gm bar` is the same rewind, one step.' },
+      { line: 'Typed `/fight atk` and `/fight def` behave like the buttons: bare, they offer the stat buttons; a stat with one foe (or a named target) opens the form; `flavour:` given, they roll at once',
+        detail: 'Percival typed `/fight atk stat:str` with one foe standing and was told whom he would have hit instead of hitting them \u2014 a leftover from before the forms. Now a typed attack with one opponent, or with `target:` named, opens the same what-you-do-what-you-say form the button does; with `flavour:` typed it swings without the form. `stat:` is no longer required: `/fight atk` on its own answers you alone with the attack buttons the turn card carries, `/fight def` with the defence ones. A typed `/fight def stat:con roll:adv` keeps its advantage through the form.' },
+      { line: 'Initiative ties reroll: fighters on the same total roll d20 + DEX again, only they, until apart \u2014 the card shows each round and who goes first',
+        detail: 'Two 13s used to be settled by the higher die, silently, and two identical rolls by list order. Now everyone sharing a total rerolls \u2014 \u201c\u{1F501} **Tie at 13** \u2014 Percival and Fenrir reroll: Percival \u{1F3B2} [15] + 3 = 18 \u00b7 Fenrir \u{1F3B2} [3] + 3 = 6 \u2192 Percival first\u201d \u2014 and any still level roll again among themselves, five rounds at most. Their slots in the order stay where the shared total put them; the reroll decides only who among them goes first. Each reroll is in the roll audit. `/fight start` and `/fight auto` both.' },
+      { line: '`/rp` \u2014 roleplay on its own: the fight buttons\' two boxes as a command, posted in the player\'s name, into the running quest\'s chronicle',
+        detail: 'T asked how players make the roleplay form appear with no roll to hang it on. `/rp` opens the two boxes (what you do, what you say \u2014 at least one); `/rp action:\u2026 speech:\u2026` skips the box. The line goes out through the channel\'s webhook in the player\'s own name and face, as NPC speech does, shaped as the cards are: `*action*` then `\u201cspeech\u201d`. Inside a run it is a \u{1F3AD} beat on the timeline, in the recap and in the story scroll. No dice. The bot remembers whose line it is.' },
+      { line: '`/edit` for players: fix or take back a line you posted with `/rp`; `delete:true` takes a picked line down (GMs: anything the bot or an NPC said)',
+        detail: '`/edit` was GM-only. A player now gets the same private dropdown, listing only the lines they posted with `/rp` here; a pick opens the text prefilled, as the GM\'s does; `link:` works for one of their own. `/edit delete:true` lists the same and the pick comes down \u2014 for a GM, any line the bot or its NPCs said; for a player, their own `/rp` lines. Edits and removals go to the roll audit under the name of whoever did them.' },
+      { line: '`/config mechanics fightnudge minutes:` \u2014 how long a fight may sit quiet before the bot pings whoever it waits on; 0 turns it off; 10 by default',
+        detail: 'The quiet-fight nudge of 14/10 was fixed at ten minutes, which a play-by-post table would feel every turn. The minutes are a setting now \u2014 bare, the command shows it; `minutes:0` turns it off; `minutes:30` for a slow table. The nudge line says the minutes it waited.' },
+      { line: 'Undo: presses that land together in a channel are journaled as one step, so two of them can no longer share or swap an entry, and a bystander\'s press cannot carve up an auto fight\'s changes',
+        detail: 'Each interaction took its own before-snapshot and diffed after; two landing in the same second could put the same change in two entries, or the second\'s change in the first\'s, and a rewind of either would take back the other\'s. Now the first press to open in a quiet moment takes the snapshot and the last to close writes one entry for the whole spell, under the first press\'s label \u2014 a rewind always walks a consistent sequence, and `/fight status` typed during an auto fight can no longer leave the fight\'s HP changes in an entry with no fight on it, which would have slipped past the ended-fight guard. The cost: a spell rewinds together.' },
+      { line: 'The ready check\'s last tick turns its button into \u25B6\uFE0F Start the run when the run has not started \u2014 the GM\'s press is `/quest run start`, no number to type',
+        detail: 'When the last seated player ticks Ready on a run that has not started, the card\'s Ready button becomes Start, for a GM. The press does what `/quest run start number:N` does \u2014 under spin-off that launches the run from the listing, as the command would. A ready check on a run already underway keeps its Ready button; the cheap refusals (no party, already running) leave the button in place.' },
+      { line: '`/fight log scroll:true` \u2014 the last fight\'s recap as a parchment PDF, for fights outside a quest',
+        detail: 'A fight inside a run reaches the story scroll on the completion card; one outside a run had only the recap text. `scroll:true` hands the same recap over on parchment in the server\'s scroll font, woven like every scroll, so it can be unfurled again anywhere.' },
+      { line: 'The Weekly chronicle adds the dice of the week: natural 20s and 1s and who rolled them, the biggest d20 total',
+        detail: 'Every player d20 is now dated for a fortnight (the lifetime tallies behind `/gm dicereport` are untouched). The chronicle\'s fifth section reads \u201c\u{1F3B2} **Dice of the week** \u2014 214 d20s thrown \u00b7 \u2728 natural 20s: **Artorius** \u00d72 \u00b7 \u{1F4A5} natural 1s: **Meliora** \u00d73 \u00b7 \u{1F3C6} biggest d20 total: **27** by **Zeus**\u201d. GMs\' own rolls count as anyone\'s; an NPC\'s roll under a GM\'s hand does not.' },
+      { line: 'The ledgers that only ever grow are pruned on boot and on `/gm check run`: `/rp` ownership past ninety days, the week\'s dice past fourteen',
+        detail: 'Two new tables would have grown without end; both are trimmed on every boot and every setup run, and the Deploy mend and the setup run say what went. Once-only presses and group rolls stay as they are \u2014 they are rules, not ledgers: a press gate that expired would open a card to someone who had already pressed it (the first draft pruned them; the cold audit caught it). The undo journal reads only the day\'s of each. `roll_history` is one row per hand and never grew; the dice report\'s tallies are lifetime by design.' },
+      { line: '`/existence kill|revive|heal` \u2014 the three moved out of `/gm`, which was near Discord\'s 8000-character wall',
+        detail: 'Discord counts every leaf name, description and choice label of one command against 8000 characters; `/gm` stood at 6310 with `/gm bar` and `/gm undo` aboard, and each new leaf costs 70\u2013700. Kill, revive and heal \u2014 rare, little muscle memory \u2014 now live under `/existence`, options and gates unchanged, the NPC fields autocompleting as before. `/gm` is at about 5200 of 8000, `/config` the largest at about 5900.' },
+      { line: 'Activities keep their script: a good one goes live at once or waits as a draft while someone is mid-run; one with problems is kept as a draft with every problem on its line; Publish, Revert, Practice',
+        detail: 'The script is the truth now and the scene rows its cache (`stories.source`; the version before the last publish in `prev_source`, a draft and its problems beside them). Every route \u2014 the box, a paste, a `.txt`, a shelf PDF, the scene box, the writer, a post in the thread \u2014 lands in one save path. A script that parses publishes unless a run is mid-way through the live version, when it waits as a draft under a reserved name so **Practice** can play it; a script that does not parse is kept as a draft with its problems, so nothing typed is lost. `draft:true` on create holds a good script back on purpose. `/activity publish`, `revert`, `copy` (held as a draft), `rename`, `export` (a `.txt` and a parchment PDF that carries the script woven after its EOF, readable by `/activity create file:` on any server) and `practice` (nothing paid, free rerolls, buttons that force the die to nat 1, fail, pass, nat 20) are new leaves; `/activity set` now rewrites the scene in the script and saves that, so the rows can never drift from the text. Activities written before this are rebuilt from their rows on the first edit.' },
+      { line: 'The parser reports every problem at once with its line and the fix, suggests the nearest name for a typo, warns about a line that reads as narration but looks like a keyword mistyped, and notes what will run but probably not as meant',
+        detail: 'A line nothing claimed used to fall silently into the narration, so `PASSS -> ford` became story text and the scene dead-ended. Problems are now collected rather than stopping at the first \u2014 each with `line N:` and, where there is one, the fix \u2014 and `-> fordd` says *Did you mean `ford`?*. Notes do not stop a save: a scene nothing reaches, no `END` reachable, a DC roll with no `FAIL` (or `PASS`), a DC outside 5\u201325, more than five choices (refused: a row holds five), scene names over twenty characters (refused: button ids have a hundred to share), a tally gained but never cashed, a flag tested that no scene sets, a voice that is not an NPC, a title nobody holds yet, a line within a letter of a keyword, an arrow with nothing in front. `#` lines are comments. The case rule: a keyword line in capitals must be well-formed; in lower case it counts only when exact (`end`, `gain renown 1`, `set torch`), so *As the sun sets* and *Roll with it* stay narration, and under `CHOICE` any `label -> scene` is a button whatever it starts with.' },
+      { line: 'The shelf: `/config channels activityshelf` names a GM forum where every activity has a thread \u2014 its card and buttons on top, the script in code blocks, a parchment PDF \u2014 redrawn after every save and mended on boot; a GM\'s post in the thread resubmits',
+        detail: 'One activity, one thread, the way NPC pages work: the card carries the state, scene count, tally, cooldown and days, who wrote it and when it was published, the odds of every DC roll for this table, the lint notes, the draft\'s problems, and the figures from play; its buttons are Edit scene (a pick of scenes, then the block in a box), Edit all (the whole script when it fits a box), Practice, Publish and Discard draft when one waits, Revert, and Retire (runs ended, off the board, thread archived; Restore undoes it). Under the card the script sits in code blocks, edited in place on each save, and a parchment PDF with the script woven after the EOF. A script, a `.txt` or the PDF posted in the thread by a GM replaces the activity (a problem list is the reply when it does not parse); a new post in the forum beginning `[ACTIVITY]` makes a new one, the GM\'s own post becoming its thread. The forum is tagged live, draft, retired, quiz, story, gauntlet, rewards, open and demo so Discord\'s filter sorts it; the three demos sit there read-only. The boot mend writes any missing thread, adds the demos, folds duplicate threads, and the Deploy mend says so. GM eyes only, since scripts hold the answers \u2014 which is why `/activity show` is a GM command now.' },
+      { line: '`/activity show` draws the map \u2014 every scene, what it asks, where each result goes, loops and endings marked, the odds per roll for this table; `script:true` adds the text and the files',
+        detail: 'The scene-by-scene listing became a map: each scene with its ask and, under it, one line per edge (`├─ pass → `far``, `└─ fail → `bank` ↺`), endings flagged 🏁, loops ↺, what an ending pays, the DC\'s intent word where one was used, and *N of M sheets pass on an average roll · P% overall* beside every DC. Notes, the draft\'s problems and the ledger figures follow. `script:true` attaches the script as a `.txt` and the parchment and prints it in code blocks.' },
+      { line: '`ROLL wis DC easy|normal|hard` sets the DC from this table\'s sheets; every DC roll shows its odds',
+        detail: 'A quarter, half or three-quarters of the server\'s sheets pass on an average roll (11 + their best offered stat), clamped to 5\u201325, worked out when the script is saved and again on each publish. The map, the shelf card and the save reply show the number chosen and the odds \u2014 the figure a GM actually wants when picking a DC.' },
+      { line: 'The grammar grew: `SET` / `UNSET` flags and `IF` routing, `NEXT adv|dis`, `RANDOM -> a|b|c`, `IMAGE`, `ONCE per day|week`, `AVAILABLE Fri-Sun`, `REQUIRE title:|merits>=|renown>=`, `QUIZ FROM category N -> next`, and `END title: heal: quest: once`',
+        detail: 'Flags live in the run\'s state and are set or unset on arrival; `IF flag -> scene`, `IF not flag`, `IF tally>=5`, `IF merits>=10`, `IF title:Name` are checked on arrival top to bottom, first match wins, and a scene of nothing but IF lines routes straight through (its SAY said on the way). `RANDOM` is a routing scene that picks at random. `NEXT adv` tilts the next roll in the run, announced on the card and spent once. `IMAGE` puts a picture on the card. `ONCE per day` and `AVAILABLE` (UTC) gate starting per player; `REQUIRE` gates it by title or standing \u2014 the refusal says which and when. `QUIZ FROM lore 5 -> done` turns the scene into the way in and writes five bank questions as scenes after it, drawn at save time, their answers still remembered per player. An ending may grant a title, a heal charge (to the server\'s cap), a note in the quest running in that channel, and `once` pays only the first time each player finishes (kept in `story_claims`, never pruned).' },
+      { line: 'Party runs: `/activity run name:X party:@A @B` is one tale for several \u2014 they press in turn, one shared tally, every member paid at the end; `player:` is on `run` as the help always said',
+        detail: 'A party run is keyed by the word `party`, one per channel, with its members and a turn counter: the card names whose turn it is, a press out of turn is refused by name, each roll uses the presser\'s sheet and rerolls, the tally is one pot, the step cap and the ledger see every member, and an ending pays each one \u2014 merits, renown, title, heal charge. Routing scenes do not pass the turn. Eight is the most a party holds, and everyone needs a sheet. `/activity stop` by any member ends it. The `player:` option had been in the help since 10/13 but never on the `run` builder; it is now.' },
+      { line: 'A run ledger: every start, roll and its band, choice, ending with its score, quit, expiry and cap is kept ninety days; `/activity scores`, figures on the shelf card and the map, the chronicle\'s activity of the week, the digest\'s drafts waiting',
+        detail: '`story_run_log` (pruned with the other ledgers on boot and `/gm check run`). The shelf card and `/activity show` read back runs and finishes, where players stopped, and any roll that fails more than six times in ten \u2014 the DC may be high. `/activity scores name:` ranks the best tally or quiz score per player. The weekly chronicle, when the week had a story, ends with the week\'s runs and its best score; the GM digest adds the week\'s runs, the most played, and every draft still waiting on a GM with its problem count.' },
+      { line: '`/activity run` while mid-run shows where you are; a run untouched for a week is put away; `/gm undo` rewinds an activity ending \u2014 merits and renown go back with the sheet and the run returns to its last scene',
+        detail: 'A second `/activity run` used to be refused; it now re-posts the current scene, buttons and all, with `/activity stop` named for abandoning it. The quest tick puts away runs with no press in seven days, logs them as expired, and says so in the channel. The undo journal\'s sheet section now includes merits and renown, and a new `runs` section snapshots this channel\'s story runs, so an ending paid by mistake can be rewound.' },
+      { line: 'The writer: `/activity write name:` builds an activity one scene at a time in boxes \u2014 name, narration, what it asks, where each result goes, extras \u2014 naming the scenes still to write; Finish composes the script and saves it; `/activity create template:` starts the box from a worked example; `/activity grammar` is the cheat sheet; The Scribe\'s Trial is a tutorial you play',
+        detail: 'Each scene is five boxes; the bot writes the grammar, keeps the work in progress per GM, lists the scenes pointed at but not yet written with a button for each, shows problems in the scene as you go, and on Finish saves through the same door as a paste (problems keep the writer\'s scenes so you can go round again). Five templates \u2014 a roll with two ways out, a branching tale with a flag, a quiz, a gauntlet with a tally, bare bones \u2014 arrive in the box with their guidance in comments. `/activity grammar [topic:]` prints the grammar a screen at a time. `/activity demo which:trial` plays *The Scribe\'s Trial*, a tutorial written in the grammar it teaches, its script on the shelf beside it.' },
+      { line: 'An NPC can call a player by name: a To picker in the `/npc say` box, `to:` on the command, or `@Name` in the words \u2014 each a real mention, and only people are ever pinged from an NPC\'s mouth; every NPC line carries a 🎭 Interact button, and `/npc edit talk:` hangs an activity on them with a 💬 Talk button. `discord.js` floor raised to ^14.27.0 for the picker',
+        detail: 'The writing box has no mention popup, so `@Aldric` there was plain text; it now resolves by server nickname, display name or username, longest match first. The webhook used to send with no mention filter, which meant an NPC could `@everyone`; sends are now users-only. The box itself gained a *To* picker — up to three players, mentioned first unless the words already do it — built in the label style discord.js reads modals in since 14.22, so `package.json` raises its floor to `^14.27.0` (delete or regenerate `package-lock.json` if the repo has one). The Interact button under an NPC\'s said lines opens the roleplay box titled as a reply to that NPC for a player, the speak-as box for a GM; only the newest line in a channel keeps it. Fight cards keep their own buttons. `talk:` names an activity (autocompleting; `none` clears) and its Talk button starts it for whoever pressed, the server\'s open/closed setting aside, since the GM chose to offer it.' },
     ], player: [
       'Every fight button opens a short form \u2014 what you do, what you say, both optional \u2014 and your words sit on the card: attack, defence, Grapple, Feint, Deflect, Disarm, the holds, Save, Insight. A blank form is a plain roll. With one foe, a stat press goes straight to the form',
       'Every turn line shows everyone\'s HP, and any condition the GM has marked you with, counting down',
@@ -20266,6 +22584,19 @@ const CHANGELOG = [
       'Once a week the **updates** forum gets a **Weekly chronicle**: quests completed, titles granted, fights won, the fallen',
       'A new sheet is told where to go next: your thread, the quest board, `/help`',
       'A GM can rewind the last step in a channel \u2014 a fight exchange, a strike, a roll \u2014 and the card says what was taken back and what moved; a fight picks up where it stood, with your buttons',
+      '`/fight atk` and `/fight def` typed behave like the buttons: on their own they offer the stat buttons, with a stat they open the form (one foe needs no `target:`), with `flavour:` they roll at once',
+      'Initiative ties reroll among the tied \u2014 the card shows the rerolls and who goes first',
+      '`/rp` \u2014 roleplay as your character outside a fight: the same two boxes, posted in your name; `/rp action:\u2026 speech:\u2026` posts at once. Inside a run it goes on the timeline and into the story scroll',
+      '`/edit` fixes a line you posted with `/rp`; `/edit delete:true` takes it back',
+      'The weekly chronicle now ends with the dice of the week \u2014 natural 20s and 1s and who rolled them, the biggest total',
+      'The quiet-fight ping is a setting now; your GM can slow it or turn it off for a play-by-post table',
+      'Play an activity together: `/activity run name:X party:@A @B` \u2014 you press in turn, the tally is shared, and the ending pays every one of you',
+      'A pinned board may list the activities with a \u25b6 Play button each; an NPC may offer one with a \U0001F4AC Talk button under their words',
+      'Every NPC line carries a \U0001F3AD Interact button \u2014 press it and the roleplay box opens as a reply to them; an NPC may now call you by name, or pick you from a list, and you will be pinged',
+      '`/activity run` while you are mid-way shows you where you are instead of refusing; a run you leave for a week is put away on its own',
+      'Some activities are once a day or week, run on certain days, or need a title to start; some endings pay only your first finish \u2014 the message says which, and when you can go again',
+      '`/activity scores name:X` \u2014 the best score per player, and how it has been played; the weekly chronicle ends with the week\'s activities and its best score',
+      '`/activity show` is a GM command now \u2014 the script holds the quiz answers; `/activity list` still shows what there is',
     ] },
   { key: '2026-10-13', gm: [
       { line: 'One NPC, one page: the boot no longer makes a second copy of every NPC page, and copies already made are folded back to one on the next boot',
@@ -20488,6 +22819,20 @@ async function announceChangelog(client, guild, opts = {}) {
     await postChangelogEntry(client, gid, { gm: forums.gm, player: unseenKeys.has(e.key) ? forums.player : null }, e);
 }
 
+// The ledgers that only ever grew: /rp ownership past ninety days, the
+// week's dice past fourteen. Once-only presses and group rolls are rules,
+// not ledgers \u2014 a press gate that expired would open a card again \u2014 so
+// they stay (the audit of 2026-10-15 caught the first draft pruning them);
+// the undo journal reads only the day's of each anyway. roll_history is
+// one row per hand and never grew; roll_tally is lifetime counts by design.
+function pruneLedgers(gid) {
+  const day = 86400000, out = [];
+  for (const [table, col, days] of [['rp_lines', 'at', 90], ['week_dice', 'at', 14], ['story_run_log', 'at', 90]]) {
+    try { const n = db.prepare(`DELETE FROM ${table} WHERE guild_id=? AND ${col} < ?`).run(gid, Date.now() - days * day).changes; if (n) out.push(`${table}: ${n} row(s) past ${days} days`); } catch {}
+  }
+  return out;
+}
+
 async function bootMend(client) {
   for (const [gid, guild] of client.guilds.cache) {
     const cfg = getConfig(gid) || {};
@@ -20498,6 +22843,7 @@ async function bootMend(client) {
     if (!configured) continue;
     try {
       const made = await mendEverything(client, guild);
+      { const pr = pruneLedgers(gid); if (pr.length) made.push(`ledgers trimmed: ${pr.join(', ')}`); }
       made.push(registerStatusLine(gid));
       if (made.length) console.log(`[mend] ${guild.name}: ${made.join(' \u00b7 ')}`);
       // The boot that opens the update forums also clears the old posts
@@ -20709,6 +23055,7 @@ async function mendEverything(client, guild, { log = () => {} } = {}) {
   } catch {}
   if (npcs) made.push(`${npcs} NPC page(s)`);
   try {
+    try { for (const line of await mendActivityPages(client, gid)) made.push(line); } catch (err) { console.error('[shelf] mend -', err?.message || err); }
     const d = await dedupeNpcPages(client, gid);
     if (d.removed) made.push(`${d.removed} duplicate NPC page(s) removed`);
     for (const k of d.kept) made.push(`duplicate NPC page left in place: ${k}`);
@@ -20738,6 +23085,8 @@ async function runSetupRepair(interaction) {
   }
   await interaction.deferReply({ ephemeral: true });
   const lines = ['🔧 **Setup run**', ''];
+  // The ledgers that only grow are trimmed here as on boot (2026-10-15).
+  { const pr = pruneLedgers(gid); if (pr.length) lines.push(`\u{1F9F9} Ledgers trimmed \u2014 ${pr.join(' \u00b7 ')}`, ''); }
   // Every channel checked and repaired where possible — permissions only.
   {
     const h = await healChannelPerms(interaction.guild);
@@ -22481,7 +24830,69 @@ async function ownWebhookForAsync(client, gid, channel, webhookId) {
   } catch { return null; }
 }
 
+// ── /rp \u2014 roleplay as yourself ─────────────────────────────────────────────
+// The two boxes every fight button opens, on their own: what you do, what
+// you say. Posted in your name and face through the channel's webhook (as
+// an NPC's line is), shaped like the cards; inside a run it is a \u{1F3AD} beat
+// on the chronicle. Nothing is rolled. (T, 2026-10-15: "how do players make
+// a role play form appear? If there's none can it be /rp".)
+function rpModal() {
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+  const m = new ModalBuilder().setCustomId('rpform').setTitle('Roleplay');
+  m.addComponents(
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('action').setLabel('What you do')
+      .setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(200).setPlaceholder('draws her blade and steps between them')),
+    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('speech').setLabel('What you say')
+      .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500).setPlaceholder('Not one step closer.')),
+  );
+  return m;
+}
+async function handleRp(interaction) {
+  const action = (interaction.options.getString('action') || '').trim();
+  const speech = (interaction.options.getString('speech') || '').trim();
+  if (!action && !speech) return interaction.showModal(rpModal());
+  return postRpLine(interaction, { action, speech });
+}
+async function handleRpModal(interaction) {
+  const action = String(interaction.fields.getTextInputValue('action') || '').trim();
+  const speech = String(interaction.fields.getTextInputValue('speech') || '').trim();
+  if (!action && !speech) return interaction.reply({ ephemeral: true, content: '\u274C Both boxes were empty \u2014 nothing posted.' });
+  return postRpLine(interaction, { action, speech });
+}
+async function postRpLine(interaction, { action, speech }) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const body = composeNpcSay({ action: action.slice(0, 200), speech: speech.slice(0, 500) });
+  if (!body) return interaction.reply({ ephemeral: true, content: '\u274C Nothing to post.' });
+  const chan = await interactionChannel(interaction);
+  if (!chan?.send) return interaction.reply({ ephemeral: true, content: MSG_NO_ACCESS_HERE });
+  const name = ((await getDisplayName(interaction.guild, uid).catch(() => null)) || interaction.member?.displayName || interaction.user.username || 'Someone').slice(0, 80);
+  const face = interaction.member?.displayAvatarURL?.() || interaction.user?.displayAvatarURL?.() || null;
+  let sent = null;
+  // The webhook is not bound by the poster's permissions, so nothing it
+  // says may ping: a player's @everyone through /rp would reach everyone (audit, 2026-10-15).
+  try { const hook = await npcWebhookIn(chan, gid, name, face); sent = hook ? await hook.send({ content: body, allowedMentions: { parse: [] } }) : null; }
+  catch (err) { console.error('[rp] webhook -', err?.message || err); sent = null; }
+  if (!sent?.id) {
+    // No webhook to be had here: the bot says it, with the name on top.
+    sent = await chan.send({ content: `\u{1F3AD} **${name}**\n${body}`, allowedMentions: { parse: [] } }).catch(() => null);
+    if (!sent) return interaction.reply({ ephemeral: true, content: '\u274C I could not post in this channel \u2014 check my permissions here.' });
+  }
+  try { db.prepare('INSERT OR REPLACE INTO rp_lines (guild_id, message_id, channel_id, user_id, at) VALUES (?,?,?,?,?)').run(gid, String(sent.id), chan.id, uid, Date.now()); } catch {}
+  try { noteQuestActivity(gid, chan.id, 'rp', `${name}: ${body.replace(/[*_]+/g, '').replace(/\s*\n\s*/g, ' \u00b7 ').trim().slice(0, 300)}`, uid); } catch {}
+  return interaction.reply({ ephemeral: true, content: '\u{1F3AD} Posted. `/edit` fixes or takes it back.' });
+}
+// Whose /rp line a message is, if it is one.
+function rpLineOwner(gid, messageId) {
+  try { return db.prepare('SELECT user_id FROM rp_lines WHERE guild_id=? AND message_id=?').get(gid, String(messageId))?.user_id || null; } catch { return null; }
+}
+// A player may edit or take back a line they posted through /rp; a GM may
+// do so with anything the bot or its NPCs said (T, 2026-10-15).
+async function mayEditLine(interaction, messageId) {
+  if (await isGm(interaction.guild, interaction.user.id)) return true;
+  return rpLineOwner(interaction.guild.id, messageId) === interaction.user.id;
+}
 const EDIT_GM_ONLY = '\u274C Only GMs can edit what the bot said.';
+const EDIT_NOT_YOURS = '\u274C That line is not yours to touch \u2014 you may fix or take back what you posted with `/rp`; GMs may fix anything the bot said.';
 async function openBotEdit(interaction) {
   if (!(await isGm(interaction.guild, interaction.user.id)))
     return interaction.reply({ ephemeral: true, content: EDIT_GM_ONLY });
@@ -22503,8 +24914,8 @@ function editLineLabel(m) {
 }
 async function handleEdit(interaction) {
   const gid = interaction.guild.id;
-  if (!(await isGm(interaction.guild, interaction.user.id)))
-    return interaction.reply({ ephemeral: true, content: EDIT_GM_ONLY });
+  const gm = await isGm(interaction.guild, interaction.user.id);
+  const deleting = !!interaction.options.getBoolean('delete');
   const link = (interaction.options.getString('link') || '').trim();
   if (link) {
     const m = /channels\/([^/\s]+)\/([^/\s]+)\/(\d+)/.exec(link);
@@ -22512,34 +24923,72 @@ async function handleEdit(interaction) {
     const messageId = m ? m[3] : (/^\d{15,22}$/.test(link) ? link : null);
     if (!messageId || (m && m[1] !== gid))
       return interaction.reply({ ephemeral: true, content: '\u274C That is not a message link or id from this server.' });
+    if (!gm && rpLineOwner(gid, messageId) !== interaction.user.id)
+      return interaction.reply({ ephemeral: true, content: EDIT_NOT_YOURS });
     const ch = await interaction.client.channels.fetch(channelId).catch(() => null);
     const msg = ch ? await ch.messages.fetch(messageId).catch(() => null) : null;
     if (!msg) return interaction.reply({ ephemeral: true, content: '\u274C I cannot see that message.' });
-    return openEditModal(interaction, msg, ch);
+    return deleting ? deleteBotLine(interaction, msg, ch) : openEditModal(interaction, msg, ch);
   }
   const channel = interaction.channel || await interaction.client.channels.fetch(interaction.channelId).catch(() => null);
   const fetched = channel?.messages ? await channel.messages.fetch({ limit: EDIT_LIST_FETCH }).catch(() => null) : null;
+  // A GM sees everything the bot and its NPCs said; a player sees only the
+  // lines they posted through /rp.
+  const own = gm ? null : new Set(db.prepare('SELECT message_id FROM rp_lines WHERE guild_id=? AND channel_id=? AND user_id=?').all(gid, channel?.id || interaction.channelId, interaction.user.id).map(r => r.message_id));
   const mine = [...(fetched?.values?.() || [])]
     .filter(m => (m.author?.id === interaction.client.user.id || m.webhookId) && String(m.content || '').trim() && !(m.components?.length))
+    .filter(m => gm || own.has(String(m.id)))
     .sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? 1 : -1))
     .slice(0, 25);
   if (!mine.length)
-    return interaction.reply({ ephemeral: true, content: `\u274C Nothing of mine to edit in the last ${EDIT_LIST_FETCH} messages here.` });
+    return interaction.reply({ ephemeral: true, content: gm
+      ? `\u274C Nothing of mine to ${deleting ? 'take down' : 'edit'} in the last ${EDIT_LIST_FETCH} messages here.`
+      : `\u274C Nothing of yours here \u2014 \`/rp\` lines you posted in the last ${EDIT_LIST_FETCH} messages are what you may ${deleting ? 'take back' : 'fix'}.` });
   const { ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
   const row = new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder().setCustomId('editpick').setPlaceholder('Which line?')
+    new StringSelectMenuBuilder().setCustomId(deleting ? 'editdel' : 'editpick').setPlaceholder('Which line?')
       .addOptions(mine.map(m => ({ label: editLineLabel(m), value: m.id, emoji: m.webhookId ? '\u{1F3AD}' : '\u{1F3B2}' }))));
   return interaction.reply({ ephemeral: true, components: [row],
-    content: `\u270F\uFE0F **Which line?** The last ${mine.length} the bot and its NPCs said here, newest first \u2014 pick one and the text opens for editing.` });
+    content: deleting
+      ? `\u{1F5D1}\uFE0F **Which line comes down?** The last ${mine.length} ${gm ? 'the bot and its NPCs said' : 'you posted with `/rp`'} here, newest first \u2014 the pick is final.`
+      : `\u270F\uFE0F **Which line?** The last ${mine.length} ${gm ? 'the bot and its NPCs said' : 'you posted with `/rp`'} here, newest first \u2014 pick one and the text opens for editing.` });
 }
-async function pickEditTarget(interaction) {
-  if (!(await isGm(interaction.guild, interaction.user.id)))
-    return interaction.reply({ ephemeral: true, content: EDIT_GM_ONLY });
+async function pickEditTarget(interaction, { deleting = false } = {}) {
   const id = interaction.values?.[0];
+  if (!(await mayEditLine(interaction, id)))
+    return interaction.reply({ ephemeral: true, content: EDIT_NOT_YOURS });
   const channel = interaction.channel || await interaction.client.channels.fetch(interaction.channelId).catch(() => null);
   const msg = id && channel?.messages ? await channel.messages.fetch(id).catch(() => null) : null;
   if (!msg) return interaction.reply({ ephemeral: true, content: '\u274C That message is gone.' });
-  return openEditModal(interaction, msg, channel);
+  return deleting ? deleteBotLine(interaction, msg, channel) : openEditModal(interaction, msg, channel);
+}
+// Taking a line down: the bot's own by deleting it, a webhook's through the
+// hook the bot holds. Audited like an edit (T, 2026-10-15).
+async function deleteBotLine(interaction, msg, channel) {
+  const gid = interaction.guild.id;
+  const hook = msg?.webhookId ? await ownWebhookForAsync(interaction.client, gid, channel, msg.webhookId) : null;
+  if (msg.webhookId && !hook)
+    return interaction.reply({ ephemeral: true, content: '\u274C That was said through a webhook I no longer hold, so Discord will not let me take it down.' });
+  if (msg.author?.id !== interaction.client.user.id && !hook)
+    return interaction.reply({ ephemeral: true, content: '\u274C I can only take down what I posted \u2014 my own messages and my NPCs\u2019 speech.' });
+  if (msg.components?.length)
+    return interaction.reply({ ephemeral: true, content: '\u274C That message carries buttons; it is managed by the bot.' });
+  const before = String(msg.content || '');
+  let gone;
+  if (msg.webhookId) {
+    const inThread = typeof channel.isThread === 'function' && channel.isThread();
+    gone = await hook.deleteMessage(msg.id, inThread ? channel.id : undefined).then(() => true).catch(() => false);
+  } else gone = await msg.delete().then(() => true).catch(() => false);
+  if (!gone) return interaction.reply({ ephemeral: true, content: '\u274C Discord refused to take it down.' });
+  try { db.prepare('DELETE FROM rp_lines WHERE guild_id=? AND message_id=?').run(gid, String(msg.id)); } catch {}
+  const who = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'someone');
+  sendRollAudit(interaction.client, gid, `\u{1F5D1}\uFE0F Taken down \u2014 **${who}** in <#${channel.id}>: \u201c${before.slice(0, 80)}${before.length > 80 ? '\u2026' : ''}\u201d`);
+  // From the dropdown, that private message becomes the receipt.
+  if (interaction.isStringSelectMenu?.() || interaction.isFromMessage?.()) {
+    const swapped = await interaction.update({ content: '\u2705 Taken down.', components: [] }).then(() => true).catch(() => false);
+    if (swapped) return;
+  }
+  return interaction.reply({ ephemeral: true, content: '\u2705 Taken down.' });
 }
 
 async function openEditModal(interaction, msg, channel) {
@@ -22551,28 +25000,40 @@ async function openEditModal(interaction, msg, channel) {
   const hook = msg?.webhookId ? await ownWebhookForAsync(interaction.client, gid, channel, msg.webhookId) : null;
   if (!msg) return interaction.reply({ ephemeral: true, content: '\u274C I cannot see that message.' });
   if (msg.webhookId && !hook)
-    return interaction.reply({ ephemeral: true, content: '\u274C That was said through a webhook I no longer hold, so Discord will not let anyone edit it. Delete it and have the NPC say it again with `/npc say`.' });
+    return interaction.reply({ ephemeral: true, content: '\u274C That was said through a webhook I no longer hold, so Discord will not let anyone edit it. Delete it and say it again \u2014 `/npc say` for an NPC, `/rp` for yourself.' });
   if (msg.author?.id !== interaction.client.user.id && !hook)
     return interaction.reply({ ephemeral: true, content: '\u274C I can only edit what I posted \u2014 my own messages and my NPCs\u2019 speech.' });
   if (msg.components?.length)
     return interaction.reply({ ephemeral: true, content: '\u274C That message carries buttons; its text is managed by the bot and should not be hand-edited.' });
   const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
-  const m = new ModalBuilder().setCustomId(`botedit:${msg.channelId}:${msg.id}`).setTitle('Edit what the bot said');
+  // A player editing an /rp line the bot had to post itself (no webhook to
+  // be had) sees the words, not the name line above them (audit, 2026-10-15).
+  const playerOwn = !msg.webhookId && !(await isGm(interaction.guild, interaction.user.id)) && rpLineOwner(gid, msg.id) === interaction.user.id;
+  const shown = playerOwn ? rpBodyOf(msg.content) : String(msg.content || '');
+  const m = new ModalBuilder().setCustomId(`botedit:${msg.channelId}:${msg.id}`).setTitle(playerOwn ? 'Edit your line' : 'Edit what the bot said');
   m.addComponents(new ActionRowBuilder().addComponents(
     new TextInputBuilder().setCustomId('text').setLabel('The message').setStyle(TextInputStyle.Paragraph)
-      .setRequired(true).setMaxLength(4000).setValue(String(msg.content || '').slice(0, 4000))));
+      .setRequired(true).setMaxLength(4000).setValue(shown.slice(0, 4000))));
   return interaction.showModal(m);
 }
+// The name line the bot puts above an /rp line it posted itself, and the
+// words beneath it.
+const RP_HEADER_RE = /^\u{1F3AD} \*\*[^\n]*\*\*\n/u;
+function rpHeaderOf(content) { const m = RP_HEADER_RE.exec(String(content || '')); return m ? m[0] : ''; }
+function rpBodyOf(content) { return String(content || '').replace(RP_HEADER_RE, ''); }
 
 async function saveBotEdit(interaction) {
   const [, channelId, messageId] = interaction.customId.split(':');
   const gid = interaction.guild.id;
-  if (!(await isGm(interaction.guild, interaction.user.id)))
-    return interaction.reply({ ephemeral: true, content: EDIT_GM_ONLY });
-  const text = interaction.fields.getTextInputValue('text');
+  if (!(await mayEditLine(interaction, messageId)))
+    return interaction.reply({ ephemeral: true, content: EDIT_NOT_YOURS });
+  let text = interaction.fields.getTextInputValue('text');
   if (!text.trim()) return interaction.reply({ ephemeral: true, content: '\u274C Nothing to save \u2014 the message cannot be emptied.' });
   const ch = await interaction.client.channels.fetch(channelId).catch(() => null);
   const msg = ch ? await ch.messages.fetch(messageId).catch(() => null) : null;
+  // A player's own bot-posted /rp line keeps its name line.
+  if (msg && !msg.webhookId && !(await isGm(interaction.guild, interaction.user.id)) && rpLineOwner(gid, messageId) === interaction.user.id)
+    text = rpHeaderOf(msg.content) + rpBodyOf(text);
   const hook = msg?.webhookId ? await ownWebhookForAsync(interaction.client, gid, ch, msg.webhookId) : null;
   if (!msg || (msg.author?.id !== interaction.client.user.id && !hook))
     return interaction.reply({ ephemeral: true, content: '\u274C That message is gone, or not mine.' });
@@ -22587,7 +25048,7 @@ async function saveBotEdit(interaction) {
     ok2 = await msg.edit({ content: text.slice(0, 4000) }).then(() => true).catch(() => false);
   }
   if (!ok2) return interaction.reply({ ephemeral: true, content: '\u274C Discord refused the edit.' });
-  const gmName = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'a GM');
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'someone');
   sendRollAudit(interaction.client, gid,
     `\u270F\uFE0F Edit \u2014 **${gmName}** in <#${channelId}>: \u201c${before.slice(0, 80)}${before.length > 80 ? '\u2026' : ''}\u201d \u2192 \u201c${text.slice(0, 80)}${text.length > 80 ? '\u2026' : ''}\u201d`);
   // Opened from /edit's dropdown: that private message becomes the receipt.
@@ -22774,7 +25235,12 @@ async function finishGmBarFight(interaction) {
 const UNDO_DEPTH = 10, UNDO_MAX_AGE_MS = 24 * 3600 * 1000;
 const UNDO_SECTIONS = {
   fight:      { table: 'fights',            keys: ['guild_id', 'channel_id'], where: 'guild_id=? AND channel_id=?', skip: ['last_at', 'nudged'] },
-  sheets:     { table: 'characters',        keys: ['guild_id', 'user_id'],    where: 'guild_id=?', only: ['hp_current', 'rerolls_current', 'next_mark', 'deception_spent', 'death_success', 'death_fail', 'str', 'con', 'dex', 'wis', 'lck'], keepRows: true },
+  sheets:     { table: 'characters',        keys: ['guild_id', 'user_id'],    where: 'guild_id=?', only: ['hp_current', 'rerolls_current', 'next_mark', 'deception_spent', 'death_success', 'death_fail', 'str', 'con', 'dex', 'wis', 'lck', 'merits', 'renown'], keepRows: true },
+  // An activity run in this channel comes back with the scene it was on, so
+  // an ending paid by mistake can be rewound along with the merits it gave.
+  runs:       { table: 'story_runs',        keys: ['guild_id', 'channel_id', 'user_id'], where: 'guild_id=? AND channel_id=?', skip: ['busy', 'last_at'] },
+  claims:     { table: 'story_claims',      keys: ['guild_id', 'story', 'user_id'], where: 'guild_id=? AND at >= ?', recent: 'at' },
+  titles:     { table: 'subject_titles',    keys: ['guild_id', 'subject_id', 'title'], where: 'guild_id=? AND at >= ?', recent: 'at' },
   npcs:       { table: 'npcs',              keys: ['guild_id', 'name'],       where: 'guild_id=?', only: ['hp_current', 'rerolls_current', 'next_mark', 'str', 'con', 'dex', 'wis', 'lck'], keepRows: true },
   charges:    { table: 'heal_charges',      keys: ['guild_id', 'user_id'],    where: 'guild_id=?' },
   targets:    { table: 'temp_targets',      keys: ['guild_id', 'message_id'], where: 'guild_id=? AND channel_id=?' },
@@ -22855,6 +25321,18 @@ function isUndoInteraction(interaction) {
   if (interaction.customId === 'gmbar:undo') return true;
   return !!(interaction.isChatInputCommand?.() && interaction.commandName === 'gm' && interaction.options?.getSubcommand?.(false) === 'undo');
 }
+// Frames in one channel share a lane: the first to open in a quiet moment
+// takes the snapshot; the last to close diffs against it and writes ONE
+// entry for the whole busy spell, under the first press's label. Presses
+// landing together can no longer put the same change in two entries or
+// the second's change in the first's, and a bystander's press during an
+// auto fight cannot carve the fight's HP changes into an entry with no
+// fight row on it (which would have slipped past "a fight that has ended
+// is not rewound" \u2014 the cold audit of 2026-10-15). The cost: a rewind
+// of a spell takes everything in it back together, and the label names
+// the press that opened it. Ticks' changes between spells are never
+// attributed: a fresh snapshot opens each.
+const undoLanes = new Map();   // `${gid}:${cid}` -> { open, before, label, actor }
 function undoFrameOpen(interaction) {
   try {
     if (!interaction?.guild?.id || interaction.isAutocomplete?.()) return null;
@@ -22862,15 +25340,27 @@ function undoFrameOpen(interaction) {
     if (isUndoInteraction(interaction)) return null;
     const cid = interactionChannelId(interaction);
     if (!cid) return null;
-    return { gid: interaction.guild.id, cid, before: undoSnapshot(interaction.guild.id, cid) };
+    const gid = interaction.guild.id, key = `${gid}:${cid}`;
+    let lane = undoLanes.get(key);
+    if (!lane || lane.open <= 0) {
+      lane = { open: 0, before: undoSnapshot(gid, cid), label: undoLabel(interaction).slice(0, 80), actor: interaction.user?.id || null };
+      undoLanes.set(key, lane);
+    }
+    lane.open++;
+    return { gid, cid, key };
   } catch (e) { console.error('[undo] open', e?.message || e); return null; }
 }
-// Close after it: anything different goes into the journal.
+// Close after it: the last frame out writes the spell's one entry.
 function undoFrameClose(frame, interaction) {
-  const changes = undoChanges(frame.before, undoSnapshot(frame.gid, frame.cid));
+  const lane = undoLanes.get(frame.key);
+  if (!lane) return;
+  lane.open = Math.max(0, lane.open - 1);
+  if (lane.open > 0) return;
+  undoLanes.delete(frame.key);
+  const changes = undoChanges(lane.before, undoSnapshot(frame.gid, frame.cid));
   if (!changes) return;
   db.prepare('INSERT INTO undo_journal (guild_id, channel_id, at, actor, label, changes) VALUES (?,?,?,?,?,?)')
-    .run(frame.gid, frame.cid, Date.now(), interaction.user?.id || null, undoLabel(interaction).slice(0, 80), JSON.stringify(changes));
+    .run(frame.gid, frame.cid, Date.now(), lane.actor, lane.label, JSON.stringify(changes));
   // Ten deep per channel, a day at most.
   db.prepare(`DELETE FROM undo_journal WHERE guild_id=? AND channel_id=? AND id NOT IN (
     SELECT id FROM undo_journal WHERE guild_id=? AND channel_id=? ORDER BY id DESC LIMIT ?)`).run(frame.gid, frame.cid, frame.gid, frame.cid, UNDO_DEPTH);
@@ -23688,13 +26178,13 @@ async function handleScrollModal(interaction) {
   }
 }
 
-// ── /gm heal ───────────────────────────────────────────────────────────────────
+// ── /existence heal (was /gm heal until 2026-10-15) ───────────────────────────────────────────────────────────────────
 // One GM command for restoring resources, on a player or an NPC (or every NPC).
 // HP changes go through setFighterHp so any active fight stays in sync.
 async function handleGmHeal(interaction) {
   const gid = interaction.guild.id, uid = interaction.user.id;
   if (!(await isGm(interaction.guild, uid)))
-    return interaction.reply({ content: '❌ Only GMs can use `/gm heal`.', ephemeral: true });
+    return interaction.reply({ content: '❌ Only GMs can use `/existence heal`.', ephemeral: true });
 
   const targetUser = interaction.options.getUser('user');
   const npcArg = (interaction.options.getString('npc') || '').trim();
@@ -23738,7 +26228,7 @@ async function handleGmHeal(interaction) {
       // Gathered first so the whole roster can be put in reading order —
       // Heroes, then knight order, then class, then name.
       for (const ch of sheets) {
-        // A heal is not a resurrection — that needs /gm revive and a decision.
+        // A heal is not a resurrection — that needs /existence revive and a decision.
         if (ch.died_at) { fallenSkipped++; continue; }
         const nm = await getDisplayName(interaction.guild, ch.user_id);
         const bits = [];
@@ -23784,7 +26274,7 @@ async function handleGmHeal(interaction) {
     if (lines.length && lines[lines.length - 1] === '') lines.pop();
 
     if (!lines.length) return interaction.editReply({ content: fallenSkipped
-      ? `❌ Nothing to restore — the only characters here have fallen. \`/gm revive\` brings one back.`
+      ? `❌ Nothing to restore — the only characters here have fallen. \`/existence revive\` brings one back.`
       : '❌ Nothing to restore — no sheets or NPCs on this server.' });
     const what = scope === 'players' ? `${players} player${players === 1 ? '' : 's'}`
                : scope === 'npcs' ? `${npcs} NPC${npcs === 1 ? '' : 's'}`
@@ -23926,19 +26416,52 @@ const withNpcStatOptions = (s) => s
 const slashCommands = [
   new SlashCommandBuilder()
     .setName('activity').setDescription('Run a minigame written for this server')
-    .addSubcommand(s=>s.setName('create').setDescription('Write an activity — opens a paste window, or attach a .txt script (GM)')
-      .addAttachmentOption(o=>o.setName('file').setDescription('An [ACTIVITY] script as a text file (for scripts over 4000 characters)').setRequired(false)))
+    .addSubcommand(s=>s.setName('create').setDescription('Write an activity — a box opens (or attach a .txt or a shelf PDF with file:) (GM)')
+      .addAttachmentOption(o=>o.setName('file').setDescription('An [ACTIVITY] script as a text file, or a PDF from a shelf').setRequired(false))
+      .addStringOption(o=>o.setName('template').setDescription('Start the box from a worked example').setRequired(false)
+        .addChoices({name:'🎲 One roll, two ways out',value:'check'},{name:'🔀 A branching tale with a flag',value:'story'},
+                    {name:'📝 A quiz',value:'quiz'},{name:'🎣 A gauntlet with a tally',value:'gauntlet'},{name:'∅ Bare bones',value:'blank'}))
+      .addBooleanOption(o=>o.setName('draft').setDescription('true = hold it as a draft to practise first, not live').setRequired(false)))
+    .addSubcommand(s=>s.setName('write').setDescription('Build one scene by scene in boxes — no grammar to learn (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('What to call it').setRequired(true)))
     .addSubcommand(s=>s.setName('list').setDescription('Every activity on this server'))
-    .addSubcommand(s=>s.setName('show').setDescription('Read an activity scene by scene')
-      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('show').setDescription('The map of an activity: every scene, what it asks, where it goes (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true))
+      .addBooleanOption(o=>o.setName('script').setDescription('true = the script itself too, as text and a file').setRequired(false)))
     .addSubcommand(s=>s.setName('run').setDescription('Start an activity in this channel')
-      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('demo').setDescription('Play a built-in activity — the fishing tale or a lore quiz; awards nothing (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true))
+      .addUserOption(o=>o.setName('player').setDescription('Start it for someone else — the buttons are theirs (GM)').setRequired(false))
+      .addStringOption(o=>o.setName('party').setDescription('@mention others to play it together — you press in turn, one tally, all paid').setRequired(false)))
+    .addSubcommand(s=>s.setName('demo').setDescription('Play a built-in one — the fishing tale, a lore quiz, or the tutorial; awards nothing (GM)')
       .addStringOption(o=>o.setName('which').setDescription('Which demo to try').setRequired(false)
         .addChoices({name:'🎣 Fishing — rolls, choices and a tally',value:'fishing'},
-                    {name:'🏰 Kalidale Lore — a five-question quiz',value:'quiz'}))
+                    {name:'🏰 Kalidale Lore — a five-question quiz',value:'quiz'},
+                    {name:"📜 The Scribe's Trial — the grammar, taught by playing it",value:'trial'}))
       .addUserOption(o=>o.setName('player').setDescription('Set it running for someone else — the buttons are theirs to press (GM)').setRequired(false)))
     .addSubcommand(s=>s.setName('stop').setDescription('Stop the activity running in this channel'))
+    .addSubcommand(s=>s.setName('practice').setDescription('A dry run of one — nothing paid, free rerolls, buttons to force the die (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('edit').setDescription('One scene in a box, or the whole script when it fits (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('scene').setDescription('Which scene — blank for the whole script').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('publish').setDescription('Put the waiting draft live (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('revert').setDescription('Back to the version before the last publish (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('copy').setDescription('A copy under a new name, held as a draft (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('Activity to copy').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('as').setDescription('The new name').setRequired(true)))
+    .addSubcommand(s=>s.setName('rename').setDescription('Rename an activity (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true))
+      .addStringOption(o=>o.setName('to').setDescription('The new name').setRequired(true)))
+    .addSubcommand(s=>s.setName('export').setDescription('The script as a .txt and a parchment PDF that carries it (GM)')
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('scores').setDescription('Best score per player, and how it has been played')
+      .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('grammar').setDescription('The script grammar, a screen at a time (GM)')
+      .addStringOption(o=>o.setName('topic').setDescription('One part of it').setRequired(false)
+        .addChoices({name:'The top of a script',value:'top'},{name:'Scenes',value:'scenes'},{name:'Rolls and what follows',value:'rolls'},
+                    {name:'Choices and questions',value:'choices'},{name:'Flags and forks',value:'flags'},{name:'Endings',value:'endings'})))
     .addSubcommand(s=>s.setName('delete').setDescription('Delete an activity (GM)')
       .addStringOption(o=>o.setName('name').setDescription('Activity name').setRequired(true).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('set').setDescription('Tweak one line of one scene without re-pasting (GM)')
@@ -23966,7 +26489,7 @@ const slashCommands = [
     .addStringOption(o=>o.setName('terms').setDescription('First blood? To yield? Anything the GMs should know').setRequired(false)),
 
   new SlashCommandBuilder()
-    .setName('gm').setDescription('GM tools — search, queue, kill, revive, heal, roll, test data (GM)')
+    .setName('gm').setDescription('GM tools — search, queue, roll, test data (GM)')
     .addSubcommand(s=>s.setName('search').setDescription('Find characters by order, class or status')
       .addStringOption(o=>o.setName('order').setDescription('Knight order').setRequired(false)
         .addChoices(...KNIGHT_ORDER_CHOICES, {name:'— none set —',value:'__none__'}))
@@ -23979,35 +26502,6 @@ const slashCommands = [
       .addBooleanOption(o=>o.setName('fallen').setDescription('Include the fallen (default no)').setRequired(false))
       .addStringOption(o=>o.setName('name').setDescription('Part of a name').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('queue').setDescription('Everything waiting on a GM, in one place'))
-    .addSubcommand(s=>s.setName('kill').setDescription('Mark a character as fallen and post their memorial')
-      .addUserOption(o=>o.setName('user').setDescription('The player whose character has fallen').setRequired(false))
-      .addStringOption(o=>o.setName('npc').setDescription('Or the NPC').setRequired(false).setAutocomplete(true))
-      .addBooleanOption(o=>o.setName('anyway').setDescription('true = kill even though they are still standing').setRequired(false)))
-    .addSubcommand(s=>s.setName('revive').setDescription('Bring a fallen character back')
-      .addUserOption(o=>o.setName('user').setDescription('The player').setRequired(false))
-      .addStringOption(o=>o.setName('npc').setDescription('Or the NPC').setRequired(false).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('heal').setDescription('Restore HP, rerolls or heal charges — players or NPCs')
-      .addUserOption(o=>o.setName('user').setDescription('Player to restore').setRequired(false))
-      .addStringOption(o=>o.setName('npc').setDescription('NPC to restore — or "all" for every NPC').setRequired(false).setAutocomplete(true))
-      .addStringOption(o=>o.setName('global').setDescription('Restore everyone at once instead of naming one').setRequired(false)
-        .addChoices(
-          {name:'👥 Players — every character sheet',value:'players'},
-          {name:'🎭 NPCs — every NPC',value:'npcs'},
-          {name:'🌍 Everyone — players and NPCs together',value:'all'}))
-      .addStringOption(o=>o.setName('amount').setDescription('How much to restore (default: full)').setRequired(false)
-        .addChoices(
-          {name:'❤️ Full — restore to maximum',value:'full'},
-          {name:'🩹 Half — restore half of maximum',value:'half'},
-          {name:'➕ Add — add the value below',value:'add'},
-          {name:'➖ Subtract — remove the value below',value:'sub'},
-          {name:'🎯 Exact — set to the value below',value:'exact'}))
-      .addIntegerOption(o=>o.setName('value').setDescription('Number used by Add / Subtract / Exact').setRequired(false).setMinValue(-99).setMaxValue(99))
-      .addStringOption(o=>o.setName('restore').setDescription('What to restore (default: HP only)').setRequired(false)
-        .addChoices(
-          {name:'❤️ HP only',value:'hp'},
-          {name:'🔄 Rerolls only',value:'rerolls'},
-          {name:'🛡️ Heal charges only',value:'charges'},
-          {name:'✨ Everything — HP, rerolls and charges',value:'all'})))
     .addSubcommand(s=>s.setName('questwipe').setDescription('Delete EVERY quest on this server — confirm-gated (GM)')
       .addBooleanOption(o=>o.setName('runs').setDescription('true = also erase the run ledger and DM guided-counters (default: kept)').setRequired(false)))
     .addSubcommandGroup(g => { g.setName('check').setDescription('Setup health \u2014 inspect, repair, rebuild');
@@ -24152,6 +26646,12 @@ const slashCommands = [
       g.addSubcommand(s=>s.setName('quizforum').setDescription('A forum where the question bank is posted, a thread per category')
       .addChannelOption(o=>o.setName('channel').setDescription('The quiz forum').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = stop posting the readable copy').setRequired(false)));
+      g.addSubcommand(s=>s.setName('activityshelf').setDescription('A GM forum where every activity has a thread: card, script, PDF, edit buttons')
+      .addChannelOption(o=>o.setName('channel').setDescription('The shelf forum').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = stop keeping the shelf').setRequired(false)));
+      g.addSubcommand(s=>s.setName('activityboard').setDescription('A channel with a pinned board of activities and Play buttons for players')
+      .addChannelOption(o=>o.setName('channel').setDescription('Where the board is pinned').setRequired(false))
+      .addBooleanOption(o=>o.setName('disable').setDescription('true = take the board down').setRequired(false)));
       g.addSubcommand(s=>s.setName('questinstances').setDescription('A forum where each STARTED quest opens its own thread for party and DM')
       .addChannelOption(o=>o.setName('channel').setDescription('The instance forum').setRequired(false))
       .addBooleanOption(o=>o.setName('disable').setDescription('true = stop opening threads').setRequired(false)));
@@ -24226,6 +26726,8 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('threshold').setDescription('1–19, or 0 to disable (default 8); omit to show current').setRequired(false).setMinValue(0).setMaxValue(19)));
       g.addSubcommand(s=>s.setName('fightping').setDescription('@-mention players when it becomes their turn in a fight')
       .addBooleanOption(o=>o.setName('enabled').setDescription('true = ping, false = silent (default); omit to show current').setRequired(false)));
+      g.addSubcommand(s=>s.setName('fightnudge').setDescription('Minutes a fight may sit quiet before the bot pings whoever it waits on (default 10, 0 = off)')
+      .addIntegerOption(o=>o.setName('minutes').setDescription('0 = never; omit to show current').setRequired(false).setMinValue(0).setMaxValue(1440)));
       g.addSubcommand(s=>s.setName('npcstats').setDescription('Show NPC stat blocks on their roll cards (default: hidden)')
       .addBooleanOption(o=>o.setName('enabled').setDescription('true = players see NPC stats; false = hidden (default)').setRequired(false)));
       g.addSubcommand(s=>s.setName('scrollfont').setDescription('The font /gm scroll props are written in — upload an .otf or .ttf')
@@ -24526,7 +27028,8 @@ const slashCommands = [
       .addStringOption(o=>o.setName('name').setDescription('NPC name').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('action').setDescription('What the NPC does — posted in italics').setRequired(false))
       .addStringOption(o=>o.setName('speech').setDescription('What the NPC says — wrapped in quote marks').setRequired(false))
-      .addStringOption(o=>o.setName('raw').setDescription('Post exactly as typed — overrides action/speech').setRequired(false)))
+      .addStringOption(o=>o.setName('raw').setDescription('Post exactly as typed — overrides action/speech').setRequired(false))
+      .addUserOption(o=>o.setName('to').setDescription('Who the NPC addresses — they are pinged; @Name in the text works too').setRequired(false)))
     .addSubcommand(s=>s.setName('roll').setDescription('Roll dice as an NPC — it posts under their name and face')
       .addStringOption(o=>o.setName('category').setDescription('Filter NPCs by category').setRequired(true)
         .addChoices({name:'All',value:'all'}))
@@ -24540,7 +27043,8 @@ const slashCommands = [
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'})))
     .addSubcommand(s=>withNpcStatOptions(s.setName('edit').setDescription('Change an existing NPC — only the options you pass; the rest stays')
       .addStringOption(o=>o.setName('name').setDescription('Which NPC').setRequired(true).setAutocomplete(true))
-      .addStringOption(o=>o.setName('category').setDescription('What kind they are — Enemy, Ally, Vendor… a new one is made if it does not exist').setRequired(false).setAutocomplete(true)))
+      .addStringOption(o=>o.setName('category').setDescription('What kind they are — Enemy, Ally, Vendor… a new one is made if it does not exist').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('talk').setDescription('An activity a 💬 Talk button on their lines starts — or none').setRequired(false).setAutocomplete(true)))
       .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
         .addChoices(...KNIGHT_ORDER_CHOICES, {name:'✖️ Clear it',value:'none'})))
     .addSubcommand(s=>s.setName('reroll').setDescription('Reroll an NPC\'s last roll here — spends one of its LCK tokens')
@@ -24672,7 +27176,7 @@ const slashCommands = [
       .addStringOption(o=>o.setName('players').setDescription('Players in order — @mention them, space-separated').setRequired(false))
       .addStringOption(o=>o.setName('sequence').setDescription('Full order incl. NPCs — e.g. @Alice, Goblin, @Bob, Orc').setRequired(false)))
     .addSubcommand(s=>s.setName('atk').setDescription('Attack a target')
-      .addStringOption(o=>o.setName('stat').setDescription('Stat to attack with').setRequired(true)
+      .addStringOption(o=>o.setName('stat').setDescription('Stat to attack with \u2014 blank offers the buttons').setRequired(false)
         .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
       .addUserOption(o=>o.setName('target').setDescription('Player to attack').setRequired(false))
       .addStringOption(o=>o.setName('target_npc').setDescription('NPC to attack instead of a player').setRequired(false).setAutocomplete(true))
@@ -24681,7 +27185,7 @@ const slashCommands = [
         .addChoices({name:'Normal (default)',value:'normal'},{name:'Advantage',value:'adv'},{name:'Disadvantage',value:'dis'}))
       .addStringOption(o=>o.setName('flavour').setDescription('Optional flavour text').setRequired(false)))
     .addSubcommand(s=>s.setName('def').setDescription('Defend against the current attack')
-      .addStringOption(o=>o.setName('stat').setDescription('Stat to defend with').setRequired(true)
+      .addStringOption(o=>o.setName('stat').setDescription('Stat to defend with \u2014 blank offers the buttons').setRequired(false)
         .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'}))
       .addStringOption(o=>o.setName('npc').setDescription('Defend AS this NPC (GM, when the NPC is the target)').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('roll').setDescription('Roll type').setRequired(false)
@@ -24723,7 +27227,8 @@ const slashCommands = [
       .addStringOption(o=>o.setName('target_npc').setDescription('NPC to remove').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('forfeit').setDescription('Concede the fight'))
     .addSubcommand(s=>s.setName('status').setDescription('Show current fight status'))
-    .addSubcommand(s=>s.setName('log').setDescription('Re-post the recap of the last finished fight in this channel'))
+    .addSubcommand(s=>s.setName('log').setDescription('Re-post the recap of the last finished fight in this channel')
+      .addBooleanOption(o=>o.setName('scroll').setDescription('true = the recap as a parchment PDF in the scroll font, as the run\'s story is').setRequired(false)))
     .addSubcommand(s=>s.setName('skip').setDescription('Skip the current turn without removing anyone (GM)'))
     .addSubcommand(s=>s.setName('end').setDescription('End the fight (GM only)')
       .addBooleanOption(o=>o.setName('all').setDescription('true = end every active fight on the server').setRequired(false))),
@@ -25071,8 +27576,51 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
   // GM sees of the last lines the bot and its NPCs said here; a pick opens
   // the box prefilled. Nothing lands in the channel (T, 2026-10-13).
   new SlashCommandBuilder()
-    .setName('edit').setDescription('Fix a line the bot or an NPC said here \u2014 a private list, the text opens prefilled (GM)')
-    .addStringOption(o=>o.setName('link').setDescription('A message link or id to go straight to it \u2014 blank lists the last 25 here').setRequired(false)),
+    .setName('edit').setDescription('Fix or take back a line \u2014 GMs: what the bot or an NPC said here; players: your own /rp lines')
+    .addStringOption(o=>o.setName('link').setDescription('A message link or id to go straight to it \u2014 blank lists the last 25 here').setRequired(false))
+    .addBooleanOption(o=>o.setName('delete').setDescription('true = take the line down instead of editing it').setRequired(false)),
+
+  // Life and death and the mending between: kill, revive and heal, lifted out
+  // of /gm so that command keeps clear of Discord's 8000-character wall
+  // (T, 2026-10-15; /gm had held them since August).
+  new SlashCommandBuilder()
+    .setName('existence').setDescription('A character\'s existence \u2014 kill, revive, heal (GM)')
+    .addSubcommand(s=>s.setName('kill').setDescription('Mark a character as fallen and post their memorial')
+      .addUserOption(o=>o.setName('user').setDescription('The player whose character has fallen').setRequired(false))
+      .addStringOption(o=>o.setName('npc').setDescription('Or the NPC').setRequired(false).setAutocomplete(true))
+      .addBooleanOption(o=>o.setName('anyway').setDescription('true = kill even though they are still standing').setRequired(false)))
+    .addSubcommand(s=>s.setName('revive').setDescription('Bring a fallen character back')
+      .addUserOption(o=>o.setName('user').setDescription('The player').setRequired(false))
+      .addStringOption(o=>o.setName('npc').setDescription('Or the NPC').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s=>s.setName('heal').setDescription('Restore HP, rerolls or heal charges — players or NPCs')
+      .addUserOption(o=>o.setName('user').setDescription('Player to restore').setRequired(false))
+      .addStringOption(o=>o.setName('npc').setDescription('NPC to restore — or "all" for every NPC').setRequired(false).setAutocomplete(true))
+      .addStringOption(o=>o.setName('global').setDescription('Restore everyone at once instead of naming one').setRequired(false)
+        .addChoices(
+          {name:'👥 Players — every character sheet',value:'players'},
+          {name:'🎭 NPCs — every NPC',value:'npcs'},
+          {name:'🌍 Everyone — players and NPCs together',value:'all'}))
+      .addStringOption(o=>o.setName('amount').setDescription('How much to restore (default: full)').setRequired(false)
+        .addChoices(
+          {name:'❤️ Full — restore to maximum',value:'full'},
+          {name:'🩹 Half — restore half of maximum',value:'half'},
+          {name:'➕ Add — add the value below',value:'add'},
+          {name:'➖ Subtract — remove the value below',value:'sub'},
+          {name:'🎯 Exact — set to the value below',value:'exact'}))
+      .addIntegerOption(o=>o.setName('value').setDescription('Number used by Add / Subtract / Exact').setRequired(false).setMinValue(-99).setMaxValue(99))
+      .addStringOption(o=>o.setName('restore').setDescription('What to restore (default: HP only)').setRequired(false)
+        .addChoices(
+          {name:'❤️ HP only',value:'hp'},
+          {name:'🔄 Rerolls only',value:'rerolls'},
+          {name:'🛡️ Heal charges only',value:'charges'},
+          {name:'✨ Everything — HP, rerolls and charges',value:'all'}))),
+
+  // Roleplay on its own: the same two boxes the fight buttons open, posted
+  // as the player, into the running quest's chronicle (T, 2026-10-15).
+  new SlashCommandBuilder()
+    .setName('rp').setDescription('Roleplay as your character \u2014 what you do, what you say; blank opens a box')
+    .addStringOption(o=>o.setName('action').setDescription('What you do \u2014 shown in italics').setRequired(false))
+    .addStringOption(o=>o.setName('speech').setDescription('What you say \u2014 shown in quotes').setRequired(false)),
 
   new SlashCommandBuilder()
     .setName('encounter').setDescription('A short session run on the fly \u2014 no board, no applications (GM)')
@@ -25152,9 +27700,10 @@ const HELP_CATEGORIES = {
       '**2 · Roll dice** — type `1d20` bare, `r1d20+5 ambush` for a label, or just a stat word like `str` or `wis`. `ra`/`rd` roll with advantage or disadvantage, and `rr` rerolls your last roll for a token. `/roll` is the guided version with dropdowns.',
       '**3 · Your card** — `/char profile on` puts your character card under your rolls, HP and tokens included. `/char profile card` compresses it, `/char view show` opens the full sheet any time.',
       '**4 · HP and rests** — `!hp -3` after a hit, `lrest` for a full rest, `srest` for a breather. White Knights (WIS ≥ 5) can `!heal @Players`.',
-      '**5 · Fights** — a GM opens one with `/fight start` and initiative sets the order. On your turn, tap a stat on the card (or `/fight atk stat:str`): with one foe it opens the form at once, with more a menu asks whom first. Every button — attack, defence, Grapple, Feint, Deflect, Disarm, the holds, Save, Insight — opens a short form, what you do and what you say, both optional; your words sit on the card. The defender answers with a stat of their own, either side may spend a token on 🔁 Reroll, and ⚖️ Resolve settles the exchange — a GM\'s press asks what happens. Every turn line carries everyone\'s HP. Ten quiet minutes and the bot pings whoever the fight is waiting on, once a turn. When it all ends, a 🏁 result and a full recap post on their own.',
+      '**5 · Fights** — a GM opens one with `/fight start` and initiative sets the order. On your turn, tap a stat on the card (or `/fight atk stat:str`): with one foe it opens the form at once, with more a menu asks whom first. Every button — attack, defence, Grapple, Feint, Deflect, Disarm, the holds, Save, Insight — opens a short form, what you do and what you say, both optional; your words sit on the card. The defender answers with a stat of their own, either side may spend a token on 🔁 Reroll, and ⚖️ Resolve settles the exchange — a GM\'s press asks what happens. Every turn line carries everyone\'s HP. A quiet spell (ten minutes unless the GM sets otherwise) and the bot pings whoever the fight is waiting on, once a turn. When it all ends, a 🏁 result and a full recap post on their own.',
       '**6 · Duels** — `/duel opponent:@Players terms:first blood` raises one. A GM signs it off and starts the fight.',
       '**7 · Quests** — `/quest board` shows what\'s posted. Tap **Apply** on a quest post (or `/quest party apply number:N`), a GM approves the party, and merits pay out when it completes.',
+      '**Roleplay** — `/rp` opens the same two boxes the fight buttons do, what you do and what you say, and posts them in your name; `/rp action:… speech:…` skips the box. Inside a run your words go on its timeline and into the story scroll. `/edit` fixes a line of yours afterwards, `/edit delete:true` takes it back.',
       '**8 · Activities** — minigames written for this server: branching scenes with rolls and rewards. `/activity list` to browse, `/activity run name:Fishing` to start one here. When a scene asks for a roll, just type the stat word — `wis`, or `wis steady does it` to add flavour — and the story moves.',
       '**9 · Renown & merits** — renown is the coin quests, encounters and activities pay out; spend it as the server allows (`/standing renown view`). Merits are lifetime honour that only climbs, and ranks hang off them (`/standing merit view`, `/standing rank list`). You can offer merit to a friend with `/standing merit give` — a GM signs it off. GMs move the coin with `/standing renown gain/loss`.',
       '**10 · Death** — characters can fall. That call belongs to a GM: a memorial is posted, the sheet locks, and the fallen keep their history. Revival is possible when the story allows it.',
@@ -25225,16 +27774,16 @@ const HELP_CATEGORIES = {
     blurb: 'turn-based combat, and duels a GM referees',
     body: [
       '_Fights are turn-based exchanges — attacker rolls, defender answers, the clash resolves. GMs referee; NPCs fight through them or on autopilot._',
-      '`/fight start players:@Artorius @Meliora @Zeus npcs:Hollow, Hollow tank` — begin a fight with any number of players and GM NPCs (auto-rolls DEX initiative)',
+      '`/fight start players:@Artorius @Meliora @Zeus npcs:Hollow, Hollow tank` — begin a fight with any number of players and GM NPCs (auto-rolls DEX initiative; fighters on the same total reroll among themselves until apart, and the card says so)',
       '`/fight start ... manual:true` — keep the order you listed fighters in (no roll)',
       '`/fight start ... practice:true` — friendly bout: fighters yield at 2 HP and are never driven below it',
       '`/fight auto ... practice:true` — the same floor in any auto mode',
       '`/fight addnpc npc:Hollow, Hollow tank` — add one or more NPCs mid-fight',
       '`/fight order sequence:@Artorius, Hollow, @Meliora, @Zeus` — set the turn order, players and NPCs (GM)',
       '`/fight atk stat:str target:@Players` — attack a player · add `target_npc:Name` to hit an NPC',
-      '`/fight atk stat:str` — leave the target off and a menu appears; with one foe standing the form opens at once. The stat buttons on the card do the same',
+      '`/fight atk stat:str` — leave the target off and a menu appears; with one foe standing the form opens at once; typed with `flavour:` it swings without the form. `/fight atk` with nothing after it answers you alone with the stat buttons. The buttons on the card do the same',
       '`/fight atk stat:str npc:Hollow target:@Players` — GM attacks AS an NPC on its turn · or tap the 🎭 stat buttons the NPC\'s turn line carries (GM only)',
-      '`/fight def stat:dex` — defend · GM defends as an NPC with `npc:Name`, or taps the 🎭 buttons on the NPC\'s defence prompt',
+      '`/fight def stat:dex` — defend: the form opens (with `flavour:` it rolls at once); bare `/fight def` offers the stat buttons · GM defends as an NPC with `npc:Name`, or taps the 🎭 buttons on the NPC\'s defence prompt',
       'Every fight button opens a short form first — what you do, what you say, both optional — and the words land on the card; a blank form is a plain roll. A GM\'s ⚖️ Resolve asks what happens and posts it under the outcome',
       '`/fight act action:Grapple target:@Players` — STR-only grapple attempt; the target answers with `/fight act action:Save` (STR). Meets-or-exceeds and the hold takes: immobile, 1 strain at each of their turn\'s ends, actions on a flat d20',
       '`/fight act action:Escape` — on your turn while held: 1d20+STR vs the grappler\'s STR score to break free — the strain lands either way',
@@ -25257,7 +27806,7 @@ const HELP_CATEGORIES = {
       'NPC lists accept `category:Name` to add a whole category at once',
       'When a fight ends a public 🏁 result posts in the channel — victor, everyone\'s final HP, and a 📜 recap',
       'The recap covers both players and NPCs: roll averages, best/worst naturals, damage dealt and taken, and a blow-by-blow of every exchange',
-      '`/fight log` — re-post the last finished fight\'s recap in this channel',
+      '`/fight log [scroll:true]` — re-post the last finished fight\'s recap in this channel; `scroll:true` hands it over as a parchment PDF in the scroll font, as a run\'s story is',
       '`/fight skip` — skip the current turn; the fighter stays in the fight (GM)',
       '`/fight auto mode:NPCs only ...` — bot plays NPC turns, players play manually (GM)',
       '`/fight auto mode:Demo` — example showcase fight · `/fight end` — end the fight (GM)',
@@ -25269,12 +27818,14 @@ const HELP_CATEGORIES = {
     body: [
       '_Activities are minigames written for this server — branching scenes, rolls, choices and rewards. Renown is the currency they and quests pay out._',
       '`/activity run name:X player:@Players` — set an activity running for another player: their name on it, their buttons, their score. `/activity demo` takes `player:` too, so you can hand someone a quiz to sit (GM)',
+      '`/activity run name:X party:@A @B` — one run for several: you press in turn, one shared tally, every member paid at the end',
       'When a scene asks for a roll, type the stat word — `wis`, or `wis steady does it` to add flavour',
-      '`/activity list` — every activity on this server · `/activity show name:X` — read one scene by scene',
-      '`/activity run name:X` — start one in this channel · `/activity stop` — stop the one running here',
+      '`/activity list` — every activity on this server · `/activity scores name:X` — best score per player, and how it has been played',
+      '`/activity run name:X` — start one in this channel (mid-run already? it shows you where you are) · `/activity stop` — stop the one running here',
       'A **Reroll** button sits on the scene card while a token remains — one second chance per roll',
-      'Some scenes offer **choices** as buttons; some tally renown as you play and bank it at the end',
-      '`/activity demo` — the built-in fishing tale, no stakes (GM)',
+      'Some scenes offer **choices** as buttons; some tally renown as you play and bank it at the end; some are once a day, run on certain days, or need a title to start — the refusal says which',
+      'A pinned **board** may list the activities with a ▶ Play button each (`/config channels activityboard`); an NPC may carry a 💬 Talk button that starts one',
+      '`/activity demo [which:]` — the built-in fishing tale, the lore quiz, or The Scribe\'s Trial that teaches the grammar; no stakes (GM)',
       '_In 5e, an attack is measured against the target\'s Armour Class — nobody rolls to defend, and the blow resolves at once. A natural 20 always hits and rolls the weapon dice twice; a natural 1 always misses._',
       '`/config channels npcforum channel:#forum` — every NPC gets a page there, tagged with their categories so the sidebar filter sorts them (Admin)',
       '`/npc create name:X category:Enemy` · `/npc manage sync [name:]` — name a category as you make them and it is created if new; sync writes up everyone already made (GM)',
@@ -25295,8 +27846,12 @@ const HELP_CATEGORIES = {
       '_In 5e you carry one hit die per level. `!srest` spends one — roll it, add your CON modifier, heal that much. `!lrest` fills you and hands back half your dice._',
       '`/dnd create name: str: dex: con: int: wis: cha: [class:] [level:] [ac:] [saves:] [skills:]` — make a D&D 5e character. Modifiers, proficiency and hit points are all worked out for you (5e servers only)',
       '`/config channels ruleset system:` — which rules this server plays by: Knightfall, or D&D 5e by the SRD. Set it before anyone makes a character — it refuses to change once sheets exist (Admin)',
-      '`/activity create` — write one: a paste window opens (or attach a `.txt` with `file:` for long scripts). Pasting an `[ACTIVITY]` script straight into chat works too — every route is validated before anything is stored (GM)',
-      '`/activity set name:X scene:Y field:Z value:...` — tweak one line of one scene without re-pasting (GM)',
+      '`/activity create [template:] [draft:true]` — write one: a box opens, started from a worked example if you like (or attach a `.txt` or a shelf PDF with `file:`). Pasting an `[ACTIVITY]` script into chat works too. A good script goes live at once — or waits as a draft if someone is mid-run; one with problems is kept as a draft with every problem on its line, nothing lost (GM)',
+      '`/activity write name:X` — build one scene by scene in boxes, no grammar to learn · `/activity grammar [topic:]` — the cheat sheet (GM)',
+      '`/activity show name:X [script:true]` — the map: every scene, what it asks, where it goes, the odds of each roll for this table · `/activity edit name:X [scene:]` — a scene in a box, or the whole script · `/activity set …` — one line (GM)',
+      '`/activity practice name:X` — a dry run: nothing paid, free rerolls, buttons to force the die · `/activity publish|revert|copy|rename|export name:X` (GM)',
+      '`/config channels activityshelf channel:#forum` — a GM forum with a thread per activity: card, script, parchment PDF, edit buttons; post a script there to replace one (Admin)',
+      '↳ The script grammar grew: `# comments`, `SET x` / `IF x -> scene`, `NEXT adv`, `RANDOM -> a|b`, `IMAGE url`, `ROLL wis DC easy`, `QUIZ FROM lore 5 -> next`, `ONCE per day`, `AVAILABLE Fri-Sun`, `REQUIRE title:X`, and `END title: heal: quest: once`',
       '`/activity delete name:X` — remove an activity (GM)',
       '`/standing renown view [user]` — balance · `/standing renown leaderboard` — who holds the most · `/standing renown history [user]`',
       '`/standing renown add/remove/set` — adjust a balance, with a reason (GM)',
@@ -25356,7 +27911,7 @@ const HELP_CATEGORIES = {
       '`/quest post number:N [channel]` — post it with an Apply button; with a quest forum set, this opens the quest\'s own board thread (GM)',
                               '`/gm queue` — everything waiting on a GM, in one place',
       '`/gm search` — find characters by order, class or status (GM)',
-      '`/gm kill user:@Players` / `/gm revive user:@Players` — mark a character fallen and post their memorial, or bring them back (GM)',
+      '`/existence kill user:@Players` / `/existence revive user:@Players` — mark a character fallen and post their memorial, or bring them back; these were `/gm kill|revive` until 15/10 (GM)',
       '`/gm test quest/npc/list/forum/clean` — throwaway fixtures, a live forum exercise, and the broom that clears them (GM)',
       '`/gm questwipe [runs:true]` — delete every quest on the server, confirm-gated; the run ledger and DM counters survive unless runs:true (GM)',
       '`/gm check build` — the one-command setup: makes every channel and forum the bot needs in two sections — **DDice** open to the table, **DDice · Game Masters** shut to everyone else — wires the config and fills them. Adopts anything already there, so it is safe to run on a server set up by hand (Admin)',
@@ -25364,7 +27919,7 @@ const HELP_CATEGORIES = {
       '`/gm override condition user:@Players|npc:Hollow text:poisoned [turns:3] [clear:true]` \u2014 a word the table agreed on and, if you like, a clock: shown on their turn line, counting down when their turn comes round, lifting at 0 with a line; no mechanics ride on it (GM)',
       '`/gm override skip` \u00b7 `/gm override dc hold:true` \u00b7 `/gm override interject user:@Players [stat:] [amount:\u00b1N] [mode:adv|dis|flat] [die:1-20] [note:]` \u2014 the referee\'s hand on the next roll, all audited (GM)',
       '`/config mechanics autorest action:Who is excluded` \u2014 who the next rest will pass over and why: the fallen, anyone on an active quest or fight, and what is holding them',
-      '`/gm check run` — build anything missing: audit shelves, pipeline books and tags. Adopts what exists, so it is safe to run any time — pull it after an update adds a book (GM)',
+      '`/gm check run` — build anything missing: audit shelves, pipeline books and tags. Adopts what exists, so it is safe to run any time — pull it after an update adds a book. Trims the ledgers that only grow (`/rp` ownership past ninety days, the week\'s dice past fourteen), as every boot does (GM)',
       '`/gm check status` — the setup mirror: every channel-backed feature, unset first with the command that sets it, then the set ones with links — stored ids are verified live; the last line says whether the slash commands registered on this boot, and the Deploy mend says the same (GM)',
       '`/gm bar` \u2014 pin a GM toolbar in this channel: \u{1F5FF} Plant target, \u{1F3AF} Call check, \u2694\uFE0F Start fight, \u{1F9ED} Status, \u23EA Undo \u2014 each opens the box its command would (a target by name, DC and stats, scene, hits, who may swing; the check window; players and NPCs for a fight); Status is this channel at a glance: the fight and everyone\'s HP, the targets standing, what waits on a GM; Undo is `/gm undo` (GM)',
       '`/gm undo [steps:1-10]` \u2014 rewind the last step in this channel: a fight exchange (attack, defence, Resolve, a reroll, an action), a target strike or verdict, a group roll, a once-only press, a called check that cost HP \u2014 and the HP, rerolls, marks and stats those changed on sheets and NPCs. The table sees what was rewound and what moved; a fight gets its status and whose move it is posted again. Ten steps deep per channel, a day at most; a fight that has ended is not rewound; audited and noted on the quest (GM)',
@@ -25399,13 +27954,13 @@ const HELP_CATEGORIES = {
       '`/encounter preset save name:... [merits:] [npcs:Hollow x3, Hollow tank]` \u2014 a saved scene; `/encounter start ... preset:` runs it with the merits set and the monsters summoned as temps \u00b7 `/encounter preset list|remove` (GM)',
       '`/gm check stalled` \u2014 what is waiting on a GM: winding-down runs, quiet encounters, staged parties never launched, idle campaigns, reviews this week, targets standing over a day. Once a week the same report is posted as a dated thread in the **gm-digest** forum, titled by its Monday (GM)',
       '`/gm check usage` \u2014 sixty days of command use, quietest first \u2014 a report only; nothing is removed by it \u00b7 `/gm check rehearse` \u2014 a private sparring thread against a dummy the bot runs, to try new buttons before the table sees them (GM)',
-      '`/help category:rules` \u2014 the live table rules, as the bot enforces them, for everyone. Every deploy posts **What\'s new** (the summary, then **In detail** beneath it) and **Deploy mend** as dated threads in the **gm-updates** forum, and the player half of the news in **updates** \u2014 the whole back-catalogue is there from the first boot; a day\'s entry that grows between two pushes is posted again whole. Once a week **updates** also gets the players\' **Weekly chronicle**: quests completed, titles granted, fights won, the fallen \u2014 nothing on a quiet week',
+      '`/help category:rules` \u2014 the live table rules, as the bot enforces them, for everyone. Every deploy posts **What\'s new** (the summary, then **In detail** beneath it) and **Deploy mend** as dated threads in the **gm-updates** forum, and the player half of the news in **updates** \u2014 the whole back-catalogue is there from the first boot; a day\'s entry that grows between two pushes is posted again whole. Once a week **updates** also gets the players\' **Weekly chronicle**: quests completed, titles granted, fights won, the fallen, and the dice of the week (natural 20s and 1s, the biggest total) \u2014 nothing on a quiet week',
       '`/instance add|kick|rally|note|pause|resume|complete|show|thread name:...` \u2014 the same by NAME rather than number; leave `name:` blank inside a run\'s own thread (GM)',
       '_One quest at a time: approving someone already seated on a live run prompts for a second press to override (audited), and a launch leaves them an applicant rather than double-booking them._',
       '`/encounter start name:... [merits:] [campaign:] [preset:]` \u2014 a short session run on the fly: no board, no applications. The bot lists every living character with HP and what is holding them; tick who is in it and press **Open the encounter** \u2014 it opens its own thread in quest-instances (where it was called if no forum is set), the party pulled in by mention. Nobody can join by themselves: `/encounter add user:` and `/encounter remove user:` are the GM\'s, run in the encounter\'s thread. `/encounter end [summary:] [title:]` pays out, writes the chronicle and posts the review button. Encounters do not count toward one-quest-at-a-time; one left quiet six hours reminds the room and pings the GMs (GM)',
       '`/campaign create name:... [description:]` \u2014 the long arc: quests, mini-quests and encounters under one name, with a GM-only thread in the campaigns forum. `campaign:` on `/quest create` or `/encounter start` links at birth; `/campaign add|remove` afterwards. `note` for beats between runs, `status` for where things stand, `recap` across every run, `complete` to close it. Players get `/campaign show` \u2014 the premise, what is done, and their own part (GM)',
       '`/quest run complete number:N` — finish it; merits auto-awarded, other rewards listed; the run\'s story rides on the card as a scroll PDF \u2014 the party, the length, every logged beat with its roleplay words, your tale \u2014 in the server\'s scroll font (GM)',
-      '`/quest run ready number:N` \u2014 a ready check: one card with a tick per seated player and a \u2705 Ready button; each press turns their tick, the last says all ready and names you (GM)',
+      '`/quest run ready number:N` \u2014 a ready check: one card with a tick per seated player and a \u2705 Ready button; each press turns their tick, the last says all ready and names you \u2014 and, if the run has not started, turns the button into \u25B6\uFE0F Start the run: your press is `/quest run start` (GM)',
       '`/quest delete number:N` — remove a quest (GM)',
     ],
   },
@@ -25428,11 +27983,12 @@ const HELP_CATEGORIES = {
       '`/npc create name:X str:N ...` — create an NPC (GM)',
       '`/npc hp name:X value:N` — set an NPC\'s HP · omit value for a full heal (GM)',
       '`/npc heal names:all` · `/npc heal names:Hollow, Hollow tank` — fully heal NPCs (GM)',
-      '`/gm heal user:@Players` / `npc:all` — restore HP, rerolls or charges, any amount (GM)',
+      '`/existence heal user:@Players` / `npc:all` — restore HP, rerolls or charges, any amount; under /gm until 15/10 (GM)',
       '`/npc manage copy name:Hollow new_name:Hollow 2` — duplicate an NPC (GM)',
       '`/npc show name:Hollow` — full stat block for one NPC',
       '`/npc hero name:X stat:str` — make an NPC a Hero with a signature stat (GM)',
-      '`/npc say name:X speech:... [action:...]` — speak or act as an NPC, no dice (GM)',
+      '`/npc say name:X speech:... [action:...] [to:@Players]` — speak or act as an NPC, no dice. The box has a **To** picker (up to three players, mentioned first) and `@Name` in the words pings that person too; only people are ever pinged, never a role or everyone. Every NPC line carries a 🎭 **Interact** button — a player gets the roleplay box, a GM the speak-as box (GM)',
+      '`/npc edit name:X talk:Activity` — a 💬 Talk button under their lines starts that activity for whoever pressed (GM)',
       '`/npc list category:Hollows` — list only one category\'s NPCs',
       '',
       '**Faces** — post a picture in the portrait forum:',
@@ -25476,6 +28032,7 @@ const HELP_CATEGORIES = {
       'Amounts take `100%`, `50%`, a flat number, or `0%` to skip that resource. Percentages round down. Quest parties are always skipped',
       '`/config mechanics npcreroll threshold:N` — NPC auto-reroll on nat ≤ N · 0 disables · omit to show',
       '`/config mechanics fightping enabled:true` — @-mention players on their turn · off by default (Admin)',
+      '`/config mechanics fightnudge minutes:10` — how long a fight may sit quiet before the bot pings whoever it waits on; 0 turns it off for a play-by-post table; 10 by default (Admin)',
       '`/config channels rollaudit channel:#x` — mirror all rolls (players + GMs) to a GM-only channel (Admin)',
       '`/config channels rollaudit test:true` — send a test mirror and report any problem (Admin)',
       '_The audit forum keeps one shelf per subject:_ 🎲 Player Rolls · 🛡️ GM Rolls · 🎭 NPC Rolls · 💬 NPC Say · 📜 Scrolls · 🎯 Called Checks · ⚖️ GM Overrides · 🤺 Duels · 🎖️ Advancement · 🕯️ The Fallen · 🧳 Items.',
@@ -25504,15 +28061,16 @@ const HELP_CATEGORIES = {
   },
   tools: {
     title: '\u{1F9F0} Table Tools',
-    blurb: 'buttons, targets, group checks, feedback, speaking as the bot',
+    blurb: 'buttons, targets, group checks, roleplay, feedback, speaking as the bot',
     body: [
       '_Things a GM plants in the channel for the table to press, and the ways players talk back._',
+      '`/rp [action:] [speech:]` \u2014 roleplay as your character: bare opens the two boxes the fight buttons open (what you do, what you say); filled, it posts at once. The line goes out in your name and face, shaped as the cards are \u2014 *action* then \u201cspeech\u201d \u2014 and inside a run it is a \u{1F3AD} beat on the timeline and in the story scroll. No dice. `/edit` fixes it afterwards, `/edit delete:true` takes it back',
       '`/button roll stat:dex dc:12 reason:...` \u2014 plant a check anyone may press; `dice:2d6+1` instead of a stat, `for:@Players` to address one person, `audience:@Ari @Bo @Guards` to address several players and/or a role (only they may press; the card names them all), `once:true` for one press each',
       '`/button group stat:wis dc:12 reason:...` \u2014 one check the whole party rolls; the message keeps the tally and \u2696\uFE0F Call it closes it with how many got through (GM)',
       '`/target create name:Barricade [dc:12] [stat:Flat d20, STR, DEX] [dice:2d6+1] [hp:3] [for:@Players] [audience:@Ari @Bo @Guards] [success_flavour:] [fail_flavour:] [write:true]` \u2014 something to strike, with no sheet. `for:` addresses one player, `audience:` several and/or a role \u2014 only they may swing, and the card names them. `hp:` is the hits it takes: with a DC a roll that meets it takes one off with no call, with no DC each pass you call does; it falls at 0. `write:true` opens a box for the scene and the two flavours instead of typing them into options. A d20 unless `dice:` says otherwise; `stat:` lists as few or as many stats as you like, one button each in that order \u2014 leave it out and all five are buttons; leave `dc:` out and every blow is your call. A press opens a short form \u2014 what they do, what they say, both optional \u2014 and the words land above the roll. A natural 20 beats it (**Roll critically succeeds**) and a natural 1 fails (**Roll critically fails**) on their own, each posting your flavour if set; anything else says **The roll succeeds / fails** and asks you \u2014 **The player passes the check** / **The player fails the check** \u2014 each opening a *What happens?* form prefilled with your flavour (blank still sends the verdict). A fail posts the card again below with its buttons and a counter; `secret:true` asks in the GM log and tells the players **Roll succeeds / fails** in theirs \u00b7 `/target list` \u2014 what stands here, with a \u{1FAA6} button per target to retire it without a swing',
       '`/dd message:... [header:] [user:@Players] [channels:#one #two]` \u2014 speak AS THE BOT: plain words by default, a bold header only if you write one, in every channel you name (or here); who said it goes to the roll-audit, not the room (GM)',
       '**Edit (DDice)** \u2014 long-press any message the bot sent \u2192 Apps \u2192 Edit (DDice): the text opens prefilled, save replaces it, the roll-audit records what changed. Covers the bot\'s own messages and NPC speech from `/npc say` alike; a line said through a webhook that has since been deleted cannot be edited by anyone \u2014 delete it and say it again (GM)',
-      '`/edit` \u2014 the same box without the Apps menu: a dropdown only you see lists the last 25 lines the bot and its NPCs said here, newest first; pick one and the text opens prefilled. `link:` a message link or id goes straight to it. Nothing shows in the channel (GM)',
+      '`/edit [delete:true]` \u2014 the same box without the Apps menu: a dropdown only you see lists the last 25 lines the bot and its NPCs said here, newest first; pick one and the text opens prefilled; `delete:true` takes the picked line down instead. `link:` a message link or id goes straight to it. Nothing shows in the channel. Players get the same for their own `/rp` lines',
       '`/feedback send [room:] [quest:]` \u2014 name a room to go straight to the form, or leave it blank for a menu; score it out of ten, say your piece; only GMs see it. Name a run you were on (or ran) and the card says which',
       '`/feedback category add|remove|list` \u2014 the rooms feedback lands in (GM) \u00b7 `/button feedback` plants a standing feedback button',
       '_A completed run posts its own \u{1F4DD} review button in its thread; `/quest show` then carries the count, the average \u2b50 and the latest lines._',
@@ -25630,6 +28188,11 @@ async function routeButton(interaction) {
     if (interaction.customId.startsWith('storypick:')) return handleStoryPickButton(interaction);
     if (interaction.customId.startsWith('storyrr:')) return handleStoryRerollButton(interaction);
     if (interaction.customId.startsWith('storygo:')) return handleStoryCarryOnButton(interaction);
+    if (interaction.customId.startsWith('storyforce:')) return handleStoryForceButton(interaction);
+    if (interaction.customId.startsWith('actv:')) return handleActivityShelfButton(interaction);
+    if (interaction.customId.startsWith('actvw:')) return handleWriterButton(interaction);
+    if (interaction.customId.startsWith('npcx:')) return handleNpcInteractButton(interaction);
+    if (interaction.customId.startsWith('npctalk:')) return handleNpcTalkButton(interaction);
     if (interaction.customId.startsWith('loreok:') || interaction.customId.startsWith('loreno:')) return handleLoreButton(interaction);
     if (interaction.customId.startsWith('tradeok:') || interaction.customId.startsWith('tradeno:')) return handleMeritTradeButton(interaction);
     if (interaction.customId.startsWith('revive:')) return handleReviveButton(interaction);
@@ -25641,8 +28204,28 @@ async function routeButton(interaction) {
       if (!party.includes(interaction.user.id)) return interaction.reply({ content: '\u274C That check is for the seated party.', ephemeral: true });
       db.prepare('INSERT OR IGNORE INTO quest_ready (guild_id, number, user_id, at) VALUES (?,?,?,?)').run(gidQ, quest.number, interaction.user.id, Date.now());
       const all = db.prepare('SELECT COUNT(*) AS c FROM quest_ready WHERE guild_id=? AND number=?').get(gidQ, quest.number).c >= party.length;
+      // The last tick turns the card's button into the GM's Start (T, 2026-10-15).
+      const { ActionRowBuilder: QR2, ButtonBuilder: QB2, ButtonStyle: QS2 } = require('discord.js');
+      const rowDone = all && quest.status !== 'active'
+        ? [new QR2().addComponents(new QB2().setCustomId(`qstart:${quest.number}`).setLabel('\u25B6\uFE0F Start the run').setStyle(QS2.Primary))]
+        : undefined;
       return interaction.update({ content: await questReadyCard(interaction.guild, gidQ, quest),
+        ...(rowDone ? { components: rowDone } : {}),
         allowedMentions: all && quest.gm_id ? { users: [quest.gm_id] } : { parse: [] } });
+    }
+    if (interaction.customId.startsWith('qstart:')) {
+      // The ready card's Start: /quest run start for the GM, no number to type.
+      // The cheap refusals come before the button goes, so a refused press
+      // leaves it to press again (audit, 2026-10-15).
+      const number = parseInt(interaction.customId.split(':')[1], 10);
+      if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '\u274C Only a GM starts the run.', ephemeral: true });
+      const qs = getQuest(interaction.guild.id, number);
+      if (!qs) return interaction.reply({ content: '\u274C That run is gone.', ephemeral: true });
+      if (qs.status === 'active') return interaction.reply({ content: `\u274C **${questTag(qs)}** is already running.`, ephemeral: true });
+      if (qs.status === 'completed') return interaction.reply({ content: '\u274C That quest is already completed.', ephemeral: true });
+      if (!getQuestMembers(interaction.guild.id, number, 'party').length) return interaction.reply({ content: '\u274C No party members yet \u2014 approve applicants first.', ephemeral: true });
+      try { await interaction.message?.edit?.({ components: [] }); } catch {}
+      return handleQuest(interaction, { sub: 'start', group: 'run', number });
     }
     if (interaction.customId.startsWith('qapply:') || interaction.customId.startsWith('qwithdraw:')) {
       const [kind, numRaw] = interaction.customId.split(':');
@@ -26126,8 +28709,14 @@ async function handleInteraction(interaction) {
       const REST_AMOUNTS = ['100%', '50%', '25%', '0%', '+25%', '+10%', '+1'];
       const serverEmojis = () => [...(interaction.guild?.emojis?.cache?.values?.() || [])].map(e => ({ name: `:${e.name}:`.slice(0, 100), value: `<${e.animated ? 'a' : ''}:${e.name}:${e.id}>`.slice(0, 100) }));
 
+      if (acCmd === 'activity' && acSub === 'edit' && focusedOption.name === 'scene') {
+        const st = getStory(acGid, acStr('name'));
+        const src = st ? (st.draft_source || sourceOf(acGid, st.name) || '') : '';
+        const names = [...new Set((src.match(/^\s*SCENE\s+(\S+)/gim) || []).map(l => l.trim().split(/\s+/)[1]))];
+        return await interaction.respond(acShape(names)).catch(() => {});
+      }
       if (acCmd === 'activity' && acSub === 'set') {
-        if (focusedOption.name === 'name') return await interaction.respond(acShape(db.prepare('SELECT name FROM stories WHERE guild_id=? ORDER BY name').all(acGid).map(r => r.name))).catch(() => {});
+        if (focusedOption.name === 'name') return await interaction.respond(acShape(listStories(acGid).map(r => r.name))).catch(() => {});
         if (focusedOption.name === 'scene') return await interaction.respond(acShape(db.prepare('SELECT scene FROM story_scenes WHERE guild_id=? AND story=? COLLATE NOCASE ORDER BY scene').all(acGid, acStr('name')).map(r => r.scene))).catch(() => {});
         if (focusedOption.name === 'value') {
           const f = acStr('field');
@@ -26321,7 +28910,7 @@ async function handleInteraction(interaction) {
         return await interaction.respond(groups.filter(g => !v || g.toLowerCase().includes(v)).slice(0, 25)
           .map(g => ({ name: g.slice(0, 100), value: g.slice(0, 100) })));
       }
-      if (interaction.commandName === 'gm' && (focusedOption.name === 'npc' || focusedOption.name === 'npcs')) {
+      if ((interaction.commandName === 'gm' || interaction.commandName === 'existence') && (focusedOption.name === 'npc' || focusedOption.name === 'npcs')) {
         const v = String(focusedOption.value).toLowerCase();
         const choices = [{ name: 'all', value: 'all' },
           ...getAllNpcs(interaction.guild.id).map(n => ({ name: n.name.slice(0,100), value: n.name }))]
@@ -26421,6 +29010,10 @@ async function handleInteraction(interaction) {
       if (interaction.commandName === 'activity' && focusedOption.name === 'name') {
         const v = String(focusedOption.value || '').toLowerCase();
         return await interaction.respond(acPick(listStories(interaction.guild.id).map(r => r.name), v));
+      }
+      if (interaction.commandName === 'npc' && focusedOption.name === 'talk') {
+        const v = String(focusedOption.value || '').toLowerCase();
+        return await interaction.respond(acPick(['none', ...listStories(interaction.guild.id).map(r => r.name)], v));
       }
       // A category by name, wherever it's asked for — including the
       // categorydelete sub, where the option is called 'name'.
@@ -26625,14 +29218,16 @@ async function handleInteraction(interaction) {
       await questAnnounce(interaction.client, fresh, '✏️ Quest edited.', { board: false });
       return interaction.editReply({ content: `✏️ **${questTag(fresh)}** updated.\n\n${await renderQuest(interaction.guild, fresh)}` });
     }
-    if (interaction.customId === 'activitycreate') {
+    if (interaction.customId === 'activitycreate' || interaction.customId === 'activitycreate:draft') {
       const gid2 = interaction.guild.id;
       if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '❌ Only GMs can add activities.', ephemeral: true });
-      const r = storeActivityScript(gid2, interaction.user.id, interaction.fields.getTextInputValue('script'));
-      return interaction.reply(r.error
-        ? { content: `❌ **Couldn't read that activity.** ${r.error}\n_Your script is still in the paste window — press Dismiss, fix it, and try again (or paste it straight into chat)._`, ephemeral: true }
-        : { content: r.saved });
+      const r = saveActivity(gid2, interaction.user.id, interaction.fields.getTextInputValue('script'), { publish: interaction.customId.endsWith(':draft') ? 'draft' : 'auto', via: 'box' });
+      if (r.error) return interaction.reply({ content: `❌ **Couldn't read that activity.** ${r.error}`, ephemeral: true });
+      // A problem list quotes the script, answers and all: it stays with the GM.
+      return interaction.reply({ content: r.saved, components: r.status === 'waiting' ? [publishRow(r.name)] : [], ephemeral: r.status === 'draft' });
     }
+    if (interaction.customId.startsWith('actvedit:') || interaction.customId.startsWith('actvall:')) return handleActivityEditModal(interaction);
+    if (interaction.customId === 'actvw') return handleWriterModal(interaction);
     if (interaction.customId.startsWith('npcsay:')) return handleNpcSayModal(interaction);
     if (interaction.customId === 'scrollwrite') return handleScrollModal(interaction);
     if (interaction.customId === 'importpaste') return handleImportPasteModal(interaction);
@@ -26727,6 +29322,7 @@ async function handleInteraction(interaction) {
       return handleQuest(interaction, { sub: 'archive', number: numA, summary: text, skipSummary: true });
     }
     if (interaction.customId.startsWith('botedit:')) return saveBotEdit(interaction);
+    if (interaction.customId === 'rpform') return handleRpModal(interaction);
     if (interaction.customId.startsWith('tgtrp:')) {
       const [, msgId, pick] = interaction.customId.split(':');
       return strikeTarget(interaction, msgId, pick).catch(e => console.error('[target]', e?.message || e));
@@ -26758,7 +29354,7 @@ async function handleInteraction(interaction) {
         case 'atk':
           return handleFight(interaction, { sub: 'atk', stat: p.stat, targetId: p.targetId, npc: p.npc || null, mode: p.mode || 'normal', flavour });
         case 'def':
-          return handleFight(interaction, { sub: 'def', stat: p.stat, npc: p.npc || null, flavour });
+          return handleFight(interaction, { sub: 'def', stat: p.stat, npc: p.npc || null, mode: p.mode || 'normal', flavour });
         case 'grapple':
           return handleFight(interaction, { sub: 'act', action: 'grapple', targetId: p.targetId, flavour });
         case 'feint': {
@@ -26845,8 +29441,14 @@ async function handleInteraction(interaction) {
   if (interaction.isStringSelectMenu?.() && interaction.customId.startsWith('encpick:')) {
     return handleEncounterPick(interaction).catch(e => console.error('[encpick]', e?.message || e));
   }
+  if (interaction.isStringSelectMenu?.() && interaction.customId.startsWith('actvscene:')) {
+    return handleActivitySceneSelect(interaction).catch(e => console.error('[actvscene]', e?.message || e));
+  }
   if (interaction.isStringSelectMenu?.() && interaction.customId === 'editpick') {
     return pickEditTarget(interaction).catch(e => console.error('[editpick]', e?.message || e));
+  }
+  if (interaction.isStringSelectMenu?.() && interaction.customId === 'editdel') {
+    return pickEditTarget(interaction, { deleting: true }).catch(e => console.error('[editdel]', e?.message || e));
   }
   if (interaction.isStringSelectMenu?.() && (interaction.customId === 'fbcat' || interaction.customId?.startsWith('fbcat:'))) {
     const key = interaction.values[0];
@@ -26939,13 +29541,6 @@ async function handleInteraction(interaction) {
       const gmSub = interaction.options.getSubcommand();
       if (gmSub === 'search') return await handleGmSearch(interaction);
       if (gmSub === 'queue') return await handleGmQueue(interaction);
-      if (gmSub === 'kill') { const r = await handleGmKill(interaction);
-        ensureCharPage(interaction.client, interaction.guild, interaction.options?.getUser?.('user')?.id ?? interaction.user.id, null).catch(() => {});
-        return r; }  // the Fallen tag follows the deed
-      if (gmSub === 'revive') { const r = await handleGmRevive(interaction);
-        ensureCharPage(interaction.client, interaction.guild, interaction.options?.getUser?.('user')?.id ?? interaction.user.id, null).catch(() => {});
-        return r; }
-      if (gmSub === 'heal') return await handleGmHeal(interaction);
       if (gmSub === 'questwipe') return await runGmQuestWipe(interaction);
       if (interaction.options.getSubcommandGroup(false) === 'check') return await handleCheck(interaction);
       if (gmSub === 'scroll') return await handleScroll(interaction);
@@ -27005,6 +29600,17 @@ async function handleInteraction(interaction) {
     if (interaction.commandName === 'instance') return await handleInstance(interaction);
     if (interaction.commandName === 'dd') return await handleDd(interaction);
     if (interaction.commandName === 'edit') return await handleEdit(interaction);
+    if (interaction.commandName === 'rp') return await handleRp(interaction);
+    if (interaction.commandName === 'existence') {
+      const exSub = interaction.options.getSubcommand();
+      if (exSub === 'kill') { const r = await handleGmKill(interaction);
+        ensureCharPage(interaction.client, interaction.guild, interaction.options?.getUser?.('user')?.id ?? interaction.user.id, null).catch(() => {});
+        return r; }  // the Fallen tag follows the deed
+      if (exSub === 'revive') { const r = await handleGmRevive(interaction);
+        ensureCharPage(interaction.client, interaction.guild, interaction.options?.getUser?.('user')?.id ?? interaction.user.id, null).catch(() => {});
+        return r; }
+      if (exSub === 'heal') return await handleGmHeal(interaction);
+    }
     if (interaction.commandName === 'encounter') return await handleEncounter(interaction);
     if (interaction.commandName === 'campaign') return await handleCampaign(interaction);
     if (interaction.commandName === 'target') return await handleTarget(interaction);
@@ -27135,11 +29741,16 @@ client.on('messageCreate', async message => {
   }
 
   // Sheet import detection — check before prefix matching
+  // A GM's post in an activity's shelf thread — a script, a .txt, the PDF —
+  // replaces that activity; a new post in the shelf forum makes a new one.
+  try { if (await tryActivityShelfPost(message)) return; }
+  catch (err) { console.error('[shelf] post -', err?.message || err); }
   // Pasted scenario script — GM only, and validated before anything is stored.
   if (/^\s*\[(STORY|ACTIVITY)\]/im.test(content)) {
     if (!(await isGm(message.guild, message.author.id))) return message.reply('❌ Only GMs can add activities.');
-    const r = storeActivityScript(message.guild.id, message.author.id, content);
-    return message.reply(r.error ? `❌ **Couldn't read that activity.** ${r.error}` : r.saved);
+    const r = saveActivity(message.guild.id, message.author.id, content, { via: 'paste' });
+    if (r.error) return message.reply(`❌ **Couldn't read that activity.** ${r.error.slice(0, 1900)}`);
+    return message.reply({ content: r.saved.slice(0, 1990), components: r.status === 'waiting' ? [publishRow(r.name)] : [] });
   }
 
   if (content.includes('[TTRPG SHEET]')) {

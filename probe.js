@@ -71,6 +71,13 @@ function recorder(kind) {
     setMaxValues(v) { this._d.max = v; return this; }
     setChannelTypes(...t) { this._d.channelTypes = t.flat(); return this; }
     addComponents(...c) { this._d.components.push(...c.flat()); return this; }
+    // The label style (discord.js 14.27): a label wraps one component; the
+    // modal lists labels. Flattened into components so idsOf and the modal
+    // field reader see the same shape as an action row's.
+    addLabelComponents(...c) { for (const l of c.flat()) this._d.components.push({ _kind: 'label', _d: { label: l._d?.label, components: l._d?.components || [] } }); return this; }
+    setTextInputComponent(c) { this._d.components = [c]; return this; }
+    setUserSelectMenuComponent(c) { this._d.components = [c]; this._d.userSelect = true; return this; }
+    setStringSelectMenuComponent(c) { this._d.components = [c]; return this; }
     addSubcommand(fn) { this._d.subcommands.push(fn(new (recorder('sub'))())._d ?? fn); return this; }
     addSubcommandGroup(fn) { const g = fn(new (recorder('group'))()); this._d.groups.push(g._d ?? g); return this; }
     addStringOption(fn) { this._d.options.push({ type: 'string', ...fn(new (recorder('opt'))())._d }); return this; }
@@ -132,7 +139,7 @@ class FakeChannel {
     // The channel's webhooks, as Discord hands them back: the bot's own carry a token.
     this._hooks = [];
     this.fetchWebhooks = async () => new FakeCollection(this._hooks.map(h => [h.id, h]));
-    this.createWebhook = async ({ name } = {}) => { const h = { id: nextId(), token: 'tok', owner: { id: 'BOT' }, name: name || 'DDice', delete: async () => {} }; this._hooks.push(h); return h; };
+    this.createWebhook = async ({ name } = {}) => { const h = { id: nextId(), token: 'tok', owner: { id: 'BOT' }, name: name || 'DDice', delete: async () => {} }; this._hooks.push(h); hookHosts.set(h.id, this); return h; };
   }
   isThread() { return !!this._isThread; }
   isTextBased() { return true; }
@@ -182,6 +189,7 @@ class FakeClient {
 }
 
 const channelsById = new Map();
+const hookHosts = new Map();   // webhook id -> the channel that owns it (a fake send lands there)
 const registered = [];      // every command set handed to REST.put — the picker as Discord would see it
 
 const fakeDiscord = {
@@ -199,10 +207,16 @@ const fakeDiscord = {
   ButtonBuilder: recorder('button'),
   ModalBuilder: recorder('modal'),
   TextInputBuilder: recorder('input'),
+  LabelBuilder: recorder('label'),
+  UserSelectMenuBuilder: recorder('uselect'),
   StringSelectMenuBuilder: recorder('select'),
   ChannelSelectMenuBuilder: recorder('cselect'),
   AttachmentBuilder: class { constructor(a, b) { this.a = a; this.b = b; } },
-  WebhookClient: class { constructor(o) { this.id = o?.id; } async send() { return { id: nextId() }; } async edit() {} async editMessage(id, p) { const m = sentById.get(id); if (m) m.content = p?.content ?? m.content; return m; } },
+  WebhookClient: class { constructor(o) { this.id = o?.id; }
+    // A webhook send lands in the channel like any other message (the thread id picks the room), so /rp lines can be read back and edited.
+    async send(p) { const ch = channelsById.get(p?.threadId) || hookHosts.get(this.id); const m = ch ? await ch.send({ content: typeof p === 'string' ? p : (p?.content ?? ''), components: p?.components || [] }) : { id: nextId() }; m.webhookId = this.id; m.author = { id: this.id, username: p?.username || 'hook' }; m.allowedMentions = p?.allowedMentions; return m; }
+    async edit() {} async editMessage(id, p) { const m = sentById.get(id); if (m) m.content = p?.content ?? m.content; return m; }
+    async deleteMessage(id) { if (sentById.has(id)) deleted.push(id); return true; } },
   REST: class { setToken() { return this; } async put(route, opts) { if (opts?.body) registered.push(opts.body); return []; } async get() { return []; } },
   Routes: new Proxy({}, { get: () => () => 'route' }),
   EmbedBuilder: recorder('embed'),
@@ -351,7 +365,9 @@ function makeInteraction(over = {}) {
       getFocused: () => ({ name: opts._focused || 'name', value: opts._focusedValue || '' }),
       data: [],
     },
-    fields: { getTextInputValue: (n) => (over.fields || {})[n] ?? '' },
+    fields: { getTextInputValue: (n) => (over.fields || {})[n] ?? '',
+      // discord.js 14.27: a modal's user picker, read back as a Collection of users
+      getSelectedUsers: (n) => new FakeCollection(((over.users || {})[n] || []).map(id => [id, { id, username: `user${id}` }])) },
     reply: async (p) => { if (i.replied || i.deferred) throw already(over, `reply after ${i.deferred ? 'defer' : 'reply'}`); i.replied = true; replies.push(norm(p)); return { id: nextId() }; },
     fetchReply: async () => ({ id: nextId(), channelId: (over.channel || chan).id, edit: async () => {} }),
     editReply: async (p) => { replies.push(norm(p)); return { id: nextId() }; },
@@ -1483,11 +1499,11 @@ async function fire(over) {
     dbHandle.prepare("INSERT OR IGNORE INTO subject_titles (guild_id, subject_id, title, source, granted_by, at) VALUES ('G1', 'U2', 'Idol-breaker', 'probe', 'U1', ?)").run(Date.now());
     dbHandle.prepare("INSERT INTO week_ledger (guild_id, at, kind, text) VALUES ('G1', ?, 'fight', 'userU1 wins!')").run(Date.now());
     dbHandle.prepare("UPDATE characters SET died_at=? WHERE guild_id='G1' AND user_id=?").run(Date.now(), P4);
-    dbHandle.prepare("UPDATE guild_config SET week_tale_at=0 WHERE guild_id='G1'").run();
+    dbHandle.prepare("UPDATE guild_config SET week_tale_at=0, fight_nudge_min=NULL WHERE guild_id='G1'").run();   // the leaf walk set the nudge to 0; the default is wanted here
     dbHandle.prepare(`UPDATE fights SET state='active', turn_order='["U1","U2"]', turn_index=0, phase='attack', current_target=NULL, nudged=0, last_at=? WHERE guild_id='G1' AND channel_id='C1'`).run(Date.now() - 11 * 60 * 1000);
     const updForum = dbHandle.prepare("SELECT updates_forum FROM guild_config WHERE guild_id='G1'").get()?.updates_forum;
     const talesBefore = threads.filter(t => t.parentId === updForum && / · Weekly chronicle$/.test(t.name)).length;   // the tick walk above posted the first
-    const nudgesBefore = sent.filter(x => /Ten minutes quiet/.test(x.content)).length;
+    const nudgesBefore = sent.filter(x => /minutes? quiet/.test(x.content)).length;
     for (const t of ticks) { try { await t.fn(); } catch (e) { loggedA.push(`tick: ${e.message}`); } }
     const tales = threads.filter(t => t.parentId === updForum && / · Weekly chronicle$/.test(t.name));
     const taleText = tales.length ? sent.filter(x => x.channel === tales[tales.length - 1].id).map(x => x.content).join('\n') : '';
@@ -1496,13 +1512,13 @@ async function fire(over) {
         && /Titles granted/.test(taleText) && /\*\*userU2\*\* — Idol-breaker/.test(taleText) && /Fights won/.test(taleText) && /userU1 wins!/.test(taleText)
         && /The fallen/.test(taleText) && taleText.includes(`**user${P4}**`),
       `${tales.length} thread(s) · ${taleText.replace(/\s+/g, ' ').slice(0, 300)}`);
-    const nudges = sent.filter(x => /Ten minutes quiet/.test(x.content));
+    const nudges = sent.filter(x => /minutes? quiet/.test(x.content));
     const nudgedRow = dbHandle.prepare("SELECT nudged FROM fights WHERE guild_id='G1' AND channel_id='C1'").get();
     for (const t of ticks) { try { await t.fn(); } catch {} }
-    const nudgesAgain = sent.filter(x => /Ten minutes quiet/.test(x.content)).length;
+    const nudgesAgain = sent.filter(x => /minutes? quiet/.test(x.content)).length;
     const talesAgain = threads.filter(t => t.parentId === updForum && / · Weekly chronicle$/.test(t.name)).length;
     ok('a fight quiet for ten minutes nudges whoever it waits on, once; a second tick nudges nobody and posts no second chronicle',
-      nudges.length === nudgesBefore + 1 && /⏳ Ten minutes quiet — \*\*userU1\*\* is up to attack\. <@U1>/.test(nudges[nudges.length - 1]?.content || '') && nudgedRow?.nudged === 1
+      nudges.length === nudgesBefore + 1 && /⏳ 10 minutes quiet — \*\*userU1\*\* is up to attack\. <@U1>/.test(nudges[nudges.length - 1]?.content || '') && nudgedRow?.nudged === 1
         && nudgesAgain === nudges.length && talesAgain === talesBefore + 1,
       `${nudges.length - nudgesBefore} nudge(s): ${(nudges[nudges.length - 1]?.content || '').slice(0, 80)} · nudged ${nudgedRow?.nudged} · again ${nudgesAgain - nudges.length} · chronicles ${talesAgain}`);
     dbHandle.prepare("UPDATE characters SET died_at=NULL WHERE guild_id='G1' AND user_id=?").run(P4);
@@ -1611,7 +1627,9 @@ async function fire(over) {
     const dcAsk = await fire({ commandName: 'gm', options: { _sub: 'dc', stat: 'str', dc: 40, target: 'U2', fail_damage: 3 }, userId: 'U1' });
     const dcCard = dcAsk.replies.find(x => idsOf(x).some(id => /^dcroll:U2:/.test(id)));
     const dcId = dcCard ? idsOf(dcCard).find(id => /^dcroll:U2:/.test(id)) : '';
+    Math.random = () => 0;   // a natural 1: a 20 would pass any DC and cost nothing
     if (dcCard) await fire({ isButton: true, customId: dcId, message: { id: nextId(), content: dcCard.content || '', components: dcCard.components.map(r => ({ components: ((r._d || r).components || []).map(b => ({ customId: (b._d || b).customId, label: (b._d || b).label, style: (b._d || b).style, disabled: false })) })) }, userId: 'U2' });
+    Math.random = realRandom;
     const hpAfterDc = hpOf('U2');
     const uD = await fire({ commandName: 'gm', options: { _sub: 'undo' }, userId: 'U1' });
     ok('a called check that cost HP rewinds: the sheet is back where it was and the table is told',
@@ -1633,6 +1651,483 @@ async function fire(over) {
     const threwB = loggedB.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column|\[undo\]/.test(l));
     console.error = realErrB;
     ok('nothing in the undo walk threw', threwB.length === 0, threwB.slice(0, 3).join('\n        '));
+  }
+
+  // ── Build C (2026-10-15): typed fight commands, initiative ties, /rp and
+  // the player's /edit, fightnudge, ready → Start, /fight log scroll, dice
+  // of the week, the prune, /existence ────────────────────────────────
+  if (dbHandle) {
+    const realErrC = console.error; const loggedC = [];
+    console.error = (...a) => { loggedC.push(a.map(String).join(' ')); };
+    const idsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+    const saidOf = (r) => r.replies.map(x => x.content || '').join(' ');
+    const modalOf = (r) => r.replies.find(x => x.modal)?.modal || null;
+    const realRandom = Math.random;
+    const P2 = '100000000000000002', P4 = '100000000000000004';
+    // 1 · typed attack and defence: bare → buttons; one foe → the form; flavour → the swing; typed defence likewise
+    dbHandle.prepare(`UPDATE fights SET state='active', turn_order='["U1","U2"]', turn_index=0, phase='attack', current_target=NULL, hp_state='{"U1":7,"U2":7}', effect_state='{}', grapples='{}', atk_roll=NULL, def_roll=NULL, atk_kind=NULL WHERE guild_id='G1' AND channel_id='C1'`).run();
+    const bare = await fire({ commandName: 'fight', options: { _sub: 'atk' }, userId: 'U1' });
+    const typedOne = await fire({ commandName: 'fight', options: { _sub: 'atk', stat: 'str' }, userId: 'U1' });
+    let before = sent.length;
+    const typedFlav = await fire({ commandName: 'fight', options: { _sub: 'atk', stat: 'str', flavour: 'a low cut' }, userId: 'U1' });
+    const swung = fightRowC();
+    const bareDef = await fire({ commandName: 'fight', options: { _sub: 'def' }, userId: 'U2' });
+    const typedDef = await fire({ commandName: 'fight', options: { _sub: 'def', stat: 'con', roll: 'adv' }, userId: 'U2' });
+    const defSub = typedDef.replies.find(x => x.modal) ? await fire({ isModal: true, fromMessage: true, customId: modalOf(typedDef), fields: { action: 'braces' }, message: { id: 'M9', content: '', components: [] }, userId: 'U2' }) : { replies: [] };
+    function fightRowC() { return dbHandle.prepare("SELECT phase, atk_roll, def_roll, atk_stat, def_stat FROM fights WHERE guild_id='G1' AND channel_id='C1'").get(); }
+    const defended = fightRowC();
+    ok('typed /fight atk: bare offers the stat buttons, a stat with one foe opens the form, a stat with flavour swings; typed /fight def likewise, the roll type riding the form',
+      idsOf(bare.replies[0]).includes('fatk:str') && /Pick a stat/.test(saidOf(bare)) && /^frp:/.test(modalOf(typedOne) || '')
+        && !modalOf(typedFlav) && swung?.phase === 'defend' && swung?.atk_stat === 'str' && /a low cut/.test(saidOf(typedFlav) + sent.slice(before).map(x => x.content).join(' '))
+        && idsOf(bareDef.replies[0]).includes('fdef:con') && /^frp:/.test(modalOf(typedDef) || '') && defended?.def_roll !== null && defended?.def_stat === 'con' && /advantage/.test(saidOf(defSub)) && /braces/.test(saidOf(defSub)),
+      `bare ${idsOf(bare.replies[0]).join(',')} · one ${modalOf(typedOne)} · flav ${JSON.stringify(swung)} · def ${idsOf(bareDef.replies[0]).join(',')} ${modalOf(typedDef)} ${JSON.stringify(defended)} · ${saidOf(defSub).replace(/\s+/g, ' ').slice(0, 60)}`);
+    // 2 · initiative ties: two fighters on one total reroll, only they, and the line says so
+    const chanT = new FakeChannel('C10', 0, 'ties', guild); channelsById.set(chanT.id, chanT);
+    const seq = [0.45, 0.45, 0.7, 0.1];   // d20: 10, 10 (a tie at 13 each with DEX 3), then 15 and 3
+    let k = 0; Math.random = () => seq[k++ % seq.length];
+    const startT = await fire({ commandName: 'fight', options: { _sub: 'start', players: `<@${P2}> <@${P4}>` }, userId: 'U1', channel: chanT });
+    Math.random = realRandom;
+    const orderT = JSON.parse(dbHandle.prepare("SELECT turn_order FROM fights WHERE guild_id='G1' AND channel_id='C10'").get()?.turn_order || '[]');
+    ok('initiative ties reroll among the tied: the line names the tie, the rerolls and who goes first, and the order follows it',
+      new RegExp(`🔁 \\*\\*Tie at 13\\*\\* — user${P2} and user${P4} reroll: user${P2} .*\\[15\\] \\+ 3 = 18 .*user${P4} .*\\[3\\] \\+ 3 = 6 → user${P2} first`).test(saidOf(startT)) && orderT[0] === P2 && orderT[1] === P4,
+      `${saidOf(startT).replace(/\s+/g, ' ').slice(0, 260)} · order ${orderT.join(',')}`);
+    // 3 · /rp: inline and by the box, posted in the player's name, chronicled; the player fixes and takes back their own through /edit
+    dbHandle.prepare(`INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, gm_id, started_at) VALUES ('G1', 911, 'Probe Rp', 'active', 'quest', ?, 'C1', 'U1', ?)`).run(Date.now(), Date.now());
+    before = sent.length;
+    const rp1 = await fire({ commandName: 'rp', options: { action: 'draws her blade', speech: 'Not one step closer.' }, userId: 'U2' });
+    const rpMsg = sent.slice(before).map(x => x.msg).find(m => /draws her blade/.test(m.content));
+    const rpBare = await fire({ commandName: 'rp', options: {}, userId: 'U2' });
+    before = sent.length;
+    const rp2 = modalOf(rpBare) === 'rpform' ? await fire({ isModal: true, customId: 'rpform', fields: { action: '', speech: 'Hold the line.' }, userId: 'U3' }) : { replies: [] };
+    const rpMsg3 = sent.slice(before).map(x => x.msg).find(m => /Hold the line/.test(m.content));
+    const rpRows = dbHandle.prepare("SELECT message_id, user_id FROM rp_lines WHERE guild_id='G1' AND channel_id='C1' ORDER BY at").all();
+    const chron = dbHandle.prepare("SELECT text FROM quest_events WHERE guild_id='G1' AND number=911 AND kind='rp'").all().map(r => r.text);
+    ok('/rp posts in the player\'s name through the channel\'s webhook with no mentions allowed, inline or from the box, and the words reach the running quest\'s chronicle',
+      /Posted/.test(saidOf(rp1)) && !!rpMsg && rpMsg.webhookId && Array.isArray(rpMsg.allowedMentions?.parse) && rpMsg.allowedMentions.parse.length === 0 && /\*draws her blade\*\n"Not one step closer\."/.test(rpMsg.content) && modalOf(rpBare) === 'rpform' && !!rpMsg3 && /^"Hold the line\."$/.test(rpMsg3.content)
+        && rpRows.some(r => r.message_id === rpMsg.id && r.user_id === 'U2') && rpRows.some(r => r.message_id === rpMsg3?.id && r.user_id === 'U3')
+        && chron.some(t => /userU2: draws her blade/.test(t) && /Not one step closer/.test(t)),
+      `${saidOf(rp1).slice(0, 40)} · msg ${JSON.stringify(rpMsg?.content)} hook ${rpMsg?.webhookId} · box ${modalOf(rpBare)} ${JSON.stringify(rpMsg3?.content)} · rows ${rpRows.length} · chron ${chron.join(' | ').slice(0, 120)}`);
+    // U3 is a plain player for the edit: the fake guild answers admin for everyone, so U3 is made plain for these calls
+    const realFetchC = guild.members.fetch;
+    guild.members.fetch = async (uid) => { const mb = await realFetchC(uid); if (uid === 'U3') { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+    const plainC = { id: 'U3', roles: { cache: new Map() }, permissions: { has: () => false } };
+    const list3 = await fire({ commandName: 'edit', options: {}, userId: 'U3', member: plainC });
+    const listIds = (list3.replies[0]?.components || []).flatMap(r => ((r._d || r).components || []).flatMap(c => ((c._d || c).options || []).map(o => o.value)));
+    const pick3 = await fire({ isSelect: true, customId: 'editpick', values: [rpMsg3?.id], message: { id: nextId(), content: '', components: [] }, userId: 'U3', member: plainC });
+    const save3 = modalOf(pick3) ? await fire({ isModal: true, fromMessage: true, customId: modalOf(pick3), fields: { text: '"Hold the line, all of you."' }, message: { id: nextId(), content: '', components: [] }, userId: 'U3', member: plainC }) : { replies: [] };
+    const notMine = await fire({ commandName: 'edit', options: { link: `https://discord.com/channels/G1/C1/${rpMsg?.id}` }, userId: 'U3', member: plainC });
+    const del3 = await fire({ commandName: 'edit', options: { delete: true }, userId: 'U3', member: plainC });
+    const delPick = await fire({ isSelect: true, customId: 'editdel', values: [rpMsg3?.id], message: { id: nextId(), content: '', components: [] }, userId: 'U3', member: plainC });
+    guild.members.fetch = realFetchC;
+    ok('a player\'s /edit lists only their own /rp lines, fixes one through the same box, refuses another\'s by link, and delete:true takes their own down',
+      listIds.length === 1 && listIds[0] === rpMsg3?.id && /^botedit:/.test(modalOf(pick3) || '') && /Edited/.test(saidOf(save3)) && rpMsg3?.content === '"Hold the line, all of you."'
+        && /not yours to touch/.test(saidOf(notMine)) && idsOf(del3.replies[0]).includes('editdel') && /Which line comes down/.test(saidOf(del3)) && /Taken down/.test(saidOf(delPick)) && deleted.includes(rpMsg3?.id)
+        && !dbHandle.prepare("SELECT 1 FROM rp_lines WHERE guild_id='G1' AND message_id=?").get(rpMsg3?.id),
+      `list ${listIds.join(',')} vs ${rpMsg3?.id} · pick ${modalOf(pick3)} · save ${saidOf(save3).slice(0, 30)} "${rpMsg3?.content}" · link ${saidOf(notMine).slice(0, 40)} · del ${saidOf(del3).slice(0, 40)} / ${saidOf(delPick).slice(0, 30)} gone ${deleted.includes(rpMsg3?.id)}`);
+    // 4 · fightnudge: off means no nudge; five means five
+    const n0 = await fire({ commandName: 'config', options: { _group: 'mechanics', _sub: 'fightnudge', minutes: 0 }, userId: 'U1' });
+    dbHandle.prepare(`UPDATE fights SET state='active', turn_order='["U1","U2"]', turn_index=0, phase='attack', current_target=NULL, nudged=0, last_at=? WHERE guild_id='G1' AND channel_id='C1'`).run(Date.now() - 30 * 60 * 1000);
+    const nudgesC0 = sent.filter(x => /minutes? quiet/.test(x.content)).length;
+    for (const t of ticks) { try { await t.fn(); } catch {} }
+    const nudgesC1 = sent.filter(x => /minutes? quiet/.test(x.content)).length;
+    const n5 = await fire({ commandName: 'config', options: { _group: 'mechanics', _sub: 'fightnudge', minutes: 5 }, userId: 'U1' });
+    const nShow = await fire({ commandName: 'config', options: { _group: 'mechanics', _sub: 'fightnudge' }, userId: 'U1' });
+    dbHandle.prepare(`UPDATE fights SET nudged=0, last_at=? WHERE guild_id='G1' AND channel_id='C1'`).run(Date.now() - 6 * 60 * 1000);
+    for (const t of ticks) { try { await t.fn(); } catch {} }
+    const nudgeLast = sent.filter(x => /minutes? quiet/.test(x.content)).pop()?.content || '';
+    dbHandle.prepare("UPDATE guild_config SET fight_nudge_min=NULL WHERE guild_id='G1'").run();
+    ok('/config mechanics fightnudge: 0 turns the quiet-fight nudge off, 5 makes it five minutes, bare shows the setting',
+      /is \*\*off\*\*/.test(saidOf(n0)) && nudgesC1 === nudgesC0 && /\*\*5 minutes\*\*/.test(saidOf(n5)) && /after \*\*5 minutes\*\*/.test(saidOf(nShow)) && /5 minutes quiet/.test(nudgeLast),
+      `${saidOf(n0).slice(0, 40)} · ticks ${nudgesC0}→${nudgesC1} · ${saidOf(n5).slice(0, 40)} · ${saidOf(nShow).slice(0, 50)} · ${nudgeLast.slice(0, 50)}`);
+    // 5 · the ready check's last tick grows a Start button; the GM's press starts the run
+    dbHandle.prepare(`INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, gm_id) VALUES ('G1', 912, 'Probe Ready', 'open', 'quest', ?, 'C1', 'U1')`).run(Date.now());
+    for (const u of ['U1', 'U2']) dbHandle.prepare("INSERT OR REPLACE INTO quest_members (guild_id, number, user_id, state) VALUES ('G1', 912, ?, 'party')").run(u);
+    const rdyC = await fire({ commandName: 'quest', options: { _group: 'run', _sub: 'ready', number: 912 }, userId: 'U1' });
+    const rdyMsgC = { id: nextId(), content: rdyC.replies[0]?.content || '', components: rdyC.replies[0]?.components || [], edit: async () => {} };
+    await fire({ isButton: true, customId: 'qready:912', message: rdyMsgC, userId: 'U2' });
+    const lastTick = await fire({ isButton: true, customId: 'qready:912', message: rdyMsgC, userId: 'U1' });
+    const startBtn = idsOf(lastTick.replies[0]);
+    const pressStart = await fire({ isButton: true, customId: 'qstart:912', message: rdyMsgC, userId: 'U1' });
+    const q912 = dbHandle.prepare("SELECT status FROM quests WHERE guild_id='G1' AND number=912").get();
+    ok('the last Ready tick turns the card\'s button into Start; the GM\'s press starts the run',
+      // Under spin-off (on in this hall) starting a listing launches a run from it; either way the press is the start.
+      startBtn.includes('qstart:912') && !startBtn.includes('qready:912') && (q912?.status === 'active' || /launched/.test(saidOf(pressStart))) && !/❌/.test(saidOf(pressStart)),
+      `buttons ${startBtn.join(',')} · status ${q912?.status} · ${saidOf(pressStart).replace(/\s+/g, ' ').slice(0, 80)}`);
+    // 6 · /fight log scroll:true hands the recap over as a parchment PDF — the C1 fight has an exchange on it; resolve and end it first
+    const resC = await fire({ isButton: true, customId: 'fresolve', message: { id: 'M9', content: '', components: [] }, userId: 'U1' });
+    if (modalOf(resC)) await fire({ isModal: true, fromMessage: true, customId: modalOf(resC), fields: { what: '' }, message: { id: 'M9', content: '', components: [] }, userId: 'U1' });
+    const endC = await fire({ commandName: 'fight', options: { _sub: 'end' }, userId: 'U1' });
+    const endBtn = idsOf(endC.replies[0]).find(id => /^confirm:/.test(id));
+    if (endBtn) await fire({ isButton: true, customId: endBtn, message: { id: nextId(), content: '', components: [] }, userId: 'U1' });
+    const chanF8 = chan;
+    const logPlain = await fire({ commandName: 'fight', options: { _sub: 'log' }, userId: 'U1', channel: chanF8 });
+    const logScroll = await fire({ commandName: 'fight', options: { _sub: 'log', scroll: true }, userId: 'U1', channel: chanF8 });
+    const scrollAtt = logScroll.replies.flatMap(x => x.files || [])[0];
+    ok('/fight log scroll:true posts the last fight\'s recap as a parchment PDF, woven like a scroll',
+      /Last fight in this channel|Last practice bout/.test(saidOf(logPlain)) && !!scrollAtt && /^fight-.*\.pdf$/.test(scrollAtt?.b?.name || '') && /^%PDF-1\.4/.test(scrollAtt.a.toString('latin1', 0, 8)) && scrollAtt.a.indexOf('DDICESCROLLv1') > 0 && /on parchment/.test(saidOf(logScroll)),
+      `plain ${saidOf(logPlain).slice(0, 40)} · att ${scrollAtt?.b?.name} · ${saidOf(logScroll).slice(0, 60)}`);
+    // 7 · dice of the week in the chronicle, from the dated d20 ledger
+    const diceRows = dbHandle.prepare("SELECT COUNT(*) AS c FROM week_dice WHERE guild_id='G1' AND user_id='U2' AND nat=1").get().c;
+    dbHandle.prepare("UPDATE guild_config SET week_tale_at=0 WHERE guild_id='G1'").run();
+    const updForumC = dbHandle.prepare("SELECT updates_forum FROM guild_config WHERE guild_id='G1'").get()?.updates_forum;
+    for (const t of ticks) { try { await t.fn(); } catch {} }
+    const talesC = threads.filter(t => t.parentId === updForumC && / · Weekly chronicle$/.test(t.name));
+    const taleTextC = talesC.length ? sent.filter(x => x.channel === talesC[talesC.length - 1].id).map(x => x.content).join('\n') : '';
+    ok('the chronicle carries the dice of the week: the natural 1s and who rolled them, the biggest total',
+      diceRows >= 1 && /Dice of the week/.test(taleTextC) && /natural 1s: .*\*\*userU2\*\*/.test(taleTextC) && /biggest d20 total: \*\*\d+\*\* by \*\*user/.test(taleTextC),
+      `nat1 rows ${diceRows} · ${taleTextC.replace(/\s+/g, ' ').slice(taleTextC.indexOf('Dice of the week'), taleTextC.indexOf('Dice of the week') + 200)}`);
+    // 8 · the prune: ninety-day-old /rp ownership goes, fresh stays; a once-only press is a rule and stays however old
+    dbHandle.prepare("INSERT OR REPLACE INTO rp_lines (guild_id, message_id, channel_id, user_id, at) VALUES ('G1', 'OLDRP', 'C1', 'U1', ?)").run(Date.now() - 100 * 86400000);
+    dbHandle.prepare("INSERT OR REPLACE INTO rp_lines (guild_id, message_id, channel_id, user_id, at) VALUES ('G1', 'NEWRP', 'C1', 'U1', ?)").run(Date.now());
+    dbHandle.prepare("INSERT OR REPLACE INTO button_presses (guild_id, message_id, user_id, at) VALUES ('G1', 'OLD1', 'U1', ?)").run(Date.now() - 100 * 86400000);
+    const runR = await fire({ commandName: 'gm', options: { _group: 'check', _sub: 'run' }, userId: 'U1' }).catch(() => ({ replies: [] }));
+    const prunedOk = !dbHandle.prepare("SELECT 1 FROM rp_lines WHERE guild_id='G1' AND message_id='OLDRP'").get() && !!dbHandle.prepare("SELECT 1 FROM rp_lines WHERE guild_id='G1' AND message_id='NEWRP'").get()
+      && !!dbHandle.prepare("SELECT 1 FROM button_presses WHERE guild_id='G1' AND message_id='OLD1'").get() && /Ledgers trimmed/.test(saidOf(runR));
+    ok('the prune takes ninety-day-old /rp ownership and keeps the fresh; a once-only press stays however old; the setup run says what went', prunedOk,
+      `old rp gone ${!dbHandle.prepare("SELECT 1 FROM rp_lines WHERE guild_id='G1' AND message_id='OLDRP'").get()} · new kept ${!!dbHandle.prepare("SELECT 1 FROM rp_lines WHERE guild_id='G1' AND message_id='NEWRP'").get()} · press kept ${!!dbHandle.prepare("SELECT 1 FROM button_presses WHERE guild_id='G1' AND message_id='OLD1'").get()} · ${saidOf(runR).replace(/\s+/g, ' ').slice(0, 80)}`);
+    // 9 · /existence: the three leaves work there; /gm answers with the new address
+    dbHandle.prepare("UPDATE characters SET hp_current=2, died_at=NULL WHERE guild_id='G1' AND user_id=?").run(P4);
+    const healX = await fire({ commandName: 'existence', options: { _sub: 'heal', user: P4 }, userId: 'U1' });
+    const hpX = dbHandle.prepare("SELECT hp_current FROM characters WHERE guild_id='G1' AND user_id=?").get(P4)?.hp_current;
+    const killAsk = await fire({ commandName: 'existence', options: { _sub: 'kill', user: P4, anyway: true }, userId: 'U1' });
+    const killX = modalOf(killAsk) ? await fire({ isModal: true, customId: modalOf(killAsk), fields: { cause: 'the probe', quote: '' }, userId: 'U1' }) : killAsk;
+    const deadX = !!dbHandle.prepare("SELECT died_at FROM characters WHERE guild_id='G1' AND user_id=?").get(P4)?.died_at;
+    const reviveX = await fire({ commandName: 'existence', options: { _sub: 'revive', user: P4 }, userId: 'U1' });
+    const aliveX = !dbHandle.prepare("SELECT died_at FROM characters WHERE guild_id='G1' AND user_id=?").get(P4)?.died_at;
+    // The /gm stubs that answered with the new address went with the same
+    // update (2026-10-20): /gm heal is simply no leaf now.
+    const oldX = await fire({ commandName: 'gm', options: { _sub: 'heal', user: P4 }, userId: 'U1' });
+    ok('/existence heal, kill and revive do what /gm\'s did; /gm no longer carries the three',
+      hpX > 2 && !/❌/.test(saidOf(healX)) && deadX && aliveX && !/has moved/.test(saidOf(oldX)),
+      `heal ${hpX} ${saidOf(healX).slice(0, 40)} · dead ${deadX} ${saidOf(killX).slice(0, 30)} · alive ${aliveX} ${saidOf(reviveX).slice(0, 30)} · old ${saidOf(oldX).slice(0, 60)}`);
+    const threwC = loggedC.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
+    console.error = realErrC;
+    ok('nothing in the C walk threw', threwC.length === 0, threwC.slice(0, 3).join('\n        '));
+  }
+
+  // ── Build D (2026-10-20): scripts kept, the parser's report, drafts and
+  // publishing, the map, practice with a forced die, flags and forks,
+  // cooldowns and once, party runs, the writer, the shelf, the board,
+  // NPC mentions and the Interact and Talk buttons, undo cover ─────────
+  if (dbHandle) {
+    const realErrD = console.error; const loggedD = [];
+    console.error = (...a) => { loggedD.push(a.map(x => (x && x.stack) ? x.stack.split('\n').slice(0, 2).join(' | ') : String(x)).join(' ')); };
+    const idsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+    const saidOf = (r) => r.replies.map(x => x.content || '').join(' ');
+    const modalOf = (r) => r.replies.find(x => x.modal)?.modal || null;
+    const modalFieldsOf = (r) => r.replies.find(x => x.modal)?.modalFields || {};
+    const realRandomD = Math.random, realTimeoutD = globalThis.setTimeout;
+    globalThis.setTimeout = (fn) => { try { fn(); } catch {} return { unref() {} }; };
+    const P2 = '100000000000000002';
+    const seed = (uid) => dbHandle.prepare(`INSERT OR REPLACE INTO characters (guild_id, user_id, str, con, dex, wis, lck, hp_current, rerolls_current, merits) VALUES ('G1', ?, 3, 3, 3, 3, 3, 7, 3, 0)`).run(uid);
+    seed('U1'); seed('U2'); seed(P2);
+    dbHandle.prepare("DELETE FROM story_runs WHERE guild_id='G1'").run();
+    dbHandle.prepare("DELETE FROM stories WHERE guild_id='G1'").run();
+    dbHandle.prepare("DELETE FROM story_scenes WHERE guild_id='G1'").run();
+    const lastIn = (cid) => sent.filter(x => x.channel === cid).slice(-1)[0]?.msg;
+    const sinceIn = (cid, n) => sent.slice(n).filter(x => x.channel === cid).map(x => x.msg);
+    const merits = (uid) => dbHandle.prepare("SELECT merits FROM characters WHERE guild_id='G1' AND user_id=?").get(uid)?.merits ?? 0;
+    const story = (name) => dbHandle.prepare("SELECT * FROM stories WHERE guild_id='G1' AND name=? COLLATE NOCASE").get(name);
+    const scenesOf = (name) => dbHandle.prepare("SELECT * FROM story_scenes WHERE guild_id='G1' AND story=? COLLATE NOCASE ORDER BY ord").all(name);
+    const logs = (name, kind) => dbHandle.prepare("SELECT * FROM story_run_log WHERE guild_id='G1' AND story=? COLLATE NOCASE AND kind=?").all(name, kind);
+    // A roll with rerolls in hand waits on Reroll / Carry on; this presses on.
+    const settle = async () => { for (let i = 0; i < 60; i++) await new Promise(r => setImmediate(r)); };
+    const carryOn = async (r, uid = 'U1') => { const go = r.replies.flatMap(x => idsOf(x)).find(id => id.startsWith('storygo:')); return go ? fire({ isButton: true, customId: go, message: { id: nextId(), content: '', edit: async () => {} }, userId: uid }) : null; };
+
+    // 1 · a broken script is kept as a draft, every problem named with its line
+    const broken = ['[ACTIVITY] Ford', 'SCENE bank', 'SAY The river.', 'ROLL str DC', '  PASSS -> far', '  FAIL -> bnk', 'SCENE far', 'SAY Across.', 'END merits:1'].join('\n');
+    const r1 = await fire({ isModal: true, customId: 'activitycreate', fields: { script: broken }, userId: 'U1' });
+    const st1 = story('Ford');
+    ok('a script with problems is kept as a draft, every problem on its line, a typo noted',
+      /kept as a draft/.test(saidOf(r1)) && /line 4:/.test(saidOf(r1)) && /line 2:[^\n]*bnk[^\n]*Did you mean `bank`/.test(saidOf(r1)) && !!st1?.draft_problems && !st1?.source,
+      saidOf(r1).slice(0, 300));
+    const runDraft = await fire({ commandName: 'activity', options: { _sub: 'run', name: 'Ford' }, userId: 'U1' });
+    ok('a draft cannot be run', /still a draft/.test(saidOf(runDraft)), saidOf(runDraft).slice(0, 120));
+    // 2 · fixed in the whole-script box: it goes live, rows and source agree, the typo note is gone
+    const key1 = require('crypto').createHash('sha1').update('ford').digest('hex').slice(0, 10);
+    const good = ['[ACTIVITY] Ford', '# the ford', 'SCENE bank', 'SAY The river runs fast.', 'ROLL str|wis DC12', '  PASS You wade across. -> far', '  FAIL The current wins. -> bank', '', 'SCENE far', 'SAY Across, dripping.', 'CHOICE', '  Rest -> done', '  Press on -> done', '', 'SCENE done', 'SAY Dry at last.', 'END merits:1'].join('\n');
+    const r2 = await fire({ isModal: true, customId: `actvall:${key1}`, fields: { script: good }, userId: 'U1' });
+    const st2 = story('Ford');
+    ok('the whole-script box publishes a good script: rows, source kept verbatim, draft cleared',
+      /saved — \*\*3\*\* scenes/.test(saidOf(r2)) && st2?.source === good && !st2.draft_source && scenesOf('Ford').length === 3 && !scenesOf('.draft.Ford').length,
+      `${saidOf(r2).slice(0, 100)} · src ${st2?.source === good} · draft ${!!st2?.draft_source}`);
+    // 3 · the map, and the script as files
+    const show = await fire({ commandName: 'activity', options: { _sub: 'show', name: 'Ford', script: true }, userId: 'U1' });
+    const showFiles = show.replies.flatMap(x => x.files || []);
+    ok('/activity show draws the map with its branches and the odds for this table; script:true attaches the text and the parchment',
+      /├─ pass → `far`/.test(saidOf(show)) && /└─ fail → `bank` ↺/.test(saidOf(show)) && /sheets? pass on an average roll/.test(saidOf(show)) && showFiles.length >= 2 && /```/.test(saidOf(show)),
+      `${saidOf(show).slice(0, 200)} · files ${showFiles.length}`);
+    // 4 · a run: the card, where-am-I, a forced-pass roll, a pick, the ending paid and logged
+    let before = sent.length;
+    const run1 = await fire({ commandName: 'activity', options: { _sub: 'run', name: 'Ford' }, userId: 'U1' });
+    const card1 = sinceIn('C1', before).find(m => idsOf(m).some(id => id.startsWith('storyroll:')));
+    ok('the run begins with a card of roll buttons', /begins for <@U1>/.test(saidOf(run1)) && !!card1, saidOf(run1).slice(0, 80));
+    before = sent.length;
+    const again = await fire({ commandName: 'activity', options: { _sub: 'run', name: 'Ford' }, userId: 'U1' });
+    ok('/activity run while mid-run shows where you are instead of refusing', /mid-way through \*\*Ford\*\*/.test(saidOf(again)) && sinceIn('C1', before).some(m => idsOf(m).some(id => id.startsWith('storyroll:'))), saidOf(again).slice(0, 100));
+    Math.random = () => 0.95;   // a high die: the pass branch
+    before = sent.length;
+    const roll1 = await fire({ isButton: true, customId: idsOf(card1).find(id => id.startsWith('storyroll:')), message: card1, userId: 'U1' });
+    ok('a roll with rerolls in hand offers Reroll and Carry on', roll1.replies.some(x => idsOf(x).some(id => id.startsWith('storyrr:'))) && roll1.replies.some(x => idsOf(x).some(id => id.startsWith('storygo:'))), JSON.stringify(roll1.replies.map(idsOf)));
+    await carryOn(roll1);
+    const pickCard = sinceIn('C1', before).find(m => idsOf(m).some(id => id.startsWith('storypick:')));
+    ok('a pass lands on the next scene with its choice buttons', /vs DC 12/.test(saidOf(roll1)) && !!pickCard, saidOf(roll1).slice(0, 120));
+    const m0 = merits('U1');
+    before = sent.length;
+    const pick1 = await fire({ isButton: true, customId: idsOf(pickCard)[0], message: pickCard, userId: 'U1' });
+    const ending = sinceIn('C1', before).map(m => m.content).join(' ');
+    ok('the ending pays its merits and the run is logged start → roll → pick → end',
+      merits('U1') === m0 + 1 && /1 merit/.test(ending) && logs('Ford', 'start').length >= 1 && logs('Ford', 'roll').length >= 1 && logs('Ford', 'pick').length >= 1 && logs('Ford', 'end').length === 1,
+      `merits ${m0}→${merits('U1')} · ${ending.slice(0, 80)} · logs ${['start', 'roll', 'pick', 'end'].map(k => logs('Ford', k).length).join('/')}`);
+    // 5 · undo brings the merits and the run back
+    const undo1 = await fire({ commandName: 'gm', options: { _sub: 'undo' }, userId: 'U1' });
+    ok('/gm undo rewinds an activity ending: the merits go back and the run stands on its last scene',
+      merits('U1') === m0 && !!dbHandle.prepare("SELECT 1 FROM story_runs WHERE guild_id='G1' AND channel_id='C1' AND user_id='U1'").get(), `${saidOf(undo1).slice(0, 100)} · merits ${merits('U1')}`);
+    dbHandle.prepare("DELETE FROM story_runs WHERE guild_id='G1'").run();
+    // 6 · scores, after a finish
+    const scores = await fire({ commandName: 'activity', options: { _sub: 'scores', name: 'Ford' }, userId: 'U1' });
+    ok('/activity scores reads the ledger', /finish/.test(saidOf(scores)) || /best/.test(saidOf(scores)), saidOf(scores).slice(0, 100));
+    // 7 · flags, a fork, a title, once, a cooldown
+    const flagged = ['[ACTIVITY] Lantern', 'ONCE per day', 'SCENE door', 'SAY Two ways in.', 'CHOICE', '  Take the torch -> lit', '  Go dark -> dark', '', 'SCENE lit', 'SAY Light.', 'SET torch', 'NEXT adv', 'CHOICE', '  On -> hall', '',
+      'SCENE dark', 'SAY Dark.', 'CHOICE', '  On -> hall', '', 'SCENE hall', 'IF torch -> seen', 'IF not torch -> unseen', '', 'SCENE seen', 'SAY You see the mural.', 'ROLL wis DC10', '  PASS -> win', '  FAIL -> win', '', 'SCENE unseen', 'SAY Nothing.', 'END', '', 'SCENE win', 'SAY Lit.', 'END merits:2 title:Lamplighter once'].join('\n');
+    const r7 = await fire({ isModal: true, customId: 'activitycreate', fields: { script: flagged }, userId: 'U1' });
+    ok('flags, IF, NEXT, a title grant, once and a cooldown all parse and publish', /saved — \*\*7\*\* scenes/.test(saidOf(r7)) && story('Lantern')?.cooldown === 'day', saidOf(r7).slice(0, 200));
+    before = sent.length;
+    await fire({ commandName: 'activity', options: { _sub: 'run', name: 'Lantern' }, userId: 'U1' });
+    let cardL = sinceIn('C1', before).find(m => idsOf(m).some(id => id.startsWith('storypick:')));
+    before = sent.length;
+    await fire({ isButton: true, customId: idsOf(cardL)[0], message: cardL, userId: 'U1' });   // the torch
+    cardL = sinceIn('C1', before).find(m => idsOf(m).some(id => id.startsWith('storypick:')));
+    before = sent.length;
+    await fire({ isButton: true, customId: idsOf(cardL)[0], message: cardL, userId: 'U1' });   // on → hall routes to seen
+    const seenCard = sinceIn('C1', before).find(m => idsOf(m).some(id => id.startsWith('storyroll:')));
+    ok('an IF routes on the flag set two scenes back, and the tilt from NEXT adv is announced on the roll', !!seenCard && /With advantage/.test(seenCard?.content || ''), (seenCard?.content || sinceIn('C1', before).map(m => m.content).join(' | ')).slice(0, 160));
+    before = sent.length;
+    const mL = merits('U1');
+    await carryOn(await fire({ isButton: true, customId: idsOf(seenCard).find(id => id.startsWith('storyroll:')), message: seenCard, userId: 'U1' }));
+    const endL = sinceIn('C1', before).map(m => m.content).join(' ');
+    const titled = !!dbHandle.prepare("SELECT 1 FROM subject_titles WHERE guild_id='G1' AND subject_id='U1' AND title='Lamplighter'").get();
+    ok('the ending grants the title and the merits', titled && merits('U1') === mL + 2 && /Lamplighter/.test(endL), `${endL.slice(0, 120)} · titled ${titled}`);
+    const cool = await fire({ commandName: 'activity', options: { _sub: 'run', name: 'Lantern' }, userId: 'U1' });
+    ok('ONCE per day refuses a second start with the time left', /once per day/.test(saidOf(cool)) && /can go again in/.test(saidOf(cool)), saidOf(cool).slice(0, 120));
+    dbHandle.prepare("DELETE FROM story_run_log WHERE guild_id='G1' AND story='Lantern'").run();
+    before = sent.length;
+    await fire({ commandName: 'activity', options: { _sub: 'run', name: 'Lantern' }, userId: 'U1' });
+    cardL = sinceIn('C1', before).find(m => idsOf(m).some(id => id.startsWith('storypick:')));
+    before = sent.length;
+    await fire({ isButton: true, customId: idsOf(cardL)[0], message: cardL, userId: 'U1' });
+    cardL = sinceIn('C1', before).find(m => idsOf(m).some(id => id.startsWith('storypick:')));
+    before = sent.length;
+    await fire({ isButton: true, customId: idsOf(cardL)[0], message: cardL, userId: 'U1' });
+    const seen2 = sinceIn('C1', before).find(m => idsOf(m).some(id => id.startsWith('storyroll:')));
+    before = sent.length;
+    const mL2 = merits('U1');
+    await carryOn(await fire({ isButton: true, customId: idsOf(seen2).find(id => id.startsWith('storyroll:')), message: seen2, userId: 'U1' }));
+    const endL2 = sinceIn('C1', before).map(m => m.content).join(' ');
+    ok('END once pays only the first time', merits('U1') === mL2 && /finished this before/.test(endL2), `${endL2.slice(0, 120)} · merits ${mL2}→${merits('U1')}`);
+    // 8 · editing one scene in its box; an edit while someone is mid-run waits as a draft; publish after they stop
+    before = sent.length;
+    await fire({ commandName: 'activity', options: { _sub: 'run', name: 'Ford' }, userId: 'U2' });
+    const editAsk = await fire({ commandName: 'activity', options: { _sub: 'edit', name: 'Ford', scene: 'far' }, userId: 'U1' });
+    ok('the scene box opens prefilled with that block alone', modalOf(editAsk) === `actvedit:${key1}:far` && /^SCENE far\nSAY Across, dripping\./.test(modalFieldsOf(editAsk).script || '') && !/SCENE bank/.test(modalFieldsOf(editAsk).script || ''), JSON.stringify(modalFieldsOf(editAsk)).slice(0, 160));
+    const edited = await fire({ isModal: true, customId: `actvedit:${key1}:far`, fields: { script: 'SCENE far\nSAY Across, soaked to the skin.\nCHOICE\n  Rest -> done\n  Press on -> done' }, userId: 'U1' });
+    const st8 = story('Ford');
+    ok('with a player mid-run the edit waits as a draft, the live script untouched, a Publish button offered',
+      /held as a draft/.test(saidOf(edited)) && st8.source === good && /soaked to the skin/.test(st8.draft_source || '') && scenesOf('.draft.Ford').length === 3 && edited.replies.some(x => idsOf(x).includes(`actv:publish:${key1}`)),
+      saidOf(edited).slice(0, 160));
+    const pubRefused = await fire({ isButton: true, customId: `actv:publish:${key1}`, message: { id: 'MP', content: '' }, userId: 'U1' });
+    ok('Publish refuses while a run is live', /mid-way through/.test(saidOf(pubRefused)), saidOf(pubRefused).slice(0, 120));
+    await fire({ commandName: 'activity', options: { _sub: 'stop' }, userId: 'U2' });
+    const pubOk = await fire({ isButton: true, customId: `actv:publish:${key1}`, message: { id: 'MP', content: '' }, userId: 'U1' });
+    const st8b = story('Ford');
+    ok('Publish puts the draft live once the run has stopped; the old script is kept for Revert',
+      /published/.test(saidOf(pubOk)) && /soaked to the skin/.test(st8b.source) && st8b.prev_source === good && !st8b.draft_source && scenesOf('Ford').some(s => /soaked/.test(s.say)),
+      saidOf(pubOk).slice(0, 120));
+    const rev = await fire({ commandName: 'activity', options: { _sub: 'revert', name: 'Ford' }, userId: 'U1' });
+    ok('Revert swaps the two', /back on its earlier version/.test(saidOf(rev)) && story('Ford').source === good, saidOf(rev).slice(0, 100));
+    // 9 · /activity set edits the script, not the rows
+    const set9 = await fire({ commandName: 'activity', options: { _sub: 'set', name: 'Ford', scene: 'bank', field: 'dc', value: '14' }, userId: 'U1' });
+    ok('/activity set rewrites the scene in the script and republishes', /updated/.test(saidOf(set9)) && /ROLL str\|wis DC14/.test(story('Ford').source) && scenesOf('Ford')[0].dc === 14, `${saidOf(set9).slice(0, 80)} · ${story('Ford').source.split('\n').find(l => /ROLL/.test(l))}`);
+    // 10 · practice: nothing paid, the die forced
+    before = sent.length;
+    const prac = await fire({ commandName: 'activity', options: { _sub: 'practice', name: 'Ford' }, userId: 'U1' });
+    const pracCard = sinceIn('C1', before).find(m => idsOf(m).some(id => id.startsWith('storyforce:')));
+    ok('practice offers force buttons on a roll', /Practice/.test(saidOf(prac)) && !!pracCard && idsOf(pracCard).some(id => /:nat20$/.test(id)), saidOf(prac).slice(0, 80));
+    const rollsBefore = logs('Ford', 'roll').length;
+    before = sent.length;
+    const forced = await fire({ isButton: true, customId: idsOf(pracCard).find(id => /:nat20$/.test(id)), message: pracCard, userId: 'U1' });
+    ok('a forced natural twenty is marked as practice, shows as a crit, and never reaches the ledger', /forced — practice/.test(saidOf(forced)) && /🟡 \*\*23\*\*/.test(saidOf(forced)) && logs('Ford', 'roll').length === rollsBefore, saidOf(forced).slice(0, 120));
+    await fire({ commandName: 'activity', options: { _sub: 'stop' }, userId: 'U1' });
+    // 11 · a party run: turns, the shared tally, everyone paid
+    before = sent.length;
+    const party = await fire({ commandName: 'activity', options: { _sub: 'run', name: 'Ford', party: `<@${P2}>` }, userId: 'U1' });
+    const pCard = sinceIn('C1', before).find(m => idsOf(m).some(id => id.startsWith('storyroll:party:')));
+    ok('a party run begins with everyone named and the first turn called', /begins for the party/.test(saidOf(party)) && !!pCard && /<@U1> — your turn/.test(pCard?.content || ''), saidOf(party).slice(0, 120));
+    const wrongTurn = await fire({ isButton: true, customId: idsOf(pCard).find(id => id.startsWith('storyroll:')), message: pCard, userId: P2 });
+    ok('out of turn is refused by name', /It is <@U1>'s turn/.test(saidOf(wrongTurn)), saidOf(wrongTurn).slice(0, 80));
+    Math.random = () => 0.95;
+    before = sent.length;
+    await carryOn(await fire({ isButton: true, customId: idsOf(pCard).find(id => id.startsWith('storyroll:')), message: pCard, userId: 'U1' }));
+    const pPick = sinceIn('C1', before).find(m => idsOf(m).some(id => id.startsWith('storypick:party:')));
+    ok('after a press the turn passes', !!pPick && /<@100000000000000002> — your turn/.test(pPick?.content || ''), (pPick?.content || '').slice(-80));
+    const mU1 = merits('U1'), mP2 = merits(P2);
+    before = sent.length;
+    await fire({ isButton: true, customId: idsOf(pPick)[0], message: pPick, userId: P2 });
+    ok('a party ending pays every member', merits('U1') === mU1 + 1 && merits(P2) === mP2 + 1, `${mU1}→${merits('U1')} · ${mP2}→${merits(P2)}`);
+    // 12 · copy, rename, export, grammar, list
+    const cp = await fire({ commandName: 'activity', options: { _sub: 'copy', name: 'Ford', as: 'Ford Two' }, userId: 'U1' });
+    ok('/activity copy makes a held draft under the new name', /Copied/.test(saidOf(cp)) && /held back as a draft/.test(saidOf(cp)) && !!story('Ford Two')?.draft_source && scenesOf('.draft.Ford Two').length === 3, saidOf(cp).slice(0, 120));
+    const rn = await fire({ commandName: 'activity', options: { _sub: 'rename', name: 'Ford Two', to: 'Crossing' }, userId: 'U1' });
+    ok('/activity rename carries the draft and its header', /is now \*\*Crossing\*\*/.test(saidOf(rn)) && !story('Ford Two') && /^\[ACTIVITY\] Crossing/.test(story('Crossing')?.draft_source || ''), saidOf(rn).slice(0, 80));
+    const ex = await fire({ commandName: 'activity', options: { _sub: 'export', name: 'Ford' }, userId: 'U1' });
+    ok('/activity export hands over the text and the parchment', ex.replies.flatMap(x => x.files || []).length >= 2, JSON.stringify(ex.replies).slice(0, 120));
+    const gr = await fire({ commandName: 'activity', options: { _sub: 'grammar', topic: 'flags' }, userId: 'U1' });
+    ok('/activity grammar reads a topic', /SET torch/.test(saidOf(gr)) && /RANDOM/.test(saidOf(gr)), saidOf(gr).slice(0, 80));
+    const ls = await fire({ commandName: 'activity', options: { _sub: 'list' }, userId: 'U1' });
+    ok('/activity list shows each one\'s state to a GM', /\*\*Ford\*\*[^\n]*live/.test(saidOf(ls)) && /\*\*Crossing\*\*[^\n]*draft/.test(saidOf(ls)), saidOf(ls).slice(0, 200));
+    // 13 · the writer: scene by scene, the next scene offered, finish saves
+    const w1 = await fire({ commandName: 'activity', options: { _sub: 'write', name: 'Gate' }, userId: 'U1' });
+    ok('/activity write opens the scene box for `start`', modalOf(w1) === 'actvw' && modalFieldsOf(w1).scene === 'start', JSON.stringify(modalFieldsOf(w1)).slice(0, 100));
+    const w2 = await fire({ isModal: true, customId: 'actvw', fields: { scene: 'start', say: 'A gate.', ask: 'choice', outcomes: 'Knock -> open\nLeave -> gone', extras: '' }, userId: 'U1' });
+    ok('a written scene names the scenes it points at but lacks', /scene `start` written/.test(saidOf(w2)) && /Next: `open`, `gone`/.test(saidOf(w2)) && w2.replies.some(x => idsOf(x).includes('actvw:next:open')), saidOf(w2).slice(0, 160));
+    const w3 = await fire({ isButton: true, customId: 'actvw:next:open', message: { id: 'MW', content: '' }, userId: 'U1' });
+    ok('Write open opens the box for that scene', modalOf(w3) === 'actvw' && modalFieldsOf(w3).scene === 'open', JSON.stringify(modalFieldsOf(w3)).slice(0, 80));
+    await fire({ isModal: true, customId: 'actvw', fields: { scene: 'open', say: 'It opens.', ask: 'end', outcomes: '', extras: 'END merits:1' }, userId: 'U1' });
+    const w4 = await fire({ isModal: true, customId: 'actvw', fields: { scene: 'gone', say: 'You leave.', ask: 'end', outcomes: '', extras: '' }, userId: 'U1' });
+    ok('with every arrow resolved the writer offers Finish', /Every arrow resolves/.test(saidOf(w4)), saidOf(w4).slice(0, 120));
+    const w5 = await fire({ isButton: true, customId: 'actvw:done', message: { id: 'MW', content: '' }, userId: 'U1' });
+    ok('Finish composes the script and publishes it', /\*\*Gate\*\* saved — \*\*3\*\* scenes/.test(saidOf(w5)) && /^\[ACTIVITY\] Gate/.test(story('Gate')?.source || '') && !dbHandle.prepare("SELECT 1 FROM activity_drafts WHERE guild_id='G1' AND user_id='U1'").get(), saidOf(w5).slice(0, 120));
+    // 14 · the shelf: a forum, a thread per activity with card, blocks, file; the demos; a GM's post in the thread resubmits
+    const shelf = new FakeChannel(nextId(), 15, 'activity-shelf', guild); channelsById.set(shelf.id, shelf);
+    const cfgShelf = await fire({ commandName: 'config', options: { _group: 'channels', _sub: 'activityshelf', channel: shelf }, userId: 'U1' });
+    const pageFord = dbHandle.prepare("SELECT * FROM activity_pages WHERE guild_id='G1' AND name='Ford'").get();
+    const fordThread = pageFord ? channelsById.get(pageFord.thread_id) : null;
+    const fordMsgs = fordThread ? sent.filter(x => x.channel === fordThread.id).map(x => x.msg) : [];
+    const head = fordMsgs.find(m => idsOf(m).includes(`actv:edit:${key1}`));
+    ok('the shelf writes a thread per activity: the card with its buttons, the script in code blocks, the parchment',
+      /The shelf is/.test(saidOf(cfgShelf)) && !!head && fordMsgs.some(m => /^```\n\[ACTIVITY\] Ford/.test(m.content)) && fordMsgs.some(m => /as a file, and on parchment/.test(m.content)) && /live/.test(head?.content || '') && /pass on an average roll/.test(head?.content || ''),
+      `${saidOf(cfgShelf).slice(0, 80)} · head ${!!head} · msgs ${fordMsgs.length}`);
+    const demoPage = dbHandle.prepare("SELECT * FROM activity_pages WHERE guild_id='G1' AND name='demo:trial'").get();
+    ok('the demos sit on the shelf read-only, the tutorial among them', !!demoPage && (sent.filter(x => x.channel === demoPage.thread_id).some(x => /Scribe's Trial/.test(x.content))), JSON.stringify(demoPage).slice(0, 80));
+    const mkIn = (ch, text, uid = 'U1') => ({ id: nextId(), content: text, author: { id: uid, bot: false }, guild, channel: ch, channelId: ch.id, member: { id: uid, roles: { cache: new Map() }, permissions: { has: () => true } }, attachments: { size: 0, first: () => null }, client,
+      reply: async (p) => { replies.push(norm(p)); return { id: nextId() }; } });
+    replies.length = 0;
+    for (const fn of listeners.messageCreate || []) await fn(mkIn(fordThread, '```\n' + good.replace('Dry at last.', 'Dry, and home.') + '\n```'));
+    await settle();
+    ok('a GM\'s script posted in the thread replaces the activity', /\*\*Ford\*\* updated/.test(replies.map(x => x.content || '').join(' ')) && /Dry, and home/.test(story('Ford').source), replies.map(x => x.content || '').join(' ').slice(0, 120));
+    const pageFord2 = dbHandle.prepare("SELECT * FROM activity_pages WHERE guild_id='G1' AND name='Ford'").get();
+    const headAfter = sentById.get(pageFord2?.head_id);
+    ok('the card redraws after a save', pageFord2?.thread_id === pageFord.thread_id && /live/.test(headAfter?.content || '') && idsOf(headAfter).includes(`actv:practice:${key1}`) && /published <t:/.test(headAfter?.content || ''), `${JSON.stringify(pageFord2)} · ${(headAfter?.content || '').slice(0, 80)} · ${JSON.stringify(idsOf(headAfter))}`);
+    const editBtn = await fire({ isButton: true, customId: `actv:edit:${key1}`, message: head, userId: 'U1' });
+    ok('Edit scene on the card asks which scene', editBtn.replies.some(x => idsOf(x).includes(`actvscene:${key1}`)), JSON.stringify(editBtn.replies).slice(0, 120));
+    const pickScene = await fire({ isSelect: true, customId: `actvscene:${key1}`, values: ['done'], message: { id: 'MS', content: '' }, userId: 'U1' });
+    ok('a picked scene opens its box', modalOf(pickScene) === `actvedit:${key1}:done` && /^SCENE done/.test(modalFieldsOf(pickScene).script || ''), JSON.stringify(modalFieldsOf(pickScene)).slice(0, 80));
+    const retire = await fire({ isButton: true, customId: `actv:retire:${key1}`, message: head, userId: 'U1' });
+    ok('Retire takes it off the board and refuses runs', /retired/.test(saidOf(retire)) && story('Ford').retired === 1 && /has been retired/.test(saidOf(await fire({ commandName: 'activity', options: { _sub: 'run', name: 'Ford' }, userId: 'U2' }))), saidOf(retire).slice(0, 80));
+    await fire({ isButton: true, customId: `actv:restore:${key1}`, message: head, userId: 'U1' });
+    ok('Restore brings it back', story('Ford').retired === 0);
+    // 15 · the board: a pinned message with Play buttons; a plain player is gated by the server's setting
+    const boardCh = new FakeChannel(nextId(), 0, 'games', guild); channelsById.set(boardCh.id, boardCh);
+    const cfgBoard = await fire({ commandName: 'config', options: { _group: 'channels', _sub: 'activityboard', channel: boardCh }, userId: 'U1' });
+    const boardMsg = sent.filter(x => x.channel === boardCh.id).map(x => x.msg).find(m => idsOf(m).some(id => id.startsWith('actv:play:')));
+    ok('the board is pinned with a Play button per live activity', /pinned/.test(saidOf(cfgBoard)) && !!boardMsg && boardMsg.pinned && idsOf(boardMsg).includes(`actv:play:${key1}`), saidOf(cfgBoard).slice(0, 80));
+    const realFetchD = guild.members.fetch;
+    const plainD = 'U7';
+    guild.members.fetch = async (uid) => { const mb = await realFetchD(uid); if (uid === plainD) { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+    seed(plainD);
+    dbHandle.prepare("UPDATE guild_config SET activity_players=0 WHERE guild_id='G1'").run();
+    const playNo = await fire({ isButton: true, customId: `actv:play:${key1}`, message: boardMsg, userId: plainD, member: { id: plainD, roles: { cache: new Map() }, permissions: { has: () => false } } });
+    dbHandle.prepare("UPDATE guild_config SET activity_players=1 WHERE guild_id='G1'").run();
+    before = sent.length;
+    const playYes = await fire({ isButton: true, customId: `actv:play:${key1}`, message: boardMsg, userId: plainD, member: { id: plainD, roles: { cache: new Map() }, permissions: { has: () => false } } });
+    ok('Play on the board follows the server\'s setting: refused while GM-led, a run once opened', /A GM starts activities/.test(saidOf(playNo)) && /begins for <@U7>/.test(saidOf(playYes)) && sinceIn('C1', before).some(m => idsOf(m).some(id => id.startsWith('storyroll:U7'))), `${saidOf(playNo).slice(0, 60)} · ${saidOf(playYes).slice(0, 60)}`);
+    await fire({ commandName: 'activity', options: { _sub: 'stop' }, userId: plainD });
+    // 16 · NPC lines: @Name resolves to a mention, only people may be pinged, the Interact button, Talk
+    guild.members.search = async ({ query }) => new Map(/^ald/i.test(query) ? [[P2, { id: P2, nickname: 'Aldric', displayName: 'Aldric', user: { id: P2, username: 'aldric', globalName: 'Aldric' } }]] : []);
+    await fire({ commandName: 'npc', options: { _sub: 'create', name: 'Dockmaster', str: 2 }, userId: 'U1' });
+    before = sent.length;
+    const say1 = await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', speech: 'Over here, @Aldric — and @everyone else wait.' }, userId: 'U1' });
+    const line1 = sinceIn('C1', before).find(m => m.webhookId);
+    ok('an NPC line turns @Name into a mention and pings people only, never everyone',
+      /Spoke as/.test(saidOf(say1)) && /<@100000000000000002>/.test(line1?.content || '') && (line1?.allowedMentions?.users || []).includes(P2) && (line1?.allowedMentions?.parse || []).length === 0 && /@everyone/.test(line1?.content || ''),
+      `${(line1?.content || '').slice(0, 80)} · ${JSON.stringify(line1?.allowedMentions)}`);
+    ok('every NPC line carries the Interact button', idsOf(line1).some(id => id.startsWith('npcx:')), JSON.stringify(idsOf(line1)));
+    const xGm = await fire({ isButton: true, customId: idsOf(line1).find(id => id.startsWith('npcx:')), message: line1, userId: 'U1' });
+    const xPl = await fire({ isButton: true, customId: idsOf(line1).find(id => id.startsWith('npcx:')), message: line1, userId: plainD, member: { id: plainD, roles: { cache: new Map() }, permissions: { has: () => false } } });
+    ok('Interact opens the speak-as box for a GM and the roleplay box for a player', modalOf(xGm) === 'npcsay:Dockmaster' && modalOf(xPl) === 'rpform', `${modalOf(xGm)} · ${modalOf(xPl)}`);
+    const boxFields = modalFieldsOf(xGm);
+    ok('the speak-as box is three labelled fields, the third a user picker called `to`', 'action' in boxFields && 'speech' in boxFields && 'to' in boxFields, JSON.stringify(Object.keys(boxFields)));
+    before = sent.length;
+    const picked = await fire({ isModal: true, customId: 'npcsay:Dockmaster', fields: { action: '', speech: 'The tide turns.' }, users: { to: [P2] }, userId: 'U1' });
+    const linePicked = sinceIn('C1', before).find(m => m.webhookId);
+    ok('a player picked in the box is mentioned first and pinged', /Posted as/.test(saidOf(picked)) && /^<@100000000000000002> "The tide turns\."/.test(linePicked?.content || '') && (linePicked?.allowedMentions?.users || []).includes(P2), `${saidOf(picked).slice(0, 40)} · ${(linePicked?.content || '').slice(0, 60)}`);
+    before = sent.length;
+    const say2 = await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', speech: 'Mind the ropes.', to: P2 }, userId: 'U1' });
+    const line2 = sinceIn('C1', before).find(m => m.webhookId);
+    ok('`to:` puts the mention first', /^<@100000000000000002> /.test(line2?.content || ''), (line2?.content || '').slice(0, 60));
+    const talkSet = await fire({ commandName: 'npc', options: { _sub: 'edit', name: 'Dockmaster', talk: 'Ford' }, userId: 'U1' });
+    before = sent.length;
+    await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', speech: 'Fancy the crossing?' }, userId: 'U1' });
+    const line3 = sinceIn('C1', before).find(m => m.webhookId);
+    const talkId = idsOf(line3).find(id => id.startsWith('npctalk:'));
+    before = sent.length;
+    const talked = await fire({ isButton: true, customId: talkId, message: line3, userId: plainD, member: { id: plainD, roles: { cache: new Map() }, permissions: { has: () => false } } });
+    ok('/npc edit talk: hangs an activity on the NPC; its Talk button starts it for whoever pressed', !/❌/.test(saidOf(talkSet)) && !!talkId && /begins for <@U7>/.test(saidOf(talked)), `${saidOf(talkSet).slice(0, 60)} · ${talkId} · ${saidOf(talked).slice(0, 60)}`);
+    await fire({ commandName: 'activity', options: { _sub: 'stop' }, userId: plainD });
+    guild.members.fetch = realFetchD; delete guild.members.search;
+    // 17 · DC by intent, and QUIZ FROM the bank
+    dbHandle.prepare("INSERT INTO quiz_questions (guild_id, category, tags, question, answers, difficulty, explain, author_id, created_at) VALUES ('G1','lore',NULL,'How many orders?','[{\"text\":\"8\",\"correct\":1},{\"text\":\"5\",\"correct\":0}]','normal',NULL,'U1',?)").run(Date.now());
+    dbHandle.prepare("INSERT INTO quiz_questions (guild_id, category, tags, question, answers, difficulty, explain, author_id, created_at) VALUES ('G1','lore',NULL,'Who crowned the king?','[{\"text\":\"the archivist\",\"correct\":1}]','normal',NULL,'U1',?)").run(Date.now());
+    const intent = ['[ACTIVITY] Archive', 'SCENE door', 'SAY A locked door.', 'ROLL wis DC easy', '  PASS -> bank', '  FAIL -> door', '', 'SCENE bank', 'SAY The archivist opens the book.', 'QUIZ FROM lore 2 -> done', '', 'SCENE done', 'SAY Done.', 'END'].join('\n');
+    const r17 = await fire({ isModal: true, customId: 'activitycreate', fields: { script: intent }, userId: 'U1' });
+    const archive = scenesOf('Archive');
+    const doorSc = archive.find(s => s.scene === 'door');
+    ok('ROLL wis DC easy is set from the table\'s sheets, and QUIZ FROM draws the bank into scenes',
+      /saved — \*\*5\*\* scenes/.test(saidOf(r17)) && doorSc?.dc === 14 && /"dcword":"easy"/.test(doorSc?.logic || '') && archive.filter(s => /^q\d+$/.test(s.scene)).length === 2 && JSON.parse(archive.find(s => s.scene === 'bank')?.choices || '[]')[0]?.label === 'Begin' && archive.some(s => s.ask === 1 && s.qid),
+      `${saidOf(r17).slice(0, 100)} · dc ${doorSc?.dc} · scenes ${archive.map(s => s.scene).join(',')}`);
+    const show17 = await fire({ commandName: 'activity', options: { _sub: 'show', name: 'Archive' }, userId: 'U1' });
+    ok('the map names the intent beside the DC', /DC 14 _\(easy\)_/.test(saidOf(show17)), saidOf(show17).slice(0, 160));
+    // 18 · the audit's guards (2026-10-20): chatter in a thread is not a script; a script may open on a fork;
+    //      Revert keeps a waiting draft; a routing scene's GAIN pays; demo rows stay off the board; a problem
+    //      reply is private; the reserved draft name is refused; a held draft stays held through an edit
+    replies.length = 0;
+    const srcBefore = story('Ford').source, draftBefore = story('Ford').draft_source;
+    for (const fn of listeners.messageCreate || []) await fn(mkIn(fordThread, 'looks good!'));
+    await settle();
+    ok('ordinary talk in a shelf thread is not read as a script', story('Ford').source === srcBefore && story('Ford').draft_source === draftBefore && !replies.some(x => /kept as a draft|updated/.test(x.content || '')), replies.map(x => x.content || '').join(' ').slice(0, 100));
+    const forked = ['[ACTIVITY] Fork', 'TALLY renown', 'SCENE start', 'GAIN renown 1', 'RANDOM -> left|right', '', 'SCENE left', 'SAY Left.', 'GAIN renown 1', 'IF tally>=2 -> done', '', 'SCENE right', 'SAY Right.', 'GAIN renown 1', 'IF tally>=2 -> done', '', 'SCENE done', 'SAY Out.', 'END TALLY'].join('\n');
+    const rF = await fire({ isModal: true, customId: 'activitycreate', fields: { script: forked }, userId: 'U1' });
+    before = sent.length;
+    const runF = await fire({ commandName: 'activity', options: { _sub: 'run', name: 'Fork' }, userId: 'U1' });
+    const endF = sinceIn('C1', before).map(m => m.content).join(' ');
+    ok('a script that opens on a fork runs its logic from the first scene, and a routing scene\'s GAIN is paid', /saved/.test(saidOf(rF)) && /begins/.test(saidOf(runF)) && /\*\*\+2\*\*/.test(endF) && !dbHandle.prepare("SELECT 1 FROM story_runs WHERE guild_id='G1' AND channel_id='C1' AND user_id='U1'").get(), `${saidOf(rF).slice(0, 60)} · ${endF.slice(0, 120)}`);
+    await fire({ commandName: 'activity', options: { _sub: 'run', name: 'Ford' }, userId: 'U2' });
+    await fire({ isModal: true, customId: `actvedit:${key1}:far`, fields: { script: 'SCENE far\nSAY Across, held.\nCHOICE\n  Rest -> done' }, userId: 'U1' });
+    const revNo = await fire({ commandName: 'activity', options: { _sub: 'revert', name: 'Ford' }, userId: 'U1' });
+    ok('Revert refuses while a draft waits, so the draft is never thrown away', /has a draft waiting/.test(saidOf(revNo)) && /Across, held/.test(story('Ford').draft_source || ''), saidOf(revNo).slice(0, 100));
+    await fire({ commandName: 'activity', options: { _sub: 'stop' }, userId: 'U2' });
+    const setD = await fire({ commandName: 'activity', options: { _sub: 'set', name: 'Ford', scene: 'far', field: 'say', value: 'Across, held and dripping.' }, userId: 'U1' });
+    ok('/activity set with a draft waiting edits the draft and keeps it held', /held as a draft/.test(saidOf(setD)) && /Across, held and dripping/.test(story('Ford').draft_source || '') && !/Across, held and dripping/.test(story('Ford').source || ''), saidOf(setD).slice(0, 120));
+    await fire({ isButton: true, customId: `actv:discard:${key1}`, message: head, userId: 'U1' });
+    ok('Discard draft clears it and leaves the live version', !story('Ford').draft_source && story('Ford').source === srcBefore);
+    const boardNow = sentById.get(dbHandle.prepare("SELECT activity_board_msg FROM guild_config WHERE guild_id='G1'").get()?.activity_board_msg);
+    ok('demo rows never reach the board', !!boardNow && !/Fishing \(demo\)|Scribe/.test(boardNow.content || ''), (boardNow?.content || '').slice(0, 120));
+    const privProb = await fire({ isModal: true, customId: 'activitycreate', fields: { script: '[ACTIVITY] Secret\nSCENE a\nSAY x\nCHOICE\n  * B — 8 -> nowhere' }, userId: 'U1' });
+    ok('a problem reply, which quotes the script, is private', privProb.replies.some(x => x.ephemeral && /kept as a draft/.test(x.content || '')), JSON.stringify(privProb.replies).slice(0, 120));
+    const draftRun = await fire({ commandName: 'activity', options: { _sub: 'run', name: '.draft.Ford' }, userId: 'U1' });
+    ok('the reserved draft name is refused by name', /working copy/.test(saidOf(draftRun)), saidOf(draftRun).slice(0, 80));
+    const lower = ['[ACTIVITY] Lower', 'SCENE a', 'SAY As the sun sets, you arrive. Set sail at dawn. Roll with it.', 'CHOICE', '  Go -> b', 'SCENE b', 'SAY Done.', 'end'].join('\n');
+    const rL = await fire({ isModal: true, customId: 'activitycreate', fields: { script: lower }, userId: 'U1' });
+    ok('lower-case keywords count when exact; prose that starts with a keyword stays prose', /saved — \*\*2\*\* scenes/.test(saidOf(rL)) && scenesOf('Lower')[1]?.ending === 1 && /As the sun sets/.test(scenesOf('Lower')[0]?.say || ''), saidOf(rL).slice(0, 160));
+    // 19 · the tutorial plays
+    before = sent.length;
+    const trial = await fire({ commandName: 'activity', options: { _sub: 'demo', which: 'trial' }, userId: 'U1' });
+    ok('the tutorial demo starts', /Scribe's Trial/.test(saidOf(trial)) && sinceIn('C1', before).some(m => idsOf(m).some(id => id.startsWith('storypick:'))), saidOf(trial).slice(0, 80));
+    await fire({ commandName: 'activity', options: { _sub: 'stop' }, userId: 'U1' });
+    Math.random = realRandomD; globalThis.setTimeout = realTimeoutD;
+    const threwD = loggedD.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
+    console.error = realErrD;
+    ok('nothing in the D walk threw', threwD.length === 0, threwD.slice(0, 3).join('\n        '));
   }
 
   // ── No button, modal or select id throws on a junk payload ──────────

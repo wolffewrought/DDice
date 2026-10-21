@@ -27,12 +27,16 @@ New verbs join their group; the wall is history until a single group nears 25.
 | First response window | 3 s | deferReply used on slow paths (gm heal, questplanning setup) |
 | Interaction token life / followups | 15 min | long loops must finish inside it |
 | **Modal rows** | **5** | **quest create & edit use 5/5** — a sixth field is impossible; numbers can never join the modal, which is why they ride the customId / stay slash-side |
-| Modal TextInput value | 4000 chars | **SHARP EDGE:** edit prefill slices legacy text >4000 to fit — saving then truncates it. Inline-authored objectives/lore longer than 4000 lose the tail on a modal edit |
+| Modal TextInput value | 4000 chars | **SHARP EDGE:** edit prefill slices legacy text >4000 to fit — saving then truncates it. Inline-authored objectives/lore longer than 4000 lose the tail on a modal edit. Activity scripts: the whole-script box opens only when the source fits; longer ones edit scene by scene (a block over 4000 is refused, not sliced), or as a file |
 | Modal title / input label | 45 chars | edit title sliced |
 | Modal placeholder | 100 chars | |
 | showModal rules | must be the FIRST response; cannot defer-then-show; cannot show from a modal submit | activity + quest modals comply |
-| **customId** | **100 chars** | **BREACHED by `/gm dc`:** `dcroll:` carries twelve fields including two free-text options, so a long `on_fail`/`on_success` overflows and the reply throws — and a colon inside either shifts every field in the `split(':')`. See HANDOFF.md §7.1. Elsewhere fine: `questcreate:m:p:h:style` well under, values never contain `:` (styleParts.join defends) |
+| Modal label components (discord.js 14.22+) | 5 per modal; a label wraps one text input or select; old action-row modals still accepted | only the `/npc say` box uses the label style (3: action, speech, a user picker); `package.json` floor `^14.27.0` for it |
+| **customId** | **100 chars** | activity ids carry the run key beside the presser (`storyrr:<uid>:<rk>:<scene>:<stat>:<next>:<n>`), so a scene name over ~20 characters risks the ceiling; the shelf and NPC buttons use ten-hex keys instead of names |
+| **customId (gm dc)** | **100 chars** | **BREACHED by `/gm dc`:** `dcroll:` carries twelve fields including two free-text options, so a long `on_fail`/`on_success` overflows and the reply throws — and a colon inside either shifts every field in the `split(':')`. See HANDOFF.md §7.1. Elsewhere fine: `questcreate:m:p:h:style` well under, values never contain `:` (styleParts.join defends) |
 | Autocomplete | ≤25 suggestions · 3 s · name ≤100 · string value ≤100 | quest-number branch slices 25; suggestion source query LIMIT 100 |
+| Select menu options | 25 | the shelf's Edit-scene pick lists the first 25 scenes; `/activity edit scene:` reaches the rest |
+| Forum tags | 20 | the activity shelf asks for nine and only adds what fits; NPC pages the categories |
 
 ## 3 · Messages, embeds, components
 
@@ -40,7 +44,7 @@ New verbs join their group; the wall is history until a single group nears 25.
 |---|---|---|
 | Message content | 2000 chars | replyLong/sendLong chunk; roster starter sliced |
 | Embed totals | 6000 all · 4096 description · 256 title · 25 fields · 1024/field | roll cards & quest embeds comfortable |
-| Action rows per message | 5 | activity CHOICE scenes: >5 choices needs multi-row; >25 impossible |
+| Action rows per message | 5 | activity CHOICE scenes: more than five choices is refused by the parser (2026-10-20); practice adds a second row of force buttons; the board holds 25 Play buttons at most |
 | Buttons per row / label | 5 / 80 chars | |
 | Reactions, attachments | 20 each | backup exports single-file |
 

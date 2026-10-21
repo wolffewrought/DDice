@@ -49,12 +49,13 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1118 as of 2026-10-15, build B) and no
+Green means every assertion passed (1166 as of 2026-10-20, build E) and no
 scanner found an ERROR. Then run the probe: `node --experimental-sqlite
-probe.js` (145 probes: the fight, encounter, override, autocomplete and
+probe.js` (224 probes: the fight, encounter, override, autocomplete and
 every-leaf walks, the GM-gate walk, chat shorthands, scheduled ticks,
 junk-id lanes, SQL compile, forum seeding and sweep, one NPC one page, the
-A2 walk, the undo walk, and a double-ack check). The probe carries a paper-thin fake
+A2 walk, the undo walk, the C walk, the D walk (activities: parser,
+drafts, shelf, board, party, writer, NPC mentions), and a double-ack check). The probe carries a paper-thin fake
 `@napi-rs/canvas` since A2 (text measures by length, drawing is a no-op, a
 buffer comes back) so the parchment paths run end to end; verify.js keeps
 the canvas absent on purpose, which is the other path.
@@ -362,6 +363,410 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 10q · Activities, written properly: the script kept, the shelf, the board, party runs, the writer; NPC mentions and Interact (2026-10-20, build D)
+
+T, after "Plan don't build — explain how /activity works": "Is there a
+better way at all to do this?" → seven suggestions → "what if there is a
+forum where when a gm creates an activity a pdf and a text block is stored
+for viewing and easy access to edit?" → the shelf → "Anything else that can
+be done to help and guide gms" → twelve → "do all of them work together?"
+→ eight more → "Anything else?" → thirteen more → "Also can npcs be able to
+@players when a gm uses /npc say / Also can a 'interact' button appear on
+all npc messages" → "Audit and build / Only send me 1 update to push".
+Scope answered as *Everything*; the 2026-10-15 entry was not pushed, so
+this folds into it. Pristine before D: `/tmp/claude-0/index.pre-d.js`
+(verify/probe/make_pdfs/HANDOFF likewise, `.pre-d.`).
+
+**The model.** The script is the truth and the rows are its cache. Three
+slots on `stories`: `source` (live), `draft_source` + `draft_problems`,
+`prev_source`. `saveActivity(gid, uid, text, { publish: 'auto'|'draft'|'now' })`
+is the one door: strips code fences, expands `QUIZ FROM`, parses with
+`{ gid }` (so `AS` names and titles can be checked), resolves `DC easy|…`
+from the sheets, and then — problems → draft (a story row is created if
+none, so the shelf can show it and the box can open it); good + `auto` +
+runs live (`liveRunsOf`, practice excluded) → waiting draft, rows written
+under `.draft.<name>` (`DRAFT_PREFIX`; names beginning `.` are refused;
+`listStories` hides them) so Practice can play them; otherwise
+`publishActivity`: prev ← old source (or `storyToText` of the rows for a
+pre-D story), `saveStory` rows, the draft rows deleted, notes stored,
+`queueActivityMirror`. The old `storeActivityScript` is gone; the three
+routes call `saveActivity`. `sceneToText`/`storyToText` render rows back
+to canonical grammar (used for pre-D scripts, and by `/activity set`, which
+now does a dry `applySceneEdit({ dry: true })`, renders the changed row,
+`replaceSceneBlock`s it into the script and saves that — rows never drift
+from the text). `sceneBlockRange` finds a scene's lines; the Edit-scene box
+is that block, the whole-script box the source when ≤ 4000.
+
+**The parser.** `parseStoryScript(text, ctx)` collects `problems`
+(`{ line, msg, fix }`) instead of returning at the first; `error` is
+`problemsText(problems)` so the old callers (`/quiz start`, the demos)
+still read it. `notes` come from `lintStory` (reachability from the first
+scene, an `END` reachable, DC rolls missing `PASS`/`FAIL`, DC outside
+5–25, one-choice scenes, long SAYs, flags tested but never set, a voice
+that is not an NPC, a title nobody holds, > 150 scenes) and from the loop
+(a line that fell to narration whose first word is uppercase and within
+one edit of a keyword → *did you mean*; an arrow with no keyword). New
+grammar: `#` comments; `ONCE per day|week`, `AVAILABLE days`, `REQUIRE
+title:|merits>=|renown>=` above the first scene; `SET`/`UNSET`, `IF cond
+-> scene` (flag, `not flag`, `tally|merits|renown op n`, `title:`), `NEXT
+adv|dis`, `RANDOM -> a|b|c`, `IMAGE url`, `ROLL stat DC easy|normal|hard`
+(`dcword`, provisional 10/13/16), `QID n` / `EXPLAIN` (emitted by the
+QUIZ FROM expansion), `END … title: heal: quest: once`. The case rule
+(after the audit): a keyword line in capitals must be well-formed —
+`malformed()` raises a problem only when `upperStart` — and in lower case it
+counts only when exact (`end`, `gain renown 1`, `set torch`, `if x -> y`,
+`as Name` only when Name is an NPC here, `hint` only after `ASK`), so *As
+the sun sets* and *Roll with it* stay narration; under `CHOICE`, any
+`label -> scene` is a button unless it begins with a keyword in capitals
+(the option check runs before the keyword checks). `isKeywordLine` (the
+wordy set, now with EXPLAIN, QID, IMAGE) still drives the ONE OF
+terminator and the before-first-SCENE check. Scene names over twenty
+characters are a problem (the reroll id carries two beside two ids). `END TALLY` eats the word after
+TALLY only when it is not a key (`merits:` was being swallowed). Choices
+over five are a problem (a row holds five; `postScene` slices anyway).
+`nearestWord` is a small Levenshtein with `d < word.length`.
+
+**The engine.** Rows gained `image`, `logic` (JSON sets/unsets/ifs/
+nextmode/random/dcword) and `grants` (title/heal/quest/once); the story
+`cooldown`, `available`, `require_json`, `retired`, `notes`, `published_at`.
+`advance(io, ctx, next, tallyState, gaAt, hops)` applies the arriving
+scene's sets/unsets, stores `_next`, then routes: first matching IF, else
+RANDOM — a routing scene's SAY is said on the way (`hops < 25`), the turn
+counter is restored (nobody pressed), and the hop counts a step toward the
+cap. `tally_state` carries `_flags` and `_next` beside the per-user pots.
+`resolveActivityRoll(ctx, stat, flavour, io, rerolled, force)`: the tilt
+is spent first; `force` (`nat1|nat20|pass|fail|partial|low|high`) builds a
+fake result (`nat = need - mod` for pass, `-1` for fail; lowest/highest
+range `lo - mod`) and is never recorded or logged. `payEnding` pays one
+person: `once` checked against `story_claims`; merits; the tally; title via
+`grantTitle`; heal via `getHealCharges`/`setHealCharges` up to
+`heal_charges`; rewards. Practice/demo endings list what a real run would
+pay and pay nothing. `logRun` writes `story_run_log` (start/roll+band/
+pick/end+score/quit/expire/cap), skipped for practice and demos.
+
+**Party runs.** `PARTY_KEY = 'party'`, one per channel: `members` JSON,
+`turn`. `partyMembers`, `whoseTurn` (`members[turn % n]`), `tallyKeyOf`
+(`'party'` for the pot). `activeSceneFor(interaction, owner, scene)`
+returns `rk` (the run key) beside `uid` (the presser); every `setRun`/
+`claimRun`/`releaseRun`/`endRun` in the engine uses `rk`. The reroll and
+carry-on ids carry both: `storyrr:<uid>:<rk>:…`, `storygo:<uid>:<rk>:…`,
+the ask modal `storyans:<owner>:<scene>`. The typed-roll route looks for
+the party run when the typist has none of their own and it is their turn.
+`startActivityRun` seeds the row; `/activity run party:` parses mentions
+(the starter included, 2–8, every member with a sheet, one party per
+channel). Endings pay every member; the cap and the ledger see them all.
+
+**The shelf.** `activity_forum`; `activity_pages (name → thread_id,
+head_id, text_ids JSON, file_id)`; `mirrorActivityPage` (in-flight map
+like NPC pages): tags (`ensureActivityTags`, nine names), the head card
+(`activityHeadLines` — state word, bits, author and published time, the
+open/closed line, odds per DC roll via `passOdds`, endings, notes, draft
+problems, `activityStatLines`) with `activityHeadRows` (`actv:<what>:<key>`
+— `activityKey` is sha1 of the lowercased name, ten hex, resolved by
+`storyByKey`), the script in `scriptCodeBlocks` edited in place / added /
+dropped, the parchment via `activityFiles` (a `.txt`, and when the canvas
+is there the `renderScrollBook` PDF with `DDICEACTIVITYv1{json}` after the
+EOF; `extractActivityData` reads it back on `file:` and in the thread).
+Adoption by name before creating; a GM-created starter post becomes the
+thread (`head_id` null → the card is sent as the next message). `retireActivityPage`
+posts a closing line, locks on delete/rename, archives. `mirrorDemoPages`
+makes read-only threads for fishing, the quiz and the trial with a *Play
+it here* button (`actv:demo:<which>`). `mendActivityPages` on boot and on
+`/config channels activityshelf`: missing threads, demos, duplicates
+folded (`botThreadsNamed`, foreign-message check) — Deploy mend lines.
+`tryActivityShelfPost(message)` runs before the paste route: a GM's post in
+a page's thread (text, `.txt`, PDF) is a resubmit (header prepended when
+missing; a script naming another activity goes there and says so); a new
+starter post in the forum is a create. `queueActivityMirror` debounces
+1.5 s per activity, timers `unref`'d; the board redraws with it.
+
+**The board.** `activity_board` + `activity_board_msg`; `redrawActivityBoard`
+edits or posts and pins one message, ≤ 25 live activities, a
+`actv:play:<key>` button each; the Play press runs `handleStory(…,{ sub:
+'run', name, viaButton })` after the open/closed check. `/config mechanics
+activities` redraws it. Retire/delete/publish all queue a redraw.
+
+**Guidance.** `/activity grammar [topic]` prints `ACTIVITY_GRAMMAR`;
+`create template:` prefills the box from `ACTIVITY_TEMPLATES` (five);
+`DEMO_TRIAL` is *The Scribe's Trial*. The writer: `activity_drafts` per GM
+(`scenes [{scene, block, top}]`, `pending`); `writerModal` (five boxes,
+5/5 rows), `writerCompose` turns them into a block (extras split on ` · `,
+`;` or newlines; TALLY/QUIZ/ONCE/AVAILABLE/REQUIRE hoisted to the top),
+`handleWriterModal` recomputes pending from every `->` and `RANDOM`
+target not yet written, parses what exists so far for problems in the
+scene (dangling-arrow problems filtered), and offers `actvw:next:<scene>`
+/ `actvw:done` / `actvw:drop`.
+
+**Gates and figures.** `runGate(gid, uid, story)`: retired, draft-only,
+REQUIRE, AVAILABLE (UTC weekday), ONCE (last start/end in the ledger;
+"can go again in Hh Mm"). `/activity run` while mid-run re-posts the
+scene. `expireIdleRuns` hourly from the quest tick (`ACTIVITY_IDLE_MS`
+seven days, `last_at` stamped by `setRun`). `activityStats`/
+`activityStatLines` (runs, players, finishes, quit scenes, rolls failing
+≥ 60% with n ≥ 3); `/activity scores` (best `score` per player, `ORDER BY
+MAX(score)` — verify's column scanner reads an alias as a column);
+`activityDigestLines` in the GM digest; the chronicle's activities block
+after the dice (only when the week had a story). `pruneLedgers` adds
+`story_run_log` at ninety days. UNDO_SECTIONS: `sheets.only` gains
+`merits`, `renown`; a `runs` section (story_runs by channel, skipping
+`busy`, `last_at`).
+
+**NPC.** `resolveNameMentions(guild, text)`: `@Name` tokens (up to three
+words, longest first) against member nickname/displayName/globalName/
+username from the cache and `guild.members.search`, right-to-left
+replacement; `postAsNpc(channel, gid, name, content, { interact })` sends
+`allowedMentions: { parse: [], users }` always, and the Interact row only
+for `/npc say` (both routes) — fight cards keep theirs. The row:
+`npcx:<npcKey>` (sha1 ten hex; `npcByKey`), `npctalk:<key>` when
+`npcs.talk_activity` is set (`/npc edit talk:`, autocompleting, `none`
+clears). `noteNpcLine` keeps the last line per channel in `npc_lines`;
+the previous line's components are cleared through the bound hook's new
+`edit` (`editMessage` with the thread id). A hook that refuses components
+falls back to a plain send. `npcSayModal(npc)` (build E, below) is the one
+label-style modal: three `LabelBuilder`s — action, speech, a
+`UserSelectMenuBuilder` `to` (0–3) — via `addLabelComponents`; the submit
+reads `fields.getSelectedUsers?.('to', false)` loosely, so a box opened
+before the deploy still submits. `/npc say to:` puts the mention first.
+
+**Build E — the To picker (2026-10-20, same unpushed update).** T:
+"Do the drop down modal thing / I still haven't pushed out the update
+either". The npm registry is unreachable from the sandbox (DNS refused,
+proxy 403), so the library could not be installed to test; the discord.js
+docs for 14.26/14.27 (`LabelBuilder.setUserSelectMenuComponent`,
+`ModalBuilder.addLabelComponents`, `ModalSubmitFields.getSelectedUsers
+(customId, required = false)`) and the current modals guide were read
+instead. `package.json` is now a deliverable: `discord.js` floor raised
+to `^14.27.0` (the screenshot showed `^14.14.1`; a lockfile, if the repo
+has one, must be deleted or regenerated or `npm ci` refuses). The probe's
+recorder learnt `addLabelComponents`/`setTextInputComponent`/
+`setUserSelectMenuComponent` (flattened into `components` so `idsOf` and
+the modal-field reader see one shape) and the fake interaction's
+`fields.getSelectedUsers` reads `over.users`; two probes: the box has the
+three fields, a pick leads the line and is pinged. verify counts label
+components as rows (the 5-row scanner) and pins the box's shape as the
+only label-style modal. The first real `/npc say` after deploy is the
+test the sandbox cannot run; the fallback, if Discord refuses the box, is
+the two-field action-row form from before this build (git history).
+
+**Removed.** The `/gm kill|revive|heal` stubs (builder, dispatcher, the
+pins, the probe) — they never shipped; the changelog item says the three
+moved and no more.
+
+**Docs.** HELP activities and NPC lines; the GM book's activities chapter
+(What Happens When You Save, The Shelf, The Board, Figures From Play, the
+header lines, the table rows, DC by Intent, SET and IF, RANDOM/NEXT/IMAGE,
+QUIZ FROM, END's new keys, The Writer); the player book (party runs, the
+board, rules of their own); NPC say (`@Name`, `to:`, Interact, Talk); the
+`/existence` paragraph. The book font has no emoji, so the Interact/Talk
+buttons are named without them there.
+
+**The cold audit.** A second agent read the diff and 10q cold and drove
+the functions through its own harness; 26 findings, 24 taken, two left
+(the writer's long reply; a member nicknamed "everyone" — users-only
+makes it harmless). Fixed: any text a GM posted in a shelf thread was a
+resubmit (chatter became the draft; a typed `wis` for a practice run in
+the thread was swallowed) — now only a header, a `SCENE` line or a
+`.txt`/`.md`/`.pdf` under 2 MB counts, and `fetchBytes`'s second argument
+is a timeout, not a size cap, so size is checked first; the first scene
+bypassed `advance`, so a script opening on `RANDOM`/`IF` threw in
+`postScene` and its SET/NEXT/GAIN never applied — `arrive()` is split out
+of `advance()` and `startActivityRun` returns `go()`, which arrives;
+`postScene` ends a run that has nothing to ask instead of throwing; a
+routing scene's GAIN was skipped (credited before the route now); Revert
+discarded a waiting draft (refused while one waits); `/activity set`
+spliced the live row into the draft text and `field:dc` was a no-op under
+a DC word (reads the draft's rows, clears `dcword`); a draft held on
+purpose was published by the next edit (held stays held); the mirror's
+in-flight map dropped a second call (dirty flag, drawn again); `.draft.`
+names were accepted by every `name:` option and listed by the `set`
+autocomplete (refused; `listStories`); demo and `/quiz start` instance
+stories reached the board, the mend and adoption-by-name (`isDemoStory`;
+never adopt a demo's or an archived thread); the problem reply could pass
+2000 characters and was public from the box (eight clipped problems,
+ephemeral); `ensureActivityTags` dropped tag ids (kept, like
+`ensurePlanTags`); Retire posted no closing line; `show script:true`
+attached the files to every chunk; `/activity edit scene:` had no
+autocomplete; `once` was claimed by an empty-handed ending and
+`\bonce\b` was stripped from inside a title (claimed only when paying;
+texts read first, `once` only as the last word or before a key); demo
+runs logged rolls but no start/end (nothing now) and `/quiz start` runs
+logged no start (they do); the one-choice note fired on the templates
+(gone); Publish could say "published" over a re-expansion that failed
+(says what happened); a party retry passed the turn (`keepTurn`);
+`@Aldric's` did not resolve (possessive and closing quote stripped); undo
+did not cover `story_claims`/`subject_titles` (two sections); the modal
+user picker mixed component generations the sandbox cannot verify
+(removed). And the parser's case rule, which had regressed lower-case
+`end`/`gain`/`as` and turned keyword-led prose and choices into problems
+(above).
+
+**Tests.** verify: pins updated for the stubs, undo sections, the prune
+list; the modal user-picker exemption. probe: the D walk — 66 probes
+across the parser, drafts, the whole-script and scene boxes, the map, a
+full run with Carry on, where-am-I, undo, scores, flags/IF/NEXT/title/
+once/cooldown, edit-while-live → publish → revert, `set` through the
+script, practice with a forced die, a party run (turns, refusal by name,
+everyone paid), copy/rename/export/grammar/list, the writer end to end,
+the shelf (card, blocks, file, demos, a thread post, the card redraw,
+Edit scene → pick → box, Retire/Restore), the board (Play gated then
+open), NPC mentions (`@Aldric`, users-only, `@everyone` left as text),
+Interact for GM and player, `to:`, Talk, DC easy from the sheets, QUIZ
+FROM the bank, the audit's guards (chatter in a thread, a script opening
+on a fork with a paid routing GAIN, Revert with a draft, `set` on a draft,
+Discard, demo rows off the board, a private problem reply, the reserved
+name, the case rule), the tutorial. The fake webhook now carries `components`;
+`guild.members.search` is stubbed in the walk; `setTimeout` is stubbed so
+the mirror runs at once (with a `settle()` of setImmediate turns).
+
+## 10p · Thirteen from the table: typed fights, ties, /rp, /existence (2026-10-15, build C)
+
+T's screenshot (Percival: "it's forcing me to roll with stat"; the bot:
+"Say who you are attacking — there is only Fenrir left"), Artorius's
+"initiative rolls get rerolled when they match", T's "how do players make a
+role play form appear? If there's none can it be /rp", then "Anything else
+to fix or work on?" → eight suggestions → "All and fold in then audit" →
+`/existence` chosen over `/life`. Pristine before C:
+`/tmp/claude-0/index.pre-c.js` (verify/probe/make_pdfs/HANDOFF likewise).
+
+**Typed fight commands (1, 2).** `stat:` is optional on `/fight atk` and
+`/fight def`. In the branches, `typed = !(forced && typeof forced ===
+'object')` — a button, a picker and a form all carry a forced object, a
+slash command none. No stat → an ephemeral with the turn card's rows
+(`fightAnswerRows`, escape/hold/atk as `announceNextTurn` chooses; the
+defence set for def). One foe, or a named target, with no flavour → the
+form (`openFightRp`); `flavour:` typed → the swing as before. Defence the
+same, and `mode` now rides the form (`frp:` lane's `def` case passes
+`p.mode`; the def branch reads `forcedOf(forced, 'mode')`). The old
+"told whom it would have hit" refusal is gone.
+
+**Initiative ties (3).** `settleInitiativeTies(inits, { gid, cid, nameOf })`
+— groups by total; a group of two or more rerolls d20 + DEX (audited as
+"initiative tie-break (round n)"), any still level roll again among
+themselves (recursive, five rounds), each round told as a 🔁 line; the
+final sort is by the original total, then each reroll round, then the
+first die, so slots in the order never move between groups. Used by
+`/fight start` and both `/fight auto` modes. Joiners are placed, not
+rolled against anyone, so they are untouched.
+
+**/rp (4) and the player's /edit (6).** `handleRp` → `rpModal()`
+(`rpform`) or `postRpLine` → `composeNpcSay` for the shape, the name from
+`getDisplayName` (the fake's `user.username` is `u1` for everyone — the
+first probe run posted "u1: …"), the face from `displayAvatarURL`, sent
+through `npcWebhookIn(chan, gid, name, face)` (the channel's shared hook;
+a plain bot post with the name on top if no hook can be had), kept in
+`rp_lines(guild_id, message_id, channel_id, user_id, at)`, chronicled as
+`rp`. `/edit`: `gm` decides the list — everything the bot and its NPCs
+said, or `rp_lines` of this user here; `mayEditLine(interaction, id)`
+gates the pick, the save and the link path (`EDIT_NOT_YOURS`);
+`delete:true` → the `editdel` dropdown → `deleteBotLine` (`msg.delete()`
+or `hook.deleteMessage(id, threadId)`), audited "Taken down". The probe's
+fake `WebhookClient.send` now lands a message in the hook's channel
+(`hookHosts`) with `webhookId` set, so `/rp` lines can be read back,
+edited and deleted in the fake; it learned `deleteMessage` too.
+
+**fightnudge (5).** `guild_config.fight_nudge_min` (NULL = 10, 0 = off);
+`fightNudgeMinutes(gid)`; `fightIdleTick` reads every un-nudged active
+fight and applies each guild's minutes; the line says "N minutes quiet".
+The leaf walk sets it to 0 (the fake's dummy int is the option's minimum),
+so the A2 and C probes reset it before their ticks.
+
+**Journal lanes (7).** `undoLanes` keyed `${gid}:${cid}`: the first frame
+to open in a quiet moment snapshots and lends its label and actor,
+`open++`; the LAST frame out diffs against that snapshot and writes one
+entry for the whole spell. (The first draft had every close diff against
+the previous close — chained, but chunked: the audit showed a `/fight
+status` typed during an auto fight carving the fight's HP changes into an
+entry with no fight row, which `gmUndo`'s ended-fight guard would not
+see.) Handlers are not serialised — an auto fight holding a lane for a
+minute would have blocked `/fight end`. The lane is dropped at nought so
+ticks between spells are never attributed.
+
+**Ready → Start (8).** The last `qready:` press replaces the button with
+`qstart:<number>` (only when the quest is not already active); `qstart:`
+is GM-gated and calls `handleQuest(interaction, { sub: 'start', group:
+'run', number })` — the start branch now reads `forced.number`. Under
+spin-off (on in the probe hall) that launches a run from the listing, as
+the command does; the probe accepts either.
+
+**/fight log scroll:true (9).** Same renderer as the run's story
+(`renderScrollBook`, `embedScrollData`), titled by the fight's day, body =
+the recap lines through `plain`; refused with a line when `hasCanvas()`
+is false. The probe resolves and ends C1's fight first — the C8 one had
+no exchange and the log answers "ended before any exchanges" for that.
+
+**Dice of the week (10).** `week_dice(guild_id, user_id, at, nat, total)`
+written by `recordRoll` for d20s with a `userId` (NPC/actor rolls skipped;
+the chosen die of an advantage roll), pruned past fourteen days;
+`weekTaleLines` adds the section after the fallen.
+
+**Prune (11).** `pruneLedgers(gid)` — `rp_lines` 90 d, `week_dice` 14 d —
+per guild in `bootMend` (a line in the Deploy mend) and in
+`runSetupRepair` (a line in the Setup run reply). `button_presses` and
+`group_check_rolls` were in the first draft and came out at the audit:
+they are rules (the once-only gate, the tally of an open check), not
+ledgers, and the journal reads only the day's of each. `roll_history`
+turned out to be one row per hand (the reroll record), not a growing
+ledger; `roll_tally` is lifetime by design. The What's new says so.
+
+**/existence (12).** The three leaves lifted verbatim into a new top-level
+builder; `/gm kill|revive|heal` are stubs ("Moved — use /existence …",
+GM-gated so the gate walk still sees a refusal) that answer with the new
+address — remove next build. The dispatcher's `/existence` branch carries
+the `ensureCharPage` follow-ups kill and revive had; the npc autocomplete
+accepts `existence`. Every `/gm kill|revive|heal` string in messages,
+help, books and comments was swept (a pin forbids the old address outside
+the three "moved" mentions). `/gm` fell 6310 → 5519; `/config` (5573) is
+the largest now; the tripwire stays at 6400.
+
+**Pins and probes.** Eleven pins for C plus the count (26), the Fallen tag
+under `/existence`, the attack-row pin's typed-form rule, the edit pins'
+remover. The C walk (eleven probes): bare/typed attack and defence with
+forced dice, a forced two-way tie at 13 settling 18 vs 6, `/rp` inline and
+by box with the chronicle beat, the plain player's `/edit` list, fix, link
+refusal and delete (the fake guild answers admin for everyone, so
+`members.fetch` is overridden for U3 as the gate walk does), fightnudge
+0/5/show with the tick, the ready card's Start pressed, the fight log on
+parchment after a resolve and a confirmed end, dice of the week in the
+chronicle, a 100-day-old press pruned by `/gm check run`, `/existence`
+heal/kill (through its memorial box)/revive and `/gm heal` answering
+"has moved". A natural 20 on the undo walk's called check was a 5% flake
+(a 20 passes any DC and costs nothing) — its die is forced now. 1147
+assertions, 156 probes.
+
+**The cold audit.** A second agent read the full diff with the spec and
+no sight of the work (T: "then audit"). Twenty-two findings; fixed:
+(1) `/rp` sent through the webhook with no `allowedMentions` — a webhook
+is not bound by the poster's permissions, so any member could @everyone
+through the bot; now `{ parse: [] }`, probed. (2) the prune took
+`button_presses` and `group_check_rolls` — rules, not ledgers; removed.
+(3) the chained journal chunked a long interaction's changes around a
+bystander's press, defeating the ended-fight guard; one entry per spell
+now. (4) typed attack/defence opened the form before the cheap refusals
+(weapon, target standing, own captive), losing the words; `typedRefusal`
+and the weapon check run first. (5) `/fight log scroll:true` rendered
+before the ack; it defers. (6) tie lines could carry the start card past
+2000 chars; `replyLong` when there are any. (7–9) `week_dice` counted a
+GM's NPC rolls as the GM's, had no total for fight rolls, and took a 3d20
+first die as a natural 20; `kind`/`actor` skipped, `total` passed from the
+attack and defence rollers, multi-die skipped. (10) help and books said
+the ready card always grows Start; it does when the run has not started
+(an instance under spin-off is active from launch). (11) `qstart:`
+stripped the button before refusals; the cheap ones run first. (12) the
+Deploy mend did not say what was pruned; per-guild line now. (13) "Ten
+quiet minutes" lingered in help §5 and the books. (14) a tie that
+outlasts five rounds says the first die decided. (15) `npc:` with no stat
+under auto-pilot got an empty button row; `auto: false` for the typed
+case. (16) a player could rewrite the name line of a bot-posted `/rp`
+line; the header is kept through their edit (`rpHeaderOf`/`rpBodyOf`).
+(17) the delete dropdown lingered; it becomes the receipt. (18) a lone
+d20 made a chronicle post; dice ride only when the week had a story.
+(20) the changelog's `/gm` figure; (21) dead `FIGHT_IDLE_MS`; (22) the
+`/edit` help tag and the webhook-gone refusal that told a player to use
+`/npc say`. Left as nits: (19) a typed `target:` with no stat is dropped
+before the buttons (the picker asks again). Verify, probe and the pins
+were brought to the fixed shapes; a probe now reads the fake webhook's
+`allowedMentions`.
 
 ## 10o · /gm undo — the channel's journal (2026-10-15, build B)
 
