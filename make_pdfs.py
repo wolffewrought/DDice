@@ -1537,23 +1537,29 @@ PARTS['npcs'] = [
 ('code', [('/npc say name:Garrick speech:Fine steel, fair prices.', 'speech \u2014 in quote marks'),
           ('/npc say name:Garrick action:polishes a blade', 'action \u2014 italic emote'),
           ('/npc say name:Garrick action:polishes a blade\n  speech:Fine steel.', 'both, stacked'),
-          ('/npc say name:Garrick', 'opens a writing box: action, speech, and a To picker'),
+          ('/npc say name:Garrick', 'opens a writing box: action, speech, a To picker,\nand which activity to offer'),
           ('/npc say name:Garrick speech:Over here, @Aldric', '@Name in the text pings that person'),
-          ('/npc say name:Garrick speech:Mind the ropes. to:@Aldric', 'to: puts the mention first'),
-          ('/npc edit name:Garrick talk:Haggling', 'a Talk button under his lines starts that activity')]),
-('p', 'An NPC may call a player by name. The writing box has a <b>To</b> picker \u2014 up to three players, '
-      'mentioned first \u2014 and <b>@Aldric</b> written in the speech, in the box as well as on the command, becomes '
-      'a real mention by server nickname, display name or username, longest match first; <b>to:</b> does the same '
-      'from the command. Only <b>people</b> are ever pinged from an NPC\u2019s mouth: never a role, never everyone, '
-      'whatever is typed. Every line an NPC says carries an '
-      '<b>Interact</b> button \u2014 a player pressing it gets the roleplay box titled as a reply to that NPC, '
-      'a Game Master the speak-as box \u2014 and only the newest line in a channel keeps the button. Hang an '
-      'activity on an NPC with <b>talk:</b> and a <b>Talk</b> button sits beside it, starting that activity for '
-      'whoever pressed; the server\u2019s open/closed setting does not apply, since you chose to offer it.'),
+          ('/npc say name:Garrick speech:Mind the ropes. to:@Aldric', 'to: names them under the words'),
+          ('/npc say name:Garrick speech:Fancy a wager? offer:Haggling', 'an Interaction button under this line starts it'),
+          ('/npc edit name:Garrick talk:Haggling', 'the activity pre-picked whenever Garrick speaks')]),
+('p', 'A line is laid out in three blocks with a blank line between: the <b>action</b> in italics, the '
+      '<b>speech</b> in quotes, then <b>who it is for</b>. An NPC may call a player by name: the writing box has a '
+      '<b>To</b> picker \u2014 up to three players, named under the words \u2014 and <b>@Aldric</b> written in the '
+      'speech, in the box as well as on the command, becomes a real mention by server nickname, display name or '
+      'username, longest match first; <b>to:</b> does the same from the command. Only <b>people</b> are ever pinged '
+      'from an NPC\u2019s mouth: never a role, never everyone, whatever is typed.'),
+('p', 'Under every line an NPC says sit two buttons, and sometimes a third \u2014 everyone sees them; what they do '
+      'depends on who presses. <b>Reply</b> opens the roleplay box titled as a reply to that NPC, for anyone (a '
+      'Game Master replies as their own character). <b>GM</b> opens the speak-as box; a player pressing it is told '
+      'quietly whose it is. <b>Interaction</b> appears only when you offered an activity on that line \u2014 the '
+      'box\u2019s fourth field lists the server\u2019s activities with <i>None</i> first, and <b>offer:</b> does the '
+      'same on the command \u2014 and starts that activity for whoever presses, the server\u2019s open/closed setting '
+      'aside, since you chose to offer it. <b>talk:</b> on the NPC is the default pick in that dropdown, no more. '
+      'Only the newest line in a channel keeps its buttons.'),
 ('note', '<b>Works in threads and forum posts too.</b> A thread cannot own a webhook, so the NPC\u2019s voice is created on the parent channel instead and every message is routed back into the thread it was called from \u2014 several threads under one channel share the same NPC webhook.'),
 ('p', 'Posts as the NPC through their webhook \u2014 their name and avatar, no dice rolled. Fill '
       '<b>action</b>, <b>speech</b>, or both: the action is italicised and the speech is wrapped in quote '
-      'marks, stacked on separate lines. Leave both blank and a <b>writing box</b> opens with roomy '
+      'marks, a blank line between. Leave both blank and a <b>writing box</b> opens with roomy '
       'multi-line fields \u2014 easier for longer roleplay. Use <b>raw</b> to post exactly as typed.'),
 ('h2', 'Rolling as an NPC'),
 ('code', [('/npc roll name:Hollow tank notation:1d20+8 label:strike\n  flavour:The hollow lunges', ''),

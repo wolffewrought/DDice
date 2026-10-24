@@ -521,6 +521,7 @@ function scanWiring(src, ast) {
     if ([...routedPrefix].some(p => id.startsWith(p))) continue;
     if (src.includes(`getTextInputValue('${id}')`)) continue;   // a modal field, not a route
     if (src.includes(`getSelectedUsers?.('${id}'`)) continue;    // a modal's user picker, likewise
+    if (src.includes(`getStringSelectValues?.('${id}')`)) continue; // and a modal's dropdown
     err('unrouted-customid', `customId "${id}" is built but nothing routes it`, line);
   }
   for (const [pre, line] of builtPrefix) {
@@ -2404,12 +2405,25 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     // The speak-as box is the one modal built in the label style (discord.js
     // 14.27): three labels, the third a user picker read with getSelectedUsers.
     // Every other modal keeps action rows, which the library still takes.
-    ok('the speak-as box is three labelled fields with a To picker, read loosely on submit; it is the only label-style modal',
-      /function npcSayModal\(npc\) \{\s*\n\s*const \{ ModalBuilder, TextInputBuilder, TextInputStyle, LabelBuilder, UserSelectMenuBuilder \} = require\('discord\.js'\);/.test(src) &&
+    ok('the speak-as box is four labelled fields — action, speech, a To picker, the Interaction dropdown (None pre-selected unless the NPC has a talk: default) — read loosely on submit; it is the only label-style modal',
+      /function npcSayModal\(npc, gid = null\) \{\s*\n\s*const \{ ModalBuilder, TextInputBuilder, TextInputStyle, LabelBuilder, UserSelectMenuBuilder, StringSelectMenuBuilder \} = require\('discord\.js'\);/.test(src) &&
       /new UserSelectMenuBuilder\(\)\s*\n\s*\.setCustomId\('to'\)[^\n]*\.setMinValues\(0\)\.setMaxValues\(3\)\.setRequired\(false\);/.test(src) &&
       /modal\.addLabelComponents\(\s*\n\s*new LabelBuilder\(\)\.setLabel\('Action \(optional\)'\)\.setTextInputComponent\(actionInput\),\s*\n\s*new LabelBuilder\(\)\.setLabel\('Speech \(optional\)'\)[^\n]*\.setTextInputComponent\(speechInput\),\s*\n\s*new LabelBuilder\(\)\.setLabel\('To \(optional\)'\)[^\n]*\.setUserSelectMenuComponent\(toPicker\),/.test(src) &&
+      /new StringSelectMenuBuilder\(\)\.setCustomId\('offer'\)[^\n]*\n\s*\.setMinValues\(0\)\.setMaxValues\(1\)\.setRequired\(false\)\.addOptions\(options\);/.test(src) &&
+      /const options = \[\{ label: 'None', value: 'none', default: !def \}\];/.test(src) &&
       /picked = \[\.\.\.\(interaction\.fields\.getSelectedUsers\?\.\('to', false\)\?\.values\?\.\(\) \|\| \[\]\)\]\.map\(u => u\.id\);/.test(src) &&
-      (src.match(/addLabelComponents\(/g) || []).length === 1);
+      /const v = interaction\.fields\.getStringSelectValues\?\.\('offer'\);/.test(src) &&
+      (src.match(/addLabelComponents\(/g) || []).length === 2);
+    // Under every NPC line: Reply for players, GM for the speak-as box, and
+    // Interaction only when the GM offered an activity on that line; the
+    // line itself is action · speech · who it is for, a blank line between.
+    ok('an NPC line is action, speech and the addressed players in three blocks; Reply and GM always, Interaction only when offered',
+      /function composeNpcSay\(\{ action, speech, raw, to = \[\] \}\)/.test(src) && /return parts\.join\('\\n\\n'\);/.test(src) &&
+      /\.filter\(id => !words\.includes\(`<@\$\{id\}>`\)\)\.map\(id => `<@\$\{id\}>`\);/.test(src) &&
+      /setCustomId\(`npcreply:\$\{key\}`\)\.setLabel\('💬 Reply'\)/.test(src) && /setCustomId\(`npcx:\$\{key\}`\)\.setLabel\('🎭 GM'\)/.test(src) &&
+      /if \(offer\) row\.addComponents\(new ButtonBuilder\(\)\.setCustomId\(`npctalk:\$\{key\}:\$\{activityKey\(offer\)\}`\)\.setLabel\('🎮 Interaction'\)/.test(src) &&
+      /function offeredActivity\(gid, npc, pick\)/.test(src) && /startsWith\('npcreply:'\)\) return handleNpcReplyButton\(interaction\);/.test(src) &&
+      /That one is the GM's — it speaks as \*\*\$\{npc\.name\}\*\*\. \*\*Reply\*\* is yours\./.test(src));
     ok('/existence carries kill, revive and heal with their options, the NPC fields autocompleting there too',
       /setName\('existence'\)/.test(src) && /if \(interaction\.commandName === 'existence'\) \{\s*const exSub = interaction\.options\.getSubcommand\(\);/.test(src) &&
       /\(interaction\.commandName === 'gm' \|\| interaction\.commandName === 'existence'\) && \(focusedOption\.name === 'npc' \|\| focusedOption\.name === 'npcs'\)/.test(src) &&

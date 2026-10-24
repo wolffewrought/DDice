@@ -366,8 +366,9 @@ function makeInteraction(over = {}) {
       data: [],
     },
     fields: { getTextInputValue: (n) => (over.fields || {})[n] ?? '',
-      // discord.js 14.27: a modal's user picker, read back as a Collection of users
-      getSelectedUsers: (n) => new FakeCollection(((over.users || {})[n] || []).map(id => [id, { id, username: `user${id}` }])) },
+      // discord.js 14.27: a modal's user picker, read back as a Collection of users; a string select as its values
+      getSelectedUsers: (n) => new FakeCollection(((over.users || {})[n] || []).map(id => [id, { id, username: `user${id}` }])),
+      getStringSelectValues: (n) => (over.selects && n in over.selects) ? over.selects[n] : [] },
     reply: async (p) => { if (i.replied || i.deferred) throw already(over, `reply after ${i.deferred ? 'defer' : 'reply'}`); i.replied = true; replies.push(norm(p)); return { id: nextId() }; },
     fetchReply: async () => ({ id: nextId(), channelId: (over.channel || chan).id, edit: async () => {} }),
     editReply: async (p) => { replies.push(norm(p)); return { id: nextId() }; },
@@ -1703,7 +1704,7 @@ async function fire(over) {
     const rpRows = dbHandle.prepare("SELECT message_id, user_id FROM rp_lines WHERE guild_id='G1' AND channel_id='C1' ORDER BY at").all();
     const chron = dbHandle.prepare("SELECT text FROM quest_events WHERE guild_id='G1' AND number=911 AND kind='rp'").all().map(r => r.text);
     ok('/rp posts in the player\'s name through the channel\'s webhook with no mentions allowed, inline or from the box, and the words reach the running quest\'s chronicle',
-      /Posted/.test(saidOf(rp1)) && !!rpMsg && rpMsg.webhookId && Array.isArray(rpMsg.allowedMentions?.parse) && rpMsg.allowedMentions.parse.length === 0 && /\*draws her blade\*\n"Not one step closer\."/.test(rpMsg.content) && modalOf(rpBare) === 'rpform' && !!rpMsg3 && /^"Hold the line\."$/.test(rpMsg3.content)
+      /Posted/.test(saidOf(rp1)) && !!rpMsg && rpMsg.webhookId && Array.isArray(rpMsg.allowedMentions?.parse) && rpMsg.allowedMentions.parse.length === 0 && /\*draws her blade\*\n\n"Not one step closer\."/.test(rpMsg.content) && modalOf(rpBare) === 'rpform' && !!rpMsg3 && /^"Hold the line\."$/.test(rpMsg3.content)
         && rpRows.some(r => r.message_id === rpMsg.id && r.user_id === 'U2') && rpRows.some(r => r.message_id === rpMsg3?.id && r.user_id === 'U3')
         && chron.some(t => /userU2: draws her blade/.test(t) && /Not one step closer/.test(t)),
       `${saidOf(rp1).slice(0, 40)} · msg ${JSON.stringify(rpMsg?.content)} hook ${rpMsg?.webhookId} · box ${modalOf(rpBare)} ${JSON.stringify(rpMsg3?.content)} · rows ${rpRows.length} · chron ${chron.join(' | ').slice(0, 120)}`);
@@ -2051,29 +2052,41 @@ async function fire(over) {
     ok('an NPC line turns @Name into a mention and pings people only, never everyone',
       /Spoke as/.test(saidOf(say1)) && /<@100000000000000002>/.test(line1?.content || '') && (line1?.allowedMentions?.users || []).includes(P2) && (line1?.allowedMentions?.parse || []).length === 0 && /@everyone/.test(line1?.content || ''),
       `${(line1?.content || '').slice(0, 80)} · ${JSON.stringify(line1?.allowedMentions)}`);
-    ok('every NPC line carries the Interact button', idsOf(line1).some(id => id.startsWith('npcx:')), JSON.stringify(idsOf(line1)));
+    ok('every NPC line carries Reply and GM, and no Interaction until one is offered', idsOf(line1).some(id => id.startsWith('npcreply:')) && idsOf(line1).some(id => id.startsWith('npcx:')) && !idsOf(line1).some(id => id.startsWith('npctalk:')), JSON.stringify(idsOf(line1)));
     const xGm = await fire({ isButton: true, customId: idsOf(line1).find(id => id.startsWith('npcx:')), message: line1, userId: 'U1' });
     const xPl = await fire({ isButton: true, customId: idsOf(line1).find(id => id.startsWith('npcx:')), message: line1, userId: plainD, member: { id: plainD, roles: { cache: new Map() }, permissions: { has: () => false } } });
-    ok('Interact opens the speak-as box for a GM and the roleplay box for a player', modalOf(xGm) === 'npcsay:Dockmaster' && modalOf(xPl) === 'rpform', `${modalOf(xGm)} · ${modalOf(xPl)}`);
+    const rPl = await fire({ isButton: true, customId: idsOf(line1).find(id => id.startsWith('npcreply:')), message: line1, userId: plainD, member: { id: plainD, roles: { cache: new Map() }, permissions: { has: () => false } } });
+    const rGm = await fire({ isButton: true, customId: idsOf(line1).find(id => id.startsWith('npcreply:')), message: line1, userId: 'U1' });
+    ok('GM opens the speak-as box for a GM and tells a player it is not theirs; Reply opens the roleplay box for anyone', modalOf(xGm) === 'npcsay:Dockmaster' && /GM's/.test(saidOf(xPl)) && modalOf(rPl) === 'rpform' && modalOf(rGm) === 'rpform', `${modalOf(xGm)} · ${saidOf(xPl).slice(0, 40)} · ${modalOf(rPl)} · ${modalOf(rGm)}`);
     const boxFields = modalFieldsOf(xGm);
-    ok('the speak-as box is three labelled fields, the third a user picker called `to`', 'action' in boxFields && 'speech' in boxFields && 'to' in boxFields, JSON.stringify(Object.keys(boxFields)));
+    ok('the speak-as box is four labelled fields: action, speech, the `to` picker, the `offer` dropdown with None pre-selected', 'action' in boxFields && 'speech' in boxFields && 'to' in boxFields && 'offer' in boxFields, JSON.stringify(Object.keys(boxFields)));
     before = sent.length;
-    const picked = await fire({ isModal: true, customId: 'npcsay:Dockmaster', fields: { action: '', speech: 'The tide turns.' }, users: { to: [P2] }, userId: 'U1' });
+    const picked = await fire({ isModal: true, customId: 'npcsay:Dockmaster', fields: { action: 'Waves', speech: 'The tide turns.' }, users: { to: [P2] }, selects: { offer: [] }, userId: 'U1' });
     const linePicked = sinceIn('C1', before).find(m => m.webhookId);
-    ok('a player picked in the box is mentioned first and pinged', /Posted as/.test(saidOf(picked)) && /^<@100000000000000002> "The tide turns\."/.test(linePicked?.content || '') && (linePicked?.allowedMentions?.users || []).includes(P2), `${saidOf(picked).slice(0, 40)} · ${(linePicked?.content || '').slice(0, 60)}`);
+    ok('a line reads action · speech · who it is for, a blank line between, the picked player pinged', /Posted as/.test(saidOf(picked)) && linePicked?.content === '*Waves*\n\n"The tide turns."\n\n<@100000000000000002>' && (linePicked?.allowedMentions?.users || []).includes(P2) && !idsOf(linePicked).some(id => id.startsWith('npctalk:')), `${saidOf(picked).slice(0, 40)} · ${JSON.stringify(linePicked?.content)}`);
     before = sent.length;
     const say2 = await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', speech: 'Mind the ropes.', to: P2 }, userId: 'U1' });
     const line2 = sinceIn('C1', before).find(m => m.webhookId);
-    ok('`to:` puts the mention first', /^<@100000000000000002> /.test(line2?.content || ''), (line2?.content || '').slice(0, 60));
-    const talkSet = await fire({ commandName: 'npc', options: { _sub: 'edit', name: 'Dockmaster', talk: 'Ford' }, userId: 'U1' });
+    ok('`to:` names them under the words', line2?.content === '"Mind the ropes."\n\n<@100000000000000002>', JSON.stringify(line2?.content));
     before = sent.length;
-    await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', speech: 'Fancy the crossing?' }, userId: 'U1' });
+    const offered = await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', speech: 'Fancy the crossing?', offer: 'Ford' }, userId: 'U1' });
     const line3 = sinceIn('C1', before).find(m => m.webhookId);
     const talkId = idsOf(line3).find(id => id.startsWith('npctalk:'));
     before = sent.length;
     const talked = await fire({ isButton: true, customId: talkId, message: line3, userId: plainD, member: { id: plainD, roles: { cache: new Map() }, permissions: { has: () => false } } });
-    ok('/npc edit talk: hangs an activity on the NPC; its Talk button starts it for whoever pressed', !/❌/.test(saidOf(talkSet)) && !!talkId && /begins for <@U7>/.test(saidOf(talked)), `${saidOf(talkSet).slice(0, 60)} · ${talkId} · ${saidOf(talked).slice(0, 60)}`);
+    ok('`offer:` puts an Interaction button under that line, and it starts the activity for whoever pressed', !/❌/.test(saidOf(offered)) && !!talkId && /begins for <@U7>/.test(saidOf(talked)), `${saidOf(offered).slice(0, 60)} · ${talkId} · ${saidOf(talked).slice(0, 60)}`);
     await fire({ commandName: 'activity', options: { _sub: 'stop' }, userId: plainD });
+    const offerBad = await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', speech: 'x', offer: 'Nope' }, userId: 'U1' });
+    ok('`offer:` of something that is not an activity is refused', /No live activity called \*\*Nope\*\*/.test(saidOf(offerBad)), saidOf(offerBad).slice(0, 80));
+    const talkSet = await fire({ commandName: 'npc', options: { _sub: 'edit', name: 'Dockmaster', talk: 'Ford' }, userId: 'U1' });
+    const boxDef = await fire({ isButton: true, customId: idsOf(line1).find(id => id.startsWith('npcx:')), message: line1, userId: 'U1' });
+    before = sent.length;
+    const plainSubmit = await fire({ isModal: true, customId: 'npcsay:Dockmaster', fields: { action: '', speech: 'Crossing?' }, selects: { offer: ['Ford'] }, userId: 'U1' });
+    const line4 = sinceIn('C1', before).find(m => m.webhookId);
+    before = sent.length;
+    const noOffer = await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', speech: 'Not today.', offer: 'none' }, userId: 'U1' });
+    const line5 = sinceIn('C1', before).find(m => m.webhookId);
+    ok('`talk:` is only the default pick: the box offers it pre-selected, `offer:none` withholds it', !/❌/.test(saidOf(talkSet)) && modalOf(boxDef) === 'npcsay:Dockmaster' && idsOf(line4).some(id => id.startsWith('npctalk:')) && !idsOf(line5).some(id => id.startsWith('npctalk:')), `${JSON.stringify(idsOf(line4))} · ${JSON.stringify(idsOf(line5))}`);
     guild.members.fetch = realFetchD; delete guild.members.search;
     // 17 · DC by intent, and QUIZ FROM the bank
     dbHandle.prepare("INSERT INTO quiz_questions (guild_id, category, tags, question, answers, difficulty, explain, author_id, created_at) VALUES ('G1','lore',NULL,'How many orders?','[{\"text\":\"8\",\"correct\":1},{\"text\":\"5\",\"correct\":0}]','normal',NULL,'U1',?)").run(Date.now());

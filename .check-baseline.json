@@ -1,25 +1,25 @@
 {
-  "at": "2026-10-20T22:30:29.362Z",
+  "at": "2026-10-24T17:14:55.533Z",
   "verify": {
     "green": true,
-    "assertions": 1166,
+    "assertions": 1167,
     "warnings": 15,
     "commands": 26,
     "subcommands": 287,
-    "customIds": 108,
-    "builders": 1013,
+    "customIds": 110,
+    "builders": 1014,
     "rules": 51,
     "pins": 102,
     "failures": []
   },
   "probe": {
     "green": true,
-    "probes": 224,
+    "probes": 226,
     "failures": []
   },
   "shape": {
-    "bytes": 1917607,
-    "lines": 29917,
+    "bytes": 1922683,
+    "lines": 29965,
     "tables": [
       "activity_drafts",
       "activity_pages",
@@ -284,6 +284,7 @@
       "number",
       "objectives",
       "off",
+      "offer",
       "on",
       "once",
       "order",

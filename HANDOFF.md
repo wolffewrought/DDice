@@ -49,9 +49,9 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1166 as of 2026-10-20, build E) and no
+Green means every assertion passed (1167 as of 2026-10-24, build F) and no
 scanner found an ERROR. Then run the probe: `node --experimental-sqlite
-probe.js` (224 probes: the fight, encounter, override, autocomplete and
+probe.js` (226 probes: the fight, encounter, override, autocomplete and
 every-leaf walks, the GM-gate walk, chat shorthands, scheduled ticks,
 junk-id lanes, SQL compile, forum seeding and sweep, one NPC one page, the
 A2 walk, the undo walk, the C walk, the D walk (activities: parser,
@@ -548,6 +548,37 @@ components as rows (the 5-row scanner) and pins the box's shape as the
 only label-style modal. The first real `/npc say` after deploy is the
 test the sandbox cannot run; the fallback, if Discord refuses the box, is
 the two-field action-row form from before this build (git history).
+
+**Build F — the line's shape, Reply · GM · Interaction (2026-10-24, same
+unpushed update; the 15/10 What's-new thread already exists, so the boot
+appends).** T, from the table: "Action / Speech / Ping with breaks between
+each section"; Imigun: "ping at the bottom, underneath the talking"; then
+"a button for players to click on so they can reply"; "is the interact
+button only seen by gms?" (no — buttons are for everyone; the press
+decides); "Reply (players) / GM (for gms)"; "can a gm prompt when an
+activity button is shown? Also can it renamed to interaction?".
+`composeNpcSay({ action, speech, raw, to })` now joins three blocks with
+a blank line and puts the addressed players last, never repeating
+someone named inside the words — `/rp` lines share the blank line (the
+probe's expectation moved); the audit mirror collapses blank lines in its
+quote. `npcInteractRow(gid, npc, offer)`: `npcreply:<key>` (anyone → the
+roleplay box titled as a reply; `handleNpcReplyButton`), `npcx:<key>`
+(GM → speak-as; a player is told whose it is), and `npctalk:<npcKey>:
+<activityKey>` only when an activity was offered on that line.
+`offeredActivity(gid, npc, pick)`: the pick, else the NPC's `talk:`
+default, `none|-|off` for nothing, and only a live non-demo activity.
+The box gains a fourth label — a `StringSelectMenuBuilder` `offer`
+(min 0, max 1) with *None* first and up to 24 live activities, the
+`talk:` one pre-selected — present only when the server has activities;
+read with `fields.getStringSelectValues?.('offer')` (an empty pick is
+None; a box without the field offers the default). `/npc say offer:`
+(autocompleting with `talk`'s list) is the command's form; a name that
+is not a live activity is refused. `talk:` no longer puts a button on
+every line. Probes: the row's three ids, GM/Reply by role, the line's
+exact shape with a pick, `to:` under the words, `offer:` → Interaction →
+the run, a bad `offer:`, the default pick and `offer:none`. verify: the
+box pin (four fields, two `addLabelComponents` in the file), a pin on the
+row and the composer, the `offer` id exempted like `to`.
 
 **Removed.** The `/gm kill|revive|heal` stubs (builder, dispatcher, the
 pins, the probe) — they never shipped; the changelog item says the three

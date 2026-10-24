@@ -8339,7 +8339,7 @@ function mirrorNpcSay(gid, { gmId, npcName, channelId, messageId = null, text })
   (async () => {
     const ch = await wakeThread(await client.channels.fetch(dest));
     if (!ch) { console.error(`[rollaudit] say fetch returned null for ${dest}`); return; }
-    const quote = String(text ?? '').slice(0, 900).replace(/\n/g, '\n> ');
+    const quote = String(text ?? '').slice(0, 900).replace(/\n{2,}/g, '\n').replace(/\n/g, '\n> ');
     const link = messageId ? `\n[↗ Jump to the line](https://discord.com/channels/${gid}/${channelId}/${messageId})` : '';
     await ch.send({ content: `💬 <@${gmId}> as **${npcName}** in <#${channelId}>\n> ${quote}${link}`,
       allowedMentions: { parse: [] } });
@@ -8431,16 +8431,26 @@ function npcKey(name) {
 function npcByKey(gid, key) {
   return getAllNpcs(gid, { includeTemp: true }).find(n => npcKey(n.name) === key) || null;
 }
-// The row under an NPC's line: Interact for everyone (a player gets the
-// roleplay box addressed to the NPC, a GM the speak-as box), and Talk when
-// the NPC has an activity to offer.
-function npcInteractRow(gid, npc) {
+// The row under an NPC's line: Reply for players (the roleplay box as a
+// reply to the NPC), GM for the speak-as box, and Interaction when the GM
+// offered an activity on this line — chosen per line in the box or with
+// `offer:`, the NPC's `talk:` only the default pick (T, 2026-10-24).
+function npcInteractRow(gid, npc, offer = null) {
   const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
   const key = npcKey(npc.name);
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`npcx:${key}`).setLabel('🎭 Interact').setStyle(ButtonStyle.Secondary));
-  if (npc.talk_activity) row.addComponents(new ButtonBuilder().setCustomId(`npctalk:${key}`).setLabel(`💬 ${String(npc.talk_activity).slice(0, 60)}`).setStyle(ButtonStyle.Primary));
+    new ButtonBuilder().setCustomId(`npcreply:${key}`).setLabel('💬 Reply').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`npcx:${key}`).setLabel('🎭 GM').setStyle(ButtonStyle.Secondary));
+  if (offer) row.addComponents(new ButtonBuilder().setCustomId(`npctalk:${key}:${activityKey(offer)}`).setLabel('🎮 Interaction').setStyle(ButtonStyle.Success));
   return row;
+}
+// The activity a GM may offer on a line: what they picked, or the NPC's
+// default; a name that is no longer an activity offers nothing.
+function offeredActivity(gid, npc, pick) {
+  const name = pick === undefined || pick === null ? npc?.talk_activity : pick;
+  if (!name || /^(none|-|off)$/i.test(String(name))) return null;
+  const st = getStory(gid, String(name));
+  return st && storyIsLive(gid, st) ? st.name : null;
 }
 // Only the latest line in a channel carries the button: when the next one
 // posts, the one before loses its row.
@@ -8459,13 +8469,13 @@ async function clearNpcLineButtons(channel, gid, npcName, messageId) {
     if (hook?.edit) await hook.edit(messageId, { components: [] });
   } catch {}
 }
-async function postAsNpc(channel, gid, npcName, content, { interact = false } = {}) {
+async function postAsNpc(channel, gid, npcName, content, { interact = false, offer = null } = {}) {
   noteNpcSpeech(gid, channel, npcName, content);
   const npc = getNpc(gid, npcName);
   const guild = channel.guild;
   const resolved = guild ? await resolveNameMentions(guild, content).catch(() => ({ text: content, users: [] })) : { text: content, users: [] };
   const payload = { content: resolved.text, allowedMentions: { parse: [], users: resolved.users.slice(0, 20) } };
-  const row = interact && npc ? npcInteractRow(gid, npc) : null;
+  const row = interact && npc ? npcInteractRow(gid, npc, offer) : null;
   const sendVia = async (hook) => {
     if (row) {
       try { return await hook.send({ ...payload, components: [row] }); }
@@ -8503,33 +8513,45 @@ async function postAsNpc(channel, gid, npcName, content, { interact = false } = 
 }
 // The Interact button: a GM gets the speak-as box for that NPC, a player
 // the roleplay box titled as a reply to them.
-async function handleNpcInteractButton(interaction) {
+// Reply: the roleplay box as a reply to the NPC, for anyone — a GM who
+// presses it replies as their own character.
+async function handleNpcReplyButton(interaction) {
   const gid = interaction.guild.id;
   const npc = npcByKey(gid, interaction.customId.split(':')[1]);
   if (!npc) return interaction.reply({ content: '❌ That NPC is gone.', ephemeral: true });
-  if (await isGm(interaction.guild, interaction.user.id)) return interaction.showModal(npcSayModal(npc));
   const m = rpModal();
   m.setTitle(`Reply to ${npc.name}`.slice(0, 45));
   return interaction.showModal(m);
 }
-// The Talk button: the NPC's activity, for whoever pressed. The GM chose
-// to hang it on the NPC, so the server's open/closed setting does not apply.
-async function handleNpcTalkButton(interaction) {
+// GM: the speak-as box for that NPC; a player is told quietly whose it is.
+async function handleNpcInteractButton(interaction) {
   const gid = interaction.guild.id;
   const npc = npcByKey(gid, interaction.customId.split(':')[1]);
-  if (!npc?.talk_activity) return interaction.reply({ content: '❌ That NPC has nothing to offer now.', ephemeral: true });
-  const story = getStory(gid, npc.talk_activity);
-  if (!story) return interaction.reply({ content: `❌ **${npc.name}**'s activity, **${npc.talk_activity}**, is gone.`, ephemeral: true });
+  if (!npc) return interaction.reply({ content: '❌ That NPC is gone.', ephemeral: true });
+  if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: `🎭 That one is the GM's — it speaks as **${npc.name}**. **Reply** is yours.`, ephemeral: true });
+  return interaction.showModal(npcSayModal(npc, gid));
+}
+// Interaction: the activity the GM offered on that line, for whoever
+// pressed. The GM chose to offer it, so the server's open/closed setting
+// does not apply.
+async function handleNpcTalkButton(interaction) {
+  const gid = interaction.guild.id;
+  const [, nkey, akey] = interaction.customId.split(':');
+  const npc = npcByKey(gid, nkey);
+  if (!npc) return interaction.reply({ content: '❌ That NPC is gone.', ephemeral: true });
+  const story = akey ? storyByKey(gid, akey) : (npc.talk_activity ? getStory(gid, npc.talk_activity) : null);
+  if (!story || !storyIsLive(gid, story)) return interaction.reply({ content: `❌ What **${npc.name}** offered is no longer there.`, ephemeral: true });
   return handleStory(interaction, { sub: 'run', name: story.name, viaButton: true });
 }
-// The speak-as box: action, speech, and a "To" picker of up to three
-// players, who are pinged first. Built in the label style discord.js 14.27
-// reads modals in (every field a label wrapping its component, nothing in
-// an action row) — `package.json` pins the floor at ^14.27.0 for it. The
-// other boxes keep the action-row style, which the library still takes;
-// this one is the only one that mixes a select into a modal.
-function npcSayModal(npc) {
-  const { ModalBuilder, TextInputBuilder, TextInputStyle, LabelBuilder, UserSelectMenuBuilder } = require('discord.js');
+// The speak-as box: action, speech, a "To" picker of up to three players
+// (named last), and — when the server has activities — which one to offer
+// on this line, the NPC's `talk:` pre-selected. Built in the label style
+// discord.js 14.27 reads modals in (every field a label wrapping its
+// component, nothing in an action row) — `package.json` pins the floor at
+// ^14.27.0 for it. The other boxes keep the action-row style, which the
+// library still takes; this one is the only one that mixes selects into a modal.
+function npcSayModal(npc, gid = null) {
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, LabelBuilder, UserSelectMenuBuilder, StringSelectMenuBuilder } = require('discord.js');
   const modal = new ModalBuilder()
     .setCustomId(`npcsay:${npc.name}`.slice(0, 100))
     .setTitle(`Speak as ${npc.name}`.slice(0, 45));
@@ -8544,8 +8566,19 @@ function npcSayModal(npc) {
   modal.addLabelComponents(
     new LabelBuilder().setLabel('Action (optional)').setTextInputComponent(actionInput),
     new LabelBuilder().setLabel('Speech (optional)').setDescription('@Name in the words pings them too').setTextInputComponent(speechInput),
-    new LabelBuilder().setLabel('To (optional)').setDescription('They are mentioned first; only people are ever pinged').setUserSelectMenuComponent(toPicker),
+    new LabelBuilder().setLabel('To (optional)').setDescription('Named under the words; only people are ever pinged').setUserSelectMenuComponent(toPicker),
   );
+  // The activities, when there are any: None, then the first twenty-four
+  // live ones; the NPC's default pre-selected so a plain submit offers it.
+  const live = gid ? listStories(gid).filter(st => storyIsLive(gid, st) && !isDemoStory(st.name)) : [];
+  if (live.length) {
+    const def = npc.talk_activity && live.some(st => st.name.toLowerCase() === String(npc.talk_activity).toLowerCase()) ? String(npc.talk_activity).toLowerCase() : null;
+    const options = [{ label: 'None', value: 'none', default: !def }];
+    for (const st of live.slice(0, 24)) options.push({ label: st.name.slice(0, 100), value: st.name.slice(0, 100), default: st.name.toLowerCase() === def });
+    const offer = new StringSelectMenuBuilder().setCustomId('offer').setPlaceholder('Offer an activity on this line?')
+      .setMinValues(0).setMaxValues(1).setRequired(false).addOptions(options);
+    modal.addLabelComponents(new LabelBuilder().setLabel('Interaction (optional)').setDescription('An 🎮 Interaction button under the line starts it for whoever presses').setStringSelectMenuComponent(offer));
+  }
   return modal;
 }
 
@@ -9184,19 +9217,22 @@ async function handlePr(interaction) {
     if (!npc) return interaction.reply({ content: `❌ NPC **${name}** not found. Create one with \`/npc create\`.`, ephemeral: true });
 
     // Nothing supplied → open a proper writing box with multi-line fields.
-    if (!action && !speech && !raw) return interaction.showModal(npcSayModal(npc));
+    if (!action && !speech && !raw) return interaction.showModal(npcSayModal(npc, gid));
 
-    const text = composeNpcSay({ action, speech, raw });
-    if (!text) return interaction.reply({ content: '❌ Nothing to post.', ephemeral: true });
-    if (text.length > 1800) return interaction.reply({ content: '❌ Message too long (max 1800 characters).', ephemeral: true });
-
-    // `to:` puts the mention first, unless the text already addresses them.
+    // `to:` names them under the words; `offer:` puts an Interaction button
+    // under the line (the NPC's `talk:` when it is not given; `none` for none).
     const to = interaction.options.getUser('to');
-    const body = to && !text.includes(`<@${to.id}>`) ? `<@${to.id}> ${text}` : text;
+    const body = composeNpcSay({ action, speech, raw, to: to ? [to.id] : [] });
+    if (!body) return interaction.reply({ content: '❌ Nothing to post.', ephemeral: true });
+    if (body.length > 1800) return interaction.reply({ content: '❌ Message too long (max 1800 characters).', ephemeral: true });
+    const offerOpt = interaction.options.getString('offer');
+    if (offerOpt && !/^(none|-|off)$/i.test(offerOpt.trim()) && !offeredActivity(gid, npc, offerOpt.trim()))
+      return interaction.reply({ content: `❌ No live activity called **${offerOpt.trim()}** — \`/activity list\` shows what there is.`, ephemeral: true });
+    const offer = offeredActivity(gid, npc, offerOpt == null ? undefined : offerOpt.trim());
 
     const chan = await interactionChannel(interaction);
     if (!chan) return interaction.reply({ content: MSG_NO_ACCESS, ephemeral: true });
-    const said = await postAsNpc(chan, gid, npc.name, body, { interact: true });
+    const said = await postAsNpc(chan, gid, npc.name, body, { interact: true, offer });
     if (!said) return interaction.reply({ content: `❌ I couldn't post in this channel — check my permissions here.`, ephemeral: true });
     mirrorNpcSay(gid, { gmId: interaction.user.id, npcName: npc.name, channelId: chan.id,
       messageId: said?.id ?? null, text: body });
@@ -9334,17 +9370,26 @@ async function handlePr(interaction) {
 // Compose an NPC's post from an optional action and an optional speech line.
 // Action is italicised, speech is wrapped in quote marks (unless the writer
 // already quoted it), and both together stack on separate lines.
-function composeNpcSay({ action, speech, raw }) {
-  if (raw && raw.trim()) return raw.trim();
+// A spoken line is three blocks with a blank line between — the action in
+// italics, the speech in quotes, and whoever it is addressed to — any of
+// them absent without leaving a gap (T, 2026-10-24: "Action / Speech /
+// Ping"). Someone already named inside the words is not named again.
+function composeNpcSay({ action, speech, raw, to = [] }) {
   const parts = [];
   const act = (action || '').trim();
   const say = (speech || '').trim();
-  if (act) parts.push(`*${act}*`);
-  if (say) {
-    const alreadyQuoted = /^["\u201c][\s\S]*["\u201d]$/.test(say);
-    parts.push(alreadyQuoted ? say : `"${say}"`);
+  if (raw && raw.trim()) parts.push(raw.trim());
+  else {
+    if (act) parts.push(`*${act}*`);
+    if (say) {
+      const alreadyQuoted = /^["\u201c][\s\S]*["\u201d]$/.test(say);
+      parts.push(alreadyQuoted ? say : `"${say}"`);
+    }
   }
-  return parts.join('\n');
+  const words = parts.join('\n');
+  const pings = [...new Set((to || []).filter(Boolean).map(String))].filter(id => !words.includes(`<@${id}>`)).map(id => `<@${id}>`);
+  if (pings.length) parts.push(pings.join(' '));
+  return parts.join('\n\n');
 }
 
 // Submission from the /npc say writing box.
@@ -9358,20 +9403,21 @@ async function handleNpcSayModal(interaction) {
 
   const action = interaction.fields.getTextInputValue('action');
   const speech = interaction.fields.getTextInputValue('speech');
-  let body = composeNpcSay({ action, speech });
-  if (!body) return interaction.reply({ content: '❌ Both boxes were empty — nothing posted.', ephemeral: true });
-  // The To picker: those people are addressed first, unless the words
-  // already do it. Read loosely — a box opened before the deploy has no
-  // such field, and the library returns nothing rather than throwing.
+  // The To picker names them under the words; the Interaction pick puts the
+  // button under the line. Both read loosely — a box opened before a deploy
+  // may lack the field, and the library returns nothing rather than throwing.
   let picked = [];
   try { picked = [...(interaction.fields.getSelectedUsers?.('to', false)?.values?.() || [])].map(u => u.id); } catch { picked = []; }
-  const lead = picked.filter(id => !body.includes(`<@${id}>`)).map(id => `<@${id}>`).join(' ');
-  if (lead) body = `${lead} ${body}`;
+  let pick;
+  try { const v = interaction.fields.getStringSelectValues?.('offer'); pick = Array.isArray(v) && v.length ? v[0] : (v && v.length === 0 ? 'none' : undefined); } catch { pick = undefined; }
+  const body = composeNpcSay({ action, speech, to: picked });
+  if (!body) return interaction.reply({ content: '❌ Both boxes were empty — nothing posted.', ephemeral: true });
   if (body.length > 1800) return interaction.reply({ content: '❌ Too long (max 1800 characters).', ephemeral: true });
+  const offer = offeredActivity(gid, npc, pick);
 
   const chan = await interactionChannel(interaction);
   if (!chan) return interaction.reply({ content: MSG_NO_ACCESS, ephemeral: true });
-  const said = await postAsNpc(chan, gid, npc.name, body, { interact: true });
+  const said = await postAsNpc(chan, gid, npc.name, body, { interact: true, offer });
   if (!said) return interaction.reply({ content: `❌ I couldn't post in this channel — check my permissions here.`, ephemeral: true });
   mirrorNpcSay(gid, { gmId: interaction.user.id, npcName: npc.name, channelId: chan.id,
     messageId: said?.id ?? null, text: body });
@@ -22569,8 +22615,8 @@ const CHANGELOG = [
         detail: 'A second `/activity run` used to be refused; it now re-posts the current scene, buttons and all, with `/activity stop` named for abandoning it. The quest tick puts away runs with no press in seven days, logs them as expired, and says so in the channel. The undo journal\'s sheet section now includes merits and renown, and a new `runs` section snapshots this channel\'s story runs, so an ending paid by mistake can be rewound.' },
       { line: 'The writer: `/activity write name:` builds an activity one scene at a time in boxes \u2014 name, narration, what it asks, where each result goes, extras \u2014 naming the scenes still to write; Finish composes the script and saves it; `/activity create template:` starts the box from a worked example; `/activity grammar` is the cheat sheet; The Scribe\'s Trial is a tutorial you play',
         detail: 'Each scene is five boxes; the bot writes the grammar, keeps the work in progress per GM, lists the scenes pointed at but not yet written with a button for each, shows problems in the scene as you go, and on Finish saves through the same door as a paste (problems keep the writer\'s scenes so you can go round again). Five templates \u2014 a roll with two ways out, a branching tale with a flag, a quiz, a gauntlet with a tally, bare bones \u2014 arrive in the box with their guidance in comments. `/activity grammar [topic:]` prints the grammar a screen at a time. `/activity demo which:trial` plays *The Scribe\'s Trial*, a tutorial written in the grammar it teaches, its script on the shelf beside it.' },
-      { line: 'An NPC can call a player by name: a To picker in the `/npc say` box, `to:` on the command, or `@Name` in the words \u2014 each a real mention, and only people are ever pinged from an NPC\'s mouth; every NPC line carries a 🎭 Interact button, and `/npc edit talk:` hangs an activity on them with a 💬 Talk button. `discord.js` floor raised to ^14.27.0 for the picker',
-        detail: 'The writing box has no mention popup, so `@Aldric` there was plain text; it now resolves by server nickname, display name or username, longest match first. The webhook used to send with no mention filter, which meant an NPC could `@everyone`; sends are now users-only. The box itself gained a *To* picker — up to three players, mentioned first unless the words already do it — built in the label style discord.js reads modals in since 14.22, so `package.json` raises its floor to `^14.27.0` (delete or regenerate `package-lock.json` if the repo has one). The Interact button under an NPC\'s said lines opens the roleplay box titled as a reply to that NPC for a player, the speak-as box for a GM; only the newest line in a channel keeps it. Fight cards keep their own buttons. `talk:` names an activity (autocompleting; `none` clears) and its Talk button starts it for whoever pressed, the server\'s open/closed setting aside, since the GM chose to offer it.' },
+      { line: 'An NPC can call a player by name: a To picker in the `/npc say` box, `to:` on the command, or `@Name` in the words \u2014 each a real mention, and only people are ever pinged from an NPC\'s mouth. A line reads action · speech · who it is for, a blank line between. Under every line: 💬 Reply for players, 🎭 GM for the speak-as box, and 🎮 Interaction when the GM offered an activity on that line (the box\'s dropdown, or `offer:`; `talk:` is the default pick). `discord.js` floor raised to ^14.27.0',
+        detail: 'The writing box has no mention popup, so `@Aldric` there was plain text; it now resolves by server nickname, display name or username, longest match first. The webhook used to send with no mention filter, which meant an NPC could `@everyone`; sends are now users-only. The box itself gained a *To* picker — up to three players, mentioned first unless the words already do it — built in the label style discord.js reads modals in since 14.22, so `package.json` raises its floor to `^14.27.0` (delete or regenerate `package-lock.json` if the repo has one). A line is laid out as three blocks with a blank line between — the action in italics, the speech in quotes, then whoever it is addressed to (the picked players, or `to:`); someone already named inside the words is not named again, and `raw:` keeps its text with the names after. Under every said line sit **Reply** (anyone: the roleplay box titled as a reply to that NPC; a GM replies as their own character) and **GM** (the speak-as box; a player pressing it is told quietly whose it is), and **Interaction** when the GM offered an activity on that line — a fourth field in the box lists the server\'s live activities with *None* first and the NPC\'s `talk:` pre-selected, and `offer:` does the same on the command (`none` withholds it). Pressing Interaction starts that activity for whoever pressed, the server\'s open/closed setting aside, since the GM chose to offer it. `talk:` (autocompleting; `none` clears) is now only that default pick, no longer a button on every line. Only the newest line in a channel keeps its buttons; fight cards keep their own.' },
     ], player: [
       'Every fight button opens a short form \u2014 what you do, what you say, both optional \u2014 and your words sit on the card: attack, defence, Grapple, Feint, Deflect, Disarm, the holds, Save, Insight. A blank form is a plain roll. With one foe, a stat press goes straight to the form',
       'Every turn line shows everyone\'s HP, and any condition the GM has marked you with, counting down',
@@ -22591,8 +22637,8 @@ const CHANGELOG = [
       'The weekly chronicle now ends with the dice of the week \u2014 natural 20s and 1s and who rolled them, the biggest total',
       'The quiet-fight ping is a setting now; your GM can slow it or turn it off for a play-by-post table',
       'Play an activity together: `/activity run name:X party:@A @B` \u2014 you press in turn, the tally is shared, and the ending pays every one of you',
-      'A pinned board may list the activities with a \u25b6 Play button each; an NPC may offer one with a \U0001F4AC Talk button under their words',
-      'Every NPC line carries a \U0001F3AD Interact button \u2014 press it and the roleplay box opens as a reply to them; an NPC may now call you by name, or pick you from a list, and you will be pinged',
+      'A pinned board may list the activities with a \u25b6 Play button each; an NPC may offer one with a \U0001F3AE Interaction button under their words',
+      'Every NPC line carries a \U0001F4AC Reply button \u2014 press it and the roleplay box opens as a reply to them (the \U0001F3AD GM button beside it is the GM\'s); an NPC may now call you by name, or pick you from a list, and you will be pinged under their words',
       '`/activity run` while you are mid-way shows you where you are instead of refusing; a run you leave for a week is put away on its own',
       'Some activities are once a day or week, run on certain days, or need a title to start; some endings pay only your first finish \u2014 the message says which, and when you can go again',
       '`/activity scores name:X` \u2014 the best score per player, and how it has been played; the weekly chronicle ends with the week\'s activities and its best score',
@@ -27029,7 +27075,8 @@ const slashCommands = [
       .addStringOption(o=>o.setName('action').setDescription('What the NPC does — posted in italics').setRequired(false))
       .addStringOption(o=>o.setName('speech').setDescription('What the NPC says — wrapped in quote marks').setRequired(false))
       .addStringOption(o=>o.setName('raw').setDescription('Post exactly as typed — overrides action/speech').setRequired(false))
-      .addUserOption(o=>o.setName('to').setDescription('Who the NPC addresses — they are pinged; @Name in the text works too').setRequired(false)))
+      .addUserOption(o=>o.setName('to').setDescription('Who the NPC addresses — named under the words and pinged; @Name in the text works too').setRequired(false))
+      .addStringOption(o=>o.setName('offer').setDescription('An activity to offer on this line as an Interaction button — or none').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('roll').setDescription('Roll dice as an NPC — it posts under their name and face')
       .addStringOption(o=>o.setName('category').setDescription('Filter NPCs by category').setRequired(true)
         .addChoices({name:'All',value:'all'}))
@@ -27044,7 +27091,7 @@ const slashCommands = [
     .addSubcommand(s=>withNpcStatOptions(s.setName('edit').setDescription('Change an existing NPC — only the options you pass; the rest stays')
       .addStringOption(o=>o.setName('name').setDescription('Which NPC').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('category').setDescription('What kind they are — Enemy, Ally, Vendor… a new one is made if it does not exist').setRequired(false).setAutocomplete(true))
-      .addStringOption(o=>o.setName('talk').setDescription('An activity a 💬 Talk button on their lines starts — or none').setRequired(false).setAutocomplete(true)))
+      .addStringOption(o=>o.setName('talk').setDescription('The activity pre-picked when this NPC speaks (offer: or the box decides per line) — or none').setRequired(false).setAutocomplete(true)))
       .addStringOption(o=>o.setName('order').setDescription('Knight order (optional)').setRequired(false)
         .addChoices(...KNIGHT_ORDER_CHOICES, {name:'✖️ Clear it',value:'none'})))
     .addSubcommand(s=>s.setName('reroll').setDescription('Reroll an NPC\'s last roll here — spends one of its LCK tokens')
@@ -27824,7 +27871,7 @@ const HELP_CATEGORIES = {
       '`/activity run name:X` — start one in this channel (mid-run already? it shows you where you are) · `/activity stop` — stop the one running here',
       'A **Reroll** button sits on the scene card while a token remains — one second chance per roll',
       'Some scenes offer **choices** as buttons; some tally renown as you play and bank it at the end; some are once a day, run on certain days, or need a title to start — the refusal says which',
-      'A pinned **board** may list the activities with a ▶ Play button each (`/config channels activityboard`); an NPC may carry a 💬 Talk button that starts one',
+      'A pinned **board** may list the activities with a ▶ Play button each (`/config channels activityboard`); an NPC may offer one with a 🎮 Interaction button under their words',
       '`/activity demo [which:]` — the built-in fishing tale, the lore quiz, or The Scribe\'s Trial that teaches the grammar; no stakes (GM)',
       '_In 5e, an attack is measured against the target\'s Armour Class — nobody rolls to defend, and the blow resolves at once. A natural 20 always hits and rolls the weapon dice twice; a natural 1 always misses._',
       '`/config channels npcforum channel:#forum` — every NPC gets a page there, tagged with their categories so the sidebar filter sorts them (Admin)',
@@ -27987,8 +28034,8 @@ const HELP_CATEGORIES = {
       '`/npc manage copy name:Hollow new_name:Hollow 2` — duplicate an NPC (GM)',
       '`/npc show name:Hollow` — full stat block for one NPC',
       '`/npc hero name:X stat:str` — make an NPC a Hero with a signature stat (GM)',
-      '`/npc say name:X speech:... [action:...] [to:@Players]` — speak or act as an NPC, no dice. The box has a **To** picker (up to three players, mentioned first) and `@Name` in the words pings that person too; only people are ever pinged, never a role or everyone. Every NPC line carries a 🎭 **Interact** button — a player gets the roleplay box, a GM the speak-as box (GM)',
-      '`/npc edit name:X talk:Activity` — a 💬 Talk button under their lines starts that activity for whoever pressed (GM)',
+      '`/npc say name:X speech:... [action:...] [to:@Players] [offer:Activity]` — speak or act as an NPC, no dice: action, speech, then who it is for, a blank line between. The box has a **To** picker (up to three players) and an **Interaction** dropdown; `@Name` in the words pings that person too; only people are ever pinged, never a role or everyone (GM)',
+      '↳ Under every NPC line: 💬 **Reply** (players — the roleplay box as a reply to them), 🎭 **GM** (the speak-as box), and 🎮 **Interaction** when you offered an activity on that line — it starts for whoever presses. `/npc edit name:X talk:Activity` sets the default pick (GM)',
       '`/npc list category:Hollows` — list only one category\'s NPCs',
       '',
       '**Faces** — post a picture in the portrait forum:',
@@ -28192,6 +28239,7 @@ async function routeButton(interaction) {
     if (interaction.customId.startsWith('actv:')) return handleActivityShelfButton(interaction);
     if (interaction.customId.startsWith('actvw:')) return handleWriterButton(interaction);
     if (interaction.customId.startsWith('npcx:')) return handleNpcInteractButton(interaction);
+    if (interaction.customId.startsWith('npcreply:')) return handleNpcReplyButton(interaction);
     if (interaction.customId.startsWith('npctalk:')) return handleNpcTalkButton(interaction);
     if (interaction.customId.startsWith('loreok:') || interaction.customId.startsWith('loreno:')) return handleLoreButton(interaction);
     if (interaction.customId.startsWith('tradeok:') || interaction.customId.startsWith('tradeno:')) return handleMeritTradeButton(interaction);
@@ -29011,7 +29059,7 @@ async function handleInteraction(interaction) {
         const v = String(focusedOption.value || '').toLowerCase();
         return await interaction.respond(acPick(listStories(interaction.guild.id).map(r => r.name), v));
       }
-      if (interaction.commandName === 'npc' && focusedOption.name === 'talk') {
+      if (interaction.commandName === 'npc' && (focusedOption.name === 'talk' || focusedOption.name === 'offer')) {
         const v = String(focusedOption.value || '').toLowerCase();
         return await interaction.respond(acPick(['none', ...listStories(interaction.guild.id).map(r => r.name)], v));
       }
