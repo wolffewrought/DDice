@@ -49,9 +49,9 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1167 as of 2026-10-24, build F) and no
+Green means every assertion passed (1168 as of 2026-10-25, build G) and no
 scanner found an ERROR. Then run the probe: `node --experimental-sqlite
-probe.js` (226 probes: the fight, encounter, override, autocomplete and
+probe.js` (227 probes: the fight, encounter, override, autocomplete and
 every-leaf walks, the GM-gate walk, chat shorthands, scheduled ticks,
 junk-id lanes, SQL compile, forum seeding and sweep, one NPC one page, the
 A2 walk, the undo walk, the C walk, the D walk (activities: parser,
@@ -579,6 +579,21 @@ exact shape with a pick, `to:` under the words, `offer:` → Interaction →
 the run, a bad `offer:`, the default pick and `offer:none`. verify: the
 box pin (four fields, two `addLabelComponents` in the file), a pin on the
 row and the composer, the `offer` id exempted like `to`.
+
+**Build G — the class tag (2026-10-25, same unpushed update).** T: "When
+I go to filter in the player sheets thread by class … those 3 don't
+appear." `ensureCharPage` tagged from `ch.char_class` — the 5e class —
+while a Knightfall sheet's class is `ch.class` (`/char create class:`),
+so Vanguard/Defender/Siege Knight existed as forum tags and no thread
+ever carried them; the page header had the same slip. Now
+`ch.class || ch.char_class` in both places; the boot mend rewrites every
+page, so the tags land on the next deploy. Probe: a plain-player U2 with
+`class='Vanguard'` edits their order (a stat edit meets the budget rules
+first) and the page's `appliedTags` resolve to Vanguard and Black Knight
+— the fake forum now keeps `appliedTags` on `threads.create` and gives
+new tags ids in `setAvailableTags`; the probe was confirmed to fail on
+the pre-G file. verify pins the column and the header. One GM bullet and
+one player bullet in the 10-15 entry.
 
 **Removed.** The `/gm kill|revive|heal` stubs (builder, dispatcher, the
 pins, the probe) — they never shipped; the changelog item says the three

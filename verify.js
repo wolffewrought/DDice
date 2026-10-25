@@ -1936,6 +1936,12 @@ function testBuilders(src) {
       /const starter = await thread\.messages\.fetch\(thread\.id\)/.test(src) &&
       /ensureCharBlocks\(client, guild, uid, thread, body\)/.test(src) &&
       /function charPageBody\(gid, ch, displayName\)/.test(src));
+    // The Knightfall class is `class`; `char_class` is 5e's. The page tagged
+    // from the wrong one for a month (T, 2026-10-25).
+    ok('a character page is tagged with its Knightfall class, the 5e column only a fallback, and names it in the header',
+      /const klass = ch\?\.class \|\| ch\?\.char_class \|\| null;\s*\n\s*if \(klass && CHAR_TAG_CLASSES\.some\(c => c\.toLowerCase\(\) === klass\.toLowerCase\(\)\)\) \{/.test(src) &&
+      /\$\{\(ch\.class \|\| ch\.char_class\) \? ` · \$\{ch\.class \|\| ch\.char_class\}` : ''\}`\];/.test(src) &&
+      !/ch\?\.char_class && CHAR_TAG_CLASSES/.test(src));
     ok('every sheet edit re-mirrors through done',
       /const done = \(content\) => \{ ensureCharPage\(interaction\.client/.test(src));
     ok('the Fallen tag follows kill and revive \u2014 under /existence since 2026-10-15; the /gm stubs that answered with the new address went with the same, unpushed, update',

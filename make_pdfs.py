@@ -1401,6 +1401,10 @@ PARTS['gmchar'] = [
           ('/char page user:@Players', 'make one now'),
           ('/char page user:@Players thread:#their-thread', 'or link a post that already exists'),
           ('/char page user:@Players unlink:true', 'forget it \u2014 the thread itself is untouched')]),
+('p', 'Every page carries up to four <b>tags</b> \u2014 its order (White Knight, Black Knight\u2026), its class '
+      '(Vanguard, Defender, Siege Knight), <b>Hero</b>, and <b>Fallen</b> \u2014 so the forum\u2019s own filter answers '
+      '\u201cevery Black Knight Vanguard\u201d or \u201cwho has died\u201d without a command. The class tag read the '
+      'wrong column until 25/10 and never landed; the first boot after that writes every page again.'),
 ('note', 'Pages are made when a sheet is <b>approved</b>. If the forum is missing or the bot cannot post '
          'there, the approval still goes through and the ' + GM + ' is told what went wrong \u2014 a broken '
          'forum must never block a character. If a thread is later deleted, the next attempt makes a fresh '

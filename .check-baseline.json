@@ -1,25 +1,25 @@
 {
-  "at": "2026-10-24T17:14:55.533Z",
+  "at": "2026-10-25T03:23:16.909Z",
   "verify": {
     "green": true,
-    "assertions": 1167,
+    "assertions": 1168,
     "warnings": 15,
     "commands": 26,
     "subcommands": 287,
     "customIds": 110,
-    "builders": 1014,
+    "builders": 1015,
     "rules": 51,
     "pins": 102,
     "failures": []
   },
   "probe": {
     "green": true,
-    "probes": 226,
+    "probes": 227,
     "failures": []
   },
   "shape": {
-    "bytes": 1922683,
-    "lines": 29965,
+    "bytes": 1923627,
+    "lines": 29972,
     "tables": [
       "activity_drafts",
       "activity_pages",

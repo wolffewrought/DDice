@@ -121,9 +121,9 @@ class FakeChannel {
       cache: new Map(),
     };
     this.threads = {
-      create: async ({ name, message }) => {
+      create: async ({ name, message, appliedTags }) => {
         const t = new FakeChannel(nextId(), 11, name, guild);
-        t.parentId = this.id; t._isThread = true; t.ownerId = 'BOT';
+        t.parentId = this.id; t._isThread = true; t.ownerId = 'BOT'; t.appliedTags = appliedTags || [];
         threads.push(t);
         channelsById.set(t.id, t);   // fetchable by id, as a real thread is
         if (message) await t.send(message);
@@ -146,7 +146,8 @@ class FakeChannel {
   permissionsFor() { return { has: () => true }; }
   async setName(n) { this.name = n; }
   async setAppliedTags(t) { this.appliedTags = t; }
-  async setAvailableTags(t) { this.availableTags = t; }
+  // Discord gives every tag an id; a tag sent without one is new and gets one here.
+  async setAvailableTags(t) { this.availableTags = t.map(x => ({ ...x, id: x.id || nextId() })); }
   async fetch() { return this; }
   async send(payload) {
     const content = typeof payload === 'string' ? payload : (payload?.content ?? '');
@@ -2088,6 +2089,25 @@ async function fire(over) {
     const line5 = sinceIn('C1', before).find(m => m.webhookId);
     ok('`talk:` is only the default pick: the box offers it pre-selected, `offer:none` withholds it', !/❌/.test(saidOf(talkSet)) && modalOf(boxDef) === 'npcsay:Dockmaster' && idsOf(line4).some(id => id.startsWith('npctalk:')) && !idsOf(line5).some(id => id.startsWith('npctalk:')), `${JSON.stringify(idsOf(line4))} · ${JSON.stringify(idsOf(line5))}`);
     guild.members.fetch = realFetchD; delete guild.members.search;
+    // 16b · a sheet's page is tagged with its Knightfall class as well as its order
+    {
+      const charForumT = [...channelsById.values()].find(c => c.name === 'character-pages');
+      if (charForumT) {
+        dbHandle.prepare("UPDATE guild_config SET char_forum=? WHERE guild_id='G1'").run(charForumT.id);
+        dbHandle.prepare("UPDATE characters SET class='Vanguard', char_class=NULL, order_name='Black Knight' WHERE guild_id='G1' AND user_id='U2'").run();
+        // U2 must be a plain player here: a GM's page goes to the GM forum, or nowhere.
+        const realFetchT = guild.members.fetch;
+        guild.members.fetch = async (uid) => { const mb = await realFetchT(uid); if (uid === 'U2') { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+        // An order edit re-mirrors the page (a stat edit would meet the budget rules first).
+        await fire({ commandName: 'char', options: { _sub: 'set', field: 'order', value: 'Black Knight' }, userId: 'U2', member: { id: 'U2', roles: { cache: new Map() }, permissions: { has: () => false } } }).catch(() => {});
+        await settle();
+        guild.members.fetch = realFetchT;
+        const pageRow = dbHandle.prepare("SELECT thread_id FROM char_pages WHERE guild_id='G1' AND user_id='U2'").get();
+        const th = pageRow ? channelsById.get(pageRow.thread_id) : null;
+        const names = (th?.appliedTags || []).map(id => (charForumT.availableTags || []).find(t => t.id === id)?.name || id);
+        ok('a Knightfall sheet\'s page carries its class tag beside its order', !!th && names.includes('Vanguard') && names.includes('Black Knight'), `${JSON.stringify(names)} · ${th ? 'thread' : 'no thread'}`);
+      }
+    }
     // 17 · DC by intent, and QUIZ FROM the bank
     dbHandle.prepare("INSERT INTO quiz_questions (guild_id, category, tags, question, answers, difficulty, explain, author_id, created_at) VALUES ('G1','lore',NULL,'How many orders?','[{\"text\":\"8\",\"correct\":1},{\"text\":\"5\",\"correct\":0}]','normal',NULL,'U1',?)").run(Date.now());
     dbHandle.prepare("INSERT INTO quiz_questions (guild_id, category, tags, question, answers, difficulty, explain, author_id, created_at) VALUES ('G1','lore',NULL,'Who crowned the king?','[{\"text\":\"the archivist\",\"correct\":1}]','normal',NULL,'U1',?)").run(Date.now());

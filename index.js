@@ -6801,7 +6801,7 @@ async function ensureCharTags(forum) {
 // The sheet a character's thread starts with — the character-side twin of
 // npcPageBody, edited in place forever after.
 function charPageBody(gid, ch, displayName) {
-  const lines = [`📜 **${displayName}**${ch.order_name ? ` — ${KNIGHT_EMOJIS[ch.order_name] ?? ''} ${ch.order_name}` : ''}${ch.char_class ? ` · ${ch.char_class}` : ''}`];
+  const lines = [`📜 **${displayName}**${ch.order_name ? ` — ${KNIGHT_EMOJIS[ch.order_name] ?? ''} ${ch.order_name}` : ''}${(ch.class || ch.char_class) ? ` · ${ch.class || ch.char_class}` : ''}`];
   if (isFallen(gid, ch.user_id)) lines.push(`⚰ **Fallen** — awaiting \`/existence revive\``);
   lines.push(`❤ HP **${ch.hp_current ?? 0}${ch.max_hp ? ` / ${ch.max_hp}` : ''}**`);
   const st = ['str','con','dex','wis','lck'].map(k => `${k.toUpperCase()} **${ch[k] ?? 0}**`).join(' · ');
@@ -6846,8 +6846,12 @@ async function ensureCharPage(client, guild, uid, displayName, scope = 'sheet') 
   if (ch?.order_name && CHAR_TAG_ORDERS.some(o => o.toLowerCase() === ch.order_name.toLowerCase())) {
     const id = tagMap[ch.order_name.toLowerCase()]; if (id) applied.push(id);
   }
-  if (ch?.char_class && CHAR_TAG_CLASSES.some(c => c.toLowerCase() === ch.char_class.toLowerCase())) {
-    const id = tagMap[ch.char_class.toLowerCase()]; if (id) applied.push(id);
+  // A Knightfall class lives in `class`; `char_class` is the 5e one — the
+  // tag read the wrong column, so no page ever carried Vanguard, Defender
+  // or Siege Knight and the filter came back empty (T, 2026-10-25).
+  const klass = ch?.class || ch?.char_class || null;
+  if (klass && CHAR_TAG_CLASSES.some(c => c.toLowerCase() === klass.toLowerCase())) {
+    const id = tagMap[klass.toLowerCase()]; if (id) applied.push(id);
   }
   if (isFallen(gid, uid)) { const id = tagMap[CHAR_TAG_FALLEN.toLowerCase()]; if (id) applied.push(id); }
   if (ch?.is_hero) { const id = tagMap[CHAR_TAG_HERO.toLowerCase()]; if (id) applied.push(id); }
@@ -22617,6 +22621,8 @@ const CHANGELOG = [
         detail: 'Each scene is five boxes; the bot writes the grammar, keeps the work in progress per GM, lists the scenes pointed at but not yet written with a button for each, shows problems in the scene as you go, and on Finish saves through the same door as a paste (problems keep the writer\'s scenes so you can go round again). Five templates \u2014 a roll with two ways out, a branching tale with a flag, a quiz, a gauntlet with a tally, bare bones \u2014 arrive in the box with their guidance in comments. `/activity grammar [topic:]` prints the grammar a screen at a time. `/activity demo which:trial` plays *The Scribe\'s Trial*, a tutorial written in the grammar it teaches, its script on the shelf beside it.' },
       { line: 'An NPC can call a player by name: a To picker in the `/npc say` box, `to:` on the command, or `@Name` in the words \u2014 each a real mention, and only people are ever pinged from an NPC\'s mouth. A line reads action · speech · who it is for, a blank line between. Under every line: 💬 Reply for players, 🎭 GM for the speak-as box, and 🎮 Interaction when the GM offered an activity on that line (the box\'s dropdown, or `offer:`; `talk:` is the default pick). `discord.js` floor raised to ^14.27.0',
         detail: 'The writing box has no mention popup, so `@Aldric` there was plain text; it now resolves by server nickname, display name or username, longest match first. The webhook used to send with no mention filter, which meant an NPC could `@everyone`; sends are now users-only. The box itself gained a *To* picker — up to three players, mentioned first unless the words already do it — built in the label style discord.js reads modals in since 14.22, so `package.json` raises its floor to `^14.27.0` (delete or regenerate `package-lock.json` if the repo has one). A line is laid out as three blocks with a blank line between — the action in italics, the speech in quotes, then whoever it is addressed to (the picked players, or `to:`); someone already named inside the words is not named again, and `raw:` keeps its text with the names after. Under every said line sit **Reply** (anyone: the roleplay box titled as a reply to that NPC; a GM replies as their own character) and **GM** (the speak-as box; a player pressing it is told quietly whose it is), and **Interaction** when the GM offered an activity on that line — a fourth field in the box lists the server\'s live activities with *None* first and the NPC\'s `talk:` pre-selected, and `offer:` does the same on the command (`none` withholds it). Pressing Interaction starts that activity for whoever pressed, the server\'s open/closed setting aside, since the GM chose to offer it. `talk:` (autocompleting; `none` clears) is now only that default pick, no longer a button on every line. Only the newest line in a channel keeps its buttons; fight cards keep their own.' },
+      { line: 'Character pages carry their class tag at last \u2014 Vanguard, Defender, Siege Knight filter the sheets forum like the orders do',
+        detail: 'The page tagged from the 5e class column, never the Knightfall one, so the three class tags sat unused on the forum and a filter on them came back empty. The page reads the right column now (the 5e one as a fallback) and names the class in its header beside the order; the boot mend rewrites every page, so the tags land on the next deploy without anyone running anything.' },
     ], player: [
       'Every fight button opens a short form \u2014 what you do, what you say, both optional \u2014 and your words sit on the card: attack, defence, Grapple, Feint, Deflect, Disarm, the holds, Save, Insight. A blank form is a plain roll. With one foe, a stat press goes straight to the form',
       'Every turn line shows everyone\'s HP, and any condition the GM has marked you with, counting down',
@@ -22643,6 +22649,7 @@ const CHANGELOG = [
       'Some activities are once a day or week, run on certain days, or need a title to start; some endings pay only your first finish \u2014 the message says which, and when you can go again',
       '`/activity scores name:X` \u2014 the best score per player, and how it has been played; the weekly chronicle ends with the week\'s activities and its best score',
       '`/activity show` is a GM command now \u2014 the script holds the quiz answers; `/activity list` still shows what there is',
+      'The sheets forum filters by class now \u2014 Vanguard, Defender, Siege Knight \u2014 as well as by order, Hero and Fallen',
     ] },
   { key: '2026-10-13', gm: [
       { line: 'One NPC, one page: the boot no longer makes a second copy of every NPC page, and copies already made are folded back to one on the next boot',
