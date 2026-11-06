@@ -6,6 +6,9 @@
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@napi-rs/canvas": "^0.1.44",
     "better-sqlite3": "^9.4.3",
