@@ -1503,6 +1503,17 @@ function testBuilders(src) {
       /key: 'attack-nat1'/.test(src) && /fumbles the attack/.test(src) && /flat d20 \\u2014 fumbled last attack|fumbled last attack/.test(src));
     ok('RULES: defending 20 parries and banks +2',
       /key: 'defence-nat20'/.test(src) && /perfect parry/.test(src) && /rollBonus/.test(src));
+    ok('RULES: an attacking 20 lands whatever the totals; no deflect, disarm or defensive feint against it; no NPC reroll wasted on it; the card says so',
+      /key: 'attack-nat20'/.test(src) && /const hit = atkNat === atkSides \|\| atkRoll >= defRoll;/.test(src)
+        && /if \(fight\.atk_nat === 20\) return refuse\('[^']*A \*\*natural 20\*\* cannot be deflected/.test(src)
+        && /if \(fight\.atk_nat === 20\) return refuse\('[^']*A \*\*natural 20\*\* cannot be disarmed/.test(src)
+        && src.indexOf("cannot be disarmed") < src.indexOf("const disarmed = nat === 20 || (nat !== 1 && total > fight.atk_roll);")
+        && /f0\.current_target === meId && !f0\.atk_kind && f0\.atk_nat === 20\) \{\s*return interaction\.reply\(\{ ephemeral: true, content: '[^']*A \*\*natural 20\*\* cannot be read/.test(src)
+        && src.indexOf('cannot be read') < src.indexOf("setEffectFlag(gid, cid, meId, 'feintDef');")
+        && /if \(hit && fight\.def_nat <= rrMax && \(fight\.atk_nat !== 20 \|\| fight\.def_nat === 1\)\) await tryReroll\(defenderId, 'def'\);/.test(src)
+        && /if \(!ac5 && hit && d\.nat <= rrMax && \(a\.nat !== 20 \|\| d\.nat === 1\) && defF\.isNpc/.test(src)
+        && /else if \(fight\.atk_nat === 20 && !forced && fight\.def_stat !== 'ac' && \(fight\.atk_roll \?\? 0\) < \(fight\.def_roll \?\? 0\)\)/.test(src)
+        && /!ac5 && a\.nat === 20 && a\.total < d\.total \? `[^`]*\*\*A natural 20!\*\* The blow lands whatever the totals\. `/.test(src));
     // (2026-11-09: the naturals speak first; one break settles both a kept
     // hold's answer and an escape on the captive's own turn.)
     ok('RULES: ties keep the hold on grapple, escape and a kept hold; the naturals speak first',
@@ -2012,7 +2023,7 @@ function testBuilders(src) {
       /if \(atkNat === 1\) return \{ hit: false, dmg: 0, detail: 'fumbled' \};/.test(src) &&
       /const clash = atkNat === atkSides && defNat === defSides;/.test(src) &&
       /if \(defNat === defSides && !clash\) return \{ hit: false, dmg: 0, detail: 'parried' \};/.test(src) &&
-      /const hit = clash \|\| atkRoll >= defRoll;/.test(src) && /Twenty meets twenty!/.test(src));
+      /const hit = atkNat === atkSides \|\| atkRoll >= defRoll;/.test(src) && /Twenty meets twenty!/.test(src));
     ok('the damage numbers are untouched: 1, +1, +1, 4',
       /let dmg = 1;\s*\n\s*if \(atkNat === atkSides\) dmg \+= 1;\s*\n\s*if \(defNat === 1\) dmg \+= 1;\s*\n\s*if \(atkNat === atkSides && defNat === 1\) dmg \+= 1;/.test(src));
     ok('the riposte banks on every defending 20 — the carry has no mutual exception, in the manual fight or the auto one',
@@ -3129,6 +3140,11 @@ function testRules(mod) {
     eq('KF twenty meets twenty: the lower attack still lands, for two', K.damage(21, 20, 20, 25, 20, 20), { hit: true, dmg: 2, clash: true });
     eq('KF twenty meets twenty: the higher attack lands the same', K.damage(25, 20, 20, 21, 20, 20), { hit: true, dmg: 2, clash: true });
     ok('KF a defending 20 against a lesser die still parries', K.damage(25, 19, 20, 21, 20, 20).hit === false && K.damage(25, 19, 20, 21, 20, 20).detail === 'parried');
+    // An attacking 20 lands whatever the totals, for its crit (T, 2026-11-09:
+    // a 20 for 23 against a 19 for 24 had been blocked).
+    eq('KF an attacking 20 lands whatever the totals, for two', K.damage(23, 20, 20, 24, 19, 20), { hit: true, dmg: 2 });
+    eq('KF an attacking 20 against a defending 1 still reaches four', K.damage(22, 20, 20, 26, 1, 20), { hit: true, dmg: 4 });
+    eq('KF a 19 against a higher defence still misses', K.damage(23, 19, 20, 24, 10, 20), { hit: false, dmg: 0 });
     eq('KF stat is added whole', K.statBonus({ str: 4 }, 'str'), 4);
     eq('KF absent stat reads zero', K.statBonus({}, 'str'), 0);
     eq('KF HP is CON plus the floor', K.maxHp({ con: 5 }, 10), 15);
@@ -3707,6 +3723,8 @@ function testBuildL(mod) {
         && /^A feint is the trick in a fight; away from one, the same trick is `\/deception`\./.test(text('feint'))
         && /a natural 1 fails outright and the blow lands, unless the attack was a 1 too/.test(text('feint'))
         && /the flat roll a trick costs counts as one\./.test(text('feint')));
+    ok('the rules say an attacking 20 lands whatever the totals, for 2, and nothing turns it',
+      /^A natural 20 on an attack lands whatever the totals, for 2 — 4 against a defending 1\. It cannot be deflected, disarmed or read by a defensive feint\.$/.test(text('attack-nat20')));
   });
 }
 

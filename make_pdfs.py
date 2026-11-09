@@ -364,9 +364,9 @@ PARTS['fight'] = [
           ('(the buttons)', 'on your turn: five stat buttons to attack with, then\nGrapple \u00b7 Feint beneath (both ask whom; Feint then asks\nwhat you pretend) \u2014 no Grapple while you are held. When\nan NPC attacks you, the defence row adds Deflect \u00b7 Disarm. Holding someone adds Maintain the hold (your\nSTR roll; they answer Break free or Stay) and Release;\nbeing held adds Break free. Save and Insight sit on the card that asks. Every one of them opens a short form first \u2014 what you do, what you say, both optional \u2014 and your words sit on the card; a blank form is a plain roll. With one foe standing, an attack press goes straight to the form'),
           ('/fight act action:Release npc:Hollow tank', GM + ' releases AS the NPC holder; add target: to\nforce-part any hold from the outside', 'gm'),
           ('/fight act action:Deflect', 'shield deflection against a PvE strike — needs a\nshield equipped and STR 4+ (the gate holds whichever\nstat rolls), once per round, and a natural 20 cannot\nbe turned. Roll STR or DEX (stat:) to beat the attack\nroll; optionally redirect_npc: sends the blow into\nanother enemy for 1 damage. Fall short and it lands\non you for 1. A natural 20 turns it whatever the\ntotals and the redirect deals 2; a natural 1 fails\noutright for 2. Either way your next attack roll is a\nflat d20 \u2014 after a 1, your next defence too', 'player'),
-          ('/fight act action:Disarm', 'disarm a PvE attacker — needs a blade equipped\n(swords, polearms, daggers; not maces, shields or\nfirearms) and DEX 4+, once per round. Roll DEX to\nbeat the attack roll — no damage, but the enemy\nspends their next turn retrieving the weapon. Fall\nshort and the strike lands on you for 1. A natural\n20 wounds the enemy 1 instead of costing them a\nturn, and their next attack is a flat d20; a natural\n1 fails and leaves your next attack flat as well.\nEither way your next defence roll is a flat d20', 'player'),
-          ('/fight act action:Deflect \u00b7 /fight act action:Disarm (vs your NPCs)', 'player abilities your NPCs face: a deflected strike\ncan be redirected into ANOTHER of your enemies for\n1 damage (2 on a natural 20), and a disarmed NPC\u2019s\nnext turn \u2014 manual or auto \u2014 is spent retrieving its\nweapon; a disarm of 20 wounds it 1 instead, and its\nnext attack \u2014 yours to roll, or the auto-pilot\u2019s \u2014\nis a flat d20', 'gm'),
-          ('/fight act action:Feint feint:\"...\"', 'the trick IN A FIGHT (away from one, the same trick\nis /deception), and it spends either half of the\nfight. On YOUR turn it is an attack \u2014 WIS against\ntheir insight, and if they fall for it the blow\nlands with normal damage (a natural 20 still crits)\nAND their very next roll is a flat d20. A feint of\n20 fools them whatever the insight; a feint of 1 is\na total failure. An insight of 20 sees through it\nunless the feint was a 20; an insight of 1 is\nfooled. With a strike pending on YOU it is a\ndefensive feint \u2014 WIS in place of your usual stat\n\u2014 and if the blow misses, the attacker\u2019s very next\nroll is flat; a defensive feint of 1 is a total\nfailure, and the blow lands whatever the totals\n(unless the attack was a 1 too). THE PRICE, landed\nor not: your own very next roll is a flat d20 \u2014 at\ndisadvantage too after a 1. WIS 4+; ties go to the\ntarget. ONE TRICK PER HONEST ROLL: after a feint you\nmust make an ordinary stat roll before you can\nfeint or deceive again \u2014 the flat roll a trick\ncosts you counts'),
+          ('/fight act action:Disarm', 'disarm a PvE attacker — needs a blade equipped\n(swords, polearms, daggers; not maces, shields or\nfirearms) and DEX 4+, once per round, and a natural\n20 cannot be disarmed. Roll DEX to beat the attack roll — no damage, but the enemy\nspends their next turn retrieving the weapon. Fall\nshort and the strike lands on you for 1. A natural\n20 wounds the enemy 1 instead of costing them a\nturn, and their next attack is a flat d20; a natural\n1 fails and leaves your next attack flat as well.\nEither way your next defence roll is a flat d20', 'player'),
+          ('/fight act action:Deflect \u00b7 /fight act action:Disarm (vs your NPCs)', 'player abilities your NPCs face: a deflected strike\ncan be redirected into ANOTHER of your enemies for\n1 damage (2 on a natural 20), and a disarmed NPC\u2019s\nnext turn \u2014 manual or auto \u2014 is spent retrieving its\nweapon; a disarm of 20 wounds it 1 instead, and its\nnext attack \u2014 yours to roll, or the auto-pilot\u2019s \u2014\nis a flat d20. Neither works against a natural 20', 'gm'),
+          ('/fight act action:Feint feint:\"...\"', 'the trick IN A FIGHT (away from one, the same trick\nis /deception), and it spends either half of the\nfight. On YOUR turn it is an attack \u2014 WIS against\ntheir insight, and if they fall for it the blow\nlands with normal damage (a natural 20 still crits)\nAND their very next roll is a flat d20. A feint of\n20 fools them whatever the insight; a feint of 1 is\na total failure. An insight of 20 sees through it\nunless the feint was a 20; an insight of 1 is\nfooled. With a strike pending on YOU it is a\ndefensive feint \u2014 WIS in place of your usual stat,\nthough not against a natural 20 \u2014 and if the blow misses, the attacker\u2019s very next\nroll is flat; a defensive feint of 1 is a total\nfailure, and the blow lands whatever the totals\n(unless the attack was a 1 too). THE PRICE, landed\nor not: your own very next roll is a flat d20 \u2014 at\ndisadvantage too after a 1. WIS 4+; ties go to the\ntarget. ONE TRICK PER HONEST ROLL: after a feint you\nmust make an ordinary stat roll before you can\nfeint or deceive again \u2014 the flat roll a trick\ncosts you counts'),
           ('/deception target:@Players claim:\"...\"', 'the trick AWAY FROM A FIGHT \u2014 the same WIS contest\nas a feint, in a market, a hall, a cell. Refused\nwhile you or your target are fighting in the\nchannel: there, the trick is a feint. Both roll at\nonce; win and their very next roll is a straight\nd20, whether that is a chat roll, /roll, a scene, a\ncalled check or a fight elsewhere. The same naturals\nas a feint, and the same price: your own very next\nroll is a flat d20, at disadvantage after a 1.\nShares the feint\u2019s cooldown \u2014 one trick per honest\nstat roll, the price\u2019s flat roll counting as one'),
           ('/fight act action:Feint feint:"..." npc:Hollow Lieutenant target:@Players', GM + ' feints AS the NPC — WIS vs WIS; the player\nanswers with /fight act action:Insight, and a fooled player\nrolls their very next roll flat \u2014 and the NPC pays\nthe price too: its own next roll is flat', 'gm'),
           ('/fight act action:Insight', 'your WIS check against the pending feint — GMs\nroll for an NPC with npc:Name; auto NPCs check\nthemselves. If you already owe a flat roll \u2014 fooled\nbefore, or a trick\u2019s price \u2014 even this roll is flat', 'player'),
@@ -449,11 +449,11 @@ PARTS['fight'] = [
 ('h2', 'Damage'),
 ('table', ['Situation', 'Damage'],
           [['Attack total ≥ Defence total', '1'],
-           ['Attacker natural 20', '+1 bonus'],
+           ['Attacker natural 20', 'Lands whatever the totals \u2014 2 (the +1 bonus)'],
            ['Defender natural 1', '+1 bonus'],
            ['Attacker nat 20 + Defender nat 1', '4 total'],
            ['Attacker nat 20 + Defender nat 20', 'The attack lands whatever the totals \u2014 2'],
-           ['Defence total > Attack total', '0 (blocked)'],
+           ['Defence total > Attack total', '0 (blocked) \u2014 unless the attack is a natural 20'],
            ['A wound (held, a failed break, a special move)', '1 \u2014 a wound is a point of damage, 1 HP'],
            ['Fighter reaches 0 HP', 'Knocked down, removed from turn order, HP goes negative']]),
 ('p', 'Players can reroll using <b>rr / rra / rrd</b> after their initial roll before <b>/fight resolve</b>.'),
@@ -461,6 +461,7 @@ PARTS['fight'] = [
 ('p', 'A natural 1 or natural 20 leaves a mark on the <i>next</i> roll, in both manual and auto fights:'),
 ('table', ['Trigger', 'What happens'],
           [['Natural 1 on an attack', 'The attack fails automatically, whatever the totals say \u2014 and the attacker\u2019s next defence is rolled as a flat d20 (no stat, no advantage)'],
+           ['Natural 20 on an attack', 'The blow lands automatically, whatever the totals, for 2 \u2014 4 against a defending 1. It cannot be deflected, disarmed or read by a defensive feint. No carry-over: an attacking 20 pays out as damage'],
            ['Natural 20 on a defence', 'The blow is parried automatically \u2014 unless the attack was also a natural 20: twenty meets twenty, and the attack lands whatever the totals, for 2. Either way the defender gains +2 TO HIT on their next attack roll (added to the stat modifier \u2014 never to damage)']]),
 ('note', 'Each carried effect is consumed by that fighter\u2019s next matching roll and announced when it lands (\u201cpresses the riposte\u201d, \u201cdefends on a flat d20\u201d). Leaving a fight clears any pending effects.'),
 ('h2', 'Naturals on the Special Moves'),
@@ -2220,14 +2221,18 @@ def build(edition, outfile, subtitle, module=None, items=None):
     # of a page is left; a heading only needs room for itself and a few
     # lines below it, so blocks split across pages instead of leaving the
     # bottom of a page blank (T, 2026-10-11).
-    for item in items:
+    for i, item in enumerate(items):
         k=item[0]
         if k=='sec':
             story.append(CondPageBreak(doc.height/4)); story.append(sec_header(item[1]))
         elif k=='pbreak':
             story.append(CondPageBreak(doc.height/4))
         elif k=='h2':
-            story.append(CondPageBreak(92)); story.append(Paragraph(item[1],h2))
+            # A heading whose lead-in line opens a table needs room for the
+            # table's first rows too, or the heading and its colon sit alone
+            # at a page's foot (Player book, 2026-11-09).
+            lead_in = [x[0] for x in items[i+1:i+3]] == ['p', 'table']
+            story.append(CondPageBreak(150 if lead_in else 92)); story.append(Paragraph(item[1],h2))
         else:
             story+=render(item)
     # The sign-off travels with the last block, so it never sits alone on
@@ -2278,9 +2283,10 @@ EXAMPLES = [
           ('/fight atk stat:str target:@Artorius', 'You swing at Artorius using your strength. A box asks what you do and say first \u2014 or type flavour: and it swings at once.'),
           ('/fight def stat:dex', 'You try to dodge, using how quick you are.'),
           ('/fight resolve', 'The bot compares the two rolls and says what happened.')]),
-('p', 'If your attack roll shows a natural 1, the attack fails and your next defence is weaker \u2014 '
+('p', 'If your attack roll shows a natural 20, the blow lands whatever they roll, for 2 damage instead of 1. '
+      'If it shows a natural 1, the attack fails and your next defence is weaker \u2014 '
       'you roll the die on its own, with no stat added. If your defence roll shows a natural 20, '
-      'you turn the blow aside AND your next attack gets +2.'),
+      'you turn the blow aside \u2014 unless their attack was a 20 too \u2014 AND your next attack gets +2.'),
 
 ('sec', 'Taking turns'),
 ('code', [('(press Join)', 'The GM calls for initiative and a card appears. Press Join to take a place.'),

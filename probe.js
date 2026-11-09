@@ -3715,6 +3715,28 @@ async function fire(over) {
         && f18e.state === 'idle' && f18e.atk_kind === null && f18e.phase === 'attack' && !f18e.def_rerolled && f18e.atk_roll === null,
       `${f18.atk_kind}/${f18.phase}/${f18.atk_rerolled}/${f18.current_target} · ${f18e.state}/${f18e.atk_kind}/${f18e.phase}/${f18e.def_rerolled}/${f18e.atk_roll}`);
 
+    // 19 · an attacking 20 lands whatever the totals, for its crit; Disarm and
+    // a defensive feint are refused against it before anything is spent
+    {
+      const hs = JSON.parse(fightL('CL3').hp_state || '{}'); hs[LA] = 10; setL({ hp_state: hs }, 'CL3');
+      dbHandle.prepare("UPDATE characters SET next_mark=NULL, deception_spent=0 WHERE guild_id='G1' AND user_id=?").run(LA);
+    }
+    const hp19 = hpOf(LA, 'CL3');
+    await crowSwing(20);   // 21
+    const d19 = await withDice([19], () => f3({ commandName: 'fight', options: { _sub: 'def', stat: 'str', flavour: 'a wall of steel' }, userId: LA, ...asL(LA) }));   // 24
+    const r19 = await f3({ commandName: 'fight', options: { _sub: 'resolve' }, userId: 'U1' });
+    const said19 = `${saidOf(d19)}\n${saidOf(r19)}`, hp19b = hpOf(LA, 'CL3');
+    await crowSwing(20);
+    const dz = await f3({ commandName: 'fight', options: { _sub: 'act', action: 'disarm' }, userId: LA, ...asL(LA) });
+    const fz = await f3({ commandName: 'fight', options: { _sub: 'act', action: 'feint', feint: 'a dodge' }, userId: LA, ...asL(LA) });
+    const spent19 = dbHandle.prepare("SELECT deception_spent d FROM characters WHERE guild_id='G1' AND user_id=?").get(LA);
+    const fx19 = fxOf(LA, 'CL3'), f19 = fightL('CL3');
+    ok('an attacking 20 lands whatever the totals, for 2, and the card says so; Disarm and a defensive feint are refused against it, nothing spent',
+      /A natural 20\*\* — the blow lands whatever the totals/.test(said19) && /hits \*\*user\d+\*\* for \*\*2\*\* damage/.test(said19) && hp19b === hp19 - 2
+        && /cannot be disarmed/.test(saidOf(dz)) && /cannot be read/.test(saidOf(fz)) && !spent19.d && !fx19.disarmUsed && !fx19.feintDef && !fx19.feintUsed
+        && f19.phase === 'defend' && f19.atk_nat === 20 && f19.def_roll === null,
+      `${flat1(said19).slice(0, 320)} · ${hp19b}/${hp19} · ${flat1(saidOf(dz)).slice(0, 100)} · ${flat1(saidOf(fz)).slice(0, 100)} · ${JSON.stringify(spent19)} ${JSON.stringify(fx19)} · ${f19.phase}/${f19.atk_nat}/${f19.def_roll}`);
+
     for (const c of ['CL1', 'CL2', 'CL3']) await fire({ channel: channelsById.get(c), commandName: 'fight', options: { _sub: 'end' }, userId: 'U1' }).catch(() => {});
     guild.members.fetch = realFetchL;
     const threwL = loggedL.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));

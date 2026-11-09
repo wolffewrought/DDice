@@ -135,3 +135,4 @@ New verbs join their group; the wall is history until a single group nears 25.
 - The Break free and Stay buttons stay on the hold card after the answer; a late press is told no hold is waiting. A reroll of the hold's roll changes the total to beat; a 20 is read at the answer, and a 1 slips the hold at once.
 - In a fight a trick re-arms on your own turn's action (an attack, a grab, Maintain, Escape), flat or not; a defence roll does not, flat or not.
 - A 5e skill check or saving throw does not strip the stat for a flat mark (a 5e sheet only gets one from a GM's check outcome).
+- A custom `/roll` standing in for a fight roll counts its first die as the natural, read against 20 whatever the dice: a d100 that shows 20 is a natural 20, and lands whatever the totals.

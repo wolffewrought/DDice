@@ -2057,6 +2057,7 @@ async function handleRollSlash(interaction) {
 const RULES = [
   { key: 'check-nat',      text: 'On any check against a DC \u2014 a called check, a planted button, a group check, a target \u2014 a natural 20 passes and a natural 1 fails, whatever the total. A target beaten by a 20 falls without the GM being asked.' },
   { key: 'attack-nat1',    text: 'A natural 1 on an attack fails outright, and your next defence is a flat d20.' },
+  { key: 'attack-nat20',   text: 'A natural 20 on an attack lands whatever the totals, for 2 \u2014 4 against a defending 1. It cannot be deflected, disarmed or read by a defensive feint.' },
   { key: 'defence-nat20',  text: 'A natural 20 on a defence is a perfect parry and banks +2 to hit on your next attack. Twenty meets twenty: the attack lands whatever the totals, for 2, and the defender still banks the riposte.' },
   { key: 'damage',         text: 'A hit deals 1 damage. An attacking 20 adds 1; a defending 1 adds 1; both together deal 4. A wound is the same thing: 1 damage, 1 HP.' },
   { key: 'grapple',        text: 'Grapple needs STR 4+: STR against a STR save, and meeting the save takes the hold. A natural 20 takes it whatever the save, for 2 wounds; a natural 1 fails outright; a save of 20 slips free unless the grab was a 20 too. Held: immobile, 1 wound a round, actions on a flat d20 \u2014 but you can still attack anyone, your grappler included. The grappler cannot strike their own captive.' },
@@ -2105,12 +2106,15 @@ const RULES_KNIGHTFALL = {
     //     also a nat 20: twenty meets twenty and the ATTACK WINS whatever
     //     the totals, both bonuses paid — +1 damage here, the riposte
     //     banked in applyExchangeEffects (T, 2026-10-12).
+    //   nat-20 attack -> lands whatever the totals, for its crit (T,
+    //     2026-11-09: "an attackers nat 20 will always auto succeed
+    //     regardless of stat bonus and follow through the crit damage").
     //   Damage when a hit lands: 1, +1 for an attacking 20, +1 for a
     //     defending 1, 4 when both — unchanged.
     if (atkNat === 1) return { hit: false, dmg: 0, detail: 'fumbled' };
     const clash = atkNat === atkSides && defNat === defSides;
     if (defNat === defSides && !clash) return { hit: false, dmg: 0, detail: 'parried' };
-    const hit = clash || atkRoll >= defRoll;
+    const hit = atkNat === atkSides || atkRoll >= defRoll;
     if (!hit) return { hit, dmg: 0 };
     let dmg = 1;
     if (atkNat === atkSides) dmg += 1;
@@ -11268,7 +11272,9 @@ async function applyAutoNpcRerolls(guild, gid, cid, channel) {
   // Defender reacts first — only when the hit would land AND its natural die was poor (≤ guild threshold)
   const rrMax = getNpcRrThreshold(gid);
   let { hit } = resolveDamage(fight.atk_roll, fight.atk_nat, 20, fight.def_roll, fight.def_nat, 20);
-  if (hit && fight.def_nat <= rrMax) await tryReroll(defenderId, 'def');
+  // Against an attacking 20 the blow lands whatever is rerolled: only a
+  // defending 1 is worth the token, for the point it adds (2026-11-09).
+  if (hit && fight.def_nat <= rrMax && (fight.atk_nat !== 20 || fight.def_nat === 1)) await tryReroll(defenderId, 'def');
   // Attacker answers a block — likewise only on a poor natural die
   ({ hit } = resolveDamage(fight.atk_roll, fight.atk_nat, 20, fight.def_roll, fight.def_nat, 20));
   if (!hit && fight.atk_nat <= rrMax) await tryReroll(attackerId, 'atk');
@@ -12193,6 +12199,8 @@ async function resolveExchange(guild, gid, cid, fight, { forceHit = false } = {}
     hpState[defenderId] = newHp;
     setFighterHp(gid, defenderId, newHp);           // persist to character or NPC
     if (clash) lines.push(`⚡ **Twenty meets twenty!** ${defName}'s parry breaks — the blow lands through it, whatever the totals.`);
+    else if (fight.atk_nat === 20 && !forced && fight.def_stat !== 'ac' && (fight.atk_roll ?? 0) < (fight.def_roll ?? 0))
+      lines.push(`\u{1F7E1} **A natural 20** \u2014 the blow lands whatever the totals.`);
     lines.push(`💥 **${atkName}** hits **${defName}** for **${dmg}** damage!`);
     lines.push(hpChangeLine(gid, defF.isNpc, defName, prevHp, newHp, defF.maxHp, floor));
     for (const l of effectNoteLines(effNotes, atkName, defName)) lines.push(l);
@@ -13522,6 +13530,9 @@ async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
   const turnOrder = fightOrder(fight);
   const attackerId = turnOrder[fight.turn_index];
   if (!isNpcFighter(attackerId)) return refuse('⚔️ Disarming works against PvE enemies only — not another player\'s strike.');
+  // An attacking 20 lands whatever the totals (T, 2026-11-09): as with a
+  // deflection, there is nothing to stop.
+  if (fight.atk_nat === 20) return refuse('⚔️ A **natural 20** cannot be disarmed — brace with `/fight def` instead.');
   {
     const gate0 = deathGate(gid, uid);
     if (gate0) return refuse(gate0);
@@ -13834,6 +13845,11 @@ async function handleFight(interaction, forced) {
     // trick is spent (it was spent and then refused, audit 2026-11-09).
     if (f0?.state === 'active' && f0.phase === 'defend' && f0.current_target === meId && f0.atk_kind === 'hold') {
       return interaction.reply({ ephemeral: true, content: '\u{1FAA2} That is a kept hold \u2014 answer with \u{1F513} Break free (`/fight act action:Escape`) or \u26D3\uFE0F Stay.' });
+    }
+    // An attacking 20 lands whatever the totals (T, 2026-11-09): there is no
+    // reading it, so the feint is refused before the trick is spent.
+    if (f0?.state === 'active' && f0.phase === 'defend' && f0.current_target === meId && !f0.atk_kind && f0.atk_nat === 20) {
+      return interaction.reply({ ephemeral: true, content: '🎭 A **natural 20** cannot be read \u2014 it lands whatever you roll. Brace with `/fight def` instead.' });
     }
     if (f0?.state === 'active' && f0.phase === 'defend' && f0.current_target === meId
         && f0.atk_kind !== 'feint' && f0.atk_kind !== 'grapple') {
@@ -14428,7 +14444,7 @@ async function handleFight(interaction, forced) {
       // NPC reroll window: only on a poor natural die (≤ guild threshold) —
       // defender answers an incoming hit, attacker a block
       const rrMax = getNpcRrThreshold(gid);
-      if (!ac5 && hit && d.nat <= rrMax && defF.isNpc && (rrTokens[defenderId] ?? 0) > 0) {
+      if (!ac5 && hit && d.nat <= rrMax && (a.nat !== 20 || d.nat === 1) && defF.isNpc && (rrTokens[defenderId] ?? 0) > 0) {
         rrTokens[defenderId]--;
         try { upsertNpc(gid, defF.name, { rerolls_current: rrTokens[defenderId] }); } catch {}
         d = autoRoll(defFlat ? 0 : (defF.stats[dStat] ?? 0), defAdv);
@@ -14467,7 +14483,8 @@ async function handleFight(interaction, forced) {
         const wasHp = hp[defenderId];
         hp[defenderId] = applyFightDamage(hp[defenderId], dmg, floor);
         setFighterHp(gid, defenderId, hp[defenderId]); // keep sheets live so the next card is accurate
-        outcome = (a.nat === 20 && d.nat === 20 ? `⚡ **Twenty meets twenty!** The parry breaks. ` : '') + `💥 Hit for **${dmg}**! ` + (defF.isNpc && !npcStatsVisible(gid)
+        outcome = (a.nat === 20 && d.nat === 20 ? `⚡ **Twenty meets twenty!** The parry breaks. `
+          : !ac5 && a.nat === 20 && a.total < d.total ? `\u{1F7E1} **A natural 20!** The blow lands whatever the totals. ` : '') + `💥 Hit for **${dmg}**! ` + (defF.isNpc && !npcStatsVisible(gid)
           ? `${defF.name}: ${hpCondition(hp[defenderId], defF.maxHp, floor)}`
           : `${defF.name} HP: **${wasHp} → ${hp[defenderId]}**`);
         if (hp[defenderId] <= floor) outcome += `\n${W.icon} **${defF.name}** ${W.out}!`;
@@ -25851,6 +25868,8 @@ async function sweepOldUpdatePosts(client, gid) {
 
 const CHANGELOG = [
   { key: '2026-11-09', gm: [
+      { line: 'An attacking natural 20 always lands now, whatever the totals, for 2 \u2014 4 against a defending 1',
+        detail: 'It used to add its point only when the totals let it through; only a 20 against a 20 landed regardless. Now no defence stops it: Deflect was already refused against a 20, and Disarm and a defensive feint are refused too, before anything is spent. A defending 20 still banks its +2, and a defending 1 still adds its point. The auto-pilot no longer spends an NPC\u2019s reroll on a defence a 20 makes pointless \u2014 only on a defending 1, which would cost a point more. The card says so when the 20 carried a blow the totals would have stopped. 5e is unchanged: a 20 always hit there.' },
       { line: 'Grappling needs STR 4+ (Knightfall); a grab of 20 takes the hold whatever the save, for 2 wounds; a grab of 1 fails outright; a save of 20 slips free unless the grab was a 20 too',
         detail: 'The bar is asked before anything is spent, so a refused grab costs no flat roll the grappler was owed. The 2 wounds land with the grab, and a knockout from them ends the fight as any blow does \u2014 no hold to keep. 5e asks no bar of a grapple.' },
       { line: 'A kept hold is answered: the holder rolls STR, the captive is pinged with \u{1F513} Break free and \u26D3\uFE0F Stay \u2014 and a held fighter takes 1 wound a round, whatever happens',
@@ -25866,6 +25885,7 @@ const CHANGELOG = [
       { line: 'A flat mark now strips the stat from `/roll`, a scene\u2019s roll and a called check, as it did from a typed roll and every fight move',
         detail: 'A deception\u2019s flat landed on `str` typed but slipped past `/roll stat:`, an activity scene\u2019s roll and a check a GM called; all three spend it now, its rider rolling at disadvantage. A GM\u2019s mark on a flat defence is honoured too \u2014 it was spent and then ignored. After a save, an insight or a break that settles itself, the auto-pilot carries on to whoever is up instead of waiting on the turn clock.' },
     ], player: [
+      'An attacking natural 20 always lands now, whatever the defence, for 2 (4 if the defender rolled a 1) \u2014 and it cannot be deflected, disarmed or read by a feint',
       'Grappling needs STR 4+. A grab of 20 takes the hold whatever your save, for 2 wounds; a grab of 1 fails; a save of 20 slips free unless the grab was a 20 too',
       'Held, you take 1 wound (1 damage) a round. When your holder keeps the grip you are pinged with \u{1F513} Break free or \u26D3\uFE0F Stay: a failed break takes the round\u2019s wound at once (1 more for each further try that round, 2 on a 1); breaking out first costs nothing; a 20 frees you and leaves their next attack flat. If their hold comes up a 1, you are free at once, no wound. Held, you can still attack anyone, your holder included, on a flat d20',
       'A feint is the trick in a fight, `/deception` the trick away from one: a 20 always fools, a 1 always fails (a defensive feint of 1 lets the blow land); an insight of 20 sees through, of 1 is fooled. Your own very next roll after any trick is a flat d20 \u2014 at disadvantage after a 1 \u2014 and that roll counts as the honest one that lets you trick again',
@@ -31682,9 +31702,9 @@ const HELP_CATEGORIES = {
       '`/fight act action:Escape` — on your turn while held: the hold rolls first, then your STR against it. Breaking out first costs nothing; a failed break takes the round\'s wound at once, each further failure that round 1 more, a natural 1 two. A break of 20 frees you whatever the totals and leaves the holder\'s next attack flat. The hold\'s own 20 makes your break flat; its 1 frees you at once, no wound',
       '`/fight act action:Release` — the holder lets go freely (no action); a grappler can never strike their own captive. GMs may part any hold with `target:`',
       '`/fight act action:Deflect` — shield deflection vs a PvE strike (shield + STR 4+, once per round, crits undeflectable): roll STR or DEX (`stat:`) to beat the attack roll, optionally `redirect_npc:` into another enemy for 1 damage. A natural 20 turns it whatever the totals and the named enemy takes 2; a natural 1 fails for 2 wounds. Either way your next attack is a flat d20 — after a 1, your next defence too',
-      '`/fight act action:Disarm` — disarm a PvE attacker (blade + DEX 4+, once per round): roll DEX to beat the attack roll — no damage, but they spend their next turn retrieving the weapon. A natural 20 wounds them 1 instead and leaves their next attack flat; a natural 1 fails for 1 wound and leaves your next attack flat too. Either way your next defence is a flat d20',
+      '`/fight act action:Disarm` — disarm a PvE attacker (blade + DEX 4+, once per round, not against a natural 20): roll DEX to beat the attack roll — no damage, but they spend their next turn retrieving the weapon. A natural 20 wounds them 1 instead and leaves their next attack flat; a natural 1 fails for 1 wound and leaves your next attack flat too. Either way your next defence is a flat d20',
       '`/fight act action:Feint feint:"..."` — the trick in a fight (away from one it is `/deception`), and it spends either half of the fight. On your turn it is an attack: WIS against their insight, and if they fall for it the blow lands with normal damage and their very next roll is a flat d20. A feint of 20 fools them whatever the insight; a feint of 1 is a total failure. An insight of 20 sees through it unless the feint was a 20; an insight of 1 is fooled.',
-      '↳ With a strike pending on you it is a defensive feint — WIS in place of your usual stat — and if the blow misses, the attacker is taken in: their very next roll is a flat d20. A defensive feint of 1 is a total failure: the blow lands whatever the totals, unless the attack was a 1 too. The price of any feint, landed or not: your own very next roll is a flat d20 — at disadvantage too after a 1. WIS 4+; ties go to the target. One trick per honest roll: after a feint or a deception you must make an ordinary stat roll before trying another — the flat roll a trick costs you counts.',
+      '↳ With a strike pending on you it is a defensive feint — WIS in place of your usual stat, though not against a natural 20, which lands whatever you roll — and if the blow misses, the attacker is taken in: their very next roll is a flat d20. A defensive feint of 1 is a total failure: the blow lands whatever the totals, unless the attack was a 1 too. The price of any feint, landed or not: your own very next roll is a flat d20 — at disadvantage too after a 1. WIS 4+; ties go to the target. One trick per honest roll: after a feint or a deception you must make an ordinary stat roll before trying another — the flat roll a trick costs you counts.',
       '`/deception target:@Players claim:"..."` — the same trick away from a fight, with the same naturals and the same price. While you or they are fighting in the channel it is refused: there, the trick is a feint. Win and their very next roll is a straight d20, be it a chat roll, `/roll`, a scene\'s roll, a called check or a fight somewhere else.',
       '`/fight rr` — reroll (costs a token) · `/fight resolve` — resolve a clash',
       '`/fight status` — show current fight · `/fight forfeit` — drop out',

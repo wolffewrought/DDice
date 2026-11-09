@@ -49,9 +49,9 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1296 as of 2026-11-09, build L2) and no
+Green means every assertion passed (1301 as of 2026-11-09, build M) and no
 scanner found an ERROR. Then run the probe: `node --experimental-sqlite
-probe.js` (325 probes: the fight, encounter, override, autocomplete and
+probe.js` (326 probes: the fight, encounter, override, autocomplete and
 every-leaf walks, the GM-gate walk, chat shorthands, scheduled ticks,
 junk-id lanes, SQL compile, forum seeding and sweep, one NPC one page, the
 A2 walk, the undo walk, the C walk, the D walk (activities: parser,
@@ -63,7 +63,8 @@ an NPC, a 5e guild end to end), the J walk (initiative and the turn clock),
 the K walk (held advantage, auto Heroes), the L walk (the naturals on the
 specials, a kept hold's answer, the trick's price, stray NPC sheets; and
 L2's slipped holds, a defensive feint of 1, `/deception` refused in a
-fight, the reroll's words, a cleared exchange), and a double-ack check). The probe carries a paper-thin fake
+fight, the reroll's words, a cleared exchange; M's attacking 20), and a
+double-ack check). The probe carries a paper-thin fake
 `@napi-rs/canvas` since A2 (text measures by length, drawing is a no-op, a
 buffer comes back) so the parchment paths run end to end; verify.js keeps
 the canvas absent on purpose, which is the other path.
@@ -371,6 +372,54 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 10w · An attacking 20 always lands (2026-11-09, build M)
+
+L2 was pushed (and the `2026-11-09` entry posted) when T sent a screenshot
+of a natural 20 for 23 blocked by a 19 for 24: "An Attackers nat 20 will
+always auto succeed regardless of stat bonus and follow through the the
+crit damage". The bot had never ruled so — his August doc made a 1 fail and
+a defending 20 parry; 12 Oct made twenty-meets-twenty land; an attacking 20
+otherwise only paid its +1 when the totals let it through, and the books
+said as much. The plan he said Build to:
+
+**The rule.** The Knightfall `damage`: `const hit = atkNat === atkSides ||
+atkRoll >= defRoll;` (the clash is a case of it). Every hit decision runs
+through `resolveDamage` — the exchange, the auto rounds, the NPC reroll
+check — so all of them follow. The ladder is unchanged: 2, or 4 against a
+defending 1; a defending 20 still banks its +2. 5e already hit on a 20.
+
+**Nothing turns it.** Deflect already refused a 20; `runFightDisarm`
+refuses it the same way (before the bar, the blade and `disarmUsed`), and
+the feint routing refuses a defensive feint against a pending plain attack
+of 20 before the trick is spent. The NPC reroll windows (the manual
+auto-pilot's `tryReroll` check and the full-auto round's) skip a defence
+against a 20 unless it is a 1, which adds a point.
+
+**The card.** The exchange says "A natural 20 — the blow lands whatever the
+totals" when the 20 carried a blow the totals would have stopped (not on a
+clash, a forced feint or a 5e AC); the full-auto round prefixes its hit line
+the same way.
+
+**Words.** RULES `attack-nat20`; `/help`'s Disarm and defensive feint
+lines; the books' damage table (the 20's row, "blocked — unless the attack
+is a natural 20"), a critical-effects row, the Disarm rows and the feint
+row; the Examples books' fighting paragraph. The `2026-11-09` entry gained
+a GM line and a player line at its head: `growChangelog` adds them beneath
+the posted thread ("Added since this was posted") or re-posts it.
+
+**The book builder.** An `h2` whose next two items are a `p` and a
+`table` asks `CondPageBreak(150)` instead of 92: the new crit row pushed
+"Naturals on the Special Moves" and its "read before the totals:" to the
+foot of a Player-book page with the table overleaf. Only the Knightfall
+Commands books moved.
+
+**Tests.** verify: three model cases (a 20 under the totals lands for 2,
+against a defending 1 for 4, a 19 under them misses), a pin for the rule,
+the refusals, both reroll windows and both card lines, the rules text; the
+hit pin reread. probe: a crow's 20 for 21 against a 19 for 24 lands for 2
+with the card's line; Disarm and a defensive feint against a 20 refused,
+nothing spent.
 
 ## 10v · L2: a hold of 1 slips; a defensive feint of 1; /deception away from a fight; the price re-arms (2026-11-09, build L2)
 
