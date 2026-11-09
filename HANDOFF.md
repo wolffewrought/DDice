@@ -49,13 +49,21 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1168 as of 2026-10-25, build G) and no
+Green means every assertion passed (1296 as of 2026-11-09, build L2) and no
 scanner found an ERROR. Then run the probe: `node --experimental-sqlite
-probe.js` (227 probes: the fight, encounter, override, autocomplete and
+probe.js` (325 probes: the fight, encounter, override, autocomplete and
 every-leaf walks, the GM-gate walk, chat shorthands, scheduled ticks,
 junk-id lanes, SQL compile, forum seeding and sweep, one NPC one page, the
 A2 walk, the undo walk, the C walk, the D walk (activities: parser,
-drafts, shelf, board, party, writer, NPC mentions), and a double-ack check). The probe carries a paper-thin fake
+drafts, shelf, board, party, writer, NPC mentions), the H walk (instances
+and sessions, recording, `to:` groups, /rp rolls and called checks, Reply
+and the jump header, /edit on roleplay lines), the I walk (as:, played:,
+part:, several dice, talk edits, transcripts, the run archive, answering as
+an NPC, a 5e guild end to end), the J walk (initiative and the turn clock),
+the K walk (held advantage, auto Heroes), the L walk (the naturals on the
+specials, a kept hold's answer, the trick's price, stray NPC sheets; and
+L2's slipped holds, a defensive feint of 1, `/deception` refused in a
+fight, the reroll's words, a cleared exchange), and a double-ack check). The probe carries a paper-thin fake
 `@napi-rs/canvas` since A2 (text measures by length, drawing is a no-op, a
 buffer comes back) so the parchment paths run end to end; verify.js keeps
 the canvas absent on purpose, which is the other path.
@@ -363,6 +371,665 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 10v · L2: a hold of 1 slips; a defensive feint of 1; /deception away from a fight; the price re-arms (2026-11-09, build L2)
+
+T answered the four calls L left open (keep the captive's flat after a hold
+of 20 and Stay — "they're still able to attack whilst grappled"; a hold of 1
+"instantly releases and their next roll is flat with disadvantage"; "a nat 1
+feint is a auto fail with the flat disadvantage"; a feint of 20 against an
+insight of 1 deals 4), asked for an audit and a wording pass ("for feints its
+clear that there are combat feints and outside of combat they're deception
+rolls"), then said yes to refusing `/deception` mid-fight and to the price's
+flat roll re-arming the trick. The plan he said Build to:
+
+**A hold of 1 slips.** `slipHold(gid, cid, holderId, captiveId, holderName,
+capName)` deletes the grapple and sets the holder's `fooled` + `fooledDis`
+(their very next roll, flat at disadvantage), returning the line. Three
+callers: `runFightMaintain` (a kept hold of 1 never reaches `phase:
+'defend'` — the turn passes from the holder at once, nothing to answer, no
+wound); `runFightEscape` (the hold's 1 frees the captive before their break
+is rolled, so no flat they owe is spent); `resolveBreakFree` (`slipped =
+fight.atk_nat === 1` — a hold rerolled into a 1 slips at once; the `/fight
+rr` path calls it straight away). `settleBreak` lost `holdNat`.
+
+**A defensive feint of 1.** `resolveExchange` peeks the defender's
+`feintDef` before the damage: `forced = forceHit || (feintDefPending &&
+fight.def_nat === 1)` — the ladder reads `max(atk, def)`, so the blow lands
+whatever the totals, the defending 1 adding its own; an attack of 1 still
+fumbles. The card: "the read fails outright and the blow lands, whatever the
+totals".
+
+**`/deception` away from a fight.** Refused (before any roll or spend) when
+the user or their target is in this channel's active fight, pointing to
+Feint; the fooled branch writes only the sheet's `'flat'` now. Description:
+"Try to deceive someone, away from a fight (in one, feint)". A feint
+pressed against a kept hold was spending the trick (`feintDef`,
+`feintUsed`, `deception_spent`) and then being refused by `/fight def`; it
+is refused first now.
+
+**The price re-arms.** `noteHonestRoll` runs on the flat roll too: the
+typed roll, `/roll stat:`, a scene's roll, `/rp`'s stat roll, and now a
+called stat check (it re-armed nothing before). In a fight, the fighter's
+own turn's action re-arms as before (`clearRoundFlag`); a defence roll does
+not.
+
+**The audit.** `/fight rr` names its roll (`the grapple` / `the feint` /
+`the hold` / `attack` / `the defensive feint` / `defence`) and points at
+the answer owed (the save, the insight, Break free or Stay) — `/fight
+resolve` only when both rolls are in, else "Waiting on X's defence"; a hold
+rerolled into a 20 says the break will be flat. A pending kind and the
+reroll flags were left on the row by `standDownFight`, a kick, a forfeit and
+three fight starts (manual, initiative, npconly), and the auto-pilot's swing
+and a custom `/roll` attack never cleared them: a grapple left pending when a
+fight ended met the next fight's first auto swing, and the player's defence
+was refused as a grapple. All of them spread `FRESH_EXCHANGE` now (the swing
+and the custom roll set `atk_kind: null` and both reroll flags).
+
+**Words.** RULES: `damage` says a wound is 1 damage, 1 HP; `grapple` says a
+captive can still attack anyone, the grappler included (it said "anyone but
+your grappler" — the code never barred it; only the grappler cannot strike
+their captive); `grapple-hold` the slip; `feint` opens "A feint is the trick
+in a fight; away from one, the same trick is `/deception`", with the
+defensive feint of 1 and the re-arm. `/help`, both Knightfall Commands books
+(the rows, the damage table's wound row, the naturals table and its note)
+and the `2026-11-09` changelog entry (not yet posted anywhere) say the same.
+The book builder's `code_block` adds `('NOSPLIT', (0,r), (1,r+1))` to every
+command whose description runs beneath it: a page break between the two left
+twelve commands alone at a page's foot (GM book 8, Player book 1, 5e GM
+book 3); the Examples books and the 5e Player book had none. The house
+placeholders now hold in `/help`'s and the GM books' `audience:` examples
+(`@Artorius @Meliora @GMs`, was `@Ari @Bo @Guards`) and in two form hints (the
+called check's targets box, the GM bar's fight form: `@Artorius @Meliora`,
+`Hollow, Hollow tank`). The `2026-10-15` changelog entry keeps its quote;
+error messages and the `teams:` option still say Goblin, Orc and `@a @b`.
+
+**Tests.** verify: pins for the re-arm, the slip, the forced blow, the
+refusal, the reroll's words, the cleared exchange, the feint against a
+hold; the stand-down and feint pins reread; the build L harness checks the
+new rules text. probe: the escape's hold of 1 slips (a tie keeps the hold,
+tested apart); a defensive feint of 1 against a weak swing lands for 2, an
+attack of 1 still fumbles; the flat roll re-arms `/deception` and a second
+lie with no roll between is refused; a kept hold of 1; a hold rerolled into
+a 1, a grab's and an attack's reroll words; `/deception` refused to both
+sides of a fight and the feint against a hold; a kick and a fight's end
+clearing the exchange.
+
+## 10u · The naturals on every special; a kept hold is answered; the price of a trick (2026-11-09, build L)
+
+A new changelog entry (`2026-11-09`): build K went to GitHub main with the
+`2026-10-15` entry (Railway's build failed on their outage, so the server
+was still on 6 Nov when L was written). T asked that grapple, feint,
+deflect and disarm "can still nat 20 and nat 1", then settled the rules over
+four messages; the plan he said Build to:
+
+**Grapple.** STR 4+ (`RULES_KNIGHTFALL.gates.grapple`; 5e has none), asked
+in `runFightGrapple` before any penalty is spent. `resolveGrappleSave`:
+`grappled = aNat === 1 ? false : aNat === 20 ? true : nat === 20 ? false :
+atk_roll >= total`. A grab of 20 deals 2 wounds on landing; a knockout from
+them ends the fight (`knockoutFromSpecial`, no hold set). A new hold clears
+the captive's `holdPaid`.
+
+**Held: one wound a round.** `applyTurnEndStrain` consumes `holdPaid` first:
+paid, the turn's end says so and costs nothing; else 1 wound ("strain" is
+"wound" in every string now). `failBreakout` takes the round's wound at once
+(sets `holdPaid`), a further failure that round 1 more, a natural 1 two.
+`settleBreak` is the one break: `free = nat === 20 || (nat !== 1 && total >
+holdTotal)`; a break of 20 sets the holder's `flatAtk` (a hold of 1 slips
+before it is reached: §10v).
+`passTurn(guild, gid, cid, hpState, order, roster, floor, lines, actorId)`
+ends a turn properly (the wound, then the next standing fighter after the
+actor in the roster as it began) and is now used by the save, the insight's
+miss, escape, disarm, a kept hold's answer, `gmSkipTurn` (which returns
+`{ name, lines, nextF, ended, announce }` — its lines used to be dropped,
+the next turn's ping with them; both callers post them), `retrievalTurn` and
+`/fight skip` (which also left a stale `atk_kind`). `clockSkipFight` runs
+`applyTurnEndStrain` for the skipped fighter itself.
+
+**A kept hold is answered.** `runFightMaintain` (still a player holder's,
+by the 🤜 button and form) rolls the holder's STR — their own flat, rider
+and marks spent, `clearRoundFlag` as any turn's action — and leaves the
+fight in `phase: 'defend'`, `atk_kind: 'hold'`, `current_target` the captive,
+`atk_roll` the hold. The captive answers with `fbreak` / `fstay` (router:
+the captive, or a GM for an NPC; forms `breakfree` / `stay`), or `/fight
+act action:Escape` / `action:Stay` (new choice on `/fight act` and `/roll
+action:`). `runFightEscape` hands a pending hold to `runFightBreakFree`
+(flat when `fight.atk_nat === 20`); `runFightStay`; both through
+`resolveBreakFree(guild, gid, cid, fight, { roll, flavour })`, which ends the
+holder's turn. A stay after a hold of 20 sets the captive's `fooled`; a
+hold of 1 slips (§10v). The turn clock: a quiet captive stays (`clockDefend`'s
+hold branch; the reminder says so); an NPC on auto always struggles
+(`autoNpcDefend`'s hold branch). Escape on the captive's own turn rolls the
+hold first, so a hold of 20 makes that break flat. The status board, the
+rewind's turn prompt, `/fight def`, deflect, disarm, `/roll fight:true` and
+the attack refusals all know `'hold'`.
+
+**Feint and /deception.** `resolveFeintInsight`: `fooled = fNat === 1 ?
+false : fNat === 20 ? true : nat === 20 ? false : nat === 1 ? true : atk_roll
+> total`; fooled → the target's `fooled`, and `resolveExchange(...,
+{ forceHit: true })` (the damage ladder reads `max(atk_roll, def_roll)` so a
+feint of 20 or an insight of 1 lands whatever the totals, crits as ever).
+`handleDeception`: the same naturals; both rolls now spend a flat mark
+(`flatMe`, `flatThem`); its roll line is no longer `lines[3]`. The price:
+`chargeTrick(gid, cid, fid, botched)` — in a live fight here the fighter's
+`fooled` (+ `fooledDis` after a 1), NPCs included; else the sheet's
+`next_mark` `'flat'` / `'flatdis'` — on every feint, defensive feint and
+deception, landed or not. It replaced the feinter's `flatDef`; a defensive
+feint that makes the blow miss sets the attacker's `fooled` (was
+`flatAtk`), unless its own die was a 1 (which forces the blow: §10v).
+Inspiration refuses over `'flatdis'` as over `'flat'`.
+
+**The rider.** `consumeFooled` returns `'dis'` when `fooledDis` rode with
+`fooled` (cleared together); `consumeFlatMark` returns `'dis'` for
+`'flatdis'`; `flatMode(flat, mode)` gives `'dis'` / `'normal'` / the mode, and
+every fight path applies it before `applyNextMark` (a GM's mark outranks,
+as before). `autoRoll(mod, 'dis')`, `autoEdge`, `autoTag`, `autoDice` carry
+it through the auto-pilot, the clock and the cards. Fixed on the way: the
+defence path spent a GM's mark and then ignored it on a flat defence; the
+auto-pilot's NPC swing ignored a hold and `flatAtk` (a disarm of 20 now sets
+one on an NPC); its card printed the stat on a flat roll; `/roll stat:`, an
+activity scene's roll and a called check let a sheet's flat mark pass.
+
+**Deflect and disarm.** Deflect: `deflected = nat === 20 || (nat !== 1 &&
+total > atk_roll)`; 2 into the named enemy on a 20; 2 to the deflector and
+their `flatDef` on a 1 (the usual `flatAtk` stands). Disarm: a 20 sets the
+attacker's `flatAtk` and deals 1 (knockout handled), no `disarmed`; a 1 deals
+the usual 1 and sets the disarmer's `flatAtk` (the usual `flatDef` stands).
+
+**Stray sheets.** `applyNextMark`, `deceptionSpent`, `spendDeception`,
+`noteHonestRoll`, `consumeFlatMark` tested `'npc_'`; fighters are `'npc:'`,
+so `spendDeception` wrote a `characters` row for every NPC that feinted and
+the mend gave it a page named "Unknown". They use `isNpcFighter` now;
+`purgeStrayNpcSheets` (in `mendEverything`, before the pages) deletes such
+rows and their page threads; the pages loop skips NPC ids. The dice-health
+report reads `npc:` tallies again.
+
+**Also.** `runAutoNpcChain` continues after a defence that settles itself
+(a save, an insight, a break) instead of stopping until the clock's pickup.
+A save, insight or break that ends a fight announces it (the old LIMITS
+line about a feint's end is gone).
+
+**Tests.** verify: the `build L` harness (`flatMode`, `autoRoll` at
+disadvantage, `autoTag`/`autoDice`, the bar, the rules text); pins for the
+bar, the grab, the wound, every turn's end, the kept hold, the feint, the
+price, deception, deflect, disarm, the rider, the ends announced, the stray
+sheets and the flat mark on `/roll`, scenes and called checks; eight older
+pins reread (the hold rules, the state line, the wound line, Maintain, `/rp`,
+the hold order, the auto count, the GM skip, the called check). probe: the
+grapple form walk gives its grappler STR 5; the L walk — the bar; the
+grab's naturals; Maintain, Break free and a second failure; a GM's skip and
+breaking out first; a hold of 20 and Stay; the escape's naturals; the clock's
+reminder and stay; an NPC captive on auto and the chain going on; the
+feint's naturals and the price biting; a defensive feint; deflect and disarm
+naturals and an NPC's flat swing; `/deception` and `/roll`; an NPC feint and
+the mend's purge; a clock-skipped held turn.
+
+## 10t · A player's own advantage waits on a GM; auto Heroes (2026-11-08, build K)
+
+Same unpushed update again (H, I and K all ride the `2026-10-15` entry).
+T: "Players are abusing the ability to use advantage during fights … hold
+the command for approval from GMs and ping the GMs to confirm or deny … if
+there is no reply within 5 minutes then a message is sent to the players
+that they can not roll with either advantage or disadvantage without GM
+approval." Asked, T chose: **every player roll**; on allow **the player
+presses Roll**; on deny **it rolls plain at once**. Then a screenshot of an
+auto fight between two Heroes: the STR Hero's card read `⭐ (signature
+advantage) → [15]` (two dice thrown, one shown) and the WIS Hero never got
+advantage at all (the auto-pilot only picks STR or DEX).
+
+**The hold.** Table `mode_holds` (id, guild, channel, user, `who`, `via`
+slash|typed, `mode`, `payload` JSON, `src_msg_id`, `card_msg_id`,
+`go_msg_id`, `state` pending → allowed → rolling → used | denied | lapsed |
+expired | moot, `decided_by`, times); `guild_config.adv_approval` (NULL/1
+on, 0 off; `/config mechanics advapproval`). `holdWanted(guild, gid, uid,
+mode)`: adv/dis, switched on, not a GM. Gates, each after its own checks
+and before anything is spent: `handleRoll` (typed — `holdWanted` awaited
+first so validation → spending stays await-free; `allowed` param for the
+replay; the invalid-notation refusal moved above the signature block),
+`handleRollSlash` (not into a fight that is not waiting on them),
+`handle5eCheck`, and `handleFight` before the feint's switch (which spends
+the trick) via `gateFightRoll`: an `npc:` or a fight not waiting on them →
+`withPlainMode` (the branch refuses as it stands; the mode reads normal so
+a race can never roll it unasked); atk/def without `stat:` refused (the
+stat buttons drop the mode). Only a typed command is gated: a button, the
+`fighttarget` picker and the `frp:` form carry what was already allowed.
+
+`snapHeldSlash` keeps the command by name (`HELD_OPTS`: /fight's and
+/roll's options share names and types); `heldOptions` reads it back. The
+card (`postHeldCard`, channel.send, GM roles pinged, under the message for
+a typed roll): `advok:<id>` / `advno:<id>`, GMs only; `moveHeld(id, from,
+to)` is the only writer, so two GMs or a GM and the tick settle it once.
+Allow → `go_msg_id` message pinging the player with `advgo:<id>` (theirs;
+ten minutes) → `goHeldRoll` runs the command on that press through
+`heldInteraction` (a Proxy: the snapshot's options, `heldMode`, chat-input
+shape, everything else the real press — so forms and pickers open for the
+player). A form keeps the press alive (state back to allowed) and carries
+`heldId` in its stash; its submit `settleHeldRoll`s. Deny →
+`runHeldPlain`: typed through `heldMessage` (an adapter replying under the
+original message), slash through `plainInteraction` (channel adapter:
+ephemeral answers said aloud to the player, `heldMode.noForm`, so
+`typedForm` skips the forms; a picker for several foes is posted for them
+— the select checks the presser). Lapse at 5 minutes (`lapseHeld`), expiry
+of an unpressed Roll at 10 (`expireHeld`): an unref'd timer each, and
+`heldRollTick` on the turn clock's tick for after a restart; rolling left
+by a crash is spent after ten, settled rows pruned after 30 days.
+`heldStillStands`: a fight move only while the fight still waits on them
+(else `moot`). The fight clock and the order clock stamp and skip while the
+one they wait on has a pending hold. 5e `/dnd inspiration use:true` sets
+`next_mark: 'adv'` (cancels a 'dis', refused over 'adv' or 'flat') instead
+of telling the player to pick advantage, which would now wait.
+
+**Auto Heroes.** `autoFightStat(stats, allowed, prefer, signature)`: a
+stated preference first, then a live signature (`hasSignatureAdvantage`)
+where the weapon allows it and it is within `SIGNATURE_EDGE` (3 — two d20s
+average 13.8 against 10.5) of the best; `chooseAutoStat` passes it, so the
+full auto fight, the NPC auto-pilot and the turn clock all reach for it.
+`autoFightCard`'s last parameter is the roll itself (`{ adv, dropped }`):
+`[15, ~~8~~]`; `mirrorAutoRoll` takes a whole roll in the `nat` slot and
+keeps both dice (thirteen callers). Seven fight ability lines printed
+`[15~~8~~]` (a struck 158): the comma is in.
+
+**Tests.** verify: `Proxy`/`Reflect` join the structure scanner's globals;
+the form pins read `typedForm`; four pins (the gates and their order, the
+hold's plumbing, inspiration, auto dice and signature); the `build K`
+harness (the signature edge, weapons, preference; the snapshot read back
+whole and plain; the card's words; the plain wrapper). probe: the K walk —
+/roll held, one at a time, GM-only answers, the player's Roll; a fight
+(stat named, clock waiting, denied plain with no form); allowed with the
+defence form, dismissed and reopened, submit; typed `stra` denied under
+its message; lapse; expiry; GM and switch; 5e inspiration and a held
+skill; an auto fight of two Heroes.
+
+## 10s · as:, several dice, 5e everywhere, the talk twice, answering as an NPC, the run archive; initiative and the turn clock (2026-11-07, build I)
+
+Same unpushed update as 10q and 10r: T had not pushed build H, so the
+changelog bullets went into the same `2026-10-15` entry (What's new posts
+an entry again whole once it gains lines). T asked whether an instance can
+be tied into a campaign and why `/instance start` said `kind:` — renamed
+**`as:`** (no "renamed" note: H was never live). Then six: advantage on
+several dice; "make sure that for that system dnd 5e stats are used for
+that framework as a whole"; "a corrected version and a raw version" of
+the recorded talk; "reply as an npc"; `/campaign add part:`; and "can GM
+ran quests be logged in a thread along with their summary pdfs" — every
+kind of run, with its runtime ("including the time total for instances
+currently being ran"). Before the push T added the turn order: "named as
+initiative … buttons to apply for players … a GM presses the close
+button then the bot rolls initiative and shows the turn order"; under
+`/session`; server defaults "a 5 minute reminder and a 15 minute turn
+skip"; "both button and typing" stop the skip; a Done button; in fights
+"auto roll to the last enemy or to the lowest hp enemy", a toggle against
+skipping; picked from the extras offered: **Round counter**; and "every
+fight" runs on the clock. Commands stay 26; /session has 12 leaves.
+
+**played:** (`parsePlayedMs`: `6h`, `2h30m`, `90m`, `1.5h`, `2:30`, a
+thousand hours at most, else null and refused) on `as:legacy` banks into
+`elapsed_ms` and is kept apart in `quests.played_ms` for the record's
+"(+N before the bot)". `/instance list` shows `questElapsed` beside each.
+
+**/campaign add part:** an instance only (a board quest is refused);
+sets `instance_kind='chapter'`, `part`; a part already given is allowed
+and said. `remove` on a chapter makes it an encounter again.
+
+**Several dice.** `rollSetTwice` — `rollAdvantage`/`rollDisadvantage`
+call it when `dice > 1`: the whole set twice, the better (worse) sum kept,
+`{ multi, keptSet, droppedSet }`; `detectCrit` reads no critical off a
+multi roll; `buildRollLine` writes `[kept] ~~[dropped]~~`. `rollForRp`
+spends a mark on dice as on a stat.
+
+**5e everywhere.** On a 5e server every shared system reads the six
+abilities and adds modifiers, never scores: typed rolls (`int`, `r cha`,
+`?wis 12`), `/roll`, `/gm reroll`, targets, planted and group checks,
+activities (`[CHECK]` words), initiative, the auto-pilot
+(`autoAtkBonus5e`: statblock attack, else modifier + proficiency, against
+AC). `/gm dc` takes the six and the eighteen skills in one list
+(`SKILL_KEYS_5E` rides button ids without spaces), `save:true`,
+proficiency where the sheet has it; `parseDcLine` reads `stealth 14`,
+`dex save 13`; sanctions `cha+1`. The pickers: `commandJsonFor(gid,
+json)` rewrites each command's stat choices as `registerSlashCommands`
+sends them per guild (Knightfall's five become the six; never Luck).
+Character pages, the sheet-summary paste, `/char set`, export/import
+(`SYSTEM:dnd5e`, INT, CHA, LEVEL, AC, SAVES, SKILLS, weapon dice;
+`validateImportedSheet`/`validateImportedNpc` per system). Two real bugs
+the 5e probe walk found: `upsertChar`'s INSERT kept only the five
+Knightfall columns, so `/dnd create` lost INT, CHA, class, level and
+proficiencies — it inserts the base row then UPDATEs the rest, filtered
+by `charColumns()` (PRAGMA); the import approval deferred twice. And
+`createTarget` lacked `guild_id`, so a 5e target card showed Knightfall
+stats. Still Knightfall-shaped on 5e: grapple, feint, deflect, disarm
+(LIMITS).
+
+**The talk, twice.** `quest_events` gains `msg_id`, `first_text`,
+`gone`; `recordRoomTalk` writes `msg_id` and the line through
+`cleanTalk` (mentions named, never carried). A `raw` listener (before
+`messageCreate`) follows MESSAGE_UPDATE → `noteTalkEdited` (first wording
+kept once) and MESSAGE_DELETE/_BULK → `noteTalkGone` — raw, so a message
+from before a restart is followed. `runTranscripts`: corrected (as the
+thread reads now) and raw (as first typed, `↳ edited to:` and
+`↳ deleted` under the line). At completion the corrected one rides with
+the story for everyone; the raw one goes to the run archive, or the GM
+quest log when there is none. Talk left the story scroll (it spent the
+150 beats) and is counted there instead.
+
+**Answering as an NPC.** `rpLineRow` is Reply + `rpnpc` 🎭 GM. A GM's
+press → `npcAnswerModal` (`npcans:<cid>:<mid>`): who answers
+(`npcAnswerOptions`: NPCs whose webhook lines are in the channel's cached
+messages first, then the rest, living, 25), action, speech, To, Groups —
+seven `addLabelComponents` with the speak-as box. `/npc say reply:` takes
+a link (`parseMessageLink`; a bare id means this channel) →
+`npcSayModal(npc, gid, { reply })` (`npcsayr:`). `replyHeaderAt` checks
+the message is this server's; the answer carries the ↪ header.
+
+**The GM run archive.** `guild_config.gm_run_archive` (a GM forum,
+`SETUP_PLAN` key, `/config channels gmarchive`), `run_archive_threads`
+(JSON gm → thread), `run_archive_backfilled`; quests `archive_gm`,
+`archive_thread_id`, `archive_msg_id`. A thread per GM (`archiveGmOf`:
+the run's GM, else the listing's); its starter is the header
+(`runArchiveHeader`: runs and hours by kind, ▶️ what is running now with
+its time, `-# Updated`), refreshed when a run starts, pauses, resumes or
+finishes and hourly from `questTick`. `archiveFinishedRun` posts the run:
+kind, campaign, part, ⏱️ runtime (+ before the bot), party, payout,
+titles, the record text, the story and record PDFs and both transcripts;
+`archiveReview` answers its post. `backfillRunArchive` files every run
+already finished, oldest first, paced (`ARCHIVE_PACE_MS`, the probe sets
+0), resumable, once (`startRunArchiveBackfill` on setup, mend, build and
+boot). Restart's wipe nulls the maps.
+
+**Initiative** (`/session initiative|turn|clock` route before
+`handleSession` resolves a run: they belong to the channel). Table
+`turn_orders` (one per channel: `state` signup|running|paused|ended,
+`entrants` JSON {id, name, kind player|npc|name}, `order_json` with roll,
+dex, total, `ties`, `turn_index`, `round`, `turn_started_at`,
+`last_sign_at`, `reminded_at`, card/turn/remind message ids). The card
+(`initSignupView`): `init:join|leave|npcs|close|cancel`; a run's party in
+the room is pinged under it. NPCs: `initnpc` modal (the
+`npcAnswerOptions` picker + a words field) and `npcs:` both go through
+`resolveInitNpcs` — `X xN` via `summonSpec` (temp copies; existing
+copies of the same names count), `category:`, an NPC by name, a library
+monster stepped out once, else a `name:` entrant on d20 + 0. Close →
+`closeInitiative`: re-reads the state before any await (two GMs roll it
+once), d20 + `statBonusOf(dex)`, `settleInitiativeTies`, the card becomes
+`initOrderView`, `postTurnCard`. Turn buttons carry `initTurnKey`
+(`round.index`): `init:done|skip:<key>`, `init:pause`, `init:end`,
+`init:resume` — every one carries the order's stamp (`orderStamp`:
+`created_at`), the turn's add `-turn_seq` (`initTurnKey`), so add/remove
+never stale the card in hand and another order's buttons do nothing;
+`advanceTurnOrder` bumps `turn_seq`, reads, checks the key and writes before
+awaiting, strips the old card and reminder (`stripButtons`), refreshes the
+order card, posts the next with the lead line. Logged on the room's run
+(`noteQuestActivity`, kind `turn`, icon 🔄): the order rolled, `Round N`,
+GM skips, time-outs, joins, leaves, the end — not Dones. `/session turn`:
+show (anyone), next (the turn's own or a GM), skip, back, pause, resume,
+close, add (rolls, inserted by total, the current turn kept), remove,
+end; `who:` autocompletes the order then living NPCs; GM actions are refused
+before the answer where they can be, then deferred (public for pause, end
+and a running order's add/remove) and the row read afresh. Only `<@id>`
+mentions seat players (`mentionIds`): a role or a channel is nobody. An
+order ends on its own only when its room is gone (10003/50001). The temp sweep
+spares order NPCs (`orderNpcNames`) — and is case-blind now: it compared
+stored names with lower-cased ones, so every capitalised temp fighting
+elsewhere was swept when any fight ended (and `/npc temp list` never
+showed _in a fight_).
+
+**The turn clock** replaced `fightIdleTick` and `fightnudge`. Server:
+`guild_config.turn_remind_min|turn_skip_min|turn_timeout` (NULL = 5, 15,
+skip; `/config mechanics turnclock`, `reset:` nulls them and
+`fight_nudge_min`); a server that had set fightnudge is read into it once
+at load (remind = it, skip = max(15, it + 10); 0 = no clock). Channel:
+`turn_clocks` (`/session clock`, or the options on `/session
+initiative`), field by field over the server's (`turnClockFor`); skip
+must exceed remind (`clockProblem`). `turnClockTick` (on the quest
+interval, never overlapping): fights — `last_at` (every real
+`upsertFight` stamps it, as before) against the clock; at remind,
+`nudged=1` and one ping with `fclock:hold` (Resolve when both rolls are
+in); at skip, `fightClockTimeout`: a defence is always rolled
+(`clockDefend`: grapple save, feint insight, or best permitted defence,
+flats honoured) and resolved; a resolve-wait resolves as it stands; an
+attack is `clockStrike` (timeout auto: `clockTargetFor` — the fighter's
+`fights.last_targets` entry, recorded by `upsertFight` whenever an attack
+is declared, if standing and not their captive, else the lowest-HP foe of
+the other side, else anyone; their `chooseAutoStat`, restrained /
+off-balance / fooled flat, riposte, signature, 5e bonus vs AC) or
+`clockSkipFight` (like /fight skip, `FRESH_EXCHANGE`, `announceNextTurn`);
+the auto-pilot is kicked after. From the cold audit: `clockTargetFor`
+reads the sides from `hp_state`'s keys too (downed fighters stay there),
+so a fight that had both sides never sets a quiet fighter on a friend —
+no foe standing, the turn is skipped; a duel falls back to anyone. Each
+tick re-reads the fight, and every clock action carries `at` (the
+`last_at` it read) and does nothing once it differs (`moved()` /
+`unmoved()`), so a move made meanwhile stands and no mark is spent.
+`fights.clock_idle` / `turn_orders.clock_idle` count the clock's own
+moves in a row (`upsertFight` zeroes it on every real write and the
+clock sets it after; a sign of life zeroes it); at `fightClockHands`
+(standing fighters, players only under the auto-pilot) or the order's
+length it stops and says so. Anything quiet `CLOCK_DORMANT_MS` (6 h) past
+its mark is left alone, so fights abandoned before the clock don't wake
+on deploy. An auto-pilot NPC quiet two minutes means a lost chain:
+`runAutoNpcChain` takes it up. A fallen defender's exchange is called off
+(`clockSkipFight` with a `lead`). Retrieval posts through `sendLong` so the
+next turn keeps its ping and buttons. Orders — quiet since `max(turn_started_at,
+last_sign_at)`; a fight in the room or a paused run there holds it
+(last_sign_at bumped). Signs of life: `noteTurnLife(gid, cid, uid,
+gmCheck)` from `messageCreate`, `raw` TYPING_START (intent
+`GuildMessageTyping` added) and the top of `handleInteraction` (any press
+or command, so opening a fight form holds the turn); an NPC's or a name's
+turn takes a GM's sign (`memberLooksGm`, no fetch). Nothing acts sooner
+than the minute tick.
+
+**Cold audit** (two agents, one on the turn clock, one on the rest).
+Besides the clock's fixes above: "Chad is here" no longer rolls CHA at
+disadvantage on 5e (`/^chad(\s|$)/`); the archive remembers its forum
+(`run_archive_forum`) so switching it off and on files nothing twice, the
+quick-setup picker offers forums for it and passes `forced.channel`, a
+GM's thread opens once at a time (`archiveThreadOpening`) and is made
+again only when Discord says it is gone (10003) or sits in another
+forum, the header is stamped as tried so a dead forum is retried hourly,
+a run finished again after a reopen replaces its post, and the backfill
+counts as done only when nothing failed; an NPC's answer is logged as its
+words, not its jump header; `/quest run recap` and `/quest run timeline`
+leave deleted talk out; a 5e auto-fight's initiative prints the modifier
+it added; `npcCardFooter` on 5e shows HP, AC and the six; `/char set` on
+5e refuses a player with no sheet (a bare row locked `/dnd create`);
+`/feedback send quest:` reviews reach the archive; `played:` without
+`as:legacy` is refused; the speak-as box defers before its fetches.
+
+**Tests.** verify: pins for the clock, the targets, the signs of life,
+the settings, initiative, the sweep; the label-modal count is nine; the
+`build I` harness (played:, several dice, 5e parsers, export/import, the
+picker) and the `build I · turns` harness (clock words and limits, turn
+keys, the entrant merge, whom a fight waits on). probe: the I walk (as:,
+played:, part:, several dice, talk edits and deletions, transcripts, the
+archive and its backfill, reviews, answering as an NPC, a 5e guild end to
+end) and the J walk (the call, the card, Close & roll, Done, keys, Skip,
+the reminder, ✍️, typing, a message, a fight in the room, time-outs and
+rounds, pause, /session turn, autocomplete, a fight on auto and on skip,
+the last foe first, the order's temps surviving a fight's end, back, end,
+the timeline); `/session turn` is open on purpose in the gate walk.
+
+## 10r · /instance and /session; /rp rolls; Reply under every line (2026-11-06, build H)
+
+Same unpushed update as 10q (T pushed through build G; the 15/10 What's
+new thread exists, so the boot appends). T, planning: "Would it be
+logical to change the /encounter function to /instance? So then quest
+instances, adhoc encounters, preexisting quests that aren't in the bot
+pipeline can be ran?" — legacy runs pay "if the gm designates it";
+"Replace /encounter with instance"; the old by-name leaves were going to
+fold under /instance until T asked "wouldn't having so many things be
+umbrella under /instance be confusing?" and chose **/session** for them.
+Then the table's asks: GMs pinging several players and whole groups from
+the RP form; "can a gm start a thread for recording?"; "/rp roll"; "a
+reply/interact/respond button … for anyone to reply to"; "can't all
+responses contain the buttons in case multiple people respond"; a reply
+that jumps to the original. Commands stay 26.
+
+**/instance** (was /encounter; `handleEncounter`, dispatched on
+`instance`). `start` takes `kind:` encounter|chapter|legacy, `part:`,
+`started:`, `quest:`, `record:`; `list`; the `preset` group unchanged.
+All three kinds are `kind='encounter'` rows — every query that knew an
+encounter knows them — told apart by new columns `instance_kind`,
+`part`, `legacy_since`, `record_all`. `INSTANCE_KINDS` (icon, noun,
+"begins" words), `instanceKindOf`, `instanceIcon`, `instanceAside`
+("Part 3 of **X**", "picked up from before the bot · begun 12/09") feed
+the room name, its greeting, the card, the start log line, the campaign
+card (`📖 Part N`), the roster pickers and `/gm roster`. A chapter needs a
+campaign (`nextChapterPart` when `part:` is blank); a legacy run's merits
+are `merits:` or 0, never a preset's. `quest:N` → `adoptRunningQuest`: an
+active quest gets `openRunThread` if it has no room, and `record:` sets
+`record_all` and tells the room. `record_all` → `recordRoomTalk`, first
+thing in `messageCreate` for any guild message: rows whose
+`run_channel_id` is this channel, active, recording, unpaused get an `rp`
+event `Name: text`; `looksLikeTypedRoll` mirrors the typed parser's
+words (and `[STORY]`/`[ACTIVITY]`), so rolls stay in the roll log.
+
+**/session** (the old /instance, `handleSession`). Same leaves, plus
+`complete summary: title:`. The pre-build audit found the by-name leaves
+mostly broken, fixed here: 17 `requireQuest(interaction, gid)` calls in
+`handleQuest` ignored the forced number (`forcedNum` now) — rally, note,
+pause, resume and show answered "No quest #null"; `thread` fell through
+to `/quest run thread`, which demands `number:` — `sessionThread` opens
+the room itself; `resolveRun` said "no runs yet" for an encounter or an
+active pre-pipeline listing — either is now its own run; inside a run's
+thread with no `run:` the listing's newest active run was taken — now
+the thread's own row (`hereRun` prefers active); approve on an *active*
+listing under spin-off staged instead of seating (`quest.status !==
+'active'` added to the staging test); add on an instance goes to
+`seatOnInstance` (the old /encounter add body: sheet, pulse, the GM's
+word) rather than approve; kick is `/quest` kick for every kind, so a
+player taken out during the winding-down is `departed` and still paid
+(the old /encounter remove deleted them). Everything but `show` is
+GM-gated at the top. `complete` with no summary → `offerDraftedEnding`:
+`draftEndingFromLog` (the recap's beats, seating notes filtered) with
+`sessend:use|edit|none:<key>` (30 min, `pendingEndings`, the starting
+GM only) and `sessendform:<key>` (prefilled); nothing logged → it just
+completes. `encounterHere`/`encounterNoneHere` are gone (unused). The
+`/session name:` autocomplete puts running ones first with their marks.
+
+**to:** (`resolveAddressees`): mentions, `@Name`, a knight order
+("White Knights", "White") or an association (`subject_assocs` name),
+commas between; a bare word tries group/order first, `@word` a person
+first; role mentions dropped. `orderMembers`/`groupMembers` give living
+players only; `ADDRESS_CAP` 50 (postAsNpc's users cap rose from 20).
+`addressNote` tells the GM which groups, the overflow and the misses.
+The NPC box: To picker 3 → 25, and a `groups` StringSelect
+(`addressableGroups`: orders then associations with someone living,
+values `o:`/`g:`) when there are any — five labels at most with `offer`.
+`/npc say to:` and `/rp to:` are string options now (no autocomplete, so
+the client's mention popup still works in them).
+
+**/rp** (`rpModal({ gid, gm, title, replyTo })`, label style now):
+action, speech, `roll` (the ruleset's stats), `dice`, and for a GM `to`.
+`postRpLine` validates first (`rpStatOf`, dice `^\d{1,2}d\d{1,3}([+-]\d{1,3})?$`),
+gates rolls on `sheetGate`, then: a stat roll looks for an open card
+(`findOpenDcCard`: last 50 messages, newest first, an enabled
+`dcroll:<uid>:<stat>:` button). `runDcRollPress` was split into
+`dcPressParams` / `rollCalledCheck` (roll + quest beat) /
+`settleCalledCheck` (flavour, sanction, mark, damage, bind, book) /
+`darkenButton`, used by the button and by /rp alike; /rp edits the card
+message to darken. Otherwise `rollForRp` (consumeFlatMark,
+applySignatureMode, noteHonestRoll, applyNextMark — what `handleRoll`
+does; the bonus is `rulesFor(gid).statBonus`). Footer lines start 🎲/🎯;
+the first ordinary roll is `saveRoll`ed so `rr` works (there is no
+reroll button for typed rolls — T's "reroll button" became `rr`); each
+roll is `recordRoll`ed after posting (audit link to the line) and a
+`roll` beat; the words an `rp` beat.
+
+**Reply everywhere.** `npc_lines` and the newest-only clearing are gone
+(the CREATE is dropped; old databases keep an idle table). `/rp` lines
+carry `rpreply` (`rpLineRow`); NPC lines keep Reply · GM · (Interaction).
+Reply → `rpform:<messageId>`; `replyHeaderFor` fetches the line and
+writes `-# ↪ replying to [Name](https://discord.com/channels/g/c/m)\n`
+(`lineSpeaker`: the webhook's username, or the bot's `🎭 **Name**` line).
+
+**/edit** (found by the audit: buttons on every line would have hidden
+every roleplay line from it). `onlyRoleplayButtons` — at least one
+button and all of them `npcreply|npcx|npctalk|rpreply` — lets the list,
+the box and the take-down through; edits send content only, so rows
+stay. A player's own line: `rpPartsOf` splits name line + reply header /
+words / footer, the box shows the words, `joinRpParts` puts the rest
+back.
+
+**package.json** `"engines": { "node": ">=20" }`.
+
+**Docs.** HELP: /rp (both), /npc say and its row, /edit, the quest
+category's /instance (start, adopt + record, list, preset) and /session
+lines, campaign; the rules `one-quest`, `encounter-idle`,
+`encounter-seats`. Books: player Instances and /rp (rolls, Reply, the
+jump link); GM /session rows, "Instances — Runs Opened Without the
+Board", campaign, temps, NPC lines (to:, Groups, Reply), /edit; the
+examples. Changelog: seven GM bullets and five player bullets in the
+10-15 entry; two older bullets in that same entry renamed (`/instance
+preset … npcs:`, `/session complete title:`), the Build F detail's
+"newest line" sentence corrected. Older entries keep `/encounter` as
+history — verify's taught-but-unregistered now skips entries before the
+newest.
+
+**Tests.** verify: the count pin (/instance and /session, no
+/encounter), /edit's filter, the DC beat, /rp, the player edit, the box
+(25, groups, five `addLabelComponents`), roster, /session forwarding, the
+seat and end pins, the bound skip, the card-row marks; new pins for
+/session's fixes, the drafted ending, /instance's kinds/adopt/record,
+/rp rolls and the called check, Reply and the header, `to:`. probe: the
+fake's `ActionRowBuilder` rows now read back like a fetched message's
+(`components` → `{ customId, label, style, disabled }`) — only the new
+code reads that shape; the encounter walk speaks /instance and /session
+(add by name from elsewhere, kick in the room); the D walk's Reply ids
+carry the line and `to:` is a mention string; the H walk (32 probes):
+chapter needs a campaign and numbers 1, 2; legacy pays 0 and says so;
+list; /session note/show/rally/pause/resume by name, a note in the room,
+a plain player refused (show allowed); thread on a pre-pipeline run; add
+seats rather than stages; adopt with record, typed talk kept, `r 1d20`
+not, record off; `to:` with a person, an order, a group and a miss; the
+box's Groups; every line keeps its row; /rp with stat + dice (STR is
+`1d20+4`), `rr`, a player's `to:` refused, no To picker for a player, a
+missing stat and bad dice refused; a stat roll answering a DC 30 card
+(darkened, then the next roll ordinary); Reply on an /rp line and on an
+NPC line with the jump header; /edit listing a Reply line and keeping
+header and roll; a roll in a thread room as the bot's own post with
+beats in the log; the drafted ending (edit → box → complete; nothing
+logged → completes; Use → spent).
+
+**Cold audit (a second agent, after the build; all fixed here, all pinned
+or probed).** (1) A player's `/edit` cut the joined line at 2000, so long
+words chopped the roll off, and the words could carry a typed 🎲 line of
+their own — now `BOT_LINE_RE` (a line starting 🎲, 🎯 or ↪) is refused in
+a player's edit and in a player's `/rp` words, and an edit too long for
+the roll is refused, not cut. (2) Recorded talk went out again in the
+hourly recap with live mentions (and the completion card without a GM
+log channel) — talk is its own event kind `talk` (💬): the scroll keeps
+it, the GM record counts it, the hourly recap skips it, the draft uses it
+only when nothing else was logged; the recap and the card send with
+`parse: []`; stored text is `cleanContent` with any mention left named
+`@someone` and @everyone/@here defused. (3) DEX called checks never
+resolved: `field.includes('d')` read `dex` as notation (older than this
+build) — notation is `^\d*d\d+`; a notation that does not read now spends
+no mark. (4) `to:` took a member by the start of a piece ("Gold Knights &
+Aldric" pinged a member called Gold) — `memberNamedExactly` (whole name
+only), "and"/"&" split a piece that is not itself a group, an order with
+nobody living is said rather than claimed, dropped roles are owned up to.
+(5) Stat shorthand (`str`, `dexa`, `?wis 12`) was recorded as talk —
+`parseStatShorthand` joins the roll test, with sheet pastes. (6) Recording
+a run with no thread recorded its whole shared channel — recording
+matches `run_thread_id` only; adopt with `record:true` and no room
+refuses to record; an instance opened in a plain channel is not recorded
+and the GM is told. (7) `/rp` replied after every fetch — it defers once
+validated and answers with `editReply`; adopt answers before announcing.
+(8) A player could take down a rolled line and roll again — refused for
+a non-GM when the line has a roll. (9) `/session` read
+`interaction.channel?.id` (null in an uncached thread) — now
+`interactionChannelId`. (10) Chapter numbers were fixed at draft time —
+numbered as the chapter opens; an asked-for part already used says
+"again — another session of it". (11) Advantage marks applied to `/rp`
+dice — marks ride the stat (d20) roll only. (12) `/edit`'s dropdown
+labelled every reply alike — labelled by the words, ↪ in front of a
+reply. Smaller: the drafted summary is capped at the 1700 the GM sees;
+the length reserve counts the bot's name line; the recording query is
+prepared once; `to:` alone is refused (the box has its own pickers); the
+GM's note lists at most eight misses; a mistyped `name:` in a shared
+channel is an error, not that channel's newest run. Stale words fixed in
+the 10-15 entry (the /rp detail, "up to three", the player /rp line) and
+the GM book (/session leaves, the Interaction field, `record:`). Known,
+left: deleting or editing a message does not take it out of the log; the
+story scroll holds the first 150 events and 12000 characters, so a long
+recorded session is cut there.
 
 ## 10q · Activities, written properly: the script kept, the shelf, the board, party runs, the writer; NPC mentions and Interact (2026-10-20, build D)
 

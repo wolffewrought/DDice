@@ -76,6 +76,10 @@ function recorder(kind) {
     // field reader see the same shape as an action row's.
     addLabelComponents(...c) { for (const l of c.flat()) this._d.components.push({ _kind: 'label', _d: { label: l._d?.label, components: l._d?.components || [] } }); return this; }
     setTextInputComponent(c) { this._d.components = [c]; return this; }
+    // A sent row read back as discord.js hands a fetched message's rows
+    // over: each component with its customId, label, style and disabled
+    // (2026-11-06 \u2014 /edit and the called-check scan read them so).
+    get components() { return kind === 'row' ? this._d.components.map(c => { const d = c?._d || c || {}; return { customId: d.customId, label: d.label, style: d.style, disabled: !!d.disabled }; }) : undefined; }
     setUserSelectMenuComponent(c) { this._d.components = [c]; this._d.userSelect = true; return this; }
     setStringSelectMenuComponent(c) { this._d.components = [c]; return this; }
     addSubcommand(fn) { this._d.subcommands.push(fn(new (recorder('sub'))())._d ?? fn); return this; }
@@ -126,7 +130,9 @@ class FakeChannel {
         t.parentId = this.id; t._isThread = true; t.ownerId = 'BOT'; t.appliedTags = appliedTags || [];
         threads.push(t);
         channelsById.set(t.id, t);   // fetchable by id, as a real thread is
-        if (message) await t.send(message);
+        // A forum post's first message is its starter, as Discord keeps it.
+        if (message) t._starter = await t.send(message);
+        t.fetchStarterMessage = async () => t._starter || null;
         return t;
       },
       // The forum's live threads, as discord.js hands them back.
@@ -154,6 +160,8 @@ class FakeChannel {
     const msg = {
       id: nextId(), content, channelId: this.id,
       components: (typeof payload === 'object' && payload?.components) || [],
+      files: (typeof payload === 'object' && payload?.files) || [],
+      replyTo: (typeof payload === 'object' && payload?.reply?.messageReference) || null,
       author: { id: 'BOT' }, editable: true,
       edit: async (p) => { msg.content = typeof p === 'string' ? p : (p?.content ?? msg.content); if (typeof p === 'object' && 'components' in p) msg.components = p.components; return msg; },
       delete: async () => { deleted.push(msg.id); },
@@ -280,6 +288,8 @@ Module._load = function (request, parent, isMain) {
 try { fs.mkdirSync('/app/data', { recursive: true }); } catch {}
 
 process.env.DISCORD_TOKEN = 'probe';
+// The GM run archive's backfill paces itself for Discord; here it need not.
+process.env.DDICE_ARCHIVE_PACE_MS = '0';
 process.env.CLIENT_ID = 'probe';
 
 let loadError = null;
@@ -336,7 +346,7 @@ function makeInteraction(over = {}) {
   const opts = over.options || {};
   const i = {
     id: over.id || nextId(),   // a real interaction has one; the DC form keys its draft by it
-    guild, guildId: GID, channel: over.channel || chan, channelId: (over.channel || chan).id,
+    guild: over.guild || guild, guildId: (over.guild || guild).id, channel: over.channel || chan, channelId: (over.channel || chan).id,
     user: { id: over.userId || 'U1', tag: 'u1#1', username: 'u1' },
     member: over.member || { id: over.userId || 'U1', roles: { cache: new Map() }, permissions: { has: () => true } },
     client, appPermissions: { has: () => true },
@@ -562,6 +572,9 @@ async function fire(over) {
     ok('a feint pick opens the form with the claim; the submit runs it with the words', /lunge at the knee/.test(f2.said) && /drops a shoulder/.test(f2.said), f2.said.replace(/\s+/g, ' ').slice(0, 160));
     // 5 · grapple: picker → form → the hold is attempted; the captive's Save opens its form.
     reset();
+    // A grip needs STR 4+ on Knightfall (2026-11-09).
+    const strU1 = dbHandle.prepare("SELECT str FROM characters WHERE guild_id='G1' AND user_id='U1'").get()?.str ?? 0;
+    dbHandle.prepare("UPDATE characters SET str=5 WHERE guild_id='G1' AND user_id='U1'").run();
     await step('fact:grapple (opens target picker)', { isButton: true, customId: 'fact:grapple' });
     const g1 = await step('fightact:grapple select → form', { isSelect: true, customId: 'fightact:grapple:U1', values: ['U2'] }, { expectModal: true });
     const g2 = await submit('grapple form → the attempt', g1.modal, { speech: 'Got you' });
@@ -569,6 +582,7 @@ async function fire(over) {
     const sv1 = await step('fsave (captive → form)', { isButton: true, customId: 'fsave', userId: 'U2' }, { expectModal: true });
     const sv2 = await submit('save form → the save', sv1.modal, { action: 'twists away' }, { userId: 'U2' });
     ok('the Save press opens the form and the submit rolls it with the words', /_\*twists away\*_/.test(sv2.said) || /\*twists away\*/.test(sv2.said), sv2.said.replace(/\s+/g, ' ').slice(0, 160));
+    dbHandle.prepare("UPDATE characters SET str=? WHERE guild_id='G1' AND user_id='U1'").run(strU1);
     // 6 · holds without a hold: refused before any form.
     reset();
     for (const [label, id] of [['fact:maintain (not holding → refusal)', 'fact:maintain'], ['grpfree (not holding → refusal)', 'grpfree'], ['fact:escape (not held → refusal)', 'fact:escape']]) {
@@ -667,7 +681,7 @@ async function fire(over) {
       ['char weaponemoji custom', await acAny('char', { _sub: 'weaponemoji', _focused: 'custom', _focusedValue: '' }), (c) => Array.isArray(c)],
       ['char tag custom emoji', await acAny('char', { _group: 'tag', _sub: 'custom', _focused: 'emoji', _focusedValue: '' }), (c) => c.some(x => x.value === '⚔️')],
       ['activity set value (roll)', await acAny('activity', { _sub: 'set', name: 'Probe', scene: 'start', field: 'roll', _focused: 'value', _focusedValue: '' }), (c) => c.some(x => x.value === 'str|dex|wis')],
-      ['encounter preset save npcs', await acAny('encounter', { _group: 'preset', _sub: 'save', _focused: 'npcs', _focusedValue: 'Gob' }), (c) => Array.isArray(c)],
+      ['instance preset save npcs', await acAny('instance', { _group: 'preset', _sub: 'save', _focused: 'npcs', _focusedValue: 'Gob' }), (c) => Array.isArray(c)],
       ['gm search name', await acAny('gm', { _sub: 'search', _focused: 'name', _focusedValue: '' }), (c) => c.length > 0],
       ['spell prepare add', await acAny('spell', { _sub: 'prepare', _focused: 'add', _focusedValue: 'Fire' }), (c) => c.some(x => x.value === 'Fire')],
     ];
@@ -744,7 +758,7 @@ async function fire(over) {
     channelsById.set(forum.id, forum);
     setConfigProbe('quest_instance_forum', 'FORUM1');
     const openEncounter = async (label, options, users) => {
-      const r0 = await press(`${label} (picker)`, { commandName: 'encounter', options: { _sub: 'start', ...options } });
+      const r0 = await press(`${label} (picker)`, { commandName: 'instance', options: { _sub: 'start', ...options } });
       const rows = r0.replies[0]?.components || [];
       const menu = rows[0]?._d?.components?.[0]?._d || {};
       const sel = menu.customId || '';
@@ -758,7 +772,7 @@ async function fire(over) {
       return { room: threads.length > n ? threads[threads.length - 1] : null, r: r2 };
     };
     dbHandle.prepare(`INSERT OR REPLACE INTO library_monsters (guild_id, name, hp, ac, attack, damage, str, dex, con, int, wis, cha) VALUES ('G1','Goblin',7,13,4,'1d6',8,14,10,10,8,8)`).run();
-    await press('preset save',   { commandName: 'encounter', options: { _group: 'preset', _sub: 'save', name: 'Ridge bandits', merits: 3, npcs: 'Goblin x2' } });
+    await press('preset save',   { commandName: 'instance', options: { _group: 'preset', _sub: 'save', name: 'Ridge bandits', merits: 3, npcs: 'Goblin x2' } });
     const { room: roomP } = await openEncounter('start from preset', { name: 'Bandits again', preset: 'Ridge bandits' }, ['U2']);
     const goblins = dbHandle.prepare("SELECT COUNT(*) AS n FROM npcs WHERE guild_id='G1' AND name LIKE 'Goblin %' AND is_temp=1").get()?.n || 0;
     ok('a preset summons its monsters as temps', goblins === 2, `got ${goblins}`);
@@ -773,7 +787,7 @@ async function fire(over) {
       && sent.some(x => x.channel === roomP.id && /merits each at the end/.test(x.content)));
     ok('one pointer line lands where the command was run', sent.some(x => x.channel === 'C1' && /has begun/.test(x.content) && x.content.includes(`<#${roomP?.id}>`)));
     const before = dbHandle.prepare("SELECT merits FROM characters WHERE guild_id='G1' AND user_id='U2'").get()?.merits ?? 0;
-    await press('encounter end (pays 3)', { commandName: 'encounter', options: { _sub: 'end' }, channel: roomP });
+    await press('session complete (pays 3)', { commandName: 'session', options: { _sub: 'complete', summary: 'They scattered.' }, channel: roomP });
     const paid = dbHandle.prepare("SELECT merits FROM characters WHERE guild_id='G1' AND user_id='U2'").get()?.merits ?? 0;
     ok('completion pays the preset merits', paid - before === 3, `delta ${paid - before}`);
     await press('qreopen press (5-min undo)', { isButton: true, customId: `qreopen:${enc2.number}`, message: { id: 'M6', content: '', components: [], edit: async () => {} } });
@@ -799,13 +813,13 @@ async function fire(over) {
     if (enc) {
       // Seats are the GM's: add from elsewhere lands in the room, remove from
       // inside it is the reply itself.
-      await press('encounter add U1 (from C1)', { commandName: 'encounter', options: { _sub: 'add', user: 'U1' } });
+      await press('session add U1 by name (from C1)', { commandName: 'session', options: { _sub: 'add', user: 'U1', name: 'Bandits on the ridge' } });
       const addRow = dbHandle.prepare("SELECT state FROM quest_members WHERE guild_id='G1' AND number=? AND user_id='U1'").get(enc.number);
-      ok('/encounter add seats a player', addRow?.state === 'party' && !!roomW && sent.some(x => x.channel === roomW.id && /<@U1> is seated/.test(x.content)), `state ${addRow?.state}`);
-      await press('encounter add U1 again → already', { commandName: 'encounter', options: { _sub: 'add', user: 'U1' } });
-      await press('encounter remove U1 (in the room)', { commandName: 'encounter', options: { _sub: 'remove', user: 'U1' }, channel: roomW });
+      ok('/session add seats a player on an instance by name, the line landing in its room', addRow?.state === 'party' && !!roomW && sent.some(x => x.channel === roomW.id && /<@U1> is seated/.test(x.content)), `state ${addRow?.state}`);
+      await press('session add U1 again → already', { commandName: 'session', options: { _sub: 'add', user: 'U1', name: 'Bandits on the ridge' } });
+      await press('session kick U1 (in the room)', { commandName: 'session', options: { _sub: 'kick', user: 'U1' }, channel: roomW });
       const remRow = dbHandle.prepare("SELECT state FROM quest_members WHERE guild_id='G1' AND number=? AND user_id='U1'").get(enc.number);
-      ok('/encounter remove takes them out', !remRow, `state ${remRow?.state}`);
+      ok('/session kick in the room takes them out', !remRow, `state ${remRow?.state}`);
       await press('campaign show (GM)',       { commandName: 'campaign', options: { _sub: 'show', campaign: 'The Probe War' } });
       // The seat override: a second quest for U1 while the encounter runs
       // is allowed (encounters are exempt), so make a real clash first.
@@ -827,7 +841,7 @@ async function fire(over) {
       dbHandle.prepare(`INSERT OR REPLACE INTO quest_members (guild_id, number, user_id, state) VALUES ('G1', 900, 'U2', 'applied')`).run();
       const r2 = await press('approve U2 elsewhere while 901 winds down', { commandName: 'quest', options: { _group: 'party', _sub: 'approve', number: 902, user: 'U2' } });
       ok('a winding-down seat does not block another quest', !/Seat them anyway/.test(JSON.stringify(r2.replies)));
-      await press('encounter end',            { commandName: 'encounter', options: { _sub: 'end', summary: 'They fled.' }, channel: roomW });
+      await press('session complete',         { commandName: 'session', options: { _sub: 'complete', summary: 'They fled.' }, channel: roomW });
       const after = dbHandle.prepare("SELECT status FROM quests WHERE guild_id='G1' AND number=?").get(enc.number);
       ok('ending an encounter completes it', after?.status === 'completed', `status ${after?.status}`);
     }
@@ -924,7 +938,7 @@ async function fire(over) {
   if (dbHandle && registered.length) {
     // /gm scroll opens its writing window before any await (a deferred
     // interaction cannot show a modal), so its gate is on the submit — probed below.
-    const OPEN_ON_PURPOSE = new Set(['/encounter list', '/encounter preset list', '/campaign show', '/campaign list', '/npc sheet', '/gm scroll']);
+    const OPEN_ON_PURPOSE = new Set(['/instance list', '/instance preset list', '/session show', '/session turn', '/campaign show', '/campaign list', '/npc sheet', '/gm scroll']);
     const byName = new Map();
     for (const body of registered) for (const c of body) byName.set(c.name, c);
     const plain = 'U7';
@@ -1501,7 +1515,8 @@ async function fire(over) {
     dbHandle.prepare("INSERT OR IGNORE INTO subject_titles (guild_id, subject_id, title, source, granted_by, at) VALUES ('G1', 'U2', 'Idol-breaker', 'probe', 'U1', ?)").run(Date.now());
     dbHandle.prepare("INSERT INTO week_ledger (guild_id, at, kind, text) VALUES ('G1', ?, 'fight', 'userU1 wins!')").run(Date.now());
     dbHandle.prepare("UPDATE characters SET died_at=? WHERE guild_id='G1' AND user_id=?").run(Date.now(), P4);
-    dbHandle.prepare("UPDATE guild_config SET week_tale_at=0, fight_nudge_min=NULL WHERE guild_id='G1'").run();   // the leaf walk set the nudge to 0; the default is wanted here
+    dbHandle.prepare("UPDATE guild_config SET week_tale_at=0, fight_nudge_min=NULL, turn_remind_min=NULL, turn_skip_min=NULL, turn_timeout=NULL WHERE guild_id='G1'").run();   // the server's own clock is wanted here, 5 and 15
+    dbHandle.prepare("DELETE FROM turn_clocks WHERE guild_id='G1'").run();
     dbHandle.prepare(`UPDATE fights SET state='active', turn_order='["U1","U2"]', turn_index=0, phase='attack', current_target=NULL, nudged=0, last_at=? WHERE guild_id='G1' AND channel_id='C1'`).run(Date.now() - 11 * 60 * 1000);
     const updForum = dbHandle.prepare("SELECT updates_forum FROM guild_config WHERE guild_id='G1'").get()?.updates_forum;
     const talesBefore = threads.filter(t => t.parentId === updForum && / · Weekly chronicle$/.test(t.name)).length;   // the tick walk above posted the first
@@ -1519,8 +1534,9 @@ async function fire(over) {
     for (const t of ticks) { try { await t.fn(); } catch {} }
     const nudgesAgain = sent.filter(x => /minutes? quiet/.test(x.content)).length;
     const talesAgain = threads.filter(t => t.parentId === updForum && / · Weekly chronicle$/.test(t.name)).length;
-    ok('a fight quiet for ten minutes nudges whoever it waits on, once; a second tick nudges nobody and posts no second chronicle',
-      nudges.length === nudgesBefore + 1 && /⏳ 10 minutes quiet — \*\*userU1\*\* is up to attack\. <@U1>/.test(nudges[nudges.length - 1]?.content || '') && nudgedRow?.nudged === 1
+    ok('a fight quiet past five minutes reminds whoever it waits on, once, with ✍️ Still writing; a second tick reminds nobody and posts no second chronicle',
+      nudges.length === nudgesBefore + 1 && /⏳ 5 minutes quiet — \*\*userU1\*\* is up to attack\. Still writing\? Press ✍️ or keep typing\. At 15 minutes the turn is skipped\. <@U1>/.test(nudges[nudges.length - 1]?.content || '') && nudgedRow?.nudged === 1
+        && JSON.stringify(nudges[nudges.length - 1]?.msg?.components || []).includes('fclock:hold')
         && nudgesAgain === nudges.length && talesAgain === talesBefore + 1,
       `${nudges.length - nudgesBefore} nudge(s): ${(nudges[nudges.length - 1]?.content || '').slice(0, 80)} · nudged ${nudgedRow?.nudged} · again ${nudgesAgain - nudges.length} · chronicles ${talesAgain}`);
     dbHandle.prepare("UPDATE characters SET died_at=NULL WHERE guild_id='G1' AND user_id=?").run(P4);
@@ -1726,21 +1742,27 @@ async function fire(over) {
         && /not yours to touch/.test(saidOf(notMine)) && idsOf(del3.replies[0]).includes('editdel') && /Which line comes down/.test(saidOf(del3)) && /Taken down/.test(saidOf(delPick)) && deleted.includes(rpMsg3?.id)
         && !dbHandle.prepare("SELECT 1 FROM rp_lines WHERE guild_id='G1' AND message_id=?").get(rpMsg3?.id),
       `list ${listIds.join(',')} vs ${rpMsg3?.id} · pick ${modalOf(pick3)} · save ${saidOf(save3).slice(0, 30)} "${rpMsg3?.content}" · link ${saidOf(notMine).slice(0, 40)} · del ${saidOf(del3).slice(0, 40)} / ${saidOf(delPick).slice(0, 30)} gone ${deleted.includes(rpMsg3?.id)}`);
-    // 4 · fightnudge: off means no nudge; five means five
-    const n0 = await fire({ commandName: 'config', options: { _group: 'mechanics', _sub: 'fightnudge', minutes: 0 }, userId: 'U1' });
+    // 4 · turnclock: 0 and 0 is no clock; a turn passes after its reminder; minutes as set; reset
+    const n0 = await fire({ commandName: 'config', options: { _group: 'mechanics', _sub: 'turnclock', remind: 0, skip: 0 }, userId: 'U1' });
     dbHandle.prepare(`UPDATE fights SET state='active', turn_order='["U1","U2"]', turn_index=0, phase='attack', current_target=NULL, nudged=0, last_at=? WHERE guild_id='G1' AND channel_id='C1'`).run(Date.now() - 30 * 60 * 1000);
     const nudgesC0 = sent.filter(x => /minutes? quiet/.test(x.content)).length;
     for (const t of ticks) { try { await t.fn(); } catch {} }
     const nudgesC1 = sent.filter(x => /minutes? quiet/.test(x.content)).length;
-    const n5 = await fire({ commandName: 'config', options: { _group: 'mechanics', _sub: 'fightnudge', minutes: 5 }, userId: 'U1' });
-    const nShow = await fire({ commandName: 'config', options: { _group: 'mechanics', _sub: 'fightnudge' }, userId: 'U1' });
+    const stillC1 = dbHandle.prepare("SELECT turn_index, phase FROM fights WHERE guild_id='G1' AND channel_id='C1'").get();
+    const nBad = await fire({ commandName: 'config', options: { _group: 'mechanics', _sub: 'turnclock', remind: 10, skip: 5 }, userId: 'U1' });
+    const n5 = await fire({ commandName: 'config', options: { _group: 'mechanics', _sub: 'turnclock', remind: 5, skip: 20 }, userId: 'U1' });
+    const nShow = await fire({ commandName: 'config', options: { _group: 'mechanics', _sub: 'turnclock' }, userId: 'U1' });
     dbHandle.prepare(`UPDATE fights SET nudged=0, last_at=? WHERE guild_id='G1' AND channel_id='C1'`).run(Date.now() - 6 * 60 * 1000);
     for (const t of ticks) { try { await t.fn(); } catch {} }
     const nudgeLast = sent.filter(x => /minutes? quiet/.test(x.content)).pop()?.content || '';
-    dbHandle.prepare("UPDATE guild_config SET fight_nudge_min=NULL WHERE guild_id='G1'").run();
-    ok('/config mechanics fightnudge: 0 turns the quiet-fight nudge off, 5 makes it five minutes, bare shows the setting',
-      /is \*\*off\*\*/.test(saidOf(n0)) && nudgesC1 === nudgesC0 && /\*\*5 minutes\*\*/.test(saidOf(n5)) && /after \*\*5 minutes\*\*/.test(saidOf(nShow)) && /5 minutes quiet/.test(nudgeLast),
-      `${saidOf(n0).slice(0, 40)} · ticks ${nudgesC0}→${nudgesC1} · ${saidOf(n5).slice(0, 40)} · ${saidOf(nShow).slice(0, 50)} · ${nudgeLast.slice(0, 50)}`);
+    const nReset = await fire({ commandName: 'config', options: { _group: 'mechanics', _sub: 'turnclock', reset: true }, userId: 'U1' });
+    const cfgAfter = dbHandle.prepare("SELECT turn_remind_min, turn_skip_min, turn_timeout FROM guild_config WHERE guild_id='G1'").get();
+    ok('/config mechanics turnclock: 0 and 0 is no clock at all, a turn must pass after its reminder, 5 and 20 remind at five, bare shows it, reset hands back the defaults',
+      /no reminder · no turn passes on its own/.test(saidOf(n0)) && nudgesC1 === nudgesC0 && stillC1?.turn_index === 0 && stillC1?.phase === 'attack'
+        && /has to be more than/.test(saidOf(nBad)) && /a reminder at \*\*5 min\*\* · the turn passes at \*\*20 min\*\*/.test(saidOf(n5)) && /a reminder at \*\*5 min\*\* · the turn passes at \*\*20 min\*\*/.test(saidOf(nShow))
+        && /^⏳ 5 minutes quiet — \*\*userU1\*\* is up to attack\. Still writing\? Press ✍️ or keep typing\. At 20 minutes the turn is skipped\. <@U1>$/.test(nudgeLast)
+        && /back to the defaults: a reminder at \*\*5 min\*\* · the turn passes at \*\*15 min\*\*/.test(saidOf(nReset)) && cfgAfter?.turn_remind_min == null && cfgAfter?.turn_skip_min == null && cfgAfter?.turn_timeout == null,
+      `${saidOf(n0).slice(0, 60)} · ticks ${nudgesC0}→${nudgesC1} · ${JSON.stringify(stillC1)} · ${saidOf(nBad).slice(0, 40)} · ${saidOf(n5).slice(0, 70)} · ${saidOf(nShow).slice(0, 70)} · ${nudgeLast.slice(0, 120)} · ${saidOf(nReset).slice(0, 70)}`);
     // 5 · the ready check's last tick grows a Start button; the GM's press starts the run
     dbHandle.prepare(`INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, gm_id) VALUES ('G1', 912, 'Probe Ready', 'open', 'quest', ?, 'C1', 'U1')`).run(Date.now());
     for (const u of ['U1', 'U2']) dbHandle.prepare("INSERT OR REPLACE INTO quest_members (guild_id, number, user_id, state) VALUES ('G1', 912, ?, 'party')").run(u);
@@ -2058,7 +2080,7 @@ async function fire(over) {
     const xPl = await fire({ isButton: true, customId: idsOf(line1).find(id => id.startsWith('npcx:')), message: line1, userId: plainD, member: { id: plainD, roles: { cache: new Map() }, permissions: { has: () => false } } });
     const rPl = await fire({ isButton: true, customId: idsOf(line1).find(id => id.startsWith('npcreply:')), message: line1, userId: plainD, member: { id: plainD, roles: { cache: new Map() }, permissions: { has: () => false } } });
     const rGm = await fire({ isButton: true, customId: idsOf(line1).find(id => id.startsWith('npcreply:')), message: line1, userId: 'U1' });
-    ok('GM opens the speak-as box for a GM and tells a player it is not theirs; Reply opens the roleplay box for anyone', modalOf(xGm) === 'npcsay:Dockmaster' && /GM's/.test(saidOf(xPl)) && modalOf(rPl) === 'rpform' && modalOf(rGm) === 'rpform', `${modalOf(xGm)} · ${saidOf(xPl).slice(0, 40)} · ${modalOf(rPl)} · ${modalOf(rGm)}`);
+    ok('GM opens the speak-as box for a GM and tells a player it is not theirs; Reply opens the roleplay box for anyone', modalOf(xGm) === 'npcsay:Dockmaster' && /GM's/.test(saidOf(xPl)) && modalOf(rPl) === `rpform:${line1.id}` && modalOf(rGm) === `rpform:${line1.id}`, `${modalOf(xGm)} · ${saidOf(xPl).slice(0, 40)} · ${modalOf(rPl)} · ${modalOf(rGm)}`);
     const boxFields = modalFieldsOf(xGm);
     ok('the speak-as box is four labelled fields: action, speech, the `to` picker, the `offer` dropdown with None pre-selected', 'action' in boxFields && 'speech' in boxFields && 'to' in boxFields && 'offer' in boxFields, JSON.stringify(Object.keys(boxFields)));
     before = sent.length;
@@ -2066,7 +2088,7 @@ async function fire(over) {
     const linePicked = sinceIn('C1', before).find(m => m.webhookId);
     ok('a line reads action · speech · who it is for, a blank line between, the picked player pinged', /Posted as/.test(saidOf(picked)) && linePicked?.content === '*Waves*\n\n"The tide turns."\n\n<@100000000000000002>' && (linePicked?.allowedMentions?.users || []).includes(P2) && !idsOf(linePicked).some(id => id.startsWith('npctalk:')), `${saidOf(picked).slice(0, 40)} · ${JSON.stringify(linePicked?.content)}`);
     before = sent.length;
-    const say2 = await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', speech: 'Mind the ropes.', to: P2 }, userId: 'U1' });
+    const say2 = await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', speech: 'Mind the ropes.', to: `<@${P2}>` }, userId: 'U1' });
     const line2 = sinceIn('C1', before).find(m => m.webhookId);
     ok('`to:` names them under the words', line2?.content === '"Mind the ropes."\n\n<@100000000000000002>', JSON.stringify(line2?.content));
     before = sent.length;
@@ -2161,6 +2183,1543 @@ async function fire(over) {
     const threwD = loggedD.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
     console.error = realErrD;
     ok('nothing in the D walk threw', threwD.length === 0, threwD.slice(0, 3).join('\n        '));
+  }
+
+  // ── Build H (2026-11-06): /instance opens an encounter, a chapter or an
+  // older quest, adopts a running quest and records its room; /session works
+  // any run by name or in its thread, with the drafted ending; /rp rolls,
+  // a stat roll answering a called check; Reply under every line and the
+  // jump header; `to:` for people, groups and orders; /edit on lines that
+  // carry only roleplay buttons ───────────────────────────────────────────
+  if (dbHandle) {
+    const realErrH = console.error; const loggedH = [];
+    console.error = (...a) => { loggedH.push(a.map(x => (x && x.stack) ? x.stack.split('\n').slice(0, 2).join(' | ') : String(x)).join(' ')); };
+    const idsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+    const saidOf = (r) => r.replies.map(x => x.content || '').join(' ');
+    const modalOf = (r) => r.replies.find(x => x.modal)?.modal || null;
+    const modalFieldsOf = (r) => r.replies.find(x => x.modal)?.modalFields || {};
+    const sinceIn = (cid, n) => sent.slice(n).filter(x => x.channel === cid).map(x => x.msg);
+    const settle = async () => { for (let i = 0; i < 60; i++) await new Promise(r => setImmediate(r)); };
+    const evs = (n, kind) => dbHandle.prepare('SELECT text FROM quest_events WHERE guild_id=? AND number=? AND kind=? ORDER BY id').all('G1', n, kind).map(r => r.text);
+    const qrow = (n) => dbHandle.prepare("SELECT * FROM quests WHERE guild_id='G1' AND number=?").get(n);
+    const PLAIN = 'U8', P3 = '100000000000000003', P4 = '100000000000000004', P5 = '100000000000000005';
+    const plainM = { id: PLAIN, roles: { cache: new Map() }, permissions: { has: () => false } };
+    const realFetchH = guild.members.fetch;
+    guild.members.fetch = async (uid) => { const mb = await realFetchH(uid); if (uid === PLAIN) { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+    const seedH = (uid, order = null) => dbHandle.prepare(`INSERT OR REPLACE INTO characters (guild_id, user_id, str, con, dex, wis, lck, hp_current, rerolls_current, merits, order_name) VALUES ('G1', ?, 4, 3, 3, 3, 3, 7, 3, 0, ?)`).run(uid, order);
+    seedH('U2'); seedH(PLAIN); seedH(P3, 'White Knight'); seedH(P5, 'White Knight'); seedH(P4);
+    dbHandle.prepare("INSERT OR REPLACE INTO subject_assocs (guild_id, subject_id, name, note, at) VALUES ('G1', ?, 'The Falconers', NULL, ?)").run(P4, Date.now());
+    const chanH = new FakeChannel('CH8', 0, 'h-walk', guild); channelsById.set(chanH.id, chanH);
+    // The instance forum again: a walk between here and the encounter walk set the config afresh.
+    // (A walk on the way re-opened the database: the bot's handle is dbHandle, not the shim's last.)
+    if (!channelsById.get('FORUM1')) channelsById.set('FORUM1', new FakeChannel('FORUM1', 15, 'quest-instances', guild));
+    dbHandle.prepare("UPDATE guild_config SET quest_instance_forum='FORUM1' WHERE guild_id='G1'").run();
+    const mkIn = (ch, text, uid = 'U2') => ({ id: nextId(), content: text, author: { id: uid, bot: false, username: `user${uid}` }, guild, channel: ch, channelId: ch.id, member: { id: uid, displayName: `Hero${uid}`, roles: { cache: new Map() }, permissions: { has: () => true } }, attachments: { size: 0, first: () => null }, client,
+      reply: async (p) => { replies.push(norm(p)); return { id: nextId() }; } });
+    const openInst = async (options, users = ['U2']) => {
+      const r0 = await fire({ commandName: 'instance', options: { _sub: 'start', ...options }, userId: 'U1', channel: chanH });
+      const menu = (r0.replies[0]?.components || [])[0]?._d?.components?.[0]?._d || {};
+      const key = String(menu.customId || '').split(':')[1];
+      if (!key) return { r0, room: null, row: null };
+      await fire({ isSelect: true, customId: menu.customId, values: users, message: { id: nextId(), content: 'x', components: [] }, userId: 'U1', channel: chanH });
+      await fire({ isButton: true, customId: `encgo:${key}`, message: { id: nextId(), content: 'x', components: [] }, userId: 'U1', channel: chanH });
+      const row = dbHandle.prepare("SELECT * FROM quests WHERE guild_id='G1' AND kind='encounter' ORDER BY number DESC LIMIT 1").get();
+      // The room is the run's own thread \u2014 a campaign card may open a thread of its own on the way.
+      return { r0, room: row?.run_thread_id ? channelsById.get(row.run_thread_id) || null : null, row };
+    };
+
+    // 1 · /instance start: a chapter needs a campaign and numbers itself; a legacy run pays only what is set
+    const chNo = await fire({ commandName: 'instance', options: { _sub: 'start', name: 'Lost Part', as: 'chapter' }, userId: 'U1', channel: chanH });
+    const c1 = await openInst({ name: 'The Ford Holds', as: 'chapter', campaign: 'The Probe War' });
+    const c2 = await openInst({ name: 'The Bridge Falls', as: 'chapter', campaign: 'The Probe War' });
+    const card1 = c1.room ? sent.filter(x => x.channel === c1.room.id).map(x => x.content).join('\n') : '';
+    ok('/instance as:chapter needs a campaign, then numbers its parts and wears the book in its room',
+      /belongs to a campaign/.test(saidOf(chNo)) && c1.row?.instance_kind === 'chapter' && c1.row?.part === 1 && c2.row?.part === 2
+        && /^📖 /.test(c1.room?.name || '') && /Part 1 of \*\*The Probe War\*\*/.test(card1) && /a chapter begins/.test(card1),
+      `${saidOf(chNo).slice(0, 50)} · ${c1.row?.instance_kind} p${c1.row?.part}/${c2.row?.part} · ${c1.room?.name} · ${card1.replace(/\s+/g, ' ').slice(0, 160)}`);
+    // Two drafts at once: each is numbered as it opens, not as it is drafted.
+    const dA = await fire({ commandName: 'instance', options: { _sub: 'start', name: 'Race A', as: 'chapter', campaign: 'The Probe War' }, userId: 'U1', channel: chanH });
+    const dB = await fire({ commandName: 'instance', options: { _sub: 'start', name: 'Race B', as: 'chapter', campaign: 'The Probe War' }, userId: 'U1', channel: chanH });
+    const keyOf = (r) => String(((r.replies[0]?.components || [])[0]?._d?.components?.[0]?._d || {}).customId || '').split(':')[1];
+    for (const r of [dA, dB]) {
+      const k = keyOf(r);
+      if (!k) continue;
+      await fire({ isSelect: true, customId: `encpick:${k}:0`, values: ['U2'], message: { id: nextId(), content: 'x', components: [] }, userId: 'U1', channel: chanH });
+      await fire({ isButton: true, customId: `encgo:${k}`, message: { id: nextId(), content: 'x', components: [] }, userId: 'U1', channel: chanH });
+    }
+    const parts = dbHandle.prepare("SELECT name, part FROM quests WHERE guild_id='G1' AND name IN ('Race A','Race B') ORDER BY number").all();
+    const dAgain = await fire({ commandName: 'instance', options: { _sub: 'start', name: 'Race C', as: 'chapter', campaign: 'The Probe War', part: 1 }, userId: 'U1', channel: chanH });
+    ok('two chapter drafts at once are numbered as they open; asking for a part already given says it is another session of it',
+      parts.length === 2 && parts[0].part === 3 && parts[1].part === 4 && /Part 1 \(again/.test(saidOf(dAgain)),
+      `${JSON.stringify(parts)} · ${saidOf(dAgain).slice(0, 100)}`);
+    for (const r of parts) dbHandle.prepare("UPDATE quests SET status='completed' WHERE guild_id='G1' AND name=?").run(r.name);
+    const lg = await openInst({ name: 'The Drowned Bell', as: 'legacy', started: '12/09' }, ['U2', PLAIN]);
+    const cardL = lg.room ? sent.filter(x => x.channel === lg.room.id).map(x => x.content).join('\n') : '';
+    ok('/instance as:legacy pays nothing unless the GM sets merits, keeps when it began, and says so',
+      lg.row?.instance_kind === 'legacy' && lg.row?.merit_reward === 0 && lg.row?.legacy_since === '12/09' && /^🗝️ /.test(lg.room?.name || '')
+        && /Picked up from before the bot · begun 12\/09/.test(cardL) && /no merits unless you set them/.test(saidOf(lg.r0)),
+      `${lg.row?.instance_kind} merits ${lg.row?.merit_reward} since ${lg.row?.legacy_since} · ${lg.room?.name} · ${saidOf(lg.r0).slice(0, 120)}`);
+    const listH = await fire({ commandName: 'instance', options: { _sub: 'list' }, userId: 'U1', channel: chanH });
+    ok('/instance list shows every run going with its mark and its time so far', /📖 \*\*/.test(saidOf(listH)) && /🗝️ \*\*/.test(saidOf(listH)) && /Part 2 of/.test(saidOf(listH)) && /⏱️ \d+h \d\dm/.test(saidOf(listH)), saidOf(listH).slice(0, 200));
+
+    // 2 · /session by name: the leaves that answered "No quest #null" now reach the run
+    const nNote = await fire({ commandName: 'session', options: { _sub: 'note', name: 'The Drowned Bell', text: 'They found the bell.' }, userId: 'U1', channel: chanH });
+    const nShow = await fire({ commandName: 'session', options: { _sub: 'show', name: 'The Drowned Bell' }, userId: PLAIN, member: plainM, channel: chanH });
+    const nRally = await fire({ commandName: 'session', options: { _sub: 'rally', name: 'The Drowned Bell' }, userId: 'U1', channel: chanH });
+    const nPause = await fire({ commandName: 'session', options: { _sub: 'pause', name: 'The Drowned Bell' }, userId: 'U1', channel: chanH });
+    const pausedL = qrow(lg.row?.number)?.paused;
+    const nResume = await fire({ commandName: 'session', options: { _sub: 'resume', name: 'The Drowned Bell' }, userId: 'U1', channel: chanH });
+    const nPlain = await fire({ commandName: 'session', options: { _sub: 'note', name: 'The Drowned Bell', text: 'sneaky' }, userId: PLAIN, member: plainM, channel: chanH });
+    const nTypo = await fire({ commandName: 'session', options: { _sub: 'note', name: 'The Drownd Bel', text: 'typo' }, userId: 'U1', channel: chanH });
+    ok('a mistyped name in a shared channel is an error, not the newest run there', /No listing|not found|No quest/i.test(saidOf(nTypo)) && !evs(lg.row?.number, 'note').some(t => /typo/.test(t)), saidOf(nTypo).slice(0, 80));
+    const inRoom = lg.room ? await fire({ commandName: 'session', options: { _sub: 'note', text: 'Said in the room.' }, userId: 'U1', channel: lg.room }) : { replies: [] };
+    const allSaid = [nNote, nShow, nRally, nPause, nResume, inRoom].map(saidOf).join(' | ');
+    ok('/session note, show, rally, pause and resume reach an instance by name; in its thread no name is needed; show is anyone\'s, the rest the GM\'s',
+      !/No quest #null|no runs yet/.test(allSaid) && evs(lg.row?.number, 'note').some(t => /They found the bell/.test(t)) && evs(lg.row?.number, 'note').some(t => /Said in the room/.test(t))
+        && /Drowned Bell/.test(saidOf(nShow)) && pausedL === 1 && qrow(lg.row?.number)?.paused === 0 && /Only GMs work a run/.test(saidOf(nPlain)) && !evs(lg.row?.number, 'note').some(t => /sneaky/.test(t)),
+      `${allSaid.replace(/\s+/g, ' ').slice(0, 260)} · paused ${pausedL}→${qrow(lg.row?.number)?.paused} · plain ${saidOf(nPlain).slice(0, 40)}`);
+
+    // 3 · a board quest started before runs existed is its own run: /session thread opens its room, add seats rather than stages
+    dbHandle.prepare("INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, gm_id) VALUES ('G1', 950, 'Old Road', 'active', 'quest', ?, 'CH8', 'U1')").run(Date.now());
+    dbHandle.prepare("INSERT OR REPLACE INTO quest_members (guild_id, number, user_id, state) VALUES ('G1', 950, 'U2', 'party')").run();
+    const th950 = await fire({ commandName: 'session', options: { _sub: 'thread', name: 'Old Road' }, userId: 'U1', channel: chanH });
+    const room950 = qrow(950)?.run_thread_id ? channelsById.get(qrow(950).run_thread_id) : null;
+    const add950 = await fire({ commandName: 'session', options: { _sub: 'add', name: 'Old Road', user: P4 }, userId: 'U1', channel: chanH });
+    const seat950 = dbHandle.prepare("SELECT state FROM quest_members WHERE guild_id='G1' AND number=950 AND user_id=?").get(P4)?.state;
+    ok('/session thread opens the room for a run that has none; on a running listing add seats, never stages',
+      !!room950 && qrow(950)?.run_thread_id === room950.id && /Old Road/.test(saidOf(th950)) && seat950 === 'party' && !/staged/.test(saidOf(add950)),
+      `${saidOf(th950).slice(0, 80)} · thread ${qrow(950)?.run_thread_id} · seat ${seat950} · ${saidOf(add950).slice(0, 80)}`);
+
+    // 4 · /instance start quest: adopts a running board quest: a room, and recording
+    dbHandle.prepare("INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, gm_id) VALUES ('G1', 951, 'Long Road', 'active', 'quest', ?, 'CH8', 'U1')").run(Date.now());
+    dbHandle.prepare("INSERT OR REPLACE INTO quest_members (guild_id, number, user_id, state) VALUES ('G1', 951, 'U2', 'party')").run();
+    dbHandle.prepare("INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at) VALUES ('G1', 952, 'Not Begun', 'open', 'quest', ?)").run(Date.now());
+    const adopt = await fire({ commandName: 'instance', options: { _sub: 'start', quest: 951, record: true }, userId: 'U1', channel: chanH });
+    const room951 = qrow(951)?.run_thread_id ? channelsById.get(qrow(951).run_thread_id) : null;
+    const adoptNo = await fire({ commandName: 'instance', options: { _sub: 'start', quest: 952 }, userId: 'U1', channel: chanH });
+    ok('/instance start quest: gives a running board quest its room and turns recording on; one not running is refused',
+      !!room951 && qrow(951)?.run_thread_id === room951.id && qrow(951)?.record_all === 1 && /now has its room/.test(saidOf(adopt)) && /Everything said in its thread is now recorded/.test(saidOf(adopt))
+        && /is not running/.test(saidOf(adoptNo)),
+      `${saidOf(adopt).slice(0, 120)} · rec ${qrow(951)?.record_all} · ${saidOf(adoptNo).slice(0, 60)}`);
+    // record:true \u2014 what is typed in the room joins the log; a typed roll does not become a line
+    replies.length = 0;
+    if (room951) {
+      for (const fn of listeners.messageCreate || []) await fn(mkIn(room951, 'We press on through the rain.'));
+      for (const fn of listeners.messageCreate || []) await fn(mkIn(room951, 'r 1d20'));
+    }
+    await settle();
+    if (room951) {
+      for (const fn of listeners.messageCreate || []) await fn(mkIn(room951, 'str'));
+      for (const fn of listeners.messageCreate || []) await fn(mkIn(room951, 'Look out, <@100000000000000002>!'));
+    }
+    const rec951 = evs(951, 'talk');
+    ok('a recorded room keeps what is typed there as talk, in the speaker\'s name, mentions named not carried; typed rolls and stat shorthand stay out',
+      rec951.some(t => /^HeroU2: We press on through the rain\.$/.test(t)) && !rec951.some(t => /r 1d20|: str$/.test(t))
+        && rec951.some(t => /^HeroU2: Look out, @someone!$/.test(t)) && !evs(951, 'rp').some(t => /press on/.test(t)),
+      JSON.stringify(rec951));
+    dbHandle.prepare("INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, gm_id) VALUES ('G1', 953, 'Shared Road', 'active', 'quest', ?, 'CH8', 'U1')").run(Date.now());
+    dbHandle.prepare("UPDATE guild_config SET quest_instance_forum=NULL WHERE guild_id='G1'").run();
+    const recNo = await fire({ commandName: 'instance', options: { _sub: 'start', quest: 953, record: true }, userId: 'U1', channel: chanH });
+    dbHandle.prepare("UPDATE guild_config SET quest_instance_forum='FORUM1' WHERE guild_id='G1'").run();
+    for (const fn of listeners.messageCreate || []) await fn(mkIn(chanH, 'A bystander says hello.', 'U9'));
+    ok('a run with no thread of its own is not recorded \u2014 a shared channel would record bystanders',
+      qrow(953)?.record_all !== 1 && /recording needs the run\u2019s own thread/.test(saidOf(recNo)) && !evs(953, 'talk').length, `${saidOf(recNo).slice(0, 140)} · rec ${qrow(953)?.record_all}`);
+    const recOff = await fire({ commandName: 'instance', options: { _sub: 'start', quest: 951, record: false }, userId: 'U1', channel: chanH });
+    if (room951) for (const fn of listeners.messageCreate || []) await fn(mkIn(room951, 'Off the record now.'));
+    await settle();
+    ok('record:false turns it off again, and the room is told', qrow(951)?.record_all === 0 && !evs(951, 'talk').some(t => /Off the record/.test(t)) && sent.some(x => x.channel === room951?.id && /no longer recorded/.test(x.content)), saidOf(recOff).slice(0, 80));
+
+    // 5 · `to:` takes people, an order and a group; the box's Groups list does the same
+    guild.members.search = async ({ query }) => new Map(/^ald/i.test(query) ? [['100000000000000002', { id: '100000000000000002', nickname: 'Aldric', displayName: 'Aldric', user: { id: '100000000000000002', username: 'aldric', globalName: 'Aldric' } }]] : []);
+    if (!dbHandle.prepare("SELECT 1 FROM npcs WHERE guild_id='G1' AND name='Dockmaster'").get()) await fire({ commandName: 'npc', options: { _sub: 'create', name: 'Dockmaster', str: 2 }, userId: 'U1' });
+    let before = sent.length;
+    const sayG = await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', speech: 'To arms!', to: '@Aldric, White Knights, The Falconers, Zed' }, userId: 'U1', channel: chanH });
+    const lineG = sinceIn('CH8', before).find(m => m.webhookId);
+    const pingedG = lineG?.allowedMentions?.users || [];
+    ok('`to:` on /npc say names a person, a knight order and a group \u2014 every living player in them \u2014 and says what it could not place',
+      [P3, P5, P4, '100000000000000002'].every(id => (lineG?.content || '').includes(`<@${id}>`) && pingedG.includes(id)) && (lineG?.allowedMentions?.parse || []).length === 0
+        && /White Knights/.test(saidOf(sayG)) && /The Falconers/.test(saidOf(sayG)) && /Nobody here goes by \*\*Zed\*\*/.test(saidOf(sayG)),
+      `${JSON.stringify(lineG?.content)} · ${JSON.stringify(pingedG)} · ${saidOf(sayG).slice(0, 120)}`);
+    guild.members.search = async ({ query }) => new Map(/^ald/i.test(query) ? [['100000000000000002', { id: '100000000000000002', nickname: 'Aldric', displayName: 'Aldric', user: { id: '100000000000000002', username: 'aldric', globalName: 'Aldric' } }]]
+      : /^gold/i.test(query) ? [['100000000000000006', { id: '100000000000000006', nickname: 'Gold', displayName: 'Gold', user: { id: '100000000000000006', username: 'gold', globalName: 'Gold' } }]] : []);
+    before = sent.length;
+    const sayAnd = await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', speech: 'You two.', to: 'Gold Knights & Aldric, <@&555>, @everyone' }, userId: 'U1', channel: chanH });
+    const lineAnd = sinceIn('CH8', before).find(m => m.webhookId);
+    ok('`to:` reads "and" and "&" between names, takes a person only by their whole name, says an order with nobody living, and owns up to dropped roles',
+      (lineAnd?.content || '').includes('<@100000000000000002>') && !(lineAnd?.content || '').includes('<@100000000000000006>') && !(lineAnd?.content || '').includes('<@&555>')
+        && /Nobody living stands in \*\*Gold Knights\*\*/.test(saidOf(sayAnd)) && /never pinged from a line/.test(saidOf(sayAnd)),
+      `${JSON.stringify(lineAnd?.content)} · ${saidOf(sayAnd).slice(0, 200)}`);
+    const sayAlone = await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', to: '@Aldric' }, userId: 'U1', channel: chanH });
+    ok('`to:` with nothing to say is refused, not dropped by the box', /Nothing to say/.test(saidOf(sayAlone)) && !modalOf(sayAlone), saidOf(sayAlone).slice(0, 80));
+    const boxG = await fire({ isButton: true, customId: idsOf(lineG).find(id => id.startsWith('npcx:')), message: lineG, userId: 'U1', channel: chanH });
+    before = sent.length;
+    await fire({ isModal: true, customId: 'npcsay:Dockmaster', fields: { action: '', speech: 'Falconers, to me.' }, users: { to: [] }, selects: { offer: [], groups: ['g:The Falconers', 'o:White Knight'] }, userId: 'U1', channel: chanH });
+    const lineB = sinceIn('CH8', before).find(m => m.webhookId);
+    ok('the speak-as box carries a Groups list (orders and associations) beside a To picker of twenty-five; a picked group is pinged whole',
+      'groups' in modalFieldsOf(boxG) && 'to' in modalFieldsOf(boxG) && [P4, P3, P5].every(id => (lineB?.content || '').includes(`<@${id}>`)),
+      `${JSON.stringify(Object.keys(modalFieldsOf(boxG)))} · ${JSON.stringify(lineB?.content)}`);
+    ok('every NPC line keeps its buttons now \u2014 the newest-only rule is gone', idsOf(lineG).some(id => id.startsWith('npcreply:')) && idsOf(lineB).some(id => id.startsWith('npcreply:')), `${JSON.stringify(idsOf(lineG))}`);
+
+    // 6 · /rp rolls: a stat in the server's own terms, dice, saved for rr; a player's to: is refused
+    before = sent.length;
+    const rpR = await fire({ commandName: 'rp', options: { action: 'heaves at the gate', roll: 'str', dice: '2d6+1' }, userId: 'U2', channel: chanH });
+    const lineR = sinceIn('CH8', before).find(m => m.webhookId);
+    const lastR = dbHandle.prepare("SELECT notation, label FROM roll_history WHERE guild_id='G1' AND channel_id='CH8' AND user_id='U2'").get();
+    replies.length = 0;
+    for (const fn of listeners.messageCreate || []) await fn(mkIn(chanH, 'rr'));
+    const rrSaid = replies.map(x => x.content || '').join(' ');
+    ok('/rp roll:str dice:2d6+1 posts the words with both rolls beneath, saves the stat roll for rr, and carries Reply',
+      /^\*heaves at the gate\*\n\n🎲 (?:🔴 |🟡 )?\*\*STR\*\* — 1d20\+4 → \[\d+\] \+4 = /.test(lineR?.content || '') && /\n🎲 2d6\+1 → \[\d+, \d+\] \+1 = /.test(lineR?.content || '')
+        && lastR?.notation === '1d20+4' && /reroll/i.test(rrSaid + JSON.stringify(replies)) && idsOf(lineR).includes('rpreply') && /`rr` rerolls/.test(saidOf(rpR)),
+      `${JSON.stringify(lineR?.content)} · last ${JSON.stringify(lastR)} · rr ${rrSaid.slice(0, 60)} · ${saidOf(rpR).slice(0, 80)}`);
+    const rpTo = await fire({ commandName: 'rp', options: { speech: 'Hey', to: '@Aldric' }, userId: PLAIN, member: plainM, channel: chanH });
+    const rpBad = await fire({ commandName: 'rp', options: { speech: 'x', roll: 'cha' }, userId: 'U2', channel: chanH });
+    const rpDice = await fire({ commandName: 'rp', options: { speech: 'x', dice: 'lots' }, userId: 'U2', channel: chanH });
+    const rpBoxP = await fire({ commandName: 'rp', options: {}, userId: PLAIN, member: plainM, channel: chanH });
+    const rpBoxG = await fire({ commandName: 'rp', options: {}, userId: 'U1', channel: chanH });
+    ok('a player\'s /rp pings nobody: to: is refused and their box has no To picker; a GM\'s box has one; a stat the server lacks and dice that do not read are refused',
+      /`to:` is the GM/.test(saidOf(rpTo)) && !('to' in modalFieldsOf(rpBoxP)) && 'roll' in modalFieldsOf(rpBoxP) && 'dice' in modalFieldsOf(rpBoxP) && 'to' in modalFieldsOf(rpBoxG)
+        && /not a stat here/.test(saidOf(rpBad)) && /Dice read like/.test(saidOf(rpDice)),
+      `${saidOf(rpTo).slice(0, 50)} · ${JSON.stringify(Object.keys(modalFieldsOf(rpBoxP)))} · ${JSON.stringify(Object.keys(modalFieldsOf(rpBoxG)))} · ${saidOf(rpBad).slice(0, 40)} · ${saidOf(rpDice).slice(0, 40)}`);
+
+    // 7 · a stat roll answers the check the GM called on that player here, on the card's terms, and darkens its button
+    const cardH = await chanH.send({ content: '🎯 **Check** — STR vs DC 30', components: [] });
+    cardH.components = [{ components: [{ customId: 'dcroll:U2:str:30:normal:0:0:0:0:0', label: 'userU2 — roll', style: 1, disabled: false }] }];
+    before = sent.length;
+    const rpDc = lg.room ? null : null;
+    const ans = await fire({ commandName: 'rp', options: { speech: 'Stand aside.', roll: 'str' }, userId: 'U2', channel: chanH });
+    const lineDc = sinceIn('CH8', before).find(m => m.webhookId);
+    const darkened = (cardH.components?.[0]?._d?.components?.[0]?._d?.disabled === true);
+    ok('a stat roll in /rp answers an open check on the card\'s terms: the DC line beneath the words, the button darkened, no rr save',
+      /answered the check/.test(saidOf(ans)) && /\n\n🎯 STR vs \*\*DC 30\*\*\n🎲 /.test(lineDc?.content || '') && /❌ \*\*Fail\*\*|💀 \*\*Critical Fail\*\*|🌟/.test(lineDc?.content || '') && darkened,
+      `${saidOf(ans).slice(0, 60)} · ${JSON.stringify(lineDc?.content)} · dark ${darkened}`);
+    const cardD = await chanH.send({ content: '🎯 **Check** — DEX vs DC 30', components: [] });
+    cardD.components = [{ components: [{ customId: 'dcroll:U2:dex:30:normal:0:0:0:0:0', label: 'userU2 — roll', style: 1, disabled: false }] }];
+    before = sent.length;
+    const ansD = await fire({ commandName: 'rp', options: { action: 'ducks', roll: 'dex' }, userId: 'U2', channel: chanH });
+    const lineD = sinceIn('CH8', before).find(m => m.webhookId);
+    const pressD = await fire({ isButton: true, customId: 'dcroll:U2:dex:30:normal:0:0:0:0:0', message: { id: nextId(), content: 'x', components: [{ components: [{ customId: 'dcroll:U2:dex:30:normal:0:0:0:0:0', label: 'roll', style: 1 }] }] }, userId: 'U2', channel: chanH });
+    ok('a DEX check answers \u2014 from /rp and from its own button (dex is a stat, not dice notation)',
+      /answered the check/.test(saidOf(ansD)) && /🎯 DEX vs \*\*DC 30\*\*/.test(lineD?.content || '') && cardD.components?.[0]?._d?.components?.[0]?._d?.disabled === true
+        && !/no longer reads/.test(saidOf(pressD)) && /DEX vs \*\*DC 30\*\*/.test(saidOf(pressD)),
+      `${saidOf(ansD).slice(0, 60)} · ${JSON.stringify(lineD?.content)} · press ${saidOf(pressD).slice(0, 80)}`);
+    before = sent.length;
+    await fire({ commandName: 'rp', options: { speech: 'Again.', roll: 'str' }, userId: 'U2', channel: chanH });
+    const lineDc2 = sinceIn('CH8', before).find(m => m.webhookId);
+    ok('a darkened check is answered once: the next stat roll is an ordinary roll', /🎲 (?:🔴 |🟡 )?\*\*STR\*\*/.test(lineDc2?.content || '') && !/DC 30/.test(lineDc2?.content || ''), JSON.stringify(lineDc2?.content));
+
+    // 8 · Reply on an /rp line opens the box as a reply; the reply jumps back to it
+    const rRp = await fire({ isButton: true, customId: 'rpreply', message: lineR, userId: PLAIN, member: plainM, channel: chanH });
+    before = sent.length;
+    const rSub = await fire({ isModal: true, customId: modalOf(rRp) || 'x', fields: { action: '', speech: 'I will hold the gate.' }, selects: { roll: [] }, userId: PLAIN, member: plainM, channel: chanH });
+    const lineRe = sinceIn('CH8', before).find(m => m.webhookId);
+    ok('Reply on an /rp line opens the box titled to its writer, and the reply carries a header that jumps back to the line',
+      modalOf(rRp) === `rpform:${lineR?.id}` && (lineRe?.content || '').startsWith(`-# ↪ replying to [userU2](https://discord.com/channels/G1/CH8/${lineR?.id})\n"I will hold the gate."`) && idsOf(lineRe).includes('rpreply'),
+      `${modalOf(rRp)} · ${JSON.stringify(lineRe?.content)}`);
+    // An NPC line's Reply, answered from a thread with no webhook to be had: the bot's own post, name line and all
+    const npcLineH = lineG;
+    const rN = await fire({ isButton: true, customId: idsOf(npcLineH).find(id => id.startsWith('npcreply:')), message: npcLineH, userId: 'U2', channel: chanH });
+    before = sent.length;
+    await fire({ isModal: true, customId: modalOf(rN) || 'x', fields: { action: 'salutes', speech: '' }, selects: { roll: ['str'] }, userId: 'U2', channel: chanH });
+    const lineRN = sinceIn('CH8', before).find(m => m.webhookId);
+    ok('a reply to an NPC line jumps back to the NPC, with its roll beneath', (lineRN?.content || '').startsWith(`-# ↪ replying to [Dockmaster](https://discord.com/channels/G1/CH8/${npcLineH?.id})\n*salutes*\n\n🎲 `) && /\n\n🎲 (?:🔴 |🟡 )?\*\*STR\*\*/.test(lineRN?.content || ''), JSON.stringify(lineRN?.content));
+
+    // 9 · /edit: a line carrying only roleplay buttons is listed; a player edits only their words
+    const listE = await fire({ commandName: 'edit', options: {}, userId: PLAIN, member: plainM, channel: chanH });
+    const listEIds = (listE.replies[0]?.components || []).flatMap(r => ((r._d || r).components || []).flatMap(c => ((c._d || c).options || []).map(o => o.value)));
+    const pickE = await fire({ isSelect: true, customId: 'editpick', values: [lineRe?.id], message: { id: nextId(), content: '', components: [] }, userId: PLAIN, member: plainM, channel: chanH });
+    const shownE = modalFieldsOf(pickE).text;
+    await fire({ isModal: true, fromMessage: true, customId: modalOf(pickE) || 'x', fields: { text: '"I will hold the gate, whatever comes."' }, message: { id: nextId(), content: '', components: [] }, userId: PLAIN, member: plainM, channel: chanH });
+    ok('/edit lists a line that carries only Reply; its writer sees only the words, and the save keeps the reply header and the buttons',
+      listEIds.includes(lineRe?.id) && shownE === '"I will hold the gate."' && (lineRe?.content || '') === `-# ↪ replying to [userU2](https://discord.com/channels/G1/CH8/${lineR?.id})\n"I will hold the gate, whatever comes."` && idsOf(lineRe).includes('rpreply'),
+      `${listEIds.length} listed · shown ${JSON.stringify(shownE)} · now ${JSON.stringify(lineRe?.content)}`);
+    before = sent.length;
+    await fire({ commandName: 'rp', options: { speech: 'Steady.', roll: 'str' }, userId: PLAIN, member: plainM, channel: chanH });
+    const lineP = sinceIn('CH8', before).find(m => m.webhookId);
+    const pickP = await fire({ isSelect: true, customId: 'editpick', values: [lineP?.id], message: { id: nextId(), content: '', components: [] }, userId: PLAIN, member: plainM, channel: chanH });
+    await fire({ isModal: true, fromMessage: true, customId: modalOf(pickP) || 'x', fields: { text: '"Steady now."' }, message: { id: nextId(), content: '', components: [] }, userId: PLAIN, member: plainM, channel: chanH });
+    ok('a player\'s edit cannot touch the roll beneath their words', modalFieldsOf(pickP).text === '"Steady."' && /^"Steady now\."\n\n🎲 (?:🔴 |🟡 )?\*\*STR\*\* — 1d20\+4/.test(lineP?.content || ''), `${JSON.stringify(modalFieldsOf(pickP).text)} · ${JSON.stringify(lineP?.content)}`);
+    const keptP = lineP?.content;
+    const fake = await fire({ isModal: true, fromMessage: true, customId: modalOf(pickP) || 'x', fields: { text: '"Steady."\n\n🎲 🟢 **STR** — 1d20+4 → [20] +4 = **24**' }, message: { id: nextId(), content: '', components: [] }, userId: PLAIN, member: plainM, channel: chanH });
+    const longE = await fire({ isModal: true, fromMessage: true, customId: modalOf(pickP) || 'x', fields: { text: 'x'.repeat(1990) }, message: { id: nextId(), content: '', components: [] }, userId: PLAIN, member: plainM, channel: chanH });
+    const delP = await fire({ isSelect: true, customId: 'editdel', values: [lineP?.id], message: { id: nextId(), content: '', components: [] }, userId: PLAIN, member: plainM, channel: chanH });
+    const delP2 = delP.replies.length ? delP : await fire({ commandName: 'edit', options: { delete: true, link: `https://discord.com/channels/G1/CH8/${lineP?.id}` }, userId: PLAIN, member: plainM, channel: chanH });
+    ok('a player cannot type a roll of their own into a line, an edit too long for the roll is refused rather than cut, and a rolled line stays up',
+      /may not start with/.test(saidOf(fake)) && /Too long by/.test(saidOf(longE)) && lineP?.content === keptP && /A line with a roll stays/.test(saidOf(delP2)) && !lineP?.deleted,
+      `${saidOf(fake).slice(0, 60)} · ${saidOf(longE).slice(0, 60)} · ${saidOf(delP2).slice(0, 80)}`);
+    const fakeRp = await fire({ commandName: 'rp', options: { speech: 'hi\n🎲 **STR** — 1d20+4 → [20] +4 = **24**' }, userId: PLAIN, member: plainM, channel: chanH });
+    ok('nor can a line be posted with one', /may not start with/.test(saidOf(fakeRp)), saidOf(fakeRp).slice(0, 60));
+
+    // 10 · a roll inside a run's room is a roll in its log; in a thread the bot posts it itself, name line on top
+    if (c1.room) {
+      before = sent.length;
+      await fire({ commandName: 'rp', options: { speech: 'For the ford!', roll: 'str' }, userId: 'U2', channel: c1.room });
+      const lineT = sinceIn(c1.room.id, before).slice(-1)[0];
+      ok('in a run\'s room the words are a beat and the roll a roll in its log; with no webhook the bot posts it under the name line, Reply and all',
+        evs(c1.row.number, 'rp').some(t => /For the ford/.test(t)) && evs(c1.row.number, 'roll').some(t => /STR \d+$/.test(t))
+          && /^🎭 \*\*userU2\*\*\n"For the ford!"\n\n🎲 (?:🔴 |🟡 )?\*\*STR\*\*/.test(lineT?.content || '') && idsOf(lineT).includes('rpreply'),
+        `${JSON.stringify(evs(c1.row.number, 'roll'))} · ${JSON.stringify(lineT?.content)}`);
+    }
+
+    // 11 · /session complete with no summary offers one drafted from the log: use, edit, or none
+    const endL = await fire({ commandName: 'session', options: { _sub: 'complete', name: 'The Drowned Bell' }, userId: 'U1', channel: chanH });
+    const endIds = idsOf(endL.replies[0]);
+    const keyL = (endIds.find(id => id.startsWith('sessend:edit:')) || '').split(':')[2];
+    const editL = keyL ? await fire({ isButton: true, customId: `sessend:edit:${keyL}`, message: { id: nextId(), content: '', components: [] }, userId: 'U1', channel: chanH }) : { replies: [] };
+    const doneL = keyL ? await fire({ isModal: true, customId: `sessendform:${keyL}`, fields: { summary: 'The bell rang once, and was still.' }, userId: 'U1', channel: chanH }) : { replies: [] };
+    ok('/session complete with no summary drafts one from the log \u2014 the beats, not the seating \u2014 and Edit opens it prefilled; the save completes the run',
+      /drafted from the log/.test(saidOf(endL)) && /They found the bell/.test(saidOf(endL)) && !/is seated/.test(saidOf(endL)) && ['sessend:use:', 'sessend:edit:', 'sessend:none:'].every(p => endIds.some(id => id.startsWith(p)))
+        && modalOf(editL) === `sessendform:${keyL}` && /They found the bell/.test(modalFieldsOf(editL).summary || '') && qrow(lg.row?.number)?.status === 'completed' && /complete/.test(saidOf(doneL)),
+      `${saidOf(endL).replace(/\s+/g, ' ').slice(0, 160)} · ${modalOf(editL)} · ${qrow(lg.row?.number)?.status}`);
+    const endC2 = await fire({ commandName: 'session', options: { _sub: 'complete', name: 'The Bridge Falls' }, userId: 'U1', channel: chanH });
+    const useKey = (idsOf(endC2.replies[0]).find(id => id.startsWith('sessend:use:')) || '');
+    const plainUse = useKey ? await fire({ isButton: true, customId: useKey, message: { id: nextId(), content: '', components: [] }, userId: PLAIN, member: plainM, channel: chanH }) : { replies: [] };
+    // Nothing logged on that one but its start: it simply ends.
+    ok('a run with nothing to tell simply completes, no draft offered', !useKey ? qrow(c2.row?.number)?.status === 'completed' : /another GM/.test(saidOf(plainUse)), `${saidOf(endC2).slice(0, 80)} · ${useKey}`);
+    const endC1 = await fire({ commandName: 'session', options: { _sub: 'complete', name: 'The Ford Holds' }, userId: 'U1', channel: chanH });
+    const useC1 = idsOf(endC1.replies[0]).find(id => id.startsWith('sessend:use:'));
+    const usedC1 = useC1 ? await fire({ isButton: true, customId: useC1, message: { id: nextId(), content: '', components: [] }, userId: 'U1', channel: chanH }) : { replies: [] };
+    const again = useC1 ? await fire({ isButton: true, customId: useC1, message: { id: nextId(), content: '', components: [] }, userId: 'U1', channel: chanH }) : { replies: [] };
+    ok('Use this completes the run with the draft as its tale; the draft is spent after',
+      !!useC1 && qrow(c1.row?.number)?.status === 'completed' && /complete/.test(saidOf(usedC1)) && /draft has gone/.test(saidOf(again)),
+      `${useC1} · ${qrow(c1.row?.number)?.status} · ${saidOf(again).slice(0, 60)}`);
+
+    guild.members.fetch = realFetchH; delete guild.members.search;
+    const threwH = loggedH.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
+    console.error = realErrH;
+    ok('nothing in the H walk threw', threwH.length === 0, threwH.slice(0, 3).join('\n        '));
+  }
+
+  // ── Build I (2026-11-07): played: and part:, advantage on several dice,
+  // the talk corrected and raw, answering as an NPC, the GM run archive, and
+  // a 5e server through every shared system ─────────────────────────────
+  if (dbHandle) {
+    const realErrI = console.error; const loggedI = [];
+    console.error = (...a) => { loggedI.push(a.map(x => (x && x.stack) ? x.stack.split('\n').slice(0, 2).join(' | ') : String(x)).join(' ')); };
+    const idsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+    const saidOf = (r) => r.replies.map(x => x.content || '').join(' ');
+    const allOf = (r) => r.replies.map(x => JSON.stringify(x)).join(' ');
+    const modalOf = (r) => r.replies.find(x => x.modal)?.modal || null;
+    const sinceIn = (cid, n) => sent.slice(n).filter(x => x.channel === cid).map(x => x.msg);
+    const settle = async () => { for (let i = 0; i < 80; i++) await new Promise(r => setImmediate(r)); };
+    const qrow = (n) => dbHandle.prepare("SELECT * FROM quests WHERE guild_id='G1' AND number=?").get(n);
+    const PLAIN = 'U8';
+    const plainM = { id: PLAIN, roles: { cache: new Map() }, permissions: { has: () => false } };
+    const realFetchI = guild.members.fetch;
+    guild.members.fetch = async (uid) => { const mb = await realFetchI(uid); if (uid === PLAIN) { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+    const chanI = new FakeChannel('CH9', 0, 'i-walk', guild); channelsById.set(chanI.id, chanI);
+    const mkIn = (ch, text, uid = 'U2', g = guild) => ({ id: nextId(), content: text, author: { id: uid, bot: false, username: `user${uid}` }, guild: g, channel: ch, channelId: ch.id,
+      member: { id: uid, displayName: `Hero${uid}`, roles: { cache: new Map() }, permissions: { has: () => true } }, attachments: { size: 0, first: () => null }, client,
+      reply: async (p) => { replies.push(norm(p)); return { id: nextId() }; } });
+    const typed = async (ch, text, uid, g = guild) => { replies.length = 0; for (const fn of listeners.messageCreate || []) await fn(mkIn(ch, text, uid, g)); await settle(); return replies.map(x => JSON.stringify(x)).join(' '); };
+    const openInstI = async (options, users = ['U2']) => {
+      const r0 = await fire({ commandName: 'instance', options: { _sub: 'start', ...options }, userId: 'U1', channel: chanI });
+      const menu = (r0.replies[0]?.components || [])[0]?._d?.components?.[0]?._d || {};
+      const key = String(menu.customId || '').split(':')[1];
+      if (!key) return { r0, row: null };
+      await fire({ isSelect: true, customId: menu.customId, values: users, message: { id: nextId(), content: 'x', components: [] }, userId: 'U1', channel: chanI });
+      await fire({ isButton: true, customId: `encgo:${key}`, message: { id: nextId(), content: 'x', components: [] }, userId: 'U1', channel: chanI });
+      return { r0, row: dbHandle.prepare("SELECT * FROM quests WHERE guild_id='G1' AND kind='encounter' ORDER BY number DESC LIMIT 1").get() };
+    };
+
+    // 1 · played: banks an older quest's time; part: makes an instance a chapter
+    const lgP = await openInstI({ name: 'The Long Siege', as: 'legacy', played: '2h30m' });
+    const lgBad = await fire({ commandName: 'instance', options: { _sub: 'start', name: 'Bad Clock', as: 'legacy', played: 'soon' }, userId: 'U1', channel: chanI });
+    ok('/instance as:legacy played: banks the time already played into the run\'s clock and says so; a time that does not read is refused',
+      lgP.row?.played_ms === 9000000 && Number(lgP.row?.elapsed_ms) >= 9000000 && /2h 30m played already/.test(saidOf(lgP.r0)) && /reads like/.test(saidOf(lgBad)),
+      `${lgP.row?.played_ms} · ${lgP.row?.elapsed_ms} · ${saidOf(lgP.r0).slice(0, 120)} · ${saidOf(lgBad).slice(0, 80)}`);
+    const sp1 = await openInstI({ name: 'Side Path' });
+    const sp2 = await openInstI({ name: 'Side Path Two' });
+    const addP = await fire({ commandName: 'campaign', options: { _sub: 'add', campaign: 'The Probe War', quest: sp1.row?.number, part: 7 }, userId: 'U1', channel: chanI });
+    const asChapter = qrow(sp1.row?.number);
+    const addP2 = await fire({ commandName: 'campaign', options: { _sub: 'add', campaign: 'The Probe War', quest: sp2.row?.number, part: 7 }, userId: 'U1', channel: chanI });
+    const addBoard = await fire({ commandName: 'campaign', options: { _sub: 'add', campaign: 'The Probe War', quest: 950, part: 2 }, userId: 'U1', channel: chanI });
+    const remP = await fire({ commandName: 'campaign', options: { _sub: 'remove', quest: sp1.row?.number }, userId: 'U1', channel: chanI });
+    const afterRem = qrow(sp1.row?.number);
+    ok('/campaign add part: makes an instance a numbered chapter, says when the part is already there, refuses a board quest; unlinked, a chapter is an encounter again',
+      asChapter?.instance_kind === 'chapter' && asChapter?.part === 7 && !!asChapter?.campaign_id && /Part 7 of/.test(saidOf(addP))
+        && /already there/.test(saidOf(addP2)) && /is for runs opened with/.test(saidOf(addBoard)) && qrow(950)?.instance_kind !== 'chapter'
+        && afterRem?.instance_kind === 'encounter' && afterRem?.part == null && !afterRem?.campaign_id && /an encounter again/.test(saidOf(remP)),
+      `${asChapter?.instance_kind}/${asChapter?.part} · ${saidOf(addP2).slice(0, 80)} · ${saidOf(addBoard).slice(0, 60)} · ${afterRem?.instance_kind}/${afterRem?.part} · ${saidOf(remP).slice(0, 60)}`);
+
+    // 2 · advantage on several dice: the set twice, the better total kept; /rp dice spend a mark
+    const ra = await typed(chanI, 'ra 2d6', 'U2');
+    dbHandle.prepare("UPDATE characters SET next_mark='adv' WHERE guild_id='G1' AND user_id='U2'").run();
+    let before = sent.length;
+    await fire({ commandName: 'rp', options: { speech: 'Two dice.', dice: '2d6' }, userId: 'U2', channel: chanI });
+    const lineDice = sinceIn('CH9', before).find(m => m.webhookId);
+    const markLeft = dbHandle.prepare("SELECT next_mark FROM characters WHERE guild_id='G1' AND user_id='U2'").get()?.next_mark;
+    ok('advantage on 2d6 rolls the set twice, the one not kept struck through; a mark is spent by /rp dice as by any roll',
+      /2d6 \(advantage\) → \[\d+, \d+\] ~~\[\d+, \d+\]~~ = /.test(ra) && /2d6 \(advantage\) → \[\d+, \d+\] ~~\[\d+, \d+\]~~/.test(lineDice?.content || '') && !markLeft,
+      `${ra.slice(0, 160)} · ${JSON.stringify(lineDice?.content)} · mark ${markLeft}`);
+
+    // 3 · the talk, corrected and raw: an edit corrects, a deletion marks
+    await fire({ commandName: 'instance', options: { _sub: 'start', quest: 951, record: true }, userId: 'U1', channel: chanI });
+    const room951 = qrow(951)?.run_thread_id ? channelsById.get(qrow(951).run_thread_id) : null;
+    const t1 = mkIn(room951 || chanI, 'We ride at dawn.'), t2 = mkIn(room951 || chanI, 'Nobody saw that.'), t3 = mkIn(room951 || chanI, 'Hold the line.');
+    for (const m of [t1, t2, t3]) for (const fn of listeners.messageCreate || []) await fn(m);
+    await settle();
+    const raw = (t, d) => { for (const fn of listeners.raw || []) fn({ t, d: { guild_id: 'G1', channel_id: room951?.id, ...d } }); };
+    raw('MESSAGE_UPDATE', { id: t1.id, content: 'We ride at first light.', author: { id: 'U2', username: 'userU2' }, member: { nick: 'HeroU2' } });
+    raw('MESSAGE_DELETE', { id: t2.id });
+    raw('MESSAGE_UPDATE', { id: t3.id, content: 'Hold the line.', author: { id: 'U2', username: 'userU2' }, member: { nick: 'HeroU2' } });
+    raw('MESSAGE_UPDATE', { id: t3.id, content: 'a bot said this', author: { id: 'BOT', bot: true } });
+    const tk = (m) => dbHandle.prepare("SELECT * FROM quest_events WHERE guild_id='G1' AND kind='talk' AND msg_id=?").get(String(m.id));
+    ok('an edit to a recorded line corrects it and keeps its first wording; a deletion marks it; an unchanged edit, or a bot\'s, leaves it be',
+      !!room951 && tk(t1)?.text === 'HeroU2: We ride at first light.' && tk(t1)?.first_text === 'HeroU2: We ride at dawn.' && tk(t2)?.gone === 1
+        && tk(t3)?.first_text == null && tk(t3)?.text === 'HeroU2: Hold the line.',
+      JSON.stringify([tk(t1), tk(t2), tk(t3)].map(r => r && { text: r.text, first: r.first_text, gone: r.gone })));
+
+    // 4 · the GM run archive: set, filled with what came before, a thread per GM
+    const arch = new FakeChannel('ARCH1', 15, 'gm-run-archive', guild); channelsById.set('ARCH1', arch);
+    const setA = await fire({ commandName: 'config', options: { _group: 'channels', _sub: 'gmarchive', forum: arch }, userId: 'U1', channel: chanI });
+    for (let i = 0; i < 8; i++) await settle();
+    const cfgA = dbHandle.prepare("SELECT gm_run_archive, run_archive_backfilled FROM guild_config WHERE guild_id='G1'").get();
+    const archThreads = threads.filter(t => t.parentId === 'ARCH1');
+    const u1Thread = archThreads.find(t => /userU1/.test(t.name));
+    const filedN = dbHandle.prepare("SELECT COUNT(*) AS c FROM quests WHERE guild_id='G1' AND archive_msg_id IS NOT NULL").get().c;
+    const headerA = u1Thread?._starter?.content || '';
+    ok('/config channels gmarchive sets the forum and files every finished run already in the bot under its GM; the header holds the totals and what is running now, with its time',
+      cfgA?.gm_run_archive === 'ARCH1' && Number(cfgA?.run_archive_backfilled) > 0 && !!u1Thread && filedN >= 2 && /every run they have led/.test(headerA)
+        && /Running now/.test(headerA) && /The Long Siege — 2h 3\dm/.test(headerA) && /\d+ runs? · \d+h \d\dm\*\* in all/.test(headerA),
+      `${JSON.stringify(cfgA)} · ${archThreads.map(t => t.name).join(',')} · filed ${filedN} · ${headerA.replace(/\s+/g, ' ').slice(0, 260)} · ${saidOf(setA).slice(0, 80)}`);
+    before = sent.length;
+    const end951 = await fire({ commandName: 'session', options: { _sub: 'complete', name: 'Long Road', summary: 'They reached the city walls.' }, userId: 'U1', channel: chanI });
+    for (let i = 0; i < 4; i++) await settle();
+    // The run's home is its own thread, so the story and the corrected talk post there, review button and all.
+    const pubPost = sent.slice(before).filter(x => x.channel === room951?.id).map(x => x.msg).find(m => (m.files || []).length);
+    const pubFiles = [...end951.replies.flatMap(x => x.files || []), ...(pubPost?.files || [])];
+    const pubNames = pubFiles.map(f => f?.b?.name || '');
+    const post951 = sent.slice(before).filter(x => x.channel === u1Thread?.id).map(x => x.msg).find(m => /Long Road/.test(m.content || '') && (m.files || []).length);
+    const postNames = (post951?.files || []).map(f => f?.b?.name || '');
+    const fileText = (arr, re) => { const f = (arr || []).find(x => re.test(x?.b?.name || '')); return f?.a ? Buffer.from(f.a).toString('utf8') : ''; };
+    const corT = fileText(pubFiles, /talk\.txt$/), rawT = fileText(post951?.files, /-raw\.txt$/);
+    const storyBuf = pubFiles.find(f => /story\.pdf$/.test(f?.b?.name || ''))?.a;
+    let story = null; try { story = JSON.parse(storyBuf.slice(storyBuf.indexOf('DDICESCROLLv1') + 13).toString('utf8')); } catch {}
+    ok('a recorded run ends with its talk twice: the corrected transcript beside the story for everyone, the raw one only in the GM archive; the scroll keeps the story',
+      pubNames.some(n => /talk\.txt$/.test(n)) && !pubNames.some(n => /-raw\.txt$/.test(n)) && ['story.pdf', 'record.pdf', 'talk.txt', 'raw.txt'].every(x => postNames.some(n => n.endsWith(x)))
+        && /HeroU2: We ride at first light\./.test(corT) && !/Nobody saw that/.test(corT) && !/We ride at dawn/.test(corT)
+        && /HeroU2: We ride at dawn\.\n\s+↳ edited to: We ride at first light\./.test(rawT) && /HeroU2: Nobody saw that\.\n\s+↳ deleted/.test(rawT) && /1 edited, 1 deleted/.test(rawT)
+        && !/We ride/.test(story?.body || 'We ride') && /lines? of table talk were kept/.test(story?.body || ''),
+      `pub ${pubNames.join(',')} · post ${postNames.join(',')} · cor ${corT.replace(/\s+/g, ' ').slice(0, 140)} · raw ${rawT.replace(/\s+/g, ' ').slice(0, 200)} · story ${(story?.body || '').replace(/\s+/g, ' ').slice(0, 120)}`);
+    const headerB = u1Thread?._starter?.content || '';
+    ok('the run\'s post carries its runtime and party, and the header no longer counts it as running',
+      /⏱️ \*\*\d+h \d\dm\*\*/.test(post951?.content || '') && /👥 /.test(post951?.content || '') && !/Long Road — \d/.test(headerB) && qrow(951)?.archive_msg_id === post951?.id,
+      `${(post951?.content || '').replace(/\s+/g, ' ').slice(0, 200)} · ${headerB.replace(/\s+/g, ' ').slice(0, 160)}`);
+    const rv = await fire({ isModal: true, customId: 'fbq:951', fields: { scale: '9', body: 'A fine ride.' }, userId: 'U2', channel: chanI });
+    for (let i = 0; i < 3; i++) await settle();
+    const rvPost = sent.filter(x => x.channel === u1Thread?.id).map(x => x.msg).find(m => /\*\*Review\*\*/.test(m.content || ''));
+    ok('a review of the run answers its post in the archive', !!rvPost && rvPost.replyTo === qrow(951)?.archive_msg_id && /9\/10/.test(rvPost.content) && /A fine ride/.test(rvPost.content),
+      `${JSON.stringify(rvPost?.content)} · ${rvPost?.replyTo} vs ${qrow(951)?.archive_msg_id} · ${saidOf(rv).slice(0, 60)}`);
+
+    // 5 · answering as an NPC: 🎭 GM beside 💬 Reply, and /npc say reply:
+    if (!dbHandle.prepare("SELECT 1 FROM npcs WHERE guild_id='G1' AND name='Dockmaster'").get()) await fire({ commandName: 'npc', options: { _sub: 'create', name: 'Dockmaster', str: 2 }, userId: 'U1' });
+    before = sent.length;
+    await fire({ commandName: 'rp', options: { speech: 'Who goes there?' }, userId: 'U2', channel: chanI });
+    const lineQ = sinceIn('CH9', before).find(m => m.webhookId);
+    const plainGm = await fire({ isButton: true, customId: 'rpnpc', message: lineQ, userId: PLAIN, member: plainM, channel: chanI });
+    const gmBox = await fire({ isButton: true, customId: 'rpnpc', message: lineQ, userId: 'U1', channel: chanI });
+    const dockKey = require('crypto').createHash('sha1').update('dockmaster').digest('hex').slice(0, 10);
+    before = sent.length;
+    await fire({ isModal: true, customId: modalOf(gmBox) || 'x', fields: { action: 'squints', speech: 'The harbour watch.' }, selects: { who: [dockKey] }, userId: 'U1', channel: chanI });
+    const lineA = sinceIn('CH9', before).find(m => m.webhookId);
+    ok('under every /rp line, 🎭 GM beside 💬 Reply: a player is told it is the GM\'s; a GM picks who answers, and the answer jumps back to the line',
+      idsOf(lineQ).includes('rpreply') && idsOf(lineQ).includes('rpnpc') && /the GM’s/.test(saidOf(plainGm)) && modalOf(gmBox) === `npcans:CH9:${lineQ?.id}`
+        && (lineA?.content || '').startsWith(`-# ↪ replying to [userU2](https://discord.com/channels/G1/CH9/${lineQ?.id})`) && /The harbour watch/.test(lineA?.content || ''),
+      `${JSON.stringify(idsOf(lineQ))} · ${saidOf(plainGm).slice(0, 60)} · ${modalOf(gmBox)} · ${JSON.stringify(lineA?.content)}`);
+    before = sent.length;
+    const sayR = await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', speech: 'Move along.', reply: `https://discord.com/channels/G1/CH9/${lineQ?.id}` }, userId: 'U1', channel: chanI });
+    const lineS = sinceIn('CH9', before).find(m => m.webhookId);
+    const sayBad = await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', speech: 'x', reply: 'https://discord.com/channels/G9/1/2' }, userId: 'U1', channel: chanI });
+    ok('/npc say reply: answers a linked line with the jump header; a link from another server is refused',
+      (lineS?.content || '').startsWith(`-# ↪ replying to [userU2](https://discord.com/channels/G1/CH9/${lineQ?.id})`) && /Move along/.test(lineS?.content || '') && /❌/.test(saidOf(sayBad)),
+      `${JSON.stringify(lineS?.content)} · ${allOf(sayR).slice(0, 200)} · ${saidOf(sayBad).slice(0, 80)}`);
+
+    // 6 · a 5e server, through every shared system
+    const g5 = {
+      id: 'G5', name: 'Probe Keep',
+      members: { me: { id: 'BOT', permissions: { has: () => true } },
+        fetch: async (uid) => ({ id: uid, nickname: null, displayName: `user${uid}`, user: { id: uid, username: `user${uid}`, tag: `user${uid}#1` }, roles: { cache: new Map() }, permissions: { has: () => true } }),
+        cache: new Map() },
+      roles: { everyone: { id: 'EVERYONE5' }, cache: new Map() },
+      channels: { create: async ({ name, type }) => { const c = new FakeChannel(nextId(), type ?? 0, name, g5); channelsById.set(c.id, c); return c; },
+        fetch: async () => new FakeCollection(channelsById), cache: new FakeCollection() },
+    };
+    if (lastClient) { lastClient.guilds.cache.set('G5', g5); g5.client = lastClient; }
+    const c5 = new FakeChannel('C5', 0, 'keep', g5); channelsById.set('C5', c5);
+    const c5a = new FakeChannel('C5A', 0, 'approvals', g5); channelsById.set('C5A', c5a);
+    const f5 = (over) => fire({ guild: g5, channel: c5, userId: 'U1', ...over });
+    const regBefore = registered.length;
+    const rs = await f5({ commandName: 'config', options: { _group: 'channels', _sub: 'ruleset', system: 'dnd5e' } });
+    await settle();
+    const body5 = registered.slice(regBefore).slice(-1)[0] || [];
+    const rollStat5 = (body5.find(c => c.name === 'roll')?.options || []).find(o => o.name === 'stat');
+    ok('a server set to 5e is handed a 5e picker: /roll stat: offers the six, no Luck, and the Knightfall commands are gone',
+      /now plays by \*\*D&D 5e/.test(saidOf(rs)) && JSON.stringify((rollStat5?.choices || []).map(c => c.value)) === '["str","dex","con","int","wis","cha"]'
+        && body5.some(c => c.name === 'dnd'),
+      `${saidOf(rs).slice(0, 60)} · ${JSON.stringify((rollStat5?.choices || []).map(c => c.value))} · ${body5.map(c => c.name).join(',')}`);
+    await f5({ commandName: 'dnd', options: { _sub: 'create', name: 'Mira', class: 'Fighter', level: 3, str: 16, dex: 12, con: 14, int: 8, wis: 10, cha: 13, saves: 'str, con', skills: 'athletics, stealth' }, userId: 'U51' });
+    const mira = dbHandle.prepare("SELECT * FROM characters WHERE guild_id='G5' AND user_id='U51'").get();
+    const tInt = await typed(c5, 'int', 'U51', g5), tCha = await typed(c5, 'r cha', 'U51', g5);
+    const tChad = await typed(c5, 'Chad', 'U51', g5), tChadQ = await typed(c5, '?chad', 'U51', g5), tLck = await typed(c5, 'lck', 'U51', g5);
+    const rInt = await f5({ commandName: 'roll', options: { stat: 'int' }, userId: 'U51' });
+    const rLck = await f5({ commandName: 'roll', options: { stat: 'lck' }, userId: 'U51' });
+    ok('5e typed rolls and /roll add the modifier — int is 1d20-1, cha 1d20+1; "Chad" alone is a name, ?chad a roll; Luck is no stat here',
+      mira?.int === 8 && /1d20-1/.test(tInt) && /1d20\+1/.test(tCha) && !tChad && /1d20\+1 \(disadvantage\)/.test(tChadQ) && !tLck
+        && /1d20-1/.test(allOf(rInt)) && /not a stat here/.test(saidOf(rLck)),
+      `int ${tInt.slice(0, 80)} · cha ${tCha.slice(0, 60)} · chad ${tChad.slice(0, 40)} · ?chad ${tChadQ.slice(0, 80)} · lck ${tLck.slice(0, 40)} · /roll ${allOf(rInt).slice(0, 80)} · ${saidOf(rLck).slice(0, 60)}`);
+
+    // /gm dc: a skill and a save, proficiency where the sheet has it; an NPC rolls its modifier
+    const press5 = async (r) => { const id = idsOf(r.replies[0]).find(x => x.startsWith('dcroll:')); return id ? f5({ isButton: true, customId: id, message: { id: nextId(), content: 'x', components: [] }, userId: 'U51' }) : { replies: [] }; };
+    const dcSk = await f5({ commandName: 'gm', options: { _sub: 'dc', target: 'U51', dc: 10, stat: 'stealth' } });
+    const pSk = await press5(dcSk);
+    const dcSv = await f5({ commandName: 'gm', options: { _sub: 'dc', target: 'U51', dc: 12, stat: 'con', save: true } });
+    const pSv = await press5(dcSv);
+    const dcSv2 = await f5({ commandName: 'gm', options: { _sub: 'dc', target: 'U51', dc: 12, stat: 'dex', save: true } });
+    const pSv2 = await press5(dcSv2);
+    const dcBad = await f5({ commandName: 'gm', options: { _sub: 'dc', target: 'U51', dc: 12, stat: 'stealth', save: true } });
+    const dcSan = await f5({ commandName: 'gm', options: { _sub: 'dc', target: 'U51', dc: 12, stat: 'dex', success_sanction: 'lck+1' } });
+    ok('5e /gm dc: Stealth adds DEX and proficiency (1d20+3), a CON save its proficiency (1d20+4), a DEX save none (1d20+1); a save is never a skill; a sanction is a 5e score',
+      /Stealth \(DEX\) check — DC 10/.test(saidOf(dcSk)) && /Stealth \(DEX\) vs \*\*DC 10\*\*/.test(saidOf(pSk)) && /1d20\+3/.test(saidOf(pSk))
+        && /CON saving throw — DC 12/.test(saidOf(dcSv)) && /1d20\+4/.test(saidOf(pSv)) && /CON save vs/.test(saidOf(pSv)) && /1d20\+1/.test(saidOf(pSv2))
+        && /goes with an ability/.test(saidOf(dcBad)) && /reads like `cha\+1`/.test(saidOf(dcSan)),
+      `${saidOf(dcSk).slice(0, 60)} · ${saidOf(pSk).replace(/\s+/g, ' ').slice(0, 120)} · ${saidOf(pSv).replace(/\s+/g, ' ').slice(0, 100)} · ${saidOf(pSv2).replace(/\s+/g, ' ').slice(0, 80)} · ${saidOf(dcBad).slice(0, 60)} · ${saidOf(dcSan).slice(0, 60)}`);
+    const mkOgre = await f5({ commandName: 'npc', options: { _sub: 'create', name: 'Ogre', str: 19, int: 5, cha: 7 } });
+    const ogre = dbHandle.prepare("SELECT * FROM npcs WHERE guild_id='G5' AND name='Ogre'").get();
+    const badNpc = await f5({ commandName: 'npc', options: { _sub: 'create', name: 'Giant', str: 40 } });
+    const dcNpc = await f5({ commandName: 'gm', options: { _sub: 'dc', npcs: 'Ogre', dc: 10, stat: 'int' } });
+    ok('5e /npc create takes the six scores (the rest an ordinary 10, 1 to 30); its check on the card adds the modifier — INT 5 is 1d20-3',
+      ogre?.int === 5 && ogre?.cha === 7 && ogre?.wis === 10 && ogre?.dex === 10 && /1 to 30/.test(saidOf(badNpc)) && /🎭 \*\*Ogre\*\* — 🎲\s+1d20-3/.test(saidOf(dcNpc)),
+      `${JSON.stringify(ogre && { int: ogre.int, cha: ogre.cha, wis: ogre.wis, hp: ogre.hp_current })} · ${saidOf(mkOgre).slice(0, 60)} · ${saidOf(badNpc).slice(0, 60)} · ${saidOf(dcNpc).replace(/\s+/g, ' ').slice(0, 140)}`);
+    const win5 = await f5({ commandName: 'gm', options: { _sub: 'dc', target: 'U51' } });
+    const sub5 = await f5({ isModal: true, customId: modalOf(win5) || 'x', fields: { scene: '', check: 'dex save 13', success: '[cha+1]\nNimble.', fail: '', targets: '' } });
+    const sub5b = await f5({ isModal: true, customId: modalOf(win5) || 'x', fields: { scene: '', check: 'sleight of hand 11', success: '', fail: '', targets: '<@U51>' } });
+    ok('the writing window reads 5e: "dex save 13" is a DEX saving throw, "sleight of hand 11" a skill, and [cha+1] a sanction',
+      /^dcform:/.test(modalOf(win5) || '') && /DEX saving throw — DC 13/.test(saidOf(sub5)) && /success: CHA \+1/.test(saidOf(sub5)) && /Sleight of Hand \(DEX\) check — DC 11/.test(saidOf(sub5b)),
+      `${modalOf(win5)} · ${saidOf(sub5).replace(/\s+/g, ' ').slice(0, 120)} · ${saidOf(sub5b).replace(/\s+/g, ' ').slice(0, 100)}`);
+
+    // targets, /char set, the guards
+    before = sent.length;
+    await f5({ commandName: 'target', options: { _sub: 'create', name: 'Straw Man', dc: 5 } });
+    const straw = sinceIn('C5', before).find(m => /Straw Man/.test(m.content || '') && (m.components || []).length);
+    // read now: a failed swing reposts the card and takes these buttons off it
+    const strawIds = idsOf(straw), strawRows = (straw?.components || []).length;
+    const tBad = await f5({ commandName: 'target', options: { _sub: 'create', name: 'Lucky', stat: 'lck' } });
+    const setInt = await f5({ commandName: 'char', options: { _sub: 'set', field: 'int', value: '14', user: 'U51' } });
+    const setLck = await f5({ commandName: 'char', options: { _sub: 'set', field: 'lck', value: '3', user: 'U51' } });
+    const mkKf = await f5({ commandName: 'char', options: { _sub: 'create', str: 3 }, userId: 'U53' });
+    const hero5 = await f5({ commandName: 'npc', options: { _sub: 'hero', name: 'Ogre', stat: 'str' } });
+    const pressT = straw ? await f5({ isButton: true, customId: 'tgtatk:int', message: straw, userId: 'U51' }) : { replies: [] };
+    before = sent.length;
+    const swing = await f5({ isModal: true, fromMessage: true, customId: modalOf(pressT) || 'x', fields: { action: 'thinks hard', speech: '' }, message: straw, userId: 'U51' });
+    const swingText = saidOf(swing) + ' ' + sinceIn('C5', before).map(m => m.content).join(' ');
+    ok('5e targets offer the six over two rows and refuse Luck; INT swings with its modifier (14 → 1d20+2); /char set takes a 5e score and refuses Luck; /char create and Heroes point elsewhere',
+      ['tgtatk:str', 'tgtatk:dex', 'tgtatk:con', 'tgtatk:int', 'tgtatk:wis', 'tgtatk:cha'].every(id => strawIds.includes(id)) && strawRows === 2
+        && /Flat d20, STR, DEX, CON, INT, WIS, CHA/.test(saidOf(tBad)) && /INT set to \*\*14\*\* \(\+2\)/.test(saidOf(setInt)) && /no Luck/.test(saidOf(setLck))
+        && /`\/dnd create`/.test(saidOf(mkKf)) && /belong to Knightfall/.test(saidOf(hero5)) && /1d20\+2/.test(swingText),
+      `${JSON.stringify(strawIds)} · ${saidOf(tBad).slice(0, 80)} · ${saidOf(setInt).slice(0, 60)} · ${saidOf(setLck).slice(0, 50)} · ${saidOf(mkKf).slice(0, 50)} · ${saidOf(hero5).slice(0, 50)} · ${swingText.replace(/\s+/g, ' ').slice(0, 120)}`);
+
+    // a 5e sheet travels as one: exported, refused by the other system, imported and approved
+    const exp5 = await f5({ commandName: 'char', options: { _sub: 'export', format: 'text' }, userId: 'U51' });
+    const block5 = saidOf(exp5);
+    dbHandle.prepare("UPDATE guild_config SET approval_channel_id='C5A' WHERE guild_id='G5'").run();
+    const kfBlock = '[TTRPG SHEET]\nNAME:Knight\nORDER:\nCLASS:\nSTR:4\nCON:3\nDEX:3\nWIS:3\nLCK:3\n';
+    const impKf = await f5({ commandName: 'char', options: { _sub: 'import', summary: kfBlock }, userId: 'U52' });
+    before = sent.length;
+    const imp5 = await f5({ commandName: 'char', options: { _sub: 'import', summary: block5 }, userId: 'U52' });
+    const card5 = sinceIn('C5A', before).find(m => idsOf(m).includes('impok:U52'));
+    const ok5 = card5 ? await f5({ isButton: true, customId: 'impok:U52', message: card5, userId: 'U1', channel: c5a }) : { replies: [] };
+    const u52 = dbHandle.prepare("SELECT * FROM characters WHERE guild_id='G5' AND user_id='U52'").get();
+    ok('a 5e sheet exports as a 5e block, is refused by a Knightfall sheet\'s server and the other way round, and lands whole on its own system',
+      /SYSTEM:dnd5e/.test(block5) && /INT:14/.test(block5) && /SKILLS:athletics,stealth/.test(block5) && /made for \*\*Knightfall\*\*/.test(saidOf(impKf))
+        && !!card5 && /level 3 Fighter/.test(card5?.content || '') && u52?.int === 14 && u52?.level === 3 && u52?.char_class === 'Fighter' && u52?.hp_current === 28
+        && /"skills":\["athletics","stealth"\]/.test(u52?.proficient || ''),
+      `${block5.replace(/\s+/g, ' ').slice(0, 160)} · ${saidOf(impKf).slice(0, 80)} · ${(card5?.content || '').replace(/\s+/g, ' ').slice(0, 120)} · ${JSON.stringify(u52 && { int: u52.int, level: u52.level, hp: u52.hp_current, prof: u52.proficient })} · ${saidOf(ok5).slice(0, 60)}`);
+
+    // the auto-pilot: the strike's bonus against Armour Class, in both auto modes
+    await f5({ commandName: 'npc', options: { _group: 'manage', _sub: 'create5e', name: 'Imp', ac: 13, hp: 10, attack: 5, damage: '1d4+3' } });
+    const realTO = globalThis.setTimeout;
+    globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
+    before = sent.length;
+    const full5 = await f5({ commandName: 'fight', options: { _sub: 'auto', mode: 'full', npcs: 'Ogre, Imp' } });
+    for (let i = 0; i < 6; i++) await settle();
+    const fullText = sinceIn('C5', before).map(m => m.content || '').join('\n');
+    dbHandle.prepare("UPDATE npcs SET hp_current=8 WHERE guild_id='G5' AND name='Ogre'").run();
+    dbHandle.prepare("UPDATE npcs SET hp_current=10 WHERE guild_id='G5' AND name='Imp'").run();
+    before = sent.length;
+    const npcOnly5 = await f5({ commandName: 'fight', options: { _sub: 'auto', mode: 'npconly', npcs: 'Ogre, Imp' } });
+    for (let i = 0; i < 6; i++) await settle();
+    globalThis.setTimeout = realTO;
+    const npcText = sinceIn('C5', before).map(m => m.content || '').join('\n') + ' ' + saidOf(npcOnly5);
+    ok('a 5e auto fight strikes against Armour Class — full and NPCs-only alike — never with an opposed defence roll',
+      /against \*\*(Imp|Ogre)\*\*'s \*\*AC (13|10)\*\*/.test(fullText) && !/defends with/.test(fullText) && /against \*\*(Imp|Ogre)\*\*'s \*\*AC (13|10)\*\*/.test(npcText) && !/defends with/.test(npcText),
+      `${fullText.replace(/\s+/g, ' ').slice(0, 200)} ‖ ${npcText.replace(/\s+/g, ' ').slice(0, 200)} · ${saidOf(full5).slice(0, 60)}`);
+
+    // a 5e fight's strike row: what 5e attacks with
+    await f5({ commandName: 'fight', options: { _sub: 'end' } });
+    before = sent.length;
+    const F51 = '100000000000000051', F52 = '100000000000000052';
+    for (const id of [F51, F52]) dbHandle.prepare("INSERT OR REPLACE INTO characters (guild_id, user_id, str, dex, con, int, wis, cha, level, hp_current) VALUES ('G5', ?, 14, 12, 12, 10, 10, 10, 2, 12)").run(id);
+    const fs5 = await f5({ commandName: 'fight', options: { _sub: 'start', players: `<@${F51}> <@${F52}>`, manual: true } });
+    const rowIds5 = [...fs5.replies.flatMap(x => idsOf(x)), ...sinceIn('C5', before).flatMap(m => idsOf(m))];
+    const pick5 = await f5({ commandName: 'fight', options: { _sub: 'atk' }, userId: F51 });
+    const pickIds5 = pick5.replies.flatMap(x => idsOf(x));
+    await f5({ commandName: 'fight', options: { _sub: 'end' } });
+    ok('a 5e fight offers the strike row 5e attacks with \u2014 STR, DEX, INT, WIS, CHA \u2014 and never Luck',
+      [...rowIds5, ...pickIds5].includes('fatk:int') && [...rowIds5, ...pickIds5].includes('fatk:cha') && ![...rowIds5, ...pickIds5].includes('fatk:lck'),
+      `${JSON.stringify(rowIds5)} · ${JSON.stringify(pickIds5)} · ${saidOf(fs5).slice(0, 80)}`);
+
+    guild.members.fetch = realFetchI;
+    const threwI = loggedI.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
+    console.error = realErrI;
+    ok('nothing in the I walk threw', threwI.length === 0, threwI.slice(0, 3).join('\n        '));
+  }
+
+  // ── Build J (2026-11-07): initiative, and the turn clock in an order
+  // and in a fight ──────────────────────────────────────────────────────
+  if (dbHandle) {
+    const realErrK = console.error; const loggedK = [];
+    console.error = (...a) => { loggedK.push(a.map(x => (x && x.stack) ? x.stack.split('\n').slice(0, 2).join(' | ') : String(x)).join(' ')); };
+    const idsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+    const saidOf = (r) => r.replies.map(x => x.content || '').join(' ');
+    const modalOf = (r) => r.replies.find(x => x.modal)?.modal || null;
+    const keyOf = (n) => require('crypto').createHash('sha1').update(String(n).toLowerCase()).digest('hex').slice(0, 10);
+    const clockTick = async () => { for (const t of ticks.filter(t => /turnClockTick/.test(String(t.fn)))) { try { await t.fn(); } catch (e) { loggedK.push(`tick: ${e.message}`); } } };
+    const P1 = '100000000000000061', P2 = '100000000000000062', PL = '100000000000000063', P4 = '100000000000000064';
+    const N1 = `user${P1}`, N2 = `user${P2}`;
+    const plainK = { id: PL, roles: { cache: new Map() }, permissions: { has: () => false } };
+    const realFetchK = guild.members.fetch;
+    guild.members.fetch = async (uid) => { const mb = await realFetchK(uid); if (uid === PL) { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+    for (const [id, dex] of [[P1, 4], [P2, 1], [PL, 1], [P4, 2]]) dbHandle.prepare("INSERT OR REPLACE INTO characters (guild_id, user_id, str, con, dex, wis, lck, hp_current) VALUES ('G1', ?, 3, 3, ?, 2, 2, 30)").run(id, dex);
+    for (const [n, dex, hp] of [['Wolf', 3, 30], ['Boar', 1, 40]]) dbHandle.prepare("INSERT OR REPLACE INTO npcs (guild_id, name, str, con, dex, wis, lck, hp_current) VALUES ('G1', ?, 2, 2, ?, 1, 1, ?)").run(n, dex, hp);
+    const chJ = new FakeChannel('CJ1', 0, 'j-walk', guild); channelsById.set(chJ.id, chJ);
+    const fJ = (over) => fire({ channel: chJ, ...over });
+    const order = () => dbHandle.prepare("SELECT * FROM turn_orders WHERE guild_id='G1' AND channel_id='CJ1'").get();
+    // the turn's key as its buttons carry it: the order's stamp, the turn's serial
+    const K = () => { const o = order(); return `${o?.created_at || 0}-${o?.turn_seq || 0}`; };
+    const has = (m, prefix) => idsOf(m).some(id => id === prefix || id.startsWith(`${prefix}:`));
+    const lastIn = (cid) => sent.filter(x => x.channel === cid).map(x => x.msg).pop();
+    const newIn = (cid, n) => sent.slice(n).filter(x => x.channel === cid).map(x => x.msg);
+    const ev930 = () => dbHandle.prepare("SELECT text FROM quest_events WHERE guild_id='G1' AND number=930 AND kind='turn' ORDER BY id").all().map(r => r.text);
+    const mkJ = (ch, text, uid) => ({ id: nextId(), content: text, author: { id: uid, bot: false, username: `user${uid}` }, guild, channel: ch, channelId: ch.id,
+      member: { id: uid, roles: { cache: new Map() }, permissions: { has: () => false } }, attachments: { size: 0, first: () => null }, client,
+      reply: async (p) => { replies.push(norm(p)); return { id: nextId() }; } });
+    // a run in the room, PL on its party: the card calls them
+    dbHandle.prepare("INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, gm_id, started_at, elapsed_ms) VALUES ('G1', 930, 'Probe Turns', 'active', 'encounter', ?, 'CJ1', 'U1', ?, 0)").run(Date.now(), Date.now());
+    dbHandle.prepare("INSERT OR REPLACE INTO quest_members (guild_id, number, user_id, state) VALUES ('G1', 930, ?, 'party')").run(PL);
+
+    // 1 · the call
+    const plainInit = await fJ({ commandName: 'session', options: { _sub: 'initiative' }, userId: PL, member: plainK });
+    let n0 = sent.length;
+    const call = await fJ({ commandName: 'session', options: { _sub: 'initiative', players: `<@${P1}>`, npcs: 'Wolf x2, Brigand', remind: 5, skip: 15 }, userId: 'U1' });
+    const card = newIn('CJ1', n0).find(m => has(m, 'init:join'));
+    const o1 = order();
+    const ents1 = JSON.parse(o1?.entrants || '[]');
+    const clk = dbHandle.prepare("SELECT * FROM turn_clocks WHERE guild_id='G1' AND channel_id='CJ1'").get();
+    const again = await fJ({ commandName: 'session', options: { _sub: 'initiative' }, userId: 'U1' });
+    ok('/session initiative: a player is refused; the GM\'s call posts the card — Join, Leave, Add NPCs, Close & roll, Cancel — pinging the run\'s party, players and NPCs in at once (Wolf x2 two temporary copies, Brigand a name), the channel\'s clock set; a second call is refused',
+      /Only GMs call for initiative/.test(saidOf(plainInit)) && !!card && ['init:join', 'init:leave', 'init:npcs', 'init:close', 'init:cancel'].every(id => idsOf(card).includes(`${id}:${o1?.created_at}`))
+        && card.content.includes(`<@${PL}>`) && o1?.state === 'signup' && o1.card_msg_id === card.id
+        && ents1.map(e => e.id).join(',') === `${P1},npc:Wolf 1,npc:Wolf 2,name:Brigand`
+        && !!dbHandle.prepare("SELECT 1 FROM npcs WHERE guild_id='G1' AND name='Wolf 2' AND is_temp=1").get()
+        && /Brigand\*\* is no NPC here/.test(saidOf(call)) && clk?.remind_min === 5 && clk?.skip_min === 15 && /has an initiative taking sign-ups/.test(saidOf(again)),
+      `${saidOf(plainInit).slice(0, 40)} · card ${idsOf(card).join(',')} · …${(card?.content || '').slice(-50)} · ${o1?.state} · ${ents1.map(e => e.id).join(',')} · ${saidOf(call).replace(/\s+/g, ' ').slice(0, 140)} · clk ${JSON.stringify(clk)} · ${saidOf(again).slice(0, 60)}`);
+
+    // 2 · the sign-up
+    const cardMsg = { id: card?.id, content: card?.content || '', components: card?.components || [] };
+    const j1 = await fJ({ isButton: true, customId: 'init:join', message: cardMsg, userId: P2 });
+    const j2 = await fJ({ isButton: true, customId: 'init:join', message: cardMsg, userId: P2 });
+    const l1 = await fJ({ isButton: true, customId: 'init:leave', message: cardMsg, userId: P2 });
+    const j3 = await fJ({ isButton: true, customId: 'init:join', message: cardMsg, userId: P2 });
+    const closePlain = await fJ({ isButton: true, customId: 'init:close', message: cardMsg, userId: PL, member: plainK });
+    const npcBtn = await fJ({ isButton: true, customId: 'init:npcs', message: cardMsg, userId: 'U1' });
+    const npcSub = await fJ({ isModal: true, fromMessage: true, customId: 'initnpc', selects: { pick: [keyOf('Boar')] }, fields: { more: 'Wolf' }, message: cardMsg, userId: 'U1' });
+    const ents2 = JSON.parse(order()?.entrants || '[]');
+    ok('Join puts a player on the card, twice is told so, Leave takes them off; Close is the GM\'s; Add NPCs opens the box, and its pick and its words join the card',
+      (j1.replies[0]?.content || '').includes(N2) && /in already/.test(saidOf(j2)) && !(l1.replies[0]?.content || '').includes(N2) && (j3.replies[0]?.content || '').includes(N2)
+        && /is the GM’s/.test(saidOf(closePlain)) && modalOf(npcBtn) === 'initnpc'
+        && ents2.length === 7 && ents2.some(e => e.id === 'npc:Boar') && ents2.some(e => e.id === 'npc:Wolf') && /In: /.test(JSON.stringify(npcSub.replies)),
+      `${(j1.replies[0]?.content || '').slice(0, 60)} · ${saidOf(j2).slice(0, 30)} · ${saidOf(closePlain).slice(0, 40)} · modal ${modalOf(npcBtn)} · ${ents2.map(e => e.id).join(',')} · ${JSON.stringify(npcSub.replies).slice(0, 160)}`);
+
+    // 3 · Close & roll
+    n0 = sent.length;
+    const closed = await fJ({ isButton: true, customId: 'init:close', message: cardMsg, userId: 'U1' });
+    const o2 = order();
+    const list2 = JSON.parse(o2?.order_json || '[]');
+    const turn1 = newIn('CJ1', n0).find(m => idsOf(m).includes(`init:done:${K()}`));
+    const p1e = list2.find(e => e.id === P1);
+    ok('Close & roll: everyone rolls d20 + DEX, highest first, the card becomes the order, the first turn is called with Done, Skip, Pause and End keyed to it, and the run\'s timeline has the order',
+      o2?.state === 'running' && list2.length === 7 && list2.every((e, i) => i === 0 || list2[i - 1].total >= e.total) && p1e?.dex === 4 && p1e.total === p1e.roll + 4
+        && /d20 \+ DEX, highest first/.test(closed.replies[0]?.content || '') && !!turn1 && K().endsWith('-1') && [`init:skip:${K()}`, `init:pause:${o2.created_at}`, `init:end:${o2.created_at}`].every(id => idsOf(turn1).includes(id))
+        && /Round 1\*\* · 1 of 7/.test(turn1.content) && ev930().some(t => /^Initiative — /.test(t)),
+      `${o2?.state} · ${list2.map(e => `${e.name}:${e.total}`).join(',')} · ${(closed.replies[0]?.content || '').slice(0, 60)} · ${idsOf(turn1).join(',')} · ${(turn1?.content || '').slice(0, 80)} · ${ev930().join(' | ').slice(0, 100)}`);
+
+    // 4 · a known order of three, to walk the turns
+    const known = [{ id: P1, name: N1, kind: 'player', roll: 15, dex: 4, total: 19 }, { id: 'npc:Wolf 1', name: 'Wolf 1', kind: 'npc', roll: 10, dex: 3, total: 13 }, { id: P2, name: N2, kind: 'player', roll: 9, dex: 1, total: 10 }];
+    dbHandle.prepare("UPDATE turn_orders SET order_json=?, turn_index=0, round=1, turn_started_at=?, last_sign_at=NULL, reminded_at=NULL WHERE guild_id='G1' AND channel_id='CJ1'").run(JSON.stringify(known), Date.now());
+    const tc = () => ({ id: lastIn('CJ1')?.id, content: lastIn('CJ1')?.content || '', components: [] });
+    const k0 = K();
+    const notYours = await fJ({ isButton: true, customId: `init:done:${k0}`, message: tc(), userId: PL, member: plainK });
+    await fJ({ isButton: true, customId: `init:done:${k0}`, message: tc(), userId: P1 });
+    const o3 = order(); const card2 = lastIn('CJ1');
+    const stale = await fJ({ isButton: true, customId: `init:done:${k0}`, message: tc(), userId: P1 });
+    const npcPlain = await fJ({ isButton: true, customId: `init:done:${K()}`, message: tc(), userId: PL, member: plainK });
+    const otherOrder = await fJ({ isButton: true, customId: `init:skip:12345-${o3.turn_seq}`, message: tc(), userId: 'U1' });
+    await fJ({ isButton: true, customId: `init:skip:${K()}`, message: tc(), userId: 'U1' });
+    const o4 = order(); const card3 = lastIn('CJ1');
+    ok('Done is the turn\'s own or a GM\'s: a stranger is refused, the player\'s press moves it on, "is done" atop the next card; a press on a passed turn does nothing; an NPC\'s turn is the GM\'s; the GM\'s Skip moves it on and goes on the timeline',
+      /It is \*\*user100000000000000061\*\*’s turn/.test(saidOf(notYours)) && o3.turn_index === 1 && card2?.content.includes(`✅ **${N1}** is done.`) && /🎭 \*\*Wolf 1\*\* — the GM’s turn/.test(card2?.content || '')
+        && /That turn has passed/.test(saidOf(stale)) && /is the GM’s — only a GM can end that turn/.test(saidOf(npcPlain)) && /That initiative is over/.test(saidOf(otherOrder))
+        && o4.turn_index === 2 && /⏭️ \*\*Wolf 1\*\*’s turn is skipped by the GM\./.test(card3?.content || '') && card3?.content.includes(`<@${P2}>`) && ev930().some(t => /Wolf 1's turn skipped by the GM/.test(t)),
+      `${saidOf(notYours).slice(0, 60)} · idx ${o3.turn_index} · ${(card2?.content || '').replace(/\s+/g, ' ').slice(0, 90)} · ${saidOf(stale).slice(0, 40)} · ${saidOf(npcPlain).slice(0, 50)} · idx ${o4.turn_index} · ${(card3?.content || '').replace(/\s+/g, ' ').slice(0, 90)}`);
+
+    // 5 · the clock in an order
+    dbHandle.prepare("UPDATE turn_orders SET turn_started_at=? WHERE guild_id='G1' AND channel_id='CJ1'").run(Date.now() - 6 * 60000);
+    n0 = sent.length; await clockTick();
+    const kRem = K();
+    const rem = newIn('CJ1', n0).find(m => idsOf(m).includes(`init:hold:${kRem}`));
+    n0 = sent.length; await clockTick();
+    const remAgain = newIn('CJ1', n0).length;
+    const hold = await fJ({ isButton: true, customId: `init:hold:${kRem}`, message: { id: rem?.id, content: rem?.content || '', components: [] }, userId: P2 });
+    const oH = order();
+    dbHandle.prepare("UPDATE turn_orders SET last_sign_at=?, reminded_at=? WHERE guild_id='G1' AND channel_id='CJ1'").run(Date.now() - 10 * 60000, Date.now());
+    for (const fn of listeners.raw || []) fn({ t: 'TYPING_START', d: { guild_id: 'G1', channel_id: 'CJ1', user_id: P2 } });
+    const oT = order();
+    dbHandle.prepare("UPDATE turn_orders SET last_sign_at=?, reminded_at=? WHERE guild_id='G1' AND channel_id='CJ1'").run(Date.now() - 10 * 60000, Date.now());
+    for (const fn of listeners.messageCreate || []) await fn(mkJ(chJ, 'She steps forward, blade low.', P2));
+    const oM = order();
+    dbHandle.prepare("UPDATE turn_orders SET last_sign_at=?, reminded_at=? WHERE guild_id='G1' AND channel_id='CJ1'").run(Date.now() - 10 * 60000, Date.now());
+    for (const fn of listeners.raw || []) fn({ t: 'TYPING_START', d: { guild_id: 'G1', channel_id: 'CJ1', user_id: PL } });
+    const oX = order();
+    ok('five quiet minutes bring one reminder, Still writing and Done on it, pinging the player; ✍️, typing and a message each start the count again — someone else typing does not',
+      !!rem && rem.content.startsWith('⏳ 5 minutes on this turn') && rem.content.includes(`<@${P2}>`) && idsOf(rem).includes(`init:done:${kRem}`) && remAgain === 0
+        && /is still writing — the clock starts again/.test(hold.replies[0]?.content || '') && oH.reminded_at == null && Date.now() - oH.last_sign_at < 5000
+        && oT.reminded_at == null && Date.now() - oT.last_sign_at < 5000 && oM.reminded_at == null && Date.now() - oM.last_sign_at < 5000
+        && oX.reminded_at != null && Date.now() - oX.last_sign_at > 5 * 60000,
+      `rem ${(rem?.content || '').slice(0, 80)} · again ${remAgain} · ${(hold.replies[0]?.content || '').slice(0, 50)} · H ${oH.reminded_at} T ${oT.reminded_at} M ${oM.reminded_at} X ${oX.reminded_at}`);
+
+    // a fight here has the floor: the order's clock waits
+    dbHandle.prepare("INSERT OR REPLACE INTO fights (guild_id, channel_id, state, turn_order, last_at) VALUES ('G1', 'CJ1', 'active', '[]', ?)").run(Date.now());
+    dbHandle.prepare("UPDATE turn_orders SET turn_started_at=?, last_sign_at=NULL, reminded_at=NULL WHERE guild_id='G1' AND channel_id='CJ1'").run(Date.now() - 16 * 60000);
+    await clockTick();
+    const oF = order();
+    dbHandle.prepare("UPDATE fights SET state='idle' WHERE guild_id='G1' AND channel_id='CJ1'").run();
+    dbHandle.prepare("UPDATE turn_orders SET turn_started_at=?, last_sign_at=NULL, reminded_at=NULL WHERE guild_id='G1' AND channel_id='CJ1'").run(Date.now() - 16 * 60000);
+    n0 = sent.length; await clockTick();
+    const oP = order();
+    const passCard = newIn('CJ1', n0).find(m => /turn passes/.test(m.content));
+    ok('while a fight runs in the room the order\'s clock waits; fifteen quiet minutes then pass the turn, the order comes round to round 2, and the timeline keeps the passing and the round',
+      oF.turn_index === 2 && Date.now() - oF.last_sign_at < 5000
+        && oP.turn_index === 0 && oP.round === 2 && passCard?.content.includes(`⏳ **${N2}**’s turn passes — 15 minutes quiet.`) && /Round 2\*\* begins · 1 of 3/.test(passCard?.content || '')
+        && ev930().some(t => /turn passed — 15 minutes quiet/.test(t)) && ev930().includes('Round 2'),
+      `held idx ${oF.turn_index} · idx ${oP.turn_index} r${oP.round} · ${(passCard?.content || '').replace(/\s+/g, ' ').slice(0, 120)} · ${ev930().join(' | ').slice(-120)}`);
+
+    // 6 · pause and resume
+    const pz = await fJ({ isButton: true, customId: 'init:pause', message: { id: lastIn('CJ1')?.id, content: 'the card', components: [] }, userId: 'U1' });
+    const oPz = order();
+    dbHandle.prepare("UPDATE turn_orders SET turn_started_at=? WHERE guild_id='G1' AND channel_id='CJ1'").run(Date.now() - 60 * 60000);
+    n0 = sent.length; await clockTick();
+    const quietPaused = newIn('CJ1', n0).length;
+    const rs = await fJ({ isButton: true, customId: 'init:resume', message: { id: nextId(), content: 'paused', components: [] }, userId: 'U1' });
+    const oRs = order();
+    ok('Pause holds the order — the card carries Resume and End, the clock does nothing however long — and Resume calls the turn again on a fresh clock',
+      oPz.state === 'paused' && JSON.stringify(pz.replies[0]?.components || []).includes('init:resume') && quietPaused === 0
+        && oRs.state === 'running' && Date.now() - oRs.turn_started_at < 5000 && /▶️ The order goes on\./.test(lastIn('CJ1')?.content || ''),
+      `${oPz.state} · ${JSON.stringify(pz.replies[0]?.components || []).slice(0, 80)} · quiet ${quietPaused} · ${oRs.state} · ${(lastIn('CJ1')?.content || '').slice(0, 60)}`);
+
+    // 7 · /session turn
+    const add = await fJ({ commandName: 'session', options: { _sub: 'turn', action: 'add', who: `<@${P4}>` }, userId: 'U1' });
+    const listA = JSON.parse(order().order_json);
+    const rm = await fJ({ commandName: 'session', options: { _sub: 'turn', action: 'remove', who: 'Wolf 1' }, userId: 'U1' });
+    const oR = order(); const listR = JSON.parse(oR.order_json);
+    const show = await fJ({ commandName: 'session', options: { _sub: 'turn', action: 'show' }, userId: PL, member: plainK });
+    const nextPlain = await fJ({ commandName: 'session', options: { _sub: 'turn', action: 'next' }, userId: PL, member: plainK });
+    const skipPlain = await fJ({ commandName: 'session', options: { _sub: 'turn', action: 'skip' }, userId: PL, member: plainK });
+    const ac = await fJ({ isAutocomplete: true, commandName: 'session', options: { _sub: 'turn', _focused: 'who', _focusedValue: '' }, userId: 'U1' });
+    const acList = ac.replies.find(x => x.autocomplete)?.autocomplete || [];
+    ok('/session turn: add rolls a newcomer into place by total, remove takes one out with the turn kept where it was, show is anyone\'s, next and skip are refused to a stranger, and who: offers those in the order first',
+      listA.length === 4 && listA.some(e => e.id === P4 && e.total === e.roll + 2) && /joins — 🎲 \[\d+\] \+ ⚡ 2 DEX = \*\*\d+\*\*, place \d of 4\./.test(saidOf(add))
+        && listR.length === 3 && !listR.some(e => e.id === 'npc:Wolf 1') && listR[oR.turn_index]?.id === P1 && /Wolf 1\*\* leaves the order/.test(saidOf(rm))
+        && /d20 \+ DEX, highest first/.test(saidOf(show)) && /only they or a GM can end it/.test(saidOf(nextPlain)) && /Only GMs move the order/.test(saidOf(skipPlain))
+        && /^<@\d+>$/.test(acList[0]?.value || '') && acList.some(x => /· in the order/.test(x.name)) && acList.some(x => /🎭 Boar/.test(x.name)),
+      `${listA.map(e => e.name).join(',')} · ${saidOf(add).slice(0, 90)} · ${listR.map(e => e.name).join(',')}@${oR.turn_index} · ${saidOf(rm).slice(0, 50)} · ${saidOf(show).slice(0, 50)} · ${saidOf(nextPlain).slice(0, 40)} · ${saidOf(skipPlain).slice(0, 40)} · ${JSON.stringify(acList.slice(0, 3))}`);
+
+    // 8 · the clock in a fight: auto at the weakest, the defence rolled, an NPC's swing, a skip, the last foe first
+    const chF = new FakeChannel('CJ2', 0, 'j-fight', guild); channelsById.set(chF.id, chF);
+    const fF = (over) => fire({ channel: chF, ...over });
+    const fightRow = () => dbHandle.prepare("SELECT * FROM fights WHERE guild_id='G1' AND channel_id='CJ2'").get();
+    const quietFight = (mins) => dbHandle.prepare("UPDATE fights SET last_at=?, nudged=0, clock_idle=0 WHERE guild_id='G1' AND channel_id='CJ2'").run(Date.now() - mins * 60000);
+    const autoClk = await fF({ commandName: 'session', options: { _sub: 'clock', timeout: 'auto' }, userId: 'U1' });
+    const showClk = await fF({ commandName: 'session', options: { _sub: 'clock' }, userId: 'U1' });
+    const badClk = await fF({ commandName: 'session', options: { _sub: 'clock', remind: 10, skip: 5 }, userId: 'U1' });
+    const plainClk = await fF({ commandName: 'session', options: { _sub: 'clock', remind: 3 }, userId: PL, member: plainK });
+    await fF({ commandName: 'fight', options: { _sub: 'start', players: `<@${P1}>`, npcs: 'Wolf, Boar', manual: true }, userId: 'U1' });
+    const fs0 = fightRow();
+    quietFight(16); n0 = sent.length; await clockTick();
+    const fs1 = fightRow();
+    const swing = newIn('CJ2', n0).find(m => /the bot attacks for/.test(m.content));
+    quietFight(16); n0 = sent.length; await clockTick();
+    const fs2 = fightRow();
+    const parry = newIn('CJ2', n0).find(m => /the bot defends for \*\*Wolf 🎭\*\*/.test(m.content));
+    ok('a fight on timeout:auto: the quiet player\'s attack is rolled at the weakest foe standing (Wolf, 30 HP to the Boar\'s 40), the GM asked to defend; the quiet defence is then rolled for the NPC and the exchange resolves, the turn moving on',
+      /in a fight the bot attacks for them/.test(saidOf(autoClk)) && /set for this channel/.test(saidOf(showClk)) && /has to be more than/.test(saidOf(badClk)) && /Only GMs set the turn clock/.test(saidOf(plainClk))
+        && fs0?.state === 'active' && JSON.parse(fs0.turn_order).join(',') === `${P1},npc:Wolf,npc:Boar`
+        && swing?.content.includes(`the bot attacks for **${N1}**, at **Wolf 🎭**`) && /A GM defends for \*\*Wolf\*\*/.test(swing?.content || '') && idsOf(swing).some(id => /^fndef:/.test(id))
+        && fs1.phase === 'defend' && fs1.current_target === 'npc:Wolf' && JSON.parse(fs1.last_targets || '{}')[P1] === 'npc:Wolf'
+        && !!parry && fs2.phase === 'attack' && fs2.turn_index === 1,
+      `${saidOf(autoClk).slice(0, 60)} · ${saidOf(showClk).slice(0, 60)} · ${fs0?.turn_order} · ${(swing?.content || '').replace(/\s+/g, ' ').slice(0, 160)} · ${fs1?.phase}/${fs1?.current_target} lt ${fs1?.last_targets} · parry ${!!parry} · ${fs2?.phase}@${fs2?.turn_index}`);
+    quietFight(16); n0 = sent.length; await clockTick();
+    const fs3 = fightRow();
+    const npcSwing = newIn('CJ2', n0).find(m => /the bot attacks for \*\*Wolf 🎭\*\*/.test(m.content));
+    quietFight(16); n0 = sent.length; await clockTick();
+    const fs4 = fightRow();
+    const myParry = newIn('CJ2', n0).find(m => m.content.includes(`the bot defends for **${N1}**`));
+    ok('the quiet NPC\'s attack goes to the player, who is pinged with the defence buttons; their own quiet defence is rolled for them and the turn moves on to the Boar',
+      npcSwing?.content.includes(`at **${N1}**`) && npcSwing?.content.includes(`<@${P1}>`) && idsOf(npcSwing).includes('fdef:dex') && fs3.current_target === P1
+        && !!myParry && fs4.phase === 'attack' && fs4.turn_index === 2,
+      `${(npcSwing?.content || '').replace(/\s+/g, ' ').slice(0, 140)} · ${fs3?.current_target} · parry ${!!myParry} · ${fs4?.phase}@${fs4?.turn_index}`);
+    await fF({ commandName: 'session', options: { _sub: 'clock', timeout: 'skip' }, userId: 'U1' });
+    quietFight(16); n0 = sent.length; await clockTick();
+    const fs5 = fightRow();
+    const skipMsg = newIn('CJ2', n0).find(m => /turn is skipped/.test(m.content));
+    // the reminder, and what holds a fight's turn
+    quietFight(6); n0 = sent.length; await clockTick();
+    const fRem = newIn('CJ2', n0).find(m => idsOf(m).includes('fclock:hold'));
+    const holdPlain = await fF({ isButton: true, customId: 'fclock:hold', message: { id: fRem?.id, content: fRem?.content || '', components: [] }, userId: PL, member: plainK });
+    const holdMine = await fF({ isButton: true, customId: 'fclock:hold', message: { id: fRem?.id, content: fRem?.content || '', components: [] }, userId: P1 });
+    const fs6 = fightRow();
+    dbHandle.prepare("UPDATE fights SET last_at=?, nudged=1 WHERE guild_id='G1' AND channel_id='CJ2'").run(Date.now() - 10 * 60000);
+    for (const fn of listeners.raw || []) fn({ t: 'TYPING_START', d: { guild_id: 'G1', channel_id: 'CJ2', user_id: P1 } });
+    const fs7 = fightRow();
+    ok('on timeout:skip the quiet Boar\'s turn is skipped and it is the player\'s again; five quiet minutes remind them with ✍️ Still writing, which only they (or a GM) can press, and typing holds the turn too',
+      /⏭️ 15 minutes quiet — \*\*Boar 🎭\*\*'s turn is skipped; they stay in the fight\./.test(skipMsg?.content || '') && fs5.turn_index === 0 && fs5.phase === 'attack'
+        && fRem?.content.startsWith(`⏳ 5 minutes quiet — **${N1}** is up to attack. Still writing? Press ✍️ or keep typing. At 15 minutes the turn is skipped.`) && fRem.content.includes(`<@${P1}>`)
+        && /only they or a GM can hold the turn/.test(saidOf(holdPlain)) && /is still writing — the clock starts again/.test(holdMine.replies[0]?.content || '') && Date.now() - fs6.last_at < 5000 && fs6.nudged === 0
+        && Date.now() - fs7.last_at < 5000 && fs7.nudged === 0,
+      `${(skipMsg?.content || '').slice(0, 90)} · ${fs5?.turn_index} · ${(fRem?.content || '').slice(0, 120)} · ${saidOf(holdPlain).slice(0, 60)} · ${(holdMine.replies[0]?.content || '').slice(0, 50)} · ${fs6?.nudged}/${fs7?.nudged}`);
+    // the last foe struck comes first, even with a weaker one standing
+    await fF({ commandName: 'session', options: { _sub: 'clock', timeout: 'auto' }, userId: 'U1' });
+    const hpNow = JSON.parse(fightRow().hp_state); hpNow['npc:Boar'] = 3;
+    dbHandle.prepare("UPDATE fights SET hp_state=? WHERE guild_id='G1' AND channel_id='CJ2'").run(JSON.stringify(hpNow));
+    quietFight(16); n0 = sent.length; await clockTick();
+    const again2 = newIn('CJ2', n0).find(m => /the bot attacks for/.test(m.content));
+    // a fight ending elsewhere leaves the order's temporary NPCs be
+    const endF = await fF({ commandName: 'fight', options: { _sub: 'end' }, userId: 'U1' });
+    const endBtnF = (endF.replies[0]?.components || []).flatMap(r => ((r._d || r).components || []).map(b => (b._d || b).customId)).find(id => /^confirm:/.test(id || ''));
+    if (endBtnF) await fF({ isButton: true, customId: endBtnF, message: { id: nextId(), content: '', components: [] }, userId: 'U1' });
+    ok('the quiet player\'s next attack goes to the foe they last struck (Wolf) though the Boar stands weaker; a fight ending elsewhere leaves the initiative\'s temporary NPCs be',
+      again2?.content.includes(`the bot attacks for **${N1}**, at **Wolf 🎭**`) && fightRow()?.state === 'idle'
+        && !!dbHandle.prepare("SELECT 1 FROM npcs WHERE guild_id='G1' AND name='Wolf 2'").get(),
+      `${(again2?.content || '').replace(/\s+/g, ' ').slice(0, 120)} · ${fightRow()?.state} · wolf2 ${!!dbHandle.prepare("SELECT 1 FROM npcs WHERE guild_id='G1' AND name='Wolf 2'").get()}`);
+
+    // 8b · with the foes down, the clock never sets a fighter on a friend;
+    // a whole round of its own moves with nobody acting and it stops
+    const chD = new FakeChannel('CJ4', 0, 'j-dormant', guild); channelsById.set(chD.id, chD);
+    await fire({ channel: chD, commandName: 'session', options: { _sub: 'clock', timeout: 'auto' }, userId: 'U1' });
+    const fD = () => dbHandle.prepare("SELECT * FROM fights WHERE guild_id='G1' AND channel_id='CJ4'").get();
+    const quietD = (mins) => dbHandle.prepare("UPDATE fights SET last_at=?, nudged=0 WHERE guild_id='G1' AND channel_id='CJ4'").run(Date.now() - mins * 60000);
+    dbHandle.prepare(`INSERT OR REPLACE INTO fights (guild_id, channel_id, state, turn_order, turn_index, phase, hp_state, rr_state, floor_hp, last_at, nudged, clock_idle, last_targets)
+      VALUES ('G1', 'CJ4', 'active', ?, 0, 'attack', ?, '{}', 0, ?, 0, 0, '{}')`).run(JSON.stringify([P1, P2, 'npc:Boar']), JSON.stringify({ [P1]: 20, [P2]: 5, 'npc:Boar': 0 }), Date.now() - 16 * 60000);
+    n0 = sent.length; await clockTick();
+    const noTeam = newIn('CJ4', n0).map(m => m.content).join(' | ');
+    const fD1 = fD();
+    quietD(16); n0 = sent.length; await clockTick();
+    const stopMsg = newIn('CJ4', n0).map(m => m.content).join(' | ');
+    const fD2 = fD();
+    quietD(40); n0 = sent.length; await clockTick();
+    const afterStop = newIn('CJ4', n0).length;
+    const fD3 = fD();
+    for (const fn of listeners.raw || []) fn({ t: 'TYPING_START', d: { guild_id: 'G1', channel_id: 'CJ4', user_id: P1 } });
+    const fD4 = fD();
+    // and a fight quiet six hours past its mark is left alone
+    dbHandle.prepare("UPDATE fights SET last_at=?, nudged=0, clock_idle=0 WHERE guild_id='G1' AND channel_id='CJ4'").run(Date.now() - 7 * 3600000);
+    n0 = sent.length; await clockTick();
+    const oldQuiet = newIn('CJ4', n0).length;
+    dbHandle.prepare("UPDATE fights SET state='idle' WHERE guild_id='G1' AND channel_id='CJ4'").run();
+    ok('with the foes down the clock skips a quiet player rather than set them on a friend; a whole round of its own moves and it stops, saying so, until someone stirs; a fight quiet six hours past its mark is left alone',
+      /turn is skipped/.test(noTeam) && !/the bot attacks/.test(noTeam) && fD1.turn_index === 1 && fD1.clock_idle === 1
+        && /the turn clock stops here/.test(stopMsg) && fD2.clock_idle === 2 && fD2.turn_index === 0
+        && afterStop === 0 && fD3.turn_index === 0 && fD4.clock_idle === 0 && oldQuiet === 0,
+      `${noTeam.replace(/\s+/g, ' ').slice(0, 120)} · idle ${fD1.clock_idle}@${fD1.turn_index} · ${stopMsg.replace(/\s+/g, ' ').slice(-90)} · idle ${fD2.clock_idle}@${fD2.turn_index} · after ${afterStop} · ${fD3.turn_index} · ${fD4.clock_idle} · old ${oldQuiet}`);
+
+    // 9 · back, end, the record, the clock handed back
+    const oPre = order();
+    const bk = await fJ({ commandName: 'session', options: { _sub: 'turn', action: 'back' }, userId: 'U1' });
+    const oB = order();
+    const wantB = Number(oPre.turn_index) > 0 ? { round: oPre.round, idx: oPre.turn_index - 1 } : { round: oPre.round - 1, idx: JSON.parse(oPre.order_json).length - 1 };
+    const tl = await fJ({ commandName: 'quest', options: { _group: 'run', _sub: 'timeline', number: 930 }, userId: 'U1' });
+    const end = await fJ({ commandName: 'session', options: { _sub: 'turn', action: 'end' }, userId: 'U1' });
+    const oE = order();
+    const lateDone = await fJ({ isButton: true, customId: `init:done:${K()}`, message: { id: nextId(), content: '', components: [] }, userId: P1 });
+    const resetClk = await fF({ commandName: 'session', options: { _sub: 'clock', reset: true }, userId: 'U1' });
+    ok('back steps a turn back across the round; the run\'s timeline shows the rounds with 🔄; end closes the order, says its rounds and puts the end on the timeline, and a press after does nothing; reset hands the channel back to the server\'s clock',
+      oB.round === wantB.round && oB.turn_index === wantB.idx && /Back a turn/.test(saidOf(bk))
+        && /🔄 Round 2/.test(saidOf(tl))
+        && oE.state === 'ended' && saidOf(end).includes(`Initiative over after ${wantB.round} round${wantB.round === 1 ? '' : 's'}.`) && ev930().includes(`Initiative ended after ${wantB.round} round${wantB.round === 1 ? '' : 's'}`)
+        && /That initiative is over/.test(saidOf(lateDone)) && /keeps the server’s turn clock again/.test(saidOf(resetClk))
+        && !dbHandle.prepare("SELECT 1 FROM turn_clocks WHERE guild_id='G1' AND channel_id='CJ2'").get(),
+      `r${oB.round}@${oB.turn_index} · ${saidOf(bk).slice(0, 30)} · tl ${/🔄/.test(saidOf(tl))} · ${oE.state} · ${saidOf(end).slice(0, 50)} · ${ev930().slice(-2).join(' | ')} · ${saidOf(lateDone).slice(0, 40)} · ${saidOf(resetClk).slice(0, 60)}`);
+
+    // 10 · edges: Cancel; the turn's own entrant removed; the last one's
+    // removed (the round comes round); back from the very first turn
+    const chE = new FakeChannel('CJ3', 0, 'j-edges', guild); channelsById.set(chE.id, chE);
+    const fE = (over) => fire({ channel: chE, ...over });
+    const orderE = () => dbHandle.prepare("SELECT * FROM turn_orders WHERE guild_id='G1' AND channel_id='CJ3'").get();
+    n0 = sent.length;
+    await fE({ commandName: 'session', options: { _sub: 'initiative', npcs: 'Brigand' }, userId: 'U1' });
+    const cardE = newIn('CJ3', n0).find(m => idsOf(m).includes('init:cancel'));
+    const cancel = await fE({ isButton: true, customId: 'init:cancel', message: { id: cardE?.id, content: cardE?.content || '', components: [] }, userId: 'U1' });
+    const oC = orderE();
+    const three = [{ id: P1, name: N1, kind: 'player', roll: 15, dex: 4, total: 19 }, { id: P2, name: N2, kind: 'player', roll: 9, dex: 1, total: 10 }, { id: 'name:Brigand', name: 'Brigand', kind: 'name', roll: 5, dex: 0, total: 5 }];
+    dbHandle.prepare("UPDATE turn_orders SET state='running', order_json=?, turn_index=1, round=1, turn_started_at=?, turn_msg_id=NULL WHERE guild_id='G1' AND channel_id='CJ3'").run(JSON.stringify(three), Date.now());
+    n0 = sent.length;
+    const rmCur = await fE({ commandName: 'session', options: { _sub: 'turn', action: 'remove', who: `<@${P2}>` }, userId: 'U1' });
+    const oRc = orderE(); const cardRc = newIn('CJ3', n0).pop();
+    n0 = sent.length;
+    const rmLast = await fE({ commandName: 'session', options: { _sub: 'turn', action: 'remove', who: 'brigand' }, userId: 'U1' });
+    const oRl = orderE(); const cardRl = newIn('CJ3', n0).pop();
+    const backFirst = await fE({ commandName: 'session', options: { _sub: 'turn', action: 'back' }, userId: 'U1' });
+    dbHandle.prepare("UPDATE turn_orders SET round=1, turn_index=0 WHERE guild_id='G1' AND channel_id='CJ3'").run();
+    const backNone = await fE({ commandName: 'session', options: { _sub: 'turn', action: 'back' }, userId: 'U1' });
+    const rmAll = await fE({ commandName: 'session', options: { _sub: 'turn', action: 'remove', who: `<@${P1}>` }, userId: 'U1' });
+    const oAll = orderE();
+    ok('edges: Cancel calls it off; removing the one whose turn it is hands the turn on at once; removing the last in line brings the round round; back from the first turn of all does nothing; removing the last one left ends it',
+      /called off/.test(cancel.replies[0]?.content || '') && oC.state === 'ended'
+        && oRc.turn_index === 1 && JSON.parse(oRc.order_json).length === 2 && /➖ \*\*user100000000000000062\*\* leaves the order — the turn moves on\./.test(saidOf(rmCur)) && /🎯 🎭 \*\*Brigand\*\*/.test(cardRc?.content || '') && oRc.turn_seq > 0
+        && oRl.turn_index === 0 && oRl.round === 2 && /Round 2\*\* begins/.test(cardRl?.content || '') && cardRl?.content.includes(`<@${P1}>`)
+        && /Back a turn/.test(saidOf(backFirst)) && /no turn before the first/.test(saidOf(backNone))
+        && oAll.state === 'ended' && /nobody left, initiative is over/.test(saidOf(rmAll)),
+      `${(cancel.replies[0]?.content || '').slice(0, 40)} ${oC.state} · ${oRc.turn_index} ${(cardRc?.content || '').replace(/\s+/g, ' ').slice(0, 100)} · ${oRl.turn_index}/${oRl.round} ${(cardRl?.content || '').replace(/\s+/g, ' ').slice(0, 80)} · ${saidOf(backFirst).slice(0, 30)} · ${saidOf(backNone).slice(0, 40)} · ${oAll.state} ${saidOf(rmAll).slice(0, 60)}`);
+
+    dbHandle.prepare("UPDATE quests SET status='completed' WHERE guild_id='G1' AND number=930").run();
+    guild.members.fetch = realFetchK;
+    const threwK = loggedK.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
+    console.error = realErrK;
+    ok('nothing in the J walk threw', threwK.length === 0, threwK.slice(0, 3).join('\n        '));
+  }
+
+  // ── Build K (2026-11-08): a player's own advantage waits on a GM; an
+  // auto fight shows both dice and a Hero reaches for their signature ────
+  if (dbHandle) {
+    const realErrKK = console.error; const loggedKK = [];
+    console.error = (...a) => { loggedKK.push(a.map(x => (x && x.stack) ? x.stack.split('\n').slice(0, 2).join(' | ') : String(x)).join(' ')); };
+    const idsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+    const saidOf = (r) => r.replies.map(x => x.content || '').join(' ');
+    const allOf = (r) => r.replies.map(x => JSON.stringify(x)).join(' ');
+    const settle = async () => { for (let i = 0; i < 60; i++) await new Promise(r => setImmediate(r)); };
+    const tickAll = async () => { for (const t of ticks.filter(t => /turnClockTick/.test(String(t.fn)))) { try { await t.fn(); } catch (e) { loggedKK.push(`tick: ${e.message}`); } } };
+    const newIn = (cid, n) => sent.slice(n).filter(x => x.channel === cid).map(x => x.msg);
+    const textOf = (msgs) => msgs.map(m => `${m.content} ${JSON.stringify(m.components || [])}`).join('\n');
+    const KA = '100000000000000071', KB = '100000000000000072';
+    const plainOf = (id) => ({ id, displayName: `user${id}`, roles: { cache: new Map() }, permissions: { has: () => false } });
+    const realFetchKK = guild.members.fetch;
+    guild.members.fetch = async (uid) => { const mb = await realFetchKK(uid); if (uid === KA || uid === KB) { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+    for (const id of [KA, KB]) dbHandle.prepare("INSERT OR REPLACE INTO characters (guild_id, user_id, str, con, dex, wis, lck, hp_current, rerolls_current) VALUES ('G1', ?, 4, 3, 3, 2, 2, 30, 2)").run(id);
+    const chK = new FakeChannel('CK1', 0, 'k-walk', guild); channelsById.set(chK.id, chK);
+    const fK = (over) => fire({ channel: chK, ...over });
+    const asK = (uid) => (uid === KA || uid === KB ? { member: plainOf(uid) } : {});
+    const press = (id, uid, ch = chK, msg = null) => fire({ channel: ch, isButton: true, customId: id, message: msg || { id: nextId(), content: 'x', components: [] }, userId: uid, ...asK(uid) });
+    const holdOf = (uid, cid = 'CK1', gid = 'G1') => dbHandle.prepare('SELECT * FROM mode_holds WHERE guild_id=? AND channel_id=? AND user_id=? ORDER BY id DESC LIMIT 1').get(gid, cid, uid);
+    const nHolds = () => dbHandle.prepare('SELECT COUNT(*) n FROM mode_holds').get().n;
+
+    // 1 · /roll: held; one at a time; only a GM answers; allowed, the player's own Roll rolls it with advantage
+    let n0 = sent.length;
+    const askR = await fK({ commandName: 'roll', options: { stat: 'str', mode: 'adv' }, userId: KA, ...asK(KA) });
+    const hR = holdOf(KA);
+    const cardR = newIn('CK1', n0).find(m => idsOf(m).includes(`advok:${hR?.id}`));
+    const again = await fK({ commandName: 'roll', options: { stat: 'dex', mode: 'dis' }, userId: KA, ...asK(KA) });
+    const selfOk = await press(`advok:${hR?.id}`, KA, chK, cardR);
+    n0 = sent.length;
+    const gmOk = await press(`advok:${hR?.id}`, 'U1', chK, cardR);
+    const goR = newIn('CK1', n0).find(m => idsOf(m).includes(`advgo:${hR?.id}`));
+    const goRText = goR?.content || '';   // as posted: the press edits it
+    const hR2 = holdOf(KA);
+    const notMine = await press(`advgo:${hR?.id}`, KB, chK, goR);
+    n0 = sent.length;
+    const goPress = await press(`advgo:${hR?.id}`, KA, chK, goR);
+    await settle();
+    const hR3 = holdOf(KA);
+    const twice = await press(`advgo:${hR?.id}`, KA, chK, goR);
+    ok('/roll mode:adv from a player waits: a quiet word to them, a card with Allow and Deny; one at a time; only a GM answers; allowed, the player is pinged with 🎲 Roll, theirs alone, and it rolls with advantage, once',
+      /needs a GM's yes/.test(saidOf(askR)) && !!askR.replies[0]?.ephemeral && hR?.state === 'pending' && hR?.via === 'slash'
+        && /asks to roll with \*\*advantage\*\*/.test(cardR?.content || '') && (cardR?.content || '').includes('/roll stat:str mode:adv') && idsOf(cardR).includes(`advno:${hR?.id}`)
+        && /already have a roll waiting/.test(saidOf(again)) && /Only a GM can answer/.test(saidOf(selfOk))
+        && /Advantage allowed\*\* for/.test(saidOf(gmOk)) && hR2?.state === 'allowed' && goRText.includes(`<@${KA}>`) && /press 🎲 Roll within 10 minutes/.test(goRText)
+        && /That roll is <@/.test(saidOf(notMine))
+        && /\(advantage\)/.test(allOf(goPress) + textOf(newIn('CK1', n0))) && hR3?.state === 'used' && /Rolled with \*\*advantage\*\*/.test(goR?.content || '')
+        && /already rolled|is rolled/.test(saidOf(twice)),
+      `${saidOf(askR).slice(0, 60)} · ${hR?.state} · ${(cardR?.content || '').replace(/\s+/g, ' ').slice(0, 120)} · ${saidOf(again).slice(0, 40)} · ${saidOf(selfOk).slice(0, 40)} · ${saidOf(gmOk).slice(0, 60)} · ${hR2?.state} · ${(goR?.content || '').slice(0, 60)} · ${saidOf(notMine).slice(0, 40)} · ${allOf(goPress).slice(0, 160)} · ${hR3?.state} · ${saidOf(twice).slice(0, 40)}`);
+
+    // 2 · a fight: a held attack names its stat; the clock waits; denied, it rolls plain at once with no form
+    const chK2 = new FakeChannel('CK2', 0, 'k-fight', guild); channelsById.set(chK2.id, chK2);
+    const fK2 = (over) => fire({ channel: chK2, ...over });
+    const fightK = () => dbHandle.prepare("SELECT * FROM fights WHERE guild_id='G1' AND channel_id='CK2'").get();
+    await fK2({ commandName: 'fight', options: { _sub: 'start', players: `<@${KA}> <@${KB}>`, manual: true }, userId: 'U1' });
+    dbHandle.prepare("UPDATE fights SET turn_order=?, turn_index=0, phase='attack', current_target=NULL, atk_roll=NULL, def_roll=NULL WHERE guild_id='G1' AND channel_id='CK2'").run(JSON.stringify([KA, KB]));
+    const noStat = await fK2({ commandName: 'fight', options: { _sub: 'atk', roll: 'adv' }, userId: KA, ...asK(KA) });
+    const hNone = holdOf(KA, 'CK2');
+    n0 = sent.length;
+    const askA = await fK2({ commandName: 'fight', options: { _sub: 'atk', stat: 'str', target: KB, roll: 'adv' }, userId: KA, ...asK(KA) });
+    const hA = holdOf(KA, 'CK2');
+    const cardA = newIn('CK2', n0).find(m => idsOf(m).includes(`advno:${hA?.id}`));
+    const fA0 = fightK();
+    dbHandle.prepare("UPDATE fights SET last_at=?, nudged=0, clock_idle=0 WHERE guild_id='G1' AND channel_id='CK2'").run(Date.now() - 16 * 60000);
+    n0 = sent.length; await tickAll();
+    const fA1 = fightK();
+    const clockSaid = textOf(newIn('CK2', n0));
+    n0 = sent.length;
+    const gmNo = await press(`advno:${hA?.id}`, 'U1', chK2, cardA);
+    await settle();
+    const fA2 = fightK();
+    const plainOut = textOf(newIn('CK2', n0));
+    const hA2 = holdOf(KA, 'CK2');
+    ok('a fight: a held attack must name its stat; held, the fight stands and the turn clock waits on it; denied, it rolls plain at once — the player told, no form — and the defence is called',
+      /Name the stat/.test(saidOf(noStat)) && !hNone
+        && /needs a GM's yes/.test(saidOf(askA)) && hA?.state === 'pending' && !!cardA && (cardA?.content || '').includes(`/fight atk stat:str target:<@${KB}> roll:adv`) && fA0.phase === 'attack'
+        && fA1.turn_index === 0 && fA1.phase === 'attack' && Number(fA1.last_at) > Date.now() - 60000 && !/quiet/.test(clockSaid)
+        && /Advantage denied\*\* for/.test(saidOf(gmNo)) && hA2?.state === 'denied'
+        && plainOut.includes(`<@${KA}> ❌ A GM said no to **advantage**`) && fA2.phase === 'defend' && fA2.current_target === KB
+        && !/\(advantage\)/.test(plainOut) && !gmNo.replies.some(x => x.modal),
+      `${saidOf(noStat).slice(0, 50)} · ${hNone?.id} · ${saidOf(askA).slice(0, 40)} · ${hA?.state} · ${(cardA?.content || '').replace(/\s+/g, ' ').slice(0, 120)} · ${fA0?.phase} · ${fA1?.turn_index}/${fA1?.phase} ${Date.now() - Number(fA1?.last_at)}ms · ${clockSaid.slice(0, 80)} · ${saidOf(gmNo).slice(0, 60)} · ${hA2?.state} · ${plainOut.replace(/\s+/g, ' ').slice(0, 240)} · ${fA2?.phase}/${fA2?.current_target}`);
+
+    // 3 · allowed: the Roll opens the defence form, a dismissed one opens again, and its submit rolls with advantage and spends the hold
+    n0 = sent.length;
+    const askD = await fK2({ commandName: 'fight', options: { _sub: 'def', stat: 'dex', roll: 'adv' }, userId: KB, ...asK(KB) });
+    const hD = holdOf(KB, 'CK2');
+    const cardD = newIn('CK2', n0).find(m => idsOf(m).includes(`advok:${hD?.id}`));
+    n0 = sent.length;
+    await press(`advok:${hD?.id}`, 'U1', chK2, cardD);
+    const goD = newIn('CK2', n0).find(m => idsOf(m).includes(`advgo:${hD?.id}`));
+    const goD1 = await press(`advgo:${hD?.id}`, KB, chK2, goD);
+    const hD1 = holdOf(KB, 'CK2');
+    const form1 = goD1.replies.find(x => x.modal)?.modal;
+    const goD2 = await press(`advgo:${hD?.id}`, KB, chK2, goD);
+    const form2 = goD2.replies.find(x => x.modal)?.modal;
+    const subD = await fK2({ isModal: true, customId: form2 || 'frp:none', fields: { action: 'braces', speech: '' }, userId: KB, ...asK(KB) });
+    await settle();
+    const hD2 = holdOf(KB, 'CK2');
+    const fD = fightK();
+    ok('allowed in a fight: the Roll opens the defence form (dismissed, it opens again); the submit rolls the defence with advantage, spends the hold and takes the button away',
+      !!askD.replies[0]?.ephemeral && hD?.state === 'pending' && !!goD && hD1?.state === 'allowed' && /^frp:/.test(form1 || '') && /^frp:/.test(form2 || '')
+        && /\(advantage\)/.test(allOf(subD)) && hD2?.state === 'used' && fD.def_roll != null && /Rolled with \*\*advantage\*\*/.test(goD?.content || '') && (goD?.components || []).length === 0,
+      `${hD?.state} · ${!!goD} · ${hD1?.state} · ${form1} · ${form2} · ${allOf(subD).slice(0, 200)} · ${hD2?.state} · ${fD?.def_roll} · ${(goD?.content || '').slice(0, 60)}`);
+    await fK2({ commandName: 'fight', options: { _sub: 'end' }, userId: 'U1' });
+
+    // 4 · typed: the card answers the message; denied, the plain roll answers it too
+    const mkK = (ch, text, uid) => ({ id: nextId(), content: text, author: { id: uid, bot: false, username: `user${uid}` }, guild, channel: ch, channelId: ch.id,
+      member: plainOf(uid), attachments: { size: 0, first: () => null }, client,
+      reply: async (p) => { replies.push(norm(p)); return { id: nextId() }; } });
+    const msgT = mkK(chK, 'stra heave', KB);
+    n0 = sent.length; replies.length = 0;
+    for (const fn of listeners.messageCreate || []) await fn(msgT);
+    await settle();
+    const hT = holdOf(KB);
+    const cardT = newIn('CK1', n0).find(m => idsOf(m).includes(`advno:${hT?.id}`));
+    n0 = sent.length;
+    const gmNoT = await press(`advno:${hT?.id}`, 'U1', chK, cardT);
+    await settle();
+    const plainT = newIn('CK1', n0);
+    const hT2 = holdOf(KB);
+    ok('typed stra waits too: the card answers the message; denied, the plain roll answers the same message',
+      hT?.via === 'typed' && cardT?.replyTo === msgT.id && /stra heave/.test(cardT?.content || '')
+        && /Advantage denied/.test(saidOf(gmNoT)) && hT2?.state === 'denied' && plainT.some(m => m.replyTo === msgT.id) && !/\(advantage\)/.test(textOf(plainT)),
+      `${hT?.via} · ${cardT?.replyTo === msgT.id} · ${(cardT?.content || '').replace(/\s+/g, ' ').slice(0, 100)} · ${hT2?.state} · ${plainT.map(m => `${m.replyTo === msgT.id}:${m.content.slice(0, 40)}`).join(' | ')}`);
+
+    // 5 · nobody answers: five minutes on, the card closes and the player is told
+    n0 = sent.length;
+    await fK({ commandName: 'roll', options: { dice: '1d20', mode: 'dis' }, userId: KA, ...asK(KA) });
+    const hL = holdOf(KA);
+    dbHandle.prepare('UPDATE mode_holds SET created_at=? WHERE id=?').run(Date.now() - 6 * 60000, hL?.id);
+    await tickAll();
+    const hL2 = holdOf(KA);
+    const told = textOf(newIn('CK1', n0));
+    ok('unanswered for five minutes: the card closes and the player is told they cannot roll with advantage or disadvantage without a GM\'s approval',
+      hL?.state === 'pending' && hL?.mode === 'dis' && hL2?.state === 'lapsed'
+        && told.includes(`<@${KA}> ⌛ No GM answered in 5 minutes. You can't roll with advantage or disadvantage without a GM's approval`)
+        && /No GM answered\*\* — no disadvantage/.test(told),
+      `${hL?.state}/${hL?.mode} · ${hL2?.state} · ${told.replace(/\s+/g, ' ').slice(0, 260)}`);
+
+    // 6 · allowed and never pressed: ten minutes on, the button goes
+    await fK({ commandName: 'roll', options: { dice: '1d20', mode: 'adv' }, userId: KB, ...asK(KB) });
+    const hE = holdOf(KB);
+    n0 = sent.length;
+    await press(`advok:${hE?.id}`, 'U1');
+    const goE = newIn('CK1', n0).find(m => idsOf(m).includes(`advgo:${hE?.id}`));
+    dbHandle.prepare('UPDATE mode_holds SET decided_at=? WHERE id=?').run(Date.now() - 11 * 60000, hE?.id);
+    await tickAll();
+    const hE2 = holdOf(KB);
+    const lateGo = await press(`advgo:${hE?.id}`, KB, chK, goE);
+    ok('allowed and never pressed: ten minutes on, the Roll button goes, and a late press is told so',
+      hE?.state === 'pending' && !!goE && hE2?.state === 'expired' && /went unused/.test(goE?.content || '') && /run out/.test(saidOf(lateGo)),
+      `${hE?.state} · ${!!goE} · ${hE2?.state} · ${(goE?.content || '').slice(0, 60)} · ${saidOf(lateGo).slice(0, 60)}`);
+
+    // 7 · a GM is never held; the switch lets players pick freely
+    const nH0 = nHolds();
+    const gmRoll = await fK({ commandName: 'roll', options: { dice: '1d20', mode: 'adv' }, userId: 'U1' });
+    const offCfg = await fK({ commandName: 'config', options: { _group: 'mechanics', _sub: 'advapproval', enabled: false }, userId: 'U1' });
+    const showCfg = await fK({ commandName: 'config', options: { _group: 'mechanics', _sub: 'advapproval' }, userId: 'U1' });
+    const freeRoll = await fK({ commandName: 'roll', options: { dice: '1d20', mode: 'adv' }, userId: KA, ...asK(KA) });
+    const onCfg = await fK({ commandName: 'config', options: { _group: 'mechanics', _sub: 'advapproval', enabled: true }, userId: 'U1' });
+    const plainCfg = await fK({ commandName: 'config', options: { _group: 'mechanics', _sub: 'advapproval', enabled: false }, userId: KA, ...asK(KA) });
+    ok('a GM\'s own advantage never waits; /config mechanics advapproval enabled:false lets players pick freely, shows itself, and switches back on; a player cannot switch it',
+      /\(advantage\)/.test(allOf(gmRoll)) && /freely/.test(saidOf(offCfg)) && /freely/.test(saidOf(showCfg)) && /\(advantage\)/.test(allOf(freeRoll))
+        && /waits on a GM/.test(saidOf(onCfg)) && nHolds() === nH0 && !/freely/.test(saidOf(plainCfg)) && dbHandle.prepare("SELECT adv_approval FROM guild_config WHERE guild_id='G1'").get()?.adv_approval === 1,
+      `${allOf(gmRoll).slice(0, 80)} · ${saidOf(offCfg).slice(0, 60)} · ${saidOf(showCfg).slice(0, 60)} · ${allOf(freeRoll).slice(0, 80)} · ${saidOf(onCfg).slice(0, 60)} · ${nHolds()}/${nH0} · ${saidOf(plainCfg).slice(0, 60)}`);
+
+    // 8 · 5e: inspiration puts 🔼 on the next roll itself; a skill check asked with advantage waits
+    const g5 = lastClient?.guilds?.cache?.get('G5'), c5 = channelsById.get('C5');
+    if (g5 && c5) {
+      const F51 = '100000000000000051';
+      const realFetch5 = g5.members.fetch;
+      g5.members.fetch = async (uid) => { const mb = await realFetch5(uid); if (uid === F51) { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+      const f5 = (over) => fire({ guild: g5, channel: c5, ...over });
+      const grant = await f5({ commandName: 'dnd', options: { _sub: 'inspiration', grant: true, user: F51 }, userId: 'U1' });
+      const spend = await f5({ commandName: 'dnd', options: { _sub: 'inspiration', use: true }, userId: F51, member: plainOf(F51) });
+      const mk = dbHandle.prepare("SELECT next_mark, inspiration FROM characters WHERE guild_id='G5' AND user_id=?").get(F51);
+      const save = await f5({ commandName: 'roll', options: { save: 'dex' }, userId: F51, member: plainOf(F51) });
+      const mk2 = dbHandle.prepare("SELECT next_mark FROM characters WHERE guild_id='G5' AND user_id=?").get(F51);
+      const askS = await f5({ commandName: 'roll', options: { skill: 'stealth', mode: 'adv' }, userId: F51, member: plainOf(F51) });
+      const hS = holdOf(F51, 'C5', 'G5');
+      g5.members.fetch = realFetch5;
+      ok('5e: spending inspiration puts 🔼 on the next roll itself, so the save rolls with advantage unasked; a skill check asked with advantage waits on a GM',
+        /granted/.test(saidOf(grant)) && /🔼 advantage on their next roll/.test(saidOf(spend)) && mk?.next_mark === 'adv' && Number(mk?.inspiration) === 0
+          && /\(advantage\)/.test(allOf(save)) && mk2?.next_mark == null
+          && hS?.state === 'pending' && /needs a GM's yes/.test(saidOf(askS)) && (hS ? JSON.parse(hS.payload).str?.skill === 'stealth' : false),
+        `${saidOf(grant).slice(0, 40)} · ${saidOf(spend).slice(0, 60)} · ${mk?.next_mark}/${mk?.inspiration} · ${allOf(save).slice(0, 100)} · ${mk2?.next_mark} · ${hS?.state} · ${saidOf(askS).slice(0, 40)}`);
+    } else ok('5e: the I walk left a 5e server to use', false, 'no G5');
+
+    // 9 · an auto fight between Heroes: WIS swings for the WIS Hero, and every signature roll shows both dice
+    const KH1 = '100000000000000073', KH2 = '100000000000000074';
+    dbHandle.prepare("INSERT OR REPLACE INTO characters (guild_id, user_id, str, con, dex, wis, lck, hp_current, is_hero, signature_stat) VALUES ('G1', ?, 5, 5, 4, 5, 1, 6, 1, 'wis')").run(KH1);
+    dbHandle.prepare("INSERT OR REPLACE INTO characters (guild_id, user_id, str, con, dex, wis, lck, hp_current, is_hero, signature_stat) VALUES ('G1', ?, 5, 5, 4, 4, 2, 6, 1, 'str')").run(KH2);
+    const chK3 = new FakeChannel('CK3', 0, 'k-auto', guild); channelsById.set(chK3.id, chK3);
+    const realTOK = globalThis.setTimeout;
+    globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
+    n0 = sent.length;
+    await fire({ channel: chK3, commandName: 'fight', options: { _sub: 'auto', mode: 'full', players: `<@${KH1}> <@${KH2}>` }, userId: 'U1' });
+    for (let i = 0; i < 8; i++) await settle();
+    globalThis.setTimeout = realTOK;
+    const autoText = textOf(newIn('CK3', n0));
+    const sigLines = autoText.split('\n').filter(l => /signature advantage/.test(l));
+    ok('an auto fight between Heroes: the WIS Hero swings and parries with WIS, the STR Hero with STR, and every signature roll shows the kept die and the dropped one',
+      new RegExp(`user${KH1} attacks [^\\n]* with WIS`).test(autoText) && new RegExp(`user${KH2} attacks [^\\n]* with STR`).test(autoText)
+        && sigLines.length >= 2 && sigLines.every(l => /\(signature advantage\) → \[\d+, ~~\d+~~\]/.test(l)),
+      `${sigLines.length} · ${sigLines.slice(0, 2).join(' | ').slice(0, 200)} · ${autoText.replace(/\s+/g, ' ').slice(0, 300)}`);
+
+    guild.members.fetch = realFetchKK;
+    const threwKK = loggedKK.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
+    console.error = realErrKK;
+    ok('nothing in the K walk threw', threwKK.length === 0, threwKK.slice(0, 3).join('\n        '));
+  }
+
+  // ── Build L (2026-11-09): the naturals on grapple, hold, feint, deflect and
+  // disarm; a kept hold's answer; the price of a trick; a stray NPC sheet ──
+  if (dbHandle) {
+    const realErrL = console.error; const loggedL = [];
+    console.error = (...a) => { loggedL.push(a.map(x => (x && x.stack) ? x.stack.split('\n').slice(0, 2).join(' | ') : String(x)).join(' ')); };
+    const idsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+    const saidOf = (r) => (r?.replies || []).map(x => x.content || '').join('\n');
+    const allOf = (r) => (r?.replies || []).map(x => JSON.stringify(x)).join(' ');
+    const modalOf = (r) => (r?.replies || []).find(x => x.modal)?.modal || null;
+    const flat1 = (t) => String(t || '').replace(/\s+/g, ' ');
+    const settle = async () => { for (let i = 0; i < 60; i++) await new Promise(r => setImmediate(r)); };
+    const tickAll = async () => { for (const t of ticks.filter(t => /turnClockTick/.test(String(t.fn)))) { try { await t.fn(); } catch (e) { loggedL.push(`tick: ${e.message}`); } } };
+    const newIn = (cid, n) => sent.slice(n).filter(x => x.channel === cid).map(x => x.msg);
+    const textOf = (msgs) => msgs.map(m => `${m.content} ${JSON.stringify(m.components || [])}`).join('\n');
+    // Dice in order — (n - 0.5) / 20 sits mid-slot for a d20 — then a middling 11.
+    const realRandL = Math.random;
+    const withDice = async (nats, fn) => {
+      const q = nats.map(n => (n - 0.5) / 20);
+      Math.random = () => (q.length ? q.shift() : 0.525);
+      try { const r = await fn(); await settle(); return r; } finally { Math.random = realRandL; }
+    };
+    const LA = '100000000000000081', LB = '100000000000000082', LW = '100000000000000083';
+    const plainOf = (id) => ({ id, displayName: `user${id}`, roles: { cache: new Map() }, permissions: { has: () => false } });
+    const realFetchL = guild.members.fetch;
+    guild.members.fetch = async (uid) => { const mb = await realFetchL(uid); if ([LA, LB, LW].includes(uid)) { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+    const asL = (uid) => ([LA, LB, LW].includes(uid) ? { member: plainOf(uid) } : {});
+    const putChar = (id, str, dex, wis, w1 = null, w2 = null) => dbHandle.prepare("INSERT OR REPLACE INTO characters (guild_id, user_id, str, con, dex, wis, lck, hp_current, weapon1, weapon2) VALUES ('G1', ?, ?, 5, ?, ?, 1, 30, ?, ?)").run(id, str, dex, wis, w1, w2);
+    putChar(LA, 5, 4, 5, 'Longsword', 'Kite shield');
+    putChar(LB, 4, 4, 8);
+    putChar(LW, 2, 2, 2);
+    const putNpc = (name, str, dex, wis, hp = 30) => dbHandle.prepare("INSERT OR REPLACE INTO npcs (guild_id, name, str, con, dex, wis, lck, hp_current) VALUES ('G1', ?, ?, 3, ?, ?, 1, ?)").run(name, str, dex, wis, hp);
+    putNpc('Lhound', 10, 2, 1); putNpc('Lcrow', 1, 1, 1); putNpc('Lbrute', 3, 2, 1);
+    const chL = new FakeChannel('CL1', 0, 'l-walk', guild); channelsById.set(chL.id, chL);
+    const fL1 = (over) => fire({ channel: chL, ...over });
+    const fightL = (cid = 'CL1') => dbHandle.prepare("SELECT * FROM fights WHERE guild_id='G1' AND channel_id=?").get(cid);
+    const setL = (o, cid = 'CL1') => { const ks = Object.keys(o); dbHandle.prepare(`UPDATE fights SET ${ks.map(k => `${k}=?`).join(', ')} WHERE guild_id='G1' AND channel_id=?`).run(...ks.map(k => (o[k] !== null && typeof o[k] === 'object') ? JSON.stringify(o[k]) : o[k]), cid); };
+    const hpOf = (id, cid = 'CL1') => JSON.parse(fightL(cid)?.hp_state || '{}')[id];
+    const fxOf = (id, cid = 'CL1') => JSON.parse(fightL(cid)?.effect_state || '{}')[id] || {};
+    const heldBy = (id, cid = 'CL1') => JSON.parse(fightL(cid)?.grapples || '{}')[id] || null;
+    const FRESH = { phase: 'attack', current_target: null, atk_kind: null, atk_roll: null, atk_nat: null, def_roll: null, def_nat: null, effect_state: {}, grapples: {} };
+    const act = (uid, o, ch = chL) => fire({ channel: ch, commandName: 'fight', options: { _sub: 'act', ...o }, userId: uid, ...asL(uid) });
+    const press = (id, uid, ch = chL) => fire({ channel: ch, isButton: true, customId: id, message: { id: nextId(), content: 'x', components: [] }, userId: uid, ...asL(uid) });
+    const submit = (modal, uid, ch = chL, fields = { action: '', speech: '' }) => fire({ channel: ch, isModal: true, customId: modal || 'frp:none', fields, userId: uid, ...asL(uid) });
+    const quietL = (mins) => dbHandle.prepare("UPDATE fights SET last_at=?, nudged=0, clock_idle=0 WHERE guild_id='G1' AND channel_id='CL1'").run(Date.now() - mins * 60000);
+    await fL1({ commandName: 'fight', options: { _sub: 'start', players: `<@${LA}> <@${LB}> <@${LW}>`, manual: true }, userId: 'U1' });
+
+    // 1 · a grip needs STR 4+: refused before anything is spent
+    setL({ ...FRESH, turn_order: [LW, LA, LB], turn_index: 0, effect_state: { [LW]: { fooled: true } } });
+    const weak = await act(LW, { action: 'grapple', target: LA, flavour: 'grab' });
+    ok('a grapple needs STR 4+ on Knightfall: refused, the fight unmoved, nothing spent',
+      /Grappling needs \*\*STR 4\+\*\*/.test(saidOf(weak)) && fightL().phase === 'attack' && fxOf(LW).fooled === true,
+      `${flat1(saidOf(weak)).slice(0, 80)} · ${fightL().phase} · ${JSON.stringify(fxOf(LW))}`);
+
+    // 2 · the grab's naturals
+    const grabSave = async (gNat, sNat) => {
+      setL({ ...FRESH, turn_order: [LA, LB], turn_index: 0 });
+      await withDice([gNat], () => act(LA, { action: 'grapple', target: LB, flavour: 'grab' }));
+      return withDice([sNat], () => act(LB, { action: 'save' }));
+    };
+    const hpB0 = hpOf(LB);
+    const g1 = await grabSave(1, 2);
+    const held1 = heldBy(LB), hpB1 = hpOf(LB), ti1 = fightL().turn_index;
+    const g20 = await grabSave(20, 20);
+    const held20 = heldBy(LB), hpB20 = hpOf(LB);
+    const gS = await grabSave(12, 20);
+    const heldS = heldBy(LB);
+    ok('a grab of 1 fails outright; twenty meets twenty and the grab wins, for 2 wounds; a save of 20 twists free of an ordinary grab',
+      /fumbles the grab — a natural 1, it fails outright/.test(saidOf(g1)) && !held1 && hpB1 === hpB0 && ti1 === 1
+        && /Twenty meets twenty!\*\* The grab wins/.test(saidOf(g20)) && /seizes \*\*user\d+\*\* for \*\*2\*\* wounds/.test(saidOf(g20)) && held20 === LA && hpB20 === hpB0 - 2
+        && /A natural 20 — \*\*user\d+\*\* twists free/.test(saidOf(gS)) && !heldS,
+      `${flat1(saidOf(g1)).slice(0, 160)} · ${held1} ${hpB1}/${hpB0} @${ti1} · ${flat1(saidOf(g20)).slice(0, 200)} · ${held20} ${hpB20} · ${flat1(saidOf(gS)).slice(0, 140)} · ${heldS}`);
+
+    // 3 · a kept hold: the grappler rolls; the captive answers by button; a
+    // failed break pays the round's wound at once, a second costs 1 more, and
+    // the turn's end then costs nothing
+    setL({ ...FRESH, turn_order: [LA, LB], turn_index: 0, grapples: { [LB]: LA } });
+    const hp3 = hpOf(LB);
+    const mP = await press('fact:maintain', LA);
+    const mS = await withDice([10], () => submit(modalOf(mP), LA));
+    const f3a = fightL();
+    const mCard = mS.replies.find(x => /Break free/.test(x.content || ''));
+    const bP = await press('fbreak', LB);
+    const bWrong = await press('fbreak', LW);
+    const bS = await withDice([3], () => submit(modalOf(bP), LB));
+    const hp3a = hpOf(LB), fx3a = fxOf(LB), f3b = fightL();
+    const esc = await withDice([12, 4], () => act(LB, { action: 'escape' }));
+    const hp3b = hpOf(LB), fx3b = fxOf(LB), f3c = fightL();
+    ok('a kept hold: the grappler rolls STR and the captive is pinged with Break free and Stay; a failed break pays the round’s wound at once, a second that round 1 more, and the turn’s end nothing',
+      !!modalOf(mP) && f3a.phase === 'defend' && f3a.atk_kind === 'hold' && f3a.current_target === LB && f3a.atk_roll === 15
+        && idsOf(mCard).includes('fbreak') && idsOf(mCard).includes('fstay') && (mCard?.content || '').includes(`<@${LB}>`)
+        && !!modalOf(bP) && /the answer is theirs/.test(saidOf(bWrong))
+        && /this round's wound now — \*\*1\*\*/.test(saidOf(bS)) && hp3a === hp3 - 1 && fx3a.holdPaid === true && f3b.turn_index === 1 && f3b.phase === 'attack'
+        && /Another failed struggle this round — \*\*1\*\* more wound/.test(saidOf(esc)) && /this round's wound is already paid/.test(saidOf(esc))
+        && hp3b === hp3 - 2 && !fx3b.holdPaid && f3c.turn_index === 0 && heldBy(LB) === LA,
+      `${!!modalOf(mP)} · ${f3a.phase}/${f3a.atk_kind}/${f3a.current_target === LB}/${f3a.atk_roll} · ${idsOf(mCard).join(',')} · ${flat1(saidOf(bWrong)).slice(0, 60)} · ${flat1(saidOf(bS)).slice(0, 240)} · ${hp3a}/${hp3} ${JSON.stringify(fx3a)} @${f3b.turn_index} · ${flat1(saidOf(esc)).slice(0, 300)} · ${hp3b} ${JSON.stringify(fx3b)} @${f3c.turn_index}`);
+
+    // 4 · a round with no attempt costs its wound at the turn's end, a GM's
+    // skip included; breaking out first costs nothing
+    setL({ turn_index: 1, phase: 'attack', current_target: null, atk_kind: null });
+    const hp4 = hpOf(LB);
+    const sk = await fL1({ commandName: 'gm', options: { _group: 'override', _sub: 'skip' }, userId: 'U1' });
+    const hp4a = hpOf(LB), f4 = fightL();
+    setL({ turn_index: 1 });
+    const out4 = await withDice([3, 15], () => act(LB, { action: 'escape' }));
+    const hp4b = hpOf(LB);
+    ok('a held fighter’s turn that passes with no attempt still costs its wound — a GM’s skip included, its lines posted; breaking out first costs nothing',
+      /skipped by the GM/.test(saidOf(sk)) && /still held by \*\*user\d+\*\* — \*\*1\*\* wound/.test(saidOf(sk)) && hp4a === hp4 - 1 && f4.turn_index === 0
+        && /breaks free of/.test(saidOf(out4)) && !heldBy(LB) && hp4b === hp4a && !/wound/.test(saidOf(out4)),
+      `${flat1(saidOf(sk)).slice(0, 220)} · ${hp4a}/${hp4} @${f4.turn_index} · ${flat1(saidOf(out4)).slice(0, 200)} · ${heldBy(LB)} ${hp4b}`);
+
+    // 5 · a hold of 20: staying keeps the flat for their next roll, and the
+    // escape that follows rolls it
+    setL({ ...FRESH, turn_order: [LA, LB], turn_index: 0, grapples: { [LB]: LA } });
+    const m5P = await press('fact:maintain', LA);
+    const m5S = await withDice([20], () => submit(modalOf(m5P), LA));
+    const sP = await press('fstay', LB);
+    const sS = await submit(modalOf(sP), LB);
+    const fx5 = fxOf(LB), f5 = fightL();
+    const e5 = await withDice([5, 9], () => act(LB, { action: 'escape' }));
+    const fx5b = fxOf(LB);
+    ok('a hold of 20: the captive who stays keeps a flat next roll, and the escape on their turn is a flat d20; the hold keeps and the turn passes on Stay',
+      /A natural 20 — if \*\*user\d+\*\* struggles, it is on a flat d20/.test(saidOf(m5S)) && !!modalOf(sP)
+        && /stays in the hold — it keeps, and this round's wound lands at the end of their turn/.test(saidOf(sS)) && /natural 20 stays with them/.test(saidOf(sS))
+        && fx5.fooled === true && f5.turn_index === 1 && f5.phase === 'attack' && heldBy(LB) === LA
+        && /escape, flat d20\): \*\*9\*\*/.test(saidOf(e5)) && !fx5b.fooled,
+      `${flat1(saidOf(m5S)).slice(0, 160)} · ${flat1(saidOf(sS)).slice(0, 200)} · ${JSON.stringify(fx5)} @${f5.turn_index}/${f5.phase} · ${flat1(saidOf(e5)).slice(0, 220)} · ${JSON.stringify(fx5b)}`);
+
+    // 6 · an escape's naturals
+    const escWith = async (dice) => { setL({ ...FRESH, turn_order: [LA, LB], turn_index: 1, grapples: { [LB]: LA } }); return withDice(dice, () => act(LB, { action: 'escape' })); };
+    const eH20 = await escWith([20, 18]);
+    const heldH20 = heldBy(LB);
+    const eB20 = await escWith([10, 20]);
+    const fxA20 = fxOf(LA), heldB20 = heldBy(LB);
+    const hp6 = hpOf(LB);
+    const eB1 = await escWith([10, 1]);
+    const hp6a = hpOf(LB);
+    const eTie = await escWith([5, 6]);   // 10 against 10
+    const heldTie = heldBy(LB), hp6b = hpOf(LB);
+    const eH1 = await escWith([1, 2]);
+    const fxA1 = fxOf(LA), heldH1 = heldBy(LB), f6 = fightL();
+    ok('an escape: a hold of 20 makes it a flat d20; a break of 20 frees them whatever the totals and leaves the grappler’s next attack flat; a break of 1 costs 2 wounds; a tie keeps the hold; a hold of 1 slips at once',
+      /The hold's natural 20 — \*\*user\d+\*\* struggles on a flat d20/.test(saidOf(eH20)) && /escape, flat d20\)/.test(saidOf(eH20)) && heldH20 === LA
+        && /A natural 20 — \*\*user\d+\*\* bursts free of \*\*user\d+\*\*, whose next attack is a flat d20/.test(saidOf(eB20)) && fxA20.flatAtk === true && !heldB20
+        && /The struggle costs \*\*user\d+\*\* \*\*2\*\* wounds/.test(saidOf(eB1)) && hp6a === hp6 - 2
+        && /\(ties go to the grappler\)/.test(saidOf(eTie)) && heldTie === LA
+        && /the grip slips: \*\*user\d+\*\* is free at once, no wound, and \*\*user\d+\*\*'s next roll is a flat d20 at disadvantage/.test(saidOf(eH1))
+        && !/escape[,)]/.test(saidOf(eH1)) && fxA1.fooled === true && fxA1.fooledDis === true && !fxA1.flatAtk && !heldH1 && hpOf(LB) === hp6b && f6.turn_index === 0,
+      `${flat1(saidOf(eH20)).slice(0, 160)} · ${heldH20 === LA} · ${flat1(saidOf(eB20)).slice(0, 160)} · ${JSON.stringify(fxA20)} ${heldB20} · ${flat1(saidOf(eB1)).slice(0, 160)} ${hp6a}/${hp6} · ${flat1(saidOf(eTie)).slice(0, 160)} ${heldTie} · ${flat1(saidOf(eH1)).slice(0, 240)} ${JSON.stringify(fxA1)} ${heldH1} ${hpOf(LB)}/${hp6b} @${f6.turn_index}`);
+
+    // 7 · the turn clock: a captive gone quiet is reminded, then stays
+    await fL1({ commandName: 'session', options: { _sub: 'clock', timeout: 'skip' }, userId: 'U1' });
+    setL({ ...FRESH, turn_order: [LA, LB], turn_index: 0, grapples: { [LB]: LA } });
+    const m7P = await press('fact:maintain', LA);
+    await withDice([10], () => submit(modalOf(m7P), LA));
+    const hp7 = hpOf(LB);
+    quietL(6); let n0 = sent.length; await tickAll();
+    const rem7 = textOf(newIn('CL1', n0));
+    quietL(16); n0 = sent.length; await tickAll();
+    const stay7 = textOf(newIn('CL1', n0)), f7 = fightL();
+    ok('the turn clock: a captive gone quiet on a kept hold is reminded what it waits for, then stays in it — the hold keeps, no wound yet, the turn moves on',
+      /has a kept hold to answer — break free or stay/.test(rem7) && /they stay in the hold/.test(rem7)
+        && /minutes quiet — \*\*user\d+\*\* stays in the hold/.test(stay7) && /stays in the hold — it keeps/.test(stay7)
+        && f7.turn_index === 1 && f7.phase === 'attack' && hpOf(LB) === hp7 && heldBy(LB) === LA,
+      `${flat1(rem7).slice(0, 220)} · ${flat1(stay7).slice(0, 260)} · @${f7.turn_index}/${f7.phase} · ${hpOf(LB)}/${hp7}`);
+
+    // 8 · an NPC captive on auto struggles by itself, and the chain goes on
+    const chL2 = new FakeChannel('CL2', 0, 'l-auto', guild); channelsById.set(chL2.id, chL2);
+    await fire({ channel: chL2, commandName: 'fight', options: { _sub: 'start', players: `<@${LA}>`, npcs: 'Lbrute', manual: true }, userId: 'U1' });
+    setL({ ...FRESH, turn_order: [LA, 'npc:Lbrute'], turn_index: 0, grapples: { 'npc:Lbrute': LA }, auto_npc: 1 }, 'CL2');
+    const realTOL = globalThis.setTimeout;
+    globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
+    n0 = sent.length;
+    const m8P = await press('fact:maintain', LA, chL2);
+    const m8S = await withDice([5, 20], async () => { const r = await submit(modalOf(m8P), LA, chL2); for (let i = 0; i < 8; i++) await settle(); return r; });
+    globalThis.setTimeout = realTOL;
+    const auto8 = textOf(newIn('CL2', n0)), f8 = fightL('CL2');
+    ok('an NPC captive on auto struggles by itself — a 20 bursts free and leaves the grappler’s next attack flat — and the chain goes on to its own swing',
+      /struggles against it/.test(saidOf(m8S)) && /Break free\*\* — Lbrute/.test(auto8) && /bursts free of \*\*user\d+\*\*, whose next attack is a flat d20/.test(auto8)
+        && !heldBy('npc:Lbrute', 'CL2') && fxOf(LA, 'CL2').flatAtk === true && f8.phase === 'defend' && f8.current_target === LA,
+      `${flat1(saidOf(m8S)).slice(0, 160)} · ${flat1(auto8).slice(0, 400)} · ${heldBy('npc:Lbrute', 'CL2')} ${JSON.stringify(fxOf(LA, 'CL2'))} · ${f8.phase}/${f8.current_target === LA}`);
+
+    // 9 · the feint's naturals, and the price
+    const feintWith = async (fNat, iNat) => {
+      dbHandle.prepare("UPDATE characters SET deception_spent=0 WHERE guild_id='G1' AND user_id=?").run(LA);
+      setL({ ...FRESH, turn_order: [LA, LB], turn_index: 0 });
+      await withDice([fNat], () => act(LA, { action: 'feint', target: LB, feint: 'a lunge high' }));
+      return withDice([iNat], () => act(LB, { action: 'insight' }));
+    };
+    const hp9 = hpOf(LB);
+    const f20 = await feintWith(20, 19);
+    const hp9a = hpOf(LB), fxB9 = fxOf(LB), fxA9 = fxOf(LA);
+    const f1 = await feintWith(1, 10);
+    const fxA9b = fxOf(LA), fxB9b = fxOf(LB), hp9b = hpOf(LB);
+    setL({ phase: 'attack', current_target: null, atk_kind: null, turn_index: 0 });
+    const bite = await withDice([15, 4], () => fL1({ commandName: 'fight', options: { _sub: 'atk', stat: 'str', target: LB, flavour: 'swing' }, userId: LA, ...asL(LA) }));
+    const f9 = fightL(), fxA9c = fxOf(LA);
+    const i20 = await feintWith(15, 20);
+    const hp9c = hpOf(LB);
+    const i1 = await feintWith(2, 1);
+    const hp9d = hpOf(LB), fxB9d = fxOf(LB);
+    ok('a feint of 20 fools them whatever the insight and lands for 2; a feint of 1 is a total failure; the feinter pays a flat next roll either way — at disadvantage after a 1, and it bites; an insight of 20 sees through, of 1 is fooled',
+      /fooled whatever they read/.test(saidOf(f20)) && hp9a === hp9 - 2 && fxB9.fooled === true && fxA9.fooled === true && !fxA9.flatDef
+        && /The price: \*\*user\d+\*\*'s next roll is a flat d20\._/.test(saidOf(f20))
+        && /botches the feint — a natural 1, a total failure/.test(saidOf(f1)) && fxA9b.fooled === true && fxA9b.fooledDis === true && !fxB9b.fooled && hp9b === hp9a
+        && /flat d20, at disadvantage\._/.test(saidOf(f1))
+        && f9.atk_roll === 4 && /🎭 flat d20 \(disadvantage\)/.test(saidOf(bite)) && !fxA9c.fooled && !fxA9c.fooledDis
+        && /A natural 20 — \*\*user\d+\*\* sees straight through it/.test(saidOf(i20)) && hp9c === hp9b
+        && /A natural 1 on the insight — \*\*user\d+\*\* is completely fooled/.test(saidOf(i1)) && hp9d === hp9c - 2 && fxB9d.fooled === true,
+      `${flat1(saidOf(f20)).slice(0, 200)} · ${hp9a}/${hp9} ${JSON.stringify(fxB9)} ${JSON.stringify(fxA9)} · ${flat1(saidOf(f1)).slice(0, 160)} · ${JSON.stringify(fxA9b)} ${JSON.stringify(fxB9b)} ${hp9b} · ${f9.atk_roll} ${flat1(saidOf(bite)).slice(0, 160)} ${JSON.stringify(fxA9c)} · ${flat1(saidOf(i20)).slice(0, 140)} ${hp9c} · ${flat1(saidOf(i1)).slice(0, 160)} ${hp9d} ${JSON.stringify(fxB9d)}`);
+
+    // 10 · a defensive feint
+    const chL3 = new FakeChannel('CL3', 0, 'l-pve', guild); channelsById.set(chL3.id, chL3);
+    const f3 = (over) => fire({ channel: chL3, ...over });
+    await f3({ commandName: 'fight', options: { _sub: 'start', players: `<@${LA}>`, npcs: 'Lhound, Lcrow', manual: true }, userId: 'U1' });
+    const npcSwing = (nat) => { setL({ ...FRESH, turn_order: ['npc:Lhound', LA, 'npc:Lcrow'], turn_index: 0 }, 'CL3'); return withDice([nat], () => f3({ commandName: 'fight', options: { _sub: 'atk', npc: 'Lhound', stat: 'str', target: LA, flavour: 'claws' }, userId: 'U1' })); };
+    const dfeint = async (aNat, dNat) => {
+      dbHandle.prepare("UPDATE characters SET deception_spent=0 WHERE guild_id='G1' AND user_id=?").run(LA);
+      await npcSwing(aNat);
+      await withDice([dNat], () => f3({ commandName: 'fight', options: { _sub: 'act', action: 'feint', feint: 'a stumble' }, userId: LA, ...asL(LA) }));
+      return f3({ commandName: 'fight', options: { _sub: 'resolve' }, userId: 'U1' });
+    };
+    const d10 = await dfeint(5, 15);
+    const fxH10 = fxOf('npc:Lhound', 'CL3'), fxA10 = fxOf(LA, 'CL3');
+    const d1 = await dfeint(18, 1);
+    const fxH10b = fxOf('npc:Lhound', 'CL3'), fxA10b = fxOf(LA, 'CL3');
+    ok('a defensive feint read right: the attacker is taken in, their next roll flat, and the feinter pays a flat next roll of their own; a natural 1 fails outright, the price at disadvantage',
+      /is taken in — their next roll is a flat d20/.test(saidOf(d10)) && fxH10.fooled === true && fxA10.fooled === true && !fxA10.flatDef && !fxH10.flatAtk
+        && /The price: \*\*user\d+\*\*'s next roll is a flat d20\._/.test(saidOf(d10))
+        && /the read fails outright/.test(saidOf(d1)) && !fxH10b.fooled && fxA10b.fooled === true && fxA10b.fooledDis === true,
+      `${flat1(saidOf(d10)).slice(0, 260)} · ${JSON.stringify(fxH10)} ${JSON.stringify(fxA10)} · ${flat1(saidOf(d1)).slice(0, 200)} · ${JSON.stringify(fxH10b)} ${JSON.stringify(fxA10b)}`);
+
+    // 10b · a defensive feint of 1 is a total failure: the blow lands though
+    // the totals say it misses — an attack of 1 still fumbles
+    const crowSwing = (nat) => { setL({ ...FRESH, turn_order: ['npc:Lcrow', LA, 'npc:Lhound'], turn_index: 0 }, 'CL3'); return withDice([nat], () => f3({ commandName: 'fight', options: { _sub: 'atk', npc: 'Lcrow', stat: 'str', target: LA, flavour: 'pecks' }, userId: 'U1' })); };
+    const dfeintC = async (aNat, dNat) => {
+      dbHandle.prepare("UPDATE characters SET deception_spent=0 WHERE guild_id='G1' AND user_id=?").run(LA);
+      await crowSwing(aNat);
+      await withDice([dNat], () => f3({ commandName: 'fight', options: { _sub: 'act', action: 'feint', feint: 'a stumble' }, userId: LA, ...asL(LA) }));
+      return f3({ commandName: 'fight', options: { _sub: 'resolve' }, userId: 'U1' });
+    };
+    const hpA10 = hpOf(LA, 'CL3');
+    const dB = await dfeintC(3, 1);   // 4 against 6: the totals say it misses
+    const hpA10b = hpOf(LA, 'CL3'), fxA10c = fxOf(LA, 'CL3');
+    const dF = await dfeintC(1, 1);
+    const hpA10c = hpOf(LA, 'CL3');
+    ok('a defensive feint of 1 is a total failure: the blow lands whatever the totals, the defending 1 adding its own; an attack of 1 still fumbles',
+      /the read fails outright and the blow lands, whatever the totals/.test(saidOf(dB)) && /hits \*\*user\d+\*\* for \*\*2\*\* damage/.test(saidOf(dB))
+        && hpA10b === hpA10 - 2 && fxA10c.fooled === true && fxA10c.fooledDis === true
+        && /fumbles the attack/.test(saidOf(dF)) && /the read fails outright;/.test(saidOf(dF)) && !/the blow lands/.test(saidOf(dF)) && hpA10c === hpA10b,
+      `${flat1(saidOf(dB)).slice(0, 320)} · ${hpA10b}/${hpA10} ${JSON.stringify(fxA10c)} · ${flat1(saidOf(dF)).slice(0, 240)} · ${hpA10c}`);
+
+    // 11 · deflect and disarm: their naturals
+    const deflectWith = async (aNat, dNat) => { await npcSwing(aNat); return withDice([dNat], () => f3({ commandName: 'fight', options: { _sub: 'act', action: 'deflect', redirect_npc: 'Lcrow' }, userId: LA, ...asL(LA) })); };
+    const hpC0 = hpOf('npc:Lcrow', 'CL3');
+    const dfl20 = await deflectWith(15, 20);
+    const hpC1 = hpOf('npc:Lcrow', 'CL3');
+    const hpA0 = hpOf(LA, 'CL3');
+    const dfl1 = await deflectWith(3, 1);
+    const hpA1 = hpOf(LA, 'CL3'), fxA11 = fxOf(LA, 'CL3');
+    const disarmWith = async (aNat, dNat) => { await npcSwing(aNat); return withDice([dNat], () => f3({ commandName: 'fight', options: { _sub: 'act', action: 'disarm' }, userId: LA, ...asL(LA) })); };
+    const hpH0 = hpOf('npc:Lhound', 'CL3');
+    const dis20 = await disarmWith(15, 20);
+    const hpH1 = hpOf('npc:Lhound', 'CL3'), fxH11 = fxOf('npc:Lhound', 'CL3'), fxA11b = fxOf(LA, 'CL3');
+    setL({ phase: 'attack', current_target: null, atk_kind: null, turn_index: 0 }, 'CL3');
+    let nSw = sent.length;
+    await withDice([12], () => f3({ commandName: 'fight', options: { _sub: 'atk', npc: 'Lhound', stat: 'str', target: LA, flavour: 'snaps' }, userId: 'U1' }));
+    const swingFlat = textOf(newIn('CL3', nSw));
+    const f11 = fightL('CL3');
+    const hpA2 = hpOf(LA, 'CL3');
+    const dis1 = await disarmWith(2, 1);
+    const hpA3 = hpOf(LA, 'CL3'), fxA11c = fxOf(LA, 'CL3');
+    ok('deflect: a 20 turns the blow whatever the totals and the named enemy takes 2; a 1 fails for 2, the next defence flat as well as the next attack. Disarm: a 20 wounds the attacker 1 and leaves their next swing flat, no fetching turn; a 1 fails for 1, the next attack flat as well as the next defence',
+      /the shield turns it whatever the totals/.test(saidOf(dfl20)) && /into \*\*Lcrow 🎭\*\* for \*\*2\*\* damage/.test(saidOf(dfl20)) && hpC1 === hpC0 - 2
+        && /the deflection fails outright/.test(saidOf(dfl1)) && /takes \*\*2\*\* damage/.test(saidOf(dfl1)) && hpA1 === hpA0 - 2 && fxA11.flatDef === true && fxA11.flatAtk === true
+        && /next attack and next defence are flat d20s/.test(saidOf(dfl1))
+        && /blade is torn from \*\*Lhound 🎭\*\*'s grip and turned on them/.test(saidOf(dis20)) && hpH1 === hpH0 - 1 && fxH11.flatAtk === true && !fxH11.disarmed && fxA11b.flatDef === true
+        && f11.atk_roll === 12 && /off-balance/.test(swingFlat)
+        && /the disarm fails outright/.test(saidOf(dis1)) && hpA3 === hpA2 - 1 && fxA11c.flatAtk === true && fxA11c.flatDef === true,
+      `${flat1(saidOf(dfl20)).slice(0, 200)} ${hpC1}/${hpC0} · ${flat1(saidOf(dfl1)).slice(0, 200)} ${hpA1}/${hpA0} ${JSON.stringify(fxA11)} · ${flat1(saidOf(dis20)).slice(0, 200)} ${hpH1}/${hpH0} ${JSON.stringify(fxH11)} ${JSON.stringify(fxA11b)} · ${f11.atk_roll} ${flat1(swingFlat).slice(0, 160)} · ${flat1(saidOf(dis1)).slice(0, 200)} ${hpA3}/${hpA2} ${JSON.stringify(fxA11c)}`);
+
+    // 12 · /deception: the naturals; the price on the deceiver's sheet; /roll
+    // honours a flat mark now, and the rider rolls at disadvantage
+    const chL4 = new FakeChannel('CL4', 0, 'l-talk', guild); channelsById.set(chL4.id, chL4);
+    const fT = (over) => fire({ channel: chL4, ...over });
+    const markOf = (id) => dbHandle.prepare("SELECT next_mark FROM characters WHERE guild_id='G1' AND user_id=?").get(id)?.next_mark ?? null;
+    dbHandle.prepare("UPDATE characters SET deception_spent=0, next_mark=NULL WHERE guild_id='G1' AND user_id IN (?, ?)").run(LA, LB);
+    const dc20 = await withDice([20, 20], () => fT({ commandName: 'deception', options: { target: LB, claim: 'the bridge is safe' }, userId: LA, ...asL(LA) }));
+    const mA = markOf(LA), mB = markOf(LB);
+    const rB = await withDice([7], () => fT({ commandName: 'roll', options: { stat: 'str' }, userId: LB, ...asL(LB) }));
+    const mB2 = markOf(LB);
+    const rA1 = await fT({ commandName: 'roll', options: { stat: 'str' }, userId: LA, ...asL(LA) });
+    const again = await withDice([10, 10], () => fT({ commandName: 'deception', options: { target: LB, claim: 'again' }, userId: LA, ...asL(LA) }));
+    const spentStill = await fT({ commandName: 'deception', options: { target: LB, claim: 'and again' }, userId: LA, ...asL(LA) });
+    await fT({ commandName: 'roll', options: { stat: 'str' }, userId: LA, ...asL(LA) });
+    const dc1 = await withDice([1, 10], () => fT({ commandName: 'deception', options: { target: LB, claim: 'I am the king' }, userId: LA, ...asL(LA) }));
+    const mA3 = markOf(LA), mB3 = markOf(LB);
+    const rA = await withDice([15, 4], () => fT({ commandName: 'roll', options: { stat: 'str' }, userId: LA, ...asL(LA) }));
+    const mA4 = markOf(LA);
+    ok('/deception: twenty meets twenty and the lie wins; both sides’ next rolls are flat — the target’s for being taken in, the deceiver’s the price — and /roll strips the stat for it; the flat roll re-arms the trick, a second lie with no roll between is refused; a lie of 1 falls apart, the price a flat d20 at disadvantage',
+      /Twenty meets twenty!\*\* The lie wins/.test(saidOf(dc20)) && mB === 'flat' && mA === 'flat' && /The price: \*\*user\d+\*\*'s very next roll is a flat d20\._/.test(saidOf(dc20))
+        && /flat d20/.test(allOf(rB)) && /\[7\]/.test(allOf(rB)) && !/\+ ?4/.test(allOf(rB).replace(/\[[^\]]*\]/g, '')) && mB2 === null
+        && /flat d20/.test(allOf(rA1)) && !/trick is spent/.test(saidOf(again)) && /sees straight through it/.test(saidOf(again)) && /trick is spent/.test(saidOf(spentStill))
+        && /the lie falls apart, a total failure/.test(saidOf(dc1)) && mA3 === 'flatdis' && mB3 === null && /flat d20, at disadvantage\._/.test(saidOf(dc1))
+        && /flat d20/.test(allOf(rA)) && /\[4, ~~15~~\]|\[15, 4\]|~~15~~/.test(allOf(rA)) && mA4 === null,
+      `${flat1(saidOf(dc20)).slice(0, 220)} · ${mA}/${mB} · ${allOf(rB).slice(0, 200)} · ${mB2} · ${allOf(rA1).slice(0, 120)} · ${flat1(saidOf(again)).slice(0, 120)} · ${flat1(saidOf(spentStill)).slice(0, 60)} · ${flat1(saidOf(dc1)).slice(0, 200)} · ${mA3}/${mB3} · ${allOf(rA).slice(0, 240)} · ${mA4}`);
+
+    // 13 · an NPC's feint writes no sheet; a stray written before goes, page
+    // and all, when the server is mended
+    dbHandle.prepare("UPDATE npcs SET wis=5 WHERE guild_id='G1' AND name='Lhound'").run();
+    setL({ ...FRESH, turn_order: ['npc:Lhound', LA, 'npc:Lcrow'], turn_index: 0 }, 'CL3');
+    const nf = await withDice([10], () => f3({ commandName: 'fight', options: { _sub: 'act', action: 'feint', npc: 'Lhound', target: LA, feint: 'a feigned retreat' }, userId: 'U1' }));
+    const strayNow = dbHandle.prepare("SELECT COUNT(*) n FROM characters WHERE guild_id='G1' AND user_id LIKE 'npc:%'").get().n;
+    const npcFeinted = fightL('CL3').atk_kind === 'feint';
+    dbHandle.prepare("INSERT OR REPLACE INTO characters (guild_id, user_id, str, con, dex, wis, lck, hp_current) VALUES ('G1', 'npc:Ghost', 1, 1, 1, 1, 1, 3)").run();
+    dbHandle.prepare("INSERT OR REPLACE INTO char_pages (guild_id, user_id, thread_id, url, title, at) VALUES ('G1', 'npc:Ghost', '999000111', NULL, 'Unknown', ?)").run(Date.now());
+    await fire({ commandName: 'gm', options: { _group: 'check', _sub: 'run' }, userId: 'U1' }).catch(() => ({ replies: [] }));
+    await settle();
+    const strayAfter = dbHandle.prepare("SELECT COUNT(*) n FROM characters WHERE guild_id='G1' AND user_id LIKE 'npc:%'").get().n;
+    const pageAfter = dbHandle.prepare("SELECT COUNT(*) n FROM char_pages WHERE guild_id='G1' AND user_id LIKE 'npc:%'").get().n;
+    ok('an NPC’s feint writes no player sheet (the trick’s spend read npc_ for npc:); a stray from before is cleared with its page when the server is mended',
+      npcFeinted && strayNow === 0 && strayAfter === 0 && pageAfter === 0,
+      `${flat1(saidOf(nf)).slice(0, 100)} · feint ${npcFeinted} · strays ${strayNow} → ${strayAfter} · pages ${pageAfter}`);
+
+    // 14 · a turn the clock skips still ends: the held fighter's wound lands
+    setL({ ...FRESH, turn_order: [LA, LB], turn_index: 1, grapples: { [LB]: LA } });
+    const hp14 = hpOf(LB);
+    quietL(16); n0 = sent.length; await tickAll();
+    const skip14 = textOf(newIn('CL1', n0));
+    ok('a held fighter’s turn the clock skips still ends with its wound',
+      /turn is skipped/.test(skip14) && /still held by \*\*user\d+\*\* — \*\*1\*\* wound/.test(skip14) && hpOf(LB) === hp14 - 1 && fightL().turn_index === 0,
+      `${flat1(skip14).slice(0, 260)} · ${hpOf(LB)}/${hp14} @${fightL().turn_index}`);
+
+    // 15 · a kept hold of 1 slips as it is rolled: free, no wound, nothing
+    // to answer, the holder flat at disadvantage, the turn gone on
+    setL({ ...FRESH, turn_order: [LA, LB], turn_index: 0, grapples: { [LB]: LA } });
+    const hp15 = hpOf(LB);
+    const m15P = await press('fact:maintain', LA);
+    const m15S = await withDice([1], () => submit(modalOf(m15P), LA));
+    const f15 = fightL(), fxA15 = fxOf(LA);
+    const card15 = (m15S.replies || []).find(x => /grip slips/.test(x.content || ''));
+    ok('a kept hold of 1 slips at once: the captive is free with no wound and nothing to answer; the holder’s next roll is flat at disadvantage; the turn moves on',
+      /the grip slips: \*\*user\d+\*\* is free at once, no wound, and \*\*user\d+\*\*'s next roll is a flat d20 at disadvantage/.test(saidOf(m15S))
+        && !heldBy(LB) && hpOf(LB) === hp15 && fxA15.fooled === true && fxA15.fooledDis === true
+        && f15.phase === 'attack' && f15.turn_index === 1 && !f15.atk_kind && !idsOf(card15).includes('fbreak'),
+      `${flat1(saidOf(m15S)).slice(0, 300)} · ${heldBy(LB)} ${hpOf(LB)}/${hp15} ${JSON.stringify(fxA15)} · ${f15.phase}/${f15.turn_index}/${f15.atk_kind} · ${idsOf(card15).join(',')}`);
+
+    // 16 · a reroll names its roll: a hold rerolled into a 1 slips at once;
+    // a grab waits on the save; an attack waits on the defence
+    dbHandle.prepare("UPDATE characters SET rerolls_current=5 WHERE guild_id='G1' AND user_id=?").run(LA);
+    setL({ ...FRESH, turn_order: [LA, LB], turn_index: 0, grapples: { [LB]: LA } });
+    const m16P = await press('fact:maintain', LA);
+    await withDice([10], () => submit(modalOf(m16P), LA));
+    const rrH = await withDice([1], () => fL1({ commandName: 'fight', options: { _sub: 'rr' }, userId: LA, ...asL(LA) }));
+    const f16 = fightL(), fxA16 = fxOf(LA);
+    setL({ ...FRESH, turn_order: [LA, LB], turn_index: 0 });
+    await withDice([8], () => act(LA, { action: 'grapple', target: LB, flavour: 'grab' }));
+    const rrG = await withDice([9], () => fL1({ commandName: 'fight', options: { _sub: 'rr' }, userId: LA, ...asL(LA) }));
+    const f16g = fightL();
+    setL({ ...FRESH, turn_order: [LA, LB], turn_index: 0 });
+    await withDice([8], () => fL1({ commandName: 'fight', options: { _sub: 'atk', stat: 'str', target: LB, flavour: 'swing' }, userId: LA, ...asL(LA) }));
+    const rrA = await withDice([9], () => fL1({ commandName: 'fight', options: { _sub: 'rr' }, userId: LA, ...asL(LA) }));
+    ok('a reroll names its roll: a hold rerolled into a 1 slips at once; a grab waits on the STR save and an attack on the defence — neither on /fight resolve',
+      /rerolls \*\(reroll\)\* — the hold with STR!/.test(saidOf(rrH)) && /the grip slips/.test(saidOf(rrH)) && !heldBy(LB)
+        && fxA16.fooled === true && fxA16.fooledDis === true && f16.turn_index === 1 && f16.phase === 'attack'
+        && /rerolls \*\(reroll\)\* — the grapple with STR!/.test(saidOf(rrG)) && /answers with the STR save/.test(saidOf(rrG)) && !/fight resolve/.test(saidOf(rrG))
+        && f16g.atk_kind === 'grapple' && f16g.atk_nat === 9
+        && /rerolls \*\(reroll\)\* — attack with STR!/.test(saidOf(rrA)) && /Waiting on \*\*user\d+\*\*'s defence/.test(saidOf(rrA)) && !/fight resolve/.test(saidOf(rrA)),
+      `${flat1(saidOf(rrH)).slice(0, 300)} · ${heldBy(LB)} ${JSON.stringify(fxA16)} @${f16.turn_index}/${f16.phase} · ${flat1(saidOf(rrG)).slice(0, 200)} · ${f16g.atk_kind}/${f16g.atk_nat} · ${flat1(saidOf(rrA)).slice(0, 200)}`);
+
+    // 17 · in a fight the trick is a feint: /deception is refused to anyone
+    // fighting in the channel, before anything is spent; a feint pressed
+    // against a kept hold is refused before the trick is spent
+    dbHandle.prepare("UPDATE characters SET deception_spent=0, next_mark=NULL WHERE guild_id='G1' AND user_id IN (?, ?)").run(LA, LB);
+    setL({ ...FRESH, turn_order: [LA, LB], turn_index: 0 });
+    const dIn = await fL1({ commandName: 'deception', options: { target: LB, claim: 'look behind you' }, userId: LA, ...asL(LA) });
+    const dInT = await fL1({ commandName: 'deception', options: { target: LA, claim: 'he started it' }, userId: LW, ...asL(LW) });
+    const spentAfter = dbHandle.prepare("SELECT deception_spent d, next_mark m FROM characters WHERE guild_id='G1' AND user_id=?").get(LA);
+    setL({ ...FRESH, turn_order: [LA, LB], turn_index: 0, grapples: { [LB]: LA } });
+    const m17P = await press('fact:maintain', LA);
+    await withDice([10], () => submit(modalOf(m17P), LA));
+    const fv = await act(LB, { action: 'feint', feint: 'a sly look' });
+    const lbAfter = dbHandle.prepare("SELECT deception_spent d FROM characters WHERE guild_id='G1' AND user_id=?").get(LB);
+    const fxB17 = fxOf(LB), f17 = fightL();
+    ok('/deception is refused to anyone fighting in the channel, pointing to Feint, with nothing spent; a feint against a kept hold is refused before the trick is spent',
+      /In a fight, a trick is a feint/.test(saidOf(dIn)) && /In a fight, a trick is a feint/.test(saidOf(dInT)) && !spentAfter.d && !spentAfter.m
+        && /That is a kept hold/.test(saidOf(fv)) && !lbAfter.d && !fxB17.feintDef && !fxB17.feintUsed && f17.atk_kind === 'hold' && f17.phase === 'defend',
+      `${flat1(saidOf(dIn)).slice(0, 120)} · ${flat1(saidOf(dInT)).slice(0, 80)} · ${JSON.stringify(spentAfter)} · ${flat1(saidOf(fv)).slice(0, 120)} · ${JSON.stringify(lbAfter)} ${JSON.stringify(fxB17)} · ${f17.atk_kind}/${f17.phase}`);
+
+    // 18 · no pending grapple, feint or hold outlives its exchange: a kick, a
+    // fight's end
+    setL({ ...FRESH, turn_order: [LA, LB, LW], turn_index: 0, phase: 'defend', current_target: LW, atk_kind: 'feint', atk_roll: 9, atk_nat: 9, atk_stat: 'wis', atk_rerolled: 1 });
+    await fL1({ commandName: 'fight', options: { _sub: 'kick', target: LW }, userId: 'U1' });
+    const f18 = fightL();
+    setL({ phase: 'defend', current_target: LA, atk_kind: 'grapple', atk_roll: 12, atk_nat: 12, def_rerolled: 1 }, 'CL2');
+    const end18 = await fire({ channel: chL2, commandName: 'fight', options: { _sub: 'end' }, userId: 'U1' });
+    const end18Btn = idsOf(end18.replies[0]).find(id => /^confirm:/.test(id));
+    if (end18Btn) await fire({ channel: chL2, isButton: true, customId: end18Btn, message: { id: nextId(), content: '', components: [] }, userId: 'U1' });
+    const f18e = fightL('CL2');
+    ok('a kick and a fight’s end clear the pending exchange: no grapple, feint or hold, no reroll spent, left for the next',
+      f18.atk_kind === null && f18.phase === 'attack' && !f18.atk_rerolled && f18.current_target === null
+        && f18e.state === 'idle' && f18e.atk_kind === null && f18e.phase === 'attack' && !f18e.def_rerolled && f18e.atk_roll === null,
+      `${f18.atk_kind}/${f18.phase}/${f18.atk_rerolled}/${f18.current_target} · ${f18e.state}/${f18e.atk_kind}/${f18e.phase}/${f18e.def_rerolled}/${f18e.atk_roll}`);
+
+    for (const c of ['CL1', 'CL2', 'CL3']) await fire({ channel: channelsById.get(c), commandName: 'fight', options: { _sub: 'end' }, userId: 'U1' }).catch(() => {});
+    guild.members.fetch = realFetchL;
+    const threwL = loggedL.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
+    console.error = realErrL;
+    ok('nothing in the L walk threw', threwL.length === 0, threwL.slice(0, 3).join('\n        '));
   }
 
   // ── No button, modal or select id throws on a junk payload ──────────

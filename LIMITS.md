@@ -31,11 +31,13 @@ New verbs join their group; the wall is history until a single group nears 25.
 | Modal title / input label | 45 chars | edit title sliced |
 | Modal placeholder | 100 chars | |
 | showModal rules | must be the FIRST response; cannot defer-then-show; cannot show from a modal submit | activity + quest modals comply |
-| Modal label components (discord.js 14.22+) | 5 per modal; a label wraps one text input or select; old action-row modals still accepted | only the `/npc say` box uses the label style (3: action, speech, a user picker); `package.json` floor `^14.27.0` for it |
+| Modal label components (discord.js 14.22+) | 5 per modal; a label wraps one text input or select; old action-row modals still accepted | two boxes use the label style, both able to reach **5/5**: `/npc say` (action, speech, To picker of 25, Groups when there are any, Interaction when there are activities) and `/rp` (action, speech, Roll, Dice, and a GM's To picker); `package.json` floor `^14.27.0`, `engines` node >=20 |
 | **customId** | **100 chars** | activity ids carry the run key beside the presser (`storyrr:<uid>:<rk>:<scene>:<stat>:<next>:<n>`), so a scene name over ~20 characters risks the ceiling; the shelf and NPC buttons use ten-hex keys instead of names |
 | **customId (gm dc)** | **100 chars** | **BREACHED by `/gm dc`:** `dcroll:` carries twelve fields including two free-text options, so a long `on_fail`/`on_success` overflows and the reply throws — and a colon inside either shifts every field in the `split(':')`. See HANDOFF.md §7.1. Elsewhere fine: `questcreate:m:p:h:style` well under, values never contain `:` (styleParts.join defends) |
 | Autocomplete | ≤25 suggestions · 3 s · name ≤100 · string value ≤100 | quest-number branch slices 25; suggestion source query LIMIT 100 |
-| Select menu options | 25 | the shelf's Edit-scene pick lists the first 25 scenes; `/activity edit scene:` reaches the rest |
+| Select menu options | 25 | the shelf's Edit-scene pick lists the first 25 scenes; `/activity edit scene:` reaches the rest; the NPC box's Groups list shows the first 25 orders and associations with someone living (orders first); its To picker and the GM's /rp picker take 25 people |
+| Mentions per message | 100 users in `allowedMentions` | `ADDRESS_CAP` 50 on one NPC or GM /rp line, the rest named back to the GM as not pinged |
+| Story scroll | 150 events, 12000 characters | a recorded run's table talk shares them with every other beat — a long recorded session is cut at the cap; the GM record only counts talk |
 | Forum tags | 20 | the activity shelf asks for nine and only adds what fits; NPC pages the categories |
 
 ## 3 · Messages, embeds, components
@@ -77,6 +79,8 @@ New verbs join their group; the wall is history until a single group nears 25.
 | channel.edit family | similar tight buckets | tag syncs are setAppliedTags (same family) — batched, low frequency |
 | Guild command registration | 200 create actions/day/guild | one PUT per restart = one action; many restarts/day still fine |
 | messages.delete/send in book moves | normal buckets | delete-and-repost per stage change is 2 calls — fine |
+| Initiative turns (2026-11-07) | normal buckets | one send per turn, one edit of the order card, a button strip on the card before; a reminder once a turn — far inside the buckets |
+| GM run archive header | normal buckets | edited at run start, pause, resume, finish and hourly; the thread name is set only when it changes (see thread.setName) |
 
 ## 7 · Data & files
 
@@ -105,13 +109,29 @@ New verbs join their group; the wall is history until a single group nears 25.
 1. **`/gm dc` customId — over 100 chars for long free text.** The one live
    breach. HANDOFF.md §7.1 has the fix and the trade.
 2. **Quest modals — 5/5 rows.** Text fields are full; anything new rides options or customId.
+   The `/npc say` box and a GM's `/rp` box can reach 5/5 labels too (2026-11-06).
 3. **Applied forum tags — 5/thread** with GM hand-tags competing.
 4. **`/npc` 24/25 and `/quest` 23/25 leaves.** The next subcommand on either
    must join a group. config and gm are already folded.
 
 ## Sharp edges to remember
 - A `customId` built from user text must budget the 100-char ceiling *and* exclude `:`.
+- A message's buttons are kept by an edit only because the edit sends content alone; `/edit` relies on it for lines carrying Reply, GM or Interaction.
 - Modal edit **truncates** any text field longer than 4000 that was authored inline.
 - Thread renames are near-once-per-10-min; never automate them.
 - Forum pin behaviour across six books needs one live verification.
 - NPC names containing "discord" would break their webhook voice.
+- Typing holds a turn only through the `GuildMessageTyping` intent (not privileged). A modal sends no typing: the press that opened a fight form holds the turn, and fifteen minutes inside an open form the clock acts.
+- The turn clock acts on the minute tick, so a turn passes up to a minute after its mark; after an outage every quiet turn is acted on at the first tick, one step each.
+- On a 5e server grapple, feint, deflect and disarm still roll the Knightfall way (STR, WIS, an opposed d20).
+- `characters` has no name column: a 5e export carries the name, an import ignores it.
+- `/rp roll:` answers a called check only on a plain ability; a skill or a saving-throw card is answered by its own button.
+- The 🎭 GM answer box has no Interaction pick: the NPC's default activity button rides under the answer.
+- A held roll is run again from what was asked, not from the moment: a typed `rra` rerolls whatever roll is last by the time it is allowed, and a denied fight command answers in the channel (what would have been the player's alone is said aloud to them).
+- `/roll action:` ignores `mode:` (the fight bridge reads `roll:`), so it is never held — and never rolls with advantage either.
+- An allowed Roll that opens a form stays live until the form comes back or the ten minutes run out; a form opened in time still rolls with advantage after the button has gone.
+- Keeping a hold by roll is a player's: an NPC holder has no Maintain, and the auto-pilot may still swing at its own captive. A held NPC on auto never tries Escape on its own turn (it swings flat); it struggles when a player keeps the hold.
+- A trick's price in a fight is the fight's flag: it waits for the fighter's next fight roll, and goes with the fight if it ends first. Outside a fight it shares the sheet's one mark with a GM's 🔼 or 🔽: whichever is set later stands.
+- The Break free and Stay buttons stay on the hold card after the answer; a late press is told no hold is waiting. A reroll of the hold's roll changes the total to beat; a 20 is read at the answer, and a 1 slips the hold at once.
+- In a fight a trick re-arms on your own turn's action (an attack, a grab, Maintain, Escape), flat or not; a defence roll does not, flat or not.
+- A 5e skill check or saving throw does not strip the stat for a flat mark (a 5e sheet only gets one from a GM's check outcome).

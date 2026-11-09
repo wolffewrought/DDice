@@ -1672,15 +1672,20 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false, a
     // was given — so "str atk" silently lost the Hero's advantage. parsed.stat
     // is the stat actually rolled, whichever spelling was typed.
     if (parsed?.stat) {
-      // A deception landed on them: this roll is a straight d20.
-      if (consumeFlatMark(gid, uid)) {
+      // A flat mark \u2014 a deception that landed, or the price of one: this
+      // roll is a straight d20, at disadvantage after a botched trick.
+      const flatMk = consumeFlatMark(gid, uid);
+      if (flatMk) {
         parsed.notation = '1d20';
-        parsed.label = parsed.label ? `${parsed.label} · 🎭 fooled` : '🎭 fooled';
+        parsed.label = parsed.label ? `${parsed.label} · 🎭 flat d20` : '🎭 flat d20';
+        if (flatMk === 'dis') mode = 'dis';
       } else {
         mode = applySignatureMode(ch, parsed.stat, mode);
         statRolled = parsed.stat;
-        noteHonestRoll(gid, uid);   // an ordinary stat roll re-arms deception
       }
+      // An ordinary stat roll re-arms deception \u2014 and so does the flat
+      // roll a trick costs (T, 2026-11-09).
+      noteHonestRoll(gid, uid);
     }
     notation = parsed.notation;
     label = parsed.label;
@@ -1788,7 +1793,7 @@ function mirrorRoll(gid, { userId = null, actor = null, channelId, messageId = n
 function mirrorAutoRoll(gid, cid, name, notation, nat, total, context) {
   // An auto roll may come whole ({ nat, adv, dropped }): advantage keeps both
   // dice in the audit line, as a manual roll's line does (2026-11-08).
-  const dropped = (nat && typeof nat === 'object' && nat.adv && nat.dropped != null) ? nat.dropped : null;
+  const dropped = (nat && typeof nat === 'object' && (nat.adv || nat.dis) && nat.dropped != null) ? nat.dropped : null;
   if (nat && typeof nat === 'object') nat = nat.nat;
   // An NPC's dice belong in its own lifetime record, the same as a player's.
   try { if (getNpc(gid, name)) tallyRoll(gid, npcFighterId(name), nat, 20); } catch {}
@@ -1848,7 +1853,8 @@ async function handleDiceReport(interaction) {
   const rows = db.prepare('SELECT user_id, sides, nat, count FROM roll_tally WHERE guild_id=?').all(gid);
   if (!rows.length) return interaction.editReply({ content: '🎲 No dice history yet — the report writes itself as they roll.' });
   const h = aggregateDiceHealth(rows);
-  const nameOf = async (uid) => uid.startsWith('npc_') ? `🎭 ${uid.slice(4)}` : await getDisplayName(interaction.guild, uid).catch(() => uid);
+  const nameOf = async (uid) => isNpcFighter(uid) ? `🎭 ${npcNameFromFighter(uid)}`
+    : uid.startsWith('npc_') ? `🎭 ${uid.slice(4)}` : await getDisplayName(interaction.guild, uid).catch(() => uid);
   const lines = [`🎲 **Dice health** — ${h.totalRolls} rolls on record, ${h.d20Total} of them d20s`, ''];
   lines.push('**Top rollers**');
   for (const u of h.topRollers) lines.push(`• ${await nameOf(u.uid)} — ${u.total} rolls${u.d20c ? ` · d20 avg ${u.avg.toFixed(1)}` : ''}`);
@@ -1934,9 +1940,13 @@ async function handleRollSlash(interaction) {
       && await holdWanted(interaction.guild, gid, uid, mode))
     return holdSlashRoll(interaction, { command: 'roll', mode, gid, cid, uid });
 
+  // A flat mark strips the stat here as a typed roll's does \u2014 /roll let it
+  // pass (2026-11-09) \u2014 and a botched trick's adds disadvantage.
+  const flatMk = stat ? consumeFlatMark(gid, uid) : false;
+  if (flatMk) notation = '1d20';
   // Hero signature advantage applies to stat rolls
-  const effMode = applyNextMark(gid, uid, stat ? applySignatureMode(char, stat, mode) : mode);
-  if (stat) noteHonestRoll(gid, uid);   // an ordinary stat roll re-arms deception
+  const effMode = applyNextMark(gid, uid, flatMk ? flatMode(flatMk, mode) : stat ? applySignatureMode(char, stat, mode) : mode);
+  if (stat) noteHonestRoll(gid, uid);   // a stat roll re-arms deception, the flat one a trick costs too
 
   let result;
   if (effMode === 'adv') result = rollAdvantage(notation);
@@ -1944,7 +1954,7 @@ async function handleRollSlash(interaction) {
   else result = rollNotation(notation);
   if (!result) return interaction.reply({ content: '❌ Could not parse dice notation.', ephemeral: true });
 
-  const finalLabel = label || (stat ? stat : null);
+  const finalLabel = flatMk ? `${label || stat} · 🎭 flat d20` : (label || (stat ? stat : null));
   saveRoll(gid, cid, uid, notation, finalLabel);
   const critType = detectCrit(result, effMode);
   const naturalRoll = effMode === 'normal' ? result.rolls[0] : result.chosen;
@@ -1963,6 +1973,7 @@ async function handleRollSlash(interaction) {
         : f.phase === 'attack' ? 'It is not your turn to attack.'
         : f.atk_kind === 'grapple' ? 'That is a grapple — answer with `/fight act action:Save` (STR only).'
         : f.atk_kind === 'feint' ? 'That is a feint — answer with `/fight act action:Insight` (WIS only).'
+        : f.atk_kind === 'hold' ? 'That is a kept hold — answer with Break free (`/fight act action:Escape`) or Stay.'
         : f.def_roll !== null ? 'That exchange already has both rolls — `/fight resolve` it.'
         : 'You are not the one being attacked.';
       return interaction.reply({ content: `❌ ${why} The roll was not submitted.`, ephemeral: true });
@@ -2047,9 +2058,11 @@ const RULES = [
   { key: 'check-nat',      text: 'On any check against a DC \u2014 a called check, a planted button, a group check, a target \u2014 a natural 20 passes and a natural 1 fails, whatever the total. A target beaten by a 20 falls without the GM being asked.' },
   { key: 'attack-nat1',    text: 'A natural 1 on an attack fails outright, and your next defence is a flat d20.' },
   { key: 'defence-nat20',  text: 'A natural 20 on a defence is a perfect parry and banks +2 to hit on your next attack. Twenty meets twenty: the attack lands whatever the totals, for 2, and the defender still banks the riposte.' },
-  { key: 'damage',         text: 'A hit deals 1. An attacking 20 adds 1; a defending 1 adds 1; both together deal 4.' },
-  { key: 'grapple',        text: 'Grapple is STR against a STR save; meeting the save takes the hold. Held: immobile, 1 wound at the end of each of your turns, actions on a flat d20, and you may strike anyone but your grappler.' },
-  { key: 'grapple-hold',   text: 'Keeping a hold costs an opposed STR roll each turn, or release it for free. Escape is an opposed STR roll on your turn. Ties keep the hold, every time.' },
+  { key: 'damage',         text: 'A hit deals 1 damage. An attacking 20 adds 1; a defending 1 adds 1; both together deal 4. A wound is the same thing: 1 damage, 1 HP.' },
+  { key: 'grapple',        text: 'Grapple needs STR 4+: STR against a STR save, and meeting the save takes the hold. A natural 20 takes it whatever the save, for 2 wounds; a natural 1 fails outright; a save of 20 slips free unless the grab was a 20 too. Held: immobile, 1 wound a round, actions on a flat d20 \u2014 but you can still attack anyone, your grappler included. The grappler cannot strike their own captive.' },
+  { key: 'grapple-hold',   text: 'Keeping a hold is a STR roll on the grappler\'s turn, and the captive answers: break free (STR against it) or stay. Escape is the same break on their own turn, the hold rolled first. Ties keep the hold. Breaking out costs nothing; a failed break takes the round\'s wound at once, each further one 1 more, a natural 1 two. A break of 20 frees them whatever the totals and leaves the grappler\'s next attack flat; a hold of 20 makes the break a flat d20; a hold of 1 slips at once \u2014 the captive is free, with no wound, and the grappler\'s next roll is a flat d20 at disadvantage. Release is free.' },
+  { key: 'feint',          text: 'A feint is the trick in a fight; away from one, the same trick is `/deception`. On your turn it is WIS against an insight. A natural 20 fools them whatever the insight and the blow lands, crits paid; a natural 1 is a total failure. An insight of 20 sees through it unless the feint was a 20; an insight of 1 is fooled. With a blow coming it is your defence instead, WIS against the attack: if the blow misses, the attacker is fooled; a natural 1 fails outright and the blow lands, unless the attack was a 1 too. Fooled, their next roll is a flat d20 \u2014 and the feinter\'s own next roll is too, every time, at disadvantage after a 1. One trick per honest roll, and the flat roll a trick costs counts as one.' },
+  { key: 'deflect-disarm', text: 'Deflect: a natural 20 turns the blow whatever the totals and a named enemy takes 2; a natural 1 fails for 2 wounds, your next defence flat as well as your next attack. Disarm: a natural 20 wounds the attacker 1 and leaves their next attack flat, in place of a turn spent fetching the blade; a natural 1 fails for 1 wound, your next attack flat as well as your next defence.' },
   { key: 'one-quest',      text: 'One quest at a time. A run that is winding down does not count; nor does anything opened with `/instance` \u2014 the GM seats those by hand.' },
   { key: 'winddown-kick',  text: 'Kicked while a run is winding down? You are still paid when it completes.' },
   { key: 'pause-round',    text: () => `A pause rounds the clock up to the next ${Math.round(QUARTER_MS / 60000)} minutes.` },
@@ -2109,7 +2122,7 @@ const RULES_KNIGHTFALL = {
   defence: 'opposed',
   profBonus: () => 0,
   // What a stat must reach before an ability is available at all.
-  gates: { deflect: ['str', 4], disarm: ['dex', 4], feint: ['wis', 4], insight: ['wis', 4], heal: ['wis', 5] },
+  gates: { deflect: ['str', 4], disarm: ['dex', 4], grapple: ['str', 4], feint: ['wis', 4], insight: ['wis', 4], heal: ['wis', 5] },
   // What progress is called here.
   vocabulary: { currency: 'renown', standing: 'merits', rank: 'rank' },
 };
@@ -10321,8 +10334,42 @@ function consumeEffectFlag(gid, cid, fid, key) {
   return on;
 }
 const consumeFlatAtk = (gid, cid, fid) => consumeEffectFlag(gid, cid, fid, 'flatAtk');
-// A successful feint: the target's very next rolled action is a straight d20.
-const consumeFooled = (gid, cid, fid) => consumeEffectFlag(gid, cid, fid, 'fooled');
+// The fighter's very next roll is a straight d20: fooled by a feint, the
+// price of making one, a hold's natural 20. A botched trick adds a rider —
+// that roll is at disadvantage too (T, 2026-11-09) — and the two clear in
+// one write. Returns 'dis' with the rider, true without it, false if unset.
+function consumeFooled(gid, cid, fid) {
+  const fight = getFight(gid, cid);
+  const all = JSON.parse(fight?.effect_state || '{}');
+  const slot = all[fid];
+  if (!slot?.fooled) return false;
+  const dis = !!slot.fooledDis;
+  delete slot.fooled; delete slot.fooledDis;
+  if (!Object.keys(slot).length) delete all[fid];
+  upsertFight(gid, cid, { effect_state: JSON.stringify(all) });
+  return dis ? 'dis' : true;
+}
+function setFooled(gid, cid, fid, dis = false) {
+  const fight = getFight(gid, cid);
+  const all = JSON.parse(fight?.effect_state || '{}');
+  const slot = (all[fid] = all[fid] || {});
+  slot.fooled = true;
+  if (dis) slot.fooledDis = true;
+  upsertFight(gid, cid, { effect_state: JSON.stringify(all) });
+}
+// What a roll's mode becomes once a flat penalty has spoken: 'dis' for a
+// botched trick's, plain for any other, untouched when there was none.
+const flatMode = (flat, mode) => (flat === 'dis' ? 'dis' : flat ? 'normal' : mode);
+// The price of a trick (T, 2026-11-09): whoever feints or deceives rolls
+// their very next roll on a flat d20 — at disadvantage too when the trick
+// came up a 1. In a live fight here it rides the fight's flag, NPCs
+// included; anywhere else it is a mark on the sheet.
+function chargeTrick(gid, cid, fid, botched = false) {
+  const f = getFight(gid, cid);
+  if (f?.state === 'active' && fightOrder(f).includes(fid)) { setFooled(gid, cid, fid, botched); return; }
+  if (!fid || isNpcFighter(String(fid))) return;
+  upsertChar(gid, fid, { next_mark: botched ? 'flatdis' : 'flat' });
+}
 // A called check can mark a character's NEXT roll — 🔼 or 🔽 — and the
 // mark is GENERAL: it rides the sheet, not any fight, and bites the very
 // next roll anywhere — a chat `!r`, an activity, any fight path, a check
@@ -10334,7 +10381,7 @@ const consumeFooled = (gid, cid, fid) => consumeEffectFlag(gid, cid, fid, 'foole
 // Deliberate — a decree should beat a circumstance — and said out loud on
 // the card so nobody thinks the penalty was forgotten.
 function applyNextMark(gid, uid, mode) {
-  if (!uid || String(uid).startsWith('npc_')) return mode;
+  if (!uid || isNpcFighter(String(uid))) return mode;
   const ch = getChar(gid, uid);
   if (!ch?.next_mark) return mode;
   if (ch.next_mark !== 'adv' && ch.next_mark !== 'dis') return mode;  // flat is consumed elsewhere
@@ -10346,28 +10393,32 @@ function applyNextMark(gid, uid, mode) {
 // real defence, a real check — which is what sells the next lie. NPCs carry
 // the same rule on the fight's own round flags, since they have no sheet.
 function deceptionSpent(gid, fid) {
-  if (String(fid).startsWith('npc_')) return false;   // NPC side uses the round flag
+  if (isNpcFighter(String(fid))) return false;   // NPC side uses the round flag
   return !!(getChar(gid, fid)?.deception_spent);
 }
 function spendDeception(gid, fid) {
-  if (String(fid).startsWith('npc_')) return;
+  // An NPC has no sheet: this read 'npc_' while NPC fighters are 'npc:', so
+  // every NPC that feinted was written a player's sheet (fixed 2026-11-09).
+  if (isNpcFighter(String(fid))) return;
   upsertChar(gid, fid, { deception_spent: 1 });
 }
 // Any honest stat roll clears it — called from every path where one happens.
 function noteHonestRoll(gid, fid) {
-  if (!fid || String(fid).startsWith('npc_')) return;
+  if (!fid || isNpcFighter(String(fid))) return;
   if (getChar(gid, fid)?.deception_spent) upsertChar(gid, fid, { deception_spent: 0 });
 }
 
 // A flat mark strips the stat from the next roll, wherever it happens. The
 // fight paths OR this into the penalties they already carry; the chat, slash
 // and activity rolls zero their own bonus when it fires.
+// 'flatdis' is a botched trick's price: flat, and at disadvantage — 'dis'
+// comes back so the roll can say so (2026-11-09).
 function consumeFlatMark(gid, uid) {
-  if (!uid || String(uid).startsWith('npc_')) return false;
+  if (!uid || isNpcFighter(String(uid))) return false;
   const ch = getChar(gid, uid);
-  if (ch?.next_mark !== 'flat') return false;
+  if (ch?.next_mark !== 'flat' && ch?.next_mark !== 'flatdis') return false;
   upsertChar(gid, uid, { next_mark: null });
-  return true;
+  return ch.next_mark === 'flatdis' ? 'dis' : true;
 }
 // Set a per-fighter effect flag (the mirror of consumeEffectFlag).
 function setEffectFlag(gid, cid, fid, key) {
@@ -10421,7 +10472,10 @@ const FRESH_EXCHANGE = Object.freeze({ phase: 'attack', current_target: null, at
 // everyone in the fight counted as still fighting and nothing was ever
 // swept), and /fight end's sweep read a `guild` that was not in scope.
 function standDownFight(gid, cid, client, fields = {}) {
-  upsertFight(gid, cid, { state: 'idle', turn_order: '[]', effect_state: '{}', grapples: '{}', last_targets: '{}', ...fields });
+  // The pending exchange goes with it: a grapple, feint or hold left waiting
+  // \u2014 and its reroll flags \u2014 met the next fight's first defence (audit,
+  // 2026-11-09).
+  upsertFight(gid, cid, { ...FRESH_EXCHANGE, state: 'idle', turn_order: '[]', effect_state: '{}', grapples: '{}', last_targets: '{}', ...fields });
   try { db.prepare('UPDATE dc_cards SET bind_channel=NULL, bind_uid=NULL, bind_skip=0 WHERE guild_id=? AND bind_channel=?').run(gid, cid); } catch {}
   try {
     const swept = sweepTempNpcs(gid, { client });
@@ -10614,16 +10668,23 @@ async function handleDuelRejectModal(interaction) {
 }
 
 // Deception, away from the sword. A straight WIS contest between two
-// characters that works anywhere — a market square, a throne room, a tavern
-// — and needs no fight to exist. Both roll at once, so it resolves in one
-// message; ties go to the target, exactly as the fight version words it.
-// Winning leaves them rolling flat on their very next action: inside a live
-// fight that is the fooled flag the combat engine already honours, and
-// outside one it is a mark on their sheet, spent by whatever they roll next.
+// characters — a market square, a throne room, a tavern — that needs no
+// fight to exist; in one, the trick is a feint, and /deception is refused
+// to anyone fighting in the channel (T, 2026-11-09). Both roll at once, so
+// it resolves in one message; ties go to the target, as a feint's do.
+// Winning leaves them rolling flat on their very next roll: a mark on their
+// sheet, spent by whatever they roll next.
 async function handleDeception(interaction) {
   const gid = interaction.guild.id, uid = interaction.user.id, cid = interactionChannelId(interaction);
   const target = interaction.options.getUser('target');
   if (target.id === uid) return interaction.reply({ content: '🎭 You cannot deceive yourself — not with dice, anyway.', ephemeral: true });
+  {
+    // In a fight the trick is a feint (T, 2026-11-09): /deception is for away
+    // from one, refused while either of you is fighting in this channel.
+    const fD = getFight(gid, cid);
+    if (fD?.state === 'active' && (fightOrder(fD).includes(uid) || fightOrder(fD).includes(target.id)))
+      return interaction.reply({ ephemeral: true, content: '🎭 In a fight, a trick is a feint \u2014 `/fight act action:Feint`. `/deception` is for away from one.' });
+  }
   const me = getChar(gid, uid), them = getChar(gid, target.id);
   const gate = sheetGate(gid, uid);
   if (gate) return interaction.reply({ content: gate, ephemeral: true });
@@ -10638,42 +10699,53 @@ async function handleDeception(interaction) {
 
   const claim = interaction.options.getString('claim');
   const flavour = interaction.options.getString('flavour');
-  const myMode = applyNextMark(gid, uid, applySignatureMode(me, 'wis', 'normal'));
-  const theirMode = applyNextMark(gid, target.id, applySignatureMode(them, 'wis', 'normal'));
-  const roll = (row, mode) => {
-    const notation = `1d20+${row.wis ?? 0}`;
+  // Either side's roll may owe a flat d20 \u2014 a trick that landed on them
+  // earlier, or the price of their own \u2014 and /deception spent neither
+  // until 2026-11-09.
+  const flatMe = consumeFlatMark(gid, uid), flatThem = consumeFlatMark(gid, target.id);
+  const myMode = applyNextMark(gid, uid, flatMode(flatMe, applySignatureMode(me, 'wis', 'normal')));
+  const theirMode = applyNextMark(gid, target.id, flatMode(flatThem, applySignatureMode(them, 'wis', 'normal')));
+  const roll = (row, mode, flat) => {
+    const notation = flat ? '1d20' : `1d20+${row.wis ?? 0}`;
     const r = mode === 'adv' ? rollAdvantage(notation) : mode === 'dis' ? rollDisadvantage(notation) : rollNotation(notation);
     return { r, nat: mode === 'normal' ? r.rolls[0] : r.chosen };
   };
-  const a = roll(me, myMode), d = roll(them, theirMode);
+  const a = roll(me, myMode, flatMe), d = roll(them, theirMode, flatThem);
   spendDeception(gid, uid);   // one trick per honest roll
   noteHonestRoll(gid, target.id);   // answering honestly re-arms the target's own
   const myName = await getDisplayName(interaction.guild, uid);
   const theirName = await getDisplayName(interaction.guild, target.id);
-  const fooled = a.r.total > d.r.total;   // ties go to the target, as in a fight
+  // The naturals speak first, as a feint's do (T, 2026-11-09): a lie of 20
+  // lands whatever the insight, of 1 is a total failure; an insight of 20
+  // sees through it unless the lie was a 20 too, of 1 swallows it. Ties go
+  // to the target, as in a fight.
+  const fooled = a.nat === 1 ? false : a.nat === 20 ? true : d.nat === 20 ? false : d.nat === 1 ? true : a.r.total > d.r.total;
+  const botched = a.nat === 1;
+  const how = (m, flat) => `${flat ? ', flat d20' : ''}${m === 'adv' ? ', advantage' : m === 'dis' ? ', disadvantage' : ''}`;
+  const myLine = `${myName} (**WIS** deception${how(myMode, flatMe)}): ${fightTotalStr(a.r.total, a.nat, 20)}`;
 
   const lines = ['─────────────────────────────',
     `🎭  **Deception** — **${myName}** vs **${theirName}**`];
   if (claim) lines.push(`_“${claim}”_`);
-  lines.push('',
-    `${myName} (**WIS** deception): ${fightTotalStr(a.r.total, a.nat, 20)}`,
-    `${theirName} (**WIS** insight): ${fightTotalStr(d.r.total, d.nat, 20)}`, '');
+  lines.push('', myLine,
+    `${theirName} (**WIS** insight${how(theirMode, flatThem)}): ${fightTotalStr(d.r.total, d.nat, 20)}`, '');
   if (fooled) {
-    const f = getFight(gid, cid);
-    if (f?.state === 'active' && fightOrder(f).includes(target.id)) {
-      setEffectFlag(gid, cid, target.id, 'fooled');
-      lines.push(`🎭 **${theirName}** believes it — their next action in this fight is a straight d20.`);
-    } else {
-      upsertChar(gid, target.id, { next_mark: 'flat' });
-      lines.push(`🎭 **${theirName}** believes it — their very next roll, anywhere, is a straight d20.`);
-    }
+    if (a.nat === 20) lines.push(d.nat === 20 ? '\u26A1 **Twenty meets twenty!** The lie wins.' : '\u{1F7E1} A natural 20 \u2014 the lie lands whatever they read.');
+    else if (d.nat === 1) lines.push('\u{1F534} A natural 1 on the insight \u2014 they swallow it whole.');
+    upsertChar(gid, target.id, { next_mark: 'flat' });
+    lines.push(`🎭 **${theirName}** believes it — their very next roll, anywhere, is a straight d20.`);
+  } else if (botched) {
+    lines.push('\u{1F4A5} A natural 1 \u2014 the lie falls apart, a total failure.');
   } else {
-    lines.push(`👁️ **${theirName}** sees straight through it.`);
+    lines.push(d.nat === 20 ? `👁️ A natural 20 \u2014 **${theirName}** sees straight through it.` : `👁️ **${theirName}** sees straight through it.`);
   }
+  // The price, whatever came of it: the deceiver's own very next roll.
+  chargeTrick(gid, cid, uid, botched);
+  lines.push(`_🎭 The price: **${myName}**'s very next roll is a flat d20${botched ? ', at disadvantage' : ''}._`);
   if (flavour) lines.push('', `_${flavour}_`);
   const result = a.r;   // shorthand below, as every other roll site writes it
   recordRoll(gid, { userId: uid, channelId: cid, interaction, result,
-    input: '/deception', rollLine: lines[3], context: `deception vs ${theirName}` });
+    input: '/deception', rollLine: myLine, context: `deception vs ${theirName}` });
   return interaction.reply({ content: lines.join('\n'), allowedMentions: { parse: [] } });
 }
 
@@ -10862,7 +10934,13 @@ function chooseAutoStat(gid, id, stats, kind) {
     subject?.[kind === 'def' ? 'preferred_def' : 'preferred_atk'], sig);
 }
 // Roll a d20 + modifier, returning { nat, total }.
+// `adv` true for advantage, 'dis' for disadvantage (2026-11-09).
 function autoRoll(mod, adv = false) {
+  if (adv === 'dis') {
+    const a = rollDie(20), b = rollDie(20);
+    const nat = Math.min(a, b);
+    return { nat, total: nat + mod, dis: true, dropped: Math.max(a, b) };
+  }
   if (adv) {
     const a = rollDie(20), b = rollDie(20);
     const nat = Math.max(a, b);
@@ -11108,8 +11186,9 @@ async function autoFightCard(guild, gid, fighter, kind, stat, nat, total, target
   const icon = kind === 'atk' ? '⚔️' : '🛡️';
   let rollLine;
   if (flat) {
-    // Flat d20 defence — no stat, no modifier.
-    rollLine = `${icon}  1d20 (flat — fumbled last attack) → [${nat}] = ${fightTotalStr(total, nat, 20)}`;
+    // A flat d20 — no stat, no modifier; at disadvantage after a botched trick.
+    const disF = !!roll?.dis && roll.dropped != null;
+    rollLine = `${icon}  1d20 (flat d20${disF ? ', disadvantage' : ''}) → ${disF ? `[${nat}, ~~${roll.dropped}~~]` : `[${nat}]`} = ${fightTotalStr(total, nat, 20)}`;
   } else {
     const eff = statVal + (kind === 'atk' ? atkBonus : 0);
     const bonusTag = (kind === 'atk' && atkBonus) ? ` +${atkBonus} riposte` : '';
@@ -11236,7 +11315,7 @@ function fightAwaiting(gid, cid, uid) {
 function submitFightRoll(gid, cid, kind, { total, nat, sides, label, targetId = null }) {
   if (kind === 'atk') {
     upsertFight(gid, cid, {
-      phase: 'defend', current_target: targetId,
+      phase: 'defend', current_target: targetId, atk_kind: null, atk_rerolled: 0, def_rerolled: 0,
       atk_roll: total, atk_nat: nat, atk_stat: label, atk_mode: 'normal', atk_sides: sides,
       def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
     });
@@ -11498,31 +11577,38 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   const targetId = opponents[Math.floor(Math.random() * opponents.length)];
   const targetF = await resolveFighter(guild, gid, targetId);
 
-  // The bot fights within the same rules a player does.
+  // The bot fights within the same rules a player does: held, off-balance
+  // or owing a flat roll, the swing is a straight d20. It let the first two
+  // pass until 2026-11-09, when a disarm of 20 began leaving an NPC off-balance.
   const stat = chooseAutoStat(gid, attackerId, attacker.stats, 'atk');
+  const restrainedAuto = !!grappleHolderOf(fight, attackerId);
+  const offBalanceAuto = !restrainedAuto && consumeFlatAtk(gid, cid, attackerId);
   const fooledAuto = consumeFooled(gid, cid, attackerId);
-  const atkBonus = fooledAuto ? 0 : consumeAtkBonus(gid, cid, attackerId);
+  const flatAuto = restrainedAuto || offBalanceAuto || fooledAuto;
+  const atkBonus = flatAuto ? 0 : consumeAtkBonus(gid, cid, attackerId);
   const attRow = attacker.isNpc ? getNpc(gid, attacker.name) : getChar(gid, attackerId);
   // Under 5e the bot strikes as a player would: the statblock's attack, or
   // the modifier and proficiency — never the raw score (2026-11-07).
   const R5 = rulesFor(gid);
   const atkMod = R5.defence === 'ac' ? autoAtkBonus5e(R5, attRow, stat) : (attacker.stats[stat] ?? 0);
-  const a = autoRoll(fooledAuto ? 0 : (atkMod + atkBonus), !fooledAuto && hasSignatureAdvantage(attRow, stat));
-  mirrorAutoRoll(gid, cid, attacker.name, `1d20${a.adv ? ' (adv)' : ''}`, a, a.total, fooledAuto ? `fight attack (${STAT_LABELS[stat]}, fooled — flat)` : `fight attack (${STAT_LABELS[stat]})`);
+  const a = autoRoll(flatAuto ? 0 : (atkMod + atkBonus), autoEdge(fooledAuto === 'dis' ? 'dis' : flatAuto, attRow, stat));
+  mirrorAutoRoll(gid, cid, attacker.name, `1d20${autoTag(a)}`, a, a.total, flatAuto ? `fight attack (${STAT_LABELS[stat]}, flat d20)` : `fight attack (${STAT_LABELS[stat]})`);
 
   // 5e: nobody rolls to defend — the target's Armour Class takes the slot,
   // and the chain resolves the exchange at once.
   const acNow = R5.defence === 'ac' ? R5.targetNumber(targetF.isNpc ? getNpc(gid, targetF.name) : getChar(gid, targetId)) : null;
   upsertFight(gid, cid, {
-    phase: 'defend', current_target: targetId,
-    atk_roll: a.total, atk_nat: a.nat, atk_stat: stat, atk_mode: 'normal', atk_sides: 20,
+    // A plain swing is a plain swing: no stale grapple, feint or hold kind
+    // rides it (audit, 2026-11-09), and a fresh roll has no reroll spent.
+    phase: 'defend', current_target: targetId, atk_kind: null, atk_rerolled: 0, def_rerolled: 0,
+    atk_roll: a.total, atk_nat: a.nat, atk_stat: stat, atk_mode: a.adv ? 'adv' : a.dis ? 'dis' : 'normal', atk_sides: 20,
     ...(acNow != null
-      ? { def_roll: acNow, def_nat: 0, def_stat: 'ac', def_mode: 'normal', atk_kind: null }
+      ? { def_roll: acNow, def_nat: 0, def_stat: 'ac', def_mode: 'normal' }
       : { def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal' }),
   });
 
   // The NPC's own roll card posts AS the NPC (webhook), matching manual rolls.
-  const atkCard = await autoFightCard(guild, gid, attacker, 'atk', stat, a.nat, a.total, `${targetF.name}${targetF.isNpc ? ' 🎭' : ''}`, false, atkBonus, false, a);
+  const atkCard = await autoFightCard(guild, gid, attacker, 'atk', stat, a.nat, a.total, `${targetF.name}${targetF.isNpc ? ' 🎭' : ''}`, false, atkBonus, !!flatAuto, a);
   await postAsNpc(channel, gid, attacker.name, atkCard);
   if (atkBonus) await channel.send(`✨ **${attacker.name}** presses the riposte (+${atkBonus}).`).catch(()=>{});
 
@@ -11546,37 +11632,53 @@ async function autoNpcDefend(guild, gid, cid, channel) {
   if (isFallen(gid, fight.current_target)) return false;   // the fallen do not defend
 
   const defender = await resolveFighter(guild, gid, fight.current_target);
+  if (fight.atk_kind === 'hold') {
+    // A kept hold: an NPC on auto always struggles (T, 2026-11-09) \u2014 on a
+    // flat d20 against a hold of 20, or a flat it already carries.
+    const drow = getNpc(gid, defender.name);
+    const fooledH = consumeFooled(gid, cid, fight.current_target);
+    const flatH = fooledH || fight.atk_nat === 20;
+    const d = autoRoll(flatH ? 0 : (defender.stats.str ?? 0), autoEdge(fooledH === 'dis' ? 'dis' : flatH, drow, 'str'));
+    mirrorAutoRoll(gid, cid, defender.name, `1d20${autoTag(d)}`, d, d.total, flatH ? 'break free (STR, flat d20)' : 'break free (STR)');
+    const r = await resolveBreakFree(guild, gid, cid, fight, { roll: { nat: d.nat, total: d.total, mode: d.adv ? 'adv' : d.dis ? 'dis' : 'normal', flat: !!flatH } });
+    await sendLong(channel, r.lines, { components: r.nextF?.answerRows ?? [] });
+    if (r.ended) await announceFightEnd(guild, gid, cid, channel, r.announce);
+    return true;
+  }
   if (fight.atk_kind === 'grapple') {
     // Grapple saves are STR-only; the auto NPC rolls its own.
     const drow = getNpc(gid, defender.name);
-    const d = autoRoll(defender.stats.str ?? 0, hasSignatureAdvantage(drow, 'str'));
-    mirrorAutoRoll(gid, cid, defender.name, `1d20${d.adv ? ' (adv)' : ''}`, d, d.total, 'grapple save (STR)');
-    const r = await resolveGrappleSave(guild, gid, cid, fight, { nat: d.nat, total: d.total, mode: d.adv ? 'adv' : 'normal' });
-    await channel.send(r.lines.join('\n')).catch(err => console.error('[auto] grapple save post -', err?.message || err));
+    const flatG = consumeFooled(gid, cid, fight.current_target);
+    const d = autoRoll(flatG ? 0 : (defender.stats.str ?? 0), autoEdge(flatG, drow, 'str'));
+    mirrorAutoRoll(gid, cid, defender.name, `1d20${autoTag(d)}`, d, d.total, flatG ? 'grapple save (STR, flat d20)' : 'grapple save (STR)');
+    const r = await resolveGrappleSave(guild, gid, cid, fight, { nat: d.nat, total: d.total, mode: d.adv ? 'adv' : d.dis ? 'dis' : 'normal' });
+    await sendLong(channel, r.lines, { components: r.nextF?.answerRows ?? [] });
+    if (r.ended) await announceFightEnd(guild, gid, cid, channel, r.announce);
     return true;
   }
   if (fight.atk_kind === 'feint') {
-    // Insight checks are WIS-only; a fooled NPC rolls even this one flat.
+    // Insight checks are WIS-only; a flat the NPC owes makes even this one flat.
     const drow = getNpc(gid, defender.name);
     const wasFooled = consumeFooled(gid, cid, fight.current_target);
-    const d = autoRoll(wasFooled ? 0 : (defender.stats.wis ?? 0), !wasFooled && hasSignatureAdvantage(drow, 'wis'));
-    mirrorAutoRoll(gid, cid, defender.name, `1d20${d.adv ? ' (adv)' : ''}`, d, d.total, wasFooled ? 'feint insight (WIS, fooled — flat)' : 'feint insight (WIS)');
-    const r = await resolveFeintInsight(guild, gid, cid, fight, { nat: d.nat, total: d.total, mode: d.adv ? 'adv' : 'normal' });
-    await channel.send(r.lines.join('\n')).catch(err => console.error('[auto] feint insight post -', err?.message || err));
+    const d = autoRoll(wasFooled ? 0 : (defender.stats.wis ?? 0), autoEdge(wasFooled, drow, 'wis'));
+    mirrorAutoRoll(gid, cid, defender.name, `1d20${autoTag(d)}`, d, d.total, wasFooled ? 'feint insight (WIS, flat d20)' : 'feint insight (WIS)');
+    const r = await resolveFeintInsight(guild, gid, cid, fight, { nat: d.nat, total: d.total, mode: d.adv ? 'adv' : d.dis ? 'dis' : 'normal' });
+    await sendLong(channel, r.lines, { components: r.nextF?.answerRows ?? [] });
+    if (r.ended) await announceFightEnd(guild, gid, cid, channel, r.announce);
     return true;
   }
   const stat = chooseAutoStat(gid, fight.current_target, defender.stats, 'def');
   const flat = consumeFlatDef(gid, cid, fight.current_target) || consumeFooled(gid, cid, fight.current_target) || consumeFlatMark(gid, fight.current_target);
   const defRow = defender.isNpc ? getNpc(gid, defender.name) : getChar(gid, fight.current_target);
-  const d = autoRoll(flat ? 0 : (defender.stats[stat] ?? 0), !flat && hasSignatureAdvantage(defRow, stat));
-  mirrorAutoRoll(gid, cid, defender.name, `1d20${d.adv ? ' (adv)' : ''}`, d, d.total,
-    flat ? 'fight defence (flat d20 — fumbled)' : `fight defence (${STAT_LABELS[stat]})`);
+  const d = autoRoll(flat ? 0 : (defender.stats[stat] ?? 0), autoEdge(flat, defRow, stat));
+  mirrorAutoRoll(gid, cid, defender.name, `1d20${autoTag(d)}`, d, d.total,
+    flat ? 'fight defence (flat d20)' : `fight defence (${STAT_LABELS[stat]})`);
 
-  upsertFight(gid, cid, { def_roll: d.total, def_nat: d.nat, def_stat: stat, def_mode: 'normal', def_sides: 20 });
+  upsertFight(gid, cid, { def_roll: d.total, def_nat: d.nat, def_stat: stat, def_mode: d.adv ? 'adv' : d.dis ? 'dis' : 'normal', def_sides: 20 });
 
   const defCard = await autoFightCard(guild, gid, defender, 'def', stat, d.nat, d.total, null, false, 0, flat, d);
   await postAsNpc(channel, gid, defender.name, defCard);
-  if (flat) await channel.send(`🎲 **${defender.name}** defends on a flat d20 (fumbled last attack).`).catch(()=>{});
+  if (flat) await channel.send(`🎲 **${defender.name}** defends on a flat d20${d.dis ? ', at disadvantage' : ''}.`).catch(()=>{});
   return true;
 }
 
@@ -11608,18 +11710,20 @@ async function fighterStateLine(guild, gid, cid, fid) {
     return r ? `${r.name}${r.isNpc ? ' \u{1F3AD}' : ''}` : 'someone';
   };
   // Held BY someone: gmap maps captive -> holder.
-  if (gmap[fid]) bits.push(`\u{1FAA2} **held by ${await nameOf(gmap[fid])}** \u2014 cannot move, 1 strain at end of turn, actions roll flat`);
+  if (gmap[fid]) bits.push(`\u{1FAA2} **held by ${await nameOf(gmap[fid])}** \u2014 cannot move, 1 wound a round, actions roll flat`);
   // Holding someone: the other side of the same map.
   const captives = Object.entries(gmap).filter(([, h]) => h === fid).map(([t]) => t);
   for (const c of captives) bits.push(`\u{1F91C} **holding ${await nameOf(c)}** \u2014 release freely, but no striking them`);
 
   // Carried marks, so nobody is surprised by their own dice.
   const eff = JSON.parse(f.effect_state || '{}')[fid] || {};
-  if (eff.flatDef) bits.push('\u{1F4A2} **next defence is a flat d20** \u2014 fumbled an attack');
+  if (eff.flatDef) bits.push('\u{1F4A2} **next defence is a flat d20**');
+  if (eff.flatAtk) bits.push('\u{1F4A2} **next attack is a flat d20**');
+  if (eff.holdPaid) bits.push('\u{1FAA2} this round\u2019s wound already paid');
   if (eff.rollBonus) bits.push(`\u2694\uFE0F **+${eff.rollBonus} to hit** on the next attack \u2014 riposte`);
   if (eff.gmAdj) bits.push(`\u2696\uFE0F **${eff.gmAdj > 0 ? '+' : ''}${eff.gmAdj}** from the GM`);
   if (eff.gmStat) bits.push(`\u2696\uFE0F GM set the stat to **${STAT_LABELS[eff.gmStat] || eff.gmStat}**`);
-  if (eff.fooled) bits.push('\u{1F300} **taken in by a feint** \u2014 next action is a straight d20');
+  if (eff.fooled) bits.push(`\u{1F3AD} **next roll is a flat d20**${eff.fooledDis ? ', at **disadvantage**' : ''}`);
   // Conditions the table agreed on: a word and a clock, no mechanics
   // (T, 2026-10-14). The clock ticks at the start of this fighter's turn.
   for (const c of Array.isArray(eff.conditions) ? eff.conditions : [])
@@ -11629,6 +11733,7 @@ async function fighterStateLine(guild, gid, cid, fid) {
     if (mk === 'adv') bits.push('\u2b06\ufe0f advantage on the next roll');
     if (mk === 'dis') bits.push('\u2b07\ufe0f disadvantage on the next roll');
     if (mk === 'flat') bits.push('\u27a1\ufe0f next roll is flat');
+    if (mk === 'flatdis') bits.push('\u27a1\ufe0f next roll is flat, at disadvantage');
   }
   return bits.length ? `\n${bits.map(b => `\u2003${b}`).join('\n')}` : '';
 }
@@ -11779,6 +11884,10 @@ async function buildFightEnd(guild, gid, cid, lines, hpState, roster, floor, win
 // full — purge, roster shrink, and the fight end when only one stands.
 // Returns { order, endedRet } like the resolver's inner paths.
 async function applyTurnEndStrain(guild, gid, cid, hpState, order, roster, floor, lines, fid) {
+  // A failed break this round already took the round's wound (T,
+  // 2026-11-09): the turn's end costs nothing more, and the next round
+  // starts unpaid \u2014 cleared whether or not they are still held.
+  const paid = consumeEffectFlag(gid, cid, fid, 'holdPaid');
   const f = getFight(gid, cid);
   const gmap = fightGrapples(f);
   if (!gmap[fid]) return { order };
@@ -11787,12 +11896,17 @@ async function applyTurnEndStrain(guild, gid, cid, hpState, order, roster, floor
   const F = await resolveFighter(guild, gid, fid);
   const name = F.name + (F.isNpc ? ' 🎭' : '');
   const W = fightWords(floor);
-  const nh = applyFightDamage(prev, 1, floor);
-  hpState[fid] = nh; setFighterHp(gid, fid, nh);
   // Name the holder every round, so a hold that lasts five of them never
   // becomes a thing the table has to remember.
   const holderName = await resolveFighter(guild, gid, gmap[fid]).catch(() => null);
-  lines.push('', `\u{1FAA2} **${name}** is still held by **${holderName ? holderName.name + (holderName.isNpc ? ' \u{1F3AD}' : '') : 'someone'}** \u2014 **1** strain.`);
+  const by = holderName ? holderName.name + (holderName.isNpc ? ' \u{1F3AD}' : '') : 'someone';
+  if (paid) {
+    lines.push('', `\u{1FAA2} **${name}** is still held by **${by}** \u2014 this round's wound is already paid.`);
+    return { order };
+  }
+  const nh = applyFightDamage(prev, 1, floor);
+  hpState[fid] = nh; setFighterHp(gid, fid, nh);
+  lines.push('', `\u{1FAA2} **${name}** is still held by **${by}** \u2014 **1** wound.`);
   lines.push(hpChangeLine(gid, F.isNpc, F.name, prev, nh, F.maxHp, floor));
   if (nh <= floor) {
     lines.push('', `${W.icon} **${name}** ${W.out}! HP: **${nh}**`);
@@ -11803,6 +11917,130 @@ async function applyTurnEndStrain(guild, gid, cid, hpState, order, roster, floor
     return { order: shrunk };
   }
   return { order };
+}
+
+// The turn passes from `actorId`: their turn's end (a held fighter's wound
+// for the round), then the next fighter standing after them in the order as
+// it began \u2014 whoever has dropped out meanwhile, the actor included.
+// Returns { lines, ended, nextF, announce } like the resolvers.
+async function passTurn(guild, gid, cid, hpState, order, roster, floor, lines, actorId) {
+  const st = await applyTurnEndStrain(guild, gid, cid, hpState, order, roster, floor, lines, actorId);
+  if (st.endedRet) return st.endedRet;
+  order = st.order;
+  const i = roster.indexOf(actorId);
+  let from = 0;
+  for (let k = 1; k <= roster.length; k++) {
+    const j = order.indexOf(roster[(i + k) % roster.length]);
+    if (j >= 0) { from = j; break; }
+  }
+  const nextIndex = nextStandingIndex(order, hpState, floor, from);
+  const nextF = await announceNextTurn(guild, gid, cid, lines, order, nextIndex);
+  upsertFight(gid, cid, { ...FRESH_EXCHANGE, turn_index: nextIndex, hp_state: JSON.stringify(hpState),
+    ...(order.length !== roster.length ? { turn_order: JSON.stringify(order) } : {}) });
+  return { lines, ended: false, nextF, announce: null };
+}
+
+// A failed break (T, 2026-11-09): the round's wound is taken now rather
+// than at the turn's end; each further failure that round costs another,
+// and a natural 1 costs two. Returns { order, endedRet } like the specials.
+async function failBreakout(guild, gid, cid, hpState, order, roster, floor, lines, fid, F, nat) {
+  const fx = JSON.parse(getFight(gid, cid)?.effect_state || '{}');
+  const paid = !!fx[fid]?.holdPaid;
+  if (!paid) setEffectFlag(gid, cid, fid, 'holdPaid');
+  const name = F.name + (F.isNpc ? ' \u{1F3AD}' : '');
+  const prev = hpState[fid] ?? 0;
+  const nh = applyFightDamage(prev, nat === 1 ? 2 : 1, floor);
+  hpState[fid] = nh; setFighterHp(gid, fid, nh);
+  lines.push(nat === 1 ? `\u{1F4A5} The struggle costs **${name}** **2** wounds.`
+    : paid ? `\u{1FAA2} Another failed struggle this round \u2014 **1** more wound.`
+    : `\u{1FAA2} The struggle costs **${name}** this round's wound now \u2014 **1**.`);
+  lines.push(hpChangeLine(gid, F.isNpc, F.name, prev, nh, F.maxHp, floor));
+  if (nh <= floor) return knockoutFromSpecial(guild, gid, cid, getFight(gid, cid), hpState, order, roster, floor, lines, fid, name);
+  return { order };
+}
+
+// A hold of 1 slips (T, 2026-11-09): the captive is free at once, with no
+// wound, and the grappler's next roll is a flat d20 at disadvantage \u2014 a
+// kept hold, an escape's hold or a rerolled hold alike. Returns its line.
+function slipHold(gid, cid, holderId, captiveId, holderName, capName) {
+  const gmap = fightGrapples(getFight(gid, cid));
+  delete gmap[captiveId];
+  setFightGrapples(gid, cid, gmap);
+  setFooled(gid, cid, holderId, true);
+  return `\u{1F534} A natural 1 \u2014 the grip slips: **${capName}** is free at once, no wound, and **${holderName}**'s next roll is a flat d20 at disadvantage.`;
+}
+
+// One break against one hold (T, 2026-11-09): a natural 20 frees them
+// whatever the totals and leaves the grappler's next attack flat; a natural
+// 1 fails; else they must beat the hold \u2014 ties keep it. (A hold of 1 never
+// gets this far: it slips first.) Returns { order, endedRet }.
+async function settleBreak(guild, gid, cid, { holderId, captiveId, capF, nat, total, holdTotal, hpState, order, roster, floor, lines }) {
+  const capName = capF.name + (capF.isNpc ? ' \u{1F3AD}' : '');
+  const hF = await resolveFighter(guild, gid, holderId);
+  const holderName = hF.name + (hF.isNpc ? ' \u{1F3AD}' : '');
+  const free = nat === 20 || (nat !== 1 && total > holdTotal);
+  let res = { order };
+  if (free) {
+    const gmap = fightGrapples(getFight(gid, cid));
+    delete gmap[captiveId];
+    setFightGrapples(gid, cid, gmap);
+    if (nat === 20) {
+      setEffectFlag(gid, cid, holderId, 'flatAtk');
+      lines.push(`\u{1F513} A natural 20 \u2014 **${capName}** bursts free of **${holderName}**, whose next attack is a flat d20!`);
+    } else lines.push(`\u{1F513} **${capName}** breaks free of **${holderName}**!`);
+  } else {
+    lines.push(nat === 1 ? '\u26D3\uFE0F A natural 1 \u2014 the hold holds.'
+      : `\u26D3\uFE0F The hold holds \u2014 **${holderName}**'s grip beats **${total}**${total === holdTotal ? ' (ties go to the grappler)' : ''}.`);
+    res = await failBreakout(guild, gid, cid, hpState, order, roster, floor, lines, captiveId, capF, nat);
+  }
+  return res;
+}
+
+// The captive's answer to a kept hold (T, 2026-11-09): break free against
+// the hold's roll, or stay. Either way the grappler's turn then ends.
+// `roll` is the break ({ nat, total, mode, flat }); none is a stay.
+async function resolveBreakFree(guild, gid, cid, fight, { roll = null, flavour = null } = {}) {
+  const roster = fightOrder(fight);
+  const holderId = roster[fight.turn_index];
+  const captiveId = fight.current_target;
+  const hpState = fightHp(fight), floor = fightFloor(fight);
+  const hF = await resolveFighter(guild, gid, holderId);
+  const capF = await resolveFighter(guild, gid, captiveId);
+  const holderName = hF.name + (hF.isNpc ? ' \u{1F3AD}' : '');
+  const capName = capF.name + (capF.isNpc ? ' \u{1F3AD}' : '');
+  // A hold of 1 slips before any answer is read \u2014 a rerolled hold that
+  // came up a 1 lands here (a kept hold of 1 slips as it is rolled).
+  const slipped = fight.atk_nat === 1;
+  const lines = ['\u2500'.repeat(29), slipped
+    ? `\u{1F91C}  **The grip slips** \u2014 ${holderName} loses ${capName}`
+    : roll
+    ? `\u{1F513}  **Break free** \u2014 ${capName} against ${holderName}'s hold`
+    : `\u26D3\uFE0F  **Stay** \u2014 ${capName} in ${holderName}'s hold`, ''];
+  withWords(lines, flavour);
+  lines.push(`${holderName} (**STR** hold): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
+  let order = [...roster];
+  if (slipped) {
+    lines.push('', slipHold(gid, cid, holderId, captiveId, holderName, capName));
+  } else if (!roll) {
+    // Already paid this round (a failed break earlier): nothing more at the turn's end.
+    const paidS = !!JSON.parse(getFight(gid, cid)?.effect_state || '{}')[captiveId]?.holdPaid;
+    lines.push('', `\u26D3\uFE0F **${capName}** stays in the hold \u2014 it keeps${paidS ? '; this round\'s wound is already paid.' : ', and this round\'s wound lands at the end of their turn.'}`);
+    if (fight.atk_nat === 20) {
+      setFooled(gid, cid, captiveId);
+      lines.push(`\u{1F7E1} The hold's natural 20 stays with them \u2014 their next roll is a flat d20.`);
+    }
+  } else {
+    lines.push(`${capName} (**STR** break${roll.flat ? ', flat d20' : ''}${roll.mode === 'adv' ? ', advantage' : roll.mode === 'dis' ? ', disadvantage' : ''}): ${fightTotalStr(roll.total, roll.nat, 20)}`, '');
+    const r = await settleBreak(guild, gid, cid, { holderId, captiveId, capF, nat: roll.nat, total: roll.total,
+      holdTotal: fight.atk_roll, hpState, order, roster, floor, lines });
+    if (r.endedRet) return r.endedRet;
+    order = r.order;
+  }
+  try {
+    const freed = !fightGrapples(getFight(gid, cid))[captiveId];
+    noteQuestActivity(gid, cid, 'combat', freed ? `${capF.name} breaks free of ${hF.name}` : `${hF.name} keeps ${capF.name} held`);
+  } catch {}
+  return passTurn(guild, gid, cid, hpState, order, roster, floor, lines, holderId);
 }
 
 // ── Exchange resolution ───────────────────────────────────────────────────────
@@ -11818,7 +12056,7 @@ async function applyTurnEndStrain(guild, gid, cid, hpState, order, roster, floor
 // Returns { lines, ended, announce } where `announce` is the payload for
 // announceFightEnd when the fight finished, and `nextF` is the fighter whose
 // turn it now is (null when the fight ended).
-async function resolveExchange(guild, gid, cid, fight) {
+async function resolveExchange(guild, gid, cid, fight, { forceHit = false } = {}) {
   const turnOrder = fightOrder(fight);
   const attackerId = turnOrder[fight.turn_index];
   const defenderId = fight.current_target;
@@ -11855,8 +12093,14 @@ async function resolveExchange(guild, gid, cid, fight) {
     }
     if (effDirty) upsertFight(gid, cid, { effect_state: JSON.stringify(eff) });
   }
+  // A feint that fooled them lands whatever the totals (T, 2026-11-09) \u2014
+  // its naturals can carry it past a better insight \u2014 and so does a blow
+  // read by a defensive feint of 1, a total failure. The damage ladder still
+  // reads both dice, so an attack of 1 fumbles all the same.
+  const feintDefPending = !!JSON.parse(getFight(gid, cid)?.effect_state || '{}')[defenderId]?.feintDef;
+  const forced = forceHit || (feintDefPending && fight.def_nat === 1);
   const { hit, dmg, crit: atkCrit, detail: dmgDetail, clash } = resolveDamage(
-    fight.atk_roll, fight.atk_nat, 20,
+    forced ? Math.max(fight.atk_roll ?? 0, fight.def_roll ?? 0) : fight.atk_roll, fight.atk_nat, 20,
     fight.def_roll, fight.def_nat, 20, gid, dmgCtx
   );
 
@@ -11895,15 +12139,21 @@ async function resolveExchange(guild, gid, cid, fight) {
   const handOver = (order, index) => announceNextTurn(guild, gid, cid, lines, order, index);
   const clearRolls = { ...FRESH_EXCHANGE };
 
-  // A defence rolled as a feint: reading the blow leaves the attacker
-  // off-balance, and the defender pays the usual flat next defence.
+  // A defence rolled as a feint (T, 2026-11-09): read right \u2014 the blow
+  // missed \u2014 the attacker is taken in, their next roll a flat d20. The
+  // feinter pays the trick's price either way, their own next roll flat; a
+  // natural 1 is a total failure \u2014 the blow lands whatever the totals \u2014
+  // and that roll at disadvantage too.
   if (consumeEffectFlag(gid, cid, defenderId, 'feintDef')) {
+    const botched = fight.def_nat === 1;
     lines.push(`🎭 **${defName}** read the blow rather than blocking it.`);
-    setEffectFlag(gid, cid, defenderId, 'flatDef');
-    if (!hit) {
-      setEffectFlag(gid, cid, attackerId, 'flatAtk');
-      lines.push(`↳ **${atkName}** is left **off-balance** — their next attack rolls flat.`);
+    if (!hit && !botched) {
+      setFooled(gid, cid, attackerId);
+      lines.push(`↳ **${atkName}** is taken in \u2014 their next roll is a flat d20.`);
     }
+    chargeTrick(gid, cid, defenderId, botched);
+    lines.push(botched ? `_🎭 A natural 1 \u2014 the read fails outright${hit ? ' and the blow lands, whatever the totals' : ''}; **${defName}**'s next roll is a flat d20, at disadvantage._`
+      : `_🎭 The price: **${defName}**'s next roll is a flat d20._`);
   }
 
   if (hit && dmgDetail) lines.push(`🎲 Damage: ${dmgDetail}${atkCrit ? ' — **critical!**' : ''}`);
@@ -11994,8 +12244,10 @@ async function resolveExchange(guild, gid, cid, fight) {
 
 // A grapple save resolves here, whoever rolled it. The grappler's stored
 // attempt wins ties ("meets or exceeds"); a failed save writes the hold into
-// the fight's grapple map. No damage moves, so no down handling is needed —
-// the turn simply passes.
+// the fight's grapple map. The naturals speak first (T, 2026-11-09): a grab
+// of 1 fails outright; a grab of 20 takes the hold whatever the save, for 2
+// wounds; a save of 20 slips free unless the grab was a 20 too. Returns
+// { lines, nextF, ended, announce, grappled }.
 async function resolveGrappleSave(guild, gid, cid, fight, { nat, total, mode = 'normal' }) {
   const turnOrder = fightOrder(fight);
   const attackerId = turnOrder[fight.turn_index];
@@ -12010,21 +12262,39 @@ async function resolveGrappleSave(guild, gid, cid, fight, { nat, total, mode = '
   lines.push(`${atkName} (**STR**): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
   lines.push(`${defName} (**STR** save${mode === 'adv' ? ', advantage' : mode === 'dis' ? ', disadvantage' : ''}): ${fightTotalStr(total, nat, 20)}`);
   lines.push('');
-  const grappled = fight.atk_roll >= total;
+  const aNat = fight.atk_nat;
+  const grappled = aNat === 1 ? false : aNat === 20 ? true : nat === 20 ? false : fight.atk_roll >= total;
+  let order = [...turnOrder];
   if (grappled) {
-    const gmap = fightGrapples(fight);
+    if (aNat === 20) {
+      lines.push(nat === 20 ? '\u26A1 **Twenty meets twenty!** The grab wins.' : '\u{1F7E1} A natural 20 \u2014 the grip takes, whatever the save.');
+      const prev = hpState[targetId] ?? 0;
+      const nh = applyFightDamage(prev, 2, floor);
+      hpState[targetId] = nh; setFighterHp(gid, targetId, nh);
+      lines.push(`🔒 **${atkName}** seizes **${defName}** for **2** wounds!`);
+      lines.push(hpChangeLine(gid, defF.isNpc, defF.name, prev, nh, defF.maxHp, floor));
+      if (nh <= floor) {
+        // Seized and finished: no hold to keep.
+        const r = await knockoutFromSpecial(guild, gid, cid, getFight(gid, cid), hpState, order, turnOrder, floor, lines, targetId, defName);
+        if (r.endedRet) return { ...r.endedRet, grappled: false };
+        return { ...(await passTurn(guild, gid, cid, hpState, r.order, turnOrder, floor, lines, attackerId)), grappled: false };
+      }
+    } else {
+      lines.push(`🔒 **${defName}** is **grappled** by **${atkName}**!`);
+    }
+    const gmap = fightGrapples(getFight(gid, cid));
     gmap[targetId] = attackerId;
     setFightGrapples(gid, cid, gmap);
-    lines.push(`🔒 **${defName}** is **grappled** by **${atkName}**!`);
-    lines.push(`_Immobile • 1 strain at each of their turn's ends • \`/fight act action:Escape\` (STR) or act on a flat d20. ${atkName} may \`/fight act action:Release\` freely, and cannot strike their captive._`);
+    consumeEffectFlag(gid, cid, targetId, 'holdPaid');   // a new hold starts unpaid
+    lines.push(`_Held \u2022 1 wound a round \u2022 break free (STR) on their turn with \`/fight act action:Escape\`, or when ${atkName} keeps the hold \u2022 or act on a flat d20. ${atkName} may \`/fight act action:Release\` freely, and cannot strike their captive._`);
+  } else if (aNat === 1) {
+    lines.push(`\u{1F4A5} **${atkName}** fumbles the grab \u2014 a natural 1, it fails outright.`);
+  } else if (nat === 20) {
+    lines.push(`💨 A natural 20 \u2014 **${defName}** twists free. No grapple.`);
   } else {
     lines.push(`💨 **${defName}** slips the hold — no grapple.`);
   }
-  const clear = { ...FRESH_EXCHANGE };
-  const nextIndex = nextStandingIndex(turnOrder, hpState, floor, fight.turn_index + 1);
-  const nextF = await announceNextTurn(guild, gid, cid, lines, turnOrder, nextIndex);
-  upsertFight(gid, cid, { ...clear, turn_index: nextIndex });
-  return { lines, nextF, grappled };
+  return { ...(await passTurn(guild, gid, cid, hpState, order, turnOrder, floor, lines, attackerId)), grappled };
 }
 
 // A condition is a word the table agreed on and, if they like, a clock:
@@ -12129,19 +12399,24 @@ async function gmSkipTurn(guild, gid, cid, reason) {
   const skipped = await resolveFighter(guild, gid, skippedId);
   const hpState = fightHp(fight);
   const floor = fightFloor(fight);
-  const clear = { ...FRESH_EXCHANGE };
   const lines = [`⏭ **${skipped?.name ?? 'Their'}**'s turn is skipped by the GM${reason ? ` — ${reason}` : ''}.`];
-  const nextIndex = nextStandingIndex(order, hpState, floor, fight.turn_index + 1);
-  await announceNextTurn(guild, gid, cid, lines, order, nextIndex);
-  upsertFight(gid, cid, { ...clear, turn_index: nextIndex });
+  // A skipped turn still ends: a held fighter's wound for the round lands
+  // (T, 2026-11-09). The lines go back to the caller to post \u2014 they used
+  // to be dropped, the next turn's ping and buttons with them.
+  const res = await passTurn(guild, gid, cid, hpState, [...order], order, floor, lines, skippedId);
   sendRollAudit(guild.client, gid, `⏭ Override — **${skipped?.name ?? skippedId}**'s turn skipped${reason ? ` (${reason})` : ''} in <#${cid}>.`);
-  return skipped?.name ?? skippedId;
+  return { name: skipped?.name ?? skippedId, ...res };
 }
 
 // A feint's insight check resolves here, whoever rolled it. Ties go to the
-// TARGET as written ("Failure: target's roll >= deceiver's"); a failed
-// insight sets the fooled flag — the target's very next rolled action is a
-// straight d20. No damage moves, so the turn simply passes.
+// TARGET as written ("Failure: target's roll >= deceiver's"). The naturals
+// speak first (T, 2026-11-09): a feint of 20 fools them whatever the
+// insight and the blow lands, crits paid; a feint of 1 is a total failure;
+// an insight of 20 sees through it unless the feint was a 20 too; an
+// insight of 1 is fooled. Fooled, their very next roll is a straight d20 and
+// the blow follows through the ordinary exchange. The feinter pays the
+// trick's price either way \u2014 their own next roll flat, at disadvantage too
+// after a 1. Returns { lines, nextF, ended, announce, fooled }.
 async function resolveFeintInsight(guild, gid, cid, fight, { nat, total, mode = 'normal' }) {
   const turnOrder = fightOrder(fight);
   const attackerId = turnOrder[fight.turn_index];
@@ -12156,31 +12431,32 @@ async function resolveFeintInsight(guild, gid, cid, fight, { nat, total, mode = 
   lines.push(`${atkName} (**WIS** feint): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
   lines.push(`${defName} (**WIS** insight${mode === 'adv' ? ', advantage' : mode === 'dis' ? ', disadvantage' : ''}): ${fightTotalStr(total, nat, 20)}`);
   lines.push('');
-  const fooled = fight.atk_roll > total;   // ties go to the target, as written
+  const fNat = fight.atk_nat;
+  const fooled = fNat === 1 ? false : fNat === 20 ? true : nat === 20 ? false : nat === 1 ? true : fight.atk_roll > total;   // ties go to the target, as written
+  const botched = fNat === 1;
+  // The price, whatever came of it.
+  chargeTrick(gid, cid, attackerId, botched);
+  const price = `_🎭 The price: **${atkName}**'s next roll is a flat d20${botched ? ', at disadvantage' : ''}._`;
   if (fooled) {
     // A feint that lands IS a blow. The insight roll becomes the defence roll
-    // and the ordinary exchange resolves it — same damage, same crit rules,
+    // and the ordinary exchange resolves it \u2014 same damage, same crit rules,
     // same knockout and log handling, so a feint can finish a fight.
-    setEffectFlag(gid, cid, targetId, 'fooled');
-    lines.push(`🎭 **${defName}** is **completely fooled** — the real blow follows!`);
-    lines.push(`_And their very next rolled action is a straight d20, no bonuses._`);
-    lines.push(`_🎭 Trade-off: **${atkName}**'s next defence roll is a flat d20._`);
-    setEffectFlag(gid, cid, attackerId, 'flatDef');
+    setFooled(gid, cid, targetId);
+    lines.push(fNat === 20 && nat === 20 ? '\u26A1 **Twenty meets twenty!** The feint wins \u2014 the real blow follows!'
+      : fNat === 20 ? `\u{1F7E1} A natural 20 \u2014 **${defName}** is fooled whatever they read, and the real blow follows!`
+      : nat === 1 ? `\u{1F534} A natural 1 on the insight \u2014 **${defName}** is completely fooled, and the real blow follows!`
+      : `🎭 **${defName}** is **completely fooled** \u2014 the real blow follows!`);
+    lines.push(`_And their very next roll is a straight d20, no bonuses._`);
+    lines.push(price);
     upsertFight(gid, cid, { def_roll: total, def_nat: nat, def_stat: 'wis', def_mode: mode, def_sides: 20 });
-    const res = await resolveExchange(guild, gid, cid, getFight(gid, cid));
-    return { lines: [...lines, ...res.lines], nextF: res.nextF, fooled: true, ended: res.ended };
+    const res = await resolveExchange(guild, gid, cid, getFight(gid, cid), { forceHit: true });
+    return { lines: [...lines, ...res.lines], nextF: res.nextF, fooled: true, ended: res.ended, announce: res.announce };
   }
-  {
-    lines.push(`👁️ **${defName}** sees through the feint — combat continues normally.`);
-  }
-  lines.push(`_🎭 Trade-off: **${atkName}**'s next defence roll is a flat d20._`);
-  const clear = { ...FRESH_EXCHANGE };
-  const nextIndex = nextStandingIndex(turnOrder, hpState, floor, fight.turn_index + 1);
-  const nextF = await announceNextTurn(guild, gid, cid, lines, turnOrder, nextIndex);
-  upsertFight(gid, cid, { ...clear, turn_index: nextIndex });
-  // The deceiver pays the flat-defence trade-off whether the feint took or not.
-  setEffectFlag(gid, cid, attackerId, 'flatDef');
-  return { lines, nextF, fooled };
+  lines.push(botched ? `\u{1F4A5} **${atkName}** botches the feint \u2014 a natural 1, a total failure.`
+    : nat === 20 ? `👁️ A natural 20 \u2014 **${defName}** sees straight through it.`
+    : `👁️ **${defName}** sees through the feint \u2014 combat continues normally.`);
+  lines.push(price);
+  return { ...(await passTurn(guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, attackerId)), fooled: false };
 }
 
 // Auto-pilot wrapper: posts to the channel. Returns whether the fight goes on.
@@ -12222,6 +12498,10 @@ async function runAutoNpcChain(guild, gid, cid, channel) {
       const defended = await autoNpcDefend(guild, gid, cid, channel);
       if (!defended) return;
       await sleep(900);
+      // A save, an insight or a break settles itself and passes the turn: on
+      // to whoever is up, rather than stopping (2026-11-09).
+      const afterD = getFight(gid, cid);
+      if (afterD?.state === 'active' && afterD.phase === 'attack') continue;
       const cont = await autoResolveExchange(guild, gid, cid, channel);
       if (!cont) return;
       await sleep(1100);
@@ -12280,6 +12560,8 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     ? '🤼 A grapple is pending — the target answers with `/fight act action:Save` (STR only).'
     : fight.atk_kind === 'feint'
     ? '🎭 A feint is pending — the target answers with `/fight act action:Insight` (WIS only).'
+    : fight.atk_kind === 'hold'
+    ? '\u{1FAA2} A kept hold is waiting on the captive \u2014 Break free or Stay.'
     : '❌ Waiting for defender to roll first.');
   if (!isNpcFighter(actorId)) {
     const gateMsg = sheetGate(gid, actorId);
@@ -12341,19 +12623,19 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     const atkBonus = flatSwing ? 0 : consumeAtkBonus(gid, cid, actorId);
     // Hero signature advantage (players and Hero NPCs alike)
     const sigRowA = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
-    mode = flatSwing ? 'normal' : applySignatureMode(sigRowA, stat, mode);
+    mode = flatMode(fooledA === 'dis' ? 'dis' : flatSwing, applySignatureMode(sigRowA, stat, mode));
     mode = applyNextMark(gid, actorId, mode);
     const effTotal = statVal + atkBonus;
     const bonusTag = atkBonus ? ` +${atkBonus} riposte` : '';
     const modStr = effTotal > 0 ? ` +${effTotal}` : effTotal < 0 ? ` ${effTotal}` : '';
 
-    let nat, dropped = null, advNote = restrained ? ' 🤼 restrained — flat d20' : offBalance ? ' 🛡️ off-balance — flat d20' : fooledA ? ' 🎭 fooled — flat d20' : '';
+    let nat, dropped = null, advNote = restrained ? ' 🤼 restrained — flat d20' : offBalance ? ' 🛡️ off-balance — flat d20' : fooledA ? ' 🎭 flat d20' : '';
     if (mode === 'adv') {
       const r1 = rollDie(20), r2 = rollDie(20);
-      nat = Math.max(r1, r2); dropped = Math.min(r1, r2); advNote = ' (advantage)';
+      nat = Math.max(r1, r2); dropped = Math.min(r1, r2); advNote += ' (advantage)';
     } else if (mode === 'dis') {
       const r1 = rollDie(20), r2 = rollDie(20);
-      nat = Math.min(r1, r2); dropped = Math.max(r1, r2); advNote = ' (disadvantage)';
+      nat = Math.min(r1, r2); dropped = Math.max(r1, r2); advNote += ' (disadvantage)';
     } else {
       nat = rollDie(20);
     }
@@ -12362,7 +12644,7 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     // Two renderings of the same throw: the full line is what the audit keeps;
     // when this server hides NPC stats, the public card drops the stat name
     // and modifier — same convention as the auto-pilot cards.
-    const lineFor = (show) => `⚔️  1d20${show ? `+${STAT_LABELS[stat]}` : ''}${bonusTag}${advNote} → ${diceBit}${show ? modStr : ''} = ${fightTotalStr(total, nat, 20)}`;
+    const lineFor = (show) => `⚔️  1d20${show && !flatSwing ? `+${STAT_LABELS[stat]}` : ''}${bonusTag}${advNote} → ${diceBit}${show ? modStr : ''} = ${fightTotalStr(total, nat, 20)}`;
     const rollLine = lineFor(true);
     const publicLine = (actor.isNpc && !npcStatsVisible(gid)) ? lineFor(false) : rollLine;
     const targetName = targetF.name + (targetF.isNpc ? ' 🎭' : '');
@@ -12472,6 +12754,13 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
 // pays 1 strain when their own turn ends (the resolver and escape both apply
 // it); the holder may release freely and can never strike their captive.
 
+// The edge an automatic roll takes: a botched trick's disadvantage, else a
+// signature's advantage unless the roll is flat.
+const autoEdge = (flat, row, stat) => (flat === 'dis' ? 'dis' : (!flat && hasSignatureAdvantage(row, stat)));
+// The audit tag of an automatic roll's mode.
+const autoTag = (r) => (r?.adv ? ' (adv)' : r?.dis ? ' (dis)' : '');
+// Two dice when two were thrown.
+const autoDice = (r) => ((r?.adv || r?.dis) && r.dropped != null ? `[${r.nat}, ~~${r.dropped}~~]` : `[${r.nat}]`);
 // One d20 under a roll mode: {nat, dropped}. The grapple family shares it.
 function rollD20Mode(mode) {
   if (mode === 'adv') { const r1 = rollDie(20), r2 = rollDie(20); return { nat: Math.max(r1, r2), dropped: Math.min(r1, r2) }; }
@@ -12527,6 +12816,13 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
     return refuse(floor > 0 ? '❌ That fighter has already yielded the bout.' : '❌ That target is already down.');
   }
 
+  {
+    // Knightfall: a grip needs STR 4+ (T, 2026-11-09). Asked before any
+    // penalty is spent, so a refusal costs nothing.
+    const barG = abilityNeeds(gid, 'grapple');
+    const meG = await resolveFighter(interaction.guild, gid, actorId);
+    if (belowBar(meG.stats, barG)) return refuse(`\u{1F93C} Grappling needs **${barG.label} ${barG.need}+** \u2014 you need the strength to hold on.`);
+  }
   // A grapple attempt is an attack roll — the deflection and feint penalties
   // clamp it too.
   const offBalance = consumeFlatAtk(gid, cid, actorId) || consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
@@ -12539,15 +12835,15 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
   const targetF = await resolveFighter(interaction.guild, gid, targetId);
   const statVal = offBalance ? 0 : (actor.stats.str ?? 0);
   const sigRowA = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
-  mode = offBalance ? 'normal' : applySignatureMode(sigRowA, 'str', mode);
+  mode = flatMode(offBalance, applySignatureMode(sigRowA, 'str', mode));
   mode = applyNextMark(gid, actorId, mode);
   const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
 
   const { nat, dropped } = rollD20Mode(mode);
-  const advNote = offBalance ? ' 🛡️ off-balance — flat d20' : mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '';
+  const advNote = (offBalance ? ' 🎭 flat d20' : '') + (mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '');
   const total = nat + statVal;
   const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
-  const lineFor = (show) => `🤼  1d20${show ? '+STR' : ''}${advNote} → ${diceBit}${show ? modStr : ''} = ${fightTotalStr(total, nat, 20)}`;
+  const lineFor = (show) => `🤼  1d20${show && !offBalance ? '+STR' : ''}${advNote} → ${diceBit}${show ? modStr : ''} = ${fightTotalStr(total, nat, 20)}`;
   const rollLine = lineFor(true);
   const publicLine = (actor.isNpc && !npcStatsVisible(gid)) ? lineFor(false) : rollLine;
   const targetName = targetF.name + (targetF.isNpc ? ' 🎭' : '');
@@ -12641,14 +12937,14 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
   }
 
   const statVal = flatFeint ? 0 : (actor.stats.wis ?? 0);
-  mode = flatFeint ? 'normal' : applySignatureMode(subjectRow, 'wis', mode);
+  mode = flatMode(flatFeint, applySignatureMode(subjectRow, 'wis', mode));
   mode = applyNextMark(gid, actorId, mode);
   const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
   const { nat, dropped } = rollD20Mode(mode);
-  const advNote = flatFeint ? ' 🎭 flat d20' : mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '';
+  const advNote = (flatFeint ? ' 🎭 flat d20' : '') + (mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '');
   const total = nat + statVal;
   const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
-  const lineFor = (show) => `🎭  1d20${show ? '+WIS' : ''}${advNote} → ${diceBit}${show ? modStr : ''} = ${fightTotalStr(total, nat, 20)}`;
+  const lineFor = (show) => `🎭  1d20${show && !flatFeint ? '+WIS' : ''}${advNote} → ${diceBit}${show ? modStr : ''} = ${fightTotalStr(total, nat, 20)}`;
   const rollLine = lineFor(true);
   const publicLine = (actor.isNpc && !npcStatsVisible(gid)) ? lineFor(false) : rollLine;
   const targetName = targetF.name + (targetF.isNpc ? ' 🎭' : '');
@@ -12711,16 +13007,17 @@ async function runFightInsight({ interaction, gid, cid, actorId, mode, flavour =
     return refuse(`⚠️ The feint is aimed at **${t.name}** — the insight is theirs.`);
   }
   const actor = await resolveFighter(interaction.guild, gid, actorId);
-  // Already fooled from an earlier feint? Even the insight rolls flat.
+  // A flat already owed \u2014 fooled earlier, or a trick's price? Even the
+  // insight rolls flat, at disadvantage after a botched trick.
   const fooledI = consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
   const statVal = fooledI ? 0 : (actor.stats.wis ?? 0);
   const sigRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
-  mode = fooledI ? 'normal' : applySignatureMode(sigRow, 'wis', mode);
+  mode = flatMode(fooledI, applySignatureMode(sigRow, 'wis', mode));
   mode = applyNextMark(gid, actorId, mode);
   const { nat, dropped } = rollD20Mode(mode);
   const total = nat + statVal;
   const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
-  const rollLine = `🎭  1d20${fooledI ? '' : '+WIS'} (insight)${fooledI ? ' 🎭 fooled — flat d20' : ''} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)}`;
+  const rollLine = `🎭  1d20${fooledI ? '' : '+WIS'} (insight)${fooledI ? ' 🎭 flat d20' : ''}${mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : ''} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)}`;
   if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'feint insight WIS');
   recordRoll(gid, { userId: uid, channelId: cid, interaction,
     kind: isNpcFighter(actorId) ? 'npcs' : null, card: null,
@@ -12734,6 +13031,8 @@ async function runFightInsight({ interaction, gid, cid, actorId, mode, flavour =
   } else {
     await replyLong(interaction, r.lines);
   }
+  // A feint can finish a fight; the winner is named, as any other end is.
+  if (r.ended) return announceFightEnd(interaction.guild, gid, cid, chan, r.announce);
   await kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
   return;
 }
@@ -12752,11 +13051,12 @@ async function runFightGrappleSave({ interaction, gid, cid, actorId, mode, flavo
   const fooledR = consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
   const statVal = fooledR ? 0 : (actor.stats.str ?? 0);
   const sigRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
-  mode = fooledR ? 'normal' : applySignatureMode(sigRow, 'str', mode);
+  mode = flatMode(fooledR, applySignatureMode(sigRow, 'str', mode));
+  mode = applyNextMark(gid, actorId, mode);
   const { nat, dropped } = rollD20Mode(mode);
   const total = nat + statVal;
   const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
-  const rollLine = `🤼  1d20+STR (save) → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)}`;
+  const rollLine = `🤼  1d20${fooledR ? '' : '+STR'} (save)${fooledR ? ' 🎭 flat d20' : ''}${mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : ''} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)}`;
   if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'grapple save STR');
   recordRoll(gid, { userId: uid, channelId: cid, interaction,
     kind: isNpcFighter(actorId) ? 'npcs' : null, card: null,
@@ -12770,15 +13070,17 @@ async function runFightGrappleSave({ interaction, gid, cid, actorId, mode, flavo
   } else {
     await replyLong(interaction, r.lines);
   }
+  if (r.ended) return announceFightEnd(interaction.guild, gid, cid, chan, r.announce);
   await kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
   return;
 }
 
-// Keeping a hold now costs a roll (T, 2026-08-22): on the grappler's turn
-// they roll 1d20+STR to keep their grip and the captive rolls 1d20+STR to
-// slip it. Ties keep the hold, exactly as Escape and the initial grapple
-// do, so a hold is lost only by being beaten outright. Their alternative
-// is Release, which costs nothing.
+// Keeping a hold costs a roll (T, 2026-08-22): on the grappler's turn they
+// roll 1d20+STR to keep their grip. The captive answers it (2026-11-09):
+// \u{1F513} Break free \u2014 STR against that roll, ties keeping the hold \u2014 or
+// \u26D3\uFE0F Stay; staying, or no answer by the turn clock, keeps it. A hold
+// of 20 makes the break a flat d20; a hold of 1 leaves the grappler's next
+// attack flat. The grappler's alternative is Release, which costs nothing.
 async function runFightMaintain(interaction, { flavour = null } = {}) {
   const gid = interaction.guild.id, cid = interaction.channel.id, uid = interaction.user.id;
   const refuse = (content) => interaction.reply({ content, ephemeral: true });
@@ -12794,49 +13096,122 @@ async function runFightMaintain(interaction, { flavour = null } = {}) {
   const holderF = await resolveFighter(interaction.guild, gid, actorId);
   const captiveF = await resolveFighter(interaction.guild, gid, heldId);
   const holderRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
-  const captiveRow = isNpcFighter(heldId) ? getNpc(gid, npcNameFromFighter(heldId)) : getChar(gid, heldId);
-  const keep = autoRoll(holderF.stats.str ?? 0, hasSignatureAdvantage(holderRow, 'str'));
-  const slip = autoRoll(captiveF.stats.str ?? 0, hasSignatureAdvantage(captiveRow, 'str'));
+  // Keeping the grip is the grappler's honest roll this turn.
+  clearRoundFlag(gid, cid, actorId);
+  const flatH = consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
+  let mode = flatMode(flatH, applySignatureMode(holderRow, 'str', 'normal'));
+  mode = applyNextMark(gid, actorId, mode);
+  const statVal = flatH ? 0 : (holderF.stats.str ?? 0);
+  const { nat, dropped } = rollD20Mode(mode);
+  const total = nat + statVal;
+  const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
   const holderName = holderF.name + (holderF.isNpc ? ' \u{1F3AD}' : '');
   const captiveName = captiveF.name + (captiveF.isNpc ? ' \u{1F3AD}' : '');
+  const rollLine = `\u{1F91C}  1d20${flatH ? ' \u{1F3AD} flat d20' : '+STR'}${mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : ''} \u2192 ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)}`;
+  saveRoll(gid, cid, uid, `1d20+${statVal}`, 'hold STR');
+  recordRoll(gid, { userId: uid, channelId: cid, interaction, kind: null, card: null,
+    input: '/fight act action:Maintain', rollLine, nat, sides: 20, context: `fight \u00b7 keeps the hold on ${captiveF.name}` });
+  if (nat === 1) {
+    // A hold of 1 slips at once (T, 2026-11-09): the captive is free with no
+    // wound and nothing to answer, and the holder's turn is spent.
+    const lines = ['\u2500'.repeat(29), `\u{1F91C}  **Hold** \u2014 ${holderName} tightens their grip on ${captiveName}`, ''];
+    withWords(lines, flavour);
+    lines.push(rollLine, '', slipHold(gid, cid, actorId, heldId, holderName, captiveName));
+    try { noteQuestActivity(gid, cid, 'combat', `${holderF.name}'s grip on ${captiveF.name} slips`); } catch {}
+    const res = await passTurn(interaction.guild, gid, cid, fightHp(fight), [...turnOrder], turnOrder, fightFloor(fight), lines, actorId);
+    await replyLong(interaction, res.lines);
+    const chanS = await interactionChannel(interaction);
+    if (!chanS) return;
+    if (res.ended) return announceFightEnd(interaction.guild, gid, cid, chanS, res.announce);
+    return kickAutoIfNpcTurn(interaction.guild, gid, cid, chanS);
+  }
+  upsertFight(gid, cid, {
+    phase: 'defend', current_target: heldId, atk_kind: 'hold',
+    atk_roll: total, atk_nat: nat, atk_stat: 'str', atk_mode: mode, atk_sides: 20,
+    def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
+    atk_rerolled: 0, def_rerolled: 0,
+  });
 
-  const lines = ['\u2500'.repeat(29), `\u{1F91C}  **Hold** \u2014 ${holderName} keeps their grip on ${captiveName}`, ''];
+  const autoOn = !!fight.auto_npc;
+  const lines = ['\u2500'.repeat(29), `\u{1F91C}  **Hold** \u2014 ${holderName} tightens their grip on ${captiveName}`, ''];
   withWords(lines, flavour);
-  lines.push(`${holderName} (**STR** hold${keep.adv ? ', advantage' : ''}): ${fightTotalStr(keep.total, keep.nat, 20)}`);
-  lines.push(`${captiveName} (**STR** slip${slip.adv ? ', advantage' : ''}): ${fightTotalStr(slip.total, slip.nat, 20)}`);
+  lines.push(rollLine);
+  if (nat === 20) lines.push(`\u{1F7E1} A natural 20 \u2014 if **${captiveName}** struggles, it is on a flat d20.`);
   lines.push('');
-  const kept = keep.total >= slip.total;
-  if (kept) {
-    lines.push(`\u{1F91C} **${holderName}** holds fast \u2014 **${captiveName}** is going nowhere.`);
+  let components = [];
+  if (!captiveF.isNpc) {
+    lines.push(`\u{1FAA2} <@${heldId}> \u2014 \u{1F513} **Break free** (STR, beat **${total}**) or \u26D3\uFE0F **Stay**. Staying, or no answer by the turn clock, keeps the hold. Breaking out costs nothing; a failed break takes this round's wound at once, a natural 1 two.`);
+    components = fightAnswerRows('breakfree');
+  } else if (autoOn) {
+    lines.push(`\u{1F916} **${captiveF.name}** struggles against it...`);
   } else {
-    const gmap = fightGrapples(fight);
-    delete gmap[heldId];
-    setFightGrapples(gid, cid, gmap);
-    lines.push(`\u{1F4A8} **${captiveName}** twists loose \u2014 the hold is broken!`);
+    lines.push(`\u{1FAA2} A GM answers for **${captiveF.name}** \u2014 \u{1F513} Break free or \u26D3\uFE0F Stay (\`/fight act action:Escape npc:${captiveF.name}\` or \`action:Stay\`).`);
+    components = fightAnswerRows('breakfree', { forNpc: true });
   }
-  try { noteQuestActivity(gid, cid, 'combat', `${holderName} ${kept ? 'holds' : 'loses'} ${captiveName}`, uid); } catch {}
+  await interaction.reply({ content: lines.join('\n'), components, allowedMentions: captiveF.isNpc ? { parse: [] } : { users: [heldId] } });
+  if (captiveF.isNpc && autoOn) {
+    await new Promise(r => setTimeout(r, 1200));
+    const chan = await interactionChannel(interaction);
+    if (chan) await runAutoNpcChain(interaction.guild, gid, cid, chan);
+  }
+}
 
-  // Keeping a grip IS the grappler's action, so the turn is spent and the
-  // end-of-turn strain lands — exactly as Escape spends the captive's. The
-  // first cut of this returned here and stalled the fight (audit, same day).
-  const hpState = fightHp(fight);
-  const floor = fightFloor(fight);
-  const chan = await interactionChannel(interaction);
-  const st = await applyTurnEndStrain(interaction.guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, actorId);
-  if (st.endedRet) {
-    await replyLong(interaction, st.endedRet.lines);
-    return announceFightEnd(interaction.guild, gid, cid, chan, st.endedRet.announce);
+// The captive breaks against a kept hold \u2014 by hand, or a GM for an NPC.
+async function runFightBreakFree({ interaction, gid, cid, actorId, mode, flavour, chan, fight, refuse }) {
+  const uid = interaction.user.id;
+  {
+    const gate0 = deathGate(gid, actorId);
+    if (gate0) return refuse(gate0);
   }
-  const order = st.order;
-  const shrunk = order.length !== turnOrder.length;
-  const nextIndex = nextStandingIndex(order, hpState, floor, shrunk ? fight.turn_index : fight.turn_index + 1);
-  await announceNextTurn(interaction.guild, gid, cid, lines, order, nextIndex);
-  upsertFight(gid, cid, { ...FRESH_EXCHANGE,
-    turn_index: nextIndex, hp_state: JSON.stringify(hpState),
-    ...(shrunk ? { turn_order: JSON.stringify(order) } : {}) });
-  await replyLong(interaction, lines);
+  const actor = await resolveFighter(interaction.guild, gid, actorId);
+  // A hold of 20 makes the break a flat d20 (T, 2026-11-09); so does a flat
+  // they already carry, with its rider.
+  const fooledB = consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
+  const flatB = fooledB || fight.atk_nat === 20;
+  const sigRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
+  mode = flatMode(fooledB === 'dis' ? 'dis' : flatB, applySignatureMode(sigRow, 'str', mode));
+  mode = applyNextMark(gid, actorId, mode);
+  const statVal = flatB ? 0 : (actor.stats.str ?? 0);
+  const { nat, dropped } = rollD20Mode(mode);
+  const total = nat + statVal;
+  const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
+  const rollLine = `\u{1F513}  1d20${flatB ? ' \u{1F3AD} flat d20' : '+STR'}${mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : ''} \u2192 ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)} vs hold ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`;
+  if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'break free STR');
+  recordRoll(gid, { userId: uid, channelId: cid, interaction,
+    kind: isNpcFighter(actorId) ? 'npcs' : null, card: null,
+    input: `/fight act action:Escape${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
+    context: isNpcFighter(actorId) ? `fight \u00b7 GM as ${actor.name} \u{1F3AD} breaks against a hold` : 'fight \u00b7 breaks against a hold' });
+  const r = await resolveBreakFree(interaction.guild, gid, cid, fight, { roll: { nat, total, mode, flat: !!flatB }, flavour });
+  if (actor.isNpc) {
+    await sendLong(chan, r.lines, { components: r.nextF?.answerRows ?? [] });
+    await interaction.reply({ content: `\u2705 Struggled as **${actor.name}**.`, ephemeral: true });
+  } else {
+    await replyLong(interaction, r.lines);
+  }
+  if (r.ended) return announceFightEnd(interaction.guild, gid, cid, chan, r.announce);
   await kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
-  return;
+}
+
+// \u26D3\uFE0F Stay: the captive lets the kept hold stand.
+async function runFightStay({ interaction, gid, cid, actorId, flavour = null }) {
+  const turn = await openFightTurn(interaction, gid, cid, actorId);
+  if (turn.refused) return turn.refused;
+  const { chan, fight, refuse } = turn;
+  if (fight.phase !== 'defend' || fight.atk_kind !== 'hold') return refuse('\u{1FAA2} No hold is waiting on an answer.');
+  if (fight.current_target !== actorId) {
+    const t = await resolveFighter(interaction.guild, gid, fight.current_target);
+    return refuse(`\u26A0\uFE0F The hold is on **${t.name}** \u2014 the answer is theirs.`);
+  }
+  const actor = await resolveFighter(interaction.guild, gid, actorId);
+  const r = await resolveBreakFree(interaction.guild, gid, cid, fight, { flavour });
+  if (actor.isNpc) {
+    await sendLong(chan, r.lines, { components: r.nextF?.answerRows ?? [] });
+    await interaction.reply({ content: `\u2705 **${actor.name}** stays.`, ephemeral: true });
+  } else {
+    await replyLong(interaction, r.lines);
+  }
+  if (r.ended) return announceFightEnd(interaction.guild, gid, cid, chan, r.announce);
+  await kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
 }
 
 async function runFightEscape({ interaction, gid, cid, actorId, mode, flavour = null }) {
@@ -12844,6 +13219,9 @@ async function runFightEscape({ interaction, gid, cid, actorId, mode, flavour = 
   const turn = await openFightTurn(interaction, gid, cid, actorId);
   if (turn.refused) return turn.refused;
   const { chan, fight, refuse } = turn;
+  // A kept hold waiting on their answer: this is the break (2026-11-09).
+  if (fight.phase === 'defend' && fight.atk_kind === 'hold' && fight.current_target === actorId)
+    return runFightBreakFree({ interaction, gid, cid, actorId, mode, flavour, chan, fight, refuse });
   const turnOrder = fightOrder(fight);
   if (turnOrder[fight.turn_index] !== actorId) {
     const cur = await resolveFighter(interaction.guild, gid, turnOrder[fight.turn_index]);
@@ -12862,55 +13240,53 @@ async function runFightEscape({ interaction, gid, cid, actorId, mode, flavour = 
   // The hold answers with a live roll of its own: STR vs STR every attempt.
   const holderRow = isNpcFighter(holderId) ? getNpc(gid, npcNameFromFighter(holderId)) : getChar(gid, holderId);
   const hold = autoRoll(holderF.stats.str ?? 0, hasSignatureAdvantage(holderRow, 'str'));
-  mirrorAutoRoll(gid, cid, holderF.name, `1d20${hold.adv ? ' (adv)' : ''}`, hold, hold.total, 'grapple hold (STR)');
-  const fooledE = consumeFooled(gid, cid, actorId);
-  const statVal = fooledE ? 0 : (actor.stats.str ?? 0);
-  const sigRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
-  mode = fooledE ? 'normal' : applySignatureMode(sigRow, 'str', mode);
-  const { nat, dropped } = rollD20Mode(mode);
-  const total = nat + statVal;
-  const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
+  mirrorAutoRoll(gid, cid, holderF.name, `1d20${autoTag(hold)}`, hold, hold.total, 'grapple hold (STR)');
   const actorName = actor.name + (actor.isNpc ? ' 🎭' : '');
   const holderName = holderF.name + (holderF.isNpc ? ' 🎭' : '');
-  const rollLine = `🤼  1d20+STR → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)} vs hold ${fightTotalStr(hold.total, hold.nat, 20)}`;
-  if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'grapple escape STR');
-  recordRoll(gid, { userId: uid, channelId: cid, interaction,
-    kind: isNpcFighter(actorId) ? 'npcs' : null, card: null,
-    input: `/fight act action:Escape${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
-    context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 escape attempt` : 'fight · escape attempt' });
-
   const hpState = fightHp(fight);
   const floor = fightFloor(fight);
-  const gmap = fightGrapples(fight);
   const lines = ['\u2500'.repeat(29), `\u{1F91C}  **Escape** \u2014 ${actorName} against ${holderName}'s hold`, ''];
   withWords(lines, flavour);
-  lines.push(`${actorName} (**STR** escape): ${fightTotalStr(total, nat, 20)}`);
   lines.push(`${holderName} (**STR** hold${hold.adv ? ', advantage' : ''}): ${fightTotalStr(hold.total, hold.nat, 20)}`);
-  lines.push('');
-  const freed = total > hold.total;   // ties keep the hold — the grappler's tie rule
-  if (freed) {
-    delete gmap[actorId];
-    setFightGrapples(gid, cid, gmap);
-    lines.push(`🔓 **${actorName}** breaks free of **${holderName}**!`);
+  let r;
+  if (hold.nat === 1) {
+    // A hold of 1 slips (T, 2026-11-09): free at once, with no break to
+    // roll and no wound; a flat they owe waits for their next roll.
+    lines.push('', slipHold(gid, cid, holderId, actorId, holderName, actorName));
+    r = { order: [...turnOrder] };
   } else {
-    lines.push(`⛓️ The hold holds — **${holderName}**'s grip beats **${total}**${total === hold.total ? ' (ties go to the grappler)' : ''}.`);
+    // A hold of 20 makes the break a flat d20 (T, 2026-11-09); so does a flat
+    // they already carry, with its rider.
+    const fooledE = consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
+    const flatE = fooledE || hold.nat === 20;
+    const statVal = flatE ? 0 : (actor.stats.str ?? 0);
+    const sigRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
+    mode = flatMode(fooledE === 'dis' ? 'dis' : flatE, applySignatureMode(sigRow, 'str', mode));
+    mode = applyNextMark(gid, actorId, mode);
+    const { nat, dropped } = rollD20Mode(mode);
+    const total = nat + statVal;
+    const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
+    const rollLine = `🤼  1d20${flatE ? ' \u{1F3AD} flat d20' : '+STR'}${mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : ''} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)} vs hold ${fightTotalStr(hold.total, hold.nat, 20)}`;
+    if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'grapple escape STR');
+    recordRoll(gid, { userId: uid, channelId: cid, interaction,
+      kind: isNpcFighter(actorId) ? 'npcs' : null, card: null,
+      input: `/fight act action:Escape${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
+      context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} 🎭 escape attempt` : 'fight · escape attempt' });
+    if (hold.nat === 20) lines.push(`\u{1F7E1} The hold's natural 20 \u2014 **${actorName}** struggles on a flat d20.`);
+    lines.push(`${actorName} (**STR** escape${flatE ? ', flat d20' : ''}${mode === 'adv' ? ', advantage' : mode === 'dis' ? ', disadvantage' : ''}): ${fightTotalStr(total, nat, 20)}`);
+    lines.push('');
+    r = await settleBreak(interaction.guild, gid, cid, { holderId, captiveId: actorId, capF: actor, nat, total,
+      holdTotal: hold.total, hpState, order: [...turnOrder], roster: turnOrder, floor, lines });
   }
-  // The turn is spent either way, and the strain lands either way.
-  const st = await applyTurnEndStrain(interaction.guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, actorId);
-  if (st.endedRet) {
-    await replyLong(interaction, st.endedRet.lines);
-    return announceFightEnd(interaction.guild, gid, cid, chan, st.endedRet.announce);
+  // The turn is spent either way. Broken out, nothing more is owed; a failed
+  // break paid the round's wound already, so its end costs nothing more.
+  const res = r.endedRet ?? await passTurn(interaction.guild, gid, cid, hpState, r.order, turnOrder, floor, lines, actorId);
+  if (res.ended) {
+    await replyLong(interaction, res.lines);
+    return announceFightEnd(interaction.guild, gid, cid, chan, res.announce);
   }
-  const order = st.order;
-  const shrunk = order.length !== turnOrder.length;
-  const nextIndex = nextStandingIndex(order, hpState, floor, shrunk ? fight.turn_index : fight.turn_index + 1);
-  const upNext = await announceNextTurn(interaction.guild, gid, cid, lines, order, nextIndex);
-  upsertFight(gid, cid, { ...FRESH_EXCHANGE,
-    turn_index: nextIndex, hp_state: JSON.stringify(hpState),
-    ...(shrunk ? { turn_order: JSON.stringify(order) } : {}) });
-
   if (actor.isNpc) {
-    await sendLong(chan, lines, { components: upNext?.answerRows ?? [] });
+    await sendLong(chan, lines, { components: res.nextF?.answerRows ?? [] });
     await interaction.reply({ content: `✅ Escape rolled as **${actor.name}**.`, ephemeral: true });
   } else {
     await replyLong(interaction, lines);
@@ -12957,10 +13333,13 @@ async function retrievalTurn(guild, gid, cid, actorId, deliver) {
   const floor = fightFloor(fight);
   const F = await resolveFighter(guild, gid, actorId);
   const lines = [`⚔️ **${F.name}${F.isNpc ? ' 🎭' : ''}** spends the turn retrieving their weapon.`];
-  const nextIndex = nextStandingIndex(turnOrder, hpState, floor, fight.turn_index + 1);
-  await announceNextTurn(guild, gid, cid, lines, turnOrder, nextIndex);
-  upsertFight(gid, cid, { ...FRESH_EXCHANGE, turn_index: nextIndex });
+  // The turn ends: a held fighter's wound for the round lands (2026-11-09).
+  const res = await passTurn(guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, actorId);
   await deliver(lines);
+  if (res.ended) {
+    const chR = await guild.client.channels.fetch(cid).catch(() => null);
+    if (chR) await announceFightEnd(guild, gid, cid, chR, res.announce);
+  }
   return true;
 }
 
@@ -12979,6 +13358,7 @@ async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId
   if (fight.phase !== 'defend') return refuse('❌ No attack to deflect — nothing is pending.');
   if (fight.atk_kind === 'grapple') return refuse('🤼 A grapple cannot be deflected — answer with `/fight act action:Save`.');
   if (fight.atk_kind === 'feint') return refuse('🎭 A feint cannot be deflected — answer with `/fight act action:Insight`.');
+  if (fight.atk_kind === 'hold') return refuse('\u{1FAA2} A hold cannot be deflected \u2014 Break free or Stay.');
   if (fight.current_target !== uid) {
     const t = await resolveFighter(interaction.guild, gid, fight.current_target);
     return refuse(`⚠️ The attack is on **${t.name}** — the deflection is theirs.`);
@@ -13019,14 +13399,15 @@ async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId
     redirectF = await resolveFighter(interaction.guild, gid, redirectId);
   }
 
-  const fooledD = consumeFooled(gid, cid, uid);
+  const fooledD = consumeFooled(gid, cid, uid) || consumeFlatMark(gid, uid);
   const statVal = fooledD ? 0 : (actor.stats[stat] ?? 0);
-  mode = fooledD ? 'normal' : applySignatureMode(subject, stat, mode);
+  mode = flatMode(fooledD, applySignatureMode(subject, stat, mode));
+  mode = applyNextMark(gid, uid, mode);
   const { nat, dropped } = rollD20Mode(mode);
   const total = nat + statVal;
   const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
-  const advNote = mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '';
-  const rollLine = `🛡️  1d20+${STAT_LABELS[stat]}${advNote} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)} vs atk **${fight.atk_roll}**`;
+  const advNote = (fooledD ? ' 🎭 flat d20' : '') + (mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '');
+  const rollLine = `🛡️  1d20${fooledD ? '' : `+${STAT_LABELS[stat]}`}${advNote} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)} vs atk **${fight.atk_roll}**`;
   saveRoll(gid, cid, uid, `1d20+${statVal}`, `shield deflection ${STAT_LABELS[stat]}`);
   recordRoll(gid, { userId: uid, channelId: cid, interaction,
     kind: null, card: null,
@@ -13045,14 +13426,20 @@ async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId
     order = r.order;
     return r.endedRet ?? null;
   };
-  const deflected = total > fight.atk_roll;   // must EXCEED the attack roll
+  // The naturals speak first (T, 2026-11-09): a 20 turns the blow whatever
+  // the totals, and a named enemy takes 2; a 1 fails outright for 2, and
+  // the next defence is flat as well as the next attack.
+  const deflected = nat === 20 || (nat !== 1 && total > fight.atk_roll);   // must EXCEED the attack roll
+  if (nat === 20) lines.push('\u{1F7E1} A natural 20 \u2014 the shield turns it whatever the totals.');
+  if (nat === 1) lines.push('\u{1F534} A natural 1 \u2014 the deflection fails outright.');
   if (deflected) {
     if (redirectF) {
       const rName = redirectF.name + ' 🎭';
+      const dmgR = nat === 20 ? 2 : 1;
       const prevR = hpState[redirectId] ?? 0;
-      const nhR = applyFightDamage(prevR, 1, floor);
+      const nhR = applyFightDamage(prevR, dmgR, floor);
       hpState[redirectId] = nhR; setFighterHp(gid, redirectId, nhR);
-      lines.push(`🛡️ **${actorName}** turns the blow aside — and into **${rName}** for **1** damage!`);
+      lines.push(`🛡️ **${actorName}** turns the blow aside — and into **${rName}** for **${dmgR}** damage!`);
       lines.push(hpChangeLine(gid, true, redirectF.name, prevR, nhR, redirectF.maxHp, floor));
       if (nhR <= floor) {
         const end = await downFromDeflect(redirectId, rName);
@@ -13066,10 +13453,12 @@ async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId
       lines.push(`🛡️ **${actorName}** turns the blow aside — it strikes nothing.`);
     }
   } else {
+    const dmgS = nat === 1 ? 2 : 1;
+    if (nat === 1) setEffectFlag(gid, cid, uid, 'flatDef');
     const prev = hpState[uid] ?? 0;
-    const nh = applyFightDamage(prev, 1, floor);
+    const nh = applyFightDamage(prev, dmgS, floor);
     hpState[uid] = nh; setFighterHp(gid, uid, nh);
-    lines.push(`💥 The shield is beaten aside — **${actorName}** takes **1** damage.`);
+    lines.push(`💥 The shield is beaten aside — **${actorName}** takes **${dmgS}** damage.`);
     lines.push(hpChangeLine(gid, false, actor.name, prev, nh, actor.maxHp, floor));
     if (nh <= floor) {
       const end = await downFromDeflect(uid, actorName);
@@ -13080,7 +13469,8 @@ async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId
       }
     }
   }
-  lines.push('', `_🛡️ Trade-off: **${actorName}**'s next attack roll is a flat d20._`);
+  lines.push('', nat === 1 ? `_🛡️ Trade-off: **${actorName}**'s next attack and next defence are flat d20s._`
+    : `_🛡️ Trade-off: **${actorName}**'s next attack roll is a flat d20._`);
 
   // The attacker's turn ends — a held attacker still pays the strain.
   const aiBefore = order.indexOf(attackerId);
@@ -13124,6 +13514,7 @@ async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
   if (fight.phase !== 'defend') return refuse('❌ No attack to disarm — nothing is pending.');
   if (fight.atk_kind === 'grapple') return refuse('🤼 A grapple cannot be disarmed — answer with `/fight act action:Save`.');
   if (fight.atk_kind === 'feint') return refuse('🎭 A feint cannot be disarmed — answer with `/fight act action:Insight`.');
+  if (fight.atk_kind === 'hold') return refuse('\u{1FAA2} A hold cannot be disarmed \u2014 Break free or Stay.');
   if (fight.current_target !== uid) {
     const t = await resolveFighter(interaction.guild, gid, fight.current_target);
     return refuse(`⚠️ The attack is on **${t.name}** — the disarm is theirs.`);
@@ -13151,14 +13542,15 @@ async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
   const hpState = fightHp(fight);
   const floor = fightFloor(fight);
 
-  const fooledDi = consumeFooled(gid, cid, uid);
+  const fooledDi = consumeFooled(gid, cid, uid) || consumeFlatMark(gid, uid);
   const statVal = fooledDi ? 0 : (actor.stats.dex ?? 0);
-  mode = fooledDi ? 'normal' : applySignatureMode(subject, 'dex', mode);
+  mode = flatMode(fooledDi, applySignatureMode(subject, 'dex', mode));
+  mode = applyNextMark(gid, uid, mode);
   const { nat, dropped } = rollD20Mode(mode);
   const total = nat + statVal;
   const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
-  const advNote = mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '';
-  const rollLine = `⚔️  1d20+DEX${advNote} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)} vs atk **${fight.atk_roll}**`;
+  const advNote = (fooledDi ? ' 🎭 flat d20' : '') + (mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '');
+  const rollLine = `⚔️  1d20${fooledDi ? '' : '+DEX'}${advNote} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)} vs atk **${fight.atk_roll}**`;
   saveRoll(gid, cid, uid, `1d20+${statVal}`, 'weapon disarm DEX');
   recordRoll(gid, { userId: uid, channelId: cid, interaction,
     kind: null, card: null,
@@ -13172,45 +13564,51 @@ async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
   lines.push('');
 
   let order = [...turnOrder];
-  const disarmed = total > fight.atk_roll;   // must EXCEED the attack roll
-  if (disarmed) {
+  // The naturals speak first (T, 2026-11-09): a 20 succeeds whatever the
+  // totals, and rather than a turn spent fetching the blade the attacker
+  // takes a wound and their next attack is flat; a 1 fails outright, and the
+  // disarmer's next attack is flat as well as their next defence.
+  const disarmed = nat === 20 || (nat !== 1 && total > fight.atk_roll);   // must EXCEED the attack roll
+  const finish = async (ret) => {
+    markDisarmUsed(gid, cid, uid);
+    await replyLong(interaction, ret.lines);
+    return announceFightEnd(interaction.guild, gid, cid, chan, ret.announce);
+  };
+  if (nat === 20) {
+    setEffectFlag(gid, cid, attackerId, 'flatAtk');
+    const prevA = hpState[attackerId] ?? 0;
+    const nhA = applyFightDamage(prevA, 1, floor);
+    hpState[attackerId] = nhA; setFighterHp(gid, attackerId, nhA);
+    lines.push(`\u{1F7E1} A natural 20 \u2014 the blade is torn from **${attackerName}**'s grip and turned on them: **1** wound, and their next attack is a flat d20!`);
+    lines.push(hpChangeLine(gid, true, attackerF.name, prevA, nhA, attackerF.maxHp, floor));
+    if (nhA <= floor) {
+      const r = await knockoutFromSpecial(interaction.guild, gid, cid, getFight(gid, cid), hpState, order, turnOrder, floor, lines, attackerId, attackerName);
+      order = r.order;
+      if (r.endedRet) return finish(r.endedRet);
+    }
+  } else if (disarmed) {
     setEffectFlag(gid, cid, attackerId, 'disarmed');
     lines.push(`⚔️ The blade spins from **${attackerName}**'s grip — **no damage**, and their next turn is spent retrieving it!`);
   } else {
+    if (nat === 1) setEffectFlag(gid, cid, uid, 'flatAtk');
     const prev = hpState[uid] ?? 0;
     const nh = applyFightDamage(prev, 1, floor);
     hpState[uid] = nh; setFighterHp(gid, uid, nh);
-    lines.push(`💥 The parry misses the wrist — **${actorName}** takes **1** damage.`);
+    lines.push(nat === 1 ? `\u{1F534} A natural 1 \u2014 the disarm fails outright: **${actorName}** takes **1** damage, and their next attack is a flat d20 as well.`
+      : `💥 The parry misses the wrist — **${actorName}** takes **1** damage.`);
     lines.push(hpChangeLine(gid, false, actor.name, prev, nh, actor.maxHp, floor));
     if (nh <= floor) {
-      const r = await knockoutFromSpecial(interaction.guild, gid, cid, fight, hpState, order, turnOrder, floor, lines, uid, actorName);
+      const r = await knockoutFromSpecial(interaction.guild, gid, cid, getFight(gid, cid), hpState, order, turnOrder, floor, lines, uid, actorName);
       order = r.order;
-      if (r.endedRet) {
-        markDisarmUsed(gid, cid, uid);
-        await replyLong(interaction, r.endedRet.lines);
-        return announceFightEnd(interaction.guild, gid, cid, chan, r.endedRet.announce);
-      }
+      if (r.endedRet) return finish(r.endedRet);
     }
   }
-  lines.push('', `_⚔️ Trade-off: **${actorName}**'s next defence roll is a flat d20._`);
+  lines.push('', nat === 1 ? `_⚔️ Trade-off: **${actorName}**'s next defence and next attack are flat d20s._`
+    : `_⚔️ Trade-off: **${actorName}**'s next defence roll is a flat d20._`);
 
-  // The attacker's turn ends — a held attacker still pays the strain.
-  const aiBefore = order.indexOf(attackerId);
-  const st = await applyTurnEndStrain(interaction.guild, gid, cid, hpState, order, turnOrder, floor, lines, attackerId);
-  if (st.endedRet) {
-    markDisarmUsed(gid, cid, uid);
-    await replyLong(interaction, st.endedRet.lines);
-    return announceFightEnd(interaction.guild, gid, cid, chan, st.endedRet.announce);
-  }
-  order = st.order;
-  const ai = order.indexOf(attackerId);
-  const from = ai >= 0 ? ai + 1 : aiBefore;
-  const nextIndex = nextStandingIndex(order, hpState, floor, from);
-  await announceNextTurn(interaction.guild, gid, cid, lines, order, nextIndex);
-  const shrunkOrder = order.length !== turnOrder.length;
-  upsertFight(gid, cid, { ...FRESH_EXCHANGE,
-    turn_index: nextIndex, hp_state: JSON.stringify(hpState),
-    ...(shrunkOrder ? { turn_order: JSON.stringify(order) } : {}) });
+  // The attacker's turn ends — a held attacker still pays the round's wound.
+  const res = await passTurn(interaction.guild, gid, cid, hpState, order, turnOrder, floor, lines, attackerId);
+  if (res.ended) return finish(res);
   markDisarmUsed(gid, cid, uid);
   await replyLong(interaction, lines);
   await kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
@@ -13309,6 +13707,7 @@ function fightAnswerRows(kind, { forNpc = false, held = false, auto = false, gid
     if (kind === 'atk' && five5) return [new ActionRowBuilder().addComponents(...STRIKE_STATS_5E.map(st => N(`fnatk:${st}`, `🎭 ${STAT_LABELS[st]}`)))];
     if (kind === 'def') return [new ActionRowBuilder().addComponents(N('fndef:str', '\u{1F3AD} STR'), N('fndef:con', '\u{1F3AD} CON'), N('fndef:dex', '\u{1F3AD} DEX'), N('fndef:wis', '\u{1F3AD} WIS'), N('fndef:lck', '\u{1F3AD} LCK'))];
     if (kind === 'atk') return [new ActionRowBuilder().addComponents(N('fnatk:str', '\u{1F3AD} STR'), N('fnatk:con', '\u{1F3AD} CON'), N('fnatk:dex', '\u{1F3AD} DEX'), N('fnatk:wis', '\u{1F3AD} WIS'), N('fnatk:lck', '\u{1F3AD} LCK'))];
+    if (kind === 'breakfree') return [new ActionRowBuilder().addComponents(N('fbreak', '\u{1F3AD} Break free (STR)'), N('fstay', '\u{1F3AD} Stay'))];
     return [];
   }
   const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
@@ -13348,6 +13747,10 @@ function fightAnswerRows(kind, { forNpc = false, held = false, auto = false, gid
     B('grpfree', '\u{1F590}\uFE0F Release', ButtonStyle.Secondary))];
   if (kind === 'escape') return [new ActionRowBuilder().addComponents(
     B('fact:escape', '\u{1F91C} Break free (STR)', ButtonStyle.Primary))];
+  // The captive's answer to a kept hold (2026-11-09).
+  if (kind === 'breakfree') return [new ActionRowBuilder().addComponents(
+    B('fbreak', '\u{1F513} Break free (STR)', ButtonStyle.Primary),
+    B('fstay', '\u26D3\uFE0F Stay', ButtonStyle.Secondary))];
   if (kind === 'save') return [new ActionRowBuilder().addComponents(B('fsave', '💪 Save (STR)'), rr)];
   if (kind === 'insight') return [new ActionRowBuilder().addComponents(B('finsight', '👁️ Insight (WIS)'), rr)];
   if (kind === 'resolve') return [new ActionRowBuilder().addComponents(B('fresolve', '⚖️ Resolve', ButtonStyle.Success), rr)];
@@ -13426,6 +13829,11 @@ async function handleFight(interaction, forced) {
     if (deceptionSpent(gid, meId) || npcSpent) {
       return interaction.reply({ ephemeral: true, content:
         '🎭 That trick is spent — make an ordinary stat roll before trying another. A lie only sells once until you fight straight.' });
+    }
+    // A kept hold is answered by Break free or Stay: refused here, before the
+    // trick is spent (it was spent and then refused, audit 2026-11-09).
+    if (f0?.state === 'active' && f0.phase === 'defend' && f0.current_target === meId && f0.atk_kind === 'hold') {
+      return interaction.reply({ ephemeral: true, content: '\u{1FAA2} That is a kept hold \u2014 answer with \u{1F513} Break free (`/fight act action:Escape`) or \u26D3\uFE0F Stay.' });
     }
     if (f0?.state === 'active' && f0.phase === 'defend' && f0.current_target === meId
         && f0.atk_kind !== 'feint' && f0.atk_kind !== 'grapple') {
@@ -13516,6 +13924,7 @@ async function handleFight(interaction, forced) {
       ordered.forEach((f,i) => lines.push(`${i+1}. **${f.name}**${f.isNpc ? ' 🎭' : ''}`));
       lines.push('', `🎯 **${ordered[0].name}** goes first!${turnPrompt(ordered[0])}${turnPing(gid, ordered[0])}`);
       upsertFight(gid, cid, {
+        ...FRESH_EXCHANGE,
         state: 'active', turn_order: JSON.stringify(turnOrder), turn_index: 0,
         phase: 'attack', current_target: null, atk_kind: null,
         grapples: '{}', effect_state: '{}',
@@ -13564,6 +13973,7 @@ async function handleFight(interaction, forced) {
     lines.push(`🎯 **${first.name}** goes first!${turnPrompt(first)}${turnPing(gid, first)}`);
 
     upsertFight(gid, cid, {
+      ...FRESH_EXCHANGE,   // no grapple, feint or hold pending, no reroll spent
       state: 'active',
       // A new fight starts clean. This path (practice bouts and duels) was
       // the one that did not, so a fumble sanction from an earlier brawl in
@@ -13731,8 +14141,7 @@ async function handleFight(interaction, forced) {
     // If the pending exchange involved them, reset it
     const attackerId = turnOrder[fight.turn_index];
     if (fight.phase === 'defend' && (fid === attackerId || fid === fight.current_target)) {
-      Object.assign(patch, { phase: 'attack', current_target: null,
-        atk_roll: null, atk_nat: null, atk_stat: null, def_roll: null, def_nat: null, def_stat: null });
+      Object.assign(patch, { ...FRESH_EXCHANGE });   // its kind too: a grapple, feint or hold
       lines.push('↩️ The pending exchange was reset.');
     }
     upsertFight(gid, cid, patch);
@@ -13915,6 +14324,7 @@ async function handleFight(interaction, forced) {
       const hpState = {}; for (const fid of fighters) hpState[fid] = hp[fid];
       const rrState = {}; for (const fid of fighters) if (F[fid].isNpc) rrState[fid] = Math.max(0, F[fid].stats.lck ?? 0);
       upsertFight(gid, cid, {
+        ...FRESH_EXCHANGE,
         state: 'active', turn_order: JSON.stringify(order), turn_index: 0,
         phase: 'attack', current_target: null, atk_kind: null,
         grapples: '{}', effect_state: '{}',
@@ -14278,6 +14688,7 @@ async function handleFight(interaction, forced) {
     if (fight.phase !== 'defend') return interaction.reply({ content: '❌ No attack to defend against yet.', ephemeral: true });
     if (fight.atk_kind === 'grapple') return interaction.reply({ content: '🤼 That is a grapple — answer with `/fight act action:Save` (STR only).', ephemeral: true });
     if (fight.atk_kind === 'feint') return interaction.reply({ content: '🎭 That is a feint — answer with `/fight act action:Insight` (WIS only).', ephemeral: true });
+    if (fight.atk_kind === 'hold') return interaction.reply({ content: '\u{1FAA2} That is a kept hold \u2014 answer with \u{1F513} Break free (`/fight act action:Escape`) or \u26D3\uFE0F Stay.', ephemeral: true });
 
     const npcActAs = forcedOf(forced, 'npc') ?? interaction.options?.getString?.('npc'); // GM defending as an NPC
     const forcedStat = (forced && typeof forced === 'object') ? forced.stat : null;
@@ -14328,16 +14739,19 @@ async function handleFight(interaction, forced) {
       if (refusal) return interaction.reply({ content: refusal, ephemeral: true });
     }
     const statVal = defender.stats[stat] ?? 0;
-    // A previous nat-1 attack — or a feint that fooled you — forces a flat d20.
-    const flat = consumeFlatDef(gid, cid, defenderId) || consumeFooled(gid, cid, defenderId);
+    // A fumbled attack, a feint (taken in by one, or the price of making
+    // one), a flat mark on the sheet: a straight d20 \u2014 at disadvantage after
+    // a botched trick. A GM's mark outranks it, as on every other roll; it was
+    // spent here and then ignored on a flat defence (2026-11-09).
+    const flat = consumeFlatDef(gid, cid, defenderId) || consumeFooled(gid, cid, defenderId) || consumeFlatMark(gid, defenderId);
     // Hero signature advantage (ignored when the roll is forced flat)
     const sigRowD = isNpcFighter(defenderId) ? getNpc(gid, npcNameFromFighter(defenderId)) : getChar(gid, defenderId);
-    if (!flat) mode = applySignatureMode(sigRowD, stat, mode);
+    mode = flatMode(flat, applySignatureMode(sigRowD, stat, mode));
     mode = applyNextMark(gid, targetId, mode);
     const effVal = flat ? 0 : statVal;
-    const effMode = flat ? 'normal' : mode;
+    const effMode = mode;
     const modStr = flat ? '' : (effVal > 0 ? ` +${effVal}` : effVal < 0 ? ` ${effVal}` : '');
-    const flatTag = flat ? ' (flat d20 — fumbled last attack)' : '';
+    const flatTag = flat ? ' (flat d20)' : '';
 
     let nat, dropped = null, advNote = '';
     if (effMode === 'adv') {
@@ -14355,7 +14769,7 @@ async function handleFight(interaction, forced) {
     // and modifier dropped from the public card when NPC stats are hidden.
     // A flat defence has nothing to hide — no stat, no modifier.
     const lineFor = (show) => flat
-      ? `🛡️  1d20${flatTag} → ${diceBit} = ${fightTotalStr(total, nat, 20)}`
+      ? `🛡️  1d20${flatTag}${advNote} → ${diceBit} = ${fightTotalStr(total, nat, 20)}`
       : `🛡️  1d20${show ? `+${STAT_LABELS[stat]}` : ''}${advNote} → ${diceBit}${show ? modStr : ''} = ${fightTotalStr(total, nat, 20)}`;
     const rollLine = lineFor(true);
     const publicLine = (defender.isNpc && !npcStatsVisible(gid)) ? lineFor(false) : rollLine;
@@ -14473,6 +14887,15 @@ async function handleFight(interaction, forced) {
     const mode = interaction.options?.getString?.('roll') || 'normal';
     return runFightEscape({ interaction, gid, cid, actorId, mode, flavour: forcedOf(forced, 'flavour') });
   }
+  if (sub === 'stay') {
+    const npcActAs = forcedOf(forced, 'npc') ?? interaction.options?.getString?.('npc');
+    let actorId = interaction.user.id;
+    if (npcActAs) {
+      if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can act as an NPC.', ephemeral: true });
+      actorId = npcFighterId(npcActAs);
+    }
+    return runFightStay({ interaction, gid, cid, actorId, flavour: forcedOf(forced, 'flavour') ?? interaction.options?.getString?.('flavour') ?? null });
+  }
   if (sub === 'release') {
     const npcActAs = forcedOf(forced, 'npc') ?? interaction.options?.getString?.('npc');
     const tUser = interaction.options?.getUser?.('target');
@@ -14541,7 +14964,7 @@ async function handleFight(interaction, forced) {
       rollLine = `${icon}  1d20+${STAT_LABELS[stat]}${bonusTag} (disadvantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     } else {
       nat = rollDie(20); total = nat + effMod;
-      const label = isFlat ? `${icon}  1d20 (flat — fumbled last attack)` : `${icon}  1d20+${STAT_LABELS[stat]}${bonusTag}`;
+      const label = isFlat ? `${icon}  1d20 (flat d20)` : `${icon}  1d20+${STAT_LABELS[stat]}${bonusTag}`;
       rollLine = `${label} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
     recordRoll(gid, { userId: uid, channelId: cid, interaction,
@@ -14549,14 +14972,33 @@ async function handleFight(interaction, forced) {
 
     const member = await interaction.guild.members.fetch(uid).catch(()=>null);
     const name = member?.nickname || member?.user.username || uid;
-    const lines = [`**${name}** rerolls *(reroll)* — ${isAttacker ? 'attack' : 'defence'} with ${STAT_LABELS[stat]}!`, rollLine];
-    lines.push('', '⚡ Use \`/fight resolve\` to resolve this exchange.');
+    // Which roll it was (audit, 2026-11-09): a grab, a feint or a kept hold
+    // waits on the target's answer, never on /fight resolve.
+    const kind = isAttacker ? fight.atk_kind : null;
+    const what = kind === 'grapple' ? 'the grapple' : kind === 'feint' ? 'the feint' : kind === 'hold' ? 'the hold'
+      : isAttacker ? 'attack' : JSON.parse(fight.effect_state || '{}')[uid]?.feintDef ? 'the defensive feint' : 'defence';
+    const lines = [`**${name}** rerolls *(reroll)* — ${what} with ${STAT_LABELS[stat]}!`, rollLine];
 
     if (isAttacker) {
       upsertFight(gid, cid, { atk_roll: total, atk_nat: nat, atk_mode: mode, atk_rerolled: 1 });
     } else {
       upsertFight(gid, cid, { def_roll: total, def_nat: nat, def_mode: mode, def_rerolled: 1 });
     }
+    // A hold rerolled into a 1 slips at once (T, 2026-11-09).
+    if (kind === 'hold' && nat === 1) {
+      const rs = await resolveBreakFree(interaction.guild, gid, cid, getFight(gid, cid), {});
+      await replyLong(interaction, [...lines, ...rs.lines]);
+      if (rs.ended) return announceFightEnd(interaction.guild, gid, cid, chan, rs.announce);
+      return kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
+    }
+    const tgtF = fight.current_target ? await resolveFighter(interaction.guild, gid, fight.current_target) : null;
+    const tgt = tgtF ? `**${tgtF.name}${tgtF.isNpc ? ' 🎭' : ''}**` : 'The target';
+    if (kind === 'hold' && nat === 20) lines.push(`\u{1F7E1} A natural 20 \u2014 if ${tgt} struggles, it is on a flat d20.`);
+    lines.push('', kind === 'grapple' ? `\u{1F93C} ${tgt} answers with the STR save \u2014 \`/fight act action:Save\`.`
+      : kind === 'feint' ? `🎭 ${tgt} answers with insight \u2014 \`/fight act action:Insight\`.`
+      : kind === 'hold' ? `\u{1FAA2} ${tgt} answers \u2014 \u{1F513} Break free or \u26D3\uFE0F Stay.`
+      : (isAttacker ? fight.def_roll : fight.atk_roll) != null ? '⚡ Use \`/fight resolve\` to resolve this exchange.'
+      : `\u23F3 Waiting on ${tgt}'s defence.`);
 
     return interaction.reply({ content: lines.join('\n') });
   }
@@ -14639,11 +15081,9 @@ async function handleFight(interaction, forced) {
       const nextHint = nextF.isNpc ? ` (GM acts with \`npc:${nextF.name}\`)` : '';
       lines.push(`🎯 Fight continues — **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn!${nextHint}${turnPing(gid, nextF)}`);
       upsertFight(gid, cid, {
+        ...FRESH_EXCHANGE,   // a grapple, feint or hold pending goes with them
         turn_order: JSON.stringify(newOrder),
         turn_index: newIndex,
-        phase: 'attack',
-        current_target: null,
-        atk_roll: null, atk_nat: null, def_roll: null, def_nat: null,
       });
     }
 
@@ -14705,30 +15145,22 @@ async function handleFight(interaction, forced) {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
     const turnOrder = fightOrder(fight);
-    const hpState = JSON.parse(fight.hp_state || '{}');
+    const hpState = fightHp(fight);
     const attackerId = turnOrder[fight.turn_index];
     const waitedOnId = fight.phase === 'defend' ? fight.current_target : attackerId;
     const waitedF = await resolveFighter(interaction.guild, gid, waitedOnId);
     const lines = [`⏭️ **${waitedF.name}${waitedF.isNpc ? ' 🎭' : ''}**'s turn skipped by the GM — they stay in the fight.`];
-
-    const patch = {};
-    if (fight.phase === 'defend') {
-      Object.assign(patch, { phase: 'attack', current_target: null,
-        atk_roll: null, atk_nat: null, atk_stat: null, def_roll: null, def_nat: null, def_stat: null });
-      lines.push('↩️ The pending exchange was reset.');
+    if (fight.phase === 'defend') lines.push('↩️ The pending exchange was reset.');
+    // The turn ends as any other does (2026-11-09): a held fighter's wound
+    // for the round lands, and the next one standing is up \u2014 with the
+    // pending exchange cleared whole, its kind included.
+    const res = await passTurn(interaction.guild, gid, cid, hpState, [...turnOrder], turnOrder, fightFloor(fight), lines, attackerId);
+    await replyLong(interaction, res.lines);
+    if (res.ended) {
+      const chS = await interactionChannel(interaction);
+      if (chS) await announceFightEnd(interaction.guild, gid, cid, chS, res.announce);
     }
-    // Advance past the current attacker, skipping anyone at or below the floor
-    const skipFloor = fightFloor(fight);
-    let nextIndex = (fight.turn_index + 1) % turnOrder.length;
-    let safety = 0;
-    while ((hpState[turnOrder[nextIndex]] ?? 0) <= skipFloor && safety < turnOrder.length) {
-      nextIndex = (nextIndex + 1) % turnOrder.length; safety++;
-    }
-    patch.turn_index = nextIndex;
-    upsertFight(gid, cid, patch);
-    const nextF = await resolveFighter(interaction.guild, gid, turnOrder[nextIndex]);
-    lines.push(`🎯 **${nextF.name}${nextF.isNpc ? ' 🎭' : ''}**'s turn to attack.${turnPing(gid, nextF)}`);
-    return interaction.reply({ content: lines.join('\n') });
+    return;
   }
 
   // ── END (GM only) ──────────────────────────────────────────────────────────
@@ -15779,9 +16211,11 @@ async function fightClockRemind(client, f, clock) {
   marked();
   const gmRole = getConfig(gid)?.gm_role_id || null;
   const ping = who.isNpc ? (gmRole ? ` <@&${gmRole}>` : '') : ` <@${who.id}>`;
-  const doing = w.what === 'resolve' ? 'has an exchange waiting to be resolved' : w.what === 'defend' ? 'is defending' : 'is up to attack';
+  const holdQ = w.what === 'defend' && f.atk_kind === 'hold';
+  const doing = w.what === 'resolve' ? 'has an exchange waiting to be resolved' : holdQ ? 'has a kept hold to answer \u2014 break free or stay' : w.what === 'defend' ? 'is defending' : 'is up to attack';
   const then = !clock.skip ? ''
     : w.what === 'attack' ? (clock.timeout === 'auto' ? ` At ${clock.skip} minutes the bot attacks for them.` : ` At ${clock.skip} minutes the turn is skipped.`)
+    : holdQ ? ` At ${clock.skip} minutes they stay in the hold.`
     : w.what === 'defend' ? ` At ${clock.skip} minutes the bot rolls the defence for them.`
     : ` At ${clock.skip} minutes it resolves as it stands.`;
   const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
@@ -15897,20 +16331,21 @@ async function clockStrike(guild, gid, cid, channel, mins, at = null) {
   const atkBonus = flat ? 0 : consumeAtkBonus(gid, cid, attackerId);
   const R = rulesFor(gid);
   const mod = flat ? 0 : (R.defence === 'ac' ? autoAtkBonus5e(R, attRow, stat) : (attacker.stats[stat] ?? 0)) + atkBonus;
-  const a = autoRoll(mod, !flat && hasSignatureAdvantage(attRow, stat));
-  mirrorAutoRoll(gid, cid, attacker.name, `1d20${a.adv ? ' (adv)' : ''}`, a, a.total, `fight attack (${STAT_LABELS[stat]}) — the turn clock`);
+  const a = autoRoll(mod, autoEdge(fooled === 'dis' ? 'dis' : flat, attRow, stat));
+  mirrorAutoRoll(gid, cid, attacker.name, `1d20${autoTag(a)}`, a, a.total, `fight attack (${flat ? 'flat d20' : STAT_LABELS[stat]}) — the turn clock`);
   const ac = R.defence === 'ac' ? R.targetNumber(targetF.isNpc ? getNpc(gid, targetF.name) : getChar(gid, target)) : null;
   upsertFight(gid, cid, {
     phase: 'defend', current_target: target, atk_kind: null,
-    atk_roll: a.total, atk_nat: a.nat, atk_stat: stat, atk_mode: a.adv ? 'adv' : 'normal', atk_sides: 20,
+    atk_roll: a.total, atk_nat: a.nat, atk_stat: stat, atk_mode: a.adv ? 'adv' : a.dis ? 'dis' : 'normal', atk_sides: 20,
     atk_rerolled: 0, def_rerolled: 0, atk_used: 0,
     ...(ac != null ? { def_roll: ac, def_nat: 0, def_stat: 'ac', def_mode: 'normal' } : { def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal' }),
   });
   const hide = attacker.isNpc && !npcStatsVisible(gid);
-  const why = restrained ? ' 🤼 restrained — flat' : offBalance ? ' 🛡️ off-balance — flat' : fooled ? ' 🎭 fooled — flat' : a.adv ? ' (advantage)' : '';
+  const why = (restrained ? ' 🤼 restrained — flat' : offBalance ? ' 🛡️ off-balance — flat' : fooled ? ' 🎭 flat d20' : '')
+    + (a.adv ? ' (advantage)' : a.dis ? ' (disadvantage)' : '');
   const lines = [
     `⏳ ${mins} minutes quiet — the bot attacks for **${attacker.name}${attacker.isNpc ? ' 🎭' : ''}**, at **${targetF.name}${targetF.isNpc ? ' 🎭' : ''}**${hide || flat ? '' : ` with **${STAT_LABELS[stat]}**`}.`,
-    `⚔️  1d20${why} → ${a.adv ? `[${a.nat}, ~~${a.dropped}~~]` : `[${a.nat}]`}${hide || !mod ? '' : (mod > 0 ? ` +${mod}` : ` ${mod}`)} = ${fightTotalStr(a.total, a.nat, 20)}`,
+    `⚔️  1d20${why} → ${autoDice(a)}${hide || !mod ? '' : (mod > 0 ? ` +${mod}` : ` ${mod}`)} = ${fightTotalStr(a.total, a.nat, 20)}`,
   ];
   if (ac != null) lines.push(`🛡️ against **${targetF.name}**'s **AC ${ac}**.`);
   let components = [];
@@ -15943,28 +16378,39 @@ async function clockDefend(guild, gid, cid, channel, mins, at = null) {
   const row = defender.isNpc ? getNpc(gid, defender.name) : getChar(gid, id);
   const name = `${defender.name}${defender.isNpc ? ' 🎭' : ''}`;
   const say = (text) => channel.send({ content: text, allowedMentions: { parse: [] } }).catch(() => {});
+  if (fight.atk_kind === 'hold') {
+    // A captive gone quiet stays in the hold (T, 2026-11-09).
+    await say(`⏳ ${mins} minutes quiet — **${name}** stays in the hold.`);
+    const r = await resolveBreakFree(guild, gid, cid, fight, {});
+    await sendLong(channel, r.lines, { components: r.nextF?.answerRows ?? [] });
+    if (r.ended) await announceFightEnd(guild, gid, cid, channel, r.announce);
+    return true;
+  }
   if (fight.atk_kind === 'grapple' || fight.atk_kind === 'feint') {
     const grapple = fight.atk_kind === 'grapple', st = grapple ? 'str' : 'wis';
-    const fooled = !grapple && consumeFooled(gid, cid, id);
-    const d = autoRoll(fooled ? 0 : (defender.stats[st] ?? 0), !fooled && hasSignatureAdvantage(row, st));
-    mirrorAutoRoll(gid, cid, defender.name, `1d20${d.adv ? ' (adv)' : ''}`, d, d.total, `${grapple ? 'grapple save (STR)' : 'feint insight (WIS)'} — the turn clock`);
+    // Their next roll, made for them: a flat it carries is spent here.
+    const flatC = consumeFooled(gid, cid, id) || consumeFlatMark(gid, id);
+    const d = autoRoll(flatC ? 0 : (defender.stats[st] ?? 0), autoEdge(flatC, row, st));
+    mirrorAutoRoll(gid, cid, defender.name, `1d20${autoTag(d)}`, d, d.total, `${grapple ? 'grapple save (STR)' : 'feint insight (WIS)'}${flatC ? ', flat d20' : ''} — the turn clock`);
     await say(`⏳ ${mins} minutes quiet — the bot rolls **${name}**'s ${grapple ? 'STR save' : 'WIS insight'}.`);
+    const mD = d.adv ? 'adv' : d.dis ? 'dis' : 'normal';
     const r = grapple
-      ? await resolveGrappleSave(guild, gid, cid, fight, { nat: d.nat, total: d.total, mode: d.adv ? 'adv' : 'normal' })
-      : await resolveFeintInsight(guild, gid, cid, fight, { nat: d.nat, total: d.total, mode: d.adv ? 'adv' : 'normal' });
+      ? await resolveGrappleSave(guild, gid, cid, fight, { nat: d.nat, total: d.total, mode: mD })
+      : await resolveFeintInsight(guild, gid, cid, fight, { nat: d.nat, total: d.total, mode: mD });
     await sendLong(channel, r.lines, { components: r.nextF?.answerRows ?? [] });
+    if (r.ended) await announceFightEnd(guild, gid, cid, channel, r.announce);
     return true;
   }
   const stat = chooseAutoStat(gid, id, defender.stats, 'def');
   const flat = consumeFlatDef(gid, cid, id) || consumeFooled(gid, cid, id) || consumeFlatMark(gid, id);
   const mod = flat ? 0 : (defender.stats[stat] ?? 0);
-  const d = autoRoll(mod, !flat && hasSignatureAdvantage(row, stat));
-  mirrorAutoRoll(gid, cid, defender.name, `1d20${d.adv ? ' (adv)' : ''}`, d, d.total,
+  const d = autoRoll(mod, autoEdge(flat, row, stat));
+  mirrorAutoRoll(gid, cid, defender.name, `1d20${autoTag(d)}`, d, d.total,
     flat ? 'fight defence (flat d20) — the turn clock' : `fight defence (${STAT_LABELS[stat]}) — the turn clock`);
-  upsertFight(gid, cid, { def_roll: d.total, def_nat: d.nat, def_stat: stat, def_mode: d.adv ? 'adv' : 'normal', def_sides: 20 });
+  upsertFight(gid, cid, { def_roll: d.total, def_nat: d.nat, def_stat: stat, def_mode: d.adv ? 'adv' : d.dis ? 'dis' : 'normal', def_sides: 20 });
   const hide = defender.isNpc && !npcStatsVisible(gid);
   await say([`⏳ ${mins} minutes quiet — the bot defends for **${name}**${hide || flat ? '' : ` with **${STAT_LABELS[stat]}**`}.`,
-    `🛡️  1d20${flat ? ' (flat)' : d.adv ? ' (advantage)' : ''} → ${d.adv ? `[${d.nat}, ~~${d.dropped}~~]` : `[${d.nat}]`}${hide || !mod ? '' : (mod > 0 ? ` +${mod}` : ` ${mod}`)} = ${fightTotalStr(d.total, d.nat, 20)}`].join('\n'));
+    `🛡️  1d20${flat ? ' (flat)' : ''}${d.adv ? ' (advantage)' : d.dis ? ' (disadvantage)' : ''} → ${autoDice(d)}${hide || !mod ? '' : (mod > 0 ? ` +${mod}` : ` ${mod}`)} = ${fightTotalStr(d.total, d.nat, 20)}`].join('\n'));
   return true;
 }
 // timeout:skip — the quiet fighter keeps their place and the next one
@@ -15977,14 +16423,25 @@ async function clockSkipFight(guild, gid, cid, channel, mins, { at = null, lead 
   if (!fight || fight.state !== 'active' || moved()) return false;
   const order = fightOrder(fight), hp = fightHp(fight), floor = fightFloor(fight);
   if (!order.length) return false;
-  const waited = await resolveFighter(guild, gid, order[fight.turn_index]);
+  const waitedId = order[fight.turn_index];
+  const waited = await resolveFighter(guild, gid, waitedId);
   if (moved()) return false;
-  let next = (fight.turn_index + 1) % order.length, safety = 0;
-  while (((hp[order[next]] ?? 0) <= floor || isFallen(gid, order[next])) && safety++ < order.length) next = (next + 1) % order.length;
-  upsertFight(gid, cid, { ...FRESH_EXCHANGE, turn_index: next, atk_used: 0 });
   try { noteQuestActivity(gid, cid, 'combat', lead ? `${waited.name}'s attack called off — its target had fallen` : `${waited.name}'s turn skipped — ${mins} minutes quiet`); } catch {}
   const lines = [lead || `⏭️ ${mins} minutes quiet — **${waited.name}${waited.isNpc ? ' 🎭' : ''}**'s turn is skipped; they stay in the fight.`];
-  const nextF = await announceNextTurn(guild, gid, cid, lines, order, next);
+  // A skipped turn still ends: a held fighter's wound for the round lands
+  // (T, 2026-11-09).
+  const st = await applyTurnEndStrain(guild, gid, cid, hp, [...order], order, floor, lines, waitedId);
+  if (st.endedRet) {
+    await sendLong(channel, st.endedRet.lines);
+    await announceFightEnd(guild, gid, cid, channel, st.endedRet.announce);
+    return true;
+  }
+  const order2 = st.order, shrunk = order2.length !== order.length;
+  let next = (shrunk ? fight.turn_index : fight.turn_index + 1) % order2.length, safety = 0;
+  while (((hp[order2[next]] ?? 0) <= floor || isFallen(gid, order2[next])) && safety++ < order2.length) next = (next + 1) % order2.length;
+  upsertFight(gid, cid, { ...FRESH_EXCHANGE, turn_index: next, atk_used: 0, hp_state: JSON.stringify(hp),
+    ...(shrunk ? { turn_order: JSON.stringify(order2) } : {}) });
+  const nextF = await announceNextTurn(guild, gid, cid, lines, order2, next);
   await sendLong(channel, lines, { components: nextF?.answerRows ?? [] });
   return true;
 }
@@ -21552,14 +22009,18 @@ async function resolveActivityRoll(ctx, statWord, flavour, io, rerolled = false,
   const say = io.reply;
 
   const stat = statWordOf(gid, statWord);
+  // A flat mark — a deception that landed, or the price of one — strips
+  // the stat here as everywhere else; a scene's roll let it pass until
+  // 2026-11-09. Its rider rolls at disadvantage, unless a tilt says otherwise.
+  const flatMk = stat && !force ? consumeFlatMark(gid, uid) : false;
   // The server's bonus: Knightfall's stat whole, a 5e modifier.
-  const mod = stat ? statBonusOf(gid, ch, stat) : 0;
+  const mod = stat && !flatMk ? statBonusOf(gid, ch, stat) : 0;
   const tallyState = JSON.parse(run.tally_state || '{}');
   // A tilt left by the last scene is spent on this roll, then forgotten.
   const tilt = tallyState._next || null;
   if (tilt) delete tallyState._next;
-  const mode = tilt || applyNextMark(gid, uid, stat ? applySignatureMode(ch, stat, 'normal') : 'normal');
-  if (stat && !force) noteHonestRoll(gid, uid);   // an ordinary stat roll re-arms deception
+  const mode = tilt || applyNextMark(gid, uid, flatMk ? flatMode(flatMk, 'normal') : stat ? applySignatureMode(ch, stat, 'normal') : 'normal');
+  if (stat && !force) noteHonestRoll(gid, uid);   // a stat roll re-arms deception, the flat one a trick costs too
   let result = mode === 'adv' ? rollAdvantage(d20Plus(mod))
              : mode === 'dis' ? rollDisadvantage(d20Plus(mod))
              : rollNotation(d20Plus(mod));
@@ -21581,7 +22042,7 @@ async function resolveActivityRoll(ctx, statWord, flavour, io, rerolled = false,
   const nat = force ? result.rolls[0] : (mode === 'normal' ? result.rolls?.[0] : result.chosen);
   const sides = result.sides ?? 20;
   const name = await getDisplayName(io.guild, uid);
-  const label = (stat || statWord).toUpperCase();
+  const label = (stat || statWord).toUpperCase() + (flatMk ? ' \u00b7 \u{1F3AD} flat d20' : '');
 
   if (!force && !run.practice) {
     recordRoll(gid, { userId: uid, channelId: cid, interaction: io.interaction ?? null, result,
@@ -23253,7 +23714,7 @@ async function handle5eStatus(interaction, kind) {
     // given. Against a 🔽 already there the two cancel, as in the rules.
     const mk = row.next_mark;
     if (mk === 'adv') return interaction.reply({ content: '❌ Their next roll already has advantage — keep the inspiration for later.', ephemeral: true });
-    if (mk === 'flat') return interaction.reply({ content: '❌ Their next roll is marked flat — spend inspiration after it.', ephemeral: true });
+    if (mk === 'flat' || mk === 'flatdis') return interaction.reply({ content: '❌ Their next roll is marked flat — spend inspiration after it.', ephemeral: true });
     write({ inspiration: 0, next_mark: mk === 'dis' ? null : 'adv' });
     return interaction.reply({ content: mk === 'dis'
       ? `✨ ${label} spends their inspiration — it cancels the 🔽 on their next roll.`
@@ -25389,6 +25850,28 @@ async function sweepOldUpdatePosts(client, gid) {
 }
 
 const CHANGELOG = [
+  { key: '2026-11-09', gm: [
+      { line: 'Grappling needs STR 4+ (Knightfall); a grab of 20 takes the hold whatever the save, for 2 wounds; a grab of 1 fails outright; a save of 20 slips free unless the grab was a 20 too',
+        detail: 'The bar is asked before anything is spent, so a refused grab costs no flat roll the grappler was owed. The 2 wounds land with the grab, and a knockout from them ends the fight as any blow does \u2014 no hold to keep. 5e asks no bar of a grapple.' },
+      { line: 'A kept hold is answered: the holder rolls STR, the captive is pinged with \u{1F513} Break free and \u26D3\uFE0F Stay \u2014 and a held fighter takes 1 wound a round, whatever happens',
+        detail: 'Maintain used to roll both sides by itself. Now the holder\u2019s STR roll goes up and the captive answers: break free against it, ties keeping the hold, or stay \u2014 by button, or `/fight act action:Escape` / `action:Stay` (new). A GM answers for an NPC; an NPC on auto always struggles. Staying, or no answer by the turn clock, keeps the hold. One wound a round: at the end of their turn, or at once when a break fails \u2014 the turn\u2019s end then costs nothing \u2014 each further failure that round 1 more, a natural 1 two; breaking out first costs nothing. A break of 20 frees them whatever the totals and leaves the holder\u2019s next attack flat; a hold of 20 makes the break a flat d20 (staying, the flat waits for their next roll); a hold of 1 slips at once \u2014 the captive is free with no wound, and the holder\u2019s next roll is a flat d20 at disadvantage. Escape on the captive\u2019s own turn is the same break, the hold rolled first. A held fighter can still attack anyone, their holder included, on a flat d20; only the holder cannot strike their captive. A held fighter\u2019s turn skipped by the clock, `/fight skip` or `/gm override skip` still ends with its wound, and the GM\u2019s skip now posts the next turn, which it used to drop.' },
+      { line: 'Feints and `/deception`: a 20 fools them whatever the insight, a 1 is a total failure; an insight of 20 sees through it, of 1 is fooled \u2014 and every trick has a price: the user\u2019s very next roll is a flat d20, at disadvantage after a 1',
+        detail: 'A feint that fools them lands as a blow whatever the totals, the crit rules as ever \u2014 a 20 hits for 2 \u2014 and their very next roll is a flat d20. A defensive feint that makes the blow miss now leaves the attacker\u2019s next roll flat, where it was their next attack. The feinter\u2019s own cost was a flat next defence; now it is their very next roll, whatever it is, on every feint and every `/deception`, landed or not \u2014 the fight\u2019s mark in a fight here, the sheet\u2019s anywhere else \u2014 and at disadvantage too after a 1. A defensive feint of 1 is a total failure too: the blow lands whatever the totals, unless the attack was a 1. One trick per honest roll still stands, and the flat roll a trick costs now counts as the honest roll that re-arms it, in a fight and out; a called check re-arms it as well. `/deception` is for away from a fight: it is refused while the deceiver or their target is fighting in that channel, where the trick is a feint. A feint that ends a fight names the winner now, and so does a grab of 20 or a break.' },
+      { line: 'Deflect: a 20 turns the blow whatever the totals and the named enemy takes 2; a 1 fails for 2 wounds and flattens the next defence as well. Disarm: a 20 wounds the attacker 1 and flattens their next attack instead of costing them a turn; a 1 fails and flattens the disarmer\u2019s next attack as well',
+        detail: 'The usual trade-offs stand \u2014 a deflector\u2019s next attack is flat, a disarmer\u2019s next defence \u2014 and a 1 adds the other. A natural 20 strike still cannot be deflected. The bot\u2019s own swings for an NPC now honour a hold and an off-balance mark, rolling flat as a player\u2019s do, so a disarm of 20 bites on auto too.' },
+      { line: 'Fixed: an NPC that feinted was written a player\u2019s sheet \u2014 and the next mend a character page named \u201cUnknown\u201d; the mend now clears both',
+        detail: 'The trick\u2019s bookkeeping read NPC fighters as `npc_` where they are `npc:`, so every NPC feint wrote a sheet row under its fighter id, and the page mend made it a page with no member behind it. The helpers read the right prefix, and the mend deletes any such row with its page. The dice-health report names NPCs again rather than \u201cUnknown\u201d.' },
+      { line: 'Fixed: a reroll of a grab, a feint or a kept hold now says which it rerolled and who answers it, where it said \u201cattack\u201d and pointed at `/fight resolve`',
+        detail: 'A defender\u2019s reroll of a defensive feint says so too, and an attack rerolled before the defence is in says it waits on the defence. A hold rerolled into a 1 slips at once. A grapple, feint or kept hold left pending when a fight ended \u2014 or when a fighter in it was kicked or forfeited \u2014 stayed on the channel\u2019s fight row, and the auto-pilot\u2019s next swing carried it, so a player\u2019s defence was refused as a grapple; a reroll spent late in one fight could be refused in the next the same way. Every way a fight ends or starts, a kick and a forfeit now clear the pending exchange. A feint pressed against a kept hold spent the trick before it was refused; it is refused first now.' },
+      { line: 'A flat mark now strips the stat from `/roll`, a scene\u2019s roll and a called check, as it did from a typed roll and every fight move',
+        detail: 'A deception\u2019s flat landed on `str` typed but slipped past `/roll stat:`, an activity scene\u2019s roll and a check a GM called; all three spend it now, its rider rolling at disadvantage. A GM\u2019s mark on a flat defence is honoured too \u2014 it was spent and then ignored. After a save, an insight or a break that settles itself, the auto-pilot carries on to whoever is up instead of waiting on the turn clock.' },
+    ], player: [
+      'Grappling needs STR 4+. A grab of 20 takes the hold whatever your save, for 2 wounds; a grab of 1 fails; a save of 20 slips free unless the grab was a 20 too',
+      'Held, you take 1 wound (1 damage) a round. When your holder keeps the grip you are pinged with \u{1F513} Break free or \u26D3\uFE0F Stay: a failed break takes the round\u2019s wound at once (1 more for each further try that round, 2 on a 1); breaking out first costs nothing; a 20 frees you and leaves their next attack flat. If their hold comes up a 1, you are free at once, no wound. Held, you can still attack anyone, your holder included, on a flat d20',
+      'A feint is the trick in a fight, `/deception` the trick away from one: a 20 always fools, a 1 always fails (a defensive feint of 1 lets the blow land); an insight of 20 sees through, of 1 is fooled. Your own very next roll after any trick is a flat d20 \u2014 at disadvantage after a 1 \u2014 and that roll counts as the honest one that lets you trick again',
+      'Deflect and Disarm have their 20s and 1s: a deflection of 20 throws 2 into the enemy you name, a disarm of 20 wounds the attacker and leaves them flat; a 1 costs you, and flattens your other next roll as well',
+      'A flat d20 owed from a deception now lands on `/roll`, a scene\u2019s roll and a called check too',
+    ] },
   { key: '2026-10-15', gm: [
       { line: 'Every fight button opens the roleplay form \u2014 attack, defence, Grapple, Feint, Deflect, Disarm, the holds, Save, Insight \u2014 and the words sit on the card; a GM\'s \u2696\uFE0F Resolve asks what happens',
         detail: 'The form targets got on 13/10 \u2014 what you do, what you say, both optional \u2014 now opens on every fight button before the roll, and the words land in the card\'s flavour block where `/fight atk flavour:` puts them, so the roll audit keeps them. Grapple and Feint ask whom first and then open the form (the feint\'s gains the two fields beside its claim); Deflect, Disarm, Maintain, Break free, Release, Save and Insight open theirs straight away. A blank form is a plain roll. Reroll acts on a roll already made and asks nothing. With one foe standing, an attack press goes straight to the form \u2014 it used to tell the player to type the command. A GM pressing \u2696\uFE0F Resolve is asked what happens; the words post in italics under the outcome, above the hand-over; a player\'s press resolves as before, and typed `/fight resolve` stays instant.' },
@@ -25954,6 +26437,24 @@ async function rebuildCharPages(interaction) {
   ].join('\n') });
 }
 
+// NPC fighters have no sheet. A feint by an NPC used to write one \u2014 the
+// trick's spend took the player's path under an 'npc:' id \u2014 and the
+// mend then gave it a character page named "Unknown" (T, 2026-11-09). The
+// rows go, and any page made for them.
+async function purgeStrayNpcSheets(client, gid) {
+  let rows = [];
+  try { rows = db.prepare("SELECT user_id FROM characters WHERE guild_id=? AND user_id LIKE 'npc:%'").all(gid); } catch { return 0; }
+  for (const r of rows) {
+    const page = getCharPage(gid, r.user_id);
+    if (page?.thread_id) {
+      const th = await client.channels.fetch(page.thread_id).catch(() => null);
+      if (th?.isThread?.()) await th.delete('A sheet written for an NPC by mistake').catch(() => {});
+    }
+    if (page) clearCharPage(gid, r.user_id);
+    db.prepare('DELETE FROM characters WHERE guild_id=? AND user_id=?').run(gid, r.user_id);
+  }
+  return rows.length;
+}
 async function mendEverything(client, guild, { log = () => {} } = {}) {
   const gid = guild.id;
   let cfg = getConfig(gid) || {};
@@ -25994,10 +26495,15 @@ async function mendEverything(client, guild, { log = () => {} } = {}) {
   try { startRunArchiveBackfill(client, gid); } catch {}
   try { const r = await ensureQuestBooks(client, guild, gid); if (r?.made?.length) made.push(`quest books +${r.made.length}`); } catch {}
 
+  // A sheet written for an NPC by the old feint (2026-11-09) goes before the
+  // pages are walked, with the page it was given.
+  try { const n = await purgeStrayNpcSheets(client, gid); if (n) made.push(`${n} stray NPC sheet(s) cleared`); } catch (e) { console.error('[mend] stray sheets', e?.message || e); }
+
   // Pages: new blocks appear on existing threads without touching the rest.
   let chars = 0;
   try {
     for (const c of allChars(gid)) {
+      if (isNpcFighter(c.user_id)) continue;
       const r = await ensureCharPage(client, guild, c.user_id, null, 'all').catch(() => null);
       if (r && !r.skipped) chars++;
       await pace(150);
@@ -27505,7 +28011,7 @@ function showDcForm(interaction) {
     T('fail', 'On failure — tags, then the words', TextInputStyle.Paragraph,
       '[dis] [dex-1] [-3hp] — same shape, and the words they dread', 900),
     T('targets', 'Targets — @players and/or NPCs', TextInputStyle.Short,
-      'blank keeps the ones you picked · @Ari @Bo Orc, Goblin', 200),
+      'blank keeps the ones you picked · @Artorius @Meliora Hollow, Hollow tank', 200),
   );
   return interaction.showModal(modal);
 }
@@ -27699,9 +28205,14 @@ const dcFaceOf = (p, gid = null) => p.notation ?? (p.stat ? checkLabel(gid, gid 
 async function rollCalledCheck(guild, gid, cid, p, ch) {
   // A notation that no longer reads spends nothing \u2014 not even a mark.
   if (p.notation && !parseNotation(p.notation)) return null;
-  const markedMode = applyNextMark(gid, p.uid, p.gmMode);
-  const r = rollDcCheck({ gid, stat: p.stat, notation: p.notation, dc: p.dc, gmMode: markedMode, flat: p.flat, modifier: p.modifier, subject: ch, sig: ch });
+  // A flat mark strips the stat from a called check too (2026-11-09); its
+  // rider rolls at disadvantage unless the GM set the check's own mode.
+  const flatMk = p.stat && !p.flat ? consumeFlatMark(gid, p.uid) : false;
+  const markedMode = applyNextMark(gid, p.uid, flatMk === 'dis' && (p.gmMode || 'normal') === 'normal' ? 'dis' : p.gmMode);
+  const r = rollDcCheck({ gid, stat: p.stat, notation: p.notation, dc: p.dc, gmMode: markedMode, flat: p.flat || !!flatMk, modifier: p.modifier, subject: ch, sig: ch });
   if (!r) return null;
+  // A called stat check is an honest roll too, flat or not (2026-11-09).
+  if (p.stat) noteHonestRoll(gid, p.uid);
   try {
     const whoDc = await getDisplayName(guild, p.uid).catch(() => 'Someone');
     noteQuestActivity(gid, cid, 'roll', `${whoDc}: ${dcFaceOf(p, gid)} ${r.total} vs DC ${p.dc} \u2014 ${r.passed ? 'passed' : 'failed'}`, p.uid);
@@ -27728,7 +28239,12 @@ async function settleCalledCheck(guild, gid, cid, p, r, cardMsgId) {
     if (!r.passed && marks.bind_skip) {
       const bf = getFight(gid, marks.bind_channel);
       if (bf?.state === 'active' && fightOrder(bf)[bf.turn_index] === p.uid) {
-        await gmSkipTurn(guild, gid, marks.bind_channel, 'the check failed').catch(() => null);
+        const sk = await gmSkipTurn(guild, gid, marks.bind_channel, 'the check failed').catch(() => null);
+        const chB = sk ? await guild.client.channels.fetch(marks.bind_channel).catch(() => null) : null;
+        if (chB?.send) {
+          await sendLong(chB, sk.lines, { components: sk.nextF?.answerRows ?? [] });
+          if (sk.ended) await announceFightEnd(guild, gid, marks.bind_channel, chB, sk.announce);
+        }
       }
     }
   }
@@ -27993,13 +28509,14 @@ function rollForRp(gid, uid, ch, { stat = null, notation = null }) {
   let mode = 'normal', label = notation, use = notation;
   if (stat) {
     label = R.labels?.[stat] || stat.toUpperCase();
-    if (consumeFlatMark(gid, uid)) { use = '1d20'; label = `${label} \u00b7 \u{1F3AD} fooled`; }
+    const flatMk = consumeFlatMark(gid, uid);
+    if (flatMk) { use = '1d20'; label = `${label} \u00b7 \u{1F3AD} flat d20`; if (flatMk === 'dis') mode = 'dis'; }
     else {
       mode = applySignatureMode(ch, stat, mode);
-      noteHonestRoll(gid, uid);
       const b = Number(R.statBonus(ch, stat)) || 0;
       use = `1d20${b >= 0 ? '+' : ''}${b}`;
     }
+    noteHonestRoll(gid, uid);   // flat or not, a stat roll re-arms the trick
   }
   // A mark is spent by whatever /rp rolls next, dice as well as a stat \u2014
   // advantage on several dice now rolls the set twice (2026-11-07).
@@ -28459,8 +28976,8 @@ async function pressGmBar(interaction, which) {
   if (which === 'fight') {
     const m = new ModalBuilder().setCustomId('gmbarfight').setTitle('Start a fight here');
     m.addComponents(
-      T('players', 'Players \u2014 @mention them', TextInputStyle.Short, '@Ari @Bo', 300),
-      T('npcs', 'NPCs \u2014 names, comma-separated', TextInputStyle.Short, 'Goblin, Orc', 200),
+      T('players', 'Players \u2014 @mention them', TextInputStyle.Short, '@Artorius @Meliora', 300),
+      T('npcs', 'NPCs \u2014 names, comma-separated', TextInputStyle.Short, 'Hollow, Hollow tank', 200),
       T('practice', 'Practice bout? yes/no', TextInputStyle.Short, 'no', 3),
     );
     return interaction.showModal(m);
@@ -28711,14 +29228,20 @@ async function fightStatusLines(guild, gid, cid, fight) {
     const rrNote = f.isNpc && fight.auto_npc ? ` · 🔁 ${rrState[fid] ?? 0}` : '';
     const fx = fxState[fid] || {};
     const fxBits = [];
-    if (fx.atkBonus) fxBits.push(`✨ +${fx.atkBonus} next attack`);
+    if (fx.rollBonus || fx.atkBonus) fxBits.push(`✨ +${fx.rollBonus || fx.atkBonus} next attack`);
     if (fx.flatDef) fxBits.push('🎲 flat-d20 next defence');
+    if (fx.flatAtk) fxBits.push('🎲 flat-d20 next attack');
+    if (fx.fooled) fxBits.push(`🎭 flat-d20 next roll${fx.fooledDis ? ', at disadvantage' : ''}`);
     const fxNote = fxBits.length ? ` · ${fxBits.join(' · ')}` : '';
     const hpText = hideHp ? hpCondition(rawHp, f.maxHp, floor) : `❤️ ${hp} / ${hpMax}${floor > 0 && rawHp <= floor ? ' 🏳️ yielded' : ''}`;
     lines.push(`${i+1}. **${f.name}${f.isNpc ? ' 🎭' : ''}** — ${hpText}${rrNote}${fxNote}${arrow}`);
   }
   lines.push('');
-  lines.push(`Phase: **${fight.phase === 'attack' ? 'Waiting for attack' : 'Waiting for defence'}**`);
+  lines.push(`Phase: **${fight.phase === 'attack' ? 'Waiting for attack'
+    : fight.atk_kind === 'hold' ? 'Waiting on the captive \u2014 break free or stay'
+    : fight.atk_kind === 'grapple' ? 'Waiting for the grapple save'
+    : fight.atk_kind === 'feint' ? 'Waiting for the insight'
+    : 'Waiting for defence'}**`);
   if (fight.atk_roll) lines.push(`Latest attack roll: **${fight.atk_roll}** (${STAT_LABELS[fight.atk_stat] ?? '?'})`);
   if (fight.def_roll) lines.push(`Latest defence roll: **${fight.def_roll}** (${STAT_LABELS[fight.def_stat] ?? '?'})`);
   return lines;
@@ -28733,6 +29256,14 @@ async function fightTurnPrompt(guild, gid, cid) {
   const curId = order[f.turn_index % order.length];
   const cur = await resolveFighter(guild, gid, curId);
   const autoNpc = !!f.auto_npc;
+  if (f.phase === 'defend' && f.current_target && f.atk_kind === 'hold') {
+    const tgtH = await resolveFighter(guild, gid, f.current_target);
+    return { content: `\u{1F91C} **${cur.name}${cur.isNpc ? ' \u{1F3AD}' : ''}** keeps the hold on **${tgtH.name}${tgtH.isNpc ? ' \u{1F3AD}' : ''}** \u2014 **${f.atk_roll ?? '?'}**.\n`
+      + (tgtH.isNpc ? (autoNpc ? `\u{1F916} **${tgtH.name}** struggles automatically...` : `\u{1FAA2} A GM answers for **${tgtH.name}** \u2014 Break free or Stay.`)
+        : `\u{1FAA2} <@${f.current_target}> \u2014 \u{1F513} Break free or \u26D3\uFE0F Stay.`),
+      components: fightAnswerRows('breakfree', { forNpc: tgtH.isNpc, auto: autoNpc }),
+      allowedMentions: tgtH.isNpc ? { parse: [] } : { users: [f.current_target] } };
+  }
   if (f.phase === 'defend' && f.current_target) {
     const tgt = await resolveFighter(guild, gid, f.current_target);
     const hint = tgt.isNpc
@@ -30318,7 +30849,7 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('id').setDescription('Question number').setRequired(true).setAutocomplete(true))),
 
   new SlashCommandBuilder()
-    .setName('deception').setDescription('Try to deceive someone — anywhere, in a fight or not')
+    .setName('deception').setDescription('Try to deceive someone, away from a fight (in one, feint)')
     .addUserOption(o=>o.setName('target').setDescription('Who you are trying to fool').setRequired(true))
     .addStringOption(o=>o.setName('claim').setDescription('What you pretend — shown to everyone').setRequired(false))
     .addStringOption(o=>o.setName('flavour').setDescription('How you sell it').setRequired(false)),
@@ -30519,7 +31050,8 @@ const slashCommands = [
         .addChoices(
           {name:'🤼 Grapple — STR; they answer with Save',value:'grapple'},
           {name:'💪 Save — your STR vs the pending grapple',value:'save'},
-          {name:'🏃 Escape — opposed STR vs the hold, on your turn',value:'escape'},
+          {name:'🏃 Escape — break a hold: STR, on your turn or when it is kept',value:'escape'},
+          {name:'⛓️ Stay — let a kept hold stand',value:'stay'},
           {name:'✋ Release — let a hold go (free action)',value:'release'},
           {name:'🛡️ Deflect — STR/DEX vs a PvE attack, may redirect',value:'deflect'},
           {name:'🗡️ Disarm — DEX vs a PvE attacker',value:'disarm'},
@@ -30577,7 +31109,7 @@ const slashCommands = [
     .addStringOption(o=>o.setName('action').setDescription('A fight ability instead of a plain roll — same menu as /fight act').setRequired(false)
       .addChoices(
         {name:'🤼 Grapple',value:'grapple'},{name:'💪 Save',value:'save'},
-        {name:'🏃 Escape',value:'escape'},{name:'✋ Release',value:'release'},
+        {name:'🏃 Escape',value:'escape'},{name:'⛓️ Stay',value:'stay'},{name:'✋ Release',value:'release'},
         {name:'🛡️ Deflect',value:'deflect'},{name:'🗡️ Disarm',value:'disarm'},
         {name:'🎭 Feint',value:'feint'},{name:'👁️ Insight',value:'insight'}))
     .addStringOption(o=>o.setName('target_npc').setDescription('Ability actions: NPC target instead of a player').setRequired(false).setAutocomplete(true))
@@ -31145,14 +31677,15 @@ const HELP_CATEGORIES = {
       '`/fight def stat:dex` — defend: the form opens (with `flavour:` it rolls at once); bare `/fight def` offers the stat buttons · GM defends as an NPC with `npc:Name`, or taps the 🎭 buttons on the NPC\'s defence prompt',
       '`roll:adv` / `roll:dis` on `/fight atk`, `def`, `act` or `rr` waits on a GM\'s yes like any roll you pick it for — name the stat with it, as the stat buttons roll plain; the turn clock waits meanwhile, and if the fight has moved on by the answer, nothing rolls',
       'Every fight button opens a short form first — what you do, what you say, both optional — and the words land on the card; a blank form is a plain roll. A GM\'s ⚖️ Resolve asks what happens and posts it under the outcome',
-      '`/fight act action:Grapple target:@Players` — STR-only grapple attempt; the target answers with `/fight act action:Save` (STR). Meets-or-exceeds and the hold takes: immobile, 1 strain at each of their turn\'s ends, actions on a flat d20',
-      '`/fight act action:Escape` — on your turn while held: 1d20+STR vs the grappler\'s STR score to break free — the strain lands either way',
+      '`/fight act action:Grapple target:@Players` — STR 4+ (Knightfall). STR against the target\'s STR save (`/fight act action:Save`); meets-or-exceeds and the hold takes. A grab of 20 takes it whatever the save, for 2 wounds; a grab of 1 fails outright; a save of 20 slips free unless the grab was a 20 too. Held: immobile, 1 wound a round, actions on a flat d20 — you can still attack anyone, your grappler included',
+      '🤜 **Maintain the hold** (the holder\'s button, on their turn) — the holder rolls STR and the captive answers: 🔓 **Break free** (STR against it; ties keep the hold) or ⛓️ **Stay** — by button, or `/fight act action:Escape` / `action:Stay`. Staying, or no answer by the turn clock, keeps the hold; an NPC on auto always struggles. A hold of 20 makes the break a flat d20 (staying, their next roll); a hold of 1 slips at once: the captive is free with no wound, and the holder\'s next roll is a flat d20 at disadvantage',
+      '`/fight act action:Escape` — on your turn while held: the hold rolls first, then your STR against it. Breaking out first costs nothing; a failed break takes the round\'s wound at once, each further failure that round 1 more, a natural 1 two. A break of 20 frees you whatever the totals and leaves the holder\'s next attack flat. The hold\'s own 20 makes your break flat; its 1 frees you at once, no wound',
       '`/fight act action:Release` — the holder lets go freely (no action); a grappler can never strike their own captive. GMs may part any hold with `target:`',
-      '`/fight act action:Deflect` — shield deflection vs a PvE strike (shield + STR 4+, once per round, crits undeflectable): roll STR or DEX (`stat:`) to beat the attack roll, optionally `redirect_npc:` into another enemy for 1 damage. Either way your next attack is a flat d20',
-      '`/fight act action:Disarm` — disarm a PvE attacker (blade + DEX 4+, once per round): roll DEX to beat the attack roll — no damage, but they spend their next turn retrieving the weapon. Either way your next defence is a flat d20',
-      '`/fight act action:Feint feint:"..."` — a feint spends either half of a fight. On your turn it is an attack: WIS against their insight, and if they fall for it the blow lands with normal damage and their next action rolls flat.',
-      '↳ With a strike pending on you it is a defence roll instead — WIS in place of your usual stat — and reading the blow leaves the attacker off-balance. Either way your own next defence rolls flat. WIS 4+; ties go to the target. One trick per honest roll: after a feint or a deception you must make an ordinary stat roll before trying another.',
-      '`/deception target:@Players claim:"..."` — the same contest away from the sword, usable anywhere. Win and their very next roll is a straight d20, be it a fight action, a chat roll or an activity.',
+      '`/fight act action:Deflect` — shield deflection vs a PvE strike (shield + STR 4+, once per round, crits undeflectable): roll STR or DEX (`stat:`) to beat the attack roll, optionally `redirect_npc:` into another enemy for 1 damage. A natural 20 turns it whatever the totals and the named enemy takes 2; a natural 1 fails for 2 wounds. Either way your next attack is a flat d20 — after a 1, your next defence too',
+      '`/fight act action:Disarm` — disarm a PvE attacker (blade + DEX 4+, once per round): roll DEX to beat the attack roll — no damage, but they spend their next turn retrieving the weapon. A natural 20 wounds them 1 instead and leaves their next attack flat; a natural 1 fails for 1 wound and leaves your next attack flat too. Either way your next defence is a flat d20',
+      '`/fight act action:Feint feint:"..."` — the trick in a fight (away from one it is `/deception`), and it spends either half of the fight. On your turn it is an attack: WIS against their insight, and if they fall for it the blow lands with normal damage and their very next roll is a flat d20. A feint of 20 fools them whatever the insight; a feint of 1 is a total failure. An insight of 20 sees through it unless the feint was a 20; an insight of 1 is fooled.',
+      '↳ With a strike pending on you it is a defensive feint — WIS in place of your usual stat — and if the blow misses, the attacker is taken in: their very next roll is a flat d20. A defensive feint of 1 is a total failure: the blow lands whatever the totals, unless the attack was a 1 too. The price of any feint, landed or not: your own very next roll is a flat d20 — at disadvantage too after a 1. WIS 4+; ties go to the target. One trick per honest roll: after a feint or a deception you must make an ordinary stat roll before trying another — the flat roll a trick costs you counts.',
+      '`/deception target:@Players claim:"..."` — the same trick away from a fight, with the same naturals and the same price. While you or they are fighting in the channel it is refused: there, the trick is a feint. Win and their very next roll is a straight d20, be it a chat roll, `/roll`, a scene\'s roll, a called check or a fight somewhere else.',
       '`/fight rr` — reroll (costs a token) · `/fight resolve` — resolve a clash',
       '`/fight status` — show current fight · `/fight forfeit` — drop out',
       '`/duel opponent:@Players terms:first blood` — raise a duel; a GM signs off, then starts the fight',
@@ -31162,7 +31695,7 @@ const HELP_CATEGORIES = {
       '`/fight hp value:N target:@Players` / `target_npc:Hollow tank` — set HP mid-fight, sheet synced (GM)',
       '`/fight kick target:@Players` / `target_npc:Hollow tank` — remove a fighter, fight continues (GM)',
       '`/fight add user:@Players [where:Next|Last]` \u2014 bring a player into a running fight: HP from their sheet, placed straight after this turn or at the end (GM)',
-      '_On your turn the bot offers buttons: the five stats to attack with, then Grapple and Feint (each asks whom; Feint then asks what you pretend). When an NPC attacks you, the defence row adds Deflect and Disarm. Holding someone adds Maintain the hold (an opposed STR roll) and Release; being held adds Break free._',
+      '_On your turn the bot offers buttons: the five stats to attack with, then Grapple and Feint (each asks whom; Feint then asks what you pretend). When an NPC attacks you, the defence row adds Deflect and Disarm. Holding someone adds Maintain the hold (your STR roll; they answer Break free or Stay) and Release; being held adds Break free._',
       '`/fight auto mode:Full teams:@Artorius @Meliora @Zeus vs Hollow, Hollow tank` — party-vs-monsters sides (GM)',
       'NPC lists accept `category:Name` to add a whole category at once',
       'When a fight ends a public 🏁 result posts in the channel — victor, everyone\'s final HP, and a 📜 recap',
@@ -31433,9 +31966,9 @@ const HELP_CATEGORIES = {
     body: [
       '_Things a GM plants in the channel for the table to press, and the ways players talk back._',
       '`/rp [action:] [speech:] [roll:] [dice:]` \u2014 roleplay as your character: bare opens the box (what you do, what you say, a stat to roll from this server\u2019s own, any dice); filled, it posts at once. The line goes out in your name and face, shaped as the cards are \u2014 *action*, \u201cspeech\u201d, then the roll beneath \u2014 and inside a run it is a \u{1F3AD} beat on the timeline and in the story scroll, the roll a roll in its log. A roll keeps the marks and signatures a typed one obeys, and `rr` rerolls it; a **stat roll answers a check the GM called on you here**, on the card\u2019s terms. Every line carries 💬 **Reply**, and beside it 🎭 **GM**: a GM answers the line as any NPC — those heard there lately first — the answer jumping back to it. A GM’s `/rp` also takes `to:` and its box a To picker; a player’s pings nobody. `/edit` fixes the words afterwards, `/edit delete:true` takes it back',
-      '`/button roll stat:dex dc:12 reason:...` \u2014 plant a check anyone may press; `dice:2d6+1` instead of a stat, `for:@Players` to address one person, `audience:@Ari @Bo @Guards` to address several players and/or a role (only they may press; the card names them all), `once:true` for one press each',
+      '`/button roll stat:dex dc:12 reason:...` \u2014 plant a check anyone may press; `dice:2d6+1` instead of a stat, `for:@Players` to address one person, `audience:@Artorius @Meliora @GMs` to address several players and/or a role (only they may press; the card names them all), `once:true` for one press each',
       '`/button group stat:wis dc:12 reason:...` \u2014 one check the whole party rolls; the message keeps the tally and \u2696\uFE0F Call it closes it with how many got through (GM)',
-      '`/target create name:Barricade [dc:12] [stat:Flat d20, STR, DEX] [dice:2d6+1] [hp:3] [for:@Players] [audience:@Ari @Bo @Guards] [success_flavour:] [fail_flavour:] [write:true]` \u2014 something to strike, with no sheet. `for:` addresses one player, `audience:` several and/or a role \u2014 only they may swing, and the card names them. `hp:` is the hits it takes: with a DC a roll that meets it takes one off with no call, with no DC each pass you call does; it falls at 0. `write:true` opens a box for the scene and the two flavours instead of typing them into options. A d20 unless `dice:` says otherwise; `stat:` lists as few or as many stats as you like, one button each in that order \u2014 leave it out and all five are buttons; leave `dc:` out and every blow is your call. A press opens a short form \u2014 what they do, what they say, both optional \u2014 and the words land above the roll. A natural 20 beats it (**Roll critically succeeds**) and a natural 1 fails (**Roll critically fails**) on their own, each posting your flavour if set; anything else says **The roll succeeds / fails** and asks you \u2014 **The player passes the check** / **The player fails the check** \u2014 each opening a *What happens?* form prefilled with your flavour (blank still sends the verdict). A fail posts the card again below with its buttons and a counter; `secret:true` asks in the GM log and tells the players **Roll succeeds / fails** in theirs \u00b7 `/target list` \u2014 what stands here, with a \u{1FAA6} button per target to retire it without a swing',
+      '`/target create name:Barricade [dc:12] [stat:Flat d20, STR, DEX] [dice:2d6+1] [hp:3] [for:@Players] [audience:@Artorius @Meliora @GMs] [success_flavour:] [fail_flavour:] [write:true]` \u2014 something to strike, with no sheet. `for:` addresses one player, `audience:` several and/or a role \u2014 only they may swing, and the card names them. `hp:` is the hits it takes: with a DC a roll that meets it takes one off with no call, with no DC each pass you call does; it falls at 0. `write:true` opens a box for the scene and the two flavours instead of typing them into options. A d20 unless `dice:` says otherwise; `stat:` lists as few or as many stats as you like, one button each in that order \u2014 leave it out and all five are buttons; leave `dc:` out and every blow is your call. A press opens a short form \u2014 what they do, what they say, both optional \u2014 and the words land above the roll. A natural 20 beats it (**Roll critically succeeds**) and a natural 1 fails (**Roll critically fails**) on their own, each posting your flavour if set; anything else says **The roll succeeds / fails** and asks you \u2014 **The player passes the check** / **The player fails the check** \u2014 each opening a *What happens?* form prefilled with your flavour (blank still sends the verdict). A fail posts the card again below with its buttons and a counter; `secret:true` asks in the GM log and tells the players **Roll succeeds / fails** in theirs \u00b7 `/target list` \u2014 what stands here, with a \u{1FAA6} button per target to retire it without a swing',
       '`/dd message:... [header:] [user:@Players] [channels:#one #two]` \u2014 speak AS THE BOT: plain words by default, a bold header only if you write one, in every channel you name (or here); who said it goes to the roll-audit, not the room (GM)',
       '**Edit (DDice)** \u2014 long-press any message the bot sent \u2192 Apps \u2192 Edit (DDice): the text opens prefilled, save replaces it, the roll-audit records what changed. Covers the bot\'s own messages and NPC speech from `/npc say` alike; a line said through a webhook that has since been deleted cannot be edited by anyone \u2014 delete it and say it again (GM)',
       '`/edit [delete:true]` \u2014 the same box without the Apps menu: a dropdown only you see lists the last 25 lines the bot and its NPCs said here, newest first; pick one and the text opens prefilled; `delete:true` takes the picked line down instead. `link:` a message link or id goes straight to it. Nothing shows in the channel. Players get the same for their own `/rp` lines. A line carrying only Reply, GM or Interaction is listed and keeps its buttons; a player sees only their own words \u2014 the roll beneath and the reply link stay the bot\u2019s',
@@ -31646,7 +32179,7 @@ async function routeButton(interaction) {
       return interaction.reply({ ephemeral: true,
         content: buildCharCard(ch3, nm3, heal3.current, cfg3.heal_charges ?? 3, interaction.guild.id).join('\n') });
     }
-    if (interaction.customId.startsWith('fdef:') || interaction.customId.startsWith('fatk:') || interaction.customId.startsWith('fndef:') || interaction.customId.startsWith('fnatk:') || interaction.customId.startsWith('fact:') || ['fsave', 'finsight', 'fresolve', 'frr'].includes(interaction.customId)) {
+    if (interaction.customId.startsWith('fdef:') || interaction.customId.startsWith('fatk:') || interaction.customId.startsWith('fndef:') || interaction.customId.startsWith('fnatk:') || interaction.customId.startsWith('fact:') || ['fsave', 'finsight', 'fresolve', 'frr', 'fbreak', 'fstay'].includes(interaction.customId)) {
       // A press walks the exact slash path — the branch's own gates (turn,
       // phase, pending kind, roll ownership, tokens) do all the deciding.
       // Every press opens the roleplay form first (T, 2026-10-14); the
@@ -31703,6 +32236,19 @@ async function routeButton(interaction) {
         }
         if (which === 'deflect' || which === 'disarm') return openFightRp(interaction, which, {}, { title: which === 'deflect' ? 'Deflect' : 'Disarm' });
         return handleFight(interaction, { sub: 'act', action: which });
+      }
+      if (interaction.customId === 'fbreak' || interaction.customId === 'fstay') {
+        // The answer to a kept hold: the captive's, or a GM's for an NPC.
+        if (fF.phase !== 'defend' || fF.atk_kind !== 'hold') return refuseF('\u{1FAA2} No hold is waiting on an answer.');
+        const cap = fF.current_target;
+        let npcB = null;
+        if (isNpcFighter(cap)) {
+          if (!(await isGm(interaction.guild, uidF))) return refuseF('\u274C Only GMs answer for an NPC.');
+          npcB = npcNameFromFighter(cap);
+        } else if (cap !== uidF) return refuseF('\u26A0\uFE0F The hold is on someone else \u2014 the answer is theirs.');
+        return interaction.customId === 'fbreak'
+          ? openFightRp(interaction, 'breakfree', { npc: npcB }, { title: 'Break free \u2014 STR' })
+          : openFightRp(interaction, 'stay', { npc: npcB }, { title: 'Stay in the hold' });
       }
       if (interaction.customId === 'fsave') return openFightRp(interaction, 'save', {}, { title: 'Save \u2014 STR' });
       if (interaction.customId === 'finsight') return openFightRp(interaction, 'insight', {}, { title: 'Insight \u2014 WIS' });
@@ -32785,6 +33331,10 @@ async function handleInteraction(interaction) {
         }
         case 'escape': case 'save': case 'insight':
           return handleFight(interaction, { sub: 'act', action: p.kind, flavour });
+        case 'breakfree':
+          return handleFight(interaction, { sub: 'act', action: 'escape', npc: p.npc || null, flavour });
+        case 'stay':
+          return handleFight(interaction, { sub: 'act', action: 'stay', npc: p.npc || null, flavour });
         case 'maintain':
           return runFightMaintain(interaction, { flavour });
         case 'release':
@@ -32972,11 +33522,15 @@ async function handleInteraction(interaction) {
           const f = getFight(interaction.guild.id, interaction.channelId);
           if (!f || f.state !== 'active') return interaction.reply({ ephemeral: true, content: '❌ No fight is running in this channel.' });
           await interaction.deferReply();
-          const who = await gmSkipTurn(interaction.guild, interaction.guild.id, interaction.channelId,
+          const sk = await gmSkipTurn(interaction.guild, interaction.guild.id, interaction.channelId,
             interaction.options.getString('reason') || null);
-          return interaction.editReply({ content: who
-            ? `⏭ **${who}**'s turn passed by your hand.`
-            : '❌ The fight ended before the skip landed.' });
+          if (!sk) return interaction.editReply({ content: '❌ The fight ended before the skip landed.' });
+          await replyLong(interaction, sk.lines);
+          if (sk.ended) {
+            const chS = await interactionChannel(interaction);
+            if (chS) await announceFightEnd(interaction.guild, interaction.guild.id, interaction.channelId, chS, sk.announce);
+          }
+          return;
         }
       }
       if (gmSub === 'dc') return await runGmDcCheck(interaction);
