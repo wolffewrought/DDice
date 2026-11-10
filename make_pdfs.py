@@ -345,11 +345,13 @@ PARTS['fight'] = [
 ('aud', 'all'),
 ('p', 'Proper fights: everyone rolls to see who goes first, then takes turns. The bot keeps score.'),
 ('h2', 'Commands'),
-('code', [('/fight start players:@Artorius @Meliora @Zeus npcs:Hollow, Hollow tank', 'any number of each \u2014 DEX initiative; fighters on the\nsame total reroll among themselves until apart, and\nthe card says who rolled what', 'player'),
+('code', [('/fight start players:@Artorius @Meliora @Zeus npcs:Hollow, Hollow tank', 'any number of each \u2014 DEX initiative: natural 20s\nfirst, natural 1s last, a level total to whoever\nrolled first; the card says who rolled what', 'player'),
           ('/fight start ... manual:true', 'skip roll, keep listed order', 'player'),
+          ('/fight start ... roll:Players', 'each player presses Roll on a card for their own\ninitiative; the bot rolls the NPCs at once. The fight\nbegins when the last has rolled, or at Begin, the\nbot rolling for anyone left', 'player'),
+          ('/fight start signup:true', 'an open card: players press Join (rolling on the\nspot with roll:Players), the ' + GM + ' adds NPCs,\nand Begin starts it \u2014 the ' + GM + '\u2019s or the\ncaller\u2019s, as Cancel is; /fight end calls a card off', 'player'),
           ('/fight start ... practice:true', 'friendly bout — fighters yield at 2 HP', 'player'),
           ('/fight addnpc npc:Hollow, Hollow tank', 'add NPC(s) mid-fight, ' + GM, 'gm'),
-          ('/fight add user:@Players where:Next', 'bring a player into a running fight \u2014 HP from their\nsheet, initiative rolled for the record; Next puts them\nstraight after this turn, Last at the end, ' + GM, 'gm'),
+          ('/fight add user:@Players where:Next', 'bring a player into a running fight \u2014 HP from their\nsheet, initiative rolled: a natural 20 or 1 marks their\nfirst turn as it would at the start; Next puts them\nstraight after this turn, Last at the end, ' + GM, 'gm'),
           ('/fight order sequence:@Artorius, Hollow, @Meliora, @Zeus', 'reorder players + NPCs, ' + GM, 'gm'),
           ('/fight atk stat:str target:@Players', 'attack a player \u2014 the form opens for your words\n(flavour: given, it swings at once); with one foe the\ntarget may be left off; /fight atk alone offers the\nstat buttons', 'player'),
           ('/fight act action:Grapple target:@Players', 'STR-only grapple attempt, STR 4+ on Knightfall \u2014 the\ntarget answers with /fight act action:Save (STR only).\nIf the attempt meets or exceeds the save, the hold\ntakes: immobile, 1 wound a round, and any action on\na flat d20 \u2014 though a captive can still attack\nanyone, the grappler included. A grab of 20 takes it\nwhatever the save, for 2 wounds; a grab of 1 fails\noutright and leaves your next defence a flat d20; a\nsave of 20 slips free unless the grab was a 20 too,\nand leaves your next attack flat and the saver +2.\nThe grappler may release freely and can never strike\ntheir own captive', 'player'),
@@ -362,13 +364,15 @@ PARTS['fight'] = [
           ('(Maintain the hold)', 'the holder\u2019s button on their turn: roll 1d20+STR to\nkeep the grip, and the captive is pinged to answer \u2014\nBreak free (STR against it; ties keep the hold) or\nStay. Staying, or no answer by the turn clock, keeps\nthe hold, and the round\u2019s wound lands at the end of\nthe captive\u2019s turn. An NPC on auto always struggles.\nA hold of 1 slips at once: the captive is free with\nno wound, and your next roll is a flat d20 at\ndisadvantage', 'player'),
           ('/fight act action:Stay', 'let a kept hold stand \u2014 the answer the Stay button\ngives; a ' + GM + ' answers for an NPC with npc:Name', 'player'),
           ('/fight act action:Release', 'the holder lets go — a free action, the turn stands;\nGMs may part any hold with target:', 'player'),
-          ('(the buttons)', 'on your turn: five stat buttons to attack with, then\nGrapple \u00b7 Feint \u00b7 Disarm beneath (each asks whom \u2014 Disarm lists\nthe NPCs; Feint then asks what you pretend) \u2014 no Grapple\nwhile you are held. Disarmed, your turn carries Retrieve\nalone. When a strike comes at you, the defence row adds\nDeflect \u00b7 Disarm \u00b7 Grapple. Holding someone adds Maintain the hold (your\nSTR roll; they answer Break free or Stay) and Release;\nbeing held adds Break free. Save and Insight sit on the card that asks. Every one of them opens a short form first \u2014 what you do, what you say, both optional \u2014 and your words sit on the card; a blank form is a plain roll. With one foe standing, an attack press goes straight to the form'),
+          ('(the buttons)', 'on your turn: five stat buttons to attack with, then\nGrapple \u00b7 Feint \u00b7 Disarm beneath (each asks whom \u2014 Disarm lists\nthe NPCs; Feint then asks what you pretend) \u2014 no Grapple\nwhile you are held. Disarmed, your turn carries Retrieve\nalone; a natural 1\u2019s first turn carries Roleplay alone. When a strike comes at you, the defence row adds\nDeflect \u00b7 Disarm \u00b7 Grapple. Holding someone adds Maintain the hold (your\nSTR roll; they answer Break free or Stay) and Release;\nbeing held adds Break free. Save and Insight sit on the card that asks. Every one of them opens a short form first \u2014 what you do, what you say, both optional \u2014 and your words sit on the card; a blank form is a plain roll. With one foe standing, an attack press goes straight to the form'),
           ('/fight act action:Release npc:Hollow tank', GM + ' releases AS the NPC holder; add target: to\nforce-part any hold from the outside', 'gm'),
           ('/fight act action:Deflect', 'shield deflection against a PvE strike — needs a\nshield equipped and STR 4+ (the gate holds whichever\nstat rolls), once per round, and a natural 20 cannot\nbe turned. Roll STR or DEX (stat:) to beat the attack\nroll; optionally redirect_npc: sends the blow into\nanother enemy for 1 damage \u2014 and the enemy loses\nits next turn retrieving the weapon. Fall short and\nit lands on you for 1. A natural 20 turns it\nwhatever the totals, the redirect deals 2, and your\nflat next attack gets +2; a natural 1 fails outright\nfor 2. Either way your next attack roll is a flat\nd20 \u2014 after a 1, your next defence too', 'player'),
           ('/fight act action:Disarm', 'NPCs only, DEX 4+, no blade needed. Against an\nNPC\u2019s strike (once per round, never a natural 20):\nDEX to beat the attack \u2014 no damage, and the NPC\nspends its next turn retrieving the weapon; fall short\nand the strike lands on you for 1. On YOUR turn\n(target_npc: or the Disarm button): your 1d20+DEX\nagainst the NPC\u2019s 1d20 + the better of its STR and\nDEX, rolled by the bot \u2014 ties to the NPC, no\nnaturals on its die. A natural 20 disarms whatever\nthe totals and wounds it 1 (against a strike it also\nbanks +2 on your next attack, flat or not); a natural\n1 fails for 2 wounds and disarms YOU. After any\ndisarm, your very next roll is a flat d20', 'player'),
           ('/fight act action:Retrieve', 'disarmed, your next turn goes to the weapon: the\nRetrieve button (or this) opens a short form \u2014 what\nyou do, what you say \u2014 and the turn passes. No\nattack, grab, feint, disarm, escape or hold until you\nhave; whatever flat roll you owe waits for your next\nreal one. A skipped turn counts as the retrieval', 'player'),
           ('/fight act action:Deflect \u00b7 /fight act action:Disarm (vs your NPCs)', 'player abilities your NPCs face: a deflected strike\ncan be redirected into ANOTHER of your enemies for\n1 damage (2 on a natural 20), and the NPC that\nthrew it loses its next turn retrieving the weapon.\nA disarm \u2014 against its strike, or on the player\u2019s\nown turn, DEX against the NPC\u2019s better of STR and\nDEX, which the bot rolls \u2014 does the same; a 20\nwounds it 1 as well. Your NPCs never disarm, and\nnone of it works against a natural 20', 'gm'),
           ('/fight act action:Retrieve npc:Hollow', GM + ' spends a disarmed NPC\u2019s turn on its weapon \u2014\nor press its Retrieve button; a short form takes\nwhat it does and says. The auto-pilot and the turn\nclock retrieve on their own, and a skipped turn\ncounts', 'gm'),
+          ('/fight act action:Roleplay', 'a natural 1 on initiative: your first turn is\nroleplay only \u2014 the Roleplay button (or this) opens a\nshort form, what you do and what you say, and the\nturn passes with no roll and no action. You can still\ndefend. A skip spends it; the turn clock passes it on\nits own', 'player'),
+          ('/fight act action:Roleplay npc:Hollow', GM + ' plays out an NPC\u2019s roleplay turn \u2014 or press\nits Roleplay button; the auto-pilot and the turn\nclock pass it on their own', 'gm'),
           ('/fight act action:Feint feint:\"...\"', 'a deception IN A FIGHT (away from one, it is\n/deception), and it spends either half of the\nfight. On YOUR turn it is an attack \u2014 WIS against\ntheir insight, and if they fall for it the blow\nlands with normal damage (a natural 20 still crits)\nAND their very next roll is a flat d20. A feint of\n20 fools them whatever the insight; a feint of 1 is\na total failure. An insight of 20 sees through it\nunless the feint was a 20; an insight of 1 is\nfooled. With a strike pending on YOU it is a\ndefensive feint \u2014 WIS in place of your usual stat,\nthough not against a natural 20 \u2014 and if the blow misses, the attacker\u2019s very next\nroll is flat; a defensive feint of 1 is a total\nfailure, and the blow lands whatever the totals\n(unless the attack was a 1 too). THE PRICE, landed\nor not: your own very next roll is a flat d20 \u2014 at\ndisadvantage too after a 1. WIS 4+; ties go to the\ntarget. ONE FEINT PER HONEST ROLL: after a feint you\nmust make an ordinary stat roll before you can\nfeint again \u2014 the flat roll a feint costs you\ncounts'),
           ('/deception target:@Players', 'a deception AWAY FROM A FIGHT \u2014 a WIS contest in a\nmarket, a hall, a cell; target_npc: makes an NPC the\nmark, its insight rolled by the bot. A form asks what\nyou pretend (everyone sees it), what you are really\nplanning (kept back until the dice have spoken) and\nwhat you say. Both roll at once and the totals\ndecide, ties to the mark; a natural 1 fails\noutright, and no other natural counts. Fooled, their\nvery next roll is a straight d20 \u2014 a chat roll,\n/roll, a scene, a called check or a fight elsewhere.\nThe price, whatever happens: your own very next roll\nis a flat d20, at disadvantage after a 1. No\ncooldown. Refused while you or they are fighting in\nthe channel: there, it is a feint'),
           ('/deception npc:Hollow Lieutenant target:@Players', GM + ' deceives AS the NPC \u2014 the same form, the card\nposted to the table, the price on the NPC: its own\nnext roll is flat, wherever it rolls next \u2014 /npc\nroll, a called check, a fight. An NPC that is fooled\ncarries its flat roll the same way', 'gm'),
@@ -398,9 +402,17 @@ PARTS['fight'] = [
           ('/fight forfeit', 'concede — HP preserved', 'player'),
           ('/fight end', GM + ' only', 'gm')]),
 ('h2', 'How a Fight Runs'),
-('p', 'When a fight starts, the bot rolls DEX initiative (1d20 + DEX) for every fighter and orders the '
-      'turn order from highest to lowest, ties broken by the raw d20. Add <b>manual:true</b> to skip the '
-      'roll and keep your listed order, or use <b>/fight order</b> with a comma-separated sequence.'),
+('p', 'When a fight starts, the bot rolls DEX initiative (1d20 + DEX) for every fighter and sets the turn '
+      'order from highest to lowest, the naturals first as the table shows. A natural 20\u2019s first turn takes any two '
+      'actions \u2014 attack, grapple, feint, disarm \u2014 and passes after the second; a natural 1\u2019s is the Roleplay '
+      'button, their words, and the turn passes, though they can still defend. A fighter joining mid-fight rolls the same way. '
+      'Add <b>roll:Players</b> and each player rolls their own on a card, or <b>signup:true</b> for a card players Join. '
+      'Add <b>manual:true</b> to skip the roll and keep your listed order, or use <b>/fight order</b> with a comma-separated sequence.'),
+('table', ['Initiative roll', 'What happens'],
+          [['Natural 20', 'First, whatever the totals; the first turn holds two actions, any two'],
+           ['Natural 1', 'Last; the first turn is roleplay only, though they can defend'],
+           ['Several 20s or 1s', 'Higher DEX first; on one DEX a 20 rolled first goes first, and a 1 rolled first goes last'],
+           ['Any other level total', 'Whoever rolled first; nobody rerolls']]),
 ('p', '<b>The turn clock:</b> a fight waits five quiet minutes on whoever it is waiting for, then reminds them \u2014 '
       'press <b>Still writing</b>, or just keep typing \u2014 and at fifteen the turn passes: skipped, or, where the ' + GM + ' has '
       'set it so, the bot attacks for them at whoever they last struck (else the weakest foe standing). A defence is never '
@@ -599,9 +611,12 @@ PARTS['quest'] = [
           ('/edit', 'fix the words of a line of yours \u2014 the roll and the reply link stay as they were'),
           ('/edit delete:true', 'take one back')]),
 ('h2', 'Taking Turns \u2014 Initiative'),
-('p', 'When the Game Master calls for initiative, a card appears with a <b>Join</b> button \u2014 press it to take a place. '
-      'Once the order is rolled (d20 + DEX, ties rerolled), each turn gets its own card naming whose it is and who is next, '
-      'and the rounds are counted. On your turn, post, then press <b>Done</b>. Quiet for five minutes, you are reminded: press '
+('p', 'When the Game Master calls for initiative, a card appears with a <b>Join</b> button \u2014 press it to take a place; '
+      'when the players roll their own, it has a <b>Roll</b> button too, and Join rolls you on the spot. The order is d20 + DEX, '
+      'highest first: a natural 20 goes to the top, and your first turn takes two actions \u2014 press <b>Done</b> after each; a '
+      'natural 1 goes to the bottom, and your first turn is roleplay only \u2014 the <b>Roleplay</b> button opens a short form for '
+      'what you do and say, and the turn passes. A level total goes to whoever rolled first. Each turn gets its own card naming '
+      'whose it is and who is next, and the rounds are counted. On your turn, post, then press <b>Done</b>. Quiet for five minutes, you are reminded: press '
       '<b>Still writing</b>, or just keep typing. At fifteen the turn passes.'),
 ('code', [('/session turn', 'the order, whose turn it is, which round'),
           ('/session turn action:next', 'Done, typed \u2014 for your own turn')]),
@@ -685,19 +700,25 @@ PARTS['gmquest'] = [
           ('/quest npc number:1 name:Hollow Lieutenant', 'attach the NPCs a run involves (remove:true to\ndetach) \u2014 they appear on the completion run record'),
           ('/quest runs number:1', 'the run ledger for a quest and all its instances:\nhow many times it has been completed, and each\nrun\u2019s date, GM, party and NPCs')]),
 ('h2', 'Initiative and the Turn Clock'),
-('p', '<b>/session initiative</b> puts a sign-up card in the channel. Players press <b>Join</b>; you add NPCs and foes with '
+('p', '<b>/initiative</b> (or <b>/session initiative</b>) puts a sign-up card in the channel. Players press <b>Join</b>; you add NPCs and foes with '
       '<b>Add NPCs</b> \u2014 a picker of those heard there lately, or words: <b>Goblin x3</b> steps out three temporary copies, '
       '<b>category:Bandits</b> brings a whole category, and a name with no NPC behind it rolls d20 + 0. <b>Close &amp; roll</b> '
-      'rolls d20 + DEX for everyone (the modifier on a 5e server), rerolls ties among the tied, and sets the order. In a '
-      'run\u2019s thread the party is pinged to the card.'),
+      'rolls d20 + DEX for everyone (the modifier on a 5e server) and sets the order: natural 20s on top, natural 1s at the '
+      'bottom, any other level total to whoever rolled first \u2014 nobody rerolls. With <b>roll:Players</b> each player presses '
+      '<b>Roll</b> for their own (Join rolls them on the spot) and the bot rolls the NPCs; Close then rolls for anyone left. '
+      'With <b>signup:false</b> only those you name are in: the bot rolling, the order is set at once; the players rolling, '
+      'the last roll sets it. In a run\u2019s thread the party is pinged to an open card.'),
 ('p', 'Then a turn at a time: each turn posts a card pinging whoever it is \u2014 the GM role for an NPC \u2014 with <b>Done</b>, '
       '<b>Skip</b>, <b>Pause</b> and <b>End</b>. Done is theirs or yours; the rest are yours. The rounds are counted, and a run '
       'going in the channel keeps the order rolled, each round, every skipped or timed-out turn and the end on its timeline '
-      'and in its record. One order a channel; while a fight runs there, the order waits.'),
+      'and in its record. A natural 20\u2019s first turn takes two <b>Done</b>s; a natural 1\u2019s card carries <b>Roleplay</b> in '
+      'place of Done \u2014 their words, then the turn passes, and the clock or a skip passes it too. One order a channel; '
+      'while a fight runs there, the order waits.'),
 ('code', [('/session initiative players:@Artorius npcs:Goblin x3', 'the sign-up card, four in already'),
+          ('/initiative players:@Artorius @Meliora roll:Players signup:false', 'only those two, each pressing Roll; the last roll\nsets the order'),
           ('/session turn', 'the order here \u2014 for anyone'),
           ('/session turn action:next', 'Done \u2014 for whoever\u2019s turn it is, or you'),
-          ('/session turn action:add who:@Meliora', 'a newcomer rolls and takes their place by total'),
+          ('/session turn action:add who:@Meliora', 'a newcomer rolls and takes their place by the\nsame rule \u2014 a natural marks their first turn'),
           ('/session turn action:remove who:Goblin 2', 'out of the order'),
           ('/session turn action:back', 'one turn back, for a slip of the finger')]),
 ('p', '<b>The turn clock</b> runs every initiative order and every fight. A turn quiet for <b>5 minutes</b> gets a reminder '
@@ -1914,7 +1935,7 @@ PARTS['rules5e'] = [
 ('code', [('/roll save:con', 'a Constitution save'),
           ('/roll skill:perception', 'a Wisdom (Perception) check'),
           ('/roll skill:athletics mode:Advantage', 'with advantage, once a GM says yes')]),
-('p', 'Going first: on a 5e server you add your DEX <b>modifier</b>; on Knightfall you add the whole DEX score \u2014 the same command, the right arithmetic for the rules in force.'),
+('p', 'Going first: on a 5e server you add your DEX <b>modifier</b>; on Knightfall you add the whole DEX score \u2014 the same command, the right arithmetic for the rules in force. The naturals rule either way: a natural 20 goes first and its first turn holds two actions; a natural 1 goes last and its first turn is roleplay only \u2014 the <b>Roleplay</b> button, your words, then the turn passes; a level total goes to whoever rolled first. With <b>roll:Players</b> on <b>/fight start</b> or <b>/initiative</b>, each player rolls their own on the card.'),
 ('h2', 'Weapons'),
 ('p', 'Set what a weapon rolls with <b>/dnd weapondice slot:1 dice:1d12</b>, and an attack uses it for damage instead of the default 1d8. Clear it and it falls back.'),
 ('h2', 'Conditions, and Being Hard to Kill'),
@@ -2296,13 +2317,17 @@ EXAMPLES = [
 
 ('sec', 'Taking turns'),
 ('code', [('(press Join)', 'The GM calls for initiative and a card appears. Press Join to take a place.'),
+          ('(press Roll)', 'When the players roll their own, the card has a Roll button \u2014 a fight\u2019s card too.'),
           ('(your turn)', 'A card names you. Post what you do, then press Done.'),
+          ('(a natural 20 or 1)', 'A 20 puts you first, with two actions on your first turn \u2014 Done after each. A 1 puts you last, and your first turn is the Roleplay button: say what you do, and the turn passes.'),
           ('(five quiet minutes)', 'You are reminded. Press Still writing, or just keep typing. At fifteen the turn passes.')]),
 
 ('aud', 'gm'),
 ('sec', 'Calling initiative'),
 ('code', [('/session initiative npcs:Goblin x3', 'A card with a Join button. The players press it; three Goblins are in already.'),
-          ('(press Close & roll)', 'Everyone rolls d20 + DEX, the order is set and the first turn is called.'),
+          ('(press Close & roll)', 'Everyone rolls d20 + DEX \u2014 natural 20s on top, 1s at the bottom, a level total to whoever rolled first \u2014 the order is set and the first turn is called.'),
+          ('/initiative players:@Artorius @Meliora roll:Players signup:false', 'Only those two, each pressing Roll; the last roll sets the order.'),
+          ('/fight start players:@Artorius npcs:Hollow roll:Players', 'A card first: the Hollow is rolled at once, Artorius presses Roll, and the fight begins.'),
           ('/session clock remind:10 skip:30', 'A slower table: the reminder at ten minutes, the turn passing at thirty.')]),
 
 ('aud', 'all'),

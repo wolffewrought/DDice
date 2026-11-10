@@ -49,9 +49,9 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1315 as of 2026-11-10, build N) and no
+Green means every assertion passed (1332 as of 2026-11-10, build O) and no
 scanner found an ERROR. Then run the probe: `node --experimental-sqlite
-probe.js` (333 probes: the fight, encounter, override, autocomplete and
+probe.js` (347 probes: the fight, encounter, override, autocomplete and
 every-leaf walks, the GM-gate walk, chat shorthands, scheduled ticks,
 junk-id lanes, SQL compile, forum seeding and sweep, one NPC one page, the
 A2 walk, the undo walk, the C walk, the D walk (activities: parser,
@@ -372,6 +372,115 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 10y · Initiative: naturals first and last, two actions and a roleplay turn, the players' own rolls (2026-11-10, build O)
+
+T asked (10 Nov): "If a player gets a nat 20 initiative + dex then they are
+first in turn and get a extra action (extra attack in combat)", multiple 20s
+by DEX then "chronological order of who rolled the nat 20s", nat 1s last
+and "lose a turn (same in combat)", several 1s lower DEX lower and on one
+DEX "the player who rolled the first nat 1 ... will be the last". Then:
+"Give the option for the bot to roll for everyone, manual rolling and also
+for people to apply to a initiative group"; /initiative and /session
+initiative both stay; "Equal rolls follow the chronological method";
+"Knightfall should use the dex modifier too" (the DEX stat as it stands,
+`statBonusOf`); "for those that get a skipped turn give them the role play
+button instead of taking an action". What was built:
+
+**One rule.** `rollStamp()` (monotonic ms) stamps every roll `at`;
+`initiativeCompare` bands 20s (DEX desc, then earliest), the rest (total
+desc, then earliest), 1s (DEX desc, then LATEST first — the first to roll a
+1 sits lowest); `sortInitiative(list, nameOf)` sorts and returns the
+`⏱️` lines for level groups. `settleInitiativeTies` and its rerolls are
+gone. Used by `/fight start`, a called fight's Begin, `/fight auto` (both
+modes), `/fight auto mode:Demo` (the compare alone) and an order's
+`settleTurnOrder`; a running order's joiner is spliced in by the compare.
+
+**The fight's naturals** live in `effect_state`: `initiativeFlags` writes
+`extraAction` (20) / `rpTurn` (1) at the start; `setInitiativeFlag` on
+`/fight add` and `/fight addnpc` (placement stays next/last).
+`keepTurnForExtra` sits at the top of `passTurn`, before the strain in both
+of `resolveExchange`'s turn ends (not when `midAction` — a 5e fighter's
+swings before the last) and in the deflect path: it consumes the flag and
+re-announces the same fighter (`announceNextTurn(..., { again: true })`
+skips `tickConditions`), no strain. `rpTurnOf` / `rpTurnRefusal`:
+`turnRowsFor` gives Roleplay alone (`fact:roleplay`, `fnroleplay` for a
+GM's NPC; before the disarmed check), every own-turn runner, the typed
+`/fight atk`, the custom `/roll fight:true`, the pickers and the router
+refuse it first. `roleplayTurn(guild, gid, cid, actorId, deliver, flavour)`
+consumes it, re-arms the once-a-round answers, takes `disarmed` with it
+("the lost turn goes to retrieving"), notes the quest, `passTurn`s (strain
+lands). Reached by `runFightRoleplay` (`/fight act action:Roleplay`, `/roll
+action:Roleplay`, the form `frp` kind `roleplay`), the auto-pilot and
+`clockStrike`. Skips (`gmSkipTurn`, `/fight skip`, `clockSkipFight`)
+consume both flags — a skip is the whole turn; `/fight skip` now also
+counts a disarmed fighter's skip as the retrieval (`SKIPPED_RETRIEVAL`,
+shared) as the other two did. The clock's reminder says a roleplay turn
+"passes". `/fight auto mode:Full` keeps `extraLeft`/`rpLeft` sets; its
+round count (`exchanges`) now counts turns. `fighterStateLine` shows both
+marks; the start's first line (`firstTurnPrompt`) says them, and a 1 first
+in line gets its button on the start card. `startFightFromInits` is the
+shared start (hp/rr state, sort, lines, the clean row with the flags).
+
+**A called fight.** Table `fight_calls` (state open|begun|cancelled,
+roll_mode, open, floor_hp, entrants with roll/dex/total/at, card_msg_id,
+created_at = the buttons' stamp). `/fight start roll:Players` (any player
+named) or `signup:true` → `openFightCall` (deferred; downed left out; NPCs
+rolled at once with Players; the players to roll and an open card's run
+party pinged). Card `fightCallView`: Join/Leave when open, 🎲 Roll with
+Players, Add NPCs (`fcallnpc`, `initNpcModal(..., { fight: true })`, NPCs
+only — a bare name is left out, the downed too), Begin, Cancel.
+`handleFightCallButton`: Join checks sheet/approval/fallen/floor
+(`fightJoinRefusal`) and rolls with Players (`rollEntrant` with the
+interaction → `recordRoll` as the player's); Roll; named-only, the last
+roll calls `beginFightCall`. Begin/Cancel are a GM's or the caller's.
+`beginFightCall` closes the call before any await (deferUpdate), re-reads
+the room after `partitionDowned`, reopens on failure, rolls the rest
+(`mirrorAutoRoll`), starts, edits the card, posts the order. `/fight start`
+and npconly refuse while a call is open; `/fight end` calls it off; the
+temp sweep spares its NPCs (`orderNpcNames`). `manual:` with `roll:`/
+`signup:` is refused.
+
+**Out of combat.** `turn_orders.roll_mode` and `.open` (ALTERs, old rows
+= bot/open). `/initiative` (new top level, 27 commands) and `/session
+initiative` share `handleSessionInitiative` and the same options (written
+out twice — the scope scanner reads options in the builder). Closed + bot
+→ `settleTurnOrder` at once (no card to join). Players: names/NPCs rolled
+at once, `init:roll`, Join rolls you; closed, the last roll →
+`closeInitiative`. Entries carry `at`, `x2` (20) and `rp` (1).
+`advanceTurnOrder`: a `done` on `x2` keeps the turn (new key, "first
+action is done — a second follows"); any other move spends both flags;
+`how: 'rp'` with `words`. The turn card and the reminder show 🎭 Roleplay
+(`init:rp:<key>`) in place of Done; Done on an rp turn opens the same form
+(`initRpModal` → `initrp:<key>` → `handleInitRpModal`); `/session turn
+action:next` passes it as `rp`. The order card marks naturals and keeps
+"d20 + DEX, highest first".
+
+**Words.** RULES `initiative`; `/help` (/fight start, roll:Players and
+signup:true, Roleplay, /initiative and /session initiative, /session turn
+add); the `2026-11-10` changelog entry gained four GM lines and two
+player lines at its head (a key must never be later than the deploy: a
+`2026-11-11` entry broke the probe's gm-updates order on the 10th; if this
+goes out on the 11th, `growChangelog` re-posts the 10/11 thread whole). Books: Knightfall fight part (the start rows,
+`/fight add`, the Roleplay rows, the buttons row, How a Fight Runs and its
+new initiative table, compacted so it does not split on the Player
+book's page); both systems' quest parts (players' Taking Turns, GM's
+Initiative and the Turn Clock, its code rows); 5e's Saves, Skills and
+Initiative; both Examples books. All six PDFs move.
+
+**Tests.** verify: a `build O` harness (sorter units, flags, tags, the
+rule text, the keep/rp/call pins), the reworded tie and initiative pins,
+27 commands. probe: the C walk's tie probe rewritten (level total, no
+rerolls), the J walk's order check follows the rule, and the O walk
+(12): the start's order and marks; two actions (grab then strike); the
+roleplay turn (refusals, the form, typed, the strain); skips; the clock
+and the auto-pilot passing it; joiners; the auto-pilot's two swings; a
+called fight with Players (the last roll begins it) and with sign-ups;
+`/fight end` on a call; `/initiative` with Players and only those named
+(two Dones, Roleplay, round two clean); a joiner's place; closed + bot.
+
+**Not built (said, not asked):** `/help category:rules` slices the table
+at 1900 characters, so most of it (this rule included) never shows.
 
 ## 10x · The special moves' carry-overs, Disarm both ways, the disarmed turn, /deception's form (2026-11-10, build N)
 

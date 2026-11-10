@@ -141,3 +141,9 @@ New verbs join their group; the wall is history until a single group nears 25.
 - `/deception`'s form lives in memory for 15 minutes: a restart, or a late submit, says it has expired.
 - `/fight rr` of a flat attack that carried a banked +2 reads it from the numbers: with a stat of exactly 2 it labels the reroll as an honest roll (the total is right either way).
 - Disarm's grip roll for the NPC has no naturals; its flat defence, a fooled flag or a sheet mark clamps it to a straight d20.
+- A natural on initiative marks the fighter's first turn, whenever it comes: one downed before it keeps the mark until their turn does come round; one who re-joins rolls afresh and keeps only the new roll's mark.
+- A skip — `/fight skip`, `/gm override skip`, the clock's — is the whole turn: a natural 20's second action goes with it. The clock's attack for a quiet fighter is one of the two.
+- Out of combat, `back` does not give back a natural 20's second Done or a natural 1's roleplay turn once spent.
+- A level initiative follows the moment each roll was made; an order rolled before 2026-11-10 carries no moments, so a newcomer level with someone in it goes after them.
+- A called fight's card has no clock: it stays open until Begin, Cancel or `/fight end`, and no other fight starts in that channel meanwhile. With sign-ups open it never begins on its own.
+- A called fight's Add NPCs takes NPCs only: a name with no NPC behind it is left out (an initiative order takes it, at d20 + 0).

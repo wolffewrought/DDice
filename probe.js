@@ -1699,15 +1699,16 @@ async function fire(over) {
         && !modalOf(typedFlav) && swung?.phase === 'defend' && swung?.atk_stat === 'str' && /a low cut/.test(saidOf(typedFlav) + sent.slice(before).map(x => x.content).join(' '))
         && idsOf(bareDef.replies[0]).includes('fdef:con') && /^frp:/.test(modalOf(typedDef) || '') && defended?.def_roll !== null && defended?.def_stat === 'con' && /advantage/.test(saidOf(defSub)) && /braces/.test(saidOf(defSub)),
       `bare ${idsOf(bare.replies[0]).join(',')} · one ${modalOf(typedOne)} · flav ${JSON.stringify(swung)} · def ${idsOf(bareDef.replies[0]).join(',')} ${modalOf(typedDef)} ${JSON.stringify(defended)} · ${saidOf(defSub).replace(/\s+/g, ' ').slice(0, 60)}`);
-    // 2 · initiative ties: two fighters on one total reroll, only they, and the line says so
+    // 2 · a level initiative goes to whoever rolled first — no rerolls since 2026-11-10 (T)
     const chanT = new FakeChannel('C10', 0, 'ties', guild); channelsById.set(chanT.id, chanT);
-    const seq = [0.45, 0.45, 0.7, 0.1];   // d20: 10, 10 (a tie at 13 each with DEX 3), then 15 and 3
+    const seq = [0.45, 0.45, 0.7, 0.1];   // d20: 10, 10 — a tie at 13 each with DEX 3
     let k = 0; Math.random = () => seq[k++ % seq.length];
     const startT = await fire({ commandName: 'fight', options: { _sub: 'start', players: `<@${P2}> <@${P4}>` }, userId: 'U1', channel: chanT });
     Math.random = realRandom;
     const orderT = JSON.parse(dbHandle.prepare("SELECT turn_order FROM fights WHERE guild_id='G1' AND channel_id='C10'").get()?.turn_order || '[]');
-    ok('initiative ties reroll among the tied: the line names the tie, the rerolls and who goes first, and the order follows it',
-      new RegExp(`🔁 \\*\\*Tie at 13\\*\\* — user${P2} and user${P4} reroll: user${P2} .*\\[15\\] \\+ 3 = 18 .*user${P4} .*\\[3\\] \\+ 3 = 6 → user${P2} first`).test(saidOf(startT)) && orderT[0] === P2 && orderT[1] === P4,
+    ok('a level initiative goes to whoever rolled first, with no rerolls: the line says so and the order follows it',
+      new RegExp(`⏱️ \\*\\*Level at 13\\*\\* — whoever rolled first goes first: user${P2} → user${P4}`).test(saidOf(startT)) && orderT[0] === P2 && orderT[1] === P4
+        && !/reroll|Tie at/.test(saidOf(startT)),
       `${saidOf(startT).replace(/\s+/g, ' ').slice(0, 260)} · order ${orderT.join(',')}`);
     // 3 · /rp: inline and by the box, posted in the player's name, chronicled; the player fixes and takes back their own through /edit
     dbHandle.prepare(`INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, gm_id, started_at) VALUES ('G1', 911, 'Probe Rp', 'active', 'quest', ?, 'C1', 'U1', ?)`).run(Date.now(), Date.now());
@@ -2848,8 +2849,8 @@ async function fire(over) {
     const list2 = JSON.parse(o2?.order_json || '[]');
     const turn1 = newIn('CJ1', n0).find(m => idsOf(m).includes(`init:done:${K()}`));
     const p1e = list2.find(e => e.id === P1);
-    ok('Close & roll: everyone rolls d20 + DEX, highest first, the card becomes the order, the first turn is called with Done, Skip, Pause and End keyed to it, and the run\'s timeline has the order',
-      o2?.state === 'running' && list2.length === 7 && list2.every((e, i) => i === 0 || list2[i - 1].total >= e.total) && p1e?.dex === 4 && p1e.total === p1e.roll + 4
+    ok('Close & roll: everyone rolls d20 + DEX, highest first with the naturals at either end, the card becomes the order, the first turn is called with Done, Skip, Pause and End keyed to it, and the run\'s timeline has the order',
+      o2?.state === 'running' && list2.length === 7 && list2.every((e, i) => { if (!i) return true; const band = (x) => (x.roll === 20 ? 0 : x.roll === 1 ? 2 : 1), a = list2[i - 1]; return band(a) < band(e) || (band(a) === band(e) && (band(e) === 1 ? a.total >= e.total : a.dex >= e.dex)); }) && p1e?.dex === 4 && p1e.total === p1e.roll + 4
         && /d20 \+ DEX, highest first/.test(closed.replies[0]?.content || '') && !!turn1 && K().endsWith('-1') && [`init:skip:${K()}`, `init:pause:${o2.created_at}`, `init:end:${o2.created_at}`].every(id => idsOf(turn1).includes(id))
         && /Round 1\*\* · 1 of 7/.test(turn1.content) && ev930().some(t => /^Initiative — /.test(t)),
       `${o2?.state} · ${list2.map(e => `${e.name}:${e.total}`).join(',')} · ${(closed.replies[0]?.content || '').slice(0, 60)} · ${idsOf(turn1).join(',')} · ${(turn1?.content || '').slice(0, 80)} · ${ev930().join(' | ').slice(0, 100)}`);
@@ -3978,6 +3979,295 @@ async function fire(over) {
     const threwL = loggedL.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
     console.error = realErrL;
     ok('nothing in the L walk threw', threwL.length === 0, threwL.slice(0, 3).join('\n        '));
+  }
+
+  // ── Build O (2026-11-10): initiative — naturals first and last, a level
+  // total to whoever rolled first; a natural 20's two actions, a natural 1's
+  // roleplay turn; the players' own rolls and sign-ups, in a fight and out ──
+  if (dbHandle) {
+    const realErrO = console.error; const loggedO = [];
+    console.error = (...a) => { loggedO.push(a.map(x => (x && x.stack) ? x.stack.split('\n').slice(0, 2).join(' | ') : String(x)).join(' ')); };
+    const idsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+    const saidOf = (r) => (r?.replies || []).map(x => x.content || '').join('\n');
+    const allOf = (r) => (r?.replies || []).map(x => JSON.stringify(x)).join(' ');
+    const modalOf = (r) => (r?.replies || []).find(x => x.modal)?.modal || null;
+    const flat1 = (t) => String(t || '').replace(/\s+/g, ' ');
+    const settle = async () => { for (let i = 0; i < 60; i++) await new Promise(r => setImmediate(r)); };
+    const tickAll = async () => { for (const t of ticks.filter(t => /turnClockTick/.test(String(t.fn)))) { try { await t.fn(); } catch (e) { loggedO.push(`tick: ${e.message}`); } } };
+    const newIn = (cid, n) => sent.slice(n).filter(x => x.channel === cid).map(x => x.msg);
+    const textOf = (msgs) => msgs.map(m => `${m.content} ${JSON.stringify(m.components || [])}`).join('\n');
+    const realRandO = Math.random;
+    const withDice = async (nats, fn) => {
+      const q = nats.map(n => (n - 0.5) / 20);
+      Math.random = () => (q.length ? q.shift() : 0.525);
+      try { const r = await fn(); await settle(); return r; } finally { Math.random = realRandO; }
+    };
+    const OA = '100000000000000091', OB = '100000000000000092', OC = '100000000000000093', OD = '100000000000000094', ON = '100000000000000095';
+    const NA = `user${OA}`, NB = `user${OB}`, NC = `user${OC}`;
+    const plainOf = (id) => ({ id, displayName: `user${id}`, roles: { cache: new Map() }, permissions: { has: () => false } });
+    const realFetchO = guild.members.fetch;
+    guild.members.fetch = async (uid) => { const mb = await realFetchO(uid); if ([OA, OB, OC, OD, ON].includes(uid)) { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+    const asO = (uid) => ([OA, OB, OC, OD, ON].includes(uid) ? { member: plainOf(uid) } : {});
+    const putCharO = (id, str, dex) => dbHandle.prepare("INSERT OR REPLACE INTO characters (guild_id, user_id, str, con, dex, wis, lck, hp_current) VALUES ('G1', ?, ?, 5, ?, 3, 1, 30)").run(id, str, dex);
+    putCharO(OA, 5, 4); putCharO(OB, 4, 2); putCharO(OC, 3, 2); putCharO(OD, 3, 2);
+    const putNpcO = (name, str, dex, hp = 30) => dbHandle.prepare("INSERT OR REPLACE INTO npcs (guild_id, name, str, con, dex, wis, lck, hp_current) VALUES ('G1', ?, ?, 3, ?, 1, 1, ?)").run(name, str, dex, hp);
+    putNpcO('Ohound', 10, 1); putNpcO('Ocrow', 1, 1, 2);
+    const chO = new FakeChannel('CO1', 0, 'o-walk', guild); channelsById.set(chO.id, chO);
+    const fO = (over, ch = chO) => fire({ channel: ch, ...over });
+    const fightO = (cid = 'CO1') => dbHandle.prepare("SELECT * FROM fights WHERE guild_id='G1' AND channel_id=?").get(cid);
+    const setO = (o, cid = 'CO1') => { const ks = Object.keys(o); dbHandle.prepare(`UPDATE fights SET ${ks.map(k => `${k}=?`).join(', ')} WHERE guild_id='G1' AND channel_id=?`).run(...ks.map(k => (o[k] !== null && typeof o[k] === 'object') ? JSON.stringify(o[k]) : o[k]), cid); };
+    const fxO = (id, cid = 'CO1') => JSON.parse(fightO(cid)?.effect_state || '{}')[id] || {};
+    const hpO = (id, cid = 'CO1') => JSON.parse(fightO(cid)?.hp_state || '{}')[id];
+    const FRESHO = { phase: 'attack', current_target: null, atk_kind: null, atk_roll: null, atk_nat: null, def_roll: null, def_nat: null, grapples: {} };
+    const act = (uid, o, ch = chO) => fire({ channel: ch, commandName: 'fight', options: { _sub: 'act', ...o }, userId: uid, ...asO(uid) });
+    const press = (id, uid, ch = chO, msg = null) => fire({ channel: ch, isButton: true, customId: id, message: msg || { id: nextId(), content: 'x', components: [] }, userId: uid, ...asO(uid) });
+    const submit = (modal, uid, ch = chO, fields = { action: '', speech: '' }, extra = {}) => fire({ channel: ch, isModal: true, customId: modal || 'frp:none', fields, userId: uid, ...asO(uid), ...extra });
+    const quietO = (mins, cid = 'CO1') => dbHandle.prepare("UPDATE fights SET last_at=?, nudged=0, clock_idle=0 WHERE guild_id='G1' AND channel_id=?").run(Date.now() - mins * 60000, cid);
+
+    // 1 · the bot rolls: a natural 20 on top, the 1s at the bottom — on one
+    // DEX, the first to roll a 1 lowest — and the naturals mark first turns
+    const st1 = await withDice([20, 1, 1, 12], () => fO({ commandName: 'fight', options: { _sub: 'start', players: `<@${OA}> <@${OB}> <@${OC}>`, npcs: 'Ohound' }, userId: 'U1' }));
+    const f1 = fightO(), ord1 = JSON.parse(f1?.turn_order || '[]');
+    ok('/fight start: a natural 20 goes first whatever the totals, the 1s last — on one DEX the first to roll a 1 lowest — each line marked, the close call told; the 20 holds two actions and each 1 a roleplay turn',
+      ord1.join(',') === `${OA},npc:Ohound,${OC},${OB}`
+        && new RegExp(`1\\. \\*\\*${NA}\\*\\* — 🎲 \\[20\\] \\+ ⚡ 4 DEX = \\*\\*24 initiative\\*\\* · ⚡ natural 20 — two actions on the first turn`).test(saidOf(st1))
+        && new RegExp(`4\\. \\*\\*${NB}\\*\\* — 🎲 \\[1\\] \\+ ⚡ 2 DEX = \\*\\*3 initiative\\*\\* · 🎭 natural 1 — the first turn is roleplay only`).test(saidOf(st1))
+        && new RegExp(`⏱️ \\*\\*Natural 1s on 2 DEX\\*\\* — the first to roll a 1 goes last: ${NC} → ${NB}`).test(saidOf(st1))
+        && /A natural 20 — two actions this turn, any two, then it passes/.test(saidOf(st1))
+        && fxO(OA).extraAction === true && fxO(OB).rpTurn === true && fxO(OC).rpTurn === true && !fxO('npc:Ohound').extraAction,
+      `${ord1.join(',')} · ${flat1(saidOf(st1)).slice(0, 500)} · ${f1?.effect_state}`);
+
+    // 2 · two actions: a grab whose save passes the turn keeps it; a strike
+    // resolved then passes it on — a natural 1's fighter still answers
+    const g2 = await withDice([12], () => act(OA, { action: 'grapple', target: OB, flavour: 'a grab' }));
+    const s2 = await withDice([3], () => act(OB, { action: 'save' }));
+    const f2a = fightO();
+    const a2 = await withDice([10], () => fO({ commandName: 'fight', options: { _sub: 'atk', stat: 'str', target: OC, flavour: 'a cut' }, userId: OA, ...asO(OA) }));
+    const d2 = await withDice([5], () => fO({ commandName: 'fight', options: { _sub: 'def', stat: 'dex', flavour: 'a parry' }, userId: OC, ...asO(OC) }));
+    const r2 = await fO({ commandName: 'fight', options: { _sub: 'resolve' }, userId: OC, ...asO(OC) });
+    const f2b = fightO();
+    ok('a natural 20’s first turn holds two actions: the grab’s end keeps the turn (“acts again”, the turn line called afresh), the strike’s end passes it; a natural 1 still saves and defends',
+      /acts again — the second action of a natural 20 on initiative/.test(saidOf(s2)) && new RegExp(`\\*\\*${NA}\\*\\*'s turn to attack!`).test(saidOf(s2))
+        && f2a.turn_index === 0 && f2a.phase === 'attack' && !fxO(OA).extraAction && JSON.parse(f2a.grapples || '{}')[OB] === OA
+        && f2b.turn_index === 1 && f2b.phase === 'attack' && !/acts again/.test(saidOf(r2)) && /Ohound/.test(saidOf(r2)),
+      `${flat1(saidOf(g2)).slice(0, 80)} · ${flat1(saidOf(s2)).slice(0, 300)} · @${f2a.turn_index}/${f2a.phase} ${f2a.grapples} · ${flat1(saidOf(a2)).slice(0, 60)} · ${flat1(saidOf(d2)).slice(0, 60)} · ${flat1(saidOf(r2)).slice(0, 200)} @${f2b.turn_index}`);
+
+    // 3 · a natural 1's first turn: Roleplay alone; anything else refused;
+    // the form's words pass the turn; typed, it opens the form; a held
+    // fighter's round wound still lands
+    const sk3 = await fO({ commandName: 'fight', options: { _sub: 'skip' }, userId: 'U1' });
+    const tryA = await fO({ commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Ohound', flavour: 'x' }, userId: OC, ...asO(OC) });
+    const tryG = await act(OC, { action: 'grapple', target_npc: 'Ohound', flavour: 'x' });
+    const tryP = await press('fatk:str', OC);
+    const rpBtnWrong = await press('fact:roleplay', OB);
+    const rpP = await press('fact:roleplay', OC);
+    const rpS = await submit(modalOf(rpP), OC, chO, { action: 'bows low', speech: 'Well met.' });
+    const f3a = fightO(), hpB3 = hpO(OB);
+    const rpT = await act(OB, { action: 'roleplay' });
+    const rpT2 = await submit(modalOf(rpT), OB);
+    const f3b = fightO();
+    ok('a natural 1’s first turn: the turn line carries Roleplay alone and says why; an attack, a grab and a stat button are refused with the button; the form’s words pass the turn; typed, it opens the form; a held fighter’s round wound still lands; the turn comes round with no natural left',
+      /fact:roleplay/.test(allOf(sk3)) && !/fatk:str/.test(allOf(sk3)) && /A natural 1 on initiative — this first turn is roleplay only: press \*\*Roleplay\*\*/.test(saidOf(sk3))
+        && [tryA, tryG, tryP].every(r => /your first turn is roleplay only/.test(saidOf(r))) && /fact:roleplay/.test(allOf(tryA))
+        && /It is not your turn/.test(saidOf(rpBtnWrong)) && /^frp:/.test(modalOf(rpP) || '')
+        && new RegExp(`🎭 \\*\\*${NC}\\*\\* spends the first turn in roleplay — a natural 1 on initiative`).test(saidOf(rpS)) && /\*bows low\*/.test(saidOf(rpS)) && /Well met\./.test(saidOf(rpS))
+        && f3a.turn_index === 3 && !fxO(OC).rpTurn && /fact:roleplay/.test(allOf(rpS))
+        && /^frp:/.test(modalOf(rpT) || '') && /is still held by/.test(saidOf(rpT2)) && hpO(OB) === hpB3 - 1 && !fxO(OB).rpTurn
+        && f3b.turn_index === 0 && !/two actions/.test(saidOf(rpT2)),
+      `${flat1(allOf(sk3)).slice(0, 300)} · ${[tryA, tryG, tryP].map(r => flat1(saidOf(r)).slice(0, 60)).join(' | ')} · ${saidOf(rpBtnWrong).slice(0, 40)} · ${flat1(saidOf(rpS)).slice(0, 240)} @${f3a.turn_index} · ${flat1(saidOf(rpT2)).slice(0, 240)} ${hpO(OB)}/${hpB3} @${f3b.turn_index}`);
+
+    // 4 · a skip is the whole turn: a 20's second action goes with it, a
+    // 1's roleplay turn is spent, a disarmed fighter's weapon is fetched
+    setO({ ...FRESHO, turn_index: 0, effect_state: { [OA]: { extraAction: true }, [OC]: { rpTurn: true, disarmed: true } } });
+    const sk4 = await fO({ commandName: 'gm', options: { _group: 'override', _sub: 'skip' }, userId: 'U1' });
+    const f4a = fightO();
+    setO({ turn_index: 2 });
+    const sk4b = await fO({ commandName: 'fight', options: { _sub: 'skip' }, userId: 'U1' });
+    const f4b = fightO();
+    ok('a skip is the whole turn: a natural 20’s second action goes with it; a natural 1’s roleplay turn is spent by it, and a disarmed fighter’s skipped turn fetches the weapon',
+      f4a.turn_index === 1 && !/acts again/.test(saidOf(sk4)) && !fxO(OA).extraAction
+        && f4b.turn_index === 3 && !fxO(OC).rpTurn && !fxO(OC).disarmed && /The skipped turn goes to retrieving their weapon/.test(saidOf(sk4b)),
+      `@${f4a.turn_index} ${flat1(saidOf(sk4)).slice(0, 120)} · @${f4b.turn_index} ${JSON.stringify(fxO(OC))} ${flat1(saidOf(sk4b)).slice(0, 160)}`);
+
+    // 5 · the turn clock and the auto-pilot pass a roleplay turn on their own
+    await fO({ commandName: 'session', options: { _sub: 'clock', remind: 5, skip: 15, timeout: 'auto' }, userId: 'U1' });
+    setO({ ...FRESHO, turn_index: 1, effect_state: { 'npc:Ohound': { rpTurn: true } }, auto_npc: 0 });
+    quietO(16); let n0 = sent.length; await tickAll();
+    const clk5 = textOf(newIn('CO1', n0)), f5a = fightO();
+    setO({ ...FRESHO, turn_index: 1, effect_state: { 'npc:Ohound': { rpTurn: true } }, auto_npc: 1 });
+    const realTO5 = globalThis.setTimeout;
+    globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
+    quietO(3); n0 = sent.length; await tickAll(); for (let i = 0; i < 6; i++) await settle();
+    globalThis.setTimeout = realTO5;
+    const auto5 = textOf(newIn('CO1', n0)), f5b = fightO();
+    setO({ auto_npc: 0 });
+    ok('the turn clock passes a natural 1’s turn in roleplay rather than attacking, and so does the auto-pilot',
+      /15 minutes quiet\./.test(clk5) && /\*\*Ohound 🎭\*\* spends the first turn in roleplay — a natural 1 on initiative/.test(clk5) && !/the bot attacks for/.test(clk5) && f5a.turn_index === 2
+        && /\*\*Ohound 🎭\*\* spends the first turn in roleplay/.test(auto5) && f5b.turn_index === 2 && !fxO('npc:Ohound').rpTurn,
+      `${flat1(clk5).slice(0, 260)} @${f5a.turn_index} · ${flat1(auto5).slice(0, 200)} @${f5b.turn_index}`);
+
+    // 6 · /fight add and addnpc: a natural on the joiner's roll marks their first turn
+    const add6 = await withDice([20], () => fO({ commandName: 'fight', options: { _sub: 'add', user: OD, where: 'last' }, userId: 'U1' }));
+    putNpcO('Ojack', 2, 1);
+    const addN6 = await withDice([1], () => fO({ commandName: 'fight', options: { _sub: 'addnpc', npc: 'Ojack' }, userId: 'U1' }));
+    ok('a fighter joining mid-fight: a natural 20 gives their first turn two actions, a natural 1 makes it roleplay only, and the line says so',
+      /A natural 20 — two actions on their first turn/.test(saidOf(add6)) && fxO(OD).extraAction === true
+        && /A natural 1 — their first turn is roleplay only/.test(saidOf(addN6)) && fxO('npc:Ojack').rpTurn === true,
+      `${flat1(saidOf(add6)).slice(0, 160)} · ${flat1(saidOf(addN6)).slice(0, 160)} · ${JSON.stringify(fxO(OD))} ${JSON.stringify(fxO('npc:Ojack'))}`);
+    dbHandle.prepare("UPDATE fights SET state='idle' WHERE guild_id='G1' AND channel_id='CO1'").run();
+
+    // 7 · the auto-pilot's natural 20: two swings before the turn passes
+    const chO2 = new FakeChannel('CO2', 0, 'o-auto', guild); channelsById.set(chO2.id, chO2);
+    await fO({ commandName: 'fight', options: { _sub: 'start', npcs: 'Ohound, Ocrow', manual: true }, userId: 'U1' }, chO2);
+    setO({ ...FRESHO, turn_order: ['npc:Ohound', 'npc:Ocrow'], turn_index: 0, auto_npc: 1, effect_state: { 'npc:Ohound': { extraAction: true } }, hp_state: { 'npc:Ohound': 30, 'npc:Ocrow': 2 }, rr_state: { 'npc:Ohound': 0, 'npc:Ocrow': 0 } }, 'CO2');
+    const realTO7 = globalThis.setTimeout;
+    globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
+    quietO(3, 'CO2'); n0 = sent.length;
+    await withDice([10, 15, 2, 10, 15, 2], async () => { await tickAll(); for (let i = 0; i < 10; i++) await settle(); });
+    globalThis.setTimeout = realTO7;
+    const auto7 = textOf(newIn('CO2', n0));
+    ok('on auto, an NPC’s natural 20 gives it a second swing before the turn passes',
+      /\*\*Ohound 🎭\*\* acts again — the second action of a natural 20 on initiative/.test(auto7) && (auto7.match(/acts again/g) || []).length === 1,
+      flat1(auto7).slice(0, 500));
+    dbHandle.prepare("UPDATE fights SET state='idle' WHERE guild_id='G1' AND channel_id='CO2'").run();
+    putNpcO('Ocrow', 1, 1, 2);
+
+    // 8 · a called fight, the players rolling their own: NPCs rolled at once;
+    // each player's Roll; the last begins it; nothing else can start here meanwhile
+    const chO3 = new FakeChannel('CO3', 0, 'o-call', guild); channelsById.set(chO3.id, chO3);
+    const callO = (cid = 'CO3') => dbHandle.prepare("SELECT * FROM fight_calls WHERE guild_id='G1' AND channel_id=?").get(cid);
+    const manualNo = await fO({ commandName: 'fight', options: { _sub: 'start', players: `<@${OA}> <@${OB}>`, manual: true, roll: 'players' }, userId: 'U1' }, chO3);
+    n0 = sent.length;
+    const call8 = await withDice([9], () => fO({ commandName: 'fight', options: { _sub: 'start', players: `<@${OA}> <@${OB}>`, npcs: 'Ohound', roll: 'players' }, userId: 'U1' }, chO3));
+    const card8 = newIn('CO3', n0).find(m => idsOf(m).some(id => id.startsWith('fcall:roll'))), ids8 = idsOf(card8), text8 = card8?.content || '';
+    const c8 = callO(), st8 = String(c8?.created_at);
+    const cardMsg8 = { id: card8?.id, content: card8?.content || '', components: card8?.components || [] };
+    const again8 = await fO({ commandName: 'fight', options: { _sub: 'start', players: `<@${OA}> <@${OC}>` }, userId: 'U1' }, chO3);
+    const rA = await withDice([15], () => press(`fcall:roll:${st8}`, OA, chO3, cardMsg8));
+    const rA2 = await press(`fcall:roll:${st8}`, OA, chO3, cardMsg8);
+    const rC = await press(`fcall:roll:${st8}`, OC, chO3, cardMsg8);
+    const joinNo = await press(`fcall:join:${st8}`, OC, chO3, cardMsg8);
+    const f8a = fightO('CO3');
+    n0 = sent.length;
+    const rB = await withDice([1], () => press(`fcall:roll:${st8}`, OB, chO3, cardMsg8));
+    const f8b = fightO('CO3'), ord8 = JSON.parse(f8b?.turn_order || '[]'), start8 = textOf(newIn('CO3', n0));
+    ok('a called fight, the players rolling: manual refuses it; the card pings who must roll, the NPC rolled already; a player rolls once, a stranger cannot; no second fight meanwhile; the last roll begins it, the order by the rule and the 1’s turn marked',
+      /`manual:` keeps the order you listed and rolls nothing/.test(saidOf(manualNo))
+        && !!card8 && ['fcall:roll', 'fcall:npcs', 'fcall:begin', 'fcall:cancel'].every(p => ids8.includes(`${p}:${st8}`)) && !ids8.some(id => id.startsWith('fcall:join'))
+        && text8.includes(`<@${OA}>`) && text8.includes(`<@${OB}>`) && /Ohound — 🎲 \[9\] \+ ⚡ 1 DEX = \*\*10\*\*/.test(text8) && new RegExp(`${NA} — ⏳ to roll`).test(text8)
+        && /The fight is called/.test(saidOf(call8)) && /A fight is being called here/.test(saidOf(again8))
+        && new RegExp(`${NA} — 🎲 \\[15\\] \\+ ⚡ 4 DEX = \\*\\*19\\*\\*`).test(saidOf(rA)) && /You have rolled — \*\*19\*\*/.test(saidOf(rA2))
+        && /You are not in this fight/.test(saidOf(rC)) && /there is no joining it/.test(saidOf(joinNo)) && (!f8a || f8a.state !== 'active')
+        && f8b?.state === 'active' && ord8.join(',') === `${OA},npc:Ohound,${OB}` && fxO(OB, 'CO3').rpTurn === true
+        && /The fight is on/.test(saidOf(rB)) && /initiative order/.test(start8) && callO()?.state === 'begun',
+      `${flat1(saidOf(manualNo)).slice(0, 60)} · ${ids8.join(',')} · ${flat1(text8).slice(0, 300)} · ${flat1(saidOf(call8)).slice(0, 80)} · ${flat1(saidOf(again8)).slice(0, 60)} · ${flat1(saidOf(rA)).slice(0, 200)} · ${saidOf(rA2).slice(0, 40)} · ${saidOf(rC).slice(0, 40)} · ${f8a?.state} · ${f8b?.state} ${ord8.join(',')} ${JSON.stringify(fxO(OB, 'CO3'))} · ${flat1(saidOf(rB)).slice(0, 80)} · ${flat1(start8).slice(0, 200)}`);
+    dbHandle.prepare("UPDATE fights SET state='idle' WHERE guild_id='G1' AND channel_id='CO3'").run();
+
+    // 9 · a called fight with sign-ups, the bot rolling: Join, Leave, the
+    // refusals, the GM's NPCs, Begin
+    n0 = sent.length;
+    const call9 = await fO({ commandName: 'fight', options: { _sub: 'start', signup: true }, userId: 'U1' }, chO3);
+    const card9 = newIn('CO3', n0).find(m => idsOf(m).some(id => id.startsWith('fcall:join')));
+    const st9 = String(callO()?.created_at), ids9 = idsOf(card9);
+    const cm9 = { id: card9?.id, content: card9?.content || '', components: card9?.components || [] };
+    const jA = await press(`fcall:join:${st9}`, OA, chO3, cm9);
+    const jA2 = await press(`fcall:join:${st9}`, OA, chO3, cm9);
+    const lA = await press(`fcall:leave:${st9}`, OA, chO3, cm9);
+    await press(`fcall:join:${st9}`, OA, chO3, cm9);
+    await press(`fcall:join:${st9}`, OC, chO3, cm9);
+    const jN = await press(`fcall:join:${st9}`, ON, chO3, cm9);
+    const rollNo = await press(`fcall:roll:${st9}`, OA, chO3, cm9);
+    const beginPlain = await press(`fcall:begin:${st9}`, OB, chO3, cm9);
+    const npcPlain = await press(`fcall:npcs:${st9}`, OB, chO3, cm9);
+    const npcBtn = await press(`fcall:npcs:${st9}`, 'U1', chO3, cm9);
+    const npcSub = await fO({ isModal: true, fromMessage: true, customId: 'fcallnpc', fields: { more: 'Ohound, Nobody here' }, message: cm9, userId: 'U1' }, chO3);
+    const ents9 = JSON.parse(callO()?.entrants || '[]');
+    n0 = sent.length;
+    const begin9 = await withDice([8, 10, 5], () => press(`fcall:begin:${st9}`, 'U1', chO3, cm9));
+    const f9 = fightO('CO3'), ord9 = JSON.parse(f9?.turn_order || '[]'), start9 = textOf(newIn('CO3', n0));
+    ok('a called fight with sign-ups: Join puts a player in, twice is told so, Leave takes them out; no sheet, no place; the bot rolls here; Begin is the GM’s or the caller’s, NPCs the GM’s by the box (a name that is no NPC left out); Begin rolls everyone and starts it, a level total to whoever rolled first',
+      !!card9 && ['fcall:join', 'fcall:leave', 'fcall:npcs', 'fcall:begin', 'fcall:cancel'].every(p => ids9.includes(`${p}:${st9}`)) && !ids9.some(id => id.startsWith('fcall:roll'))
+        && (jA.replies[0]?.content || '').includes(NA) && /in already/.test(saidOf(jA2)) && !(lA.replies[0]?.content || '').includes(NA)
+        && /no character sheet/.test(saidOf(jN)) && /The bot rolls for everyone on this call/.test(saidOf(rollNo))
+        && /is the GM’s, or whoever called it/.test(saidOf(beginPlain)) && /Adding NPCs is the GM’s/.test(saidOf(npcPlain)) && modalOf(npcBtn) === 'fcallnpc'
+        && ents9.map(e => e.id).join(',') === `${OA},${OC},npc:Ohound` && /Nobody here\*\* is no NPC here — left out/.test(allOf(npcSub))
+        && f9?.state === 'active' && ord9.join(',') === `${OA},${OC},npc:Ohound` && /Level at 12/.test(start9),
+      `${ids9.join(',')} · ${flat1(saidOf(jA)).slice(0, 60)} · ${saidOf(jA2).slice(0, 30)} · ${saidOf(jN).slice(0, 50)} · ${saidOf(rollNo).slice(0, 50)} · ${saidOf(beginPlain).slice(0, 50)} · ${modalOf(npcBtn)} · ${ents9.map(e => e.id).join(',')} · ${flat1(allOf(npcSub)).slice(0, 160)} · ${f9?.state} ${ord9.join(',')} · ${flat1(start9).slice(0, 300)}`);
+    dbHandle.prepare("UPDATE fights SET state='idle' WHERE guild_id='G1' AND channel_id='CO3'").run();
+
+    // 10 · sign-ups with the players rolling: Join rolls you; /fight end calls it off
+    n0 = sent.length;
+    await fO({ commandName: 'fight', options: { _sub: 'start', signup: true, roll: 'players' }, userId: 'U1' }, chO3);
+    const card10 = newIn('CO3', n0).find(m => idsOf(m).some(id => id.startsWith('fcall:join')));
+    const st10 = String(callO()?.created_at), ids10 = idsOf(card10);
+    const j10 = await withDice([7], () => press(`fcall:join:${st10}`, OA, chO3, { id: card10?.id, content: '', components: [] }));
+    const e10 = JSON.parse(callO()?.entrants || '[]')[0];
+    const end10 = await fO({ commandName: 'fight', options: { _sub: 'end' }, userId: 'U1' }, chO3);
+    const late10 = await press(`fcall:begin:${st10}`, 'U1', chO3);
+    ok('sign-ups with the players rolling: the card carries Join, Leave and Roll, and Join rolls you on the spot; /fight end calls the call off and its buttons go quiet',
+      ['fcall:join', 'fcall:leave', 'fcall:roll'].every(p => ids10.includes(`${p}:${st10}`)) && e10?.id === OA && e10.roll === 7 && e10.total === 11
+        && /The fight call is off/.test(saidOf(end10)) && callO()?.state === 'cancelled' && /That fight call is over/.test(saidOf(late10)),
+      `${ids10.join(',')} · ${JSON.stringify(e10)} · ${flat1(saidOf(j10)).slice(0, 80)} · ${saidOf(end10).slice(0, 50)} · ${callO()?.state} · ${saidOf(late10).slice(0, 40)}`);
+
+    // 11 · out of combat: /initiative, the players rolling, only those named —
+    // the last roll sets it; a natural 20's two Dones; a natural 1's Roleplay
+    const chO4 = new FakeChannel('CO4', 0, 'o-order', guild); channelsById.set(chO4.id, chO4);
+    const orderO = () => dbHandle.prepare("SELECT * FROM turn_orders WHERE guild_id='G1' AND channel_id='CO4'").get();
+    const KO = () => { const o = orderO(); return `${o?.created_at || 0}-${o?.turn_seq || 0}`; };
+    const lastO = () => sent.filter(x => x.channel === 'CO4').map(x => x.msg).pop();
+    n0 = sent.length;
+    const ini11 = await fO({ commandName: 'initiative', options: { players: `<@${OA}> <@${OB}>`, roll: 'players', signup: false }, userId: 'U1' }, chO4);
+    const card11 = newIn('CO4', n0).find(m => idsOf(m).some(id => id.startsWith('init:roll')));
+    const o11 = orderO(), st11 = String(o11?.created_at), ids11 = idsOf(card11), text11 = card11?.content || '';
+    const cm11 = { id: card11?.id, content: card11?.content || '', components: card11?.components || [] };
+    const jNo = await press(`init:join:${st11}`, OC, chO4, cm11);
+    await withDice([20], () => press(`init:roll:${st11}`, OA, chO4, cm11));
+    n0 = sent.length;
+    const rB11 = await withDice([1], () => press(`init:roll:${st11}`, OB, chO4, cm11));
+    const o11b = orderO(), list11 = JSON.parse(o11b?.order_json || '[]'), turn11 = newIn('CO4', n0).find(m => idsOf(m).some(id => id.startsWith('init:done'))), turnText11 = turn11?.content || '';
+    ok('/initiative: the players rolling and only those named — the card has Roll and no Join, pinging them; the last roll sets the order, the 20 on top marked for two actions, the 1 below marked for roleplay; the first turn says two actions',
+      /Each player rolls with 🎲 \*\*Roll\*\*\. \*\*Close & roll\*\* rolls for anyone left, or the last roll sets it/.test(saidOf(ini11))
+        && !!card11 && ids11.includes(`init:roll:${st11}`) && !ids11.some(id => id.startsWith('init:join')) && text11.includes(`<@${OA}>`)
+        && /there is no joining or leaving it/.test(saidOf(jNo)) && o11b?.state === 'running' && list11.map(e => e.id).join(',') === `${OA},${OB}`
+        && list11[0].x2 === true && list11[1].rp === true && /natural 20s on top/.test(saidOf(rB11)) && /A natural 20 on initiative — two actions this turn, ✅ Done after each/.test(turnText11),
+      `${flat1(saidOf(ini11)).slice(0, 200)} · ${ids11.join(',')} · ${saidOf(jNo).slice(0, 50)} · ${o11b?.state} ${JSON.stringify(list11)} · ${flat1(saidOf(rB11)).slice(0, 100)} · ${flat1(turn11?.content).slice(0, 200)}`);
+    const k11 = KO();
+    await press(`init:done:${k11}`, OA, chO4);
+    const o12a = orderO(), card12a = lastO(), text12a = card12a?.content || '';
+    await press(`init:done:${KO()}`, OA, chO4);
+    const o12b = orderO(), card12b = lastO(), ids12b = idsOf(card12b), text12b = card12b?.content || '';
+    const rpWrong = await press(`init:rp:${KO()}`, OA, chO4);
+    const rpOpen = await press(`init:rp:${KO()}`, OB, chO4);
+    const kRp = KO();
+    const rpSub = await submit(modalOf(rpOpen), OB, chO4, { action: 'shrugs', speech: 'Later, then.' }, { fromMessage: true, message: { id: nextId(), content: 'x', components: [] } });
+    const o12c = orderO(), card12c = lastO();
+    ok('out of combat: a natural 20’s first Done keeps the turn for a second action; the second passes it; a natural 1’s card carries Roleplay in place of Done, theirs alone, and its words pass the turn; round two has no naturals left',
+      o12a.turn_index === 0 && /first action is done — a second follows: a natural 20 on initiative/.test(text12a) && !JSON.parse(o12a.order_json)[0].x2
+        && o12b.turn_index === 1 && ids12b.some(id => id.startsWith('init:rp:')) && !ids12b.some(id => id.startsWith('init:done:')) && /this first turn is roleplay only/.test(text12b)
+        && /only they or a GM/.test(saidOf(rpWrong)) && modalOf(rpOpen) === `initrp:${kRp}`
+        && o12c.round === 2 && o12c.turn_index === 0 && new RegExp(`🎭 \\*\\*${NB}\\*\\* spends the first turn in roleplay — a natural 1 on initiative\\.`).test(card12c?.content || '')
+        && /\*shrugs\*/.test(card12c?.content || '') && /Later, then\./.test(card12c?.content || '') && !/two actions/.test(card12c?.content || '')
+        && JSON.parse(o12c.order_json).every(e => !e.x2 && !e.rp),
+      `@${o12a.turn_index} ${flat1(card12a?.content).slice(0, 120)} · @${o12b.turn_index} ${ids12b.join(',')} ${flat1(text12b).slice(0, 120)} · ${saidOf(rpWrong).slice(0, 60)} · ${modalOf(rpOpen)} · r${o12c.round}@${o12c.turn_index} ${flat1(card12c?.content).slice(0, 240)}`);
+
+    // 12 · a joiner takes their place by the rule; sign-ups off with the bot
+    // rolling set the order at once
+    const add12 = await withDice([20], () => fO({ commandName: 'session', options: { _sub: 'turn', action: 'add', who: `<@${OC}>` }, userId: 'U1' }, chO4));
+    const list12 = JSON.parse(orderO()?.order_json || '[]');
+    await fO({ commandName: 'session', options: { _sub: 'turn', action: 'end' }, userId: 'U1' }, chO4);
+    n0 = sent.length;
+    const now12 = await fO({ commandName: 'initiative', options: { players: `<@${OA}>`, npcs: 'Ohound', signup: false }, userId: 'U1' }, chO4);
+    const o13 = orderO(), msgs13 = newIn('CO4', n0);
+    ok('a joiner rolls and takes their place by the rule — a natural 20 among the 20s, after a higher DEX — marked for two actions; with sign-ups off and the bot rolling the order is set at once, no card to join',
+      list12.map(e => e.id).join(',') === `${OA},${OC},${OB}` && list12[1].x2 === true && /place 2 of 3/.test(saidOf(add12)) && /A natural 20 — two actions on their first turn/.test(saidOf(add12))
+        && /Rolled — the order is set/.test(saidOf(now12)) && o13?.state === 'running' && !msgs13.some(m => idsOf(m).some(id => id.startsWith('init:join'))) && msgs13.some(m => idsOf(m).some(id => /^init:(done|rp):/.test(id))),
+      `${list12.map(e => `${e.id}:${e.roll}`).join(',')} · ${flat1(saidOf(add12)).slice(0, 160)} · ${flat1(saidOf(now12)).slice(0, 80)} · ${o13?.state} · ${msgs13.map(m => idsOf(m).join('+')).join(' | ')}`);
+    await fO({ commandName: 'session', options: { _sub: 'turn', action: 'end' }, userId: 'U1' }, chO4);
+
+    guild.members.fetch = realFetchO;
+    const threwO = loggedO.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
+    console.error = realErrO;
+    ok('nothing in the O walk threw', threwO.length === 0, threwO.slice(0, 3).join('\n        '));
   }
 
   // ── No button, modal or select id throws on a junk payload ──────────

@@ -1408,7 +1408,9 @@ const EXPORTS = ['chunkLines', 'rulesFor', 'abilityNeeds', 'belowBar', 'resolveD
   'withPlainMode', 'HOLD_ASK_MS', 'HOLD_GO_MS',
   // Build L (2026-11-09): what a flat penalty does to a roll's mode, an
   // automatic roll at disadvantage and how it reads, the rules table.
-  'flatMode', 'autoRoll', 'autoTag', 'autoDice', 'RULES'];
+  'flatMode', 'autoRoll', 'autoTag', 'autoDice', 'RULES',
+  // Build O (2026-11-10): initiative's one rule, the marks a natural leaves.
+  'initiativeCompare', 'sortInitiative', 'initiativeFlags', 'initTag', 'joinNatLine'];
 
 let loaded = null;
 function loadIndex(src) {
@@ -1447,8 +1449,8 @@ function testBuilders(src) {
                      'help', 'library', 'npc', 'quest', 'quiz', 'roll', 'spell', 'standing']) {
       ok(`/${n} is registered`, !!by[n]);
     }
-    ok('twenty-six commands registered \\u2014 /campaign joined 2026-09-24, /edit 2026-10-13, /rp and /existence 2026-10-15; /encounter became /instance and the old /instance /session 2026-11-06',
-      cmds.length === 26 && cmds.some(c => c.name === 'instance') && cmds.some(c => c.name === 'session') && !cmds.some(c => c.name === 'encounter') &&
+    ok('twenty-seven commands registered \\u2014 /campaign joined 2026-09-24, /edit 2026-10-13, /rp and /existence 2026-10-15; /encounter became /instance and the old /instance /session 2026-11-06; /initiative 2026-11-10',
+      cmds.length === 27 && cmds.some(c => c.name === 'initiative') && cmds.some(c => c.name === 'instance') && cmds.some(c => c.name === 'session') && !cmds.some(c => c.name === 'encounter') &&
       cmds.some(c => c.name === 'campaign') && cmds.some(c => c.name === 'edit') && cmds.some(c => c.name === 'rp') && cmds.some(c => c.name === 'existence'));
     // /edit: the private route to the Edit (DDice) box. The list is the
     // bot's own and NPC lines only, buttons excluded, newest first, and a
@@ -2193,7 +2195,8 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         return starts.length >= 3 && starts.every(m => {
           const win = src.slice(m.index, m.index + 700);
           const end = win.indexOf('});');
-          return /effect_state: '\{\}'/.test(end > 0 ? win.slice(0, end) : win);
+          // The naturals on initiative are a new fight's only marks (2026-11-10).
+          return /effect_state: (?:'\{\}'|JSON\.stringify\(initiativeFlags\(inits\)\))/.test(end > 0 ? win.slice(0, end) : win);
         });
       })());
     ok('every fight end stands down through one helper \u2014 six paths, no idle written elsewhere',
@@ -2264,7 +2267,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         && /const res = await passTurn\(guild, gid, cid, hpState, \[\.\.\.turnOrder\], turnOrder, floor, lines, actorId\);\s*await deliver\(lines\);/.test(src)
         && /const res = await passTurn\(interaction\.guild, gid, cid, hpState, \[\.\.\.turnOrder\], turnOrder, fightFloor\(fight\), lines, attackerId\);/.test(src));
     ok('a kept hold: the captive or a GM for an NPC answers by button or slash; a quiet captive stays; an NPC on auto struggles; a hold of 20 makes the break flat',
-      /\['fsave', 'finsight', 'fresolve', 'frr', 'fbreak', 'fstay', 'fnretrieve'\]\.includes\(interaction\.customId\)/.test(src)
+      /\['fsave', 'finsight', 'fresolve', 'frr', 'fbreak', 'fstay', 'fnretrieve', 'fnroleplay'\]\.includes\(interaction\.customId\)/.test(src)
         && /openFightRp\(interaction, 'breakfree', \{ npc: npcB \}/.test(src) && /case 'stay':\s*return handleFight\(interaction, \{ sub: 'act', action: 'stay'/.test(src)
         && /if \(fight\.phase === 'defend' && fight\.atk_kind === 'hold' && fight\.current_target === actorId\)\s*return runFightBreakFree\(/.test(src)
         && /if \(fight\.atk_kind === 'hold'\) \{\s*\/\/ A captive gone quiet stays in the hold/.test(src)
@@ -2541,12 +2544,14 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /if \(typedD && !flavourD && !interaction\.heldMode\?\.noForm\) \{[\s\S]{0,260}?return openFightRp\(interaction, 'def', \{ stat, npc: npcActAs \|\| null, mode: /.test(src) &&
       /let mode = forcedOf\(forced, 'mode'\) \?\? interaction\.options\?\.getString\?\.\('roll'\) \?\? 'normal';/.test(src) &&
       /case 'def':\s*return handleFight\(interaction, \{ sub: 'def', stat: p\.stat, npc: p\.npc \|\| null, mode: p\.mode \|\| 'normal', flavour \}\);/.test(src));
-    ok('initiative ties reroll among the tied, in /fight start and /fight auto, each round audited and told',
-      /function settleInitiativeTies\(inits, \{ gid, cid, nameOf \}\)/.test(src) &&
-      /const tieLines = settleInitiativeTies\(initiatives, \{ gid, cid, nameOf: \(it\) => it\.name \}\);/.test(src) &&
-      /const tieLinesA = settleInitiativeTies\(inits, \{ gid, cid, nameOf: \(it\) => F\[it\.fid\]\.name \}\);/.test(src) &&
-      /`initiative tie-break \(round \$\{round\}\)`/.test(src) && /\*\*Tie at \$\{at\}\*\*/.test(src) && /still level after five rounds/.test(src) &&
-      /return startLong \? replyLong\(interaction, lines\) : interaction\.reply/.test(src) &&
+    // The tie rerolls went 2026-11-10 (T): a level total goes to whoever rolled first.
+    ok('initiative is one rule in /fight start, a called fight, /fight auto and an order: naturals first and last, the rest by total, a level total to whoever rolled first',
+      /function initiativeCompare\(a, b\)/.test(src) && /function sortInitiative\(inits, nameOf = \(it\) => it\.name\)/.test(src) &&
+      !/settleInitiativeTies/.test(src) && !/initiative tie-break/.test(src) &&
+      /const \{ lines, rows \} = await startFightFromInits\(interaction\.guild, gid, cid, initiatives, floor\);\s*return replyLong\(interaction, lines, rows\.length \? \{ components: rows \} : \{\}\);/.test(src) &&
+      /const \{ lines, rows \} = await startFightFromInits\(interaction\.guild, gid, cid, inits, floor\);/.test(src) &&
+      /const tieLinesA = sortInitiative\(inits, \(it\) => F\[it\.fid\]\.name\);/.test(src) &&
+      /const ties = sortInitiative\(list\);/.test(src) &&
       (src.match(/if \(tieLines(?:A)?\.length\) lines0?\.push\('', \.\.\.tieLines(?:A)?\);/g) || []).length === 3);
     ok('/rp: a box or inline, posted in the player\'s name through the channel\'s webhook, kept in rp_lines, chronicled as a roleplay beat',
       /setName\('rp'\)/.test(src) && /async function handleRp\(interaction\)/.test(src) && /async function handleRpModal\(interaction\)/.test(src) &&
@@ -2607,10 +2612,10 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /setConfig\(gid, \{ turn_remind_min: null, turn_skip_min: null, turn_timeout: null, fight_nudge_min: null \}\);/.test(src) &&
       /function applyChannelClock\(gid, cid, ask, uid\)/.test(src) && /CREATE TABLE IF NOT EXISTS turn_clocks/.test(src) &&
       /if \(subT === 'clock'\) return handleSessionClock\(interaction\);/.test(src));
-    ok('initiative: a sign-up card, Close rolls d20 + DEX with ties rerolled, a turn card each turn keyed to it, rounds and skips on a run\'s timeline',
+    ok('initiative: a sign-up card, Close rolls d20 + DEX in the one order, a turn card each turn keyed to it, rounds and skips on a run\'s timeline',
       /CREATE TABLE IF NOT EXISTS turn_orders/.test(src) && /if \(subT === 'initiative'\) return handleSessionInitiative\(interaction\);/.test(src) &&
       /setCustomId\(`init:join:\$\{st\}`\)/.test(src) && /setCustomId\(`init:close:\$\{st\}`\)/.test(src) && /setCustomId\('initnpc'\)/.test(src) &&
-      /const ties = settleInitiativeTies\(list, \{ gid, cid, nameOf: \(it\) => it\.name \}\);/.test(src) &&
+      /function settleTurnOrder\(gid, cid\)/.test(src) &&
       /setCustomId\(`init:done:\$\{key\}`\)/.test(src) && /if \(expectKey && initTurnKey\(o\) !== expectKey\) return null;/.test(src) &&
       /noteQuestActivity\(gid, cid, 'turn', `Round \$\{round\}`\)/.test(src) && /turn: '\\u\{1F504\}'/.test(src) &&
       /startsWith\('init:'\)\) return handleInitButton/.test(src) && /customId === 'initnpc'\) return handleInitNpcModal/.test(src));
@@ -2921,7 +2926,8 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
                 '/quest run winddown', '/quest run recap', '/quest run note', '/session add',
                 '/gm override interject', 'pages|roster', '/fight add', 'temp:true', '/npc temp',
                 '/standing title', '/standing association', 'Who is excluded', 'Maintain the hold',
-                '/session add|kick', '/instance start quest:N', 'kind:', 'record:true']
+                '/session add|kick', '/instance start quest:N', 'kind:', 'record:true',
+                '`/initiative`', 'roll:Players', 'signup:true', '**Roleplay**']
           .every(t => h.includes(t));
       })());
     ok('the help picker offers the tools page',
@@ -3709,7 +3715,7 @@ function testBuildN(src) {
         && /const barG = abilityNeeds\(gid, 'grapple'\);\s*if \(belowBar\(subject, barG\)\)[^\n]*\n\s*const turnOrder = fightOrder\(fight\);\s*const attackerId/.test(src));
     ok('the striker seized is held from that moment, with no wound as its turn ends; a grab that falls short resolves the exchange as a failed defence',
       /passTurn\(interaction\.guild, gid, cid, hpState, \[\.\.\.turnOrder\], turnOrder, floor, lines, attackerId, \{ strain: false \}\)/.test(src)
-        && /async function passTurn\(guild, gid, cid, hpState, order, roster, floor, lines, actorId, \{ strain = true \} = \{\}\) \{\s*const st = strain \? await applyTurnEndStrain\(/.test(src)
+        && /async function passTurn\(guild, gid, cid, hpState, order, roster, floor, lines, actorId, \{ strain = true \} = \{\}\) \{\s*const again = await keepTurnForExtra\([^\n]*\n\s*if \(again\) return again;\s*const st = strain \? await applyTurnEndStrain\(/.test(src)
         && /upsertFight\(gid, cid, \{ def_roll: total, def_nat: nat, def_stat: 'str', def_mode: mode, def_sides: 20 \}\);\s*const res = await resolveExchange\(interaction\.guild, gid, cid, getFight\(gid, cid\), \{ forceHit: true \}\);/.test(src));
     ok('Grapple with a strike pending on you is the defence — typed, /roll, the button — and a target picked on the attack picker is always the grab',
       /if \(forcedOf\(forced, 'defend'\) \|\| \(!npcActAs && !pickedG && fG\?\.state === 'active' && fG\.phase === 'defend' && fG\.current_target === uid\)\) \{\s*return runFightGrappleDef\(/.test(src)
@@ -3783,6 +3789,58 @@ function testBuildN(src) {
 
 // Build L (2026-11-09): a flat penalty and its rider, an automatic roll at
 // disadvantage and how it reads, the grapple bar, the rules as written.
+// Build O (2026-11-10): initiative is one rule everywhere — naturals first
+// and last, the rest by total, a level total to whoever rolled first — and
+// a natural marks the first turn: a 20 two actions, a 1 roleplay only.
+function testBuildO(mod, src) {
+  return harness('build O', (ok, eq) => {
+    const { initiativeCompare: cmp, sortInitiative: sort, initiativeFlags: flags, initTag: tag, joinNatLine: jn, RULES: R } = mod;
+    const E = (name, roll, dex, at) => ({ id: name, name, roll, dex, total: roll + dex, at });
+    const order = (xs) => { const l = xs.map(x => ({ ...x })); sort(l); return l.map(x => x.name); };
+    eq('a natural 20 goes first whatever the totals, a natural 1 last', order([E('mid', 19, 5, 1), E('twenty', 20, -2, 2), E('one', 1, 9, 3)]), ['twenty', 'mid', 'one']);
+    eq('several 20s: the higher DEX first, then whoever rolled first', order([E('a', 20, 2, 3), E('b', 20, 4, 5), E('c', 20, 2, 1)]), ['b', 'c', 'a']);
+    eq('several 1s: the lower DEX lower; on one DEX the first to roll a 1 lowest, later rollers above', order([E('early', 1, 2, 1), E('lowdex', 1, 0, 9), E('late', 1, 2, 7)]), ['late', 'early', 'lowdex']);
+    eq('everyone else by total; a level total to whoever rolled first, whatever the die or DEX', order([E('first', 10, 5, 1), E('second', 14, 1, 2), E('top', 18, 0, 3)]), ['top', 'first', 'second']);
+    ok('the comparison is a total order: the same rolls sort the same whichever way they come in',
+      JSON.stringify(order([E('x', 7, 3, 4), E('y', 20, 1, 2), E('z', 1, 1, 3), E('w', 9, 1, 1)])) === JSON.stringify(order([E('w', 9, 1, 1), E('z', 1, 1, 3), E('y', 20, 1, 2), E('x', 7, 3, 4)])));
+    const told = (() => { const l = [E('A', 10, 3, 1), E('B', 10, 3, 2), E('C', 1, 2, 3), E('D', 1, 2, 4)]; return sort(l); })();
+    ok('the close calls are told: a level total, and naturals on one DEX — and nothing is rerolled',
+      told.some(l => /\*\*Level at 13\*\* — whoever rolled first goes first: A → B/.test(l))
+        && told.some(l => /\*\*Natural 1s on 2 DEX\*\* — the first to roll a 1 goes last: D → C/.test(l)) && !told.some(l => /reroll/i.test(l)));
+    eq('a fight starts with a 20’s second action and a 1’s roleplay turn marked, nothing else', flags([E('a', 20, 1, 1), E('b', 1, 1, 2), E('c', 12, 1, 3)]), { a: { extraAction: true }, b: { rpTurn: true } });
+    ok('the lines say what a natural leaves', /two actions on the first turn/.test(tag({ roll: 20 })) && /roleplay only/.test(tag({ roll: 1 })) && tag({ roll: 12 }) === ''
+      && /two actions on their first turn/.test(jn(20)) && /roleplay only/.test(jn(1)) && jn(9) === '');
+    const text = (key) => { const r = R.find(x => x.key === key); return r ? (typeof r.text === 'function' ? r.text() : r.text) : ''; };
+    ok('the rules say it: the naturals at either end, the two actions, the roleplay turn, the level total, no rerolls',
+      /^Initiative is d20 \+ DEX \(the modifier on 5e\), highest first\./.test(text('initiative'))
+        && /A natural 20 goes to the top whatever the totals, and its first turn holds two actions, any two/.test(text('initiative'))
+        && /several 1s go lower DEX lower, and on one DEX the first to roll a 1 sits lowest/.test(text('initiative'))
+        && /Any other level total goes to whoever rolled first; nobody rerolls/.test(text('initiative')));
+    ok('a natural 20 keeps the turn for its second action in every turn’s end: the pass, the exchange (not between a 5e fighter’s swings), the deflection',
+      /async function keepTurnForExtra\(guild, gid, cid, hpState, order, roster, floor, lines, actorId\)/.test(src)
+        && (src.match(/midAction \? null : await keepTurnForExtra\(/g) || []).length === 2
+        && /\{ midAction: usedSoFar < allowed \}/.test(src)
+        && /const again = await keepTurnForExtra\(interaction\.guild, gid, cid, hpState, order, turnOrder, floor, lines, attackerId\);/.test(src)
+        && /if \(!again\) for \(const l of tickConditions\(/.test(src));
+    ok('a natural 1’s first turn: Roleplay alone, every other action refused first; the auto-pilot and the clock pass it; a skip spends it, and a 20’s second action',
+      /if \(rpTurnOf\(fight, fid\)\) return fightAnswerRows\('roleplay', \{ forNpc: npc, auto, gid \}\);/.test(src)
+        && (src.match(/if \(rpTurnOf\(fight, actorId\)\) return refuse\(rpTurnRefusal\(/g) || []).length >= 6
+        && (src.match(/await roleplayTurn\(guild, gid, cid, attackerId,/g) || []).length === 2
+        && (src.match(/consumeEffectFlag\(gid, cid, (skippedId|waitedId|attackerId), 'rpTurn'\);/g) || []).length === 3
+        && (src.match(/consumeEffectFlag\(gid, cid, (skippedId|waitedId|attackerId), 'extraAction'\);/g) || []).length === 3
+        && /case 'roleplay':\s*return handleFight\(interaction, \{ sub: 'act', action: 'roleplay', npc: p\.npc \|\| null, flavour \}\);/.test(src)
+        && /\{name:'🎭 Roleplay — a natural 1 on initiative: your first turn, in words',value:'roleplay'\}/.test(src));
+    ok('a called fight: its table, its card’s lanes, the start that waits for it and the end that calls it off; /initiative routed with roll: and signup:',
+      /CREATE TABLE IF NOT EXISTS fight_calls/.test(src) && /startsWith\('fcall:'\)\) return handleFightCallButton\(interaction\);/.test(src)
+        && /customId === 'fcallnpc'\) return handleFightCallNpcModal\(interaction\);/.test(src)
+        && /if \(liveFightCall\(gid, cid\)\) return interaction\.reply\(\{ ephemeral: true, content: '\\u274C A fight is being called here/.test(src)
+        && /saveFightCall\(gid, cid, \{ state: 'cancelled' \}\);\s*await refreshCallCard\(chan, gid, call,/.test(src)
+        && /if \(interaction\.commandName === 'initiative'\) return await handleSessionInitiative\(interaction\);/.test(src)
+        && /ALTER TABLE turn_orders ADD COLUMN roll_mode TEXT/.test(src) && /ALTER TABLE turn_orders ADD COLUMN open INTEGER/.test(src)
+        && /customId\.startsWith\('initrp:'\)\) return handleInitRpModal\(interaction\);/.test(src));
+  });
+}
+
 function testBuildL(mod) {
   return harness('build L', (ok, eq) => {
     const { flatMode: fm, autoRoll: ar, autoTag: at, autoDice: ad, RULES_KNIGHTFALL: KF, RULES_DND5E: D5, RULES: R } = mod;
@@ -4007,7 +4065,7 @@ function main() {
     }
     if (missing.length) console.log(`${C.yel}!${C.off} load                   ${C.dim}not exported: ${missing.join(', ')}${C.off}`);
 
-    for (const r of [testBuilders(src), testRules(mod), testPins(src), testBuildI(mod), testBuildJ(mod), testBuildK(mod), testBuildL(mod), testBuildN(src)]) {
+    for (const r of [testBuilders(src), testRules(mod), testPins(src), testBuildI(mod), testBuildJ(mod), testBuildK(mod), testBuildL(mod), testBuildN(src), testBuildO(mod, src)]) {
       assertions += r.pass;
       if (r.fails.length) {
         failedSteps.push(r.name);

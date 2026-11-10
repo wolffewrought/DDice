@@ -770,6 +770,17 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS turn_orders (
   created_at INTEGER, ended_at INTEGER,
   PRIMARY KEY (guild_id, channel_id)
 )`); } catch (e) { console.error('turn_orders schema', e); }
+// A fight called before it starts (T, 2026-11-10): its card, who is in and
+// what each rolled, who rolls, whether it takes sign-ups, the bout floor.
+// state open | begun | cancelled. One a channel.
+try { db.exec(`CREATE TABLE IF NOT EXISTS fight_calls (
+  guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'open',
+  gm_id TEXT, roll_mode TEXT NOT NULL DEFAULT 'bot', open INTEGER NOT NULL DEFAULT 0,
+  floor_hp INTEGER NOT NULL DEFAULT 0, entrants TEXT NOT NULL DEFAULT '[]',
+  card_msg_id TEXT, created_at INTEGER,
+  PRIMARY KEY (guild_id, channel_id)
+)`); } catch (e) { console.error('fight_calls schema', e); }
 // A player's own advantage or disadvantage, held for a GM (2026-11-08):
 // what was asked, as it can be run again, and how it went.
 try { db.exec(`CREATE TABLE IF NOT EXISTS mode_holds (
@@ -784,6 +795,11 @@ try { db.exec('CREATE INDEX IF NOT EXISTS mode_holds_open ON mode_holds (guild_i
 // npc_lines (2026-10-20 to 2026-11-06) held each channel's newest NPC line,
 // whose row was the only one kept; every line keeps its row now, so it is
 // no longer made. A server that had it keeps an idle table, read by nothing.
+// Who rolls an order, and whether it takes sign-ups (T, 2026-11-10): the bot
+// for everyone at Close, or each player on the card; Join open, or only
+// those named. Rows from before read as the bot and open.
+try { db.exec("ALTER TABLE turn_orders ADD COLUMN roll_mode TEXT DEFAULT 'bot'"); } catch {}
+try { db.exec('ALTER TABLE turn_orders ADD COLUMN open INTEGER DEFAULT 1'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN rerolls_current INTEGER DEFAULT 0'); } catch {}
 // A temporary NPC is a real fighter in every way the engine cares about —
@@ -1945,6 +1961,7 @@ async function handleRollSlash(interaction) {
   // 2026-11-10): refused before any flat mark is spent.
   if (intoFight) {
     const wD = fightAwaiting(gid, cid, uid);
+    if (wD?.kind === 'atk' && rpTurnOf(wD.fight, uid)) return interaction.reply({ ephemeral: true, content: rpTurnRefusal() });
     if (wD?.kind === 'atk' && disarmedOf(wD.fight, uid)) return interaction.reply({ ephemeral: true, content: disarmedRefusal() });
   }
   // A flat mark strips the stat here as a typed roll's does \u2014 /roll let it
@@ -2074,6 +2091,7 @@ const RULES = [
   { key: 'deflect-disarm', text: 'Deflect: beat the attack and the enemy loses its next turn retrieving the weapon. A natural 20 turns the blow whatever the totals, a named enemy takes 2, and your flat next attack gets +2; a natural 1 fails for 2 wounds, your next defence flat as well as your next attack. Disarm needs DEX 4+, works on NPCs only and needs no blade: against a strike, beat the attack; on your turn, beat their best of STR and DEX, ties to them. Disarmed, they spend their next turn retrieving the weapon. A natural 20 disarms whatever the totals and wounds 1 \u2014 against a strike it banks +2 too, riding even a flat attack; a natural 1 fails for 2 wounds and disarms you. After any disarm your very next roll is a flat d20.' },
   { key: 'disarmed',       text: 'Disarmed, your next turn goes to retrieving the weapon \u2014 no attack, grab, feint, disarm, escape or hold until you have. A skipped turn counts; the auto-pilot and the turn clock retrieve on their own.' },
   { key: 'defence-once',   text: 'One answer per strike: once a defence is in \u2014 a roll, a deflection, a disarm, a feint or a grapple \u2014 it is rerolled with a token, never rolled again.' },
+  { key: 'initiative',     text: 'Initiative is d20 + DEX (the modifier on 5e), highest first. A natural 20 goes to the top whatever the totals, and its first turn holds two actions, any two; several 20s go higher DEX first, then whoever rolled first. A natural 1 goes to the bottom, and its first turn is roleplay only \u2014 your words, no roll or action, though you can still defend; several 1s go lower DEX lower, and on one DEX the first to roll a 1 sits lowest. Any other level total goes to whoever rolled first; nobody rerolls. Out of combat a 20\u2019s first turn takes two Dones and a 1\u2019s is a Roleplay turn. Join later and you roll the same way.' },
   { key: 'one-quest',      text: 'One quest at a time. A run that is winding down does not count; nor does anything opened with `/instance` \u2014 the GM seats those by hand.' },
   { key: 'winddown-kick',  text: 'Kicked while a run is winding down? You are still paid when it completes.' },
   { key: 'pause-round',    text: () => `A pause rounds the clock up to the next ${Math.round(QUARTER_MS / 60000)} minutes.` },
@@ -10484,12 +10502,21 @@ const markDisarmUsed = (gid, cid, fid) => markRoundSpecial(gid, cid, fid, 'disar
 // A player presses Retrieve or types `/fight act action:Retrieve`; a GM does
 // it for an NPC; the auto-pilot and the turn clock retrieve on their own.
 const disarmedOf = (fight, fid) => !!JSON.parse(fight?.effect_state || '{}')[fid]?.disarmed;
+// A natural 1 on initiative (T, 2026-11-10): the first turn is roleplay only
+// \u2014 the form's words, no roll and no action, though they can still defend.
+const rpTurnOf = (fight, fid) => !!JSON.parse(fight?.effect_state || '{}')[fid]?.rpTurn;
+const rpTurnRefusal = (npcName = null) => npcName
+  ? `\u{1F3AD} **${npcName}** rolled a natural 1 on initiative \u2014 its first turn is roleplay only: the \u{1F3AD} Roleplay button, or \`/fight act action:Roleplay npc:${npcName}\`.`
+  : '\u{1F3AD} A natural 1 on initiative \u2014 your first turn is roleplay only: press **Roleplay**, or `/fight act action:Roleplay`. You can still defend.';
 const disarmedRefusal = (npcName = null) => npcName
   ? `\u2694\uFE0F **${npcName}** is disarmed \u2014 its turn goes to retrieving the weapon: the \u{1F3AD} Retrieve button, or \`/fight act action:Retrieve npc:${npcName}\`.`
   : '\u2694\uFE0F You are disarmed \u2014 this turn goes to retrieving your weapon: press **Retrieve**, or `/fight act action:Retrieve`.';
 // One answer per strike: a defence already cast is rerolled with a token,
 // not rolled again (audit, 2026-11-10 \u2014 a second `/fight def`, deflect,
 // disarm or feint replaced the first for nothing).
+// A skipped turn is the one a disarmed fighter would have spent on the
+// weapon (2026-11-10): the GM's skips and the clock's say so alike.
+const SKIPPED_RETRIEVAL = '\u{1F5E1}\uFE0F The skipped turn goes to retrieving their weapon.';
 const ALREADY_ANSWERED = '\u274C That strike already has its answer \u2014 `/fight resolve` it, or `/fight rr` to reroll.';
 
 function grappleHeldTargetOf(fight, id) {
@@ -11693,6 +11720,10 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   const attackerId = order[fight.turn_index];
   if (!isNpcFighter(attackerId)) return false; // current fighter is a player — wait for them
   if (isFallen(gid, attackerId)) return false;  // fallen NPCs take no turn
+  // A natural 1 on initiative: the auto-pilot passes the first turn in
+  // roleplay (T, 2026-11-10); the next turn's buttons ride with the line.
+  if (await roleplayTurn(guild, gid, cid, attackerId,
+      async (l) => sendLong(channel, l))) return true;
   // Disarmed, the auto-pilot spends the turn retrieving (T, 2026-11-10); the
   // next turn's buttons ride with the line.
   if (await retrievalTurn(guild, gid, cid, attackerId,
@@ -11852,6 +11883,9 @@ async function fighterStateLine(guild, gid, cid, fid) {
   if (eff.holdPaid) bits.push('\u{1FAA2} this round\u2019s wound already paid');
   if (eff.rollBonus) bits.push(`\u2694\uFE0F **+${eff.rollBonus} to hit** on the next attack \u2014 riposte${eff.rbFlat ? ', flat or not' : ''}`);
   if (eff.disarmed) bits.push('\u{1F5E1}\uFE0F **disarmed** \u2014 the next turn goes to retrieving the weapon');
+  // A natural on initiative: the first turn's shape (T, 2026-11-10).
+  if (eff.extraAction) bits.push('\u26A1 **two actions on the first turn** \u2014 a natural 20 on initiative');
+  if (eff.rpTurn) bits.push('\u{1F3AD} **first turn roleplay only** \u2014 a natural 1 on initiative');
   if (eff.gmAdj) bits.push(`\u2696\uFE0F **${eff.gmAdj > 0 ? '+' : ''}${eff.gmAdj}** from the GM`);
   if (eff.gmStat) bits.push(`\u2696\uFE0F GM set the stat to **${STAT_LABELS[eff.gmStat] || eff.gmStat}**`);
   if (eff.fooled) bits.push(`\u{1F3AD} **next roll is a flat d20**${eff.fooledDis ? ', at **disadvantage**' : ''}`);
@@ -11909,55 +11943,131 @@ async function fightHpLine(guild, gid, cid, order) {
   return bits.length ? `\n\u2764\uFE0F ${bits.join(' \u00b7 ')}` : '';
 }
 
-// Initiative ties reroll among the tied (T, 2026-10-15: "whenever multiple
-// initiative rolls are the same end total have the bot reroll for those
-// players"). `inits` carry {id|fid, name, roll, dex, total}; fighters on one
-// total roll d20 + DEX again, only them, until apart \u2014 five rounds, then
-// the higher die as before. Their slots in the order stay where the shared
-// total put them; the reroll settles only who among them goes first.
-// Sorts `inits` in place and returns the lines that tell it.
-function settleInitiativeTies(inits, { gid, cid, nameOf }) {
+// Initiative (T, 2026-11-10). d20 + DEX \u2014 Knightfall's DEX as it stands,
+// 5e's modifier. Natural 20s go first: the higher DEX first and, on the
+// same DEX, whoever rolled first. Natural 1s go last: the lower DEX lower
+// and, on the same DEX, the first to roll a 1 lowest of all, later rollers
+// above. Everyone else by total, an equal total to whoever rolled first.
+// No rerolls (the rule from 2026-10-15): DEX splits only the naturals, and
+// time the rest. Each roll carries `at`, the moment it was made.
+let lastRollStamp = 0;
+function rollStamp() {
+  const t = Date.now();
+  lastRollStamp = t > lastRollStamp ? t : lastRollStamp + 1;
+  return lastRollStamp;
+}
+const initBand = (x) => (x.roll === 20 ? 0 : x.roll === 1 ? 2 : 1);
+function initiativeCompare(a, b) {
+  const ba = initBand(a), bb = initBand(b);
+  if (ba !== bb) return ba - bb;
+  const at = (x) => Number(x.at) || 0, dex = (x) => Number(x.dex) || 0;
+  if (ba === 0) return (dex(b) - dex(a)) || (at(a) - at(b));
+  if (ba === 2) return (dex(b) - dex(a)) || (at(b) - at(a));
+  return ((Number(b.total) || 0) - (Number(a.total) || 0)) || (at(a) - at(b));
+}
+// Sorts `inits` in place; returns the lines that say how the close calls
+// went \u2014 a shared total, naturals on one DEX.
+function sortInitiative(inits, nameOf = (it) => it.name) {
+  inits.sort(initiativeCompare);
   const told = [];
-  const key = (x) => x.id ?? x.fid;
-  inits.sort((a, b) => b.total - a.total || b.roll - a.roll);
-  const rank = new Map();   // key -> [original total, then each reroll total]
-  for (const it of inits) rank.set(key(it), [it.total]);
-  // Everyone sharing a total rolls again; any who still share one roll
-  // again among themselves, round after round, five at most.
-  const settle = (pool, at, round) => {
-    if (pool.length < 2) return;
-    if (round > 5) {
-      // Five rounds level: the higher first die decides, and the card says so.
-      const byDie = [...pool].sort((a, b) => b.roll - a.roll);
-      told.push(`\u{1F501} still level after five rounds \u2014 the higher first die decides: ${byDie.map(it => `${nameOf(it)} [${it.roll}]`).join(' \u00b7 ')}`);
-      return;
+  const level = (x, y) => initBand(x) === initBand(y)
+    && (initBand(x) === 1 ? x.total === y.total : (Number(x.dex) || 0) === (Number(y.dex) || 0));
+  for (let i = 0; i < inits.length;) {
+    let j = i + 1;
+    while (j < inits.length && level(inits[i], inits[j])) j++;
+    if (j - i > 1) {
+      const grp = inits.slice(i, j), names = grp.map(nameOf).join(' \u2192 '), b = initBand(grp[0]);
+      told.push(b === 1 ? `\u23F1\uFE0F **Level at ${grp[0].total}** \u2014 whoever rolled first goes first: ${names}`
+        : b === 0 ? `\u23F1\uFE0F **Natural 20s on ${grp[0].dex} DEX** \u2014 whoever rolled first goes first: ${names}`
+        : `\u23F1\uFE0F **Natural 1s on ${grp[0].dex} DEX** \u2014 the first to roll a 1 goes last: ${names}`);
     }
-    const bits = pool.map(it => {
-      const r = rollDie(20), t = r + (it.dex ?? 0);
-      rank.get(key(it)).push(t);
-      try { mirrorAutoRoll(gid, cid, nameOf(it), '1d20', r, t, `initiative tie-break (round ${round})`); } catch {}
-      return { it, r, t };
-    });
-    const top = Math.max(...bits.map(b => b.t));
-    const leaders = bits.filter(b => b.t === top);
-    const names = pool.map(it => nameOf(it));
-    told.push(`\u{1F501} **Tie at ${at}** \u2014 ${names.length > 2 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : names.join(' and ')} reroll: `
-      + bits.map(b => `${nameOf(b.it)} \u{1F3B2} [${b.r}] + ${b.it.dex ?? 0} = ${b.t}`).join(' · ')
-      + (leaders.length === 1 ? ` → ${nameOf(leaders[0].it)} first` : ' → still tied'));
-    const byT = new Map();
-    for (const b of bits) { if (!byT.has(b.t)) byT.set(b.t, []); byT.get(b.t).push(b.it); }
-    for (const [t, grp] of byT) if (grp.length > 1) settle(grp, t, round + 1);
-  };
-  const groups = new Map();
-  for (const it of inits) { if (!groups.has(it.total)) groups.set(it.total, []); groups.get(it.total).push(it); }
-  for (const [total, tied] of groups) if (tied.length > 1) settle(tied, total, 1);
-  // Order: by the original total, then by each reroll round, then the first die.
-  inits.sort((a, b) => {
-    const ra = rank.get(key(a)), rb = rank.get(key(b));
-    for (let i = 0; i < Math.max(ra.length, rb.length); i++) { const d = (rb[i] ?? -1) - (ra[i] ?? -1); if (d) return d; }
-    return b.roll - a.roll;
-  });
+    i = j;
+  }
   return told;
+}
+// The mark a natural leaves on an initiative line.
+const initTag = (it) => (it.roll === 20 ? ' \u00b7 \u26A1 natural 20 \u2014 two actions on the first turn'
+  : it.roll === 1 ? ' \u00b7 \u{1F3AD} natural 1 \u2014 the first turn is roleplay only' : '');
+// What a natural leaves a fighter who joins mid-fight, said after their roll.
+const joinNatLine = (roll) => (roll === 20 ? '\n\u26A1 A natural 20 \u2014 two actions on their first turn.'
+  : roll === 1 ? '\n\u{1F3AD} A natural 1 \u2014 their first turn is roleplay only.' : '');
+// The flags a fight starts with: a natural 20's second action, a natural
+// 1's roleplay turn (T, 2026-11-10). Keyed by fighter id.
+function initiativeFlags(inits) {
+  const fx = {};
+  for (const it of inits) {
+    const id = it.id ?? it.fid;
+    if (it.roll === 20) fx[id] = { extraAction: true };
+    else if (it.roll === 1) fx[id] = { rpTurn: true };
+  }
+  return fx;
+}
+// A fighter joining mid-fight rolls too, and a natural marks their first
+// turn the same way; a mark left from an earlier entry goes.
+function setInitiativeFlag(gid, cid, fid, roll) {
+  const all = JSON.parse(getFight(gid, cid)?.effect_state || '{}');
+  const slot = all[fid] || {};
+  delete slot.extraAction; delete slot.rpTurn;
+  if (roll === 20) slot.extraAction = true;
+  else if (roll === 1) slot.rpTurn = true;
+  if (Object.keys(slot).length) all[fid] = slot; else delete all[fid];
+  upsertFight(gid, cid, { effect_state: JSON.stringify(all) });
+}
+// The first turn's line at a fight's start: the usual prompt, or what a
+// natural on initiative makes of it.
+function firstTurnPrompt(f) {
+  if (f.roll === 1) return f.isNpc
+    ? `\n_\u{1F3AD} A natural 1 \u2014 its first turn is roleplay only: a GM plays it with the \u{1F3AD} Roleplay button, or \`/fight act action:Roleplay npc:${f.name}\`._`
+    : '\n_\u{1F3AD} A natural 1 \u2014 this first turn is roleplay only: press **Roleplay**, or `/fight act action:Roleplay`. You can still defend._';
+  return turnPrompt(f) + (f.roll === 20 ? '\n_\u26A1 A natural 20 \u2014 two actions this turn, any two, then it passes._' : '');
+}
+// A fight begins from its rolled initiative: the order sorted, the first
+// turn's naturals marked, the row written clean. Shared by /fight start and
+// a called fight's \u2694\uFE0F Begin. `inits` carry { id, name, roll, dex, total,
+// at, isNpc }. Returns the lines to post and the buttons the first turn
+// carries \u2014 only a natural 1 first in line has any.
+function startFightFromInits(guild, gid, cid, inits, floor = 0) {
+  const W = fightWords(floor);
+  const banner = practiceBanner(floor);
+  const hpState = {}, rrState = {};
+  for (const it of inits) {
+    if (it.isNpc) {
+      const npc = getNpc(gid, it.name);
+      hpState[it.id] = npc?.hp_current ?? 0;
+      rrState[it.id] = Math.max(0, npc?.rerolls_current ?? npc?.lck ?? 0);
+    } else hpState[it.id] = getChar(gid, it.id)?.hp_current ?? 0;
+  }
+  const tieLines = sortInitiative(inits);
+  const npcCount = inits.filter(i => i.isNpc).length;
+  const playerCount = inits.length - npcCount;
+  const lines = [`\u2694\uFE0F **${W.started}** ${playerCount} player${playerCount === 1 ? '' : 's'} + ${npcCount} NPC${npcCount === 1 ? '' : 's'} \u2014 initiative order:`, ''];
+  if (banner) lines.splice(1, 0, banner);
+  inits.forEach((f, i) => lines.push(`${i + 1}. **${f.name}**${f.isNpc ? ' \u{1F3AD}' : ''} \u2014 \u{1F3B2} [${f.roll}] + \u26A1 ${f.dex} DEX = **${f.total} initiative**${initTag(f)}`));
+  if (tieLines.length) lines.push('', ...tieLines);
+  lines.push('');
+  const first = inits[0];
+  lines.push(`\u{1F3AF} **${first.name}** goes first!${firstTurnPrompt(first)}${turnPing(gid, first)}`);
+  upsertFight(gid, cid, {
+    ...FRESH_EXCHANGE,   // no grapple, feint or hold pending, no reroll spent
+    state: 'active',
+    // A new fight starts clean. This path (practice bouts and duels) was
+    // the one that did not, so a fumble sanction from an earlier brawl in
+    // the same channel landed on someone's first defence here \u2014 Fenrir,
+    // who had not swung yet (T's screenshot, 2026-08-20). The naturals on
+    // initiative are its only marks.
+    effect_state: JSON.stringify(initiativeFlags(inits)), grapples: '{}',
+    turn_order: JSON.stringify(inits.map(i => i.id)),
+    turn_index: 0,
+    phase: 'attack',
+    current_target: null,
+    atk_roll: null, atk_nat: null, atk_stat: null,
+    def_roll: null, def_nat: null, def_stat: null,
+    hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState),
+    floor_hp: floor,
+    log_state: '{}',   // a new fight, a new recap
+  });
+  const rows = first.roll === 1 ? turnRowsFor(gid, getFight(gid, cid), first.id) : [];
+  return { lines, rows, first };
 }
 
 // The buttons a fighter's turn carries. A disarmed fighter's is Retrieve
@@ -11967,6 +12077,9 @@ function settleInitiativeTies(inits, { gid, cid, nameOf }) {
 // on auto.
 function turnRowsFor(gid, fight, fid, { auto = false } = {}) {
   const npc = isNpcFighter(fid);
+  // A natural 1 on initiative: Roleplay alone (T, 2026-11-10) \u2014 before the
+  // weapon, since the lost turn fetches it as a skipped one does.
+  if (rpTurnOf(fight, fid)) return fightAnswerRows('roleplay', { forNpc: npc, auto, gid });
   if (disarmedOf(fight, fid)) return fightAnswerRows('retrieve', { forNpc: npc, auto, gid });
   if (npc) return fightAnswerRows('atk', { forNpc: true, auto, gid });
   const gmap = fight ? fightGrapples(fight) : {};
@@ -11974,14 +12087,20 @@ function turnRowsFor(gid, fight, fid, { auto = false } = {}) {
   return rowsFor.flatMap(k => fightAnswerRows(k, { held: !!gmap[fid], gid })).slice(0, 5);
 }
 
-async function announceNextTurn(guild, gid, cid, lines, order, index) {
+async function announceNextTurn(guild, gid, cid, lines, order, index, { again = false } = {}) {
   const nextF = await resolveFighter(guild, gid, order[index]);
   const autoOn = !!getFight(gid, cid)?.auto_npc;
-  for (const l of tickConditions(gid, cid, order[index], nextF.name)) lines.push(l);
+  // A second action is the same turn: its conditions have ticked already.
+  if (!again) for (const l of tickConditions(gid, cid, order[index], nextF.name)) lines.push(l);
   const hpLine = await fightHpLine(guild, gid, cid, order);
   // Disarmed, the turn goes to fetching the weapon (T, 2026-11-10).
   const disarmedNow = disarmedOf(getFight(gid, cid), order[index]);
-  const hint = (autoOn && nextF.isNpc) ? '' : disarmedNow
+  // A natural 1 on initiative: the first turn is roleplay only (T, 2026-11-10).
+  const rpNow = rpTurnOf(getFight(gid, cid), order[index]);
+  const hint = (autoOn && nextF.isNpc) ? '' : rpNow
+    ? (nextF.isNpc ? `\n_\u{1F3AD} A natural 1 on initiative \u2014 its first turn is roleplay only: a GM plays it with the \u{1F3AD} Roleplay button, or \`/fight act action:Roleplay npc:${nextF.name}\`._`
+      : '\n_\u{1F3AD} A natural 1 on initiative \u2014 this first turn is roleplay only: press **Roleplay**, or `/fight act action:Roleplay`. You can still defend._')
+    : disarmedNow
     ? (nextF.isNpc ? `\n_\u{1F5E1}\uFE0F Disarmed \u2014 a GM spends the turn retrieving: the \u{1F3AD} Retrieve button, or \`/fight act action:Retrieve npc:${nextF.name}\`_`
       : '\n_\u{1F5E1}\uFE0F Disarmed \u2014 this turn goes to retrieving your weapon: press **Retrieve**, or `/fight act action:Retrieve`._')
     : nextF.isNpc
@@ -12059,6 +12178,23 @@ async function applyTurnEndStrain(guild, gid, cid, hpState, order, roster, floor
   return { order };
 }
 
+// A natural 20 on initiative (T, 2026-11-10): the first turn holds two
+// actions, any two \u2014 attack, grapple, feint, disarm, the lot. The first
+// one's end keeps the turn: no strain, no hand-over, the conditions not
+// ticked again; the same fighter is called for the second. Returns the
+// turn's result, or null when the turn passes as usual.
+async function keepTurnForExtra(guild, gid, cid, hpState, order, roster, floor, lines, actorId) {
+  const idx = order.indexOf(actorId);
+  if (idx < 0 || (hpState[actorId] ?? 0) <= floor || isFallen(gid, actorId)) return null;
+  if (!consumeEffectFlag(gid, cid, actorId, 'extraAction')) return null;
+  const F = await resolveFighter(guild, gid, actorId);
+  lines.push('', `\u26A1 **${F.name}${F.isNpc ? ' \u{1F3AD}' : ''}** acts again \u2014 the second action of a natural 20 on initiative.`);
+  upsertFight(gid, cid, { ...FRESH_EXCHANGE, turn_index: idx, hp_state: JSON.stringify(hpState),
+    ...(order.length !== roster.length ? { turn_order: JSON.stringify(order) } : {}) });
+  const nextF = await announceNextTurn(guild, gid, cid, lines, order, idx, { again: true });
+  return { lines, ended: false, nextF, announce: null };
+}
+
 // The turn passes from `actorId`: their turn's end (a held fighter's wound
 // for the round), then the next fighter standing after them in the order as
 // it began \u2014 whoever has dropped out meanwhile, the actor included.
@@ -12066,7 +12202,10 @@ async function applyTurnEndStrain(guild, gid, cid, hpState, order, roster, floor
 // false` skips the turn's-end wound: a striker seized by a defensive grapple
 // is held from that moment, the wounds starting once the grappler's own
 // turn has come round (T, 2026-11-10).
+// A natural 20's first action ends here without passing it.
 async function passTurn(guild, gid, cid, hpState, order, roster, floor, lines, actorId, { strain = true } = {}) {
+  const again = await keepTurnForExtra(guild, gid, cid, hpState, order, roster, floor, lines, actorId);
+  if (again) return again;
   const st = strain ? await applyTurnEndStrain(guild, gid, cid, hpState, order, roster, floor, lines, actorId) : { order };
   if (st.endedRet) return st.endedRet;
   order = st.order;
@@ -12199,7 +12338,7 @@ async function resolveBreakFree(guild, gid, cid, fight, { roll = null, flavour =
 // Returns { lines, ended, announce } where `announce` is the payload for
 // announceFightEnd when the fight finished, and `nextF` is the fighter whose
 // turn it now is (null when the fight ended).
-async function resolveExchange(guild, gid, cid, fight, { forceHit = false } = {}) {
+async function resolveExchange(guild, gid, cid, fight, { forceHit = false, midAction = false } = {}) {
   const turnOrder = fightOrder(fight);
   const attackerId = turnOrder[fight.turn_index];
   const defenderId = fight.current_target;
@@ -12350,6 +12489,9 @@ async function resolveExchange(guild, gid, cid, fight, { forceHit = false } = {}
       if (newOrder.length <= 1) {
         return buildFightEnd(guild, gid, cid, lines, hpState, turnOrder, floor, newOrder[0]);
       }
+      // A natural 20 on initiative: the victor's first turn holds a second action.
+      const againK = midAction ? null : await keepTurnForExtra(guild, gid, cid, hpState, newOrder, turnOrder, floor, lines, attackerId);
+      if (againK) return againK;
       // The victor's turn ends too — a held attacker still pays the strain.
       const st = await applyEndStrain(newOrder);
       if (st.endedRet) return st.endedRet;
@@ -12374,6 +12516,10 @@ async function resolveExchange(guild, gid, cid, fight, { forceHit = false } = {}
     for (const l of effectNoteLines(effNotes, atkName, defName)) lines.push(l);
   }
 
+  // A natural 20 on initiative: the attacker's first turn holds a second
+  // action (T, 2026-11-10) \u2014 not between a 5e fighter's several swings.
+  const again = midAction ? null : await keepTurnForExtra(guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, attackerId);
+  if (again) return again;
   // The attacker's turn ends — a held attacker pays the strain, then the
   // fight advances to the next fighter still standing.
   const st = await applyEndStrain([...turnOrder]);
@@ -12554,9 +12700,13 @@ async function gmSkipTurn(guild, gid, cid, reason) {
   const hpState = fightHp(fight);
   const floor = fightFloor(fight);
   const lines = [`⏭ **${skipped?.name ?? 'Their'}**'s turn is skipped by the GM${reason ? ` — ${reason}` : ''}.`];
+  // A skipped turn is the whole turn (T, 2026-11-10): a natural 20's second
+  // action goes with it, and a natural 1's roleplay turn is spent by it.
+  consumeEffectFlag(gid, cid, skippedId, 'extraAction');
+  consumeEffectFlag(gid, cid, skippedId, 'rpTurn');
   // A skipped turn is the one a disarmed fighter would have spent on the
   // weapon: it counts as the retrieval (2026-11-10).
-  if (consumeEffectFlag(gid, cid, skippedId, 'disarmed')) lines.push('\u{1F5E1}\uFE0F The skipped turn goes to retrieving their weapon.');
+  if (consumeEffectFlag(gid, cid, skippedId, 'disarmed')) lines.push(SKIPPED_RETRIEVAL);
   // A skipped turn still ends: a held fighter's wound for the round lands
   // (T, 2026-11-09). The lines go back to the caller to post \u2014 they used
   // to be dropped, the next turn's ping and buttons with them.
@@ -12722,7 +12872,8 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     : '❌ Waiting for defender to roll first.');
   // Disarmed, the turn goes to the weapon (T, 2026-11-10) \u2014 refused before
   // any flat roll they owe is spent; it used to be spent and then lost to
-  // the retrieval.
+  // the retrieval. A natural 1's roleplay turn likewise.
+  if (rpTurnOf(fight, actorId)) return refuse(rpTurnRefusal(isNpcFighter(actorId) ? npcNameFromFighter(actorId) : null));
   if (disarmedOf(fight, actorId)) return refuse(disarmedRefusal(isNpcFighter(actorId) ? npcNameFromFighter(actorId) : null));
   if (!isNpcFighter(actorId)) {
     const gateMsg = sheetGate(gid, actorId);
@@ -12847,7 +12998,7 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
       const allowed = actor.isNpc ? 1 : rulesA.attacksPerAction(rowSelf);
       const usedSoFar = (Number(fight.atk_used) || 0) + 1;
       const heldIndex = fight.turn_index;
-      const res = await resolveExchange(interaction.guild, gid, cid, getFight(gid, cid));
+      const res = await resolveExchange(interaction.guild, gid, cid, getFight(gid, cid), { midAction: usedSoFar < allowed });
       const head = `⚔️  **${actor.name}** strikes at **${targetF.name}** — ${fightTotalStr(total, nat, 20)} vs **AC ${ac}**`;
       const extra = [];
       const after = getFight(gid, cid);
@@ -12958,6 +13109,7 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
   if (fight.phase !== 'attack') return refuse(fight.atk_kind === 'grapple'
     ? '🤼 A grapple is already pending — the target answers with `/fight act action:Save`.'
     : '❌ Waiting for defender to roll first.');
+  if (rpTurnOf(fight, actorId)) return refuse(rpTurnRefusal(isNpcFighter(actorId) ? npcNameFromFighter(actorId) : null));
   if (disarmedOf(fight, actorId)) return refuse(disarmedRefusal(isNpcFighter(actorId) ? npcNameFromFighter(actorId) : null));
   if (!isNpcFighter(actorId)) {
     const gateMsg = sheetGate(gid, actorId);
@@ -13068,6 +13220,7 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
   if (fight.phase !== 'attack') return refuse(fight.atk_kind === 'feint'
     ? '🎭 A feint is already pending — the target answers with `/fight act action:Insight`.'
     : '❌ Waiting for defender to roll first.');
+  if (rpTurnOf(fight, actorId)) return refuse(rpTurnRefusal(isNpcFighter(actorId) ? npcNameFromFighter(actorId) : null));
   if (disarmedOf(fight, actorId)) return refuse(disarmedRefusal(isNpcFighter(actorId) ? npcNameFromFighter(actorId) : null));
   if (!isNpcFighter(actorId)) {
     const gateMsg = sheetGate(gid, actorId);
@@ -13248,6 +13401,7 @@ async function runFightMaintain(interaction, { flavour = null } = {}) {
   if (actorId !== uid) return refuse('\u274C It is not your turn.');
   const heldId = grappleHeldTargetOf(fight, actorId);
   if (!heldId) return refuse('\u{1F91C} You are not holding anyone.');
+  if (rpTurnOf(fight, actorId)) return refuse(rpTurnRefusal());
   if (disarmedOf(fight, actorId)) return refuse(disarmedRefusal());
 
   const holderF = await resolveFighter(interaction.guild, gid, actorId);
@@ -13385,6 +13539,7 @@ async function runFightEscape({ interaction, gid, cid, actorId, mode, flavour = 
     return refuse(`⚠️ It's **${cur.name}**'s turn.`);
   }
   if (fight.phase !== 'attack') return refuse('❌ Resolve the pending exchange first.');
+  if (rpTurnOf(fight, actorId)) return refuse(rpTurnRefusal(isNpcFighter(actorId) ? npcNameFromFighter(actorId) : null));
   if (disarmedOf(fight, actorId)) return refuse(disarmedRefusal(isNpcFighter(actorId) ? npcNameFromFighter(actorId) : null));
   const holderId = grappleHolderOf(fight, actorId);
   if (!holderId) return refuse('🤼 You are not held — nothing to escape.');
@@ -13499,6 +13654,35 @@ async function retrievalTurn(guild, gid, cid, actorId, deliver, flavour = null) 
   if (flavour) lines.push(`_${flavour}_`);
   try { noteQuestActivity(gid, cid, 'combat', `${F.name} retrieves their weapon`); } catch {}
   // The turn ends: a held fighter's wound for the round lands (2026-11-09).
+  const res = await passTurn(guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, actorId);
+  await deliver(lines);
+  if (res.ended) {
+    const chR = await guild.client.channels.fetch(cid).catch(() => null);
+    if (chR) await announceFightEnd(guild, gid, cid, chR, res.announce);
+  }
+  return true;
+}
+
+// A natural 1 on initiative (T, 2026-11-10): the first turn is roleplay
+// only \u2014 the form's words, no roll and no action, and the turn passes (a
+// held fighter's wound for the round lands, as on any turn). A GM plays it
+// for an NPC; the auto-pilot and the turn clock pass it on their own.
+// Disarmed as well, the lost turn is the retrieval, as a skipped one is;
+// the once-a-round answers re-arm, as any turn of theirs re-arms them.
+// Consumes the flag and the turn; returns true if it did.
+async function roleplayTurn(guild, gid, cid, actorId, deliver, flavour = null) {
+  if (!consumeEffectFlag(gid, cid, actorId, 'rpTurn')) return false;
+  consumeEffectFlag(gid, cid, actorId, 'deflected');
+  consumeEffectFlag(gid, cid, actorId, 'disarmUsed');
+  const fight = getFight(gid, cid);
+  const turnOrder = fightOrder(fight);
+  const hpState = fightHp(fight);
+  const floor = fightFloor(fight);
+  const F = await resolveFighter(guild, gid, actorId);
+  const lines = [`\u{1F3AD} **${F.name}${F.isNpc ? ' \u{1F3AD}' : ''}** spends the first turn in roleplay \u2014 a natural 1 on initiative.`];
+  if (flavour) lines.push(`_${flavour}_`);
+  if (consumeEffectFlag(gid, cid, actorId, 'disarmed')) lines.push('\u{1F5E1}\uFE0F The lost turn goes to retrieving their weapon.');
+  try { noteQuestActivity(gid, cid, 'combat', `${F.name} spends the first turn in roleplay \u2014 a natural 1 on initiative`); } catch {}
   const res = await passTurn(guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, actorId);
   await deliver(lines);
   if (res.ended) {
@@ -13647,6 +13831,16 @@ async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId
     : nat === 20 ? `_🛡️ Trade-off: **${actorName}**'s next attack roll is a flat d20 \u2014 with **+2** from the natural 20._`
     : `_🛡️ Trade-off: **${actorName}**'s next attack roll is a flat d20._`);
 
+  // A natural 20 on initiative: the attacker's first turn holds a second
+  // action (T, 2026-11-10) \u2014 retrieving, when the deflection disarmed it.
+  {
+    const again = await keepTurnForExtra(interaction.guild, gid, cid, hpState, order, turnOrder, floor, lines, attackerId);
+    if (again) {
+      markDeflectUsed(gid, cid, uid);
+      await replyLong(interaction, lines);
+      return kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
+    }
+  }
   // The attacker's turn ends — a held attacker still pays the strain.
   const aiBefore = order.indexOf(attackerId);
   const st = await applyTurnEndStrain(interaction.guild, gid, cid, hpState, order, turnOrder, floor, lines, attackerId);
@@ -13813,6 +14007,7 @@ async function runFightDisarmAttack({ interaction, gid, cid, targetId, mode, fla
     return refuse(`⚠️ It's **${cur.name}**'s turn to attack.`);
   }
   if (fight.phase !== 'attack') return refuse('❌ Resolve the pending exchange first.');
+  if (rpTurnOf(fight, uid)) return refuse(rpTurnRefusal());
   if (disarmedOf(fight, uid)) return refuse(disarmedRefusal());
   {
     const gate0 = deathGate(gid, uid);
@@ -14034,6 +14229,7 @@ async function runFightRetrieve({ interaction, gid, cid, actorId, flavour = null
     return refuse(`⚠️ It's **${cur.name}**'s turn.`);
   }
   if (fight.phase !== 'attack') return refuse('❌ Resolve the pending exchange first.');
+  if (rpTurnOf(fight, actorId)) return refuse(rpTurnRefusal(isNpcFighter(actorId) ? npcNameFromFighter(actorId) : null));
   if (!disarmedOf(fight, actorId)) return refuse('⚔️ Nothing to retrieve — not disarmed.');
   {
     const gate0 = deathGate(gid, actorId);
@@ -14044,6 +14240,32 @@ async function runFightRetrieve({ interaction, gid, cid, actorId, flavour = null
     if (!npc) return replyLong(interaction, l);
     await sendLong(chan, l);
     return interaction.reply({ ephemeral: true, content: `✅ Retrieved as **${npcNameFromFighter(actorId)}**.` });
+  }, flavour);
+  return kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
+}
+
+// A natural 1 on initiative (T, 2026-11-10): the first turn in words alone
+// \u2014 the form, then the turn passes. A GM plays it for an NPC.
+async function runFightRoleplay({ interaction, gid, cid, actorId, flavour = null }) {
+  const turn = await openFightTurn(interaction, gid, cid, actorId);
+  if (turn.refused) return turn.refused;
+  const { chan, fight, refuse } = turn;
+  const order = fightOrder(fight);
+  if (order[fight.turn_index] !== actorId) {
+    const cur = await resolveFighter(interaction.guild, gid, order[fight.turn_index]);
+    return refuse(`⚠️ It's **${cur.name}**'s turn.`);
+  }
+  if (fight.phase !== 'attack') return refuse('❌ Resolve the pending exchange first.');
+  if (!rpTurnOf(fight, actorId)) return refuse('\u{1F3AD} This turn is not a roleplay one \u2014 act as you will.');
+  {
+    const gate0 = deathGate(gid, actorId);
+    if (gate0) return refuse(gate0);
+  }
+  const npc = isNpcFighter(actorId);
+  await roleplayTurn(interaction.guild, gid, cid, actorId, async (l) => {
+    if (!npc) return replyLong(interaction, l);
+    await sendLong(chan, l);
+    return interaction.reply({ ephemeral: true, content: `✅ Played out as **${npcNameFromFighter(actorId)}**.` });
   }, flavour);
   return kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
 }
@@ -14142,6 +14364,7 @@ function fightAnswerRows(kind, { forNpc = false, held = false, auto = false, gid
     if (kind === 'atk') return [new ActionRowBuilder().addComponents(N('fnatk:str', '\u{1F3AD} STR'), N('fnatk:con', '\u{1F3AD} CON'), N('fnatk:dex', '\u{1F3AD} DEX'), N('fnatk:wis', '\u{1F3AD} WIS'), N('fnatk:lck', '\u{1F3AD} LCK'))];
     if (kind === 'breakfree') return [new ActionRowBuilder().addComponents(N('fbreak', '\u{1F3AD} Break free (STR)'), N('fstay', '\u{1F3AD} Stay'))];
     if (kind === 'retrieve') return [new ActionRowBuilder().addComponents(N('fnretrieve', '\u{1F3AD} Retrieve the weapon'))];
+    if (kind === 'roleplay') return [new ActionRowBuilder().addComponents(N('fnroleplay', '\u{1F3AD} Roleplay'))];
     return [];
   }
   const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
@@ -14181,6 +14404,9 @@ function fightAnswerRows(kind, { forNpc = false, held = false, auto = false, gid
   // Disarmed: the turn is the weapon's (T, 2026-11-10).
   if (kind === 'retrieve') return [new ActionRowBuilder().addComponents(
     B('fact:retrieve', '\u{1FAF4} Retrieve your weapon', ButtonStyle.Primary))];
+  // A natural 1 on initiative: the first turn is words alone (T, 2026-11-10).
+  if (kind === 'roleplay') return [new ActionRowBuilder().addComponents(
+    B('fact:roleplay', '\u{1F3AD} Roleplay', ButtonStyle.Primary))];
   // A held fighter, on their own turn: keep the hold or let it go. Escape
   // belongs to the captive, so it is offered on their turn instead.
   if (kind === 'hold') return [new ActionRowBuilder().addComponents(
@@ -14206,7 +14432,9 @@ async function offerAbilityTarget(interaction, which) {
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active') return interaction.reply({ ephemeral: true, content: NO_ACTIVE_FIGHT });
   const order = fightOrder(fight);
-  // Disarmed, the turn is the weapon's: refused before the picker.
+  // A roleplay turn, or a disarmed one: refused before the picker.
+  if (fight.phase === 'attack' && order[fight.turn_index] === uid && rpTurnOf(fight, uid))
+    return interaction.reply({ ephemeral: true, content: rpTurnRefusal(), components: fightAnswerRows('roleplay', { gid }) });
   if (fight.phase === 'attack' && order[fight.turn_index] === uid && disarmedOf(fight, uid))
     return interaction.reply({ ephemeral: true, content: disarmedRefusal(), components: fightAnswerRows('retrieve', { gid }) });
   const hp = fightHp(fight), floor = fightFloor(fight);
@@ -14321,6 +14549,8 @@ async function handleFight(interaction, forced) {
     if (existing && existing.state !== 'idle') {
       return interaction.reply({ content: '❌ A fight is already in progress in this channel. Use `/fight end` to stop it first.', ephemeral: true });
     }
+    // A fight called and not yet begun holds the channel (T, 2026-11-10).
+    if (liveFightCall(gid, cid)) return interaction.reply({ ephemeral: true, content: '\u274C A fight is being called here \u2014 \u2694\uFE0F **Begin** on its card starts it; \u2716 **Cancel** or `/fight end` calls it off.' });
 
     const fighters = [];
     // Players from the @mention list
@@ -14343,6 +14573,19 @@ async function handleFight(interaction, forced) {
     // Guard against duplicate fighters
     if (new Set(fighters).size !== fighters.length) {
       return interaction.reply({ content: '❌ A fighter was listed more than once.', ephemeral: true });
+    }
+
+    // Who rolls, and whether there are sign-ups (T, 2026-11-10): the bot for
+    // everyone as ever, or each player on a card; sign-ups open a card the
+    // players Join. `manual:` keeps the listed order and rolls nothing.
+    const rollMode = (forcedOf(forced, 'roll') ?? interaction.options?.getString?.('roll')) === 'players' ? 'players' : 'bot';
+    const signup = !!(forcedOf(forced, 'signup') ?? interaction.options?.getBoolean?.('signup') ?? false);
+    if ((interaction.options?.getBoolean?.('manual') ?? false) && (signup || rollMode === 'players'))
+      return interaction.reply({ ephemeral: true, content: '\u274C `manual:` keeps the order you listed and rolls nothing \u2014 leave `roll:` and `signup:` off with it.' });
+    if (signup || (rollMode === 'players' && fighters.some(f => !isNpcFighter(f)))) {
+      if (!signup && fighters.length < 2) return interaction.reply({ content: '❌ Need at least 2 fighters. Add players via `players:` (@mention them) and/or NPCs via `npcs:` (comma-separated names).', ephemeral: true });
+      const floorC = ((forced && typeof forced === 'object' && forced.practice) || (interaction.options?.getBoolean?.('practice') ?? false)) ? PRACTICE_FLOOR : 0;
+      return openFightCall(interaction, { gid, cid, uid, chan, fighters, rollMode, open: signup, floor: floorC });
     }
 
     if (fighters.length < 2) return interaction.reply({ content: '❌ Need at least 2 fighters. Add players via `players:` (@mention them) and/or NPCs via `npcs:` (comma-separated names).', ephemeral: true });
@@ -14393,10 +14636,9 @@ async function handleFight(interaction, forced) {
       return interaction.reply({ content: lines.join('\n') });
     }
 
-    // Roll initiative for each fighter (players and NPCs alike)
+    // Roll initiative for each fighter (players and NPCs alike), each roll
+    // stamped with its moment: a level total goes to whoever rolled first.
     const initiatives = [];
-    const hpState = {};
-    const rrState = {};
     for (const fid of fighters) {
       const f = await resolveFighter(interaction.guild, gid, fid);
       // Knightfall adds the score; 5e adds the modifier. The ruleset knows which.
@@ -14404,50 +14646,13 @@ async function handleFight(interaction, forced) {
       const roll = rollDie(20);
       const total = roll + dex;
       mirrorAutoRoll(gid, cid, f.name, '1d20', roll, total, 'initiative');
-      hpState[fid] = f.isNpc ? (getNpc(gid, f.name)?.hp_current ?? 0) : (getChar(gid, fid)?.hp_current ?? 0);
-      if (f.isNpc) rrState[fid] = Math.max(0, getNpc(gid, f.name)?.rerolls_current ?? f.stats.lck ?? 0);
-      initiatives.push({ id: fid, name: f.name, roll, dex, total, isNpc: f.isNpc });
+      initiatives.push({ id: fid, name: f.name, roll, dex, total, isNpc: f.isNpc, at: rollStamp() });
     }
-
-    // Sort by total descending; a shared total is rerolled among the tied.
-    const tieLines = settleInitiativeTies(initiatives, { gid, cid, nameOf: (it) => it.name });
-
-    const turnOrder = initiatives.map(i => i.id);
-    const npcCount = initiatives.filter(i => i.isNpc).length;
-    const playerCount = initiatives.length - npcCount;
-    const lines = [`⚔️ **${W.started}** ${playerCount} player${playerCount===1?'':'s'} + ${npcCount} NPC${npcCount===1?'':'s'} — initiative order:`, ''];
-    if (banner) lines.splice(1, 0, banner);
-    initiatives.forEach((f,i) => {
-      lines.push(`${i+1}. **${f.name}**${f.isNpc ? ' 🎭' : ''} — 🎲 [${f.roll}] + ⚡ ${f.dex} DEX = **${f.total} initiative**`);
-    });
-    if (tieLines.length) lines.push('', ...tieLines);
-    lines.push('');
-    const first = initiatives[0];
-    // Tie lines can carry the card past Discord's 2000 characters; it is
-    // sent in pieces rather than lost (audit, 2026-10-15).
-    const startLong = tieLines.length > 0;
-    lines.push(`🎯 **${first.name}** goes first!${turnPrompt(first)}${turnPing(gid, first)}`);
-
-    upsertFight(gid, cid, {
-      ...FRESH_EXCHANGE,   // no grapple, feint or hold pending, no reroll spent
-      state: 'active',
-      // A new fight starts clean. This path (practice bouts and duels) was
-      // the one that did not, so a fumble sanction from an earlier brawl in
-      // the same channel landed on someone's first defence here — Fenrir,
-      // who had not swung yet (T's screenshot, 2026-08-20).
-      effect_state: '{}', grapples: '{}',
-      turn_order: JSON.stringify(turnOrder),
-      turn_index: 0,
-      phase: 'attack',
-      current_target: null,
-      atk_roll: null, atk_nat: null, atk_stat: null,
-      def_roll: null, def_nat: null, def_stat: null,
-      hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState),
-      floor_hp: floor,
-      log_state: '{}',   // a new fight, a new recap
-    });
-
-    return startLong ? replyLong(interaction, lines) : interaction.reply({ content: lines.join('\n') });
+    // Sorted, marked and written by the start a called fight shares. The
+    // card can carry past Discord's 2000 characters; it is sent in pieces
+    // rather than lost (audit, 2026-10-15).
+    const { lines, rows } = await startFightFromInits(interaction.guild, gid, cid, initiatives, floor);
+    return replyLong(interaction, lines, rows.length ? { components: rows } : {});
   }
 
   // ── ADDNPC (add one or more GM NPCs to an active fight) ───────────────────
@@ -14487,9 +14692,11 @@ async function handleFight(interaction, forced) {
       placed = 'at the end of the turn order';
     }
     upsertFight(gid, cid, { turn_order: JSON.stringify(turnOrder), hp_state: JSON.stringify(hpState) });
+    // A natural marks their first turn as it would at the start (T, 2026-11-10).
+    setInitiativeFlag(gid, cid, who.id, roll);
     try { noteQuestActivity(gid, cid, 'combat', `${name} joins the fight`, uid); } catch {}
     return interaction.reply({ allowedMentions: { parse: [] }, content: [
-      `⚔️ **${name}** joins the fight — 🎲 [${roll}] + ⚡ ${dexJ} DEX = **${total} initiative**, ${placed}.`,
+      `⚔️ **${name}** joins the fight — 🎲 [${roll}] + ⚡ ${dexJ} DEX = **${total} initiative**, ${placed}.${joinNatLine(roll)}`,
       `\u2764\uFE0F ${ch.hp_current}/${maxHp(ch, gid)} \u00b7 _\`/fight order\` to reposition._`,
     ].join('\n') });
   }
@@ -14505,7 +14712,7 @@ async function handleFight(interaction, forced) {
     const turnOrder = fightOrder(fight);
     const hpState = fightHp(fight);
     const rrState = JSON.parse(fight.rr_state || '{}');
-    const added = [];
+    const added = [], rolledN = [];
     for (const npcName of names) {
       const npc = getNpc(gid, npcName);
       if (!npc) return interaction.reply({ content: `❌ NPC **${npcName}** not found.`, ephemeral: true });
@@ -14520,9 +14727,12 @@ async function handleFight(interaction, forced) {
       hpState[fid] = npc.hp_current;
       rrState[fid] = Math.max(0, npc.rerolls_current ?? npc.lck ?? 0);
       turnOrder.push(fid);
-      added.push(`🎭 **${npc.name}** — 🎲 [${roll}] + ⚡ ${dexN} DEX = **${total} initiative**`);
+      rolledN.push([fid, roll]);
+      added.push(`🎭 **${npc.name}** — 🎲 [${roll}] + ⚡ ${dexN} DEX = **${total} initiative**${joinNatLine(roll)}`);
     }
     upsertFight(gid, cid, { turn_order: JSON.stringify(turnOrder), hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState) });
+    // A natural marks each one's first turn as it would at the start (T, 2026-11-10).
+    for (const [fidN, rollN] of rolledN) setInitiativeFlag(gid, cid, fidN, rollN);
     return interaction.reply({ content: [`**Joined the fight** (added to the end of the turn order — use \`/fight order\` to reposition):`, '', ...added].join('\n') });
   }
 
@@ -14660,7 +14870,9 @@ async function handleFight(interaction, forced) {
       const aInit = aInitRoll + A.dex, bInit = bInitRoll + B.dex;
       mirrorAutoRoll(gid, cid, A.name, '1d20', aInitRoll, aInit, 'demo initiative');
       mirrorAutoRoll(gid, cid, B.name, '1d20', bInitRoll, bInit, 'demo initiative');
-      const order = aInit >= bInit ? [A, B] : [B, A];
+      // The order a real fight keeps (T, 2026-11-10): naturals first and
+      // last, the rest by total, a level total to whoever rolled first.
+      const order = initiativeCompare({ roll: aInitRoll, dex: A.dex, total: aInit, at: 1 }, { roll: bInitRoll, dex: B.dex, total: bInit, at: 2 }) <= 0 ? [A, B] : [B, A];
       await sleep(900);
       await send([`⚔️ **Demo ${W.noun} — initiative:**`, ...(banner ? [banner] : []), '', `1. **${order[0].name}**`, `2. **${order[1].name}**`, '', `🎯 **${order[0].name}** goes first!`].join('\n'));
       let turn = 0, round = 1, safety = 0;
@@ -14756,10 +14968,12 @@ async function handleFight(interaction, forced) {
     // Knightfall adds DEX whole; 5e its modifier (2026-11-07).
     const inits = fighters.map(fid => ({ fid, roll: 0, total: 0, dex: statBonusOf(gid, F[fid].stats, 'dex') }));
     for (const it of inits) {
-      const r = rollDie(20); it.roll = r; it.total = r + it.dex;
+      const r = rollDie(20); it.roll = r; it.total = r + it.dex; it.at = rollStamp();
       mirrorAutoRoll(gid, cid, F[it.fid].name, '1d20', r, it.total, 'initiative (auto fight)');
     }
-    const tieLinesA = settleInitiativeTies(inits, { gid, cid, nameOf: (it) => F[it.fid].name });
+    // Naturals first and last, the rest by total, a level total to whoever
+    // rolled first (T, 2026-11-10).
+    const tieLinesA = sortInitiative(inits, (it) => F[it.fid].name);
     const order = inits.map(i => i.fid);
 
     // Live HP for each fighter (from their sheet's current HP)
@@ -14777,13 +14991,14 @@ async function handleFight(interaction, forced) {
     if (mode === 'npconly') {
       const existing = getFight(gid, cid);
       if (existing && existing.state !== 'idle') return interaction.reply({ content: '❌ Finish or `/fight end` the current fight first.', ephemeral: true });
+      if (liveFightCall(gid, cid)) return interaction.reply({ ephemeral: true, content: '\u274C A fight is being called here \u2014 Begin or Cancel it on its card first.' });
       const hpState = {}; for (const fid of fighters) hpState[fid] = hp[fid];
       const rrState = {}; for (const fid of fighters) if (F[fid].isNpc) rrState[fid] = Math.max(0, F[fid].stats.lck ?? 0);
       upsertFight(gid, cid, {
         ...FRESH_EXCHANGE,
         state: 'active', turn_order: JSON.stringify(order), turn_index: 0,
         phase: 'attack', current_target: null, atk_kind: null,
-        grapples: '{}', effect_state: '{}',
+        grapples: '{}', effect_state: JSON.stringify(initiativeFlags(inits)),
         atk_roll: null, atk_nat: null, atk_stat: null,
         def_roll: null, def_nat: null, def_stat: null,
         hp_state: JSON.stringify(hpState), rr_state: JSON.stringify(rrState), auto_npc: 1,
@@ -14791,13 +15006,15 @@ async function handleFight(interaction, forced) {
         floor_hp: floor,
       });
       const lines = [`⚔️ **${W.started} (NPCs auto-piloted)**`, ...(banner ? [banner] : []), '', '**Initiative:**'];
-      inits.forEach((it,i)=>{ const f=F[it.fid]; lines.push(`${i+1}. **${f.name}${f.isNpc?' 🎭':''}** — 🎲 [${it.roll}] + ⚡ ${it.dex} DEX = **${it.total}**`); });
+      inits.forEach((it,i)=>{ const f=F[it.fid]; lines.push(`${i+1}. **${f.name}${f.isNpc?' 🎭':''}** — 🎲 [${it.roll}] + ⚡ ${it.dex} DEX = **${it.total}**${initTag(it)}`); });
       if (tieLinesA.length) lines.push('', ...tieLinesA);
       const firstF = F[order[0]];
       lines.push('', firstF.isNpc
         ? `🤖 **${firstF.name}** is an NPC — the bot will take its turn automatically.`
-        : `🎯 **${firstF.name}** goes first!${turnPrompt(firstF)}${turnPing(gid, firstF)}`);
-      await interaction.reply({ content: lines.join('\n') });
+        : `🎯 **${firstF.name}** goes first!${firstTurnPrompt({ ...firstF, roll: inits[0].roll })}${turnPing(gid, firstF)}`);
+      // A natural 1 first in line: its one button rides with the order.
+      const firstRows = !firstF.isNpc && inits[0].roll === 1 ? turnRowsFor(gid, getFight(gid, cid), order[0], { auto: true }) : [];
+      await interaction.reply({ content: lines.join('\n'), components: firstRows });
       // If the first fighter is an NPC, kick off its turn
       if (firstF.isNpc) { await sleep(1200); await runAutoNpcChain(interaction.guild, gid, cid, channel); }
       return;
@@ -14806,7 +15023,7 @@ async function handleFight(interaction, forced) {
     // ---- FULL: bot rolls everything to a winner, persists final HP, stores nothing ongoing ----
     await interaction.reply({ content: `🎬 **Auto-resolving the ${W.noun}...**` });
     const lines0 = ['⚔️ **Initiative:**', ...(banner ? [banner] : [])];
-    inits.forEach((it,i)=>{ const f=F[it.fid]; lines0.push(`${i+1}. **${f.name}${f.isNpc?' 🎭':''}** — 🎲 [${it.roll}] + ⚡ ${it.dex} DEX = **${it.total}**`); });
+    inits.forEach((it,i)=>{ const f=F[it.fid]; lines0.push(`${i+1}. **${f.name}${f.isNpc?' 🎭':''}** — 🎲 [${it.roll}] + ⚡ ${it.dex} DEX = **${it.total}**${initTag(it)}`); });
     if (tieLinesA.length) lines0.push('', ...tieLinesA);
     await sleep(800); await send(lines0.join('\n'));
 
@@ -14815,6 +15032,10 @@ async function handleFight(interaction, forced) {
     const fightOn = () => useTeams ? (sideAlive(1) && sideAlive(2)) : alive().length > 1;
     const autoLog = { exchanges: 0, f: {} };
     const ensureLog = (fid) => (autoLog.f[fid] = autoLog.f[fid] || FIGHTER_LOG());
+    // A natural on initiative shapes a first turn here too (T, 2026-11-10):
+    // a 20 holds two exchanges, a 1 passes in roleplay.
+    const extraLeft = new Set(inits.filter(it => it.roll === 20).map(it => it.fid));
+    const rpLeft = new Set(inits.filter(it => it.roll === 1).map(it => it.fid));
     let idx = 0, round = 1, safety = 0, exchanges = 0;
     while (fightOn() && safety < 200) {
       safety++;
@@ -14822,12 +15043,19 @@ async function handleFight(interaction, forced) {
       let guard = 0;
       while (hp[order[idx]] <= floor && guard < order.length) { idx = (idx + 1) % order.length; guard++; }
       const attackerId = order[idx];
-      // One round = every living fighter has taken one attack. Count completed
-      // exchanges against the current number of living fighters rather than
-      // watching the index wrap, which mislabelled the second half of a round.
+      // One round = every living fighter has taken one turn. Count completed
+      // turns against the current number of living fighters rather than
+      // watching the index wrap, which mislabelled the second half of a
+      // round; a natural 20's second exchange is the same turn.
       const livingCount = Math.max(1, order.filter(fid => hp[fid] > floor).length);
       round = Math.floor(exchanges / livingCount) + 1;
-      exchanges++;
+      if (rpLeft.delete(attackerId)) {
+        await sleep(700);
+        await send(`\u{1F3AD} **${F[attackerId].name}${F[attackerId].isNpc ? ' \u{1F3AD}' : ''}** spends the first turn in roleplay \u2014 a natural 1 on initiative.`);
+        exchanges++;
+        idx = (idx + 1) % order.length;
+        continue;
+      }
       // pick a random living opponent
       const opponents = alive().filter(fid => useTeams ? sideOf[fid] !== sideOf[attackerId] : fid !== attackerId);
       if (!opponents.length) break;
@@ -14934,6 +15162,12 @@ async function handleFight(interaction, forced) {
       for (const l of effectNoteLines(fxNotes, `**${atkF.name}${atkF.isNpc?' 🎭':''}**`, `**${defF.name}${defF.isNpc?' 🎭':''}**`)) outcome += `\n${l}`;
       await sleep(700); await send(outcome);
 
+      // A natural 20 on initiative: a second exchange before the turn passes.
+      if (extraLeft.delete(attackerId) && hp[attackerId] > floor && fightOn()) {
+        await send(`\u26A1 **${atkF.name}${atkF.isNpc ? ' \u{1F3AD}' : ''}** acts again \u2014 the second action of a natural 20 on initiative.`);
+        continue;
+      }
+      exchanges++;
       idx = (idx + 1) % order.length;
     }
 
@@ -15052,8 +15286,11 @@ async function handleFight(interaction, forced) {
     }
 
     if (fight.phase !== 'attack') return interaction.reply({ content: '❌ Waiting for defender to roll first.', ephemeral: true });
-    // Disarmed: the turn goes to the weapon, and the refusal carries the
-    // Retrieve button (T, 2026-11-10).
+    // A natural 1's first turn is roleplay only, a disarmed one the weapon's:
+    // the refusal carries the button that turn has (T, 2026-11-10).
+    if (rpTurnOf(fight, actorId)) return interaction.reply({ ephemeral: true,
+      content: rpTurnRefusal(npcActAs ? npcNameFromFighter(actorId) : null),
+      components: fightAnswerRows('roleplay', { forNpc: !!npcActAs, gid }) });
     if (disarmedOf(fight, actorId)) return interaction.reply({ ephemeral: true,
       content: disarmedRefusal(npcActAs ? npcNameFromFighter(actorId) : null),
       components: fightAnswerRows('retrieve', { forNpc: !!npcActAs, gid }) });
@@ -15418,6 +15655,27 @@ async function handleFight(interaction, forced) {
     }
     return runFightRetrieve({ interaction, gid, cid, actorId, flavour });
   }
+  if (sub === 'roleplay') {
+    // A natural 1 on initiative (T, 2026-11-10): the first turn is roleplay
+    // only \u2014 the form, then the turn passes. A GM plays an NPC's with npc:.
+    const npcActAs = forcedOf(forced, 'npc') ?? interaction.options?.getString?.('npc');
+    let actorId = interaction.user.id;
+    if (npcActAs) {
+      if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can act as an NPC.', ephemeral: true });
+      actorId = npcFighterId(npcActAs);
+    }
+    const flavour = forcedOf(forced, 'flavour') ?? interaction.options?.getString?.('flavour') ?? null;
+    // Typed with no words: the form the Roleplay button opens.
+    if (!(forced && typeof forced === 'object') && !flavour) {
+      const fR = getFight(gid, cid);
+      const whyR = !fR || fR.state !== 'active' ? NO_ACTIVE_FIGHT
+        : fR.phase !== 'attack' || fightOrder(fR)[fR.turn_index] !== actorId ? '❌ It is not your turn.'
+        : !rpTurnOf(fR, actorId) ? '\u{1F3AD} This turn is not a roleplay one \u2014 act as you will.' : null;
+      if (whyR) return interaction.reply({ ephemeral: true, content: whyR });
+      return openFightRp(interaction, 'roleplay', { npc: npcActAs || null }, { title: 'Your first turn \u2014 roleplay' });
+    }
+    return runFightRoleplay({ interaction, gid, cid, actorId, flavour });
+  }
   if (sub === 'rr') {
     let fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
@@ -15664,6 +15922,12 @@ async function handleFight(interaction, forced) {
     const waitedF = await resolveFighter(interaction.guild, gid, waitedOnId);
     const lines = [`⏭️ **${waitedF.name}${waitedF.isNpc ? ' 🎭' : ''}**'s turn skipped by the GM — they stay in the fight.`];
     if (fight.phase === 'defend') lines.push('↩️ The pending exchange was reset.');
+    // A skipped turn is the whole turn (T, 2026-11-10): a natural 20's second
+    // action goes with it, a natural 1's roleplay turn is spent by it, and a
+    // disarmed fighter's skipped turn is their retrieval, as the other skips have it.
+    consumeEffectFlag(gid, cid, attackerId, 'extraAction');
+    consumeEffectFlag(gid, cid, attackerId, 'rpTurn');
+    if (consumeEffectFlag(gid, cid, attackerId, 'disarmed')) lines.push(SKIPPED_RETRIEVAL);
     // The turn ends as any other does (2026-11-09): a held fighter's wound
     // for the round lands, and the next one standing is up \u2014 with the
     // pending exchange cleared whole, its kind included.
@@ -15711,7 +15975,16 @@ async function handleFight(interaction, forced) {
       });
     }
     const fight = getFight(gid, cid);
-    if (!fight || fight.state !== 'active') return interaction.reply({ content: '❌ No active fight to end.', ephemeral: true });
+    if (!fight || fight.state !== 'active') {
+      // A fight called and not yet begun: /fight end calls it off (2026-11-10).
+      const call = liveFightCall(gid, cid);
+      if (call) {
+        saveFightCall(gid, cid, { state: 'cancelled' });
+        await refreshCallCard(chan, gid, call, '\u2716 The fight is called off.');
+        return interaction.reply({ ephemeral: true, content: '\u2716 The fight call is off.' });
+      }
+      return interaction.reply({ content: '❌ No active fight to end.', ephemeral: true });
+    }
     return requestConfirm(interaction, 'End the current fight? Turn order clears but HP states are preserved.', async () => {
       const gmName = await getDisplayName(interaction.guild, interaction.user.id);
       await endOne(cid, chan, gmName);
@@ -16725,8 +16998,11 @@ async function fightClockRemind(client, f, clock) {
   const gmRole = getConfig(gid)?.gm_role_id || null;
   const ping = who.isNpc ? (gmRole ? ` <@&${gmRole}>` : '') : ` <@${who.id}>`;
   const holdQ = w.what === 'defend' && f.atk_kind === 'hold';
-  const doing = w.what === 'resolve' ? 'has an exchange waiting to be resolved' : holdQ ? 'has a kept hold to answer \u2014 break free or stay' : w.what === 'defend' ? 'is defending' : 'is up to attack';
+  // A natural 1's roleplay turn is played out, never attacked for (2026-11-10).
+  const rpQ = w.what === 'attack' && rpTurnOf(f, w.id);
+  const doing = w.what === 'resolve' ? 'has an exchange waiting to be resolved' : holdQ ? 'has a kept hold to answer \u2014 break free or stay' : w.what === 'defend' ? 'is defending' : rpQ ? 'has a roleplay turn to play out' : 'is up to attack';
   const then = !clock.skip ? ''
+    : rpQ ? ` At ${clock.skip} minutes it passes.`
     : w.what === 'attack' ? (clock.timeout === 'auto' ? ` At ${clock.skip} minutes the bot attacks for them.` : ` At ${clock.skip} minutes the turn is skipped.`)
     : holdQ ? ` At ${clock.skip} minutes they stay in the hold.`
     : w.what === 'defend' ? ` At ${clock.skip} minutes the bot rolls the defence for them.`
@@ -16825,6 +17101,9 @@ async function clockStrike(guild, gid, cid, channel, mins, at = null) {
   if (!fight || fight.state !== 'active' || fight.phase !== 'attack' || moved()) return false;
   const attackerId = fightOrder(fight)[fight.turn_index];
   if (!attackerId || isFallen(gid, attackerId)) return false;
+  // A natural 1 on initiative: the clock passes the roleplay turn on its own.
+  if (await roleplayTurn(guild, gid, cid, attackerId,
+      async (l) => sendLong(channel, [`⏳ ${mins} minutes quiet.`, ...l]))) return true;
   if (await retrievalTurn(guild, gid, cid, attackerId,
       // the next turn's ping and buttons ride with it, as on any turn
       async (l) => sendLong(channel, [`⏳ ${mins} minutes quiet.`, ...l]))) return true;
@@ -16942,8 +17221,12 @@ async function clockSkipFight(guild, gid, cid, channel, mins, { at = null, lead 
   if (moved()) return false;
   try { noteQuestActivity(gid, cid, 'combat', lead ? `${waited.name}'s attack called off — its target had fallen` : `${waited.name}'s turn skipped — ${mins} minutes quiet`); } catch {}
   const lines = [lead || `⏭️ ${mins} minutes quiet — **${waited.name}${waited.isNpc ? ' 🎭' : ''}**'s turn is skipped; they stay in the fight.`];
+  // The whole turn (T, 2026-11-10): a natural 20's second action goes with
+  // it, a natural 1's roleplay turn is spent by it.
+  consumeEffectFlag(gid, cid, waitedId, 'extraAction');
+  consumeEffectFlag(gid, cid, waitedId, 'rpTurn');
   // A disarmed fighter's skipped turn is their retrieval (2026-11-10).
-  if (consumeEffectFlag(gid, cid, waitedId, 'disarmed')) lines.push('\u{1F5E1}\uFE0F The skipped turn goes to retrieving their weapon.');
+  if (consumeEffectFlag(gid, cid, waitedId, 'disarmed')) lines.push(SKIPPED_RETRIEVAL);
   // A skipped turn still ends: a held fighter's wound for the round lands
   // (T, 2026-11-09).
   const st = await applyTurnEndStrain(guild, gid, cid, hp, [...order], order, floor, lines, waitedId);
@@ -17450,6 +17733,11 @@ function orderNpcNames(gid) {
     for (const o of db.prepare("SELECT entrants, order_json FROM turn_orders WHERE guild_id=? AND state IN ('signup','running','paused')").all(gid))
       for (const e of [...orderEntrants(o), ...orderList(o)]) if (e.kind === 'npc') out.push(String(e.name));
   } catch {}
+  // A fight called and not yet begun holds its NPCs the same way.
+  try {
+    for (const c of db.prepare("SELECT entrants FROM fight_calls WHERE guild_id=? AND state='open'").all(gid))
+      for (const e of JSON.parse(c.entrants || '[]')) if (e.kind === 'npc') out.push(String(e.name));
+  } catch {}
   return out;
 }
 // "Goblin x3, category:Bandits, Bandit captain": copies stepped out of the
@@ -17509,6 +17797,32 @@ async function initEntrantsFrom(guild, gid, text) {
   if (rest) { const r = resolveInitNpcs(gid, rest); entrants.push(...r.entrants); notes.push(...r.notes); }
   return { entrants, notes };
 }
+// One entrant's initiative (T, 2026-11-10): d20 + DEX off their sheet \u2014
+// Knightfall's DEX as it stands, 5e's modifier; an NPC's own; + 0 for a bare
+// name \u2014 stamped with the moment it was rolled, since a level total goes
+// to whoever rolled first. A player's own press files under their dice;
+// the bot's rolls under its own.
+function rollEntrant(gid, cid, e, { interaction = null, why = 'initiative' } = {}) {
+  const row = e.kind === 'player' ? getChar(gid, e.id) : e.kind === 'npc' ? getNpc(gid, e.name) : null;
+  const dex = row ? statBonusOf(gid, row, 'dex') : 0;
+  const roll = rollDie(20), total = roll + dex;
+  if (interaction && e.kind === 'player') {
+    try {
+      recordRoll(gid, { userId: e.id, channelId: cid, interaction, kind: null, card: null, input: 'initiative',
+        rollLine: `\u{1F3B2}  1d20+DEX \u2192 [${roll}]${dex ? (dex > 0 ? ` +${dex}` : ` ${dex}`) : ''} = **${total}**`,
+        nat: roll, sides: 20, total, context: why });
+    } catch {}
+  } else {
+    try { mirrorAutoRoll(gid, cid, e.name, '1d20', roll, total, why); } catch {}
+  }
+  return { ...e, roll, dex, total, at: rollStamp() };
+}
+// An entrant's roll as the cards show it, with the mark a natural leaves;
+// a player still to roll, when the players roll their own.
+function entrantRollText(e, playersRoll = false) {
+  if (e.roll != null) return ` \u2014 \u{1F3B2} [${e.roll}] + \u26A1 ${e.dex} DEX = **${e.total}**${e.roll === 20 ? ' \u00b7 \u26A1 natural 20' : e.roll === 1 ? ' \u00b7 \u{1F3AD} natural 1' : ''}`;
+  return playersRoll && e.kind === 'player' ? ' \u2014 \u23F3 to roll' : '';
+}
 function mergeEntrants(list, more) {
   const out = [...list], added = [], skipped = [];
   for (const e of more) {
@@ -17521,22 +17835,30 @@ function mergeEntrants(list, more) {
 function initSignupView(gid, o) {
   const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
   const ents = orderEntrants(o), st = orderStamp(o);
+  // Who rolls, and whether Join is open (T, 2026-11-10); rows from before
+  // read as the bot rolling and sign-ups open.
+  const open = Number(o.open ?? 1) !== 0, players = o.roll_mode === 'players';
   const lines = [
     `🎲 **Initiative** — called by <@${o.gm_id}>`,
-    'Press **Join** to take a place. The GM adds NPCs, then **Close & roll** rolls d20 + DEX for everyone and sets the order.',
+    players
+      ? `${open ? 'Press **Join** to take a place \u2014 it rolls your initiative on the spot. ' : ''}Each player presses \u{1F3B2} **Roll**; the bot rolls the NPCs. The GM adds NPCs, and **Close & roll** rolls for anyone left${open ? '' : ' \u2014 or the order sets itself once the last player has rolled'}.`
+      : 'Press **Join** to take a place. The GM adds NPCs, then **Close & roll** rolls d20 + DEX for everyone and sets the order.',
     '',
     ents.length ? `**In so far — ${ents.length}**` : '_Nobody yet._',
-    ...ents.map(e => `· ${entrantMark(e)}${e.name}`),
+    ...ents.map(e => `· ${entrantMark(e)}${e.name}${entrantRollText(e, players)}`),
     '',
     `-# ⏱️ ${clockWords(turnClockFor(gid, o.channel_id), { fight: false })}`,
   ];
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`init:join:${st}`).setLabel('🙋 Join').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(`init:leave:${st}`).setLabel('Leave').setStyle(ButtonStyle.Secondary),
+  const mine = [];
+  if (open) mine.push(new ButtonBuilder().setCustomId(`init:join:${st}`).setLabel('🙋 Join').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`init:leave:${st}`).setLabel('Leave').setStyle(ButtonStyle.Secondary));
+  if (players) mine.push(new ButtonBuilder().setCustomId(`init:roll:${st}`).setLabel('\u{1F3B2} Roll').setStyle(ButtonStyle.Primary));
+  const rows = mine.length ? [new ActionRowBuilder().addComponents(...mine)] : [];
+  rows.push(new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`init:npcs:${st}`).setLabel('🎭 Add NPCs').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`init:close:${st}`).setLabel('🎲 Close & roll').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`init:cancel:${st}`).setLabel('✖ Cancel').setStyle(ButtonStyle.Danger));
-  return { content: lines.join('\n').slice(0, 1990), components: [row], allowedMentions: { parse: [] } };
+    new ButtonBuilder().setCustomId(`init:cancel:${st}`).setLabel('✖ Cancel').setStyle(ButtonStyle.Danger)));
+  return { content: lines.join('\n').slice(0, 1990), components: rows, allowedMentions: { parse: [] } };
 }
 function initOrderView(gid, o, { ended = false } = {}) {
   const list = orderList(o);
@@ -17545,9 +17867,9 @@ function initOrderView(gid, o, { ended = false } = {}) {
   try { ties = JSON.parse(o.ties || '[]'); } catch {}
   const lines = [
     ended ? `🎲 **Initiative** — over after ${r} round${r === 1 ? '' : 's'}`
-      : `🎲 **Initiative** — d20 + DEX, highest first · 🔄 Round ${r}${o.state === 'paused' ? ' · ⏸️ paused' : ''}`,
+      : `🎲 **Initiative** — d20 + DEX, highest first (natural 20s on top, 1s at the bottom) · 🔄 Round ${r}${o.state === 'paused' ? ' · ⏸️ paused' : ''}`,
     '',
-    ...list.map((e, i) => `${!ended && i === cur ? '▶️' : '▫️'} ${i + 1}. ${entrantMark(e)}**${e.name}** — 🎲 [${e.roll}] + ⚡ ${e.dex} DEX = **${e.total}**`),
+    ...list.map((e, i) => `${!ended && i === cur ? '▶️' : '▫️'} ${i + 1}. ${entrantMark(e)}**${e.name}** — 🎲 [${e.roll}] + ⚡ ${e.dex} DEX = **${e.total}**${e.roll === 20 ? ' \u00b7 \u26A1 natural 20' : e.roll === 1 ? ' \u00b7 \u{1F3AD} natural 1' : ''}`),
     ...(ties.length ? ['', ...ties] : []),
     ...(ended ? [] : ['', `-# ⏱️ ${clockWords(turnClockFor(gid, o.channel_id), { fight: false })} · \`/session turn\` shows, adds or removes`]),
   ];
@@ -17562,12 +17884,18 @@ function initTurnView(gid, o, lead = []) {
   const gmRole = getConfig(gid)?.gm_role_id || null;
   const ping = cur.kind === 'player' ? ` <@${cur.id}>` : (gmRole ? ` <@&${gmRole}>` : '');
   const key = initTurnKey(o), st = orderStamp(o);
+  // A natural on initiative (T, 2026-11-10): a 20's first turn holds two
+  // actions, Done after each; a 1's is roleplay only, its words through
+  // \u{1F3AD} Roleplay in place of Done.
+  const nat = cur.rp ? (cur.kind === 'player' ? ' \u{1F3AD} A natural 1 on initiative \u2014 this first turn is roleplay only: press **Roleplay**.' : ' \u{1F3AD} A natural 1 \u2014 its first turn is roleplay only.')
+    : cur.x2 ? ' \u26A1 A natural 20 on initiative \u2014 two actions this turn, \u2705 Done after each.' : '';
   const lines = [...lead,
     `🔄 **Round ${r}**${i === 0 && r > 1 ? ' begins' : ''} · ${i + 1} of ${list.length}`,
-    cur.kind === 'player' ? `🎯 **${cur.name}** — your turn.${ping}` : `🎯 🎭 **${cur.name}** — the GM’s turn.${ping}`,
+    cur.kind === 'player' ? `🎯 **${cur.name}** — your turn.${nat}${ping}` : `🎯 🎭 **${cur.name}** — the GM’s turn.${nat}${ping}`,
     `-# ${next ? `Then ${entrantMark(next)}${next.name} · ` : ''}⏱️ ${clockWords(turnClockFor(gid, o.channel_id), { fight: false })}`];
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`init:done:${key}`).setLabel('✅ Done').setStyle(ButtonStyle.Success),
+    cur.rp ? new ButtonBuilder().setCustomId(`init:rp:${key}`).setLabel('\u{1F3AD} Roleplay').setStyle(ButtonStyle.Primary)
+      : new ButtonBuilder().setCustomId(`init:done:${key}`).setLabel('✅ Done').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`init:skip:${key}`).setLabel('⏭️ Skip').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`init:pause:${st}`).setLabel('⏸️ Pause').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`init:end:${st}`).setLabel('🏁 End').setStyle(ButtonStyle.Danger));
@@ -17606,7 +17934,7 @@ async function refreshInitCard(ch, gid, o, opts = {}) {
 // awaited, so a press and the clock can never both move one turn. How it
 // moved is said on the next card, and kept on a run's timeline when it
 // was more than a Done.
-async function advanceTurnOrder(client, gid, cid, { how = 'done', expectKey = null, minutes = 0, channel = null } = {}) {
+async function advanceTurnOrder(client, gid, cid, { how = 'done', expectKey = null, minutes = 0, channel = null, words = null } = {}) {
   const o = getTurnOrder(gid, cid);
   if (!o || o.state !== 'running') return null;
   if (expectKey && initTurnKey(o) !== expectKey) return null;
@@ -17614,25 +17942,34 @@ async function advanceTurnOrder(client, gid, cid, { how = 'done', expectKey = nu
   if (!list.length) return null;
   const was = orderCurrent(o);
   let idx = Number(o.turn_index) || 0, round = Number(o.round) || 1;
-  if (how === 'back') {
+  // A natural 20 on initiative (T, 2026-11-10): the first Done keeps the turn
+  // for a second action. Anything else that moves it on \u2014 a skip, the
+  // clock, the roleplay turn \u2014 spends whatever the natural left.
+  const at = Math.min(Math.max(0, idx), list.length - 1);
+  const second = how === 'done' && !!list[at]?.x2;
+  if (how !== 'back' && list[at]) { delete list[at].x2; delete list[at].rp; }
+  if (second) { /* the same turn, a fresh card */ }
+  else if (how === 'back') {
     if (idx > 0) idx--;
     else if (round > 1) { round--; idx = list.length - 1; }
     else return null;
   } else if (++idx >= list.length) { idx = 0; round++; }
   const old = [o.turn_msg_id, o.remind_msg_id];
-  const o2 = saveTurnOrder(gid, cid, { turn_index: idx, round, turn_seq: (Number(o.turn_seq) || 0) + 1, turn_started_at: Date.now(),
+  const o2 = saveTurnOrder(gid, cid, { order_json: JSON.stringify(list), turn_index: idx, round, turn_seq: (Number(o.turn_seq) || 0) + 1, turn_started_at: Date.now(),
     last_sign_at: null, reminded_at: null, remind_msg_id: null, turn_msg_id: null,
     // the clock's own passes in a row; anything else starts the count again
     clock_idle: how === 'timeout' ? (Number(o.clock_idle) || 0) + 1 : 0 });
-  const lead = {
+  const lead = second ? `✅ **${was.name}**’s first action is done \u2014 a second follows: a natural 20 on initiative.` : {
     done: `✅ **${was.name}** is done.`,
     skip: `⏭️ **${was.name}**’s turn is skipped by the GM.`,
     timeout: `⏳ **${was.name}**’s turn passes — ${minutes} minute${minutes === 1 ? '' : 's'} quiet.`,
     back: '⏮️ Back a turn.',
+    rp: `\u{1F3AD} **${was.name}** spends the first turn in roleplay \u2014 a natural 1 on initiative.${words ? `\n${words}` : ''}`,
   }[how] || null;
   try {
     if (how === 'skip') noteQuestActivity(gid, cid, 'turn', `${was.name}'s turn skipped by the GM`);
     if (how === 'timeout') noteQuestActivity(gid, cid, 'turn', `${was.name}'s turn passed — ${minutes} minutes quiet`);
+    if (how === 'rp') noteQuestActivity(gid, cid, 'turn', `${was.name} spent the first turn in roleplay \u2014 a natural 1 on initiative`);
     if (round > (Number(o.round) || 1)) noteQuestActivity(gid, cid, 'turn', `Round ${round}`);
   } catch {}
   const ch = channel || await client.channels.fetch(cid).catch(() => null);
@@ -17672,7 +18009,8 @@ async function remindTurnOrder(client, gid, cid, o, clock) {
   const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`init:hold:${key}`).setLabel('✍️ Still writing').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`init:done:${key}`).setLabel('✅ Done').setStyle(ButtonStyle.Success));
+    cur.rp ? new ButtonBuilder().setCustomId(`init:rp:${key}`).setLabel('\u{1F3AD} Roleplay').setStyle(ButtonStyle.Success)
+      : new ButtonBuilder().setCustomId(`init:done:${key}`).setLabel('✅ Done').setStyle(ButtonStyle.Success));
   const m = await ch.send({
     content: `⏳ ${clock.remind} minute${clock.remind === 1 ? '' : 's'} on this turn — **${cur.name}**${cur.kind === 'player' ? '' : ' 🎭'}, still writing? Press ✍️ or keep typing${clock.skip ? `; at ${clock.skip} minutes the turn passes` : ''}.${ping}`,
     components: [row], allowedMentions: cur.kind === 'player' ? { users: [cur.id] } : { roles: gmRole ? [gmRole] : [] } }).catch(() => null);
@@ -17717,38 +18055,77 @@ async function orderClockTick(client) {
     } catch (e) { console.error('[turnclock] order -', e?.message || e); }
   }
 }
-// Close & roll: d20 + DEX for everyone in, ties rerolled among the tied,
-// the order set and the first turn called. The state is read again here,
-// before anything is awaited, so two GMs pressing at once roll it once.
+// The order set (T, 2026-11-10): d20 + DEX for anyone not yet rolled \u2014
+// everyone, when the bot rolls \u2014 then naturals first and last, the rest by
+// total, a level total to whoever rolled first, and a natural's first turn
+// marked: a 20's second action (`x2`), a 1's roleplay turn (`rp`). Read and
+// written with nothing awaited, so two presses set it once. Returns the
+// running order, or null when there was none to set.
+function settleTurnOrder(gid, cid) {
+  const o = getTurnOrder(gid, cid);
+  if (!o || o.state !== 'signup') return null;
+  const ents = orderEntrants(o);
+  if (!ents.length) return null;
+  const list = ents.map(e => (e.roll != null ? e : rollEntrant(gid, cid, e)));
+  const ties = sortInitiative(list);
+  const o2 = saveTurnOrder(gid, cid, {
+    state: 'running',
+    order_json: JSON.stringify(list.map(({ id, name, kind, roll, dex, total, at }) => ({ id, name, kind, roll, dex, total, at,
+      ...(roll === 20 ? { x2: true } : roll === 1 ? { rp: true } : {}) }))),
+    ties: JSON.stringify(ties), turn_index: 0, round: 1, turn_seq: 1, clock_idle: 0, turn_started_at: Date.now(), last_sign_at: null, reminded_at: null });
+  try { noteQuestActivity(gid, cid, 'turn', `Initiative — ${list.map(x => `${x.name} ${x.total}`).join(', ')}`.slice(0, 400)); } catch {}
+  return o2;
+}
+// Close & roll: the order set and the first turn called. The state is read
+// again here, before anything is awaited, so two GMs pressing at once roll
+// it once.
 async function closeInitiative(interaction, gid, cid, { fromCard = false } = {}) {
   const answer = (content) => (interaction.deferred || interaction.replied)
     ? interaction.editReply({ content }) : interaction.reply({ ephemeral: true, content });
   const o = getTurnOrder(gid, cid);
   if (!o || o.state !== 'signup') return answer('⏳ The order is already set.');
-  const ents = orderEntrants(o);
-  if (!ents.length) return answer('❌ Nobody is in yet — wait for **Join**, or add NPCs.');
-  const list = ents.map(e => {
-    const row = e.kind === 'player' ? getChar(gid, e.id) : e.kind === 'npc' ? getNpc(gid, e.name) : null;
-    const dex = row ? statBonusOf(gid, row, 'dex') : 0;
-    const roll = rollDie(20);
-    try { mirrorAutoRoll(gid, cid, e.name, '1d20', roll, roll + dex, 'initiative'); } catch {}
-    return { ...e, roll, dex, total: roll + dex };
-  });
-  const ties = settleInitiativeTies(list, { gid, cid, nameOf: (it) => it.name });
-  const o2 = saveTurnOrder(gid, cid, {
-    state: 'running', order_json: JSON.stringify(list.map(({ id, name, kind, roll, dex, total }) => ({ id, name, kind, roll, dex, total }))),
-    ties: JSON.stringify(ties), turn_index: 0, round: 1, turn_seq: 1, clock_idle: 0, turn_started_at: Date.now(), last_sign_at: null, reminded_at: null });
-  try { noteQuestActivity(gid, cid, 'turn', `Initiative — ${list.map(x => `${x.name} ${x.total}`).join(', ')}`.slice(0, 400)); } catch {}
+  if (!orderEntrants(o).length) return answer('❌ Nobody is in yet — wait for **Join**, or add NPCs.');
+  const o2 = settleTurnOrder(gid, cid);
+  if (!o2) return answer('⏳ The order is already set.');
   const ch = await interactionChannel(interaction);
   if (fromCard) await interaction.update(initOrderView(gid, o2));
   else { await answer('🎲 Rolled — the order is set.'); await refreshInitCard(ch, gid, o2); }
   await postTurnCard(gid, cid, o2, ch, []);
   return o2;
 }
-async function initNpcModal(interaction, gid) {
+// A natural 1's first turn out of combat (T, 2026-11-10): what they do and
+// say, both optional; the turn passes with the words.
+function initRpModal(key, cur) {
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+  const field = (id, label, style, max) => new ActionRowBuilder().addComponents(
+    new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(style).setRequired(false).setMaxLength(max));
+  return new ModalBuilder().setCustomId(`initrp:${key}`).setTitle(`${cur?.kind === 'player' ? 'Your first turn' : String(cur?.name || 'The turn')} \u2014 roleplay`.slice(0, 45))
+    .addComponents(field('action', 'What do you do? (optional)', TextInputStyle.Short, 200),
+      field('speech', 'What do you say? (optional)', TextInputStyle.Paragraph, 500));
+}
+async function handleInitRpModal(interaction) {
+  const gid = interaction.guild.id, cid = interactionChannelId(interaction), uid = interaction.user.id;
+  const key = interaction.customId.slice('initrp:'.length);
+  const no = (content) => interaction.reply({ ephemeral: true, content });
+  const o = getTurnOrder(gid, cid);
+  if (!o || o.state !== 'running') return no(o?.state === 'paused' ? '⏸️ The order is paused — a GM resumes it.' : '⏳ The order is not running.');
+  const cur = orderCurrent(o);
+  if (initTurnKey(o) !== key) return no(`⏳ That turn has passed — it is **${cur?.name || 'someone else'}**’s now.`);
+  if (!(await isGm(interaction.guild, uid)) && !(cur?.kind === 'player' && cur.id === uid))
+    return no(cur?.kind === 'player' ? `⏳ It is **${cur.name}**’s turn — only they or a GM can play it out.` : `🎭 **${cur?.name}** is the GM’s — only a GM can play that turn out.`);
+  const words = rpWords(interaction);
+  if (words) { try { noteQuestActivity(gid, cid, 'rp', `${cur.name}: ${words.replace(/[*_]+/g, '').replace(/\s*\n\s*/g, ' \u00b7 ').trim().slice(0, 300)}`, uid); } catch {} }
+  if (interaction.isFromMessage?.()) await interaction.update({ components: [] }).catch(() => {});
+  else await interaction.reply({ ephemeral: true, content: '🎭 Played out.' }).catch(() => {});
+  const moved = await advanceTurnOrder(interaction.client, gid, cid, { how: 'rp', expectKey: key, words, channel: await interactionChannel(interaction) });
+  if (!moved) await interaction.followUp({ ephemeral: true, content: '⏳ That turn had already passed.' }).catch(() => {});
+}
+async function initNpcModal(interaction, gid, { fight = false } = {}) {
   const { ModalBuilder, TextInputBuilder, TextInputStyle, LabelBuilder, StringSelectMenuBuilder } = require('discord.js');
   const options = await npcAnswerOptions(interaction, gid);
-  const modal = new ModalBuilder().setCustomId('initnpc').setTitle('Add NPCs to the initiative');
+  // A called fight's box (2026-11-10) takes NPCs only: a fighter needs a sheet.
+  const modal = fight ? new ModalBuilder().setCustomId('fcallnpc').setTitle('Add NPCs to the fight')
+    : new ModalBuilder().setCustomId('initnpc').setTitle('Add NPCs to the initiative');
   if (options.length) {
     const pick = new StringSelectMenuBuilder().setCustomId('pick').setPlaceholder('Pick NPCs')
       .setMinValues(0).setMaxValues(Math.min(25, options.length)).setRequired(false).addOptions(options.slice(0, 25));
@@ -17756,7 +18133,7 @@ async function initNpcModal(interaction, gid) {
   }
   const more = new TextInputBuilder().setCustomId('more').setPlaceholder('Goblin x3, category:Bandits, Bandit captain')
     .setStyle(TextInputStyle.Short).setRequired(!options.length).setMaxLength(300);
-  modal.addLabelComponents(new LabelBuilder().setLabel('More').setDescription('Copies with x3, a whole category, or any name').setTextInputComponent(more));
+  modal.addLabelComponents(new LabelBuilder().setLabel('More').setDescription(fight ? 'NPC names, copies with x3, or a whole category' : 'Copies with x3, a whole category, or any name').setTextInputComponent(more));
   return modal;
 }
 async function handleInitNpcModal(interaction) {
@@ -17771,7 +18148,9 @@ async function handleInitNpcModal(interaction) {
   for (const k of picks) { const npc = npcByKey(gid, k); if (npc && !npc.died_at) found.push({ id: npcFighterId(npc.name), name: npc.name, kind: 'npc' }); }
   if (more) { const r = resolveInitNpcs(gid, more); found.push(...r.entrants); notes.push(...r.notes); }
   const m = mergeEntrants(orderEntrants(o), found);
-  const o2 = saveTurnOrder(gid, cid, { entrants: JSON.stringify(m.list) });
+  // The players rolling their own: the bot rolls each NPC as it comes in.
+  const listN = o.roll_mode === 'players' ? m.list.map(e => (e.kind !== 'player' && e.roll == null ? rollEntrant(gid, cid, e) : e)) : m.list;
+  const o2 = saveTurnOrder(gid, cid, { entrants: JSON.stringify(listN) });
   const tell = [m.added.length ? `➕ In: ${m.added.map(e => `${entrantMark(e)}**${e.name}**`).join(', ')}.` : '❌ Nobody new was added.',
     ...[...notes, ...m.skipped].map(n => `· ${n}`)].join('\n').slice(0, 1900);
   if (interaction.isFromMessage?.() && interaction.message?.id && interaction.message.id === o.card_msg_id) {
@@ -17790,8 +18169,23 @@ async function handleInitButton(interaction) {
   // A button from another order — one ended, or called before this one —
   // does nothing to the order here.
   if (!o || o.state === 'ended' || (tag && tag.split('-')[0] !== orderStamp(o))) return no('⏳ That initiative is over.');
-  if (['join', 'leave', 'npcs', 'close', 'cancel'].includes(act)) {
+  if (['join', 'leave', 'roll', 'npcs', 'close', 'cancel'].includes(act)) {
     if (o.state !== 'signup') return no('⏳ Sign-ups are closed — the order is set. `/session turn` shows it.');
+    const playersRoll = o.roll_mode === 'players', openO = Number(o.open ?? 1) !== 0;
+    if (act === 'roll') {
+      // Each player's own roll (T, 2026-11-10); the last of those named sets
+      // the order when sign-ups are off.
+      if (!playersRoll) return no('🎲 The bot rolls for everyone here, at **Close & roll**.');
+      const ents = orderEntrants(o);
+      const at = ents.findIndex(e => e.id === uid);
+      if (at < 0) return no(openO ? '❌ You are not in it \u2014 press **Join**.' : '❌ You are not in this order.');
+      if (ents[at].roll != null) return no(`🎲 You have rolled \u2014 **${ents[at].total}**.`);
+      ents[at] = rollEntrant(gid, cid, ents[at], { interaction });
+      const o2 = saveTurnOrder(gid, cid, { entrants: JSON.stringify(ents) });
+      if (!openO && !ents.some(e => e.kind === 'player' && e.roll == null)) return closeInitiative(interaction, gid, cid, { fromCard: true });
+      return interaction.update(initSignupView(gid, o2));
+    }
+    if ((act === 'join' || act === 'leave') && !openO) return no('❌ This order names who is in \u2014 there is no joining or leaving it.');
     if (act === 'join' || act === 'leave') {
       const name = act === 'join' ? String(await getDisplayName(interaction.guild, uid)).slice(0, 60) : null;
       const now = getTurnOrder(gid, cid);
@@ -17806,7 +18200,8 @@ async function handleInitButton(interaction) {
         const gate = deathGate(gid, uid);
         if (gate) return no(gate);
         if (ents.length >= INIT_MAX) return no(`❌ The order holds ${INIT_MAX} at most.`);
-        ents.push({ id: uid, name, kind: 'player' });
+        // Rolling their own, a player's Join rolls them on the spot (T, 2026-11-10).
+        ents.push(playersRoll ? rollEntrant(gid, cid, { id: uid, name, kind: 'player' }, { interaction }) : { id: uid, name, kind: 'player' });
       }
       return interaction.update(initSignupView(gid, saveTurnOrder(gid, cid, { entrants: JSON.stringify(ents) })));
     }
@@ -17819,7 +18214,7 @@ async function handleInitButton(interaction) {
     saveTurnOrder(gid, cid, { state: 'ended', ended_at: Date.now() });
     return interaction.update({ content: '✖ Initiative called off.', components: [], allowedMentions: { parse: [] } });
   }
-  if (act === 'done' || act === 'hold' || act === 'skip') {
+  if (act === 'done' || act === 'hold' || act === 'skip' || act === 'rp') {
     if (o.state === 'paused') return no('⏸️ The order is paused — a GM resumes it.');
     if (o.state !== 'running') return no('⏳ The order has not started yet.');
     const cur = orderCurrent(o);
@@ -17836,6 +18231,12 @@ async function handleInitButton(interaction) {
       const c = turnClockFor(gid, cid);
       return interaction.update({ components: [], allowedMentions: { parse: [] },
         content: `✍️ **${cur.name}** is still writing — the clock starts again${c.skip ? `: the turn passes ${c.skip} minutes from now` : ''}.` });
+    }
+    // A natural 1's first turn (T, 2026-11-10): Roleplay \u2014 or Done, on a
+    // card from before \u2014 opens the form, and its words pass the turn.
+    if (act === 'rp' || (act === 'done' && cur?.rp)) {
+      if (!cur?.rp) return no('🎭 This turn is not a roleplay one \u2014 ✅ Done ends it.');
+      return interaction.showModal(initRpModal(initTurnKey(o), cur));
     }
     await interaction.update({ components: [] }).catch(() => {});
     const moved = await advanceTurnOrder(interaction.client, gid, cid, { how: act === 'skip' ? 'skip' : 'done', expectKey: initTurnKey(o), channel: await interactionChannel(interaction) });
@@ -17870,8 +18271,10 @@ async function handleInitButton(interaction) {
   }
   return no('⏳ That button has nothing left to do.');
 }
-// /session initiative: the sign-up card, here. A run going in this room
-// has its party called to it.
+// /session initiative and /initiative: the card, here \u2014 or, sign-ups off and
+// the bot rolling, the order at once (T, 2026-11-10). A run going in this
+// room has its party called to an open card; players named to roll their
+// own are pinged to Roll.
 async function handleSessionInitiative(interaction) {
   const gid = interaction.guild.id, cid = interactionChannelId(interaction), uid = interaction.user.id;
   if (!(await isGm(interaction.guild, uid))) return interaction.reply({ ephemeral: true, content: '❌ Only GMs call for initiative.' });
@@ -17881,26 +18284,43 @@ async function handleSessionInitiative(interaction) {
   if (live) return interaction.reply({ ephemeral: true, content: `❌ This channel has an initiative ${live.state === 'signup' ? 'taking sign-ups' : live.state === 'paused' ? 'paused' : 'running'} — \`/session turn action:end\` ends it, \`action:show\` shows it.` });
   const ask = readClockOptions(interaction);
   if (ask.any) { const bad = applyChannelClock(gid, cid, ask, uid); if (bad) return interaction.reply({ ephemeral: true, content: bad }); }
+  // Who rolls, and whether Join is open (T, 2026-11-10).
+  const players = interaction.options.getString('roll') === 'players';
+  const open = interaction.options.getBoolean('signup') ?? true;
   // Names fetched and the card posted can outlast Discord's three seconds.
   await interaction.deferReply({ ephemeral: true });
   const asked = await initEntrantsFrom(interaction.guild, gid, interaction.options.getString('players') || '');
   if (liveTurnOrder(gid, cid)) return interaction.editReply({ content: '❌ Another initiative was called here a moment ago — `/session turn` shows it.' });
   const npcs = resolveInitNpcs(gid, interaction.options.getString('npcs') || '');
   const m = mergeEntrants([], [...asked.entrants, ...npcs.entrants]);
-  db.prepare("INSERT OR REPLACE INTO turn_orders (guild_id, channel_id, state, gm_id, entrants, order_json, ties, turn_index, round, created_at) VALUES (?,?,'signup',?,?,'[]','[]',0,1,?)")
-    .run(gid, cid, uid, JSON.stringify(m.list), Date.now());
+  const notes = [...asked.notes, ...npcs.notes, ...m.skipped].map(n => `· ${n}`);
+  if (!open && !m.list.length) return interaction.editReply({ content: ['❌ With sign-ups off, name who is in \u2014 `players:` and `npcs:`.', ...notes].join('\n').slice(0, 1900) });
+  // The players rolling their own: the bot rolls the NPCs and names now.
+  const list = players ? m.list.map(e => (e.kind === 'player' ? e : rollEntrant(gid, cid, e))) : m.list;
+  db.prepare("INSERT OR REPLACE INTO turn_orders (guild_id, channel_id, state, gm_id, entrants, order_json, ties, turn_index, round, created_at, roll_mode, open) VALUES (?,?,'signup',?,?,'[]','[]',0,1,?,?,?)")
+    .run(gid, cid, uid, JSON.stringify(list), Date.now(), players ? 'players' : 'bot', open ? 1 : 0);
+  const clockLine = `⏱️ The clock here: ${clockWords(turnClockFor(gid, cid))}.`;
+  // Sign-ups off and nobody left to roll their own: the order at once.
+  if (!open && (!players || !list.some(e => e.kind === 'player' && e.roll == null))) {
+    const o2 = settleTurnOrder(gid, cid);
+    const card = o2 ? await ch.send(initOrderView(gid, o2)).catch(() => null) : null;
+    if (!card) { saveTurnOrder(gid, cid, { state: 'ended', ended_at: Date.now() }); return interaction.editReply({ content: MSG_NO_ACCESS_HERE }); }
+    await postTurnCard(gid, cid, saveTurnOrder(gid, cid, { card_msg_id: card.id }), ch, []);
+    return interaction.editReply({ content: ['🎲 Rolled — the order is set.', ...notes, clockLine].join('\n').slice(0, 1900) });
+  }
   const o = getTurnOrder(gid, cid);
-  const party = [...new Set(activeQuestsInChannel(gid, cid).flatMap(q => getQuestMembers(gid, q.number, 'party')))]
-    .filter(id => !m.list.some(e => e.id === id)).slice(0, 25);
+  const toRoll = players ? list.filter(e => e.kind === 'player' && e.roll == null).map(e => e.id) : [];
+  const party = open ? [...new Set(activeQuestsInChannel(gid, cid).flatMap(q => getQuestMembers(gid, q.number, 'party')))]
+    .filter(id => !list.some(e => e.id === id)) : [];
+  const pings = [...new Set([...toRoll, ...party])].slice(0, 25);
   const view = initSignupView(gid, o);
-  const card = await ch.send({ ...view, content: party.length ? `${view.content}\n${party.map(id => `<@${id}>`).join(' ')}`.slice(0, 1990) : view.content,
-    allowedMentions: { users: party } }).catch(() => null);
+  const card = await ch.send({ ...view, content: pings.length ? `${view.content}\n${pings.map(id => `<@${id}>`).join(' ')}`.slice(0, 1990) : view.content,
+    allowedMentions: { users: pings } }).catch(() => null);
   if (!card) { saveTurnOrder(gid, cid, { state: 'ended', ended_at: Date.now() }); return interaction.editReply({ content: MSG_NO_ACCESS_HERE }); }
   saveTurnOrder(gid, cid, { card_msg_id: card.id });
   return interaction.editReply({ content: [
-    `🎲 Initiative called — the card is up${party.length ? ' and the party pinged' : ''}. **Close & roll** when everyone is in.`,
-    ...[...asked.notes, ...npcs.notes, ...m.skipped].map(n => `· ${n}`),
-    `⏱️ The clock here: ${clockWords(turnClockFor(gid, cid))}.`].join('\n').slice(0, 1900) });
+    `🎲 Initiative called — the card is up${party.length ? ' and the party pinged' : ''}.${players ? ' Each player rolls with \u{1F3B2} **Roll**. **Close & roll** rolls for anyone left' + (open ? '.' : ', or the last roll sets it.') : ' **Close & roll** when everyone is in.'}`,
+    ...notes, clockLine].join('\n').slice(0, 1900) });
 }
 // /session turn: the order here, shown to anyone; Done for whoever's turn
 // it is; the rest the GM's. What can be refused is refused before the
@@ -17916,7 +18336,7 @@ async function handleSessionTurn(interaction) {
   if (action === 'show') {
     if (o.state === 'signup') {
       const ents = orderEntrants(o);
-      return no([`🎲 **Initiative** — taking sign-ups (${ents.length})`, ...ents.map(e => `· ${entrantMark(e)}${e.name}`)].join('\n').slice(0, 1990));
+      return no([`🎲 **Initiative** — taking sign-ups (${ents.length})`, ...ents.map(e => `· ${entrantMark(e)}${e.name}${entrantRollText(e, o.roll_mode === 'players')}`)].join('\n').slice(0, 1990));
     }
     return interaction.reply({ ephemeral: true, ...initOrderView(gid, o) });
   }
@@ -17927,8 +18347,9 @@ async function handleSessionTurn(interaction) {
     if (now.state !== 'running') return no(now.state === 'paused' ? '⏸️ The order is paused.' : '⏳ The order has not started — Close & roll first.');
     const cur = orderCurrent(now);
     if (!(gm || (cur?.kind === 'player' && cur.id === uid))) return no(`⏳ It is **${cur?.name}**’s turn — only they or a GM can end it.`);
-    await interaction.reply({ ephemeral: true, content: '✅ Done.' });
-    await advanceTurnOrder(interaction.client, gid, cid, { how: 'done', expectKey: initTurnKey(now) });
+    // A natural 1's first turn passes in roleplay, with no words typed here.
+    await interaction.reply({ ephemeral: true, content: cur?.rp ? '🎭 Played out.' : '✅ Done.' });
+    await advanceTurnOrder(interaction.client, gid, cid, { how: cur?.rp ? 'rp' : 'done', expectKey: initTurnKey(now) });
     return;
   }
   if (!gm) return no('❌ Only GMs move the order — `action:show` is open to everyone, and **Done** to whoever’s turn it is.');
@@ -17987,27 +18408,30 @@ async function handleSessionTurn(interaction) {
     const { entrants, notes } = found;
     if (now.state === 'signup') {
       const m = mergeEntrants(orderEntrants(now), entrants);
-      const o2 = saveTurnOrder(gid, cid, { entrants: JSON.stringify(m.list) });
+      // The players rolling their own: NPCs and names are rolled as they come in.
+      const listA = now.roll_mode === 'players' ? m.list.map(e => (e.kind !== 'player' && e.roll == null ? rollEntrant(gid, cid, e) : e)) : m.list;
+      const o2 = saveTurnOrder(gid, cid, { entrants: JSON.stringify(listA) });
       await say([m.added.length ? `➕ In: ${m.added.map(e => `${entrantMark(e)}**${e.name}**`).join(', ')}.` : '❌ Nobody new.', ...[...notes, ...m.skipped].map(n => `· ${n}`)].join('\n'));
       await refreshInitCard(ch, gid, o2);
       return;
     }
-    // Once rolled, each newcomer rolls and takes their place by total —
-    // before the turn now going, they wait for the next round.
+    // Once rolled, each newcomer rolls and takes their place by the order's
+    // rule (T, 2026-11-10) — a natural 20 among the 20s, a 1 among the 1s,
+    // and after anyone level with them, having rolled last; a natural marks
+    // their first turn. Before the turn now going, they wait for the next round.
     const list = orderList(now);
     let idx = Number(now.turn_index) || 0;
     const said = [], skipped = [...notes];
     for (const e of entrants) {
       if (list.some(x => x.id === e.id)) { skipped.push(`**${e.name}** is in already`); continue; }
       if (list.length >= INIT_MAX) { skipped.push(`**${e.name}** — the order holds ${INIT_MAX} at most`); continue; }
-      const row = e.kind === 'player' ? getChar(gid, e.id) : e.kind === 'npc' ? getNpc(gid, e.name) : null;
-      const dex = row ? statBonusOf(gid, row, 'dex') : 0, roll = rollDie(20), total = roll + dex;
-      try { mirrorAutoRoll(gid, cid, e.name, '1d20', roll, total, 'initiative (joined)'); } catch {}
-      let at = list.findIndex(x => x.total < total);
+      const ne = rollEntrant(gid, cid, e, { why: 'initiative (joined)' });
+      let at = list.findIndex(x => initiativeCompare(ne, x) < 0);
       if (at < 0) at = list.length;
-      list.splice(at, 0, { id: e.id, name: e.name, kind: e.kind, roll, dex, total });
+      list.splice(at, 0, { id: e.id, name: e.name, kind: e.kind, roll: ne.roll, dex: ne.dex, total: ne.total, at: ne.at,
+        ...(ne.roll === 20 ? { x2: true } : ne.roll === 1 ? { rp: true } : {}) });
       if (at <= idx) idx++;
-      said.push(`➕ ${entrantMark(e)}**${e.name}** joins — 🎲 [${roll}] + ⚡ ${dex} DEX = **${total}**, place ${at + 1} of ${list.length}.`);
+      said.push(`➕ ${entrantMark(e)}**${e.name}** joins — 🎲 [${ne.roll}] + ⚡ ${ne.dex} DEX = **${ne.total}**, place ${at + 1} of ${list.length}.${joinNatLine(ne.roll)}`);
     }
     if (!said.length) return say(['❌ Nobody new.', ...skipped.map(n => `· ${n}`)].join('\n'));
     const o2 = saveTurnOrder(gid, cid, { order_json: JSON.stringify(list), turn_index: idx });
@@ -18050,6 +18474,242 @@ async function handleSessionTurn(interaction) {
     if (wasCurrent && running) { await stripButtons(ch, [now.turn_msg_id, now.remind_msg_id]); await postTurnCard(gid, cid, o2, ch, []); }
   }
 }
+// ── A fight called (2026-11-10, T) ─────────────────────────────────────
+// `/fight start roll:Players` or `signup:true` puts a card in the channel
+// before the fight. With Players, each player presses \u{1F3B2} Roll for their
+// own initiative and the bot rolls the NPCs at once; with the fighters
+// named, the fight begins when the last has rolled. With sign-ups, players
+// press \u{1F64B} Join \u2014 rolling on the spot when they roll their own \u2014 and the
+// GM adds NPCs. \u2694\uFE0F Begin starts it either way, the bot rolling for anyone
+// left: the same start /fight start makes. One call a channel.
+function getFightCall(gid, cid) {
+  try { return db.prepare('SELECT * FROM fight_calls WHERE guild_id=? AND channel_id=?').get(gid, cid) || null; } catch { return null; }
+}
+function liveFightCall(gid, cid) {
+  const c = getFightCall(gid, cid);
+  return c && c.state === 'open' ? c : null;
+}
+function saveFightCall(gid, cid, fields) {
+  const keys = Object.keys(fields || {});
+  if (keys.length) db.prepare(`UPDATE fight_calls SET ${keys.map(k => `${k}=?`).join(',')} WHERE guild_id=? AND channel_id=?`).run(...keys.map(k => fields[k]), gid, cid);
+  return getFightCall(gid, cid);
+}
+function callEntrants(c) { try { return JSON.parse(c?.entrants || '[]'); } catch { return []; } }
+function callStamp(c) { return String(Number(c?.created_at) || 0); }
+function fightCallView(gid, c) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  const ents = callEntrants(c), st = callStamp(c);
+  const open = !!Number(c.open), players = c.roll_mode === 'players';
+  const banner = practiceBanner(Number(c.floor_hp) || 0);
+  const lines = [
+    `\u2694\uFE0F **A fight is called** \u2014 by <@${c.gm_id}>`,
+    ...(banner ? [banner] : []),
+    [open ? `Press \u{1F64B} **Join** to fight${players ? ' \u2014 it rolls your initiative on the spot' : ''}.` : null,
+      players ? `Each player presses \u{1F3B2} **Roll** for initiative; the bot rolls the NPCs.${open ? '' : ' The fight begins once the last has rolled.'}`
+        : 'The bot rolls initiative for everyone when it begins.',
+      `The GM adds NPCs, and \u2694\uFE0F **Begin** starts it${players ? ', rolling for anyone left' : ''}.`].filter(Boolean).join(' '),
+    '',
+    ents.length ? `**In so far \u2014 ${ents.length}**` : '_Nobody yet._',
+    ...ents.map(e => `\u00b7 ${e.kind === 'npc' ? '\u{1F3AD} ' : ''}${e.name}${entrantRollText(e, players)}`),
+    '',
+    '-# d20 + DEX \u00b7 natural 20s go first, with two actions on the first turn \u00b7 natural 1s go last, the first turn roleplay only',
+  ];
+  const rows = [];
+  const mine = [];
+  if (open) mine.push(new ButtonBuilder().setCustomId(`fcall:join:${st}`).setLabel('\u{1F64B} Join').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`fcall:leave:${st}`).setLabel('Leave').setStyle(ButtonStyle.Secondary));
+  if (players) mine.push(new ButtonBuilder().setCustomId(`fcall:roll:${st}`).setLabel('\u{1F3B2} Roll').setStyle(ButtonStyle.Primary));
+  if (mine.length) rows.push(new ActionRowBuilder().addComponents(...mine));
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`fcall:npcs:${st}`).setLabel('\u{1F3AD} Add NPCs').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`fcall:begin:${st}`).setLabel('\u2694\uFE0F Begin').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`fcall:cancel:${st}`).setLabel('\u2716 Cancel').setStyle(ButtonStyle.Danger)));
+  return { content: lines.join('\n').slice(0, 1990), components: rows, allowedMentions: { parse: [] } };
+}
+async function refreshCallCard(ch, gid, c, content = null) {
+  if (!ch?.messages || !c?.card_msg_id) return;
+  try {
+    const m = await ch.messages.fetch(c.card_msg_id);
+    if (m?.edit) await m.edit(content ? { content, components: [], allowedMentions: { parse: [] } } : fightCallView(gid, c));
+  } catch {}
+}
+// Who may sign up for a called fight: a sheet, approved, standing above the
+// bout's floor, and not among the fallen.
+function fightJoinRefusal(gid, uid, floor) {
+  const ch = getChar(gid, uid);
+  if (!ch) return `\u274C You have no character sheet \u2014 \`${createCmdOf(gid)}\` first.`;
+  const gate = sheetGate(gid, uid) || deathGate(gid, uid);
+  if (gate) return gate;
+  if ((ch.hp_current ?? 0) <= floor) return `\u274C You are at \u2764\uFE0F ${ch.hp_current ?? 0}${floor > 0 ? ` \u2014 the bout floor is ${floor}` : ''}. Heal first.`;
+  return null;
+}
+// /fight start with roll:Players or signup:true: the card, not the fight.
+// The fighters named are in at once (the downed left out, as the start
+// leaves them out); with Players the bot rolls their NPCs now, and the
+// players asked to roll are pinged, as is a run's party to a sign-up.
+async function openFightCall(interaction, { gid, cid, uid, chan, fighters, rollMode, open, floor }) {
+  // Names fetched and the card posted can outlast Discord's three seconds.
+  await interaction.deferReply({ ephemeral: true });
+  const { active, downed } = await partitionDowned(interaction.guild, gid, fighters, floor);
+  const warn = downedWarning(downed, gid, floor);
+  if (!open && active.length < 2) return interaction.editReply({ content: `\u274C Need at least 2 fighters with HP above ${floor}.${warn ? `\n${warn}` : ''}` });
+  // Read the room again after the wait: a fight or a call begun meanwhile stands.
+  if (liveFightCall(gid, cid) || (getFight(gid, cid)?.state ?? 'idle') !== 'idle')
+    return interaction.editReply({ content: '\u274C Another fight was started or called here a moment ago.' });
+  const players = rollMode === 'players';
+  const entrants = active.map(a => ({ id: a.fid, name: String(a.name).slice(0, 60), kind: a.isNpc ? 'npc' : 'player' }))
+    .map(e => (players && e.kind === 'npc' ? rollEntrant(gid, cid, e) : e));
+  db.prepare("INSERT OR REPLACE INTO fight_calls (guild_id, channel_id, state, gm_id, roll_mode, open, floor_hp, entrants, card_msg_id, created_at) VALUES (?,?,'open',?,?,?,?,?,NULL,?)")
+    .run(gid, cid, uid, players ? 'players' : 'bot', open ? 1 : 0, floor, JSON.stringify(entrants), Date.now());
+  const c = getFightCall(gid, cid);
+  const toRoll = players ? entrants.filter(e => e.kind === 'player').map(e => e.id) : [];
+  const party = open ? [...new Set(activeQuestsInChannel(gid, cid).flatMap(q => getQuestMembers(gid, q.number, 'party')))]
+    .filter(id => !entrants.some(e => e.id === id)) : [];
+  const pings = [...new Set([...toRoll, ...party])].slice(0, 25);
+  const view = fightCallView(gid, c);
+  const card = await chan.send({ ...view, content: pings.length ? `${view.content}\n${pings.map(id => `<@${id}>`).join(' ')}`.slice(0, 1990) : view.content,
+    allowedMentions: { users: pings } }).catch(() => null);
+  if (!card) { saveFightCall(gid, cid, { state: 'cancelled' }); return interaction.editReply({ content: MSG_NO_ACCESS_HERE }); }
+  saveFightCall(gid, cid, { card_msg_id: card.id });
+  return interaction.editReply({ content: [
+    `\u2694\uFE0F The fight is called \u2014 the card is up.${players ? ' Each player rolls with \u{1F3B2} **Roll**.' : ''} **Begin** starts it${players && !open ? ', or the last roll does' : ''}.`,
+    ...(warn ? [warn] : [])].join('\n') });
+}
+// \u2694\uFE0F Begin (or the last roll of named fighters): the bot rolls for anyone
+// left, the downed are left out, and the fight starts from the rolls. The
+// call is closed before anything is awaited, so two presses begin it once;
+// one that cannot begin after all opens it again.
+async function beginFightCall(interaction, gid, cid) {
+  const fail = async (content) => {
+    const now = liveFightCall(gid, cid);
+    if (now && interaction.isButton?.() && !interaction.replied && !interaction.deferred) {
+      await interaction.update(fightCallView(gid, now)).catch(() => {});
+      return interaction.followUp({ ephemeral: true, content }).catch(() => {});
+    }
+    return interaction.reply({ ephemeral: true, content });
+  };
+  const c = liveFightCall(gid, cid);
+  if (!c) return interaction.reply({ ephemeral: true, content: '\u23F3 That fight call is over.' });
+  const existing = getFight(gid, cid);
+  if (existing && existing.state !== 'idle') return fail('\u274C A fight is already in progress here \u2014 `/fight end` it first, or \u2716 Cancel this call.');
+  const ents = callEntrants(c);
+  if (ents.length < 2) return fail('\u274C Need at least 2 fighters \u2014 wait for \u{1F64B} **Join**, or add NPCs.');
+  saveFightCall(gid, cid, { state: 'begun' });
+  // The names fetched can outlast Discord's three seconds: the card is held.
+  await interaction.deferUpdate().catch(() => {});
+  const floor = Number(c.floor_hp) || 0;
+  const { active, downed } = await partitionDowned(interaction.guild, gid, ents.map(e => e.id), floor);
+  const warn = downedWarning(downed, gid, floor);
+  const meanwhile = getFight(gid, cid);
+  if (active.length < 2 || (meanwhile && meanwhile.state !== 'idle')) {
+    const back = saveFightCall(gid, cid, { state: 'open' });
+    await interaction.editReply(fightCallView(gid, back)).catch(() => {});
+    return interaction.followUp({ ephemeral: true, content: active.length < 2
+      ? `\u274C Need at least 2 fighters with HP above ${floor}.${warn ? `\n${warn}` : ''}`
+      : '\u274C A fight began here meanwhile \u2014 `/fight end` it first, or \u2716 Cancel this call.' }).catch(() => {});
+  }
+  const able = new Set(active.map(a => a.fid));
+  const inits = ents.filter(e => able.has(e.id)).map(e => (e.roll != null ? e : rollEntrant(gid, cid, e)))
+    .map(e => ({ id: e.id, name: e.name, roll: e.roll, dex: e.dex, total: e.total, at: e.at, isNpc: e.kind === 'npc' }));
+  const { lines, rows } = await startFightFromInits(interaction.guild, gid, cid, inits, floor);
+  if (warn) lines.unshift(warn, '');
+  await interaction.editReply({ content: `\u2694\uFE0F **The fight is on** \u2014 called by <@${c.gm_id}>: ${inits.length} fighters, the order below.`, components: [], allowedMentions: { parse: [] } }).catch(() => {});
+  const ch = await interactionChannel(interaction);
+  await sendLong(ch, lines, rows.length ? { components: rows } : {});
+}
+async function handleFightCallButton(interaction) {
+  const gid = interaction.guild.id, cid = interactionChannelId(interaction), uid = interaction.user.id;
+  const [, act, tag] = interaction.customId.split(':');
+  const no = (content) => interaction.reply({ ephemeral: true, content });
+  const c = liveFightCall(gid, cid);
+  // A button from a call begun, cancelled or replaced does nothing here.
+  if (!c || (tag && tag !== callStamp(c))) return no('\u23F3 That fight call is over.');
+  const players = c.roll_mode === 'players', open = !!Number(c.open);
+  if (act === 'join' || act === 'leave' || act === 'roll') {
+    const ents = callEntrants(c);
+    const at = ents.findIndex(e => e.id === uid);
+    if (act === 'leave') {
+      if (!open) return no('\u274C This call names its fighters \u2014 a GM can \u2716 Cancel it.');
+      if (at < 0) return no('You are not in it.');
+      ents.splice(at, 1);
+      return interaction.update(fightCallView(gid, saveFightCall(gid, cid, { entrants: JSON.stringify(ents) })));
+    }
+    if (act === 'join') {
+      if (!open) return no('\u274C This call names its fighters \u2014 there is no joining it.');
+      if (at >= 0) return no('\u2705 You are in already.');
+      const why = fightJoinRefusal(gid, uid, Number(c.floor_hp) || 0);
+      if (why) return no(why);
+      const name = String(await getDisplayName(interaction.guild, uid)).slice(0, 60);
+      // Read again after the wait: a press meanwhile stands.
+      const now = liveFightCall(gid, cid);
+      if (!now || callStamp(now) !== callStamp(c)) return no('\u23F3 That fight call is over.');
+      const ents2 = callEntrants(now);
+      if (ents2.some(e => e.id === uid)) return no('\u2705 You are in already.');
+      if (ents2.length >= INIT_MAX) return no(`\u274C A fight holds ${INIT_MAX} at most here.`);
+      const e = { id: uid, name, kind: 'player' };
+      ents2.push(players ? rollEntrant(gid, cid, e, { interaction }) : e);
+      return interaction.update(fightCallView(gid, saveFightCall(gid, cid, { entrants: JSON.stringify(ents2) })));
+    }
+    if (!players) return no('\u{1F3B2} The bot rolls for everyone on this call, when it begins.');
+    if (at < 0) return no(open ? '\u274C You are not in this fight \u2014 press \u{1F64B} **Join**.' : '\u274C You are not in this fight.');
+    if (ents[at].roll != null) return no(`\u{1F3B2} You have rolled \u2014 **${ents[at].total}**.`);
+    ents[at] = rollEntrant(gid, cid, ents[at], { interaction });
+    const c2 = saveFightCall(gid, cid, { entrants: JSON.stringify(ents) });
+    // Named fighters only: the last roll begins it.
+    if (!open && !ents.some(e => e.kind === 'player' && e.roll == null)) return beginFightCall(interaction, gid, cid);
+    return interaction.update(fightCallView(gid, c2));
+  }
+  const gm = await isGm(interaction.guild, uid);
+  if (act === 'npcs') {
+    if (!gm) return no('\u274C Adding NPCs is the GM\u2019s.');
+    return interaction.showModal(await initNpcModal(interaction, gid, { fight: true }));
+  }
+  if (act !== 'begin' && act !== 'cancel') return no('\u23F3 That button has nothing left to do.');
+  if (!gm && uid !== c.gm_id) return no(`\u274C ${act === 'begin' ? 'Beginning it' : 'Calling it off'} is the GM\u2019s, or whoever called it.`);
+  if (act === 'begin') return beginFightCall(interaction, gid, cid);
+  saveFightCall(gid, cid, { state: 'cancelled' });
+  return interaction.update({ content: '\u2716 The fight is called off.', components: [], allowedMentions: { parse: [] } });
+}
+// The NPC box on a called fight: NPCs only, the fallen and the downed left
+// out; with the players rolling their own, the bot rolls each NPC at once.
+async function handleFightCallNpcModal(interaction) {
+  const gid = interaction.guild.id, cid = interactionChannelId(interaction);
+  if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ ephemeral: true, content: '\u274C Adding NPCs is the GM\u2019s.' });
+  const c = liveFightCall(gid, cid);
+  if (!c) return interaction.reply({ ephemeral: true, content: '\u23F3 That fight call is over \u2014 `/fight addnpc` adds to a fight that is on.' });
+  let picks = [], more = '';
+  try { const v = interaction.fields.getStringSelectValues?.('pick'); picks = Array.isArray(v) ? v : []; } catch { picks = []; }
+  try { more = String(interaction.fields.getTextInputValue('more') || '').trim(); } catch { more = ''; }
+  const found = [], notes = [];
+  for (const k of picks) { const npc = npcByKey(gid, k); if (npc && !npc.died_at) found.push({ id: npcFighterId(npc.name), name: npc.name, kind: 'npc' }); }
+  if (more) {
+    const r = resolveInitNpcs(gid, more);
+    for (const e of r.entrants) { if (e.kind === 'npc') found.push(e); else notes.push(`**${e.name}** is no NPC here \u2014 left out`); }
+    notes.push(...r.notes.filter(n => !/is no NPC here/.test(n)));
+  }
+  const floor = Number(c.floor_hp) || 0, fit = [];
+  for (const e of found) {
+    if ((getNpc(gid, e.name)?.hp_current ?? 0) <= floor) { notes.push(`**${e.name}** is ${floor > 0 ? 'not fit to spar' : 'knocked down'} \u2014 left out`); continue; }
+    fit.push(e);
+  }
+  // Read again: the box may have stood open a while.
+  const now = liveFightCall(gid, cid);
+  if (!now || callStamp(now) !== callStamp(c)) return interaction.reply({ ephemeral: true, content: '\u23F3 That fight call is over.' });
+  const m = mergeEntrants(callEntrants(now), fit);
+  const players = now.roll_mode === 'players';
+  const list = m.list.map(e => (players && e.kind === 'npc' && e.roll == null ? rollEntrant(gid, cid, e) : e));
+  const c2 = saveFightCall(gid, cid, { entrants: JSON.stringify(list) });
+  const tell = [m.added.length ? `\u2795 In: ${m.added.map(e => `\u{1F3AD} **${e.name}**`).join(', ')}.` : '\u274C Nobody new was added.',
+    ...[...notes, ...m.skipped].map(n => `\u00b7 ${n}`)].join('\n').slice(0, 1900);
+  if (interaction.isFromMessage?.() && interaction.message?.id && interaction.message.id === now.card_msg_id) {
+    await interaction.update(fightCallView(gid, c2));
+    await interaction.followUp({ ephemeral: true, content: tell }).catch(() => {});
+    return;
+  }
+  await refreshCallCard(await interactionChannel(interaction), gid, c2);
+  return interaction.reply({ ephemeral: true, content: tell });
+}
+
 // /session clock: this channel's turn clock, shown, set or handed back.
 async function handleSessionClock(interaction) {
   const gid = interaction.guild.id, cid = interactionChannelId(interaction), uid = interaction.user.id;
@@ -26367,6 +27027,14 @@ async function sweepOldUpdatePosts(client, gid) {
 
 const CHANGELOG = [
   { key: '2026-11-10', gm: [
+      { line: 'Initiative, reworked: natural 20s go first and their first turn holds two actions; natural 1s go last and their first turn is roleplay only; a level total goes to whoever rolled first \u2014 no more rerolls',
+        detail: 'd20 + DEX as before (the modifier on 5e). Several 20s go higher DEX first, then whoever rolled first; several 1s lower DEX lower, and on one DEX the first to roll a 1 sits lowest. Every other total is highest first, a tie to whoever rolled first \u2014 the tie rerolls are gone. The 20\u2019s first turn takes any two actions \u2014 attack, grapple, feint, disarm \u2014 and passes after the second, the auto-pilot\u2019s NPCs too; a skip takes both. The 1\u2019s first turn carries a \u{1F3AD} Roleplay button alone: a form for what they do and say, then the turn passes, no roll; they can still defend, and a held fighter still takes the round\u2019s wound. GMs play an NPC\u2019s with its \u{1F3AD} button or `/fight act action:Roleplay npc:`; the auto-pilot and the turn clock pass it on their own, and a skip spends it. A fighter joining with `/fight add` or `/fight addnpc` rolls the same way and still goes next or last; `/fight auto` plays it all out the same.' },
+      { line: '`/fight start roll:Players` \u2014 each player rolls their own initiative on a card; `signup:true` \u2014 an open card players Join; \u2694\uFE0F Begin starts either',
+        detail: 'With Players the bot rolls the NPCs at once and pings the players named to press \u{1F3B2} Roll; the fight begins when the last has rolled, or at \u2694\uFE0F Begin, the bot rolling for anyone left. With sign-ups the card takes \u{1F64B} Join and Leave (Join rolls you on the spot when the players roll their own); \u{1F3AD} Add NPCs is the GM\u2019s; Begin and \u2716 Cancel are the GM\u2019s or the caller\u2019s, and `/fight end` calls a card off too. No other fight starts in the channel while a card is open. `manual:true` still keeps the listed order and rolls nothing.' },
+      { line: '`/initiative` \u2014 the out-of-combat order as a command of its own (`/session initiative` stays), with `roll:Players` and `signup:`',
+        detail: 'The same card. `roll:Players` gives each player a \u{1F3B2} Roll (Join rolls you), the bot rolling the NPCs and names; `signup:false` takes only those named \u2014 with the bot rolling the order is set at once, with the players rolling the last roll sets it. A natural 20\u2019s first turn takes two \u2705 Dones; a natural 1\u2019s card carries \u{1F3AD} Roleplay in place of Done, a form for their words, and the turn passes; the clock and a skip pass it too. A newcomer added while it runs takes their place by the same rule.' },
+      { line: 'Fixed: `/fight skip` now counts a disarmed fighter\u2019s skipped turn as the retrieval, as `/gm override skip` and the turn clock already did',
+        detail: 'It passed the turn and left them disarmed, so their next turn was lost to the weapon as well.' },
       { line: 'Disarm, reworked: DEX 4+, no blade, NPCs only \u2014 against an NPC\u2019s strike, or now on your own turn \u2014 and a disarmed fighter spends their next turn retrieving the weapon, through a Retrieve button and its form',
         detail: 'On your turn Disarm goes for an NPC\u2019s weapon: your d20 + DEX against its d20 + the better of its STR and DEX, rolled by the bot with its signature advantage, no naturals on its die, ties to the NPC. Against a strike it is DEX against the attack as before, once a round and never against a natural 20. Either way a 20 disarms whatever the totals and wounds the NPC 1 \u2014 against a strike it also banks +2 that rides even a flat attack \u2014 and a 1 fails outright for 2 wounds and disarms YOU. After any disarm the disarmer\u2019s very next roll is a flat d20, in place of the old flat next defence. Disarmed, a fighter\u2019s turn is the weapon\u2019s: no attack, grab, feint, disarm, escape or hold. A player presses \u{1FAF4} Retrieve (or `/fight act action:Retrieve`) and a short form takes what they do and say; a GM has the \u{1F3AD} Retrieve button for an NPC, or `npc:`; the auto-pilot and the turn clock retrieve on their own, and a skipped turn counts as the retrieval. Whatever flat roll they owe now waits for their next real roll \u2014 a disarmed attack used to spend it before refusing. NPCs never disarm.' },
       { line: 'A deflected NPC loses its next turn retrieving the weapon, and a deflection of 20 banks +2 on the deflector\u2019s flat next attack',
@@ -26378,6 +27046,8 @@ const CHANGELOG = [
       { line: 'Fixed: a defence could be rolled again for free \u2014 a second `/fight def`, or a deflect, disarm or feint after one, replaced the first',
         detail: 'One answer per strike now: once the defence is in, `/fight resolve` settles it, and `/fight rr` (a token) is the reroll \u2014 as a custom `/roll fight:true` already insisted. Refused before anything is spent.' },
     ], player: [
+      'Initiative: a natural 20 puts you first with two actions on your first turn; a natural 1 puts you last, and your first turn is roleplay only \u2014 the \u{1F3AD} Roleplay button, your words, then it passes. A level total goes to whoever rolled first',
+      'Some fights and turn orders ask you to roll your own: press \u{1F3B2} Roll on the card. An open card takes \u{1F64B} Join',
       'Disarm needs DEX 4+, not a blade, and works on NPCs only: against their strike, or on your own turn (your DEX against their best of STR and DEX). A 20 disarms and wounds; a 1 costs 2 and disarms YOU; after any disarm your next roll is a flat d20',
       'Disarmed? Your next turn goes to the \u{1FAF4} Retrieve button \u2014 say what you do in its form, and the turn passes',
       'A deflected NPC loses its next turn; a deflection of 20 adds +2 to your flat next attack',
@@ -31550,7 +32220,10 @@ const slashCommands = [
       .addStringOption(o=>o.setName('players').setDescription('Players to include — @mention them, space-separated').setRequired(false))
       .addStringOption(o=>o.setName('npcs').setDescription('GM NPCs to include — names, comma-separated').setRequired(false).setAutocomplete(true))
       .addBooleanOption(o=>o.setName('manual').setDescription('Skip initiative roll and use the order you listed fighters in').setRequired(false))
-      .addBooleanOption(o=>o.setName('practice').setDescription('Friendly bout — fighters yield at 2 HP and are never driven below it').setRequired(false)))
+      .addBooleanOption(o=>o.setName('practice').setDescription('Friendly bout — fighters yield at 2 HP and are never driven below it').setRequired(false))
+      .addStringOption(o=>o.setName('roll').setDescription('Who rolls initiative \u2014 the bot for everyone (default), or each player on a card').setRequired(false)
+        .addChoices({name:'Bot \u2014 rolls for everyone (default)',value:'bot'},{name:'Players \u2014 each presses \u{1F3B2} Roll; the bot rolls the NPCs',value:'players'}))
+      .addBooleanOption(o=>o.setName('signup').setDescription('true = an open card: players press \u{1F64B} Join, you add NPCs, then \u2694\uFE0F Begin').setRequired(false)))
     .addSubcommand(s=>s.setName('add').setDescription('Bring a player into the current fight (GM)')
       .addUserOption(o=>o.setName('user').setDescription('Who joins').setRequired(true))
       .addStringOption(o=>o.setName('where').setDescription('Where they slot in').setRequired(false)
@@ -31598,6 +32271,7 @@ const slashCommands = [
           {name:'🛡️ Deflect — STR/DEX vs a PvE attack, may redirect',value:'deflect'},
           {name:'🗡️ Disarm — DEX vs an NPC: on your turn, or against its strike',value:'disarm'},
           {name:'🫴 Retrieve — your disarmed turn: fetch the weapon',value:'retrieve'},
+          {name:'🎭 Roleplay — a natural 1 on initiative: your first turn, in words',value:'roleplay'},
           {name:'🎭 Feint — WIS vs WIS; fooled targets roll flat',value:'feint'},
           {name:'👁️ Insight — your WIS against the pending feint',value:'insight'}))
       .addUserOption(o=>o.setName('target').setDescription('Player target (grapple/feint; GM force-release)').setRequired(false))
@@ -31654,7 +32328,8 @@ const slashCommands = [
         {name:'🤼 Grapple',value:'grapple'},{name:'💪 Save',value:'save'},
         {name:'🏃 Escape',value:'escape'},{name:'⛓️ Stay',value:'stay'},{name:'✋ Release',value:'release'},
         {name:'🛡️ Deflect',value:'deflect'},{name:'🗡️ Disarm',value:'disarm'},
-        {name:'🎭 Feint',value:'feint'},{name:'👁️ Insight',value:'insight'},{name:'🫴 Retrieve',value:'retrieve'}))
+        {name:'🎭 Feint',value:'feint'},{name:'👁️ Insight',value:'insight'},{name:'🫴 Retrieve',value:'retrieve'},
+        {name:'🎭 Roleplay',value:'roleplay'}))
     .addStringOption(o=>o.setName('target_npc').setDescription('Ability actions: NPC target instead of a player').setRequired(false).setAutocomplete(true))
     .addStringOption(o=>o.setName('feint').setDescription('Feint only: what you pretend to do').setRequired(false))
     .addBooleanOption(o=>o.setName('last').setDescription('true = show your most recent roll in this channel instead of rolling').setRequired(false))
@@ -31793,6 +32468,9 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('initiative').setDescription('Call for initiative here: players join, you add NPCs, Close rolls the order (GM)')
       .addStringOption(o=>o.setName('players').setDescription('Put these in at once \u2014 @mention them').setRequired(false))
       .addStringOption(o=>o.setName('npcs').setDescription('NPCs and foes \u2014 Goblin x3, category:Bandits, any name').setRequired(false))
+      .addStringOption(o=>o.setName('roll').setDescription('Who rolls \u2014 the bot for everyone at Close (default), or each player on the card').setRequired(false)
+        .addChoices({ name: 'Bot \u2014 rolls for everyone (default)', value: 'bot' }, { name: 'Players \u2014 each presses \u{1F3B2} Roll; the bot rolls the NPCs', value: 'players' }))
+      .addBooleanOption(o=>o.setName('signup').setDescription('Players press \u{1F64B} Join (default true); false = only those named').setRequired(false))
       .addIntegerOption(o=>o.setName('remind').setDescription('This channel: minutes before a quiet turn is reminded (0 = never)').setRequired(false).setMinValue(0).setMaxValue(1440))
       .addIntegerOption(o=>o.setName('skip').setDescription('This channel: minutes before a quiet turn passes (0 = never)').setRequired(false).setMinValue(0).setMaxValue(1440))
       .addStringOption(o=>o.setName('timeout').setDescription('This channel: in a fight, a turn that times out is\u2026').setRequired(false)
@@ -31817,6 +32495,19 @@ const slashCommands = [
       .addStringOption(o=>o.setName('timeout').setDescription('In a fight, a turn that times out is\u2026').setRequired(false)
         .addChoices({ name: 'Skipped', value: 'skip' }, { name: 'Rolled for them \u2014 an attack at their last foe', value: 'auto' }))
       .addBooleanOption(o=>o.setName('reset').setDescription('true = back to the server\'s clock').setRequired(false))),
+  // The same call at the top level (T, 2026-11-10): the turn order out of
+  // combat. /session initiative stays; the options are the same.
+  new SlashCommandBuilder()
+    .setName('initiative').setDescription('Call for initiative here \u2014 the turn order out of combat (GM)')
+    .addStringOption(o=>o.setName('players').setDescription('Put these in at once \u2014 @mention them').setRequired(false))
+    .addStringOption(o=>o.setName('npcs').setDescription('NPCs and foes \u2014 Goblin x3, category:Bandits, any name').setRequired(false))
+    .addStringOption(o=>o.setName('roll').setDescription('Who rolls \u2014 the bot for everyone at Close (default), or each player on the card').setRequired(false)
+      .addChoices({ name: 'Bot \u2014 rolls for everyone (default)', value: 'bot' }, { name: 'Players \u2014 each presses \u{1F3B2} Roll; the bot rolls the NPCs', value: 'players' }))
+    .addBooleanOption(o=>o.setName('signup').setDescription('Players press \u{1F64B} Join (default true); false = only those named').setRequired(false))
+    .addIntegerOption(o=>o.setName('remind').setDescription('This channel: minutes before a quiet turn is reminded (0 = never)').setRequired(false).setMinValue(0).setMaxValue(1440))
+    .addIntegerOption(o=>o.setName('skip').setDescription('This channel: minutes before a quiet turn passes (0 = never)').setRequired(false).setMinValue(0).setMaxValue(1440))
+    .addStringOption(o=>o.setName('timeout').setDescription('This channel: in a fight, a turn that times out is\u2026').setRequired(false)
+      .addChoices({ name: 'Skipped', value: 'skip' }, { name: 'Rolled for them \u2014 an attack at their last foe', value: 'auto' })),
   new SlashCommandBuilder()
     .setName('quest').setDescription('Quest board — create, post, join and complete quests')
     .addSubcommand(s=>s.setName('create').setDescription('Create a quest — leave name blank for a writing window (GM)')
@@ -32207,8 +32898,9 @@ const HELP_CATEGORIES = {
     blurb: 'turn-based combat, and duels a GM referees',
     body: [
       '_Fights are turn-based exchanges — attacker rolls, defender answers, the clash resolves. GMs referee; NPCs fight through them or on autopilot._',
-      '`/fight start players:@Artorius @Meliora @Zeus npcs:Hollow, Hollow tank` — begin a fight with any number of players and GM NPCs (auto-rolls DEX initiative; fighters on the same total reroll among themselves until apart, and the card says so)',
+      '`/fight start players:@Artorius @Meliora @Zeus npcs:Hollow, Hollow tank` — begin a fight with any number of players and GM NPCs (the bot rolls DEX initiative: natural 20s go first with two actions on their first turn, natural 1s last with a roleplay-only first turn, and a level total goes to whoever rolled first \u2014 no rerolls)',
       '`/fight start ... manual:true` — keep the order you listed fighters in (no roll)',
+      '`/fight start ... roll:Players` — each player presses \u{1F3B2} Roll on a card for their own initiative, the bot rolling the NPCs at once; the fight begins when the last has rolled, or at \u2694\uFE0F Begin, the bot rolling for anyone left \u00b7 `signup:true` — an open card: players press \u{1F64B} Join (rolling on the spot with `roll:Players`), the GM adds NPCs, and Begin starts it; \u2716 Cancel or `/fight end` calls it off',
       '`/fight start ... practice:true` — friendly bout: fighters yield at 2 HP and are never driven below it',
       'Every fight runs on the turn clock: whoever it waits on is reminded after 5 quiet minutes — ✍️ Still writing, or just keep typing — and at 15 the turn is skipped, or with `timeout:auto` the bot attacks for them, at whoever they last struck if still standing, else the weakest foe standing. A defence is never skipped: the bot rolls it. A whole round gone by with nobody acting stops the clock until someone stirs. `/session clock` sets a channel\'s minutes, `/config mechanics turnclock` the server\'s',
       '`/fight auto ... practice:true` — the same floor in any auto mode',
@@ -32228,6 +32920,7 @@ const HELP_CATEGORIES = {
       '`/fight act action:Deflect` — shield deflection vs a PvE strike (shield + STR 4+, once per round, crits undeflectable): roll STR or DEX (`stat:`) to beat the attack roll, optionally `redirect_npc:` into another enemy for 1 damage — and the enemy loses its next turn retrieving the weapon. A natural 20 turns it whatever the totals, the named enemy takes 2, and your flat next attack gets +2; a natural 1 fails for 2 wounds. Either way your next attack is a flat d20 — after a 1, your next defence too',
       '`/fight act action:Disarm` — NPCs only, DEX 4+, no blade needed. Against an NPC\'s strike (once per round, not against a natural 20): DEX to beat the attack — no damage, and they spend their next turn retrieving the weapon; a miss lets the blow land for 1. On your own turn (`target_npc:` or the ⚔️ Disarm button): your DEX against their best of STR and DEX, ties to them. A 20 disarms whatever the totals and wounds them 1 (against a strike it also banks +2, even on a flat attack); a 1 fails for 2 wounds and disarms you. After any disarm your very next roll is a flat d20',
       '🫴 **Retrieve** — disarmed, your next turn goes to fetching the weapon: press Retrieve (or `/fight act action:Retrieve`) and say what you do; no attack, grab, feint, disarm, escape or hold until you have. GMs retrieve for an NPC with its 🎭 button or `npc:`; the auto-pilot and the turn clock do it themselves, and a skipped turn counts',
+      '\u{1F3AD} **Roleplay** — a natural 1 on initiative: your first turn is roleplay only. Press Roleplay (or `/fight act action:Roleplay`) and say what you do and say; no roll and no action, and the turn passes \u2014 you can still defend. GMs play an NPC\'s with its \u{1F3AD} button or `npc:`; the auto-pilot and the turn clock pass it on their own, and a skip spends it. A natural 20 on initiative holds two actions on its first turn, any two',
       '`/fight act action:Feint feint:"..."` — a deception in a fight (away from one it is `/deception`), and it spends either half of the fight. On your turn it is an attack: WIS against their insight, and if they fall for it the blow lands with normal damage and their very next roll is a flat d20. A feint of 20 fools them whatever the insight; a feint of 1 is a total failure. An insight of 20 sees through it unless the feint was a 20; an insight of 1 is fooled.',
       '↳ With a strike pending on you it is a defensive feint — WIS in place of your usual stat, though not against a natural 20, which lands whatever you roll — and if the blow misses, the attacker is taken in: their very next roll is a flat d20. A defensive feint of 1 is a total failure: the blow lands whatever the totals, unless the attack was a 1 too. The price of any feint, landed or not: your own very next roll is a flat d20 — at disadvantage too after a 1. WIS 4+; ties go to the target. One feint per honest roll: after a feint you must make an ordinary stat roll before feinting again — the flat roll a feint costs you counts.',
       '`/deception target:@Players` (or `target_npc:`) — away from a fight, a form: what you pretend (shown), what you are really planning (shown once the dice have spoken), what you say. WIS against their insight; the totals decide, ties to them, and a natural 1 fails outright — no other natural counts. Win and their very next roll is a straight d20, be it a chat roll, `/roll`, a scene\'s roll, a called check or a fight somewhere else; your own very next roll is a flat d20 whatever happens, at disadvantage after a 1. No cooldown. GMs deceive as an NPC with `npc:`. Refused while you or they are fighting in the channel: there, it is a feint.',
@@ -32397,8 +33090,8 @@ const HELP_CATEGORIES = {
       '`/gm check usage` \u2014 sixty days of command use, quietest first \u2014 a report only; nothing is removed by it \u00b7 `/gm check rehearse` \u2014 a private sparring thread against a dummy the bot runs, to try new buttons before the table sees them (GM)',
       '`/help category:rules` \u2014 the live table rules, as the bot enforces them, for everyone. Every deploy posts **What\'s new** (the summary, then **In detail** beneath it) and **Deploy mend** as dated threads in the **gm-updates** forum, and the player half of the news in **updates** \u2014 the whole back-catalogue is there from the first boot; a day\'s entry that grows between two pushes is posted again whole. Once a week **updates** also gets the players\' **Weekly chronicle**: quests completed, titles granted, fights won, the fallen, and the dice of the week (natural 20s and 1s, the biggest total) \u2014 nothing on a quiet week',
       '`/session add|kick|rally|note|pause|resume|complete|show|thread [name:] [run:]` \u2014 work any run that is going, whatever opened it (a board run, an encounter, a chapter, an older quest), by NAME rather than number; leave `name:` blank inside its own thread. `add` seats (on an instance it is your word: a sheet and a pulse required) \u00b7 `kick` takes them out, still paid if the run is winding down \u00b7 `complete [summary:] [title:]` pays out; leave `summary:` blank and a summary drafted from the log is offered to use, edit or skip \u00b7 `thread` opens its room if it has none. `show` is open to everyone (GM)',
-      '`/session initiative [players:] [npcs:Goblin x3, category:Bandits] [remind:] [skip:] [timeout:]` — a sign-up card here: players press 🙋 Join, 🎭 Add NPCs is yours (copies with `x3`, a whole category, or any name), and 🎲 Close & roll rolls d20 + DEX for everyone — ties reroll among the tied — and sets the order. Each turn then gets a card pinging whoever it is, with ✅ Done (theirs or yours), ⏭️ Skip, ⏸️ Pause and 🏁 End, and the rounds are counted; a run going here keeps the order, each round and every skipped turn on its timeline. One order a channel, waiting while a fight runs there (GM)',
-      '`/session turn [action:] [who:]` — the order here: `show` for anyone, `next` (Done) for whoever\'s turn it is; `skip`, `back`, `pause`, `resume`, `close`, `add` (a newcomer rolls and takes their place by total), `remove` and `end` are the GM\'s',
+      '`/initiative` or `/session initiative [players:] [npcs:Goblin x3, category:Bandits] [roll:Bot|Players] [signup:] [remind:] [skip:] [timeout:]` — a card here: players press 🙋 Join (`signup:false` takes only those named), 🎭 Add NPCs is yours (copies with `x3`, a whole category, or any name), and 🎲 Close & roll rolls d20 + DEX for everyone and sets the order \u2014 or with `roll:Players` each player presses \u{1F3B2} Roll (Join rolls you on the spot), the bot rolls the NPCs, and Close rolls for anyone left; with only those named, the last roll sets it, and with the bot rolling the order is set at once. Natural 20s go first and their first turn takes two \u2705 Dones; natural 1s go last and their first turn is \u{1F3AD} Roleplay \u2014 their words, then it passes; a level total goes to whoever rolled first. Each turn then gets a card pinging whoever it is, with ✅ Done (theirs or yours), ⏭️ Skip, ⏸️ Pause and 🏁 End, and the rounds are counted; a run going here keeps the order, each round and every skipped turn on its timeline. One order a channel, waiting while a fight runs there (GM)',
+      '`/session turn [action:] [who:]` — the order here: `show` for anyone, `next` (Done) for whoever\'s turn it is; `skip`, `back`, `pause`, `resume`, `close`, `add` (a newcomer rolls and takes their place by the same rule), `remove` and `end` are the GM\'s',
       '`/session clock [remind:] [skip:] [timeout:skip|auto] [reset:true]` — this channel\'s turn clock, for its fights and its initiative: minutes to the reminder (with ✍️ Still writing) and to the turn passing, 0 for never; `timeout:auto` has the bot attack for a quiet fighter instead of skipping them. Typing, a message or any press from the one it waits on holds the turn (GM)',
       '_One quest at a time: approving someone already seated on a live run prompts for a second press to override (audited), and a launch leaves them an applicant rather than double-booking them._',
       '`/instance start name:... [as:] [merits:] [campaign:] [part:] [preset:] [record:true] [started:] [played:]` — open a run without the board: no listing, no applications. `as:` says what it is: **encounter** (the default) is a session on the fly; **chapter** is a numbered part of a campaign (`campaign:` needed, `part:` the next one if blank); **legacy** picks up a quest from before the bot (`started:` when it began, `played:` the time already played — `6h`, `2h30m` — banked into its clock) and pays only the merits you set. The bot lists every living character with HP and what is holding them; tick who is in it and press **Open** \u2014 it opens its own thread in quest-instances (where it was called if no forum is set), the party pulled in by mention. Nobody can join by themselves: `/session add` and `/session kick`. `/session complete` pays out, writes the chronicle and posts the review button. Instances do not count toward one-quest-at-a-time; one left quiet six hours reminds the room and pings the GMs (GM)',
@@ -32638,6 +33331,7 @@ async function routeButton(interaction) {
     if (interaction.customId.startsWith('storyforce:')) return handleStoryForceButton(interaction);
     if (interaction.customId.startsWith('sessend:')) return handleSessionEnd(interaction);
     if (interaction.customId.startsWith('init:')) return handleInitButton(interaction);
+    if (interaction.customId.startsWith('fcall:')) return handleFightCallButton(interaction);
     if (interaction.customId.startsWith('fclock:')) return handleFightClockButton(interaction);
     if (/^adv(ok|no|go):/.test(interaction.customId)) return handleHeldRollButton(interaction);
     if (interaction.customId.startsWith('actv:')) return handleActivityShelfButton(interaction);
@@ -32724,7 +33418,7 @@ async function routeButton(interaction) {
       return interaction.reply({ ephemeral: true,
         content: buildCharCard(ch3, nm3, heal3.current, cfg3.heal_charges ?? 3, interaction.guild.id).join('\n') });
     }
-    if (interaction.customId.startsWith('fdef:') || interaction.customId.startsWith('fatk:') || interaction.customId.startsWith('fndef:') || interaction.customId.startsWith('fnatk:') || interaction.customId.startsWith('fact:') || ['fsave', 'finsight', 'fresolve', 'frr', 'fbreak', 'fstay', 'fnretrieve'].includes(interaction.customId)) {
+    if (interaction.customId.startsWith('fdef:') || interaction.customId.startsWith('fatk:') || interaction.customId.startsWith('fndef:') || interaction.customId.startsWith('fnatk:') || interaction.customId.startsWith('fact:') || ['fsave', 'finsight', 'fresolve', 'frr', 'fbreak', 'fstay', 'fnretrieve', 'fnroleplay'].includes(interaction.customId)) {
       // A press walks the exact slash path — the branch's own gates (turn,
       // phase, pending kind, roll ownership, tokens) do all the deciding.
       // Every press opens the roleplay form first (T, 2026-10-14); the
@@ -32783,19 +33477,27 @@ async function routeButton(interaction) {
         // Grapple needs a target and Feint a target AND a claim: the picker
         // first, then the form. The rest open their form straight away.
         if (which === 'grapple' || which === 'feint') return offerAbilityTarget(interaction, which);
+        if (which === 'roleplay') {
+          if (currentF !== uidF || fF.phase !== 'attack') return refuseF('\u274C It is not your turn.');
+          if (!rpTurnOf(fF, uidF)) return refuseF('\u{1F3AD} This turn is not a roleplay one \u2014 act as you will.');
+          return openFightRp(interaction, 'roleplay', {}, { title: 'Your first turn \u2014 roleplay' });
+        }
         if (which === 'retrieve') {
           if (currentF !== uidF || fF.phase !== 'attack') return refuseF('\u274C It is not your turn.');
+          if (rpTurnOf(fF, uidF)) return refuseF(rpTurnRefusal());
           if (!disarmedOf(fF, uidF)) return refuseF('\u2694\uFE0F Nothing to retrieve \u2014 you are not disarmed.');
           return openFightRp(interaction, 'retrieve', {}, { title: 'Retrieve your weapon' });
         }
         if (which === 'maintain') {
           if (currentF !== uidF) return refuseF('\u274C It is not your turn.');
           if (!grappleHeldTargetOf(fF, uidF)) return refuseF('\u{1F91C} You are not holding anyone.');
+          if (rpTurnOf(fF, uidF)) return refuseF(rpTurnRefusal());
           if (disarmedOf(fF, uidF)) return refuseF(disarmedRefusal());
           return openFightRp(interaction, 'maintain', {}, { title: 'Keep the hold' });
         }
         if (which === 'escape') {
           if (!fightGrapples(fF)[uidF]) return refuseF('\u{1F91C} You are not held.');
+          if (fF.phase === 'attack' && currentF === uidF && rpTurnOf(fF, uidF)) return refuseF(rpTurnRefusal());
           if (fF.phase === 'attack' && currentF === uidF && disarmedOf(fF, uidF)) return refuseF(disarmedRefusal());
           return openFightRp(interaction, 'escape', {}, { title: 'Break free' });
         }
@@ -32824,6 +33526,13 @@ async function routeButton(interaction) {
         if (!(await isGm(interaction.guild, uidF))) return refuseF('\u274C Only GMs act for an NPC.');
         if (!disarmedOf(fF, currentF)) return refuseF(`\u2694\uFE0F **${npcNameFromFighter(currentF)}** is not disarmed.`);
         return openFightRp(interaction, 'retrieve', { npc: npcNameFromFighter(currentF) }, { title: `${npcNameFromFighter(currentF)} \u2014 retrieve`.slice(0, 45) });
+      }
+      if (interaction.customId === 'fnroleplay') {
+        // A GM plays out an NPC's roleplay turn (T, 2026-11-10).
+        if (fF.phase !== 'attack' || !isNpcFighter(currentF)) return refuseF('\u274C It is not an NPC\u2019s turn.');
+        if (!(await isGm(interaction.guild, uidF))) return refuseF('\u274C Only GMs act for an NPC.');
+        if (!rpTurnOf(fF, currentF)) return refuseF(`\u{1F3AD} **${npcNameFromFighter(currentF)}**\u2019s turn is not a roleplay one.`);
+        return openFightRp(interaction, 'roleplay', { npc: npcNameFromFighter(currentF) }, { title: `${npcNameFromFighter(currentF)} \u2014 roleplay`.slice(0, 45) });
       }
       if (interaction.customId === 'fsave') return openFightRp(interaction, 'save', {}, { title: 'Save \u2014 STR' });
       if (interaction.customId === 'finsight') return openFightRp(interaction, 'insight', {}, { title: 'Insight \u2014 WIS' });
@@ -33761,6 +34470,8 @@ async function handleInteraction(interaction) {
     if (interaction.customId === 'actvw') return handleWriterModal(interaction);
     if (interaction.customId.startsWith('sessendform:')) return handleSessionEnd(interaction);
     if (interaction.customId === 'initnpc') return handleInitNpcModal(interaction);
+    if (interaction.customId.startsWith('initrp:')) return handleInitRpModal(interaction);
+    if (interaction.customId === 'fcallnpc') return handleFightCallNpcModal(interaction);
     if (/^(npcsay|npcsayr|npcans):/.test(interaction.customId)) return handleNpcSayModal(interaction);
     if (interaction.customId === 'scrollwrite') return handleScrollModal(interaction);
     if (interaction.customId === 'importpaste') return handleImportPasteModal(interaction);
@@ -33915,6 +34626,9 @@ async function handleInteraction(interaction) {
           return handleFight(interaction, { sub: 'act', action: 'disarm', attack: true, targetId: p.targetId, flavour });
         case 'retrieve':
           return handleFight(interaction, { sub: 'act', action: 'retrieve', npc: p.npc || null, flavour });
+        // A natural 1 on initiative: the first turn in words (T, 2026-11-10).
+        case 'roleplay':
+          return handleFight(interaction, { sub: 'act', action: 'roleplay', npc: p.npc || null, flavour });
         case 'breakfree':
           return handleFight(interaction, { sub: 'act', action: 'escape', npc: p.npc || null, flavour });
         case 'stay':
@@ -34152,6 +34866,7 @@ async function handleInteraction(interaction) {
       if (sg === 'title' || sg === 'association') return await handleTitles(interaction, sg);
     }
     if (interaction.commandName === 'session') return await handleSession(interaction);
+    if (interaction.commandName === 'initiative') return await handleSessionInitiative(interaction);
     if (interaction.commandName === 'dd') return await handleDd(interaction);
     if (interaction.commandName === 'edit') return await handleEdit(interaction);
     if (interaction.commandName === 'rp') return await handleRp(interaction);
