@@ -2205,7 +2205,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
           /standDownFight\(gid, quest\.run_thread_id, client\);/.test(src) &&
           /const swept = sweepTempNpcs\(gid, \{ client \}\);/.test(src) && !/sweepTempFighters/.test(src);
       })());
-    ok('opening abilities sit with the attack, answering ones with the defence',
+    ok('opening abilities sit with the attack, answering ones with the defence; Grapple and Disarm sit with both (2026-11-10)',
       /B\('fact:grapple'/.test(src) && /B\('fact:feint'/.test(src) &&
       (() => {
         // The player's rows come after the NPC's (GM-gated) rows in the same function.
@@ -2213,8 +2213,8 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         const a = src.lastIndexOf("if (kind === 'atk') return [");
         const defBlock = src.slice(d, src.indexOf('];', d));
         const atkBlock = src.slice(a, src.indexOf('];', a));
-        return /fact:deflect/.test(defBlock) && /fact:disarm/.test(defBlock)
-            && !/fact:deflect/.test(atkBlock) && !/fact:disarm/.test(atkBlock);
+        return /fact:deflect/.test(defBlock) && /fact:disarm/.test(defBlock) && /fact:grapple/.test(defBlock)
+            && !/fact:deflect/.test(atkBlock) && /fact:disarm/.test(atkBlock) && /fact:grapple/.test(atkBlock) && !/fact:feint/.test(defBlock);
       })() &&
       /return handleFight\(interaction, \{ sub: 'act', action: p\.kind, targetId: pendingAttacker, flavour \}\);/.test(src) &&
       /\? String\(forced\.action\)\.toLowerCase\(\)/.test(src) &&
@@ -2264,7 +2264,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         && /const res = await passTurn\(guild, gid, cid, hpState, \[\.\.\.turnOrder\], turnOrder, floor, lines, actorId\);\s*await deliver\(lines\);/.test(src)
         && /const res = await passTurn\(interaction\.guild, gid, cid, hpState, \[\.\.\.turnOrder\], turnOrder, fightFloor\(fight\), lines, attackerId\);/.test(src));
     ok('a kept hold: the captive or a GM for an NPC answers by button or slash; a quiet captive stays; an NPC on auto struggles; a hold of 20 makes the break flat',
-      /\['fsave', 'finsight', 'fresolve', 'frr', 'fbreak', 'fstay'\]\.includes\(interaction\.customId\)/.test(src)
+      /\['fsave', 'finsight', 'fresolve', 'frr', 'fbreak', 'fstay', 'fnretrieve'\]\.includes\(interaction\.customId\)/.test(src)
         && /openFightRp\(interaction, 'breakfree', \{ npc: npcB \}/.test(src) && /case 'stay':\s*return handleFight\(interaction, \{ sub: 'act', action: 'stay'/.test(src)
         && /if \(fight\.phase === 'defend' && fight\.atk_kind === 'hold' && fight\.current_target === actorId\)\s*return runFightBreakFree\(/.test(src)
         && /if \(fight\.atk_kind === 'hold'\) \{\s*\/\/ A captive gone quiet stays in the hold/.test(src)
@@ -2277,23 +2277,29 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         && /forced \? Math\.max\(fight\.atk_roll \?\? 0, fight\.def_roll \?\? 0\) : fight\.atk_roll/.test(src)
         && /if \(!hit && !botched\) \{\s*setFooled\(gid, cid, attackerId\);/.test(src)
         && (src.match(/chargeTrick\(gid, cid, /g) || []).length === 4);   // the definition and its three callers
-    ok('the price of a trick: a fight\u2019s flag in a live fight here, NPCs too; a sheet mark anywhere else, flatdis after a 1; the flag\u2019s rider clears with it',
+    ok('the price of a feint or a deception: a fight\u2019s flag in a live fight here, NPCs too; a sheet mark anywhere else \u2014 an NPC\u2019s as well (2026-11-10) \u2014 flatdis after a 1; the flag\u2019s rider clears with it',
       /function chargeTrick\(gid, cid, fid, botched = false\)/.test(src) && /fightOrder\(f\)\.includes\(fid\)\) \{ setFooled\(gid, cid, fid, botched\); return; \}/.test(src)
-        && /upsertChar\(gid, fid, \{ next_mark: botched \? 'flatdis' : 'flat' \}\);/.test(src)
+        && /setFlatMark\(gid, fid, botched \? 'flatdis' : 'flat'\);/.test(src)
+        && /function setFlatMark\(gid, fid, mark = 'flat'\) \{[\s\S]{0,300}?if \(n\) upsertNpc\(gid, n\.name, \{ next_mark: mark \}\);[\s\S]{0,80}?upsertChar\(gid, fid, \{ next_mark: mark \}\);/.test(src)
+        && /return n\.next_mark === 'flatdis' \? 'dis' : true;/.test(src)
+        && /ALTER TABLE npcs ADD COLUMN next_mark TEXT/.test(src)
         && /function consumeFooled\(gid, cid, fid\) \{[\s\S]{0,400}?delete slot\.fooled; delete slot\.fooledDis;[\s\S]{0,200}?return dis \? 'dis' : true;/.test(src)
         && /return ch\.next_mark === 'flatdis' \? 'dis' : true;/.test(src)
         && /const flatMode = \(flat, mode\) => \(flat === 'dis' \? 'dis' : flat \? 'normal' : mode\);/.test(src));
-    ok('/deception: the naturals as a feint\u2019s; both rolls spend a flat mark; the deceiver pays',
-      /const fooled = a\.nat === 1 \? false : a\.nat === 20 \? true : d\.nat === 20 \? false : d\.nat === 1 \? true : a\.r\.total > d\.r\.total;/.test(src)
-        && /const flatMe = consumeFlatMark\(gid, uid\), flatThem = consumeFlatMark\(gid, target\.id\);/.test(src)
-        && /chargeTrick\(gid, cid, uid, botched\);/.test(src));
+    ok('/deception (2026-11-10): the totals decide, ties to the mark; a 1 fails outright and no other natural counts; both rolls spend a flat mark, an NPC\u2019s too; the deceiver pays; no cooldown',
+      /const botched = a\.nat === 1;\s*const fooled = !botched && a\.r\.total > d\.r\.total;/.test(src)
+        && /const flatMe = consumeFlatMark\(gid, p\.deceiverId\), flatThem = consumeFlatMark\(gid, p\.targetId\);/.test(src)
+        && /chargeTrick\(gid, cid, p\.deceiverId, botched\);/.test(src) && /setFlatMark\(gid, p\.targetId, 'flat'\);/.test(src)
+        && (() => { const h = src.slice(src.indexOf('async function deceptionParties('), src.indexOf('function fightTotalStr(')); return h.length > 2000 && !/deceptionSpent|spendDeception/.test(h); })());
     ok('deflect: a 20 turns it whatever the totals, 2 into the named enemy; a 1 fails for 2, the next defence flat too',
       /const deflected = nat === 20 \|\| \(nat !== 1 && total > fight\.atk_roll\);/.test(src) && /const dmgR = nat === 20 \? 2 : 1;/.test(src)
         && /const dmgS = nat === 1 \? 2 : 1;\s*if \(nat === 1\) setEffectFlag\(gid, cid, uid, 'flatDef'\);/.test(src));
-    ok('disarm: a 20 wounds the attacker and leaves their next attack flat, no fetching turn; a 1 fails, the next attack flat too',
+    ok('disarm against a strike (2026-11-10): a 20 disarms, wounds 1 and banks +2 that rides a flat attack; a 1 fails for 2 and disarms the disarmer; any disarm leaves the very next roll flat; no blade asked',
       /const disarmed = nat === 20 \|\| \(nat !== 1 && total > fight\.atk_roll\);/.test(src)
-        && /if \(nat === 20\) \{\s*setEffectFlag\(gid, cid, attackerId, 'flatAtk'\);\s*const prevA = hpState\[attackerId\] \?\? 0;\s*const nhA = applyFightDamage\(prevA, 1, floor\);/.test(src)
-        && /\} else \{\s*if \(nat === 1\) setEffectFlag\(gid, cid, uid, 'flatAtk'\);/.test(src));
+        && /if \(disarmed\) \{\s*setEffectFlag\(gid, cid, attackerId, 'disarmed'\);\s*if \(nat === 20\) \{\s*bankRiposte\(gid, cid, uid, \{ onFlat: true \}\);\s*const prevA = hpState\[attackerId\] \?\? 0;\s*const nhA = applyFightDamage\(prevA, 1, floor\);/.test(src)
+        && /const dmgD = nat === 1 \? 2 : 1;\s*if \(nat === 1\) setEffectFlag\(gid, cid, uid, 'disarmed'\);/.test(src)
+        && /const markDisarmUsed = \(gid, cid, fid\) => markRoundSpecial\(gid, cid, fid, 'disarmUsed', 'fooled'\);/.test(src)
+        && !/hasBladeEquipped/.test(src));
     ok('every flat roll in a fight carries the rider: the auto-pilot\u2019s, the clock\u2019s, the hand\u2019s',
       (src.match(/autoEdge\(/g) || []).length >= 8 && /const restrainedAuto = !!grappleHolderOf\(fight, attackerId\);/.test(src)
         && /const offBalanceAuto = !restrainedAuto && consumeFlatAtk\(gid, cid, attackerId\);/.test(src)
@@ -2333,10 +2339,11 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         && src.indexOf('const forced = forceHit || (feintDefPending') < src.indexOf("if (consumeEffectFlag(gid, cid, defenderId, 'feintDef')) {")
         && /if \(atkNat === 1\) return \{ hit: false, dmg: 0, detail: 'fumbled' \};/.test(src)
         && /the read fails outright\$\{hit \? ' and the blow lands, whatever the totals' : ''\}/.test(src));
-    ok('/deception is for away from a fight: refused to anyone fighting in the channel, before anything is rolled; its mark is the sheet\u2019s',
-      /if \(fD\?\.state === 'active' && \(fightOrder\(fD\)\.includes\(uid\) \|\| fightOrder\(fD\)\.includes\(target\.id\)\)\)\s*return interaction\.reply\(\{ ephemeral: true, content: '\u{1F3AD} In a fight, a trick is a feint/u.test(src)
-        && src.indexOf('fightOrder(fD).includes(uid)') < src.indexOf('const flatMe = consumeFlatMark(gid, uid), flatThem')
-        && /setDescription\('Try to deceive someone, away from a fight \(in one, feint\)'\)/.test(src)
+    ok('/deception is for away from a fight: refused to anyone fighting in the channel before the form opens, and again if one starts while it is open; its mark is the sheet\u2019s',
+      /if \(fD\?\.state === 'active' && \(fightOrder\(fD\)\.includes\(deceiverId\) \|\| fightOrder\(fD\)\.includes\(targetId\)\)\)\s*return no\('\u{1F3AD} In a fight, a deception is a feint/u.test(src)
+        && /if \(fD\?\.state === 'active' && \(fightOrder\(fD\)\.includes\(p\.deceiverId\) \|\| fightOrder\(fD\)\.includes\(p\.targetId\)\)\)/.test(src)
+        && src.indexOf('fightOrder(fD).includes(p.deceiverId)') < src.indexOf('const flatMe = consumeFlatMark(gid, p.deceiverId), flatThem')
+        && /setDescription\('Try to deceive someone, away from a fight \(in one, feint\)[^']*a form follows'\)/.test(src)
         && !/their next roll in this fight is a straight d20/.test(src));
     ok('a reroll says which roll it was and who answers it: a grab, a feint, a hold, a defensive feint; /fight resolve only when both rolls are in',
       /const what = kind === 'grapple' \? 'the grapple' : kind === 'feint' \? 'the feint' : kind === 'hold' \? 'the hold'\s*: isAttacker \? 'attack' : JSON\.parse\(fight\.effect_state \|\| '\{\}'\)\[uid\]\?\.feintDef \? 'the defensive feint' : 'defence';/.test(src)
@@ -2354,7 +2361,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         && src.indexOf("f0.current_target === meId && f0.atk_kind === 'hold'") < src.indexOf("setEffectFlag(gid, cid, meId, 'feintDef');"));
     ok('a held fighter is offered no Grapple button',
       /\.\.\.\(held \? \[\] : \[B\('fact:grapple'/.test(src) &&
-      /fightAnswerRows\(k, \{ held: isHeld, gid \}\)/.test(src));
+      /fightAnswerRows\(k, \{ held: !!gmap\[fid\], gid \}\)/.test(src));
     ok('there is an attack button row, routed like the defence one',
       /if \(kind === 'atk'\) return \[/.test(src) &&
       /B\('fatk:str'/.test(src) &&
@@ -2379,7 +2386,11 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /if \(!flavour\) return openFightRp\(interaction, 'atk', \{ stat, targetId, mode, npc: /.test(src) &&
       (src.match(/forcedOf\(forced, 'flavour'\)/g) || []).length >= 10 &&
       /N\('fnatk:str', /.test(src) && /N\('fndef:str', /.test(src) &&
-      /nextF\.answerRows = nextF\.isNpc\s*\? fightAnswerRows\('atk', \{ forNpc: true, auto: autoNpc, gid \}\)/.test(src));
+      /nextF\.answerRows = turnRowsFor\(gid, getFight\(gid, cid\), order\[index\], \{ auto: autoNpc \}\);/.test(src) &&
+      /if \(npc\) return fightAnswerRows\('atk', \{ forNpc: true, auto, gid \}\);/.test(src) &&
+      /return openFightRp\(interaction, 'grappledef', \{\}, \{ title: 'Grapple the blow' \}\);/.test(src) &&
+      /return openFightRp\(interaction, 'disarmatk', \{ targetId \}, \{ title: 'Disarm' \}\);/.test(src) &&
+      /return openFightRp\(interaction, 'retrieve', \{\}, \{ title: 'Retrieve your weapon' \}\);/.test(src));
 // (2026-09-12: rows are now claimed by sendLong/replyLong themselves, so
     // no sender can forget — six had.)
     ok('turn buttons are universal: the announcer stashes, the senders claim',
@@ -2642,7 +2653,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         && (src.match(/if \(hold\) return holdTypedRoll\(message, \{ rest, mode, isReroll, successCheck \}\);/g) || []).length === 2
         && src.indexOf('if (hold) return holdTypedRoll') < src.indexOf('markRerolled(gid, cid, uid);')
         && /if \(!parsed\) return message\.reply\('❌ Invalid notation\. Try `r1d20\+5 attack`, `r2d6`, or `r str`\.'\);\s*if \(hold\) return holdTypedRoll/.test(src)
-        && /return holdSlashRoll\(interaction, \{ command: 'roll', mode, gid, cid, uid \}\);\s*\/\/ A flat mark strips the stat here[\s\S]{0,300}?\/\/ Hero signature advantage applies to stat rolls/.test(src)
+        && /return holdSlashRoll\(interaction, \{ command: 'roll', mode, gid, cid, uid \}\);\s*\/\/ Disarmed, a custom roll cannot strike[\s\S]{0,500}?\/\/ A flat mark strips the stat here[\s\S]{0,300}?\/\/ Hero signature advantage applies to stat rolls/.test(src)
         && /return holdSlashRoll\(interaction, \{ command: 'roll', mode: asked, gid, cid, uid \}\);\s*\}\s*const mode = applyNextMark/.test(src)
         && /const g = await gateFightRoll\(interaction, \{ gid, cid, uid, sub, mode: asked \}\);/.test(src)
         && src.indexOf('const g = await gateFightRoll') < src.indexOf('spendDeception(gid, meId);')
@@ -2662,7 +2673,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('auto rolls show both dice — the card, the audit, the ability lines — and a Hero on auto reaches for a live signature',
       /const diceBit = adv && roll\.dropped != null \? `\[\$\{nat\}, ~~\$\{roll\.dropped\}~~\]` : `\[\$\{nat\}\]`;/.test(src)
         && (src.match(/`1d20\$\{(\w+)\.adv \? ' \(adv\)' : ''\}`, \1, /g) || []).length
-          + (src.match(/`1d20\$\{autoTag\((\w+)\)\}`, \1, /g) || []).length === 14
+          + (src.match(/`1d20\$\{autoTag\((\w+)\)\}`, \1, /g) || []).length === 15   // + the disarm grip (2026-11-10)
         && /rollLine: `🎲  \$\{notation\} → \$\{dropped != null \? `\[\$\{nat\}, ~~\$\{dropped\}~~\]` : `\[\$\{nat\}\]`\}/.test(src)
         && !/\[\$\{nat\}~~\$\{dropped\}~~\]/.test(src) && !/autoFightCard\([^\n]*!!\w+\.adv\)/.test(src)
         && /const sig = sigStat && hasSignatureAdvantage\(subject, sigStat\) \? sigStat : null;/.test(src));
@@ -3678,6 +3689,98 @@ function testBuildK(mod) {
   });
 }
 
+// Build N (2026-11-10): what the special moves leave behind, a grapple that
+// answers a strike, Disarm both ways, the turn a disarmed fighter spends on
+// the weapon, a riposte that rides a flat attack, an NPC's own flat mark,
+// /deception through a form, one answer per strike.
+function testBuildN(src) {
+  return harness('build N', (ok, eq) => {
+    ok('a grab of 1 leaves the grappler’s next defence flat; a save of 20 that holds leaves their next attack flat and banks the saver +2 — both when both are rolled',
+      /if \(aNat === 1\) \{\s*setEffectFlag\(gid, cid, attackerId, 'flatDef'\);/.test(src)
+        && /if \(nat === 20\) \{\s*setEffectFlag\(gid, cid, attackerId, 'flatAtk'\);\s*bankRiposte\(gid, cid, targetId\);/.test(src)
+        && /\} else if \(aNat !== 1\) \{\s*lines\.push\(`💨 \*\*\$\{defName\}\*\* slips the hold — no grapple\.`\);/.test(src));
+    ok('a grapple answers an ordinary strike: STR against it, ties to the attack, a 20 holds and banks +2, a 1 never does; refused against a 20, a special, from a hold, while holding, on one already held',
+      /function defGrappleRefusal\(fight, uid\)/.test(src)
+        && /if \(fight\.atk_nat === 20\) return '🤼 A \*\*natural 20\*\* cannot be grappled/.test(src)
+        && /if \(grappleHolderOf\(fight, fightOrder\(fight\)\[fight\.turn_index\]\)\) return '🤼 They are already held\.';/.test(src)
+        && /const seized = nat === 20 \|\| \(nat !== 1 && total > fight\.atk_roll\);/.test(src)
+        && /if \(nat === 20\) \{\s*bankRiposte\(gid, cid, uid\);/.test(src)
+        && /const flatG = consumeFlatDef\(gid, cid, uid\) \|\| consumeFooled\(gid, cid, uid\) \|\| consumeFlatMark\(gid, uid\);/.test(src)
+        && /const barG = abilityNeeds\(gid, 'grapple'\);\s*if \(belowBar\(subject, barG\)\)[^\n]*\n\s*const turnOrder = fightOrder\(fight\);\s*const attackerId/.test(src));
+    ok('the striker seized is held from that moment, with no wound as its turn ends; a grab that falls short resolves the exchange as a failed defence',
+      /passTurn\(interaction\.guild, gid, cid, hpState, \[\.\.\.turnOrder\], turnOrder, floor, lines, attackerId, \{ strain: false \}\)/.test(src)
+        && /async function passTurn\(guild, gid, cid, hpState, order, roster, floor, lines, actorId, \{ strain = true \} = \{\}\) \{\s*const st = strain \? await applyTurnEndStrain\(/.test(src)
+        && /upsertFight\(gid, cid, \{ def_roll: total, def_nat: nat, def_stat: 'str', def_mode: mode, def_sides: 20 \}\);\s*const res = await resolveExchange\(interaction\.guild, gid, cid, getFight\(gid, cid\), \{ forceHit: true \}\);/.test(src));
+    ok('Grapple with a strike pending on you is the defence — typed, /roll, the button — and a target picked on the attack picker is always the grab',
+      /if \(forcedOf\(forced, 'defend'\) \|\| \(!npcActAs && !pickedG && fG\?\.state === 'active' && fG\.phase === 'defend' && fG\.current_target === uid\)\) \{\s*return runFightGrappleDef\(/.test(src)
+        && /if \(which === 'grapple' && fF\.phase === 'defend' && fF\.current_target === uidF\) \{\s*const whyG = defGrappleRefusal\(fF, uidF\);/.test(src)
+        && /case 'grappledef':\s*return handleFight\(interaction, \{ sub: 'act', action: 'grapple', defend: true, flavour \}\);/.test(src));
+    ok('a deflected NPC loses its next turn to the weapon; a deflection of 20 banks +2 that rides the flat next attack',
+      /if \(deflected\) \{\s*\/\/ Thrown off[^\n]*\n[^\n]*\n[^\n]*\n\s*setEffectFlag\(gid, cid, attackerId, 'disarmed'\);\s*if \(nat === 20\) bankRiposte\(gid, cid, uid, \{ onFlat: true \}\);/.test(src)
+        && /const markDeflectUsed = \(gid, cid, fid\) => markRoundSpecial\(gid, cid, fid, 'deflected', 'flatAtk'\);/.test(src));
+    ok('a riposte banked to ride a flat attack is spent by one; any other waits for an honest swing — the hand, the auto-pilot and the clock alike',
+      /if \(!bonus \|\| \(flat && !slot\.rbFlat\)\) return 0;/.test(src)
+        && /function bankRiposte\(gid, cid, fid, \{ onFlat = false \} = \{\}\)/.test(src)
+        && /const atkBonus = consumeAtkBonus\(gid, cid, actorId, \{ flat: !!flatSwing \}\);/.test(src)
+        && /const atkBonus = consumeAtkBonus\(gid, cid, attackerId, \{ flat: !!flatAuto \}\);/.test(src)
+        && /const atkBonus = consumeAtkBonus\(gid, cid, attackerId, \{ flat: !!flat \}\);/.test(src)
+        && /const a = autoRoll\(\(flatAuto \? 0 : atkMod\) \+ atkBonus, /.test(src)
+        && /const mod = \(flat \? 0 : \(R\.defence === 'ac' \? autoAtkBonus5e\(R, attRow, stat\) : \(attacker\.stats\[stat\] \?\? 0\)\)\) \+ atkBonus;/.test(src)
+        && !/flatSwing \? 0 : consumeAtkBonus|flatAuto \? 0 : consumeAtkBonus|flat \? 0 : consumeAtkBonus/.test(src)
+        && /const flatRip = isAttacker && effMod === 2 && rawStat !== 0 && rawStat !== 2;/.test(src));
+    ok('Disarm on your own turn: NPCs only, DEX against the better of their STR and DEX, ties to the NPC, no naturals on its die; a 20 wounds 1, a 1 costs 2 and disarms you; the very next roll flat, whatever came of it',
+      /async function runFightDisarmAttack\(\{ interaction, gid, cid, targetId, mode, flavour \}\)/.test(src)
+        && /if \(!isNpcFighter\(targetId\)\) return refuse\('⚔️ Disarming works on NPCs only\.'\);/.test(src)
+        && /const gripStat = sD > sS \? 'dex' : sS > sD \? 'str' : \(hasSignatureAdvantage\(npcRow, 'dex'\) \? 'dex' : 'str'\);/.test(src)
+        && /const won = nat === 20 \|\| \(nat !== 1 && total > g\.total\);   \/\/ ties go to the NPC/.test(src)
+        && /\/\/ The price, whatever comes of it: the disarmer's very next roll is flat\.\s*setFooled\(gid, cid, uid\);/.test(src)
+        && /const flatN = consumeFlatDef\(gid, cid, targetId\) \|\| consumeFooled\(gid, cid, targetId\) \|\| consumeFlatMark\(gid, targetId\);/.test(src)
+        && /if \(which === 'disarm' && \(!isNpcFighter\(fid\) \|\| disarmedOf\(fight, fid\)\)\) continue;/.test(src)
+        && /if \(forcedOf\(forced, 'attack'\) \|\| myTurn\) \{/.test(src)
+        && /NPCs are disarmed; they do not disarm\./.test(src));
+    ok('disarmed, the turn is the weapon’s: attack, grab, feint, hold, escape, a custom roll and the pickers refuse it before any flat roll is spent',
+      (src.match(/if \(disarmedOf\(fight, actorId\)\) return refuse\(disarmedRefusal\(/g) || []).length === 5
+        && src.indexOf('if (disarmedOf(fight, actorId)) return refuse(disarmedRefusal(isNpcFighter(actorId)') < src.indexOf('const offBalance = !restrained && consumeFlatAtk(gid, cid, actorId);')
+        && /if \(wD\?\.kind === 'atk' && disarmedOf\(wD\.fight, uid\)\) return interaction\.reply\(\{ ephemeral: true, content: disarmedRefusal\(\) \}\);/.test(src)
+        && src.indexOf("if (wD?.kind === 'atk' && disarmedOf(wD.fight, uid))") < src.indexOf('const flatMk = stat ? consumeFlatMark(gid, uid) : false;')
+        && /if \(disarmedOf\(fight, actorId\)\) return interaction\.reply\(\{ ephemeral: true,\s*content: disarmedRefusal\(npcActAs \? npcNameFromFighter\(actorId\) : null\),\s*components: fightAnswerRows\('retrieve'/.test(src)
+        && !/if \(await retrievalTurn\(interaction\.guild/.test(src));
+    ok('Retrieve: a button and its form for a player, a 🎭 one for a GM, the auto-pilot and the clock on their own; a skipped turn counts; the once-a-round answers re-arm',
+      /if \(kind === 'retrieve'\) return \[new ActionRowBuilder\(\)\.addComponents\(\s*B\('fact:retrieve', /.test(src)
+        && /if \(kind === 'retrieve'\) return \[new ActionRowBuilder\(\)\.addComponents\(N\('fnretrieve', /.test(src)
+        && /if \(disarmedOf\(fight, fid\)\) return fightAnswerRows\('retrieve', \{ forNpc: npc, auto, gid \}\);/.test(src)
+        && /async function runFightRetrieve\(\{ interaction, gid, cid, actorId, flavour = null \}\)/.test(src)
+        && /async function retrievalTurn\(guild, gid, cid, actorId, deliver, flavour = null\) \{\s*if \(!consumeEffectFlag\(gid, cid, actorId, 'disarmed'\)\) return false;\s*consumeEffectFlag\(gid, cid, actorId, 'deflected'\);\s*consumeEffectFlag\(gid, cid, actorId, 'disarmUsed'\);/.test(src)
+        && /async \(l\) => sendLong\(channel, l\)\)\) return true;/.test(src)
+        && (src.match(/if \(consumeEffectFlag\(gid, cid, (skippedId|waitedId), 'disarmed'\)\) lines\.push\(/g) || []).length === 2
+        && /\{name:'🫴 Retrieve — your disarmed turn: fetch the weapon',value:'retrieve'\}/.test(src)
+        && /case 'retrieve':\s*return handleFight\(interaction, \{ sub: 'act', action: 'retrieve', npc: p\.npc \|\| null, flavour \}\);/.test(src));
+    ok('one answer per strike: a second defence, deflect, disarm, feint or grapple is refused before anything is spent',
+      /const ALREADY_ANSWERED = /.test(src)
+        && (src.match(/if \(fight\.def_roll != null\) return refuse\(ALREADY_ANSWERED\);/g) || []).length === 2
+        && /if \(fight\.def_roll != null\) return interaction\.reply\(\{ ephemeral: true, content: ALREADY_ANSWERED \}\);/.test(src)
+        && /if \(fight\.def_roll != null\) return ALREADY_ANSWERED;/.test(src)
+        && src.indexOf("f0.atk_kind && f0.def_roll != null") < src.indexOf("setEffectFlag(gid, cid, meId, 'feintDef');")
+        && /if \(fF\.def_roll != null && !fF\.atk_kind\) return refuseF\(ALREADY_ANSWERED\);/.test(src));
+    ok('an NPC carries a flat mark: spent by its next roll anywhere — /npc roll, a called check, every auto-pilot roll',
+      /const flatN = stat && \/\^1\?d20\(\[\+-\]\\d\+\)\?\$\/i\.test\(String\(notationRaw\)\.trim\(\)\) \? consumeFlatMark\(gid, npcFighterId\(npc\.name\)\) : false;/.test(src)
+        && /const flatN = stat && !flat \? consumeFlatMark\(gid, npcFighterId\(npc\.name\)\) : false;/.test(src)
+        && /const fooledAuto = consumeFooled\(gid, cid, attackerId\) \|\| consumeFlatMark\(gid, attackerId\);/.test(src)
+        && /const fooledH = consumeFooled\(gid, cid, fight\.current_target\) \|\| consumeFlatMark\(gid, fight\.current_target\);/.test(src)
+        && /const flatG = consumeFooled\(gid, cid, fight\.current_target\) \|\| consumeFlatMark\(gid, fight\.current_target\);/.test(src)
+        && /const wasFooled = consumeFooled\(gid, cid, fight\.current_target\) \|\| consumeFlatMark\(gid, fight\.current_target\);/.test(src)
+        && /const mk = isNpcFighter\(fid\) \? getNpc\(gid, npcNameFromFighter\(fid\)\)\?\.next_mark : getChar\(gid, fid\)\?\.next_mark;/.test(src));
+    ok('/deception opens a form — the pretence, the plan kept back until the dice have spoken, the words — with a mark that may be an NPC and a GM who may lie as one',
+      /setCustomId\(`decept:\$\{token\}`\)/.test(src) && /if \(interaction\.customId\.startsWith\('decept:'\)\) return handleDeceptionSubmit\(interaction\);/.test(src)
+        && /field\('claim', 'What do you pretend\?', 300, true\)/.test(src) && /field\('plan', 'What are you really planning\? \(kept hidden\)', 300, true\)/.test(src)
+        && /field\('speech', 'What do you say\? \(optional\)', 500, false\)/.test(src)
+        && src.indexOf("lines.push('', myLine, theirLine, '');") < src.indexOf('was really planning: _${plan}_')
+        && /setName\('target_npc'\)\.setDescription\('Or an NPC/.test(src) && /setName\('npc'\)\.setDescription\('GM: deceive AS this NPC'\)/.test(src)
+        && /interaction\.commandName === 'deception' \|\|/.test(src)
+        && !/setName\('claim'\)\.setDescription\('What you pretend/.test(src));
+  });
+}
+
 // Build L (2026-11-09): a flat penalty and its rider, an automatic roll at
 // disadvantage and how it reads, the grapple bar, the rules as written.
 function testBuildL(mod) {
@@ -3712,19 +3815,32 @@ function testBuildL(mod) {
       /A natural 20 fools them whatever the insight/.test(text('feint')) && /a natural 1 is a total failure/.test(text('feint'))
         && /An insight of 20 sees through it unless the feint was a 20; an insight of 1 is fooled/.test(text('feint'))
         && /the feinter\'s own next roll is too, every time, at disadvantage after a 1/.test(text('feint')));
-    ok('the rules say deflect\u2019s and disarm\u2019s naturals',
-      /a natural 20 turns the blow whatever the totals and a named enemy takes 2/.test(text('deflect-disarm'))
-        && /a natural 20 wounds the attacker 1 and leaves their next attack flat/.test(text('deflect-disarm'))
-        && /a natural 1 fails for 1 wound, your next attack flat as well as your next defence/.test(text('deflect-disarm')));
+    ok('the rules say deflect\u2019s and disarm\u2019s naturals, what disarmed means, and one answer per strike (2026-11-10)',
+      /beat the attack and the enemy loses its next turn retrieving the weapon/.test(text('deflect-disarm'))
+        && /A natural 20 turns the blow whatever the totals, a named enemy takes 2, and your flat next attack gets \+2/.test(text('deflect-disarm'))
+        && /Disarm needs DEX 4\+, works on NPCs only and needs no blade/.test(text('deflect-disarm'))
+        && /on your turn, beat their best of STR and DEX, ties to them/.test(text('deflect-disarm'))
+        && /a natural 1 fails for 2 wounds and disarms you\. After any disarm your very next roll is a flat d20\./.test(text('deflect-disarm'))
+        && /^Disarmed, your next turn goes to retrieving the weapon/.test(text('disarmed'))
+        && /^One answer per strike/.test(text('defence-once')));
+    ok('the rules say a grapple answers a strike, and what the grab\u2019s naturals carry over (2026-11-10)',
+      /a natural 1 fails outright and leaves your next defence a flat d20/.test(text('grapple'))
+        && /leaves the grappler's next attack a flat d20 and the saver \+2 on theirs/.test(text('grapple'))
+        && /Against an ordinary strike a grapple is your defence: STR against the attack, ties to the attack\./.test(text('grapple'))
+        && /the wounds starting once your turn has come round/.test(text('grapple')));
+    ok('the rules say /deception: a form, the totals, a 1 fails, no cooldown, NPCs either side (2026-11-10)',
+      /^`\/deception` is WIS against WIS away from a fight, through a form/.test(text('deception'))
+        && /The totals decide, ties to the mark; a natural 1 fails outright, and no other natural counts\./.test(text('deception'))
+        && /No cooldown\./.test(text('deception')) && /A GM can deceive as an NPC, and an NPC can be the mark\./.test(text('deception')));
     ok('the rules say a wound is a point of damage, a captive can still attack, a hold of 1 slips, a defensive feint of 1 fails, and a feint is the fight\u2019s trick',
       /A wound is the same thing: 1 damage, 1 HP\./.test(text('damage'))
         && /you can still attack anyone, your grappler included\. The grappler cannot strike their own captive\./.test(text('grapple'))
         && /a hold of 1 slips at once \u2014 the captive is free, with no wound, and the grappler's next roll is a flat d20 at disadvantage/.test(text('grapple-hold'))
-        && /^A feint is the trick in a fight; away from one, the same trick is `\/deception`\./.test(text('feint'))
+        && /^A feint is a deception in a fight; away from one, it is `\/deception`\./.test(text('feint'))
         && /a natural 1 fails outright and the blow lands, unless the attack was a 1 too/.test(text('feint'))
-        && /the flat roll a trick costs counts as one\./.test(text('feint')));
+        && /One feint per honest roll, and the flat roll a feint costs counts as one\./.test(text('feint')));
     ok('the rules say an attacking 20 lands whatever the totals, for 2, and nothing turns it',
-      /^A natural 20 on an attack lands whatever the totals, for 2 — 4 against a defending 1\. It cannot be deflected, disarmed or read by a defensive feint\.$/.test(text('attack-nat20')));
+      /^A natural 20 on an attack lands whatever the totals, for 2 — 4 against a defending 1\. It cannot be deflected, disarmed, grappled or read by a defensive feint\.$/.test(text('attack-nat20')));
   });
 }
 
@@ -3891,7 +4007,7 @@ function main() {
     }
     if (missing.length) console.log(`${C.yel}!${C.off} load                   ${C.dim}not exported: ${missing.join(', ')}${C.off}`);
 
-    for (const r of [testBuilders(src), testRules(mod), testPins(src), testBuildI(mod), testBuildJ(mod), testBuildK(mod), testBuildL(mod)]) {
+    for (const r of [testBuilders(src), testRules(mod), testPins(src), testBuildI(mod), testBuildJ(mod), testBuildK(mod), testBuildL(mod), testBuildN(src)]) {
       assertions += r.pass;
       if (r.fails.length) {
         failedSteps.push(r.name);

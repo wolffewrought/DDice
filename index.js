@@ -1037,6 +1037,7 @@ try { db.exec('ALTER TABLE characters ADD COLUMN damage_type TEXT'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN damage_type TEXT'); } catch {}
 try { db.exec('ALTER TABLE characters ADD COLUMN resist TEXT'); } catch {}              // comma list
 try { db.exec('ALTER TABLE npcs ADD COLUMN resist TEXT'); } catch {}
+try { db.exec('ALTER TABLE npcs ADD COLUMN next_mark TEXT'); } catch {}  // a deception's flat d20 on their very next roll, anywhere
 try { db.exec('ALTER TABLE fights ADD COLUMN atk_used INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN ruleset TEXT'); } catch {}
 try { db.exec('ALTER TABLE story_runs ADD COLUMN quiz_right INTEGER NOT NULL DEFAULT 0'); } catch {}
@@ -1940,6 +1941,12 @@ async function handleRollSlash(interaction) {
       && await holdWanted(interaction.guild, gid, uid, mode))
     return holdSlashRoll(interaction, { command: 'roll', mode, gid, cid, uid });
 
+  // Disarmed, a custom roll cannot strike in place of the retrieval (T,
+  // 2026-11-10): refused before any flat mark is spent.
+  if (intoFight) {
+    const wD = fightAwaiting(gid, cid, uid);
+    if (wD?.kind === 'atk' && disarmedOf(wD.fight, uid)) return interaction.reply({ ephemeral: true, content: disarmedRefusal() });
+  }
   // A flat mark strips the stat here as a typed roll's does \u2014 /roll let it
   // pass (2026-11-09) \u2014 and a botched trick's adds disadvantage.
   const flatMk = stat ? consumeFlatMark(gid, uid) : false;
@@ -2057,13 +2064,16 @@ async function handleRollSlash(interaction) {
 const RULES = [
   { key: 'check-nat',      text: 'On any check against a DC \u2014 a called check, a planted button, a group check, a target \u2014 a natural 20 passes and a natural 1 fails, whatever the total. A target beaten by a 20 falls without the GM being asked.' },
   { key: 'attack-nat1',    text: 'A natural 1 on an attack fails outright, and your next defence is a flat d20.' },
-  { key: 'attack-nat20',   text: 'A natural 20 on an attack lands whatever the totals, for 2 \u2014 4 against a defending 1. It cannot be deflected, disarmed or read by a defensive feint.' },
+  { key: 'attack-nat20',   text: 'A natural 20 on an attack lands whatever the totals, for 2 \u2014 4 against a defending 1. It cannot be deflected, disarmed, grappled or read by a defensive feint.' },
   { key: 'defence-nat20',  text: 'A natural 20 on a defence is a perfect parry and banks +2 to hit on your next attack. Twenty meets twenty: the attack lands whatever the totals, for 2, and the defender still banks the riposte.' },
   { key: 'damage',         text: 'A hit deals 1 damage. An attacking 20 adds 1; a defending 1 adds 1; both together deal 4. A wound is the same thing: 1 damage, 1 HP.' },
-  { key: 'grapple',        text: 'Grapple needs STR 4+: STR against a STR save, and meeting the save takes the hold. A natural 20 takes it whatever the save, for 2 wounds; a natural 1 fails outright; a save of 20 slips free unless the grab was a 20 too. Held: immobile, 1 wound a round, actions on a flat d20 \u2014 but you can still attack anyone, your grappler included. The grappler cannot strike their own captive.' },
+  { key: 'grapple',        text: 'Grapple needs STR 4+: STR against a STR save, and meeting the save takes the hold. A natural 20 takes it whatever the save, for 2 wounds; a natural 1 fails outright and leaves your next defence a flat d20; a save of 20 slips free unless the grab was a 20 too, and leaves the grappler\'s next attack a flat d20 and the saver +2 on theirs. Against an ordinary strike a grapple is your defence: STR against the attack, ties to the attack. Beat it and the blow does nothing and the striker is held, the wounds starting once your turn has come round; a natural 20 takes hold whatever the totals and banks +2; fall short and the blow lands, a natural 1 adding its point. Held: immobile, 1 wound a round, actions on a flat d20 \u2014 but you can still attack anyone, your grappler included. The grappler cannot strike their own captive.' },
   { key: 'grapple-hold',   text: 'Keeping a hold is a STR roll on the grappler\'s turn, and the captive answers: break free (STR against it) or stay. Escape is the same break on their own turn, the hold rolled first. Ties keep the hold. Breaking out costs nothing; a failed break takes the round\'s wound at once, each further one 1 more, a natural 1 two. A break of 20 frees them whatever the totals and leaves the grappler\'s next attack flat; a hold of 20 makes the break a flat d20; a hold of 1 slips at once \u2014 the captive is free, with no wound, and the grappler\'s next roll is a flat d20 at disadvantage. Release is free.' },
-  { key: 'feint',          text: 'A feint is the trick in a fight; away from one, the same trick is `/deception`. On your turn it is WIS against an insight. A natural 20 fools them whatever the insight and the blow lands, crits paid; a natural 1 is a total failure. An insight of 20 sees through it unless the feint was a 20; an insight of 1 is fooled. With a blow coming it is your defence instead, WIS against the attack: if the blow misses, the attacker is fooled; a natural 1 fails outright and the blow lands, unless the attack was a 1 too. Fooled, their next roll is a flat d20 \u2014 and the feinter\'s own next roll is too, every time, at disadvantage after a 1. One trick per honest roll, and the flat roll a trick costs counts as one.' },
-  { key: 'deflect-disarm', text: 'Deflect: a natural 20 turns the blow whatever the totals and a named enemy takes 2; a natural 1 fails for 2 wounds, your next defence flat as well as your next attack. Disarm: a natural 20 wounds the attacker 1 and leaves their next attack flat, in place of a turn spent fetching the blade; a natural 1 fails for 1 wound, your next attack flat as well as your next defence.' },
+  { key: 'feint',          text: 'A feint is a deception in a fight; away from one, it is `/deception`. On your turn it is WIS against an insight. A natural 20 fools them whatever the insight and the blow lands, crits paid; a natural 1 is a total failure. An insight of 20 sees through it unless the feint was a 20; an insight of 1 is fooled. With a blow coming it is your defence instead, WIS against the attack: if the blow misses, the attacker is fooled; a natural 1 fails outright and the blow lands, unless the attack was a 1 too. Fooled, their next roll is a flat d20 \u2014 and the feinter\'s own next roll is too, every time, at disadvantage after a 1. One feint per honest roll, and the flat roll a feint costs counts as one.' },
+  { key: 'deception',      text: '`/deception` is WIS against WIS away from a fight, through a form: what you pretend, what you are really planning (shown once the dice have spoken) and what you say. The totals decide, ties to the mark; a natural 1 fails outright, and no other natural counts. Fooled, their very next roll, anywhere, is a flat d20; yours is too, whatever happens, at disadvantage after a 1. No cooldown. A GM can deceive as an NPC, and an NPC can be the mark.' },
+  { key: 'deflect-disarm', text: 'Deflect: beat the attack and the enemy loses its next turn retrieving the weapon. A natural 20 turns the blow whatever the totals, a named enemy takes 2, and your flat next attack gets +2; a natural 1 fails for 2 wounds, your next defence flat as well as your next attack. Disarm needs DEX 4+, works on NPCs only and needs no blade: against a strike, beat the attack; on your turn, beat their best of STR and DEX, ties to them. Disarmed, they spend their next turn retrieving the weapon. A natural 20 disarms whatever the totals and wounds 1 \u2014 against a strike it banks +2 too, riding even a flat attack; a natural 1 fails for 2 wounds and disarms you. After any disarm your very next roll is a flat d20.' },
+  { key: 'disarmed',       text: 'Disarmed, your next turn goes to retrieving the weapon \u2014 no attack, grab, feint, disarm, escape or hold until you have. A skipped turn counts; the auto-pilot and the turn clock retrieve on their own.' },
+  { key: 'defence-once',   text: 'One answer per strike: once a defence is in \u2014 a roll, a deflection, a disarm, a feint or a grapple \u2014 it is rerolled with a token, never rolled again.' },
   { key: 'one-quest',      text: 'One quest at a time. A run that is winding down does not count; nor does anything opened with `/instance` \u2014 the GM seats those by hand.' },
   { key: 'winddown-kick',  text: 'Kicked while a run is winding down? You are still paid when it completes.' },
   { key: 'pause-round',    text: () => `A pause rounds the clock up to the next ${Math.round(QUARTER_MS / 60000)} minutes.` },
@@ -9882,13 +9892,18 @@ async function handlePr(interaction) {
     const labelRaw = interaction.options.getString('label') ?? null;
     const flavour  = interaction.options.getString('flavour') ?? null;
     const rollType = interaction.options.getString('roll') ?? 'normal';
-    const mode     = rollType === 'adv' ? 'adv' : rollType === 'dis' ? 'dis' : 'normal';
+    let mode     = rollType === 'adv' ? 'adv' : rollType === 'dis' ? 'dis' : 'normal';
     // Combine stat and label: stat first, then label, separated by ' — '
-    const label = stat && labelRaw ? `${stat} — ${labelRaw}` : stat ?? labelRaw ?? null;
+    let label = stat && labelRaw ? `${stat} — ${labelRaw}` : stat ?? labelRaw ?? null;
+    // An NPC's flat mark \u2014 a deception that fooled it, or the price of one
+    // it told (2026-11-10) \u2014 strips the stat from its next d20 stat roll,
+    // and its rider rolls that at disadvantage.
+    const flatN = stat && /^1?d20([+-]\d+)?$/i.test(String(notationRaw).trim()) ? consumeFlatMark(gid, npcFighterId(npc.name)) : false;
+    if (flatN) { mode = flatMode(flatN, mode); label = `${label} \u00b7 \u{1F3AD} flat d20`; }
 
     // Apply stat modifier to notation
-    let notation = notationRaw;
-    if (stat) {
+    let notation = flatN ? '1d20' : notationRaw;
+    if (stat && !flatN) {
       const statKey = stat.toLowerCase();
       // The stat as the server reads it (a 5e modifier, Knightfall's stat
       // whole), folded into the notation's own modifier: "1d20+5" with a
@@ -10319,12 +10334,6 @@ function hasShieldEquipped(subject) {
   return [subject?.weapon1, subject?.weapon2].filter(Boolean)
     .some(w => /\b(shield|buckler|targe|kite|tower|pavise|aegis)\b/i.test(w));
 }
-// A blade in either hand — swords, polearms, daggers and kin. Maces,
-// shields and firearms do not qualify.
-function hasBladeEquipped(subject) {
-  return [subject?.weapon1, subject?.weapon2].filter(Boolean)
-    .some(w => /\b(\w*sword|\w*blade|sabre|saber|katana|scimitar|rapier|falchion|claymore|glaive|halberd|spear|pike|naginata|partisan|lance|polearm|dagger|dirk|knife|kris|estoc|cutlass)\b/i.test(w));
-}
 // Pull and clear a per-fighter effect flag from the fight's effect_state.
 function consumeEffectFlag(gid, cid, fid, key) {
   const fight = getFight(gid, cid);
@@ -10371,8 +10380,19 @@ const flatMode = (flat, mode) => (flat === 'dis' ? 'dis' : flat ? 'normal' : mod
 function chargeTrick(gid, cid, fid, botched = false) {
   const f = getFight(gid, cid);
   if (f?.state === 'active' && fightOrder(f).includes(fid)) { setFooled(gid, cid, fid, botched); return; }
-  if (!fid || isNpcFighter(String(fid))) return;
-  upsertChar(gid, fid, { next_mark: botched ? 'flatdis' : 'flat' });
+  setFlatMark(gid, fid, botched ? 'flatdis' : 'flat');
+}
+// A flat mark on a sheet: a character's, or an NPC's since `/deception`
+// can fool one or be told by one (T, 2026-11-10). Spent by the very next
+// roll, anywhere.
+function setFlatMark(gid, fid, mark = 'flat') {
+  if (!fid) return;
+  if (isNpcFighter(String(fid))) {
+    const n = getNpc(gid, npcNameFromFighter(String(fid)));
+    if (n) upsertNpc(gid, n.name, { next_mark: mark });
+    return;
+  }
+  upsertChar(gid, fid, { next_mark: mark });
 }
 // A called check can mark a character's NEXT roll — 🔼 or 🔽 — and the
 // mark is GENERAL: it rides the sheet, not any fight, and bites the very
@@ -10418,7 +10438,15 @@ function noteHonestRoll(gid, fid) {
 // 'flatdis' is a botched trick's price: flat, and at disadvantage — 'dis'
 // comes back so the roll can say so (2026-11-09).
 function consumeFlatMark(gid, uid) {
-  if (!uid || isNpcFighter(String(uid))) return false;
+  if (!uid) return false;
+  if (isNpcFighter(String(uid))) {
+    // An NPC's own mark (T, 2026-11-10): a deception that fooled it, or the
+    // price of one it told.
+    const n = getNpc(gid, npcNameFromFighter(String(uid)));
+    if (n?.next_mark !== 'flat' && n?.next_mark !== 'flatdis') return false;
+    upsertNpc(gid, n.name, { next_mark: null });
+    return n.next_mark === 'flatdis' ? 'dis' : true;
+  }
   const ch = getChar(gid, uid);
   if (ch?.next_mark !== 'flat' && ch?.next_mark !== 'flatdis') return false;
   upsertChar(gid, uid, { next_mark: null });
@@ -10447,7 +10475,22 @@ function markRoundSpecial(gid, cid, fid, usedKey, flatKey) {
   all[fid][flatKey] = true;
   upsertFight(gid, cid, { effect_state: JSON.stringify(all) });
 }
-const markDisarmUsed = (gid, cid, fid) => markRoundSpecial(gid, cid, fid, 'disarmUsed', 'flatDef');
+// After any disarm the disarmer's very next roll is a flat d20 (T, 2026-11-10)
+// \u2014 it was their next defence.
+const markDisarmUsed = (gid, cid, fid) => markRoundSpecial(gid, cid, fid, 'disarmUsed', 'fooled');
+
+// Disarmed (T, 2026-11-10): the fighter's next turn goes to retrieving the
+// weapon \u2014 no attack, grab, feint, disarm, escape or hold until they have.
+// A player presses Retrieve or types `/fight act action:Retrieve`; a GM does
+// it for an NPC; the auto-pilot and the turn clock retrieve on their own.
+const disarmedOf = (fight, fid) => !!JSON.parse(fight?.effect_state || '{}')[fid]?.disarmed;
+const disarmedRefusal = (npcName = null) => npcName
+  ? `\u2694\uFE0F **${npcName}** is disarmed \u2014 its turn goes to retrieving the weapon: the \u{1F3AD} Retrieve button, or \`/fight act action:Retrieve npc:${npcName}\`.`
+  : '\u2694\uFE0F You are disarmed \u2014 this turn goes to retrieving your weapon: press **Retrieve**, or `/fight act action:Retrieve`.';
+// One answer per strike: a defence already cast is rerolled with a token,
+// not rolled again (audit, 2026-11-10 \u2014 a second `/fight def`, deflect,
+// disarm or feint replaced the first for nothing).
+const ALREADY_ANSWERED = '\u274C That strike already has its answer \u2014 `/fight resolve` it, or `/fight rr` to reroll.';
 
 function grappleHeldTargetOf(fight, id) {
   for (const [t, h] of Object.entries(fightGrapples(fight))) if (h === id) return t;
@@ -10671,86 +10714,148 @@ async function handleDuelRejectModal(interaction) {
   } catch {}
 }
 
-// Deception, away from the sword. A straight WIS contest between two
-// characters — a market square, a throne room, a tavern — that needs no
-// fight to exist; in one, the trick is a feint, and /deception is refused
-// to anyone fighting in the channel (T, 2026-11-09). Both roll at once, so
-// it resolves in one message; ties go to the target, as a feint's do.
-// Winning leaves them rolling flat on their very next roll: a mark on their
-// sheet, spent by whatever they roll next.
-async function handleDeception(interaction) {
+// Deception, away from the sword (T, 2026-11-10). A WIS contest between two
+// characters \u2014 a market, a hall, a cell \u2014 that needs no fight; in one,
+// the deception is a feint, and `/deception` is refused to anyone fighting
+// in the channel. The command opens a form: what you pretend (everyone sees
+// it), what you are really planning (kept back until the dice have spoken)
+// and what you say. Both roll at once and the totals decide, ties to the
+// mark; no natural carries it but one \u2014 a deception of 1 fails outright.
+// Fooled, the mark's very next roll, anywhere, is a straight d20. The
+// deceiver pays either way: their own very next roll is a flat d20, at
+// disadvantage too after a 1. No cooldown: as many lies as the scene will
+// hold \u2014 the one-per-honest-roll rule is the feint's alone now. A GM
+// deceives as an NPC with `npc:`; an NPC can be the mark with
+// `target_npc:`, its insight rolled by the bot and its flat roll kept on
+// its sheet until it next rolls.
+const pendingDeceptions = new Map();
+async function deceptionParties(interaction) {
   const gid = interaction.guild.id, uid = interaction.user.id, cid = interactionChannelId(interaction);
-  const target = interaction.options.getUser('target');
-  if (target.id === uid) return interaction.reply({ content: '🎭 You cannot deceive yourself — not with dice, anyway.', ephemeral: true });
-  {
-    // In a fight the trick is a feint (T, 2026-11-09): /deception is for away
-    // from one, refused while either of you is fighting in this channel.
-    const fD = getFight(gid, cid);
-    if (fD?.state === 'active' && (fightOrder(fD).includes(uid) || fightOrder(fD).includes(target.id)))
-      return interaction.reply({ ephemeral: true, content: '🎭 In a fight, a trick is a feint \u2014 `/fight act action:Feint`. `/deception` is for away from one.' });
+  const no = (refusal) => ({ refusal });
+  const npcAs = String(interaction.options.getString('npc') || '').trim();
+  const tUser = interaction.options.getUser('target');
+  const tNpc = String(interaction.options.getString('target_npc') || '').trim();
+  if (!tUser && !tNpc) return no('🎭 Name your mark \u2014 `target:@player`, or `target_npc:Name` for an NPC.');
+  if (tUser && tNpc) return no('🎭 One mark at a time \u2014 `target:` or `target_npc:`, not both.');
+  let deceiverId = uid, deceiverRow, deceiverName;
+  if (npcAs) {
+    if (!(await isGm(interaction.guild, uid))) return no('❌ Only GMs can deceive as an NPC.');
+    const n = getNpc(gid, npcAs);
+    if (!n) return no(`❌ No NPC named **${npcAs}**.`);
+    if (tNpc) return no('🎭 As an NPC, deceive a player \u2014 `target:@player`.');
+    deceiverId = npcFighterId(n.name); deceiverRow = n; deceiverName = n.name;
+  } else {
+    const gate = sheetGate(gid, uid);
+    if (gate) return no(gate);
+    deceiverRow = getChar(gid, uid);
+    if (!deceiverRow) return no('❌ You need a character sheet — `/char create`.');
+    deceiverName = await getDisplayName(interaction.guild, uid);
   }
-  const me = getChar(gid, uid), them = getChar(gid, target.id);
-  const gate = sheetGate(gid, uid);
-  if (gate) return interaction.reply({ content: gate, ephemeral: true });
-  if (!me) return interaction.reply({ content: '❌ You need a character sheet — `/char create`.', ephemeral: true });
-  if (!them) return interaction.reply({ content: `❌ **${await getDisplayName(interaction.guild, target.id)}** has no character sheet yet.`, ephemeral: true });
+  let targetId, targetName;
+  if (tNpc) {
+    const n = getNpc(gid, tNpc);
+    if (!n) return no(`❌ No NPC named **${tNpc}**.`);
+    targetId = npcFighterId(n.name); targetName = n.name;
+  } else {
+    if (tUser.id === uid && !npcAs) return no('🎭 You cannot deceive yourself — not with dice, anyway.');
+    if (!getChar(gid, tUser.id)) return no(`❌ **${await getDisplayName(interaction.guild, tUser.id)}** has no character sheet yet.`);
+    targetId = tUser.id; targetName = await getDisplayName(interaction.guild, tUser.id);
+  }
+  // In a fight the deception is a feint: refused while either is fighting here.
+  const fD = getFight(gid, cid);
+  if (fD?.state === 'active' && (fightOrder(fD).includes(deceiverId) || fightOrder(fD).includes(targetId)))
+    return no('🎭 In a fight, a deception is a feint \u2014 `/fight act action:Feint`. `/deception` is for away from one.');
   const barD = abilityNeeds(gid, 'feint');
-  if (belowBar(me, barD)) return interaction.reply({ content: `🎭 Deception takes **${barD.label} ${barD.need}+** — a poor liar only convinces themselves.`, ephemeral: true });
-  if (deceptionSpent(gid, uid)) {
-    return interaction.reply({ ephemeral: true, content:
-      '🎭 That trick is spent — make an ordinary stat roll before trying another. A lie only sells once until you fight straight.' });
-  }
-
-  const claim = interaction.options.getString('claim');
-  const flavour = interaction.options.getString('flavour');
-  // Either side's roll may owe a flat d20 \u2014 a trick that landed on them
-  // earlier, or the price of their own \u2014 and /deception spent neither
-  // until 2026-11-09.
-  const flatMe = consumeFlatMark(gid, uid), flatThem = consumeFlatMark(gid, target.id);
-  const myMode = applyNextMark(gid, uid, flatMode(flatMe, applySignatureMode(me, 'wis', 'normal')));
-  const theirMode = applyNextMark(gid, target.id, flatMode(flatThem, applySignatureMode(them, 'wis', 'normal')));
+  if (belowBar(deceiverRow, barD)) return no(`🎭 Deception takes **${barD.label} ${barD.need}+** — a poor liar only convinces themselves.`);
+  return { parties: { deceiverId, deceiverName, targetId, targetName, npc: !!npcAs } };
+}
+async function handleDeception(interaction) {
+  const r = await deceptionParties(interaction);
+  if (r.refusal) return interaction.reply({ ephemeral: true, content: r.refusal });
+  const now = Date.now();
+  for (const [k, v] of pendingDeceptions) if (now - v.at > 15 * 60000) pendingDeceptions.delete(k);
+  const token = `${now.toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+  pendingDeceptions.set(token, { at: now, uid: interaction.user.id, ...r.parties });
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: MR } = require('discord.js');
+  const field = (id, label, max, required) => new MR().addComponents(new TextInputBuilder()
+    .setCustomId(id).setLabel(label).setStyle(TextInputStyle.Paragraph).setRequired(required).setMaxLength(max));
+  const m = new ModalBuilder().setCustomId(`decept:${token}`).setTitle(`Deceive ${r.parties.targetName}`.slice(0, 45))
+    .addComponents(
+      field('claim', 'What do you pretend?', 300, true),
+      field('plan', 'What are you really planning? (kept hidden)', 300, true),
+      field('speech', 'What do you say? (optional)', 500, false));
+  return interaction.showModal(m);
+}
+async function handleDeceptionSubmit(interaction) {
+  const token = interaction.customId.slice('decept:'.length);
+  const p = pendingDeceptions.get(token);
+  pendingDeceptions.delete(token);
+  if (!p) return interaction.reply({ ephemeral: true, content: '❌ That form has expired \u2014 run `/deception` again.' });
+  if (p.uid !== interaction.user.id) return interaction.reply({ ephemeral: true, content: '❌ That form is not yours.' });
+  const gid = interaction.guild.id, cid = interactionChannelId(interaction);
+  const val = (id, max) => { try { return String(interaction.fields.getTextInputValue(id) || '').trim().slice(0, max); } catch { return ''; } };
+  const claim = val('claim', 300), plan = val('plan', 300), speech = val('speech', 500);
+  if (!claim) return interaction.reply({ ephemeral: true, content: '❌ A deception needs a pretence \u2014 what you pretend.' });
+  // A fight may have started while the form was open.
+  const fD = getFight(gid, cid);
+  if (fD?.state === 'active' && (fightOrder(fD).includes(p.deceiverId) || fightOrder(fD).includes(p.targetId)))
+    return interaction.reply({ ephemeral: true, content: '🎭 A fight has started \u2014 there, a deception is a feint.' });
+  const rowOf = (id) => isNpcFighter(id) ? getNpc(gid, npcNameFromFighter(id)) : getChar(gid, id);
+  const me = rowOf(p.deceiverId), them = rowOf(p.targetId);
+  if (!me || !them) return interaction.reply({ ephemeral: true, content: '❌ One of you is gone \u2014 run `/deception` again.' });
+  // Either side's roll may owe a flat d20 \u2014 a deception that landed on
+  // them earlier, or the price of their own.
+  const flatMe = consumeFlatMark(gid, p.deceiverId), flatThem = consumeFlatMark(gid, p.targetId);
+  const myMode = applyNextMark(gid, p.deceiverId, flatMode(flatMe, applySignatureMode(me, 'wis', 'normal')));
+  const theirMode = applyNextMark(gid, p.targetId, flatMode(flatThem, applySignatureMode(them, 'wis', 'normal')));
   const roll = (row, mode, flat) => {
     const notation = flat ? '1d20' : `1d20+${row.wis ?? 0}`;
     const r = mode === 'adv' ? rollAdvantage(notation) : mode === 'dis' ? rollDisadvantage(notation) : rollNotation(notation);
     return { r, nat: mode === 'normal' ? r.rolls[0] : r.chosen };
   };
   const a = roll(me, myMode, flatMe), d = roll(them, theirMode, flatThem);
-  spendDeception(gid, uid);   // one trick per honest roll
-  noteHonestRoll(gid, target.id);   // answering honestly re-arms the target's own
-  const myName = await getDisplayName(interaction.guild, uid);
-  const theirName = await getDisplayName(interaction.guild, target.id);
-  // The naturals speak first, as a feint's do (T, 2026-11-09): a lie of 20
-  // lands whatever the insight, of 1 is a total failure; an insight of 20
-  // sees through it unless the lie was a 20 too, of 1 swallows it. Ties go
-  // to the target, as in a fight.
-  const fooled = a.nat === 1 ? false : a.nat === 20 ? true : d.nat === 20 ? false : d.nat === 1 ? true : a.r.total > d.r.total;
+  noteHonestRoll(gid, p.targetId);   // answering honestly re-arms the mark's own feint
+  // The totals decide, ties to the mark; the one natural that counts is the
+  // deceiver's 1, a total failure (T, 2026-11-10).
   const botched = a.nat === 1;
+  const fooled = !botched && a.r.total > d.r.total;
+  const myName = p.deceiverName + (p.npc ? ' 🎭' : '');
+  const theirName = p.targetName + (isNpcFighter(p.targetId) ? ' 🎭' : '');
   const how = (m, flat) => `${flat ? ', flat d20' : ''}${m === 'adv' ? ', advantage' : m === 'dis' ? ', disadvantage' : ''}`;
-  const myLine = `${myName} (**WIS** deception${how(myMode, flatMe)}): ${fightTotalStr(a.r.total, a.nat, 20)}`;
-
-  const lines = ['─────────────────────────────',
-    `🎭  **Deception** — **${myName}** vs **${theirName}**`];
-  if (claim) lines.push(`_“${claim}”_`);
-  lines.push('', myLine,
-    `${theirName} (**WIS** insight${how(theirMode, flatThem)}): ${fightTotalStr(d.r.total, d.nat, 20)}`, '');
+  const myLine = `${myName} (**WIS** deception${how(myMode, flatMe)}): ${botched ? '\u{1F534} ' : ''}**${a.r.total}**`;
+  const theirLine = `${theirName} (**WIS** insight${how(theirMode, flatThem)}): **${d.r.total}**`;
+  const lines = ['─────────────────────────────', `🎭  **Deception** — **${myName}** vs **${theirName}**`, `_${claim}_`];
+  if (speech) lines.push(`💬 \u201C${speech}\u201D`);
+  lines.push('', myLine, theirLine, '');
   if (fooled) {
-    if (a.nat === 20) lines.push(d.nat === 20 ? '\u26A1 **Twenty meets twenty!** The lie wins.' : '\u{1F7E1} A natural 20 \u2014 the lie lands whatever they read.');
-    else if (d.nat === 1) lines.push('\u{1F534} A natural 1 on the insight \u2014 they swallow it whole.');
-    upsertChar(gid, target.id, { next_mark: 'flat' });
+    setFlatMark(gid, p.targetId, 'flat');
     lines.push(`🎭 **${theirName}** believes it — their very next roll, anywhere, is a straight d20.`);
   } else if (botched) {
     lines.push('\u{1F4A5} A natural 1 \u2014 the lie falls apart, a total failure.');
   } else {
-    lines.push(d.nat === 20 ? `👁️ A natural 20 \u2014 **${theirName}** sees straight through it.` : `👁️ **${theirName}** sees straight through it.`);
+    lines.push(`👁️ **${theirName}** sees straight through it${a.r.total === d.r.total ? ' \u2014 ties go to the mark' : ''}.`);
   }
+  // What they were really after, now the dice have spoken.
+  if (plan) lines.push(`\u{1F92B} What **${myName}** was really planning: _${plan}_`);
   // The price, whatever came of it: the deceiver's own very next roll.
-  chargeTrick(gid, cid, uid, botched);
+  chargeTrick(gid, cid, p.deceiverId, botched);
   lines.push(`_🎭 The price: **${myName}**'s very next roll is a flat d20${botched ? ', at disadvantage' : ''}._`);
-  if (flavour) lines.push('', `_${flavour}_`);
   const result = a.r;   // shorthand below, as every other roll site writes it
-  recordRoll(gid, { userId: uid, channelId: cid, interaction, result,
-    input: '/deception', rollLine: myLine, context: `deception vs ${theirName}` });
-  return interaction.reply({ content: lines.join('\n'), allowedMentions: { parse: [] } });
+  recordRoll(gid, { userId: interaction.user.id, channelId: cid, interaction, result,
+    ...(p.npc ? { kind: 'npcs' } : {}),
+    input: '/deception', rollLine: myLine,
+    context: p.npc ? `as NPC ${p.deceiverName} \u2014 deception vs ${p.targetName}` : `deception vs ${p.targetName}` });
+  if (isNpcFighter(p.targetId)) {
+    try { mirrorAutoRoll(gid, cid, p.targetName, `1d20${theirMode !== 'normal' ? ` (${theirMode})` : ''}`, d.nat, d.r.total, 'deception insight (WIS)'); } catch {}
+  }
+  try { noteQuestActivity(gid, cid, 'roll', `${p.deceiverName} deceives ${p.targetName} (${claim}) ${a.r.total} vs ${d.r.total} \u2014 ${fooled ? 'believed' : 'seen through'}`.slice(0, 300), p.npc ? null : interaction.user.id); } catch {}
+  if (p.npc) {
+    // An NPC's lie is the table's to see, not the GM's to sign.
+    const chan = await interactionChannel(interaction);
+    if (chan) await sendLong(chan, lines);
+    return interaction.reply({ ephemeral: true, content: `✅ Deceived as **${p.deceiverName}**.` });
+  }
+  return replyLong(interaction, lines, { allowedMentions: { parse: [] } });
 }
 
 function fightTotalStr(total, nat, sides) {
@@ -10791,19 +10896,33 @@ function damageBonusFor(row) {
 //   nat-20 defence (that blocks) → defender's NEXT attack gets +2,    { atkBonus:2 }
 //     UNLESS the incoming attack was itself a nat 20.
 // Pull and clear an attacker's pending +N bonus. Returns the bonus (0 if none).
-function consumeAtkBonus(gid, cid, fid) {
+function consumeAtkBonus(gid, cid, fid, { flat = false } = {}) {
   // Unified carry: rollBonus applies to the fighter's next roll of EITHER
   // kind. A fight already in flight may hold the pre-rule atkBonus key —
-  // honoured once, then gone.
+  // honoured once, then gone. A flat attack spends it only when it was
+  // banked to ride one \u2014 a deflection's or a disarm's 20 (T, 2026-11-10);
+  // any other waits for an honest swing.
   const fight = getFight(gid, cid);
   if (!fight) return 0;
   const all = JSON.parse(fight.effect_state || '{}');
-  const bonus = all[fid]?.rollBonus ?? all[fid]?.atkBonus ?? 0;
-  if (bonus) {
-    delete all[fid].rollBonus; delete all[fid].atkBonus;
-    upsertFight(gid, cid, { effect_state: JSON.stringify(all) });
-  }
+  const slot = all[fid];
+  const bonus = slot?.rollBonus ?? slot?.atkBonus ?? 0;
+  if (!bonus || (flat && !slot.rbFlat)) return 0;
+  delete slot.rollBonus; delete slot.atkBonus; delete slot.rbFlat;
+  if (!Object.keys(slot).length) delete all[fid];
+  upsertFight(gid, cid, { effect_state: JSON.stringify(all) });
   return bonus;
+}
+// Bank the +2 riposte on a fighter's next attack. `onFlat` lets it ride a
+// flat one: a deflection of 20 and a disarm of 20 leave the next attack flat
+// and still pay their +2 on it (T, 2026-11-10).
+function bankRiposte(gid, cid, fid, { onFlat = false } = {}) {
+  const fight = getFight(gid, cid);
+  const all = JSON.parse(fight?.effect_state || '{}');
+  const slot = (all[fid] = all[fid] || {});
+  slot.rollBonus = 2;
+  if (onFlat) slot.rbFlat = true;
+  upsertFight(gid, cid, { effect_state: JSON.stringify(all) });
 }
 // Pull and clear a GM-forced stat for a fighter's next roll (set by
 // /gm override interject stat:). Returns the stat name or null.
@@ -11192,7 +11311,9 @@ async function autoFightCard(guild, gid, fighter, kind, stat, nat, total, target
   if (flat) {
     // A flat d20 — no stat, no modifier; at disadvantage after a botched trick.
     const disF = !!roll?.dis && roll.dropped != null;
-    rollLine = `${icon}  1d20 (flat d20${disF ? ', disadvantage' : ''}) → ${disF ? `[${nat}, ~~${roll.dropped}~~]` : `[${nat}]`} = ${fightTotalStr(total, nat, 20)}`;
+    // A riposte banked to ride a flat roll shows its +2 (2026-11-10).
+    const ripF = kind === 'atk' ? (atkBonus || 0) : 0;
+    rollLine = `${icon}  1d20 (flat d20${disF ? ', disadvantage' : ''})${ripF ? ` +${ripF} riposte` : ''} → ${disF ? `[${nat}, ~~${roll.dropped}~~]` : `[${nat}]`}${ripF ? ` +${ripF}` : ''} = ${fightTotalStr(total, nat, 20)}`;
   } else {
     const eff = statVal + (kind === 'atk' ? atkBonus : 0);
     const bonusTag = (kind === 'atk' && atkBonus) ? ` +${atkBonus} riposte` : '';
@@ -11572,8 +11693,10 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   const attackerId = order[fight.turn_index];
   if (!isNpcFighter(attackerId)) return false; // current fighter is a player — wait for them
   if (isFallen(gid, attackerId)) return false;  // fallen NPCs take no turn
+  // Disarmed, the auto-pilot spends the turn retrieving (T, 2026-11-10); the
+  // next turn's buttons ride with the line.
   if (await retrievalTurn(guild, gid, cid, attackerId,
-      async (l) => channel.send(l.join('\n')).catch(()=>{}))) return true;
+      async (l) => sendLong(channel, l))) return true;
 
   const attacker = await resolveFighter(guild, gid, attackerId);
   // pick a random opponent still standing (above the bout floor / 0)
@@ -11589,15 +11712,16 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   const stat = chooseAutoStat(gid, attackerId, attacker.stats, 'atk');
   const restrainedAuto = !!grappleHolderOf(fight, attackerId);
   const offBalanceAuto = !restrainedAuto && consumeFlatAtk(gid, cid, attackerId);
-  const fooledAuto = consumeFooled(gid, cid, attackerId);
+  const fooledAuto = consumeFooled(gid, cid, attackerId) || consumeFlatMark(gid, attackerId);
   const flatAuto = restrainedAuto || offBalanceAuto || fooledAuto;
-  const atkBonus = flatAuto ? 0 : consumeAtkBonus(gid, cid, attackerId);
+  // A riposte banked to ride a flat roll rides this one too (2026-11-10).
+  const atkBonus = consumeAtkBonus(gid, cid, attackerId, { flat: !!flatAuto });
   const attRow = attacker.isNpc ? getNpc(gid, attacker.name) : getChar(gid, attackerId);
   // Under 5e the bot strikes as a player would: the statblock's attack, or
   // the modifier and proficiency — never the raw score (2026-11-07).
   const R5 = rulesFor(gid);
   const atkMod = R5.defence === 'ac' ? autoAtkBonus5e(R5, attRow, stat) : (attacker.stats[stat] ?? 0);
-  const a = autoRoll(flatAuto ? 0 : (atkMod + atkBonus), autoEdge(fooledAuto === 'dis' ? 'dis' : flatAuto, attRow, stat));
+  const a = autoRoll((flatAuto ? 0 : atkMod) + atkBonus, autoEdge(fooledAuto === 'dis' ? 'dis' : flatAuto, attRow, stat));
   mirrorAutoRoll(gid, cid, attacker.name, `1d20${autoTag(a)}`, a, a.total, flatAuto ? `fight attack (${STAT_LABELS[stat]}, flat d20)` : `fight attack (${STAT_LABELS[stat]})`);
 
   // 5e: nobody rolls to defend — the target's Armour Class takes the slot,
@@ -11642,7 +11766,7 @@ async function autoNpcDefend(guild, gid, cid, channel) {
     // A kept hold: an NPC on auto always struggles (T, 2026-11-09) \u2014 on a
     // flat d20 against a hold of 20, or a flat it already carries.
     const drow = getNpc(gid, defender.name);
-    const fooledH = consumeFooled(gid, cid, fight.current_target);
+    const fooledH = consumeFooled(gid, cid, fight.current_target) || consumeFlatMark(gid, fight.current_target);
     const flatH = fooledH || fight.atk_nat === 20;
     const d = autoRoll(flatH ? 0 : (defender.stats.str ?? 0), autoEdge(fooledH === 'dis' ? 'dis' : flatH, drow, 'str'));
     mirrorAutoRoll(gid, cid, defender.name, `1d20${autoTag(d)}`, d, d.total, flatH ? 'break free (STR, flat d20)' : 'break free (STR)');
@@ -11654,7 +11778,7 @@ async function autoNpcDefend(guild, gid, cid, channel) {
   if (fight.atk_kind === 'grapple') {
     // Grapple saves are STR-only; the auto NPC rolls its own.
     const drow = getNpc(gid, defender.name);
-    const flatG = consumeFooled(gid, cid, fight.current_target);
+    const flatG = consumeFooled(gid, cid, fight.current_target) || consumeFlatMark(gid, fight.current_target);
     const d = autoRoll(flatG ? 0 : (defender.stats.str ?? 0), autoEdge(flatG, drow, 'str'));
     mirrorAutoRoll(gid, cid, defender.name, `1d20${autoTag(d)}`, d, d.total, flatG ? 'grapple save (STR, flat d20)' : 'grapple save (STR)');
     const r = await resolveGrappleSave(guild, gid, cid, fight, { nat: d.nat, total: d.total, mode: d.adv ? 'adv' : d.dis ? 'dis' : 'normal' });
@@ -11665,7 +11789,7 @@ async function autoNpcDefend(guild, gid, cid, channel) {
   if (fight.atk_kind === 'feint') {
     // Insight checks are WIS-only; a flat the NPC owes makes even this one flat.
     const drow = getNpc(gid, defender.name);
-    const wasFooled = consumeFooled(gid, cid, fight.current_target);
+    const wasFooled = consumeFooled(gid, cid, fight.current_target) || consumeFlatMark(gid, fight.current_target);
     const d = autoRoll(wasFooled ? 0 : (defender.stats.wis ?? 0), autoEdge(wasFooled, drow, 'wis'));
     mirrorAutoRoll(gid, cid, defender.name, `1d20${autoTag(d)}`, d, d.total, wasFooled ? 'feint insight (WIS, flat d20)' : 'feint insight (WIS)');
     const r = await resolveFeintInsight(guild, gid, cid, fight, { nat: d.nat, total: d.total, mode: d.adv ? 'adv' : d.dis ? 'dis' : 'normal' });
@@ -11726,7 +11850,8 @@ async function fighterStateLine(guild, gid, cid, fid) {
   if (eff.flatDef) bits.push('\u{1F4A2} **next defence is a flat d20**');
   if (eff.flatAtk) bits.push('\u{1F4A2} **next attack is a flat d20**');
   if (eff.holdPaid) bits.push('\u{1FAA2} this round\u2019s wound already paid');
-  if (eff.rollBonus) bits.push(`\u2694\uFE0F **+${eff.rollBonus} to hit** on the next attack \u2014 riposte`);
+  if (eff.rollBonus) bits.push(`\u2694\uFE0F **+${eff.rollBonus} to hit** on the next attack \u2014 riposte${eff.rbFlat ? ', flat or not' : ''}`);
+  if (eff.disarmed) bits.push('\u{1F5E1}\uFE0F **disarmed** \u2014 the next turn goes to retrieving the weapon');
   if (eff.gmAdj) bits.push(`\u2696\uFE0F **${eff.gmAdj > 0 ? '+' : ''}${eff.gmAdj}** from the GM`);
   if (eff.gmStat) bits.push(`\u2696\uFE0F GM set the stat to **${STAT_LABELS[eff.gmStat] || eff.gmStat}**`);
   if (eff.fooled) bits.push(`\u{1F3AD} **next roll is a flat d20**${eff.fooledDis ? ', at **disadvantage**' : ''}`);
@@ -11734,8 +11859,9 @@ async function fighterStateLine(guild, gid, cid, fid) {
   // (T, 2026-10-14). The clock ticks at the start of this fighter's turn.
   for (const c of Array.isArray(eff.conditions) ? eff.conditions : [])
     bits.push(`\u{1FA79} **${c.text}**${c.turns ? ` \u2014 ${c.turns} turn${c.turns === 1 ? '' : 's'} left` : ''}`);
-  if (!isNpcFighter(fid)) {
-    const mk = getChar(gid, fid)?.next_mark;
+  {
+    // A mark on the sheet \u2014 an NPC's too, since `/deception` can fool one.
+    const mk = isNpcFighter(fid) ? getNpc(gid, npcNameFromFighter(fid))?.next_mark : getChar(gid, fid)?.next_mark;
     if (mk === 'adv') bits.push('\u2b06\ufe0f advantage on the next roll');
     if (mk === 'dis') bits.push('\u2b07\ufe0f disadvantage on the next roll');
     if (mk === 'flat') bits.push('\u27a1\ufe0f next roll is flat');
@@ -11834,12 +11960,31 @@ function settleInitiativeTies(inits, { gid, cid, nameOf }) {
   return told;
 }
 
+// The buttons a fighter's turn carries. A disarmed fighter's is Retrieve
+// alone (T, 2026-11-10); a captive is offered the break, a grappler the
+// choice T asked for \u2014 keep the grip or let go \u2014 and everyone the
+// attack set (2026-08-22). An NPC's turn carries the GM's 🎭 set, or none
+// on auto.
+function turnRowsFor(gid, fight, fid, { auto = false } = {}) {
+  const npc = isNpcFighter(fid);
+  if (disarmedOf(fight, fid)) return fightAnswerRows('retrieve', { forNpc: npc, auto, gid });
+  if (npc) return fightAnswerRows('atk', { forNpc: true, auto, gid });
+  const gmap = fight ? fightGrapples(fight) : {};
+  const rowsFor = gmap[fid] ? ['escape', 'atk'] : Object.values(gmap).includes(fid) ? ['hold', 'atk'] : ['atk'];
+  return rowsFor.flatMap(k => fightAnswerRows(k, { held: !!gmap[fid], gid })).slice(0, 5);
+}
+
 async function announceNextTurn(guild, gid, cid, lines, order, index) {
   const nextF = await resolveFighter(guild, gid, order[index]);
   const autoOn = !!getFight(gid, cid)?.auto_npc;
   for (const l of tickConditions(gid, cid, order[index], nextF.name)) lines.push(l);
   const hpLine = await fightHpLine(guild, gid, cid, order);
-  const hint = (autoOn && nextF.isNpc) ? '' : nextF.isNpc
+  // Disarmed, the turn goes to fetching the weapon (T, 2026-11-10).
+  const disarmedNow = disarmedOf(getFight(gid, cid), order[index]);
+  const hint = (autoOn && nextF.isNpc) ? '' : disarmedNow
+    ? (nextF.isNpc ? `\n_\u{1F5E1}\uFE0F Disarmed \u2014 a GM spends the turn retrieving: the \u{1F3AD} Retrieve button, or \`/fight act action:Retrieve npc:${nextF.name}\`_`
+      : '\n_\u{1F5E1}\uFE0F Disarmed \u2014 this turn goes to retrieving your weapon: press **Retrieve**, or `/fight act action:Retrieve`._')
+    : nextF.isNpc
     ? `\n_A GM acts for them: \`/fight atk stat:str npc:${nextF.name} target:@player\`_`
     : '\n_\`/fight atk stat:str target:@player\` — or \`/roll dice:2d6+3 fight:true target:@player\` for a custom roll._';
     const state = await fighterStateLine(guild, gid, cid, order[index]);
@@ -11847,19 +11992,8 @@ lines.push(`\n\u{1F3AF} **${nextF.name}${nextF.isNpc ? ' \u{1F3AD}' : ''}**'s tu
   // Whoever sends these lines should offer the attacker their buttons — an
   // NPC's turn belongs to a GM typing `npc:`, so it gets none.
   const autoNpc = !!getFight(gid, cid)?.auto_npc;
-  // Which buttons suit this turn: a captive is offered the break, a
-  // grappler is offered the choice T asked for — keep the grip or let go —
-  // and everyone else gets the ordinary attack set (2026-08-22).
-  const fNow = getFight(gid, cid);
-  const gmapNow = fNow ? fightGrapples(fNow) : {};
-  const id = order[index];
-  const rowsFor = gmapNow[id] ? ['escape', 'atk']
-    : Object.values(gmapNow).includes(id) ? ['hold', 'atk']
-    : ['atk'];
-  const isHeld = !!gmapNow[id];
-  nextF.answerRows = nextF.isNpc
-    ? fightAnswerRows('atk', { forNpc: true, auto: autoNpc, gid })
-    : rowsFor.flatMap(k => fightAnswerRows(k, { held: isHeld, gid })).slice(0, 5);
+  // Which buttons suit this turn \u2014 one door for every sender (turnRowsFor).
+  nextF.answerRows = turnRowsFor(gid, getFight(gid, cid), order[index], { auto: autoNpc });
   // Every sender used to be asked to attach these by hand, and six of them
   // never did — the grappler's turn arrived with no Maintain/Release in
   // sight (T, 2026-09-12). Now the announcer leaves them where sendLong and
@@ -11928,9 +12062,12 @@ async function applyTurnEndStrain(guild, gid, cid, hpState, order, roster, floor
 // The turn passes from `actorId`: their turn's end (a held fighter's wound
 // for the round), then the next fighter standing after them in the order as
 // it began \u2014 whoever has dropped out meanwhile, the actor included.
-// Returns { lines, ended, nextF, announce } like the resolvers.
-async function passTurn(guild, gid, cid, hpState, order, roster, floor, lines, actorId) {
-  const st = await applyTurnEndStrain(guild, gid, cid, hpState, order, roster, floor, lines, actorId);
+// Returns { lines, ended, nextF, announce } like the resolvers. `strain:
+// false` skips the turn's-end wound: a striker seized by a defensive grapple
+// is held from that moment, the wounds starting once the grappler's own
+// turn has come round (T, 2026-11-10).
+async function passTurn(guild, gid, cid, hpState, order, roster, floor, lines, actorId, { strain = true } = {}) {
+  const st = strain ? await applyTurnEndStrain(guild, gid, cid, hpState, order, roster, floor, lines, actorId) : { order };
   if (st.endedRet) return st.endedRet;
   order = st.order;
   const i = roster.indexOf(actorId);
@@ -12254,8 +12391,11 @@ async function resolveExchange(guild, gid, cid, fight, { forceHit = false } = {}
 // attempt wins ties ("meets or exceeds"); a failed save writes the hold into
 // the fight's grapple map. The naturals speak first (T, 2026-11-09): a grab
 // of 1 fails outright; a grab of 20 takes the hold whatever the save, for 2
-// wounds; a save of 20 slips free unless the grab was a 20 too. Returns
-// { lines, nextF, ended, announce, grappled }.
+// wounds; a save of 20 slips free unless the grab was a 20 too. And they
+// carry over (T, 2026-11-10): a grab of 1 leaves the grappler's next
+// defence a flat d20; a save of 20 that holds leaves the grappler's next
+// attack a flat d20 and banks the saver +2 \u2014 both, when both are rolled.
+// Returns { lines, nextF, ended, announce, grappled }.
 async function resolveGrappleSave(guild, gid, cid, fight, { nat, total, mode = 'normal' }) {
   const turnOrder = fightOrder(fight);
   const attackerId = turnOrder[fight.turn_index];
@@ -12295,12 +12435,18 @@ async function resolveGrappleSave(guild, gid, cid, fight, { nat, total, mode = '
     setFightGrapples(gid, cid, gmap);
     consumeEffectFlag(gid, cid, targetId, 'holdPaid');   // a new hold starts unpaid
     lines.push(`_Held \u2022 1 wound a round \u2022 break free (STR) on their turn with \`/fight act action:Escape\`, or when ${atkName} keeps the hold \u2022 or act on a flat d20. ${atkName} may \`/fight act action:Release\` freely, and cannot strike their captive._`);
-  } else if (aNat === 1) {
-    lines.push(`\u{1F4A5} **${atkName}** fumbles the grab \u2014 a natural 1, it fails outright.`);
-  } else if (nat === 20) {
-    lines.push(`💨 A natural 20 \u2014 **${defName}** twists free. No grapple.`);
   } else {
-    lines.push(`💨 **${defName}** slips the hold — no grapple.`);
+    if (aNat === 1) {
+      setEffectFlag(gid, cid, attackerId, 'flatDef');
+      lines.push(`\u{1F4A5} **${atkName}** fumbles the grab \u2014 a natural 1, it fails outright, and their next defence is a flat d20.`);
+    }
+    if (nat === 20) {
+      setEffectFlag(gid, cid, attackerId, 'flatAtk');
+      bankRiposte(gid, cid, targetId);
+      lines.push(`💨 A natural 20 \u2014 **${defName}** twists free: **${atkName}**'s next attack is a flat d20, and **${defName}**'s next attack gets **+2**.`);
+    } else if (aNat !== 1) {
+      lines.push(`💨 **${defName}** slips the hold — no grapple.`);
+    }
   }
   return { ...(await passTurn(guild, gid, cid, hpState, order, turnOrder, floor, lines, attackerId)), grappled };
 }
@@ -12408,6 +12554,9 @@ async function gmSkipTurn(guild, gid, cid, reason) {
   const hpState = fightHp(fight);
   const floor = fightFloor(fight);
   const lines = [`⏭ **${skipped?.name ?? 'Their'}**'s turn is skipped by the GM${reason ? ` — ${reason}` : ''}.`];
+  // A skipped turn is the one a disarmed fighter would have spent on the
+  // weapon: it counts as the retrieval (2026-11-10).
+  if (consumeEffectFlag(gid, cid, skippedId, 'disarmed')) lines.push('\u{1F5E1}\uFE0F The skipped turn goes to retrieving their weapon.');
   // A skipped turn still ends: a held fighter's wound for the round lands
   // (T, 2026-11-09). The lines go back to the caller to post \u2014 they used
   // to be dropped, the next turn's ping and buttons with them.
@@ -12571,6 +12720,10 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     : fight.atk_kind === 'hold'
     ? '\u{1FAA2} A kept hold is waiting on the captive \u2014 Break free or Stay.'
     : '❌ Waiting for defender to roll first.');
+  // Disarmed, the turn goes to the weapon (T, 2026-11-10) \u2014 refused before
+  // any flat roll they owe is spent; it used to be spent and then lost to
+  // the retrieval.
+  if (disarmedOf(fight, actorId)) return refuse(disarmedRefusal(isNpcFighter(actorId) ? npcNameFromFighter(actorId) : null));
   if (!isNpcFighter(actorId)) {
     const gateMsg = sheetGate(gid, actorId);
     if (gateMsg && !(await isGm(interaction.guild, uid))) return refuse(gateMsg);
@@ -12608,10 +12761,6 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     const fooledA = consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
     const flatSwing = restrained || offBalance || fooledA;
     clearRoundFlag(gid, cid, actorId);
-    if (await retrievalTurn(interaction.guild, gid, cid, actorId,
-        async (l) => interaction.reply({ content: l.join('\n') }))) {
-      return kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
-    }
     const actor = await resolveFighter(interaction.guild, gid, actorId);
     const targetF = await resolveFighter(interaction.guild, gid, targetId);
     // Under 5e a monster adds the bonus off its statblock, and a character
@@ -12627,8 +12776,9 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
       statVal = monster != null ? monster
               : rulesAtk.statBonus(rowA, stat) + rulesAtk.profBonus(rowA);
     } else statVal = (actor.stats[stat] ?? 0);
-    // Consume a pending riposte bonus from a previous nat-20 defence.
-    const atkBonus = flatSwing ? 0 : consumeAtkBonus(gid, cid, actorId);
+    // Consume a pending riposte bonus from a previous nat-20 defence \u2014 on a
+    // flat swing only one banked to ride it (2026-11-10).
+    const atkBonus = consumeAtkBonus(gid, cid, actorId, { flat: !!flatSwing });
     // Hero signature advantage (players and Hero NPCs alike)
     const sigRowA = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
     mode = flatMode(fooledA === 'dis' ? 'dis' : flatSwing, applySignatureMode(sigRowA, stat, mode));
@@ -12808,6 +12958,7 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
   if (fight.phase !== 'attack') return refuse(fight.atk_kind === 'grapple'
     ? '🤼 A grapple is already pending — the target answers with `/fight act action:Save`.'
     : '❌ Waiting for defender to roll first.');
+  if (disarmedOf(fight, actorId)) return refuse(disarmedRefusal(isNpcFighter(actorId) ? npcNameFromFighter(actorId) : null));
   if (!isNpcFighter(actorId)) {
     const gateMsg = sheetGate(gid, actorId);
     if (gateMsg && !(await isGm(interaction.guild, uid))) return refuse(gateMsg);
@@ -12835,10 +12986,6 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
   // clamp it too.
   const offBalance = consumeFlatAtk(gid, cid, actorId) || consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
   clearRoundFlag(gid, cid, actorId);
-  if (await retrievalTurn(interaction.guild, gid, cid, actorId,
-      async (l) => interaction.reply({ content: l.join('\n') }))) {
-    return kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
-  }
   const actor = await resolveFighter(interaction.guild, gid, actorId);
   const targetF = await resolveFighter(interaction.guild, gid, targetId);
   const statVal = offBalance ? 0 : (actor.stats.str ?? 0);
@@ -12921,6 +13068,7 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
   if (fight.phase !== 'attack') return refuse(fight.atk_kind === 'feint'
     ? '🎭 A feint is already pending — the target answers with `/fight act action:Insight`.'
     : '❌ Waiting for defender to roll first.');
+  if (disarmedOf(fight, actorId)) return refuse(disarmedRefusal(isNpcFighter(actorId) ? npcNameFromFighter(actorId) : null));
   if (!isNpcFighter(actorId)) {
     const gateMsg = sheetGate(gid, actorId);
     if (gateMsg && !(await isGm(interaction.guild, uid))) return refuse(gateMsg);
@@ -13100,6 +13248,7 @@ async function runFightMaintain(interaction, { flavour = null } = {}) {
   if (actorId !== uid) return refuse('\u274C It is not your turn.');
   const heldId = grappleHeldTargetOf(fight, actorId);
   if (!heldId) return refuse('\u{1F91C} You are not holding anyone.');
+  if (disarmedOf(fight, actorId)) return refuse(disarmedRefusal());
 
   const holderF = await resolveFighter(interaction.guild, gid, actorId);
   const captiveF = await resolveFighter(interaction.guild, gid, heldId);
@@ -13236,6 +13385,7 @@ async function runFightEscape({ interaction, gid, cid, actorId, mode, flavour = 
     return refuse(`⚠️ It's **${cur.name}**'s turn.`);
   }
   if (fight.phase !== 'attack') return refuse('❌ Resolve the pending exchange first.');
+  if (disarmedOf(fight, actorId)) return refuse(disarmedRefusal(isNpcFighter(actorId) ? npcNameFromFighter(actorId) : null));
   const holderId = grappleHolderOf(fight, actorId);
   if (!holderId) return refuse('🤼 You are not held — nothing to escape.');
   clearRoundFlag(gid, cid, actorId);
@@ -13332,15 +13482,22 @@ async function kickAutoIfNpcTurn(guild, gid, cid, channel) {
 }
 
 // A disarmed fighter's turn is spent retrieving the weapon. Consumes the flag
-// and the turn; returns true if it did.
-async function retrievalTurn(guild, gid, cid, actorId, deliver) {
+// and the turn; returns true if it did. The flat rolls they owe wait for
+// their next real roll; the once-a-round answers re-arm, as any turn of
+// theirs re-arms them; the words of a Retrieve form ride along (T,
+// 2026-11-10).
+async function retrievalTurn(guild, gid, cid, actorId, deliver, flavour = null) {
   if (!consumeEffectFlag(gid, cid, actorId, 'disarmed')) return false;
+  consumeEffectFlag(gid, cid, actorId, 'deflected');
+  consumeEffectFlag(gid, cid, actorId, 'disarmUsed');
   const fight = getFight(gid, cid);
   const turnOrder = fightOrder(fight);
   const hpState = fightHp(fight);
   const floor = fightFloor(fight);
   const F = await resolveFighter(guild, gid, actorId);
   const lines = [`⚔️ **${F.name}${F.isNpc ? ' 🎭' : ''}** spends the turn retrieving their weapon.`];
+  if (flavour) lines.push(`_${flavour}_`);
+  try { noteQuestActivity(gid, cid, 'combat', `${F.name} retrieves their weapon`); } catch {}
   // The turn ends: a held fighter's wound for the round lands (2026-11-09).
   const res = await passTurn(guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, actorId);
   await deliver(lines);
@@ -13355,9 +13512,11 @@ async function retrievalTurn(guild, gid, cid, actorId, deliver) {
 // strike. STR 4+ and a shield required; a natural-20 strike cannot be turned;
 // once per round (the flag clears when your own turn comes). Exceed the
 // attack roll and the blow is turned — optionally into another enemy for 1
-// damage with full down handling. Fall short and it lands on you for 1.
-// Either way your next attack roll is a flat d20, the attacker's turn ends
-// (a held attacker still pays strain), and the fight advances.
+// damage with full down handling — and the enemy loses its next turn
+// retrieving the weapon (T, 2026-11-10). Fall short and it lands on you for
+// 1. Either way your next attack roll is a flat d20 \u2014 with +2 on it after a
+// deflection of 20 \u2014 the attacker's turn ends (a held attacker still pays
+// strain), and the fight advances.
 async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId, mode, flavour }) {
   const uid = interaction.user.id;
   const turn = await openFightTurn(interaction, gid, cid);
@@ -13371,6 +13530,7 @@ async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId
     const t = await resolveFighter(interaction.guild, gid, fight.current_target);
     return refuse(`⚠️ The attack is on **${t.name}** — the deflection is theirs.`);
   }
+  if (fight.def_roll != null) return refuse(ALREADY_ANSWERED);
   const turnOrder = fightOrder(fight);
   const attackerId = turnOrder[fight.turn_index];
   if (!isNpcFighter(attackerId)) return refuse('🛡️ Deflection works against PvE enemies only — not another player\'s strike.');
@@ -13441,6 +13601,11 @@ async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId
   if (nat === 20) lines.push('\u{1F7E1} A natural 20 \u2014 the shield turns it whatever the totals.');
   if (nat === 1) lines.push('\u{1F534} A natural 1 \u2014 the deflection fails outright.');
   if (deflected) {
+    // Thrown off, the enemy spends its next turn retrieving the weapon, as a
+    // disarmed one does; a 20 banks +2 on the deflector's flat next attack
+    // (T, 2026-11-10).
+    setEffectFlag(gid, cid, attackerId, 'disarmed');
+    if (nat === 20) bankRiposte(gid, cid, uid, { onFlat: true });
     if (redirectF) {
       const rName = redirectF.name + ' 🎭';
       const dmgR = nat === 20 ? 2 : 1;
@@ -13477,7 +13642,9 @@ async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId
       }
     }
   }
+  if (deflected) lines.push(`\u{1F5E1}\uFE0F The blow is knocked from **${attackerName}**'s hands \u2014 their next turn goes to retrieving the weapon.`);
   lines.push('', nat === 1 ? `_🛡️ Trade-off: **${actorName}**'s next attack and next defence are flat d20s._`
+    : nat === 20 ? `_🛡️ Trade-off: **${actorName}**'s next attack roll is a flat d20 \u2014 with **+2** from the natural 20._`
     : `_🛡️ Trade-off: **${actorName}**'s next attack roll is a flat d20._`);
 
   // The attacker's turn ends — a held attacker still pays the strain.
@@ -13507,13 +13674,14 @@ async function runFightDeflect({ interaction, gid, cid, stat = 'str', redirectId
 // flat next attack.
 const markDeflectUsed = (gid, cid, fid) => markRoundSpecial(gid, cid, fid, 'deflected', 'flatAtk');
 
-// Disarming: a defend-phase alternative for players facing a PvE strike.
-// DEX 4+ and a blade required; once per round; PvE only. Exceed the attack
-// roll and the enemy is disarmed — zero damage, their next turn spent
-// retrieving (see retrievalTurn). Fall short and the strike lands on you
-// for 1. Either way your next DEFENCE roll is a flat d20 (the flatDef flag,
-// consumed by both manual and auto defence). The spec sets no crit
-// exception here, so a natural 20 may be disarmed — as written.
+// Disarm, as a defence (T, 2026-11-10): a player answers an NPC's strike by
+// going for its weapon \u2014 DEX 4+, no blade needed, once a round, never
+// against a natural 20. Exceed the attack roll and the NPC is disarmed: no
+// damage, and its next turn goes to retrieving the weapon. A natural 20 does
+// it whatever the totals, wounds the NPC 1 and banks +2 on the disarmer's
+// next attack, flat or not; a natural 1 fails outright for 2 wounds and
+// leaves the DISARMER disarmed; any other miss lets the blow land for 1.
+// Whatever came of it, the disarmer's very next roll is a flat d20.
 async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
   const uid = interaction.user.id;
   const turn = await openFightTurn(interaction, gid, cid);
@@ -13527,9 +13695,10 @@ async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
     const t = await resolveFighter(interaction.guild, gid, fight.current_target);
     return refuse(`⚠️ The attack is on **${t.name}** — the disarm is theirs.`);
   }
+  if (fight.def_roll != null) return refuse(ALREADY_ANSWERED);
   const turnOrder = fightOrder(fight);
   const attackerId = turnOrder[fight.turn_index];
-  if (!isNpcFighter(attackerId)) return refuse('⚔️ Disarming works against PvE enemies only — not another player\'s strike.');
+  if (!isNpcFighter(attackerId)) return refuse('⚔️ Disarming works on NPCs only — not another player\'s strike.');
   // An attacking 20 lands whatever the totals (T, 2026-11-09): as with a
   // deflection, there is nothing to stop.
   if (fight.atk_nat === 20) return refuse('⚔️ A **natural 20** cannot be disarmed — brace with `/fight def` instead.');
@@ -13538,7 +13707,6 @@ async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
     if (gate0) return refuse(gate0);
   }
   const subject = getChar(gid, uid);
-  if (!hasBladeEquipped(subject)) return refuse('⚔️ Disarming needs a **blade** equipped — maces, shields and firearms can\'t do it.');
   const barDis = abilityNeeds(gid, 'disarm');
   if (belowBar(subject, barDis)) return refuse(`⚔️ Disarming needs **${barDis.label} ${barDis.need}+** — the hands have to be quick.`);
   {
@@ -13575,37 +13743,37 @@ async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
   lines.push('');
 
   let order = [...turnOrder];
-  // The naturals speak first (T, 2026-11-09): a 20 succeeds whatever the
-  // totals, and rather than a turn spent fetching the blade the attacker
-  // takes a wound and their next attack is flat; a 1 fails outright, and the
-  // disarmer's next attack is flat as well as their next defence.
   const disarmed = nat === 20 || (nat !== 1 && total > fight.atk_roll);   // must EXCEED the attack roll
   const finish = async (ret) => {
     markDisarmUsed(gid, cid, uid);
     await replyLong(interaction, ret.lines);
     return announceFightEnd(interaction.guild, gid, cid, chan, ret.announce);
   };
-  if (nat === 20) {
-    setEffectFlag(gid, cid, attackerId, 'flatAtk');
-    const prevA = hpState[attackerId] ?? 0;
-    const nhA = applyFightDamage(prevA, 1, floor);
-    hpState[attackerId] = nhA; setFighterHp(gid, attackerId, nhA);
-    lines.push(`\u{1F7E1} A natural 20 \u2014 the blade is torn from **${attackerName}**'s grip and turned on them: **1** wound, and their next attack is a flat d20!`);
-    lines.push(hpChangeLine(gid, true, attackerF.name, prevA, nhA, attackerF.maxHp, floor));
-    if (nhA <= floor) {
-      const r = await knockoutFromSpecial(interaction.guild, gid, cid, getFight(gid, cid), hpState, order, turnOrder, floor, lines, attackerId, attackerName);
-      order = r.order;
-      if (r.endedRet) return finish(r.endedRet);
-    }
-  } else if (disarmed) {
+  if (disarmed) {
     setEffectFlag(gid, cid, attackerId, 'disarmed');
-    lines.push(`⚔️ The blade spins from **${attackerName}**'s grip — **no damage**, and their next turn is spent retrieving it!`);
+    if (nat === 20) {
+      bankRiposte(gid, cid, uid, { onFlat: true });
+      const prevA = hpState[attackerId] ?? 0;
+      const nhA = applyFightDamage(prevA, 1, floor);
+      hpState[attackerId] = nhA; setFighterHp(gid, attackerId, nhA);
+      lines.push(`\u{1F7E1} A natural 20 \u2014 the blade is torn from **${attackerName}**'s grip and turned on them: **1** wound, and their next turn goes to retrieving it. **${actorName}**'s next attack gets **+2**, flat or not.`);
+      lines.push(hpChangeLine(gid, true, attackerF.name, prevA, nhA, attackerF.maxHp, floor));
+      if (nhA <= floor) {
+        const r = await knockoutFromSpecial(interaction.guild, gid, cid, getFight(gid, cid), hpState, order, turnOrder, floor, lines, attackerId, attackerName);
+        order = r.order;
+        if (r.endedRet) return finish(r.endedRet);
+      }
+    } else {
+      lines.push(`⚔️ The blade spins from **${attackerName}**'s grip — **no damage**, and their next turn is spent retrieving it!`);
+    }
   } else {
-    if (nat === 1) setEffectFlag(gid, cid, uid, 'flatAtk');
+    // A 1 fails outright for 2, and the disarmer's own weapon goes.
+    const dmgD = nat === 1 ? 2 : 1;
+    if (nat === 1) setEffectFlag(gid, cid, uid, 'disarmed');
     const prev = hpState[uid] ?? 0;
-    const nh = applyFightDamage(prev, 1, floor);
+    const nh = applyFightDamage(prev, dmgD, floor);
     hpState[uid] = nh; setFighterHp(gid, uid, nh);
-    lines.push(nat === 1 ? `\u{1F534} A natural 1 \u2014 the disarm fails outright: **${actorName}** takes **1** damage, and their next attack is a flat d20 as well.`
+    lines.push(nat === 1 ? `\u{1F534} A natural 1 \u2014 the disarm fails outright: **${actorName}** takes **2** damage and loses their own weapon \u2014 their next turn goes to retrieving it.`
       : `💥 The parry misses the wrist — **${actorName}** takes **1** damage.`);
     lines.push(hpChangeLine(gid, false, actor.name, prev, nh, actor.maxHp, floor));
     if (nh <= floor) {
@@ -13614,8 +13782,7 @@ async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
       if (r.endedRet) return finish(r.endedRet);
     }
   }
-  lines.push('', nat === 1 ? `_⚔️ Trade-off: **${actorName}**'s next defence and next attack are flat d20s._`
-    : `_⚔️ Trade-off: **${actorName}**'s next defence roll is a flat d20._`);
+  lines.push('', `_⚔️ The price: **${actorName}**'s very next roll is a flat d20._`);
 
   // The attacker's turn ends — a held attacker still pays the round's wound.
   const res = await passTurn(interaction.guild, gid, cid, hpState, order, turnOrder, floor, lines, attackerId);
@@ -13624,6 +13791,261 @@ async function runFightDisarm({ interaction, gid, cid, mode, flavour }) {
   await replyLong(interaction, lines);
   await kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
   return;
+}
+
+// Disarm, on your own turn (T, 2026-11-10): a player goes for an NPC's
+// weapon \u2014 DEX 4+, no blade needed. Their 1d20 + DEX against the NPC's
+// 1d20 + the better of its STR and DEX, rolled by the bot \u2014 a signature
+// advantage honoured, no naturals on its die \u2014 ties to the NPC. Beat it
+// and the NPC's next turn goes to retrieving the weapon; a natural 20 does
+// it whatever the totals and wounds them 1; a natural 1 fails outright,
+// costs 2 wounds and leaves the disarmer disarmed; any other miss does
+// nothing. Whatever came of it, the disarmer's very next roll is a flat
+// d20, and the turn passes.
+async function runFightDisarmAttack({ interaction, gid, cid, targetId, mode, flavour }) {
+  const uid = interaction.user.id;
+  const turn = await openFightTurn(interaction, gid, cid);
+  if (turn.refused) return turn.refused;
+  const { chan, fight, refuse } = turn;
+  const turnOrder = fightOrder(fight);
+  if (turnOrder[fight.turn_index] !== uid) {
+    const cur = await resolveFighter(interaction.guild, gid, turnOrder[fight.turn_index]);
+    return refuse(`⚠️ It's **${cur.name}**'s turn to attack.`);
+  }
+  if (fight.phase !== 'attack') return refuse('❌ Resolve the pending exchange first.');
+  if (disarmedOf(fight, uid)) return refuse(disarmedRefusal());
+  {
+    const gate0 = deathGate(gid, uid);
+    if (gate0) return refuse(gate0);
+  }
+  {
+    const gateMsg = sheetGate(gid, uid);
+    if (gateMsg && !(await isGm(interaction.guild, uid))) return refuse(gateMsg);
+  }
+  if (!turnOrder.includes(targetId)) return refuse('❌ That target is not in this fight.');
+  if (!isNpcFighter(targetId)) return refuse('⚔️ Disarming works on NPCs only.');
+  const hpState = fightHp(fight);
+  const floor = fightFloor(fight);
+  if (hpState[targetId] !== undefined && hpState[targetId] <= floor) {
+    return refuse(floor > 0 ? '❌ That fighter has already yielded the bout.' : '❌ That target is already down.');
+  }
+  if (grappleHolderOf(fight, targetId) === uid) return refuse('\u{1F93C} You are holding them \u2014 your hands are full. `/fight act action:Release` first.');
+  if (disarmedOf(fight, targetId)) return refuse('⚔️ Their weapon is already on the floor \u2014 they are disarmed.');
+  const subject = getChar(gid, uid);
+  const barX = abilityNeeds(gid, 'disarm');
+  if (belowBar(subject, barX)) return refuse(`⚔️ Disarming needs **${barX.label} ${barX.need}+** — the hands have to be quick.`);
+
+  // Your roll: held, off-balance or owing a flat roll, it is a straight d20.
+  const restrained = !!grappleHolderOf(fight, uid);
+  const offBalance = !restrained && consumeFlatAtk(gid, cid, uid);
+  const fooledX = consumeFooled(gid, cid, uid) || consumeFlatMark(gid, uid);
+  const flatX = restrained || offBalance || fooledX;
+  clearRoundFlag(gid, cid, uid);
+  const actor = await resolveFighter(interaction.guild, gid, uid);
+  const targetF = await resolveFighter(interaction.guild, gid, targetId);
+  const actorName = actor.name;
+  const targetName = targetF.name + ' 🎭';
+  const statVal = flatX ? 0 : (actor.stats.dex ?? 0);
+  mode = flatMode(fooledX === 'dis' ? 'dis' : flatX, applySignatureMode(subject, 'dex', mode));
+  mode = applyNextMark(gid, uid, mode);
+  const { nat, dropped } = rollD20Mode(mode);
+  const total = nat + statVal;
+  const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
+  const advNote = (restrained ? ' 🤼 restrained — flat' : offBalance ? ' 🛡️ off-balance — flat' : fooledX ? ' 🎭 flat d20' : '')
+    + (mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '');
+  const rollLine = `⚔️  1d20${flatX ? '' : '+DEX'}${advNote} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)}`;
+  saveRoll(gid, cid, uid, `1d20+${statVal}`, 'disarm DEX');
+  recordRoll(gid, { userId: uid, channelId: cid, interaction,
+    kind: null, card: null,
+    input: '/fight act action:Disarm', rollLine, nat, sides: 20,
+    context: `fight · disarm vs ${targetF.name}` });
+  // The NPC's grip: the better of its STR and DEX \u2014 a flat roll it owes
+  // makes it a straight d20 \u2014 and no natural on its die: totals decide.
+  const npcRow = getNpc(gid, targetF.name);
+  const sS = targetF.stats.str ?? 0, sD = targetF.stats.dex ?? 0;
+  const gripStat = sD > sS ? 'dex' : sS > sD ? 'str' : (hasSignatureAdvantage(npcRow, 'dex') ? 'dex' : 'str');
+  const flatN = consumeFlatDef(gid, cid, targetId) || consumeFooled(gid, cid, targetId) || consumeFlatMark(gid, targetId);
+  const g = autoRoll(flatN ? 0 : (targetF.stats[gripStat] ?? 0), autoEdge(flatN, npcRow, gripStat));
+  mirrorAutoRoll(gid, cid, targetF.name, `1d20${autoTag(g)}`, g, g.total, `disarm grip (${flatN ? 'flat d20' : STAT_LABELS[gripStat]})`);
+  // The price, whatever comes of it: the disarmer's very next roll is flat.
+  setFooled(gid, cid, uid);
+
+  const showN = npcStatsVisible(gid);
+  const lines = ['\u2500'.repeat(29), `\u2694\uFE0F  **Disarm** \u2014 ${actorName} goes for ${targetName}'s weapon`, ''];
+  if (flavour) lines.push(`_${flavour}_`, '');
+  lines.push(`**${actorName}** (**DEX**): ${rollLine.replace('⚔️  ', '')}`);
+  lines.push(`${targetName} (${showN ? `**${STAT_LABELS[gripStat]}** ` : ''}grip${flatN ? ', flat d20' : g.adv ? ', advantage' : g.dis ? ', disadvantage' : ''}): **${g.total}**`);
+  lines.push('');
+
+  let order = [...turnOrder];
+  const won = nat === 20 || (nat !== 1 && total > g.total);   // ties go to the NPC
+  const ended = async (ret) => {
+    await replyLong(interaction, ret.lines);
+    return announceFightEnd(interaction.guild, gid, cid, chan, ret.announce);
+  };
+  if (won) {
+    setEffectFlag(gid, cid, targetId, 'disarmed');
+    if (nat === 20) {
+      const prevT = hpState[targetId] ?? 0;
+      const nhT = applyFightDamage(prevT, 1, floor);
+      hpState[targetId] = nhT; setFighterHp(gid, targetId, nhT);
+      lines.push(`\u{1F7E1} A natural 20 \u2014 **${actorName}** tears the weapon from **${targetName}**'s grip and turns it on them: **1** wound, and their next turn goes to retrieving it!`);
+      lines.push(hpChangeLine(gid, true, targetF.name, prevT, nhT, targetF.maxHp, floor));
+      if (nhT <= floor) {
+        const r = await knockoutFromSpecial(interaction.guild, gid, cid, getFight(gid, cid), hpState, order, turnOrder, floor, lines, targetId, targetName);
+        order = r.order;
+        if (r.endedRet) return ended(r.endedRet);
+      }
+    } else {
+      lines.push(`⚔️ The weapon spins from **${targetName}**'s grip — their next turn goes to retrieving it!`);
+    }
+  } else if (nat === 1) {
+    setEffectFlag(gid, cid, uid, 'disarmed');
+    const prev = hpState[uid] ?? 0;
+    const nh = applyFightDamage(prev, 2, floor);
+    hpState[uid] = nh; setFighterHp(gid, uid, nh);
+    lines.push(`\u{1F534} A natural 1 \u2014 the disarm fails outright: **${actorName}** takes **2** damage and loses their own weapon \u2014 their next turn goes to retrieving it.`);
+    lines.push(hpChangeLine(gid, false, actor.name, prev, nh, actor.maxHp, floor));
+    if (nh <= floor) {
+      const r = await knockoutFromSpecial(interaction.guild, gid, cid, getFight(gid, cid), hpState, order, turnOrder, floor, lines, uid, actorName);
+      order = r.order;
+      if (r.endedRet) return ended(r.endedRet);
+    }
+  } else {
+    lines.push(`\u{1F6E1}\uFE0F **${targetName}** keeps hold of the weapon${total === g.total ? ' \u2014 ties go to the one holding it' : ''}.`);
+  }
+  lines.push('', `_⚔️ The price: **${actorName}**'s very next roll is a flat d20._`);
+  try { noteQuestActivity(gid, cid, 'combat', `${actor.name} goes for ${targetF.name}'s weapon${won ? ' and takes it' : ''}`); } catch {}
+  const res = await passTurn(interaction.guild, gid, cid, hpState, order, turnOrder, floor, lines, uid);
+  if (res.ended) return ended(res);
+  await replyLong(interaction, lines);
+  return kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
+}
+
+// A grapple as a defence (T, 2026-11-10): a player answers an ordinary
+// strike by seizing the striker \u2014 STR 4+, 1d20 + STR against the attack,
+// ties to the attack. Beat it and the blow does nothing and the striker is
+// held, the wounds starting once the grappler's own turn has come round; a
+// natural 20 takes hold whatever the totals and banks +2. Fall short and
+// the blow lands as on any failed defence \u2014 a natural 1 fails outright and
+// adds its point. Not against a natural 20, a grab, a feint or a kept hold;
+// not from a hold or while holding someone; not on one already held.
+function defGrappleRefusal(fight, uid) {
+  if (!fight || fight.state !== 'active') return NO_ACTIVE_FIGHT;
+  if (fight.phase !== 'defend') return '❌ No strike to grapple — nothing is pending.';
+  if (fight.atk_kind === 'grapple') return '🤼 A grab is answered with its save — `/fight act action:Save`.';
+  if (fight.atk_kind === 'feint') return '🎭 A feint is answered with insight — `/fight act action:Insight`.';
+  if (fight.atk_kind === 'hold') return '\u{1FAA2} A kept hold is answered by Break free or Stay.';
+  if (fight.current_target !== uid) return '⚠️ The strike is on someone else — the answer is theirs.';
+  if (fight.def_roll != null) return ALREADY_ANSWERED;
+  if (fight.atk_nat === 20) return '🤼 A **natural 20** cannot be grappled — it lands whatever you roll. Brace with `/fight def` instead.';
+  if (grappleHolderOf(fight, uid)) return '🤼 You are held — no grappling from a hold.';
+  if (grappleHeldTargetOf(fight, uid)) return '🤼 You are already holding someone — `/fight act action:Release` first.';
+  if (grappleHolderOf(fight, fightOrder(fight)[fight.turn_index])) return '🤼 They are already held.';
+  return null;
+}
+async function runFightGrappleDef({ interaction, gid, cid, mode, flavour }) {
+  const uid = interaction.user.id;
+  const turn = await openFightTurn(interaction, gid, cid);
+  if (turn.refused) return turn.refused;
+  const { chan, fight, refuse } = turn;
+  const why = defGrappleRefusal(fight, uid);
+  if (why) return refuse(why);
+  {
+    const gate0 = deathGate(gid, uid);
+    if (gate0) return refuse(gate0);
+  }
+  {
+    const gateMsg = sheetGate(gid, uid);
+    if (gateMsg && !(await isGm(interaction.guild, uid))) return refuse(gateMsg);
+  }
+  const subject = getChar(gid, uid);
+  const barG = abilityNeeds(gid, 'grapple');
+  if (belowBar(subject, barG)) return refuse(`\u{1F93C} Grappling needs **${barG.label} ${barG.need}+** \u2014 you need the strength to hold on.`);
+  const turnOrder = fightOrder(fight);
+  const attackerId = turnOrder[fight.turn_index];
+  const actor = await resolveFighter(interaction.guild, gid, uid);
+  const attackerF = await resolveFighter(interaction.guild, gid, attackerId);
+  const actorName = actor.name;
+  const attackerName = attackerF.name + (attackerF.isNpc ? ' 🎭' : '');
+  // A defence roll: a fumble's flat defence and any flat roll owed clamp it.
+  const flatG = consumeFlatDef(gid, cid, uid) || consumeFooled(gid, cid, uid) || consumeFlatMark(gid, uid);
+  const statVal = flatG ? 0 : (actor.stats.str ?? 0);
+  mode = flatMode(flatG, applySignatureMode(subject, 'str', mode));
+  mode = applyNextMark(gid, uid, mode);
+  const { nat, dropped } = rollD20Mode(mode);
+  const total = nat + statVal;
+  const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
+  const advNote = (flatG ? ' 🎭 flat d20' : '') + (mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '');
+  const rollLine = `\u{1F93C}  1d20${flatG ? '' : '+STR'}${advNote} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)} vs atk **${fight.atk_roll}**`;
+  saveRoll(gid, cid, uid, `1d20+${statVal}`, 'grapple the blow STR');
+  recordRoll(gid, { userId: uid, channelId: cid, interaction,
+    kind: null, card: null,
+    input: '/fight act action:Grapple', rollLine, nat, sides: 20,
+    context: `fight · grapples ${attackerF.name}'s strike` });
+
+  const lines = ['\u2500'.repeat(29), `\u{1F93C}  **Grapple** \u2014 ${actorName} seizes at ${attackerName}'s strike`, ''];
+  if (flavour) lines.push(`_${flavour}_`, '');
+  lines.push(`${attackerName} attacks: ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
+  lines.push(`**${actorName}** (**STR**): ${rollLine.replace('\u{1F93C}  ', '')}`);
+  lines.push('');
+  const hpState = fightHp(fight), floor = fightFloor(fight);
+  // Beat the attack to take hold, ties to the attack; a 20 takes it
+  // whatever the totals, a 1 never does.
+  const seized = nat === 20 || (nat !== 1 && total > fight.atk_roll);
+  if (seized) {
+    const gmap = fightGrapples(getFight(gid, cid));
+    gmap[attackerId] = uid;
+    setFightGrapples(gid, cid, gmap);
+    consumeEffectFlag(gid, cid, attackerId, 'holdPaid');   // a new hold starts unpaid
+    if (nat === 20) {
+      bankRiposte(gid, cid, uid);
+      lines.push(`\u{1F7E1} A natural 20 \u2014 the grip takes whatever the totals, and **${actorName}**'s next attack gets **+2**.`);
+    }
+    lines.push(`\u{1F512} **${actorName}** catches the blow and seizes **${attackerName}** \u2014 no damage!`);
+    lines.push(`_Held \u2022 the wounds start once ${actorName}'s turn has come round, 1 a round \u2022 break free (STR) on their turn with \`/fight act action:Escape\`, or when ${actorName} keeps the hold \u2022 or act on a flat d20. ${actorName} may \`/fight act action:Release\` freely, and cannot strike their captive._`);
+    try { noteQuestActivity(gid, cid, 'combat', `${actor.name} catches ${attackerF.name}'s blow and seizes them`); } catch {}
+    // The striker's turn ends with no wound: the hold is new.
+    const res = await passTurn(interaction.guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, attackerId, { strain: false });
+    await replyLong(interaction, res.lines);
+    if (res.ended) return announceFightEnd(interaction.guild, gid, cid, chan, res.announce);
+    return kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
+  }
+  // Short of it: the exchange resolves as on any failed defence \u2014 the blow
+  // lands for 1, a natural 1 adds its point, an attack of 1 still fumbles.
+  lines.push(nat === 1 ? '\u{1F534} A natural 1 \u2014 the grab fails outright.' : `\u{1F4A5} **${actorName}** grabs and misses.`);
+  upsertFight(gid, cid, { def_roll: total, def_nat: nat, def_stat: 'str', def_mode: mode, def_sides: 20 });
+  const res = await resolveExchange(interaction.guild, gid, cid, getFight(gid, cid), { forceHit: true });
+  await replyLong(interaction, [...lines, ...res.lines]);
+  if (res.ended) return announceFightEnd(interaction.guild, gid, cid, chan, res.announce);
+  return kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
+}
+
+// Retrieve (T, 2026-11-10): a disarmed fighter's turn \u2014 the button, its
+// form (what they do, what they say) and then the turn passes. A GM does it
+// for an NPC; the auto-pilot and the turn clock do it on their own.
+async function runFightRetrieve({ interaction, gid, cid, actorId, flavour = null }) {
+  const turn = await openFightTurn(interaction, gid, cid, actorId);
+  if (turn.refused) return turn.refused;
+  const { chan, fight, refuse } = turn;
+  const order = fightOrder(fight);
+  if (order[fight.turn_index] !== actorId) {
+    const cur = await resolveFighter(interaction.guild, gid, order[fight.turn_index]);
+    return refuse(`⚠️ It's **${cur.name}**'s turn.`);
+  }
+  if (fight.phase !== 'attack') return refuse('❌ Resolve the pending exchange first.');
+  if (!disarmedOf(fight, actorId)) return refuse('⚔️ Nothing to retrieve — not disarmed.');
+  {
+    const gate0 = deathGate(gid, actorId);
+    if (gate0) return refuse(gate0);
+  }
+  const npc = isNpcFighter(actorId);
+  await retrievalTurn(interaction.guild, gid, cid, actorId, async (l) => {
+    if (!npc) return replyLong(interaction, l);
+    await sendLong(chan, l);
+    return interaction.reply({ ephemeral: true, content: `✅ Retrieved as **${npcNameFromFighter(actorId)}**.` });
+  }, flavour);
+  return kickAutoIfNpcTurn(interaction.guild, gid, cid, chan);
 }
 
 async function runFightRelease({ interaction, gid, cid, actorId, forceTargetId = null, flavour = null }) {
@@ -13719,6 +14141,7 @@ function fightAnswerRows(kind, { forNpc = false, held = false, auto = false, gid
     if (kind === 'def') return [new ActionRowBuilder().addComponents(N('fndef:str', '\u{1F3AD} STR'), N('fndef:con', '\u{1F3AD} CON'), N('fndef:dex', '\u{1F3AD} DEX'), N('fndef:wis', '\u{1F3AD} WIS'), N('fndef:lck', '\u{1F3AD} LCK'))];
     if (kind === 'atk') return [new ActionRowBuilder().addComponents(N('fnatk:str', '\u{1F3AD} STR'), N('fnatk:con', '\u{1F3AD} CON'), N('fnatk:dex', '\u{1F3AD} DEX'), N('fnatk:wis', '\u{1F3AD} WIS'), N('fnatk:lck', '\u{1F3AD} LCK'))];
     if (kind === 'breakfree') return [new ActionRowBuilder().addComponents(N('fbreak', '\u{1F3AD} Break free (STR)'), N('fstay', '\u{1F3AD} Stay'))];
+    if (kind === 'retrieve') return [new ActionRowBuilder().addComponents(N('fnretrieve', '\u{1F3AD} Retrieve the weapon'))];
     return [];
   }
   const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
@@ -13730,9 +14153,11 @@ function fightAnswerRows(kind, { forNpc = false, held = false, auto = false, gid
     // Deflect and Disarm ANSWER an NPC's attack, so they live with the
     // defence, not the attack (moved 2026-09-12; on your own attack turn
     // they could only refuse).
+    // A grapple answers any ordinary strike too (T, 2026-11-10).
     new ActionRowBuilder().addComponents(
       B('fact:deflect', '\u{1F6E1}\uFE0F Deflect', ButtonStyle.Secondary),
-      B('fact:disarm', '\u2694\uFE0F Disarm', ButtonStyle.Secondary))];
+      B('fact:disarm', '\u2694\uFE0F Disarm', ButtonStyle.Secondary),
+      B('fact:grapple', '\u{1F93C} Grapple', ButtonStyle.Secondary))];
 // The attacker's turn had no buttons at all until now — you could answer
   // a blow by tapping but never throw one (T, 2026-08-22). Same five stats,
   // same shape; the target is asked for by the picker the press opens.
@@ -13750,7 +14175,12 @@ function fightAnswerRows(kind, { forNpc = false, held = false, auto = false, gid
       // Someone already in a hold has no free hands to start one (T,
       // 2026-08-22) — the rest they may still attempt, at a flat d20.
       ...(held ? [] : [B('fact:grapple', '\u{1F93C} Grapple', ButtonStyle.Secondary)]),
-      B('fact:feint', '\u{1F300} Feint', ButtonStyle.Secondary)])];
+      B('fact:feint', '\u{1F300} Feint', ButtonStyle.Secondary),
+      // On your own turn a disarm goes for an NPC's weapon (T, 2026-11-10).
+      B('fact:disarm', '\u2694\uFE0F Disarm', ButtonStyle.Secondary)])];
+  // Disarmed: the turn is the weapon's (T, 2026-11-10).
+  if (kind === 'retrieve') return [new ActionRowBuilder().addComponents(
+    B('fact:retrieve', '\u{1FAF4} Retrieve your weapon', ButtonStyle.Primary))];
   // A held fighter, on their own turn: keep the hold or let it go. Escape
   // belongs to the captive, so it is offered on their turn instead.
   if (kind === 'hold') return [new ActionRowBuilder().addComponents(
@@ -13768,27 +14198,33 @@ function fightAnswerRows(kind, { forNpc = false, held = false, auto = false, gid
   return [];
 }
 
-// A grapple or feint pressed from a button has no target yet. Offer the
-// other fighters; a feint then asks for the claim in a modal.
+// A grapple, feint or disarm pressed from a button has no target yet. Offer
+// the other fighters \u2014 for a disarm the NPCs only, the ones still armed
+// (T, 2026-11-10); a feint then asks for the claim in a modal.
 async function offerAbilityTarget(interaction, which) {
   const gid = interaction.guild.id, cid = interaction.channel.id, uid = interaction.user.id;
   const fight = getFight(gid, cid);
   if (!fight || fight.state !== 'active') return interaction.reply({ ephemeral: true, content: NO_ACTIVE_FIGHT });
   const order = fightOrder(fight);
+  // Disarmed, the turn is the weapon's: refused before the picker.
+  if (fight.phase === 'attack' && order[fight.turn_index] === uid && disarmedOf(fight, uid))
+    return interaction.reply({ ephemeral: true, content: disarmedRefusal(), components: fightAnswerRows('retrieve', { gid }) });
   const hp = fightHp(fight), floor = fightFloor(fight);
   const opts = [];
   for (const fid of order) {
     if (fid === uid) continue;
     if (hp[fid] !== undefined && hp[fid] <= floor) continue;
+    if (which === 'disarm' && (!isNpcFighter(fid) || disarmedOf(fight, fid))) continue;
     const F = await resolveFighter(interaction.guild, gid, fid).catch(() => null);
     if (F) opts.push({ label: `${F.name}${F.isNpc ? ' (NPC)' : ''}`.slice(0, 100), value: fid });
   }
-  if (!opts.length) return interaction.reply({ ephemeral: true, content: '\u274C Nobody left to target.' });
+  if (!opts.length) return interaction.reply({ ephemeral: true, content: which === 'disarm' ? '\u274C No armed NPC left standing to disarm.' : '\u274C Nobody left to target.' });
   const { ActionRowBuilder: PR, StringSelectMenuBuilder: PS } = require('discord.js');
-  const menu = new PS().setCustomId(`fightact:${which}:${uid}`).setPlaceholder(which === 'feint' ? 'Feint at whom?' : 'Grapple whom?')
+  const menu = new PS().setCustomId(`fightact:${which}:${uid}`).setPlaceholder(which === 'feint' ? 'Feint at whom?' : which === 'disarm' ? 'Disarm whom?' : 'Grapple whom?')
     .addOptions(opts.slice(0, 25));
   return interaction.reply({ ephemeral: true, content: which === 'feint'
     ? '\u{1F300} Pick your mark \u2014 then you will be asked what you pretend to do.'
+    : which === 'disarm' ? '\u2694\uFE0F Pick whose weapon you are going for \u2014 NPCs only.'
     : '\u{1F93C} Pick who you are grabbing.', components: [new PR().addComponents(menu)] });
 }
 
@@ -13839,7 +14275,7 @@ async function handleFight(interaction, forced) {
     const npcSpent = isNpcFighter(meId) && f0 && (JSON.parse(f0.effect_state || '{}')[meId]?.feintUsed);
     if (deceptionSpent(gid, meId) || npcSpent) {
       return interaction.reply({ ephemeral: true, content:
-        '🎭 That trick is spent — make an ordinary stat roll before trying another. A lie only sells once until you fight straight.' });
+        '🎭 That feint is spent — make an ordinary stat roll before feinting again. A lie only sells once until you fight straight.' });
     }
     // A kept hold is answered by Break free or Stay: refused here, before the
     // trick is spent (it was spent and then refused, audit 2026-11-09).
@@ -13850,6 +14286,10 @@ async function handleFight(interaction, forced) {
     // reading it, so the feint is refused before the trick is spent.
     if (f0?.state === 'active' && f0.phase === 'defend' && f0.current_target === meId && !f0.atk_kind && f0.atk_nat === 20) {
       return interaction.reply({ ephemeral: true, content: '🎭 A **natural 20** cannot be read \u2014 it lands whatever you roll. Brace with `/fight def` instead.' });
+    }
+    // One answer per strike: refused before the deception is spent.
+    if (f0?.state === 'active' && f0.phase === 'defend' && f0.current_target === meId && !f0.atk_kind && f0.def_roll != null) {
+      return interaction.reply({ ephemeral: true, content: ALREADY_ANSWERED });
     }
     if (f0?.state === 'active' && f0.phase === 'defend' && f0.current_target === meId
         && f0.atk_kind !== 'feint' && f0.atk_kind !== 'grapple') {
@@ -14612,6 +15052,11 @@ async function handleFight(interaction, forced) {
     }
 
     if (fight.phase !== 'attack') return interaction.reply({ content: '❌ Waiting for defender to roll first.', ephemeral: true });
+    // Disarmed: the turn goes to the weapon, and the refusal carries the
+    // Retrieve button (T, 2026-11-10).
+    if (disarmedOf(fight, actorId)) return interaction.reply({ ephemeral: true,
+      content: disarmedRefusal(npcActAs ? npcNameFromFighter(actorId) : null),
+      components: fightAnswerRows('retrieve', { forNpc: !!npcActAs, gid }) });
 
     // A stat button carries its stat on `forced`; the slash command on the
     // option. The defence branch honoured this; the attack branch did not,
@@ -14706,6 +15151,8 @@ async function handleFight(interaction, forced) {
     if (fight.atk_kind === 'grapple') return interaction.reply({ content: '🤼 That is a grapple — answer with `/fight act action:Save` (STR only).', ephemeral: true });
     if (fight.atk_kind === 'feint') return interaction.reply({ content: '🎭 That is a feint — answer with `/fight act action:Insight` (WIS only).', ephemeral: true });
     if (fight.atk_kind === 'hold') return interaction.reply({ content: '\u{1FAA2} That is a kept hold \u2014 answer with \u{1F513} Break free (`/fight act action:Escape`) or \u26D3\uFE0F Stay.', ephemeral: true });
+    // One answer per strike (audit, 2026-11-10): `/fight rr` rerolls it.
+    if (fight.def_roll != null) return interaction.reply({ ephemeral: true, content: ALREADY_ANSWERED });
 
     const npcActAs = forcedOf(forced, 'npc') ?? interaction.options?.getString?.('npc'); // GM defending as an NPC
     const forcedStat = (forced && typeof forced === 'object') ? forced.stat : null;
@@ -14855,6 +15302,19 @@ async function handleFight(interaction, forced) {
   if (sub === 'disarm') {
     const mode = interaction.options?.getString?.('roll') || 'normal';
     const flavour = forcedOf(forced, 'flavour') ?? interaction.options?.getString?.('flavour');
+    if (forcedOf(forced, 'npc') ?? interaction.options?.getString?.('npc'))
+      return interaction.reply({ ephemeral: true, content: '⚔️ Disarming is a player\u2019s move \u2014 NPCs are disarmed; they do not disarm.' });
+    // On your own turn a disarm goes for an NPC's weapon (T, 2026-11-10);
+    // with a strike pending on you, it answers the strike.
+    const fX = getFight(gid, cid);
+    const myTurn = fX?.state === 'active' && fX.phase === 'attack' && fightOrder(fX)[fX.turn_index] === uid;
+    if (forcedOf(forced, 'attack') || myTurn) {
+      const tNpcX = interaction.options?.getString?.('target_npc');
+      const tUserX = interaction.options?.getUser?.('target');
+      const targetX = forcedOf(forced, 'targetId') || (tNpcX ? npcFighterId(tNpcX) : tUserX ? tUserX.id : null);
+      if (!targetX) return offerAbilityTarget(interaction, 'disarm');
+      return runFightDisarmAttack({ interaction, gid, cid, targetId: targetX, mode, flavour });
+    }
     return runFightDisarm({ interaction, gid, cid, mode, flavour });
   }
   if (sub === 'deflect') {
@@ -14870,6 +15330,18 @@ async function handleFight(interaction, forced) {
   }
   if (sub === 'grapple') {
     const npcActAs = forcedOf(forced, 'npc') ?? interaction.options?.getString?.('npc');
+    // With an ordinary strike pending on you, a grapple is your defence (T,
+    // 2026-11-10): no target to name \u2014 it seizes the striker. A target
+    // picked on the attack picker always means the attacking grab.
+    {
+      const pickedG = (forced && typeof forced === 'object') ? forced.targetId : null;
+      const fG = getFight(gid, cid);
+      if (forcedOf(forced, 'defend') || (!npcActAs && !pickedG && fG?.state === 'active' && fG.phase === 'defend' && fG.current_target === uid)) {
+        return runFightGrappleDef({ interaction, gid, cid,
+          mode: interaction.options?.getString?.('roll') || 'normal',
+          flavour: forcedOf(forced, 'flavour') ?? interaction.options?.getString?.('flavour') });
+      }
+    }
     let actorId = interaction.user.id;
     if (npcActAs) {
       if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can act as an NPC.', ephemeral: true });
@@ -14925,6 +15397,27 @@ async function handleFight(interaction, forced) {
     const forceTargetId = tNpc ? npcFighterId(tNpc) : (tUser ? tUser.id : null);
     return runFightRelease({ interaction, gid, cid, actorId, forceTargetId, flavour: forcedOf(forced, 'flavour') });
   }
+  if (sub === 'retrieve') {
+    // A disarmed fighter's turn (T, 2026-11-10): the form, then the turn
+    // passes. A GM retrieves for an NPC with npc:.
+    const npcActAs = forcedOf(forced, 'npc') ?? interaction.options?.getString?.('npc');
+    let actorId = interaction.user.id;
+    if (npcActAs) {
+      if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can act as an NPC.', ephemeral: true });
+      actorId = npcFighterId(npcActAs);
+    }
+    const flavour = forcedOf(forced, 'flavour') ?? interaction.options?.getString?.('flavour') ?? null;
+    // Typed with no words: the form the Retrieve button opens.
+    if (!(forced && typeof forced === 'object') && !flavour) {
+      const fR = getFight(gid, cid);
+      const whyR = !fR || fR.state !== 'active' ? NO_ACTIVE_FIGHT
+        : fR.phase !== 'attack' || fightOrder(fR)[fR.turn_index] !== actorId ? '❌ It is not your turn.'
+        : !disarmedOf(fR, actorId) ? '⚔️ Nothing to retrieve — not disarmed.' : null;
+      if (whyR) return interaction.reply({ ephemeral: true, content: whyR });
+      return openFightRp(interaction, 'retrieve', { npc: npcActAs || null }, { title: 'Retrieve your weapon' });
+    }
+    return runFightRetrieve({ interaction, gid, cid, actorId, flavour });
+  }
   if (sub === 'rr') {
     let fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
@@ -14961,10 +15454,13 @@ async function handleFight(interaction, forced) {
     // (no stat, no advantage/disadvantage) on the reroll too.
     // A flat roll (fumbled defence, restrained/off-balance/fooled attack) stays
     // flat on the reroll: mod 0 while the fighter's real stat is non-zero.
-    const isFlat = effMod === 0 && rawStat !== 0;
-    const bonus = isAttacker ? Math.max(0, effMod - rawStat) : 0; // riposte carried into the reroll
+    // A flat attack can carry a riposte banked to ride it (T, 2026-11-10): a
+    // flat d20 +2, a modifier no honest stat of theirs would give.
+    const flatRip = isAttacker && effMod === 2 && rawStat !== 0 && rawStat !== 2;
+    const isFlat = (effMod === 0 && rawStat !== 0) || flatRip;
+    const bonus = flatRip ? 2 : isAttacker ? Math.max(0, effMod - rawStat) : 0; // riposte carried into the reroll
     const effMode = isFlat ? 'normal' : mode;
-    const modStr = isFlat ? '' : (effMod > 0 ? ` +${effMod}` : effMod < 0 ? ` ${effMod}` : '');
+    const modStr = isFlat && !flatRip ? '' : (effMod > 0 ? ` +${effMod}` : effMod < 0 ? ` ${effMod}` : '');
     const bonusTag = bonus ? ` +${bonus} riposte` : '';
     let nat, total, rollLine;
     const icon = isAttacker ? '⚔️' : '🛡️';
@@ -14981,7 +15477,7 @@ async function handleFight(interaction, forced) {
       rollLine = `${icon}  1d20+${STAT_LABELS[stat]}${bonusTag} (disadvantage) → [${nat}, ~~${dropped}~~]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     } else {
       nat = rollDie(20); total = nat + effMod;
-      const label = isFlat ? `${icon}  1d20 (flat d20)` : `${icon}  1d20+${STAT_LABELS[stat]}${bonusTag}`;
+      const label = isFlat ? `${icon}  1d20 (flat d20)${bonusTag}` : `${icon}  1d20+${STAT_LABELS[stat]}${bonusTag}`;
       rollLine = `${label} → [${nat}]${modStr} = ${fightTotalStr(total, nat, 20)}`;
     }
     recordRoll(gid, { userId: uid, channelId: cid, interaction,
@@ -16345,9 +16841,9 @@ async function clockStrike(guild, gid, cid, channel, mins, at = null) {
   const fooled = consumeFooled(gid, cid, attackerId) || consumeFlatMark(gid, attackerId);
   const flat = restrained || offBalance || fooled;
   clearRoundFlag(gid, cid, attackerId);
-  const atkBonus = flat ? 0 : consumeAtkBonus(gid, cid, attackerId);
+  const atkBonus = consumeAtkBonus(gid, cid, attackerId, { flat: !!flat });
   const R = rulesFor(gid);
-  const mod = flat ? 0 : (R.defence === 'ac' ? autoAtkBonus5e(R, attRow, stat) : (attacker.stats[stat] ?? 0)) + atkBonus;
+  const mod = (flat ? 0 : (R.defence === 'ac' ? autoAtkBonus5e(R, attRow, stat) : (attacker.stats[stat] ?? 0))) + atkBonus;
   const a = autoRoll(mod, autoEdge(fooled === 'dis' ? 'dis' : flat, attRow, stat));
   mirrorAutoRoll(gid, cid, attacker.name, `1d20${autoTag(a)}`, a, a.total, `fight attack (${flat ? 'flat d20' : STAT_LABELS[stat]}) — the turn clock`);
   const ac = R.defence === 'ac' ? R.targetNumber(targetF.isNpc ? getNpc(gid, targetF.name) : getChar(gid, target)) : null;
@@ -16359,6 +16855,7 @@ async function clockStrike(guild, gid, cid, channel, mins, at = null) {
   });
   const hide = attacker.isNpc && !npcStatsVisible(gid);
   const why = (restrained ? ' 🤼 restrained — flat' : offBalance ? ' 🛡️ off-balance — flat' : fooled ? ' 🎭 flat d20' : '')
+    + (atkBonus ? ` \u2728 +${atkBonus} riposte` : '')
     + (a.adv ? ' (advantage)' : a.dis ? ' (disadvantage)' : '');
   const lines = [
     `⏳ ${mins} minutes quiet — the bot attacks for **${attacker.name}${attacker.isNpc ? ' 🎭' : ''}**, at **${targetF.name}${targetF.isNpc ? ' 🎭' : ''}**${hide || flat ? '' : ` with **${STAT_LABELS[stat]}**`}.`,
@@ -16445,6 +16942,8 @@ async function clockSkipFight(guild, gid, cid, channel, mins, { at = null, lead 
   if (moved()) return false;
   try { noteQuestActivity(gid, cid, 'combat', lead ? `${waited.name}'s attack called off — its target had fallen` : `${waited.name}'s turn skipped — ${mins} minutes quiet`); } catch {}
   const lines = [lead || `⏭️ ${mins} minutes quiet — **${waited.name}${waited.isNpc ? ' 🎭' : ''}**'s turn is skipped; they stay in the fight.`];
+  // A disarmed fighter's skipped turn is their retrieval (2026-11-10).
+  if (consumeEffectFlag(gid, cid, waitedId, 'disarmed')) lines.push('\u{1F5E1}\uFE0F The skipped turn goes to retrieving their weapon.');
   // A skipped turn still ends: a held fighter's wound for the round lands
   // (T, 2026-11-09).
   const st = await applyTurnEndStrain(guild, gid, cid, hp, [...order], order, floor, lines, waitedId);
@@ -25867,6 +26366,26 @@ async function sweepOldUpdatePosts(client, gid) {
 }
 
 const CHANGELOG = [
+  { key: '2026-11-10', gm: [
+      { line: 'Disarm, reworked: DEX 4+, no blade, NPCs only \u2014 against an NPC\u2019s strike, or now on your own turn \u2014 and a disarmed fighter spends their next turn retrieving the weapon, through a Retrieve button and its form',
+        detail: 'On your turn Disarm goes for an NPC\u2019s weapon: your d20 + DEX against its d20 + the better of its STR and DEX, rolled by the bot with its signature advantage, no naturals on its die, ties to the NPC. Against a strike it is DEX against the attack as before, once a round and never against a natural 20. Either way a 20 disarms whatever the totals and wounds the NPC 1 \u2014 against a strike it also banks +2 that rides even a flat attack \u2014 and a 1 fails outright for 2 wounds and disarms YOU. After any disarm the disarmer\u2019s very next roll is a flat d20, in place of the old flat next defence. Disarmed, a fighter\u2019s turn is the weapon\u2019s: no attack, grab, feint, disarm, escape or hold. A player presses \u{1FAF4} Retrieve (or `/fight act action:Retrieve`) and a short form takes what they do and say; a GM has the \u{1F3AD} Retrieve button for an NPC, or `npc:`; the auto-pilot and the turn clock retrieve on their own, and a skipped turn counts as the retrieval. Whatever flat roll they owe now waits for their next real roll \u2014 a disarmed attack used to spend it before refusing. NPCs never disarm.' },
+      { line: 'A deflected NPC loses its next turn retrieving the weapon, and a deflection of 20 banks +2 on the deflector\u2019s flat next attack',
+        detail: 'The trade-off stands \u2014 the deflector\u2019s next attack is a flat d20 \u2014 and after a 20 it carries +2. A riposte banked that way, or by a disarm of 20, is the only kind a flat attack spends; any other still waits for an honest swing.' },
+      { line: 'Grapple as a defence: against an ordinary strike, STR against the attack \u2014 beat it and the blow does nothing and the striker is held, the wounds starting once your turn has come round',
+        detail: 'STR 4+, ties to the attack. A 20 takes hold whatever the totals and banks +2; falling short lets the blow land as on any failed defence, a 1 adding its point. Not against a natural 20, a grab, a feint or a kept hold; not from a hold, while holding someone, or on a striker already held. The defence buttons carry \u{1F93C} Grapple, and `/fight act action:Grapple` with a strike pending on you is this. And the grab\u2019s naturals carry over: a grab of 1 leaves the grappler\u2019s next defence flat, and a save of 20 that holds leaves the grappler\u2019s next attack flat and banks the saver +2.' },
+      { line: '`/deception` opens a form \u2014 what you pretend, what you are really planning (shown once the dice have spoken), what you say \u2014 and the totals decide: a 1 fails outright, no other natural counts, and there is no cooldown',
+        detail: 'Ties go to the mark; fooled, their very next roll anywhere is a flat d20, and the deceiver\u2019s is too whatever happens, at disadvantage after a 1. Deceive as often as the scene holds; one feint per honest roll still stands in a fight. `target_npc:` deceives an NPC, its insight rolled by the bot; a GM deceives a player as an NPC with `npc:`. An NPC fooled, or paying its own price, carries the flat roll on its sheet to its next roll anywhere \u2014 `/npc roll`, a called check, a fight. The `claim:` and `flavour:` options are gone: the form takes them. The bot says \u201cdeception\u201d where it said \u201ctrick\u201d.' },
+      { line: 'Fixed: a defence could be rolled again for free \u2014 a second `/fight def`, or a deflect, disarm or feint after one, replaced the first',
+        detail: 'One answer per strike now: once the defence is in, `/fight resolve` settles it, and `/fight rr` (a token) is the reroll \u2014 as a custom `/roll fight:true` already insisted. Refused before anything is spent.' },
+    ], player: [
+      'Disarm needs DEX 4+, not a blade, and works on NPCs only: against their strike, or on your own turn (your DEX against their best of STR and DEX). A 20 disarms and wounds; a 1 costs 2 and disarms YOU; after any disarm your next roll is a flat d20',
+      'Disarmed? Your next turn goes to the \u{1FAF4} Retrieve button \u2014 say what you do in its form, and the turn passes',
+      'A deflected NPC loses its next turn; a deflection of 20 adds +2 to your flat next attack',
+      'Grapple a blow: with a strike coming, \u{1F93C} Grapple is STR against the attack \u2014 beat it and you take no damage and hold them',
+      'A grab of 1 leaves the grappler\u2019s next defence flat; a save of 20 leaves their next attack flat and gives you +2',
+      '`/deception` opens a form: what you pretend, what you really plan (shown after the roll), what you say. The totals decide, a 1 fails, and there is no cooldown',
+      'One answer per strike: a defence is rerolled with a token, not rolled again',
+    ] },
   { key: '2026-11-09', gm: [
       { line: 'An attacking natural 20 always lands now, whatever the totals, for 2 \u2014 4 against a defending 1',
         detail: 'It used to add its point only when the totals let it through; only a 20 against a 20 landed regardless. Now no defence stops it: Deflect was already refused against a 20, and Disarm and a defensive feint are refused too, before anything is spent. A defending 20 still banks its +2, and a defending 1 still adds its point. The auto-pilot no longer spends an NPC\u2019s reroll on a defence a 20 makes pointless \u2014 only on a defending 1, which would cost a point more. The card says so when the 20 carried a blow the totals would have stopped. 5e is unchanged: a 20 always hit there.' },
@@ -28163,10 +28682,14 @@ async function postDcCheck(interaction, { stat, notation, dc, gmMode, flat, modi
   for (const name of npcNames.slice(0, 10)) {
     const npc = getNpc(gid, name);
     if (!npc) { lines.push('', `❌ No NPC named **${name}**.`); continue; }
-    const r = rollDcCheck({ gid, stat, notation, dc, gmMode, flat, modifier, subject: npc, sig: npc });
+    // An NPC's flat mark strips the stat here too, its rider at disadvantage
+    // (2026-11-10), as a player's does on the press.
+    const flatN = stat && !flat ? consumeFlatMark(gid, npcFighterId(npc.name)) : false;
+    const r = rollDcCheck({ gid, stat, notation, dc, gmMode: flatN === 'dis' && (gmMode || 'normal') === 'normal' ? 'dis' : gmMode,
+      flat: flat || !!flatN, modifier, subject: npc, sig: npc });
     if (!r) continue;
     mirrorAutoRoll(gid, cid, npc.name, `${notation ?? '1d20'}${r.mode !== 'normal' ? ` (${r.mode})` : ''}`, r.nat, r.total, `GM check vs DC ${dc}`);
-    lines.push('', `🎭 **${npc.name}** — ${r.rollLine}`, secret ? r.band : `${r.band} vs DC ${dc}`);
+    lines.push('', `🎭 **${npc.name}**${flatN ? ' (\u{1F3AD} flat d20)' : ''} — ${r.rollLine}`, secret ? r.band : `${r.band} vs DC ${dc}`);
     const oFlav = r.passed ? sF : fF;
     if (oFlav) lines.push(`_${oFlav}_`);
     applyDcSanction({ gid, id: npcFighterId(npc.name), isNpc: true, sanction: r.passed ? sS : fS, lines });
@@ -29252,6 +29775,7 @@ async function fightStatusLines(guild, gid, cid, fight) {
     if (fx.flatDef) fxBits.push('🎲 flat-d20 next defence');
     if (fx.flatAtk) fxBits.push('🎲 flat-d20 next attack');
     if (fx.fooled) fxBits.push(`🎭 flat-d20 next roll${fx.fooledDis ? ', at disadvantage' : ''}`);
+    if (fx.disarmed) fxBits.push('\u{1F5E1}\uFE0F disarmed \u2014 next turn retrieving');
     const fxNote = fxBits.length ? ` · ${fxBits.join(' · ')}` : '';
     const hpText = hideHp ? hpCondition(rawHp, f.maxHp, floor) : `❤️ ${hp} / ${hpMax}${floor > 0 && rawHp <= floor ? ' 🏳️ yielded' : ''}`;
     lines.push(`${i+1}. **${f.name}${f.isNpc ? ' 🎭' : ''}** — ${hpText}${rrNote}${fxNote}${arrow}`);
@@ -29293,9 +29817,7 @@ async function fightTurnPrompt(guild, gid, cid) {
       components: fightAnswerRows('def', { forNpc: tgt.isNpc, auto: autoNpc }),
       allowedMentions: tgt.isNpc ? { parse: [] } : { users: [f.current_target] } };
   }
-  const gmap = fightGrapples(f);
-  const rowsFor = gmap[curId] ? ['escape', 'atk'] : Object.values(gmap).includes(curId) ? ['hold', 'atk'] : ['atk'];
-  const rows = cur.isNpc ? fightAnswerRows('atk', { forNpc: true, auto: autoNpc, gid }) : rowsFor.flatMap(k => fightAnswerRows(k, { held: !!gmap[curId], gid })).slice(0, 5);
+  const rows = turnRowsFor(gid, f, curId, { auto: autoNpc });
   const hpLine = await fightHpLine(guild, gid, cid, order);
   const state = await fighterStateLine(guild, gid, cid, curId);
   return { content: `🎯 **${cur.name}${cur.isNpc ? ' 🎭' : ''}**'s turn to attack!${turnPing(gid, cur)}${hpLine}${state}`,
@@ -30869,10 +31391,10 @@ const slashCommands = [
       .addIntegerOption(o=>o.setName('id').setDescription('Question number').setRequired(true).setAutocomplete(true))),
 
   new SlashCommandBuilder()
-    .setName('deception').setDescription('Try to deceive someone, away from a fight (in one, feint)')
-    .addUserOption(o=>o.setName('target').setDescription('Who you are trying to fool').setRequired(true))
-    .addStringOption(o=>o.setName('claim').setDescription('What you pretend — shown to everyone').setRequired(false))
-    .addStringOption(o=>o.setName('flavour').setDescription('How you sell it').setRequired(false)),
+    .setName('deception').setDescription('Try to deceive someone, away from a fight (in one, feint) \u2014 a form follows')
+    .addUserOption(o=>o.setName('target').setDescription('The player you are deceiving').setRequired(false))
+    .addStringOption(o=>o.setName('target_npc').setDescription('Or an NPC \u2014 the bot rolls its insight').setRequired(false).setAutocomplete(true))
+    .addStringOption(o=>o.setName('npc').setDescription('GM: deceive AS this NPC').setRequired(false).setAutocomplete(true)),
 
   new SlashCommandBuilder()
     .setName('help').setDescription('Show all commands by category')
@@ -31068,13 +31590,14 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('act').setDescription('A fight ability — pick it from the menu; grapple, feint, deflect and the rest')
       .addStringOption(o=>o.setName('action').setDescription('The ability').setRequired(true)
         .addChoices(
-          {name:'🤼 Grapple — STR; they answer with Save',value:'grapple'},
+          {name:'🤼 Grapple — STR: on your turn they Save; against a strike, your defence',value:'grapple'},
           {name:'💪 Save — your STR vs the pending grapple',value:'save'},
           {name:'🏃 Escape — break a hold: STR, on your turn or when it is kept',value:'escape'},
           {name:'⛓️ Stay — let a kept hold stand',value:'stay'},
           {name:'✋ Release — let a hold go (free action)',value:'release'},
           {name:'🛡️ Deflect — STR/DEX vs a PvE attack, may redirect',value:'deflect'},
-          {name:'🗡️ Disarm — DEX vs a PvE attacker',value:'disarm'},
+          {name:'🗡️ Disarm — DEX vs an NPC: on your turn, or against its strike',value:'disarm'},
+          {name:'🫴 Retrieve — your disarmed turn: fetch the weapon',value:'retrieve'},
           {name:'🎭 Feint — WIS vs WIS; fooled targets roll flat',value:'feint'},
           {name:'👁️ Insight — your WIS against the pending feint',value:'insight'}))
       .addUserOption(o=>o.setName('target').setDescription('Player target (grapple/feint; GM force-release)').setRequired(false))
@@ -31131,7 +31654,7 @@ const slashCommands = [
         {name:'🤼 Grapple',value:'grapple'},{name:'💪 Save',value:'save'},
         {name:'🏃 Escape',value:'escape'},{name:'⛓️ Stay',value:'stay'},{name:'✋ Release',value:'release'},
         {name:'🛡️ Deflect',value:'deflect'},{name:'🗡️ Disarm',value:'disarm'},
-        {name:'🎭 Feint',value:'feint'},{name:'👁️ Insight',value:'insight'}))
+        {name:'🎭 Feint',value:'feint'},{name:'👁️ Insight',value:'insight'},{name:'🫴 Retrieve',value:'retrieve'}))
     .addStringOption(o=>o.setName('target_npc').setDescription('Ability actions: NPC target instead of a player').setRequired(false).setAutocomplete(true))
     .addStringOption(o=>o.setName('feint').setDescription('Feint only: what you pretend to do').setRequired(false))
     .addBooleanOption(o=>o.setName('last').setDescription('true = show your most recent roll in this channel instead of rolling').setRequired(false))
@@ -31697,16 +32220,18 @@ const HELP_CATEGORIES = {
       '`/fight def stat:dex` — defend: the form opens (with `flavour:` it rolls at once); bare `/fight def` offers the stat buttons · GM defends as an NPC with `npc:Name`, or taps the 🎭 buttons on the NPC\'s defence prompt',
       '`roll:adv` / `roll:dis` on `/fight atk`, `def`, `act` or `rr` waits on a GM\'s yes like any roll you pick it for — name the stat with it, as the stat buttons roll plain; the turn clock waits meanwhile, and if the fight has moved on by the answer, nothing rolls',
       'Every fight button opens a short form first — what you do, what you say, both optional — and the words land on the card; a blank form is a plain roll. A GM\'s ⚖️ Resolve asks what happens and posts it under the outcome',
-      '`/fight act action:Grapple target:@Players` — STR 4+ (Knightfall). STR against the target\'s STR save (`/fight act action:Save`); meets-or-exceeds and the hold takes. A grab of 20 takes it whatever the save, for 2 wounds; a grab of 1 fails outright; a save of 20 slips free unless the grab was a 20 too. Held: immobile, 1 wound a round, actions on a flat d20 — you can still attack anyone, your grappler included',
+      '`/fight act action:Grapple target:@Players` — STR 4+ (Knightfall). STR against the target\'s STR save (`/fight act action:Save`); meets-or-exceeds and the hold takes. A grab of 20 takes it whatever the save, for 2 wounds; a grab of 1 fails outright and leaves your next defence flat; a save of 20 slips free unless the grab was a 20 too, leaving the grappler\'s next attack flat and the saver +2. Held: immobile, 1 wound a round, actions on a flat d20 — you can still attack anyone, your grappler included',
+      '↳ With an ordinary strike pending on you, 🤼 **Grapple** is your defence: STR against the attack, ties to the attack. Beat it and the blow does nothing and the striker is held — the wounds start once your turn has come round; a 20 holds whatever the totals and banks +2; fall short and the blow lands, a 1 adding its point. Not against a natural 20, a grab, a feint or a hold, nor from a hold or while holding someone',
       '🤜 **Maintain the hold** (the holder\'s button, on their turn) — the holder rolls STR and the captive answers: 🔓 **Break free** (STR against it; ties keep the hold) or ⛓️ **Stay** — by button, or `/fight act action:Escape` / `action:Stay`. Staying, or no answer by the turn clock, keeps the hold; an NPC on auto always struggles. A hold of 20 makes the break a flat d20 (staying, their next roll); a hold of 1 slips at once: the captive is free with no wound, and the holder\'s next roll is a flat d20 at disadvantage',
       '`/fight act action:Escape` — on your turn while held: the hold rolls first, then your STR against it. Breaking out first costs nothing; a failed break takes the round\'s wound at once, each further failure that round 1 more, a natural 1 two. A break of 20 frees you whatever the totals and leaves the holder\'s next attack flat. The hold\'s own 20 makes your break flat; its 1 frees you at once, no wound',
       '`/fight act action:Release` — the holder lets go freely (no action); a grappler can never strike their own captive. GMs may part any hold with `target:`',
-      '`/fight act action:Deflect` — shield deflection vs a PvE strike (shield + STR 4+, once per round, crits undeflectable): roll STR or DEX (`stat:`) to beat the attack roll, optionally `redirect_npc:` into another enemy for 1 damage. A natural 20 turns it whatever the totals and the named enemy takes 2; a natural 1 fails for 2 wounds. Either way your next attack is a flat d20 — after a 1, your next defence too',
-      '`/fight act action:Disarm` — disarm a PvE attacker (blade + DEX 4+, once per round, not against a natural 20): roll DEX to beat the attack roll — no damage, but they spend their next turn retrieving the weapon. A natural 20 wounds them 1 instead and leaves their next attack flat; a natural 1 fails for 1 wound and leaves your next attack flat too. Either way your next defence is a flat d20',
-      '`/fight act action:Feint feint:"..."` — the trick in a fight (away from one it is `/deception`), and it spends either half of the fight. On your turn it is an attack: WIS against their insight, and if they fall for it the blow lands with normal damage and their very next roll is a flat d20. A feint of 20 fools them whatever the insight; a feint of 1 is a total failure. An insight of 20 sees through it unless the feint was a 20; an insight of 1 is fooled.',
-      '↳ With a strike pending on you it is a defensive feint — WIS in place of your usual stat, though not against a natural 20, which lands whatever you roll — and if the blow misses, the attacker is taken in: their very next roll is a flat d20. A defensive feint of 1 is a total failure: the blow lands whatever the totals, unless the attack was a 1 too. The price of any feint, landed or not: your own very next roll is a flat d20 — at disadvantage too after a 1. WIS 4+; ties go to the target. One trick per honest roll: after a feint or a deception you must make an ordinary stat roll before trying another — the flat roll a trick costs you counts.',
-      '`/deception target:@Players claim:"..."` — the same trick away from a fight, with the same naturals and the same price. While you or they are fighting in the channel it is refused: there, the trick is a feint. Win and their very next roll is a straight d20, be it a chat roll, `/roll`, a scene\'s roll, a called check or a fight somewhere else.',
-      '`/fight rr` — reroll (costs a token) · `/fight resolve` — resolve a clash',
+      '`/fight act action:Deflect` — shield deflection vs a PvE strike (shield + STR 4+, once per round, crits undeflectable): roll STR or DEX (`stat:`) to beat the attack roll, optionally `redirect_npc:` into another enemy for 1 damage — and the enemy loses its next turn retrieving the weapon. A natural 20 turns it whatever the totals, the named enemy takes 2, and your flat next attack gets +2; a natural 1 fails for 2 wounds. Either way your next attack is a flat d20 — after a 1, your next defence too',
+      '`/fight act action:Disarm` — NPCs only, DEX 4+, no blade needed. Against an NPC\'s strike (once per round, not against a natural 20): DEX to beat the attack — no damage, and they spend their next turn retrieving the weapon; a miss lets the blow land for 1. On your own turn (`target_npc:` or the ⚔️ Disarm button): your DEX against their best of STR and DEX, ties to them. A 20 disarms whatever the totals and wounds them 1 (against a strike it also banks +2, even on a flat attack); a 1 fails for 2 wounds and disarms you. After any disarm your very next roll is a flat d20',
+      '🫴 **Retrieve** — disarmed, your next turn goes to fetching the weapon: press Retrieve (or `/fight act action:Retrieve`) and say what you do; no attack, grab, feint, disarm, escape or hold until you have. GMs retrieve for an NPC with its 🎭 button or `npc:`; the auto-pilot and the turn clock do it themselves, and a skipped turn counts',
+      '`/fight act action:Feint feint:"..."` — a deception in a fight (away from one it is `/deception`), and it spends either half of the fight. On your turn it is an attack: WIS against their insight, and if they fall for it the blow lands with normal damage and their very next roll is a flat d20. A feint of 20 fools them whatever the insight; a feint of 1 is a total failure. An insight of 20 sees through it unless the feint was a 20; an insight of 1 is fooled.',
+      '↳ With a strike pending on you it is a defensive feint — WIS in place of your usual stat, though not against a natural 20, which lands whatever you roll — and if the blow misses, the attacker is taken in: their very next roll is a flat d20. A defensive feint of 1 is a total failure: the blow lands whatever the totals, unless the attack was a 1 too. The price of any feint, landed or not: your own very next roll is a flat d20 — at disadvantage too after a 1. WIS 4+; ties go to the target. One feint per honest roll: after a feint you must make an ordinary stat roll before feinting again — the flat roll a feint costs you counts.',
+      '`/deception target:@Players` (or `target_npc:`) — away from a fight, a form: what you pretend (shown), what you are really planning (shown once the dice have spoken), what you say. WIS against their insight; the totals decide, ties to them, and a natural 1 fails outright — no other natural counts. Win and their very next roll is a straight d20, be it a chat roll, `/roll`, a scene\'s roll, a called check or a fight somewhere else; your own very next roll is a flat d20 whatever happens, at disadvantage after a 1. No cooldown. GMs deceive as an NPC with `npc:`. Refused while you or they are fighting in the channel: there, it is a feint.',
+      '`/fight rr` — reroll (costs a token): one answer per strike, so a defence is rerolled, never rolled again · `/fight resolve` — resolve a clash',
       '`/fight status` — show current fight · `/fight forfeit` — drop out',
       '`/duel opponent:@Players terms:first blood` — raise a duel; a GM signs off, then starts the fight',
       '`/fight auto mode:Full players:@Players npcs:Hollow tank` — bot resolves the whole fight (GM)',
@@ -32199,7 +32724,7 @@ async function routeButton(interaction) {
       return interaction.reply({ ephemeral: true,
         content: buildCharCard(ch3, nm3, heal3.current, cfg3.heal_charges ?? 3, interaction.guild.id).join('\n') });
     }
-    if (interaction.customId.startsWith('fdef:') || interaction.customId.startsWith('fatk:') || interaction.customId.startsWith('fndef:') || interaction.customId.startsWith('fnatk:') || interaction.customId.startsWith('fact:') || ['fsave', 'finsight', 'fresolve', 'frr', 'fbreak', 'fstay'].includes(interaction.customId)) {
+    if (interaction.customId.startsWith('fdef:') || interaction.customId.startsWith('fatk:') || interaction.customId.startsWith('fndef:') || interaction.customId.startsWith('fnatk:') || interaction.customId.startsWith('fact:') || ['fsave', 'finsight', 'fresolve', 'frr', 'fbreak', 'fstay', 'fnretrieve'].includes(interaction.customId)) {
       // A press walks the exact slash path — the branch's own gates (turn,
       // phase, pending kind, roll ownership, tokens) do all the deciding.
       // Every press opens the roleplay form first (T, 2026-10-14); the
@@ -32219,6 +32744,7 @@ async function routeButton(interaction) {
         const stat = interaction.customId.split(':')[1];
         const asNpc = interaction.customId.startsWith('fndef:');
         if (fF.phase !== 'defend') return refuseF('\u274C No attack to defend against yet.');
+        if (fF.def_roll != null && !fF.atk_kind) return refuseF(ALREADY_ANSWERED);
         const tgt = fF.current_target;
         if (asNpc) {
           if (!isNpcFighter(tgt)) return refuseF('\u274C The one defending is a player.');
@@ -32242,19 +32768,41 @@ async function routeButton(interaction) {
       }
       if (interaction.customId.startsWith('fact:')) {
         const which = interaction.customId.split(':')[1];
+        // With an ordinary strike pending on you, Grapple is your defence (T,
+        // 2026-11-10): the form, then the grab \u2014 no target to pick.
+        if (which === 'grapple' && fF.phase === 'defend' && fF.current_target === uidF) {
+          const whyG = defGrappleRefusal(fF, uidF);
+          if (whyG) return refuseF(whyG);
+          return openFightRp(interaction, 'grappledef', {}, { title: 'Grapple the blow' });
+        }
+        // On your own turn Disarm goes for an NPC's weapon: the picker first.
+        if (which === 'disarm' && fF.phase === 'attack') {
+          if (currentF !== uidF) return refuseF('\u26A0\uFE0F It is not your turn.');
+          return offerAbilityTarget(interaction, 'disarm');
+        }
         // Grapple needs a target and Feint a target AND a claim: the picker
         // first, then the form. The rest open their form straight away.
         if (which === 'grapple' || which === 'feint') return offerAbilityTarget(interaction, which);
+        if (which === 'retrieve') {
+          if (currentF !== uidF || fF.phase !== 'attack') return refuseF('\u274C It is not your turn.');
+          if (!disarmedOf(fF, uidF)) return refuseF('\u2694\uFE0F Nothing to retrieve \u2014 you are not disarmed.');
+          return openFightRp(interaction, 'retrieve', {}, { title: 'Retrieve your weapon' });
+        }
         if (which === 'maintain') {
           if (currentF !== uidF) return refuseF('\u274C It is not your turn.');
           if (!grappleHeldTargetOf(fF, uidF)) return refuseF('\u{1F91C} You are not holding anyone.');
+          if (disarmedOf(fF, uidF)) return refuseF(disarmedRefusal());
           return openFightRp(interaction, 'maintain', {}, { title: 'Keep the hold' });
         }
         if (which === 'escape') {
           if (!fightGrapples(fF)[uidF]) return refuseF('\u{1F91C} You are not held.');
+          if (fF.phase === 'attack' && currentF === uidF && disarmedOf(fF, uidF)) return refuseF(disarmedRefusal());
           return openFightRp(interaction, 'escape', {}, { title: 'Break free' });
         }
-        if (which === 'deflect' || which === 'disarm') return openFightRp(interaction, which, {}, { title: which === 'deflect' ? 'Deflect' : 'Disarm' });
+        if (which === 'deflect' || which === 'disarm') {
+          if (fF.phase === 'defend' && fF.current_target === uidF && fF.def_roll != null && !fF.atk_kind) return refuseF(ALREADY_ANSWERED);
+          return openFightRp(interaction, which, {}, { title: which === 'deflect' ? 'Deflect' : 'Disarm' });
+        }
         return handleFight(interaction, { sub: 'act', action: which });
       }
       if (interaction.customId === 'fbreak' || interaction.customId === 'fstay') {
@@ -32269,6 +32817,13 @@ async function routeButton(interaction) {
         return interaction.customId === 'fbreak'
           ? openFightRp(interaction, 'breakfree', { npc: npcB }, { title: 'Break free \u2014 STR' })
           : openFightRp(interaction, 'stay', { npc: npcB }, { title: 'Stay in the hold' });
+      }
+      if (interaction.customId === 'fnretrieve') {
+        // A GM spends a disarmed NPC's turn on its weapon (T, 2026-11-10).
+        if (fF.phase !== 'attack' || !isNpcFighter(currentF)) return refuseF('\u274C It is not an NPC\u2019s turn.');
+        if (!(await isGm(interaction.guild, uidF))) return refuseF('\u274C Only GMs act for an NPC.');
+        if (!disarmedOf(fF, currentF)) return refuseF(`\u2694\uFE0F **${npcNameFromFighter(currentF)}** is not disarmed.`);
+        return openFightRp(interaction, 'retrieve', { npc: npcNameFromFighter(currentF) }, { title: `${npcNameFromFighter(currentF)} \u2014 retrieve`.slice(0, 45) });
       }
       if (interaction.customId === 'fsave') return openFightRp(interaction, 'save', {}, { title: 'Save \u2014 STR' });
       if (interaction.customId === 'finsight') return openFightRp(interaction, 'insight', {}, { title: 'Insight \u2014 WIS' });
@@ -33094,7 +33649,7 @@ async function handleInteraction(interaction) {
         return await interaction.respond(choices.slice(0, 25));
       }
       // Fight NPC fields — suggest server NPC names
-      if ((interaction.commandName === 'fight' || (interaction.commandName === 'roll' && focusedOption.name === 'target_npc')) &&
+      if ((interaction.commandName === 'fight' || interaction.commandName === 'deception' || (interaction.commandName === 'roll' && focusedOption.name === 'target_npc')) &&
           (focusedOption.name === 'npc' || focusedOption.name === 'target_npc' || focusedOption.name === 'redirect_npc')) {
         const focused = (focusedOption.value || '').toString().toLowerCase();
         const npcs = getAllNpcs(interaction.guild.id);
@@ -33312,6 +33867,7 @@ async function handleInteraction(interaction) {
     if (interaction.customId.startsWith('tgtwrite:')) return finishTargetWrite(interaction, interaction.customId.slice(9)).catch(e => console.error('[target]', e?.message || e));
     if (interaction.customId === 'gmbartgt') return finishGmBarTarget(interaction);
     if (interaction.customId === 'gmbarfight') return finishGmBarFight(interaction);
+    if (interaction.customId.startsWith('decept:')) return handleDeceptionSubmit(interaction);
 
     if (interaction.customId.startsWith('frp:')) {
       // The roleplay form comes back: the press's own decision is under the
@@ -33351,6 +33907,14 @@ async function handleInteraction(interaction) {
         }
         case 'escape': case 'save': case 'insight':
           return handleFight(interaction, { sub: 'act', action: p.kind, flavour });
+        // A grapple as the answer to a strike, a disarm on your own turn, and
+        // a disarmed fighter's retrieval (T, 2026-11-10).
+        case 'grappledef':
+          return handleFight(interaction, { sub: 'act', action: 'grapple', defend: true, flavour });
+        case 'disarmatk':
+          return handleFight(interaction, { sub: 'act', action: 'disarm', attack: true, targetId: p.targetId, flavour });
+        case 'retrieve':
+          return handleFight(interaction, { sub: 'act', action: 'retrieve', npc: p.npc || null, flavour });
         case 'breakfree':
           return handleFight(interaction, { sub: 'act', action: 'escape', npc: p.npc || null, flavour });
         case 'stay':
@@ -33455,6 +34019,7 @@ async function handleInteraction(interaction) {
     // The pick opens the form: the grapple's words, or the feint's claim
     // with its words (T, 2026-10-14). The ephemeral picker stays behind.
     if (which === 'grapple') return openFightRp(interaction, 'grapple', { targetId }, { title: 'Grapple' });
+    if (which === 'disarm') return openFightRp(interaction, 'disarmatk', { targetId }, { title: 'Disarm' });
     return openFightRp(interaction, 'feint', { targetId }, { title: 'The feint', claim: true });
   }
 

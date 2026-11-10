@@ -49,9 +49,9 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1301 as of 2026-11-09, build M) and no
+Green means every assertion passed (1315 as of 2026-11-10, build N) and no
 scanner found an ERROR. Then run the probe: `node --experimental-sqlite
-probe.js` (326 probes: the fight, encounter, override, autocomplete and
+probe.js` (333 probes: the fight, encounter, override, autocomplete and
 every-leaf walks, the GM-gate walk, chat shorthands, scheduled ticks,
 junk-id lanes, SQL compile, forum seeding and sweep, one NPC one page, the
 A2 walk, the undo walk, the C walk, the D walk (activities: parser,
@@ -372,6 +372,128 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 10x · The special moves' carry-overs, Disarm both ways, the disarmed turn, /deception's form (2026-11-10, build N)
+
+T queued these over 9–10 Nov while M was out ("Hold this build theres other
+stuff to work on"), then said "But yes build" and "Also audit then push once
+done". What he asked for, as built:
+
+**The grab's naturals carry over.** `resolveGrappleSave`: a grab of 1 sets
+the grappler's `flatDef`; a save of 20 that holds (the grab not a 20) sets
+the grappler's `flatAtk` and banks the saver +2 (`bankRiposte`). Both apply
+when both are rolled, as an exchange's 1 and 20 do.
+
+**A grapple answers a strike.** `runFightGrappleDef` (players; STR 4+; vs any
+ordinary strike, PvP too): 1d20+STR against the attack, ties to the attack,
+a 20 holds whatever the totals and banks +2, a 1 never holds. Seized: no
+damage, `gmap[attacker] = defender`, and the striker's turn ends through
+`passTurn(..., { strain: false })` — the hold is new, its wounds starting
+once the grappler's own turn has come round (T: "damage does not start until
+the defender grapplers attack comes around"). Short of it the defence is
+written to the exchange and `resolveExchange(..., { forceHit: true })` lands
+the blow — 1, a defending 1 adding its point ("regular crit"), an attack of
+1 still fumbling. `defGrappleRefusal` is the one list of no's: a natural 20,
+a grab, a feint, a kept hold (T: "Always prioritise any of the Attack that
+is a special move"), from a hold, while holding someone, on a striker already
+held. Routing: `/fight act action:Grapple` (and `/roll action:Grapple`) with
+a strike pending on you is this; a target picked on the attack picker is
+always the grab; the defence row carries 🤼 Grapple (frp kind `grappledef`).
+
+**Deflect.** A successful deflection sets `disarmed` on the NPC ("Lose its
+next turn to retrieve"); a 20 also banks +2 with `rbFlat`, riding the
+deflector's flat next attack (T: "It adds a +2 on the flat if a nat 20
+deflect").
+
+**A riposte that rides a flat roll.** `bankRiposte(gid, cid, fid, { onFlat })`
+writes `rollBonus: 2` (+ `rbFlat`). `consumeAtkBonus(..., { flat })` spends a
+riposte on a flat attack only when `rbFlat` is set; any other waits for an
+honest swing, as before. The three attack sites (hand, auto-pilot, clock)
+pass `{ flat }` and add the bonus outside the flat zero. The auto card and
+the clock line show "+2 riposte"; `/fight rr` reads a flat +2 from the
+numbers (`flatRip`).
+
+**Disarm, reworked** (T: "Disarm can only be used on npcs, it is a DEX roll,
+4+ Dex is required to disarm, a weapon is not needed"). `hasBladeEquipped`
+is gone. Against a strike (`runFightDisarm`, once a round, never a 20):
+exceed the attack and the NPC is `disarmed`; a 20 disarms whatever, wounds 1
+and banks +2 with `rbFlat`; a 1 fails for 2 and disarms the DISARMER; a plain
+miss lands for 1. On your own turn (`runFightDisarmAttack`, NPC targets only,
+picker `fightact:disarm:*` lists the armed NPCs, frp kind `disarmatk`): your
+1d20+DEX against the NPC's 1d20 + the better of STR and DEX (a tie goes to
+the signature stat), rolled by the bot with its signature advantage, its
+flatDef / fooled / sheet mark clamping it, no naturals on its die, ties to
+the NPC; 20 → disarmed + 1 wound; 1 → you take 2 and are disarmed; a miss →
+nothing; the turn passes. After ANY disarm the disarmer's very next roll is
+flat: `markDisarmUsed` now marks `fooled` (was `flatDef`), and the attacking
+one calls `setFooled`. `npc:` on Disarm is refused — NPCs never disarm.
+
+**The disarmed turn.** `disarmedOf(fight, fid)`; `disarmedRefusal(npcName)`.
+Refused before any flat is spent: `runFightAttack` (the old `retrievalTurn`
+call there, and in `runFightGrapple`, spent the owed flat and then lost it
+to the retrieval — both removed), `runFightGrapple`, `runFightFeint`,
+`runFightMaintain`, `runFightEscape` (own turn; the Break free answer to a
+kept hold is not a turn and stays open), `runFightDisarmAttack`, the typed
+`/fight atk` (with the Retrieve button), a custom `/roll fight:true`, and the
+pickers. `turnRowsFor(gid, fight, fid, { auto })` is now the one door for a
+turn's buttons (announceNextTurn and the undo redraw): a disarmed player gets
+🫴 Retrieve alone (`fact:retrieve` → form → `runFightRetrieve`), a GM's NPC
+🎭 Retrieve (`fnretrieve`, GM-gated); the turn line's hint says so.
+`retrievalTurn(..., flavour)` re-arms `deflected`/`disarmUsed`, leaves owed
+flats for the next real roll, notes the quest, and the auto-pilot now
+delivers through `sendLong` so the next turn's buttons ride along. A GM skip
+or the clock's skip of a disarmed fighter consumes the flag ("the skipped
+turn goes to retrieving their weapon"). `/fight act action:Retrieve` (and
+`/roll action:Retrieve`) typed without words opens the form; `npc:` for GMs.
+
+**One answer per strike** (audit). A second `/fight def` — or a deflect,
+disarm, defensive feint or defensive grapple after one — replaced the cast
+defence for nothing; the custom `/roll fight:true` already refused it.
+`ALREADY_ANSWERED` now refuses all of them, and the `fdef:` buttons, before
+anything is spent (the feint routing's check sits before the deception is
+spent). `/fight rr` is the reroll.
+
+**/deception** (T's version: "A nat 1 deception is a auto fail"; "Call
+tricks as deception...drop it and allow for multiple rp deception").
+`deceptionParties` checks everything, then a form (`decept:<token>`,
+`pendingDeceptions`, 15 minutes): claim (shown), plan ("kept hidden",
+printed after the outcome), speech (optional). The totals decide, ties to
+the mark; only the deceiver's 1 counts (auto-fail, price flat at
+disadvantage); no 20s, no insight naturals. No cooldown: `/deception` neither
+reads nor spends `deception_spent` — one feint per honest roll stays the
+feint's. `target_npc:` makes an NPC the mark (bot insight, mirrored);
+`npc:` lets a GM lie as an NPC (card to the channel, ephemeral ack, refused
+NPC-on-NPC and below WIS 4). Options `claim:`/`flavour:` removed (check.js
+baseline re-saved). Quest log: a `roll` event.
+
+**NPC flat marks.** `npcs.next_mark` (migration). `consumeFlatMark` reads it
+for `npc:` ids; `setFlatMark` writes either sheet; `chargeTrick` uses it
+outside a fight. Spent by the NPC's next roll anywhere: `/npc roll` (a d20
+stat roll: the stat stripped, flatdis at disadvantage, the label says so), a
+GM's called check, and every fight path — the auto-pilot's attack, hold
+break, grab save and insight now read it too. `fighterStateLine` shows an
+NPC's mark.
+
+**Words.** RULES `grapple`, `feint` (a deception in a fight), `deflect-disarm`,
+`attack-nat20` (+ "grappled"), new `deception`, `disarmed`, `defence-once`;
+`/help`; both Knightfall Commands books (the rows, a defensive-grapple row,
+Retrieve rows for both, a GM `/deception npc:` row, the naturals table and
+its note, the buttons row); the `2026-11-10` changelog entry. "Trick" left
+the bot's words (the posted changelog keeps its own). The Examples and 5e
+books did not move.
+
+**Tests.** verify: a `build N` harness (12 pins) and the reworded L pins.
+probe: test 11 (deflect/disarm against a strike) and 12 (/deception) rewritten,
+12b (NPCs either side, the checks before the form), 17 reworded, and 20–25:
+the grab's carry-overs; the defensive grapple (no wound at the striker's turn
+end, the wound when its own turn ends, the button and form, a 20, a miss, a
+1, refusals); one answer per strike; Disarm on your turn (win, tie, 20, 1,
+the picker, PvP refused); the disarmed turn (refusals keep the owed flat,
+Retrieve by button, a GM's 🎭 Retrieve, a skip, the auto-pilot); a riposte on
+a flat attack.
+
+**Not built (said, not asked):** the 5e grapple/deception raw-score fix; the
+auto-pilot swinging at its own captive.
 
 ## 10w · An attacking 20 always lands (2026-11-09, build M)
 

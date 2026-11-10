@@ -131,8 +131,13 @@ New verbs join their group; the wall is history until a single group nears 25.
 - `/roll action:` ignores `mode:` (the fight bridge reads `roll:`), so it is never held — and never rolls with advantage either.
 - An allowed Roll that opens a form stays live until the form comes back or the ten minutes run out; a form opened in time still rolls with advantage after the button has gone.
 - Keeping a hold by roll is a player's: an NPC holder has no Maintain, and the auto-pilot may still swing at its own captive. A held NPC on auto never tries Escape on its own turn (it swings flat); it struggles when a player keeps the hold.
-- A trick's price in a fight is the fight's flag: it waits for the fighter's next fight roll, and goes with the fight if it ends first. Outside a fight it shares the sheet's one mark with a GM's 🔼 or 🔽: whichever is set later stands.
+- A feint's or a deception's price in a fight is the fight's flag: it waits for the fighter's next fight roll, and goes with the fight if it ends first. Outside a fight it shares the sheet's one mark with a GM's 🔼 or 🔽: whichever is set later stands. An NPC's sheet mark is the same one slot.
 - The Break free and Stay buttons stay on the hold card after the answer; a late press is told no hold is waiting. A reroll of the hold's roll changes the total to beat; a 20 is read at the answer, and a 1 slips the hold at once.
-- In a fight a trick re-arms on your own turn's action (an attack, a grab, Maintain, Escape), flat or not; a defence roll does not, flat or not.
+- In a fight a feint re-arms on your own turn's action (an attack, a grab, a disarm, Maintain, Escape), flat or not; a defence roll does not, flat or not. A retrieval is no roll and re-arms nothing.
 - A 5e skill check or saving throw does not strip the stat for a flat mark (a 5e sheet only gets one from a GM's check outcome).
 - A custom `/roll` standing in for a fight roll counts its first die as the natural, read against 20 whatever the dice: a d100 that shows 20 is a natural 20, and lands whatever the totals.
+- A disarmed fighter's turn carries Retrieve alone: one holding someone types `/fight act action:Release` (still free) — there is no button for it that turn.
+- Disarm on your own turn and a grapple against a strike are players' moves; NPCs never disarm, and an NPC never grapples a blow.
+- `/deception`'s form lives in memory for 15 minutes: a restart, or a late submit, says it has expired.
+- `/fight rr` of a flat attack that carried a banked +2 reads it from the numbers: with a stat of exactly 2 it labels the reroll as an honest roll (the total is right either way).
+- Disarm's grip roll for the NPC has no naturals; its flat defence, a fooled flag or a sheet mark clamps it to a straight d20.

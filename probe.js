@@ -3568,6 +3568,7 @@ async function fire(over) {
     const hpC0 = hpOf('npc:Lcrow', 'CL3');
     const dfl20 = await deflectWith(15, 20);
     const hpC1 = hpOf('npc:Lcrow', 'CL3');
+    const fxH11a = fxOf('npc:Lhound', 'CL3'), fxA11a = fxOf(LA, 'CL3');
     const hpA0 = hpOf(LA, 'CL3');
     const dfl1 = await deflectWith(3, 1);
     const hpA1 = hpOf(LA, 'CL3'), fxA11 = fxOf(LA, 'CL3');
@@ -3576,21 +3577,23 @@ async function fire(over) {
     const dis20 = await disarmWith(15, 20);
     const hpH1 = hpOf('npc:Lhound', 'CL3'), fxH11 = fxOf('npc:Lhound', 'CL3'), fxA11b = fxOf(LA, 'CL3');
     setL({ phase: 'attack', current_target: null, atk_kind: null, turn_index: 0 }, 'CL3');
-    let nSw = sent.length;
-    await withDice([12], () => f3({ commandName: 'fight', options: { _sub: 'atk', npc: 'Lhound', stat: 'str', target: LA, flavour: 'snaps' }, userId: 'U1' }));
-    const swingFlat = textOf(newIn('CL3', nSw));
-    const f11 = fightL('CL3');
+    const swingR = await withDice([12], () => f3({ commandName: 'fight', options: { _sub: 'atk', npc: 'Lhound', stat: 'str', target: LA, flavour: 'snaps' }, userId: 'U1' }));
+    const f11 = fightL('CL3'), fxH11r = fxOf('npc:Lhound', 'CL3');
     const hpA2 = hpOf(LA, 'CL3');
     const dis1 = await disarmWith(2, 1);
     const hpA3 = hpOf(LA, 'CL3'), fxA11c = fxOf(LA, 'CL3');
-    ok('deflect: a 20 turns the blow whatever the totals and the named enemy takes 2; a 1 fails for 2, the next defence flat as well as the next attack. Disarm: a 20 wounds the attacker 1 and leaves their next swing flat, no fetching turn; a 1 fails for 1, the next attack flat as well as the next defence',
+    ok('deflect: a 20 turns the blow whatever the totals, the named enemy takes 2, the attacker loses its next turn to the weapon and the deflector’s flat next attack carries +2; a 1 fails for 2, the next defence flat as well as the next attack. Disarm against a strike: a 20 disarms, wounds 1 and banks +2 for even a flat attack; a disarmed NPC’s swing is refused, nothing spent; a 1 fails for 2 and disarms the disarmer; every disarm leaves the very next roll flat',
       /the shield turns it whatever the totals/.test(saidOf(dfl20)) && /into \*\*Lcrow 🎭\*\* for \*\*2\*\* damage/.test(saidOf(dfl20)) && hpC1 === hpC0 - 2
+        && fxH11a.disarmed === true && fxA11a.rollBonus === 2 && fxA11a.rbFlat === true && fxA11a.flatAtk === true
+        && /their next turn goes to retrieving the weapon/.test(saidOf(dfl20)) && /with \*\*\+2\*\* from the natural 20/.test(saidOf(dfl20))
         && /the deflection fails outright/.test(saidOf(dfl1)) && /takes \*\*2\*\* damage/.test(saidOf(dfl1)) && hpA1 === hpA0 - 2 && fxA11.flatDef === true && fxA11.flatAtk === true
         && /next attack and next defence are flat d20s/.test(saidOf(dfl1))
-        && /blade is torn from \*\*Lhound 🎭\*\*'s grip and turned on them/.test(saidOf(dis20)) && hpH1 === hpH0 - 1 && fxH11.flatAtk === true && !fxH11.disarmed && fxA11b.flatDef === true
-        && f11.atk_roll === 12 && /off-balance/.test(swingFlat)
-        && /the disarm fails outright/.test(saidOf(dis1)) && hpA3 === hpA2 - 1 && fxA11c.flatAtk === true && fxA11c.flatDef === true,
-      `${flat1(saidOf(dfl20)).slice(0, 200)} ${hpC1}/${hpC0} · ${flat1(saidOf(dfl1)).slice(0, 200)} ${hpA1}/${hpA0} ${JSON.stringify(fxA11)} · ${flat1(saidOf(dis20)).slice(0, 200)} ${hpH1}/${hpH0} ${JSON.stringify(fxH11)} ${JSON.stringify(fxA11b)} · ${f11.atk_roll} ${flat1(swingFlat).slice(0, 160)} · ${flat1(saidOf(dis1)).slice(0, 200)} ${hpA3}/${hpA2} ${JSON.stringify(fxA11c)}`);
+        && /blade is torn from \*\*Lhound 🎭\*\*'s grip and turned on them/.test(saidOf(dis20)) && hpH1 === hpH0 - 1 && fxH11.disarmed === true && !fxH11.flatAtk
+        && fxA11b.rollBonus === 2 && fxA11b.rbFlat === true && fxA11b.fooled === true && !fxA11b.flatDef
+        && /Lhound\*\* is disarmed — its turn goes to retrieving the weapon/.test(saidOf(swingR)) && f11.phase === 'attack' && f11.atk_roll === null && fxH11r.disarmed === true
+        && /the disarm fails outright/.test(saidOf(dis1)) && /loses their own weapon/.test(saidOf(dis1)) && hpA3 === hpA2 - 2
+        && fxA11c.disarmed === true && fxA11c.fooled === true && !fxA11c.flatAtk && !fxA11c.flatDef,
+      `${flat1(saidOf(dfl20)).slice(0, 300)} ${hpC1}/${hpC0} ${JSON.stringify(fxH11a)} ${JSON.stringify(fxA11a)} · ${flat1(saidOf(dfl1)).slice(0, 200)} ${hpA1}/${hpA0} ${JSON.stringify(fxA11)} · ${flat1(saidOf(dis20)).slice(0, 200)} ${hpH1}/${hpH0} ${JSON.stringify(fxH11)} ${JSON.stringify(fxA11b)} · ${flat1(saidOf(swingR)).slice(0, 160)} ${f11.atk_roll} ${JSON.stringify(fxH11r)} · ${flat1(saidOf(dis1)).slice(0, 200)} ${hpA3}/${hpA2} ${JSON.stringify(fxA11c)}`);
 
     // 12 · /deception: the naturals; the price on the deceiver's sheet; /roll
     // honours a flat mark now, and the rider rolls at disadvantage
@@ -3598,25 +3601,70 @@ async function fire(over) {
     const fT = (over) => fire({ channel: chL4, ...over });
     const markOf = (id) => dbHandle.prepare("SELECT next_mark FROM characters WHERE guild_id='G1' AND user_id=?").get(id)?.next_mark ?? null;
     dbHandle.prepare("UPDATE characters SET deception_spent=0, next_mark=NULL WHERE guild_id='G1' AND user_id IN (?, ?)").run(LA, LB);
-    const dc20 = await withDice([20, 20], () => fT({ commandName: 'deception', options: { target: LB, claim: 'the bridge is safe' }, userId: LA, ...asL(LA) }));
+    const npcMarkOf = (n) => dbHandle.prepare("SELECT next_mark FROM npcs WHERE guild_id='G1' AND name=?").get(n)?.next_mark ?? null;
+    // The command checks and opens the form; the form's words and the dice decide.
+    const lie = async (uid, opts, dice, fields) => {
+      const o = await fT({ commandName: 'deception', options: opts, userId: uid, ...asL(uid) });
+      const m = modalOf(o);
+      if (!m) return { open: o, done: null };
+      const done = await withDice(dice, () => fT({ isModal: true, customId: m, fields, userId: uid, ...asL(uid) }));
+      return { open: o, done };
+    };
+    const F12 = { claim: 'the bridge is safe', plan: 'cut the ropes behind them', speech: 'After you, friend.' };
+    const l1 = await lie(LA, { target: LB }, [15, 11], F12);            // 15+5 against 11+8: fooled
     const mA = markOf(LA), mB = markOf(LB);
+    const said1 = saidOf(l1.done);
     const rB = await withDice([7], () => fT({ commandName: 'roll', options: { stat: 'str' }, userId: LB, ...asL(LB) }));
     const mB2 = markOf(LB);
-    const rA1 = await fT({ commandName: 'roll', options: { stat: 'str' }, userId: LA, ...asL(LA) });
-    const again = await withDice([10, 10], () => fT({ commandName: 'deception', options: { target: LB, claim: 'again' }, userId: LA, ...asL(LA) }));
-    const spentStill = await fT({ commandName: 'deception', options: { target: LB, claim: 'and again' }, userId: LA, ...asL(LA) });
-    await fT({ commandName: 'roll', options: { stat: 'str' }, userId: LA, ...asL(LA) });
-    const dc1 = await withDice([1, 10], () => fT({ commandName: 'deception', options: { target: LB, claim: 'I am the king' }, userId: LA, ...asL(LA) }));
+    const l2 = await lie(LA, { target: LB }, [20, 13], { claim: 'and the ford is shallow', plan: 'drown them' });   // flat 20 against 21
+    const mA2 = markOf(LA);
+    const lT = await lie(LA, { target: LB }, [10, 2], { claim: 'trust me', plan: 'nothing' });   // flat 10 against 10
+    const l1x = await lie(LA, { target: LB }, [1, 1], { claim: 'I am the king', plan: 'take the crown' });   // a 1 fails; their 1 fools no one
     const mA3 = markOf(LA), mB3 = markOf(LB);
     const rA = await withDice([15, 4], () => fT({ commandName: 'roll', options: { stat: 'str' }, userId: LA, ...asL(LA) }));
     const mA4 = markOf(LA);
-    ok('/deception: twenty meets twenty and the lie wins; both sides’ next rolls are flat — the target’s for being taken in, the deceiver’s the price — and /roll strips the stat for it; the flat roll re-arms the trick, a second lie with no roll between is refused; a lie of 1 falls apart, the price a flat d20 at disadvantage',
-      /Twenty meets twenty!\*\* The lie wins/.test(saidOf(dc20)) && mB === 'flat' && mA === 'flat' && /The price: \*\*user\d+\*\*'s very next roll is a flat d20\._/.test(saidOf(dc20))
-        && /flat d20/.test(allOf(rB)) && /\[7\]/.test(allOf(rB)) && !/\+ ?4/.test(allOf(rB).replace(/\[[^\]]*\]/g, '')) && mB2 === null
-        && /flat d20/.test(allOf(rA1)) && !/trick is spent/.test(saidOf(again)) && /sees straight through it/.test(saidOf(again)) && /trick is spent/.test(saidOf(spentStill))
-        && /the lie falls apart, a total failure/.test(saidOf(dc1)) && mA3 === 'flatdis' && mB3 === null && /flat d20, at disadvantage\._/.test(saidOf(dc1))
+    ok('/deception opens a form, then the totals decide: the pretence and the words shown, the plan only after the dice; fooled, the mark’s next roll is flat and /roll strips the stat; no cooldown — a second lie at once is rolled; a 20 counts for nothing more, ties go to the mark, a 1 falls apart and their 1 fools no one; the price a flat d20, at disadvantage after a 1',
+      !!l1.done && /^decept:/.test(modalOf(l1.open)) && Object.keys(l1.open.replies[0]?.modalFields || {}).join(',') === 'claim,plan,speech'
+        && /_the bridge is safe_/.test(said1) && /💬 “After you, friend\.”/.test(said1) && /believes it — their very next roll, anywhere, is a straight d20/.test(said1)
+        && said1.indexOf('cut the ropes behind them') > said1.indexOf('believes it') && /was really planning: _cut the ropes behind them_/.test(said1)
+        && mB === 'flat' && mA === 'flat' && /The price: \*\*user\d+\*\*'s very next roll is a flat d20\._/.test(said1)
+        && /flat d20/.test(allOf(rB)) && /\[7\]/.test(allOf(rB)) && mB2 === null
+        && !!l2.done && /sees straight through it/.test(saidOf(l2.done)) && !/Twenty|natural 20/.test(saidOf(l2.done)) && /flat d20/.test(saidOf(l2.done)) && mA2 === 'flat'
+        && /sees straight through it — ties go to the mark/.test(saidOf(lT.done))
+        && /the lie falls apart, a total failure/.test(saidOf(l1x.done)) && !/believes it/.test(saidOf(l1x.done)) && mA3 === 'flatdis' && mB3 === null && /flat d20, at disadvantage\._/.test(saidOf(l1x.done))
         && /flat d20/.test(allOf(rA)) && /\[4, ~~15~~\]|\[15, 4\]|~~15~~/.test(allOf(rA)) && mA4 === null,
-      `${flat1(saidOf(dc20)).slice(0, 220)} · ${mA}/${mB} · ${allOf(rB).slice(0, 200)} · ${mB2} · ${allOf(rA1).slice(0, 120)} · ${flat1(saidOf(again)).slice(0, 120)} · ${flat1(saidOf(spentStill)).slice(0, 60)} · ${flat1(saidOf(dc1)).slice(0, 200)} · ${mA3}/${mB3} · ${allOf(rA).slice(0, 240)} · ${mA4}`);
+      `${JSON.stringify(l1.open.replies[0] || {}).slice(0, 160)} · ${flat1(said1).slice(0, 420)} · ${mA}/${mB} · ${allOf(rB).slice(0, 160)} · ${mB2} · ${flat1(saidOf(l2.done)).slice(0, 200)} ${mA2} · ${flat1(saidOf(lT.done)).slice(0, 200)} · ${flat1(saidOf(l1x.done)).slice(0, 240)} · ${mA3}/${mB3} · ${allOf(rA).slice(0, 200)} · ${mA4}`);
+
+    // 12b · an NPC either side: fooled, its mark waits on its sheet for its
+    // next roll anywhere; a GM lies as one, the price on the NPC's sheet;
+    // the checks before the form
+    putNpc('Lfox', 2, 3, 6);
+    dbHandle.prepare("UPDATE characters SET next_mark=NULL WHERE guild_id='G1' AND user_id IN (?, ?)").run(LA, LB);
+    const ln = await lie(LA, { target_npc: 'Lcrow' }, [12, 3], { claim: 'the gate is open', plan: 'slip past' });   // 12+5 against 3+1
+    const mCrow = npcMarkOf('Lcrow');
+    let n12 = sent.length;
+    const nr = await withDice([9], () => fT({ commandName: 'npc', options: { _sub: 'roll', name: 'Lcrow', stat: 'str' }, userId: 'U1' }));
+    const nrText = `${allOf(nr)} ${textOf(newIn('CL4', n12))}`;
+    const mCrow2 = npcMarkOf('Lcrow');
+    n12 = sent.length;
+    const lg = await lie('U1', { npc: 'Lfox', target: LB }, [14, 2], { claim: 'I serve the duke', plan: 'rob the duke', speech: '' });   // 14+6 against 2+8
+    const gmText = textOf(newIn('CL4', n12));
+    const mFox = npcMarkOf('Lfox'), mB12 = markOf(LB);
+    const noMark = await fT({ commandName: 'deception', options: {}, userId: LA, ...asL(LA) });
+    const both = await fT({ commandName: 'deception', options: { target: LB, target_npc: 'Lcrow' }, userId: LA, ...asL(LA) });
+    const asNpc = await fT({ commandName: 'deception', options: { npc: 'Lfox', target: LB }, userId: LA, ...asL(LA) });
+    const npcNpc = await fT({ commandName: 'deception', options: { npc: 'Lfox', target_npc: 'Lcrow' }, userId: 'U1' });
+    const dull = await fT({ commandName: 'deception', options: { npc: 'Lhound', target: LB }, userId: 'U1' });
+    ok('/deception with an NPC: fooled, its flat roll waits on its sheet and /npc roll spends it; a GM lies as an NPC — the card to the table, the price on the NPC; the checks come before the form',
+      /believes it/.test(saidOf(ln.done)) && mCrow === 'flat' && /flat d20/.test(nrText) && mCrow2 === null
+        && /✅ Deceived as \*\*Lfox\*\*/.test(saidOf(lg.done)) && /Deception\*\* — \*\*Lfox 🎭\*\* vs \*\*user\d+\*\*/.test(gmText) && /believes it/.test(gmText)
+        && /was really planning: _rob the duke_/.test(gmText) && mFox === 'flat' && mB12 === 'flat'
+        && /Name your mark/.test(saidOf(noMark)) && /One mark at a time/.test(saidOf(both)) && /Only GMs can deceive as an NPC/.test(saidOf(asNpc))
+        && /As an NPC, deceive a player/.test(saidOf(npcNpc)) && /Deception takes \*\*WIS 4\+\*\*/.test(saidOf(dull))
+        && [noMark, both, asNpc, npcNpc, dull].every(r => !modalOf(r)),
+      `${flat1(saidOf(ln.done)).slice(0, 160)} · ${mCrow} → ${mCrow2} · ${flat1(nrText).slice(0, 200)} · ${flat1(saidOf(lg.done)).slice(0, 80)} · ${flat1(gmText).slice(0, 300)} · ${mFox}/${mB12} · ${[noMark, both, asNpc, npcNpc, dull].map(r => flat1(saidOf(r)).slice(0, 50)).join(' | ')}`);
+    dbHandle.prepare("UPDATE characters SET next_mark=NULL WHERE guild_id='G1' AND user_id IN (?, ?)").run(LA, LB);
+    dbHandle.prepare("UPDATE npcs SET next_mark=NULL WHERE guild_id='G1'").run();
 
     // 13 · an NPC's feint writes no sheet; a stray written before goes, page
     // and all, when the server is mended
@@ -3695,8 +3743,8 @@ async function fire(over) {
     const fv = await act(LB, { action: 'feint', feint: 'a sly look' });
     const lbAfter = dbHandle.prepare("SELECT deception_spent d FROM characters WHERE guild_id='G1' AND user_id=?").get(LB);
     const fxB17 = fxOf(LB), f17 = fightL();
-    ok('/deception is refused to anyone fighting in the channel, pointing to Feint, with nothing spent; a feint against a kept hold is refused before the trick is spent',
-      /In a fight, a trick is a feint/.test(saidOf(dIn)) && /In a fight, a trick is a feint/.test(saidOf(dInT)) && !spentAfter.d && !spentAfter.m
+    ok('/deception is refused to anyone fighting in the channel, pointing to Feint, before its form, with nothing spent; a feint against a kept hold is refused before it is spent',
+      /In a fight, a deception is a feint/.test(saidOf(dIn)) && /In a fight, a deception is a feint/.test(saidOf(dInT)) && !modalOf(dIn) && !modalOf(dInT) && !spentAfter.d && !spentAfter.m
         && /That is a kept hold/.test(saidOf(fv)) && !lbAfter.d && !fxB17.feintDef && !fxB17.feintUsed && f17.atk_kind === 'hold' && f17.phase === 'defend',
       `${flat1(saidOf(dIn)).slice(0, 120)} · ${flat1(saidOf(dInT)).slice(0, 80)} · ${JSON.stringify(spentAfter)} · ${flat1(saidOf(fv)).slice(0, 120)} · ${JSON.stringify(lbAfter)} ${JSON.stringify(fxB17)} · ${f17.atk_kind}/${f17.phase}`);
 
@@ -3736,6 +3784,194 @@ async function fire(over) {
         && /cannot be disarmed/.test(saidOf(dz)) && /cannot be read/.test(saidOf(fz)) && !spent19.d && !fx19.disarmUsed && !fx19.feintDef && !fx19.feintUsed
         && f19.phase === 'defend' && f19.atk_nat === 20 && f19.def_roll === null,
       `${flat1(said19).slice(0, 320)} · ${hp19b}/${hp19} · ${flat1(saidOf(dz)).slice(0, 100)} · ${flat1(saidOf(fz)).slice(0, 100)} · ${JSON.stringify(spent19)} ${JSON.stringify(fx19)} · ${f19.phase}/${f19.atk_nat}/${f19.def_roll}`);
+
+    // ── Build N (2026-11-10) ──
+    const healL = (cid) => { const hs = JSON.parse(fightL(cid).hp_state || '{}'); for (const k of Object.keys(hs)) hs[k] = 20; setL({ hp_state: hs }, cid); };
+    dbHandle.prepare("UPDATE characters SET next_mark=NULL, deception_spent=0 WHERE guild_id='G1'").run();
+    // 20 · the grab's naturals carry over: a grab of 1 flattens the grappler's
+    // next defence; a save of 20 that holds flattens their next attack and
+    // banks the saver +2; both, when both are rolled
+    healL('CL1');
+    const g20a = await grabSave(1, 5);
+    const fxA20a = fxOf(LA), fxB20a = fxOf(LB);
+    const g20b = await grabSave(12, 20);
+    const fxA20b = fxOf(LA), fxB20b = fxOf(LB);
+    const g20c = await grabSave(1, 20);
+    const fxA20c = fxOf(LA), fxB20c = fxOf(LB);
+    ok('a grab of 1 leaves the grappler’s next defence flat; a save of 20 leaves their next attack flat and banks the saver +2; both when both are rolled',
+      /fails outright, and their next defence is a flat d20/.test(saidOf(g20a)) && fxA20a.flatDef === true && !fxA20a.flatAtk && !fxB20a.rollBonus
+        && /twists free: \*\*user\d+\*\*'s next attack is a flat d20, and \*\*user\d+\*\*'s next attack gets \*\*\+2\*\*/.test(saidOf(g20b)) && fxA20b.flatAtk === true && !fxA20b.flatDef && fxB20b.rollBonus === 2 && !fxB20b.rbFlat
+        && fxA20c.flatDef === true && fxA20c.flatAtk === true && fxB20c.rollBonus === 2 && !heldBy(LB),
+      `${flat1(saidOf(g20a)).slice(0, 200)} ${JSON.stringify(fxA20a)} ${JSON.stringify(fxB20a)} · ${flat1(saidOf(g20b)).slice(0, 240)} ${JSON.stringify(fxA20b)} ${JSON.stringify(fxB20b)} · ${JSON.stringify(fxA20c)} ${JSON.stringify(fxB20c)}`);
+
+    // 21 · a grapple answers a strike: STR against the attack, ties to the
+    // attack; seized, the striker's turn ends with no wound and its wounds
+    // start once the grappler's turn has come round; a 20 banks +2; short of
+    // it the blow lands, a 1 adding its point; refused against a 20 and
+    // while holding someone; the defence buttons carry it
+    healL('CL3');
+    let n21 = sent.length;
+    await crowSwing(10);   // 11
+    const prompt21 = textOf(newIn('CL3', n21));
+    const hpA21 = hpOf(LA, 'CL3'), hpC21 = hpOf('npc:Lcrow', 'CL3');
+    const gd1 = await withDice([10], () => f3({ commandName: 'fight', options: { _sub: 'act', action: 'grapple', flavour: 'catches the beak' }, userId: LA, ...asL(LA) }));   // 15
+    const f21 = fightL('CL3'), held21 = heldBy('npc:Lcrow', 'CL3'), hpC21b = hpOf('npc:Lcrow', 'CL3'), hpA21b = hpOf(LA, 'CL3');
+    const skip = () => f3({ commandName: 'gm', options: { _group: 'override', _sub: 'skip' }, userId: 'U1' });
+    await skip(); await skip();   // LA's turn, Lhound's
+    const hpC21c = hpOf('npc:Lcrow', 'CL3');
+    const sk21 = await skip();     // the captive's own turn ends: now the wound
+    const hpC21d = hpOf('npc:Lcrow', 'CL3');
+    setL({ grapples: {}, effect_state: {} }, 'CL3');
+    await crowSwing(10);
+    n21 = sent.length;
+    const gP = await press('fact:grapple', LA, chL3);
+    const gSb = await withDice([20], () => submit(modalOf(gP), LA, chL3, { action: 'wrestles it down', speech: '' }));
+    const fxA21 = fxOf(LA, 'CL3'), held21b = heldBy('npc:Lcrow', 'CL3');
+    setL({ grapples: {}, effect_state: {} }, 'CL3');
+    const hpA21c = hpOf(LA, 'CL3');
+    await crowSwing(15);   // 16
+    const gMiss = await withDice([5], () => f3({ commandName: 'fight', options: { _sub: 'act', action: 'grapple', flavour: 'grabs' }, userId: LA, ...asL(LA) }));   // 10
+    const hpA21d = hpOf(LA, 'CL3');
+    await crowSwing(3);    // 4
+    const gOne = await withDice([1], () => f3({ commandName: 'fight', options: { _sub: 'act', action: 'grapple', flavour: 'grabs' }, userId: LA, ...asL(LA) }));   // 6, but a 1
+    const hpA21e = hpOf(LA, 'CL3');
+    await crowSwing(20);
+    const gTwenty = await f3({ commandName: 'fight', options: { _sub: 'act', action: 'grapple', flavour: 'grabs' }, userId: LA, ...asL(LA) });
+    await crowSwing(10);
+    setL({ grapples: { 'npc:Lhound': LA } }, 'CL3');
+    const gHolding = await f3({ commandName: 'fight', options: { _sub: 'act', action: 'grapple', flavour: 'grabs' }, userId: LA, ...asL(LA) });
+    setL({ grapples: {} }, 'CL3');
+    ok('a grapple answers a strike: seized for no damage, no wound as the striker’s turn ends, the wounds starting once the grappler’s turn has come round; a 20 banks +2 (by the button and its form); short of it the blow lands, a 1 adding its point; refused against a 20 and while holding someone; the defence prompt carries Grapple',
+      /fact:grapple/.test(prompt21)
+        && /catches the blow and seizes \*\*Lcrow 🎭\*\* — no damage/.test(saidOf(gd1)) && held21 === LA && hpA21b === hpA21 && hpC21b === hpC21 && f21.turn_index === 1 && f21.phase === 'attack'
+        && !/is still held by/.test(saidOf(gd1)) && hpC21c === hpC21 && hpC21d === hpC21 - 1 && /still held by/.test(saidOf(sk21))
+        && !!modalOf(gP) && /A natural 20 — the grip takes whatever the totals/.test(saidOf(gSb)) && /wrestles it down/.test(saidOf(gSb)) && fxA21.rollBonus === 2 && held21b === LA
+        && /grabs and misses/.test(saidOf(gMiss)) && hpA21d === hpA21c - 1 && !heldBy('npc:Lcrow', 'CL3')
+        && /the grab fails outright/.test(saidOf(gOne)) && hpA21e === hpA21d - 2
+        && /cannot be grappled/.test(saidOf(gTwenty)) && /already holding someone/.test(saidOf(gHolding)),
+      `${/fact:grapple/.test(prompt21)} · ${flat1(saidOf(gd1)).slice(0, 300)} · ${held21} ${hpA21b}/${hpA21} ${hpC21b}/${hpC21} @${f21.turn_index}/${f21.phase} · ${hpC21c} ${hpC21d} · ${flat1(saidOf(sk21)).slice(0, 160)} · ${!!modalOf(gP)} ${flat1(saidOf(gSb)).slice(0, 200)} ${JSON.stringify(fxA21)} ${held21b} · ${flat1(saidOf(gMiss)).slice(0, 200)} ${hpA21d}/${hpA21c} · ${flat1(saidOf(gOne)).slice(0, 200)} ${hpA21e} · ${flat1(saidOf(gTwenty)).slice(0, 80)} · ${flat1(saidOf(gHolding)).slice(0, 80)}`);
+
+    // 22 · one answer per strike: a second defence, a deflect, a disarm, a
+    // grapple or a feint after the first is refused, nothing spent
+    healL('CL3');
+    await crowSwing(10);
+    await withDice([5], () => f3({ commandName: 'fight', options: { _sub: 'def', stat: 'str', flavour: 'parries' }, userId: LA, ...asL(LA) }));
+    const def22 = fightL('CL3').def_roll;
+    const again22 = [];
+    for (const o of [{ _sub: 'def', stat: 'dex', flavour: 'again' }, { _sub: 'act', action: 'deflect' }, { _sub: 'act', action: 'disarm' }, { _sub: 'act', action: 'grapple', flavour: 'x' }, { _sub: 'act', action: 'feint', feint: 'a dodge' }])
+      again22.push(await withDice([19], () => f3({ commandName: 'fight', options: o, userId: LA, ...asL(LA) })));
+    const f22 = fightL('CL3'), fx22 = fxOf(LA, 'CL3');
+    const spent22 = dbHandle.prepare("SELECT deception_spent d FROM characters WHERE guild_id='G1' AND user_id=?").get(LA);
+    ok('one answer per strike: a second /fight def, a deflect, a disarm, a grapple or a feint after the first is refused, the roll and the deception untouched',
+      again22.every(r => /already has its answer/.test(saidOf(r))) && f22.def_roll === def22 && f22.phase === 'defend' && !spent22.d && !fx22.feintDef && !fx22.disarmUsed && !fx22.deflected,
+      `${again22.map(r => flat1(saidOf(r)).slice(0, 50)).join(' | ')} · ${f22.def_roll}/${def22} ${f22.phase} · ${JSON.stringify(spent22)} ${JSON.stringify(fx22)}`);
+
+    // 23 · Disarm on your own turn: NPCs only; DEX against the better of
+    // STR and DEX, ties to the NPC; a 20 wounds; a 1 costs 2 and disarms you;
+    // the very next roll flat whatever came of it; the picker lists the
+    // armed NPCs only
+    healL('CL3');
+    const myTurn = (fx = {}) => setL({ ...FRESH, turn_order: [LA, 'npc:Lhound', 'npc:Lcrow'], turn_index: 0, effect_state: fx }, 'CL3');
+    myTurn();
+    const xd1 = await withDice([18, 5], () => f3({ commandName: 'fight', options: { _sub: 'act', action: 'disarm', target_npc: 'Lhound', flavour: 'a twist of the wrist' }, userId: LA, ...asL(LA) }));   // 22 against 15
+    const fxH23 = fxOf('npc:Lhound', 'CL3'), fxA23 = fxOf(LA, 'CL3'), f23 = fightL('CL3');
+    myTurn();
+    const xdT = await withDice([11, 5], () => f3({ commandName: 'fight', options: { _sub: 'act', action: 'disarm', target_npc: 'Lhound' }, userId: LA, ...asL(LA) }));   // 15 against 15
+    const fxH23b = fxOf('npc:Lhound', 'CL3');
+    myTurn();
+    const hpH23 = hpOf('npc:Lhound', 'CL3');
+    const xd20 = await withDice([20, 19], () => f3({ commandName: 'fight', options: { _sub: 'act', action: 'disarm', target_npc: 'Lhound' }, userId: LA, ...asL(LA) }));   // 24 against 29
+    const hpH23b = hpOf('npc:Lhound', 'CL3'), fxH23c = fxOf('npc:Lhound', 'CL3');
+    myTurn();
+    const hpA23 = hpOf(LA, 'CL3');
+    const xd1f = await withDice([1, 2], () => f3({ commandName: 'fight', options: { _sub: 'act', action: 'disarm', target_npc: 'Lcrow' }, userId: LA, ...asL(LA) }));
+    const hpA23b = hpOf(LA, 'CL3'), fxA23b = fxOf(LA, 'CL3');
+    myTurn({ 'npc:Lcrow': { disarmed: true } });
+    const pk = await press('fact:disarm', LA, chL3);
+    const pkIds = JSON.stringify(pk.replies[0] || {});
+    const pkSel = await fire({ channel: chL3, isSelect: true, customId: `fightact:disarm:${LA}`, values: ['npc:Lhound'], userId: LA, ...asL(LA) });
+    const pkDone = await withDice([18, 2], () => f3({ isModal: true, customId: modalOf(pkSel), fields: { action: 'lunges for the hilt', speech: '' }, userId: LA, ...asL(LA) }));
+    setL({ ...FRESH, turn_order: [LA, LB], turn_index: 0 });
+    const pvp = await act(LA, { action: 'disarm', target: LB });
+    ok('Disarm on your own turn: DEX against the NPC’s better of STR and DEX, ties to the NPC; a 20 disarms whatever the totals and wounds 1; a 1 costs 2 and disarms you; the very next roll flat every time; the button’s picker lists the armed NPCs only; a player is refused',
+      /goes for Lhound 🎭's weapon/.test(saidOf(xd1)) && /a twist of the wrist/.test(saidOf(xd1)) && /grip\): \*\*15\*\*/.test(saidOf(xd1)) && /spins from \*\*Lhound 🎭\*\*'s grip/.test(saidOf(xd1))
+        && fxH23.disarmed === true && fxA23.fooled === true && f23.turn_index === 1
+        && /keeps hold of the weapon — ties go to the one holding it/.test(saidOf(xdT)) && !fxH23b.disarmed
+        && /A natural 20 — \*\*user\d+\*\* tears the weapon from/.test(saidOf(xd20)) && hpH23b === hpH23 - 1 && fxH23c.disarmed === true
+        && /the disarm fails outright: \*\*user\d+\*\* takes \*\*2\*\* damage and loses their own weapon/.test(saidOf(xd1f)) && hpA23b === hpA23 - 2 && fxA23b.disarmed === true && fxA23b.fooled === true
+        && /fightact:disarm:/.test(pkIds) && /npc:Lhound/.test(pkIds) && !/npc:Lcrow/.test(pkIds) && !new RegExp(LA).test(pkIds.replace(`fightact:disarm:${LA}`, ''))
+        && !!modalOf(pkSel) && /spins from \*\*Lhound 🎭\*\*'s grip/.test(saidOf(pkDone)) && /lunges for the hilt/.test(saidOf(pkDone))
+        && /Disarming works on NPCs only/.test(saidOf(pvp)),
+      `${flat1(saidOf(xd1)).slice(0, 320)} ${JSON.stringify(fxH23)} ${JSON.stringify(fxA23)} @${f23.turn_index} · ${flat1(saidOf(xdT)).slice(0, 200)} · ${flat1(saidOf(xd20)).slice(0, 200)} ${hpH23b}/${hpH23} · ${flat1(saidOf(xd1f)).slice(0, 200)} ${hpA23b}/${hpA23} ${JSON.stringify(fxA23b)} · ${pkIds.slice(0, 300)} · ${!!modalOf(pkSel)} ${flat1(saidOf(pkDone)).slice(0, 160)} · ${flat1(saidOf(pvp)).slice(0, 80)}`);
+
+    // 24 · disarmed: the turn is the weapon's. An attack, a grab, a feint, a
+    // disarm, a custom roll are refused with the flat roll they owe kept; the
+    // turn line carries Retrieve alone; its form passes the turn; a GM's 🎭
+    // Retrieve for an NPC; a skipped turn counts; the auto-pilot retrieves
+    healL('CL3');
+    dbHandle.prepare("UPDATE characters SET next_mark='flat' WHERE guild_id='G1' AND user_id=?").run(LA);
+    setL({ ...FRESH, turn_order: ['npc:Lhound', LA, 'npc:Lcrow'], turn_index: 0, effect_state: { [LA]: { disarmed: true, fooled: true } } }, 'CL3');
+    let n24 = sent.length;
+    const sk0 = await skip();   // Lhound's turn passes: LA's comes up disarmed
+    const turn24 = `${allOf(sk0)} ${textOf(newIn('CL3', n24))}`;
+    const tries24 = [];
+    tries24.push(await withDice([15], () => f3({ commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Lcrow', flavour: 'swing' }, userId: LA, ...asL(LA) })));
+    tries24.push(await f3({ commandName: 'fight', options: { _sub: 'act', action: 'grapple', target_npc: 'Lcrow', flavour: 'grab' }, userId: LA, ...asL(LA) }));
+    tries24.push(await f3({ commandName: 'fight', options: { _sub: 'act', action: 'feint', target_npc: 'Lcrow', feint: 'a dodge' }, userId: LA, ...asL(LA) }));
+    tries24.push(await f3({ commandName: 'fight', options: { _sub: 'act', action: 'disarm', target_npc: 'Lcrow' }, userId: LA, ...asL(LA) }));
+    tries24.push(await f3({ commandName: 'roll', options: { stat: 'str', fight: true, target_npc: 'Lcrow' }, userId: LA, ...asL(LA) }));
+    const fx24 = fxOf(LA, 'CL3'), mk24 = markOf(LA), f24 = fightL('CL3');
+    const rP = await press('fact:retrieve', LA, chL3);
+    const rS = await submit(modalOf(rP), LA, chL3, { action: 'snatches the sword from the mud', speech: 'Not today.' });
+    const fx24b = fxOf(LA, 'CL3'), f24b = fightL('CL3');
+    setL({ ...FRESH, turn_order: ['npc:Lhound', LA, 'npc:Lcrow'], turn_index: 0, effect_state: { 'npc:Lhound': { disarmed: true } } }, 'CL3');
+    const gmSwing = await withDice([12], () => f3({ commandName: 'fight', options: { _sub: 'atk', npc: 'Lhound', stat: 'str', target: LA, flavour: 'claws' }, userId: 'U1' }));
+    const gmP = await press('fnretrieve', 'U1', chL3);
+    const plP = await press('fnretrieve', LA, chL3);
+    n24 = sent.length;
+    const gmS = await submit(modalOf(gmP), 'U1', chL3, { action: 'paws for the blade', speech: '' });
+    const gmText24 = textOf(newIn('CL3', n24)), f24c = fightL('CL3');
+    setL({ ...FRESH, turn_order: ['npc:Lhound', LA, 'npc:Lcrow'], turn_index: 1, effect_state: { [LA]: { disarmed: true } } }, 'CL3');
+    const sk24 = await skip();
+    const fx24c = fxOf(LA, 'CL3');
+    // the auto-pilot: a disarmed NPC's turn goes to the weapon by itself
+    setL({ ...FRESH, turn_order: [LA, 'npc:Lhound', 'npc:Lcrow'], turn_index: 0, auto_npc: 1, effect_state: { 'npc:Lhound': { disarmed: true } } }, 'CL3');
+    const realTON = globalThis.setTimeout;
+    globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
+    n24 = sent.length;
+    await withDice([2, 15, 10, 10, 10, 10], async () => { const r = await f3({ commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Lcrow', flavour: 'swing' }, userId: LA, ...asL(LA) }); for (let i = 0; i < 8; i++) await settle(); return r; });
+    globalThis.setTimeout = realTON;
+    const auto24 = textOf(newIn('CL3', n24)), fxH24 = fxOf('npc:Lhound', 'CL3');
+    setL({ auto_npc: 0 }, 'CL3');
+    ok('disarmed, the turn is the weapon’s: the turn line carries Retrieve alone; an attack, a grab, a feint, a disarm and a custom roll are refused with the flat roll owed kept; the form passes the turn; a GM’s 🎭 Retrieve for an NPC (a player cannot press it); a skipped turn counts; the auto-pilot retrieves on its own',
+      /fact:retrieve/.test(turn24) && !/fatk:str/.test(turn24) && /Disarmed — this turn goes to retrieving your weapon/.test(turn24)
+        && tries24.every(r => /You are disarmed — this turn goes to retrieving your weapon/.test(saidOf(r))) && /fact:retrieve/.test(allOf(tries24[0]))
+        && fx24.fooled === true && fx24.disarmed === true && mk24 === 'flat' && f24.phase === 'attack' && f24.turn_index === 1
+        && !!modalOf(rP) && /spends the turn retrieving their weapon/.test(saidOf(rS)) && /snatches the sword from the mud/.test(saidOf(rS))
+        && !fx24b.disarmed && fx24b.fooled === true && f24b.turn_index === 2
+        && /Lhound\*\* is disarmed — its turn goes to retrieving the weapon/.test(saidOf(gmSwing)) && !!modalOf(gmP) && /Only GMs act for an NPC/.test(saidOf(plP))
+        && /Lhound 🎭\*\* spends the turn retrieving their weapon/.test(gmText24) && /paws for the blade/.test(gmText24) && /Retrieved as \*\*Lhound\*\*/.test(saidOf(gmS)) && f24c.turn_index === 1
+        && /The skipped turn goes to retrieving their weapon/.test(saidOf(sk24)) && !fx24c.disarmed
+        && /Lhound 🎭\*\* spends the turn retrieving their weapon/.test(auto24) && !fxH24.disarmed,
+      `${flat1(turn24).slice(0, 300)} · ${tries24.map(r => flat1(saidOf(r)).slice(0, 40)).join(' | ')} · ${JSON.stringify(fx24)} ${mk24} @${f24.turn_index} · ${!!modalOf(rP)} ${flat1(saidOf(rS)).slice(0, 200)} ${JSON.stringify(fx24b)} @${f24b.turn_index} · ${flat1(saidOf(gmSwing)).slice(0, 100)} · ${!!modalOf(gmP)} ${flat1(saidOf(plP)).slice(0, 60)} · ${flat1(gmText24).slice(0, 200)} ${flat1(saidOf(gmS)).slice(0, 60)} @${f24c.turn_index} · ${flat1(saidOf(sk24)).slice(0, 160)} ${JSON.stringify(fx24c)} · ${flat1(auto24).slice(0, 400)} ${JSON.stringify(fxH24)}`);
+    dbHandle.prepare("UPDATE characters SET next_mark=NULL WHERE guild_id='G1' AND user_id=?").run(LA);
+
+    // 25 · a riposte banked to ride a flat attack is spent by it, flat d20 +2;
+    // any other waits for an honest swing
+    healL('CL3');
+    setL({ ...FRESH, turn_order: [LA, 'npc:Lhound', 'npc:Lcrow'], turn_index: 0, effect_state: { [LA]: { flatAtk: true, rollBonus: 2, rbFlat: true } } }, 'CL3');
+    const rip1 = await withDice([10], () => f3({ commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Lcrow', flavour: 'swing' }, userId: LA, ...asL(LA) }));
+    const atk25a = fightL('CL3').atk_roll, fx25a = fxOf(LA, 'CL3');
+    setL({ ...FRESH, turn_order: [LA, 'npc:Lhound', 'npc:Lcrow'], turn_index: 0, effect_state: { [LA]: { flatAtk: true, rollBonus: 2 } } }, 'CL3');
+    await withDice([10], () => f3({ commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Lcrow', flavour: 'swing' }, userId: LA, ...asL(LA) }));
+    const atk25b = fightL('CL3').atk_roll, fx25b = fxOf(LA, 'CL3');
+    setL({ ...FRESH, turn_order: [LA, 'npc:Lhound', 'npc:Lcrow'], turn_index: 0, effect_state: { [LA]: { rollBonus: 2 } } }, 'CL3');
+    await withDice([10], () => f3({ commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Lcrow', flavour: 'swing' }, userId: LA, ...asL(LA) }));
+    const atk25c = fightL('CL3').atk_roll, fx25c = fxOf(LA, 'CL3');
+    ok('a riposte banked to ride a flat attack is spent by it — a flat d20 +2; one banked by a parry waits out a flat swing and pays on the honest one',
+      atk25a === 12 && !fx25a.rollBonus && !fx25a.rbFlat && /\+2 riposte/.test(saidOf(rip1))
+        && atk25b === 10 && fx25b.rollBonus === 2 && atk25c === 17 && !fx25c.rollBonus,
+      `${atk25a} ${JSON.stringify(fx25a)} ${flat1(saidOf(rip1)).slice(0, 200)} · ${atk25b} ${JSON.stringify(fx25b)} · ${atk25c} ${JSON.stringify(fx25c)}`);
 
     for (const c of ['CL1', 'CL2', 'CL3']) await fire({ channel: channelsById.get(c), commandName: 'fight', options: { _sub: 'end' }, userId: 'U1' }).catch(() => {});
     guild.members.fetch = realFetchL;
