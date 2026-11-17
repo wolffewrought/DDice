@@ -347,7 +347,7 @@ PARTS['fight'] = [
 ('code', [('/fight start players:@Artorius @Meliora @Zeus npcs:Hollow, Hollow tank', 'any number of each \u2014 DEX initiative: natural 20s\nfirst, natural 1s last, a level total to whoever\nrolled first; the card says who rolled what', 'player'),
           ('/fight start ... manual:true', 'skip roll, keep listed order', 'player'),
           ('/fight start ... roll:Players', 'each player presses Roll on a card for their own\ninitiative; the bot rolls the NPCs at once. The fight\nbegins when the last has rolled, or at Begin, the\nbot rolling for anyone left', 'player'),
-          ('/fight start signup:true', 'an open card: players press Join (rolling on the\nspot with roll:Players), the ' + GM + ' adds NPCs,\nand Begin starts it \u2014 the ' + GM + '\u2019s or the\ncaller\u2019s, as Cancel is; /fight end calls a card off', 'player'),
+          ('/fight start signup:true', 'an open card: players press Join (rolling on the\nspot with roll:Players), the ' + GM + ' adds NPCs,\nand Begin starts it \u2014 the ' + GM + '\u2019s or the\ncaller\u2019s, as Cancel is; /fight end calls a card off,\nand a card nobody touches for a day lapses', 'player'),
           ('/fight start ... practice:true', 'friendly bout — fighters yield at 2 HP', 'player'),
           ('/fight addnpc npc:Hollow, Hollow tank', 'add NPC(s) mid-fight, ' + GM, 'gm'),
           ('/fight add user:@Players where:Next', 'bring a player into a running fight \u2014 HP from their\nsheet, initiative rolled: a natural 20 or 1 marks their\nfirst turn as it would at the start; Next puts them\nstraight after this turn, Last at the end, ' + GM, 'gm'),
@@ -363,17 +363,17 @@ PARTS['fight'] = [
           ('(Maintain the hold)', 'the holder\u2019s button on their turn: roll 1d20+STR to\nkeep the grip, and the captive is pinged to answer \u2014\nBreak free (STR against it; ties keep the hold) or\nStay. Staying, or no answer by the turn clock, keeps\nthe hold, and the round\u2019s wound lands at the end of\nthe captive\u2019s turn. An NPC on auto always struggles.\nA hold of 1 slips at once: the captive is free with\nno wound, and your next roll is a flat d20 at\ndisadvantage', 'player'),
           ('/fight act action:Stay', 'let a kept hold stand \u2014 the answer the Stay button\ngives; a ' + GM + ' answers for an NPC with npc:Name', 'player'),
           ('/fight act action:Release', 'the holder lets go — a free action, the turn stands;\nGMs may part any hold with target:', 'player'),
-          ('(the buttons)', 'on your turn: five stat buttons to attack with, then\nGrapple \u00b7 Feint \u00b7 Disarm beneath (each asks whom \u2014 Disarm lists\nthe NPCs; Feint then asks what you pretend) \u2014 no Grapple\nwhile you are held. Disarmed, your turn carries Retrieve\nalone; a natural 1\u2019s first turn carries Roleplay alone. When a strike comes at you, the defence row adds\nDeflect \u00b7 Disarm \u00b7 Grapple. Holding someone adds Maintain the hold (your\nSTR roll; they answer Break free or Stay) and Release;\nbeing held adds Break free. Save and Insight sit on the card that asks. Every one of them opens a short form first \u2014 what you do, what you say, both optional \u2014 and your words sit on the card; a blank form is a plain roll. With one foe standing, an attack press goes straight to the form'),
+          ('(the buttons)', 'on your turn: five stat buttons to attack with, then\nGrapple \u00b7 Feint \u00b7 Disarm beneath (each asks whom \u2014 Disarm lists\nthe NPCs; Feint then asks what you pretend) \u2014 no Grapple\nwhile you are held. Disarmed, your turn carries Retrieve\nalone (and Release, if you hold someone); a natural 1\u2019s first turn carries Roleplay alone. When a strike comes at you, the defence row adds\nDeflect \u00b7 Disarm \u00b7 Grapple. Holding someone adds Maintain the hold (your\nSTR roll; they answer Break free or Stay) and Release;\nbeing held adds Break free. Save and Insight sit on the card that asks. Every one of them opens a short form first \u2014 what you do, what you say, both optional \u2014 and your words sit on the card; a blank form is a plain roll. Each box holds 4,000 characters, and a post longer than one Discord message carries on in the next, the buttons on the last. With one foe standing, an attack press goes straight to the form'),
           ('/fight act action:Release npc:Hollow tank', GM + ' releases AS the NPC holder; add target: to\nforce-part any hold from the outside', 'gm'),
           ('/fight act action:Deflect', 'shield deflection against a PvE strike — needs a\nshield equipped and STR 4+ (the gate holds whichever\nstat rolls), once per round, and a natural 20 cannot\nbe turned. Roll STR or DEX (stat:) to beat the attack\nroll; optionally redirect_npc: sends the blow into\nanother enemy for 1 damage \u2014 and the enemy loses\nits next turn retrieving the weapon. Fall short and\nit lands on you for 1. A natural 20 turns it\nwhatever the totals, the redirect deals 2, and your\nflat next attack gets +2; a natural 1 fails outright\nfor 2. Either way your next attack roll is a flat\nd20 \u2014 after a 1, your next defence too', 'player'),
           ('/fight act action:Disarm', 'NPCs only, DEX 4+, no blade needed. Against an\nNPC\u2019s strike (once per round, never a natural 20):\nDEX to beat the attack \u2014 no damage, and the NPC\nspends its next turn retrieving the weapon; fall short\nand the strike lands on you for 1. On YOUR turn\n(target_npc: or the Disarm button): your 1d20+DEX\nagainst the NPC\u2019s 1d20 + the better of its STR and\nDEX, rolled by the bot \u2014 ties to the NPC, no\nnaturals on its die. A natural 20 disarms whatever\nthe totals and wounds it 1 (against a strike it also\nbanks +2 on your next attack, flat or not); a natural\n1 fails for 2 wounds and disarms YOU. After any\ndisarm, your very next roll is a flat d20', 'player'),
-          ('/fight act action:Retrieve', 'disarmed, your next turn goes to the weapon: the\nRetrieve button (or this) opens a short form \u2014 what\nyou do, what you say \u2014 and the turn passes. No\nattack, grab, feint, disarm, escape or hold until you\nhave; whatever flat roll you owe waits for your next\nreal one. A skipped turn counts as the retrieval', 'player'),
+          ('/fight act action:Retrieve', 'disarmed, your next turn goes to the weapon: the\nRetrieve button (or this) opens a short form \u2014 what\nyou do, what you say \u2014 and the turn passes. No\nattack, grab, feint, disarm, escape or hold until you\nhave; whatever flat roll you owe waits for your next\nreal one. A skipped turn counts as the retrieval.\nHolding someone, Release sits beside it', 'player'),
           ('/fight act action:Deflect \u00b7 /fight act action:Disarm (vs your NPCs)', 'player abilities your NPCs face: a deflected strike\ncan be redirected into ANOTHER of your enemies for\n1 damage (2 on a natural 20), and the NPC that\nthrew it loses its next turn retrieving the weapon.\nA disarm \u2014 against its strike, or on the player\u2019s\nown turn, DEX against the NPC\u2019s better of STR and\nDEX, which the bot rolls \u2014 does the same; a 20\nwounds it 1 as well. Your NPCs never disarm, and\nnone of it works against a natural 20', 'gm'),
           ('/fight act action:Retrieve npc:Hollow', GM + ' spends a disarmed NPC\u2019s turn on its weapon \u2014\nor press its Retrieve button; a short form takes\nwhat it does and says. The auto-pilot and the turn\nclock retrieve on their own, and a skipped turn\ncounts', 'gm'),
           ('/fight act action:Roleplay', 'a natural 1 on initiative: your first turn is\nroleplay only \u2014 the Roleplay button (or this) opens a\nshort form, what you do and what you say, and the\nturn passes with no roll and no action. You can still\ndefend. A skip spends it; the turn clock passes it on\nits own', 'player'),
           ('/fight act action:Roleplay npc:Hollow', GM + ' plays out an NPC\u2019s roleplay turn \u2014 or press\nits Roleplay button; the auto-pilot and the turn\nclock pass it on their own', 'gm'),
           ('/fight act action:Feint feint:\"...\"', 'a deception IN A FIGHT (away from one, it is\n/deception), and it spends either half of the\nfight. On YOUR turn it is an attack \u2014 WIS against\ntheir insight, and if they fall for it the blow\nlands with normal damage (a natural 20 still crits)\nAND their very next roll is a flat d20. A feint of\n20 fools them whatever the insight; a feint of 1 is\na total failure. An insight of 20 sees through it\nunless the feint was a 20; an insight of 1 is\nfooled. With a strike pending on YOU it is a\ndefensive feint \u2014 WIS in place of your usual stat,\nthough not against a natural 20 \u2014 and if the blow misses, the attacker\u2019s very next\nroll is flat; a defensive feint of 1 is a total\nfailure, and the blow lands whatever the totals\n(unless the attack was a 1 too). THE PRICE, landed\nor not: your own very next roll is a flat d20 \u2014 at\ndisadvantage too after a 1. WIS 4+; ties go to the\ntarget. ONE FEINT PER HONEST ROLL: after a feint you\nmust make an ordinary stat roll before you can\nfeint again \u2014 the flat roll a feint costs you\ncounts'),
-          ('/deception target:@Players', 'a deception AWAY FROM A FIGHT \u2014 a WIS contest in a\nmarket, a hall, a cell; target_npc: makes an NPC the\nmark, its insight rolled by the bot. A form asks what\nyou pretend (everyone sees it), what you are really\nplanning (kept back until the dice have spoken) and\nwhat you say. Both roll at once; the naturals\ncount as in a fight \u2014 your 20 fools, your 1 fails,\ntheir 20 sees through, their 1 is taken in, twenty\nagainst twenty yours \u2014 then the totals, ties to the\nmark. With a token in hand either of you may\nReroll or Keep first. Fooled, their\nvery next roll is a straight d20 \u2014 a chat roll,\n/roll, a scene, a called check or a fight elsewhere.\nThe price, whatever happens: your own very next roll\nis a flat d20, at disadvantage after a 1. No\ncooldown. Refused while you or they are fighting in\nthe channel: there, it is a feint'),
+          ('/deception target:@Players', 'a deception AWAY FROM A FIGHT \u2014 a WIS contest in a\nmarket, a hall, a cell; target_npc: makes an NPC the\nmark, its insight rolled by the bot. A form asks what\nyou pretend (everyone sees it), what you are really\nplanning (kept back until the dice have spoken) and\nwhat you say. Both roll at once; the naturals\ncount as in a fight \u2014 your 20 fools, your 1 fails,\ntheir 20 sees through, their 1 is taken in, twenty\nagainst twenty yours \u2014 then the totals, ties to the\nmark. With a token in hand either of you may\nReroll or Keep first. Fooled, their\nvery next roll is a straight d20 \u2014 a chat roll,\n/roll, a scene, a called check or a fight elsewhere.\nThe price, whatever happens: your own very next roll\nis a flat d20, at disadvantage after a 1. No\ncooldown; the form waits an hour, a restart and all.\nRefused while you or they are fighting in\nthe channel: there, it is a feint'),
           ('/deception npc:Hollow Lieutenant target:@Players', GM + ' deceives AS the NPC \u2014 the same form, the card\nposted to the table, the price on the NPC: its own\nnext roll is flat, wherever it rolls next \u2014 /npc\nroll, a called check, a fight. An NPC that is fooled\ncarries its flat roll the same way', 'gm'),
           ('/fight act action:Feint feint:"..." npc:Hollow Lieutenant target:@Players', GM + ' feints AS the NPC — WIS vs WIS; the player\nanswers with /fight act action:Insight, and a fooled player\nrolls their very next roll flat \u2014 and the NPC pays\nthe price too: its own next roll is flat', 'gm'),
           ('/fight act action:Insight', 'your WIS check against the pending feint — GMs\nroll for an NPC with npc:Name; auto NPCs check\nthemselves. If you already owe a flat roll \u2014 fooled\nbefore, or a feint\u2019s or a deception\u2019s price \u2014 even\nthis roll is flat', 'player'),
@@ -395,7 +395,7 @@ PARTS['fight'] = [
           ('/fight act action:Disarm npc:Hollow target:@Players', 'NPCs use every move a player can, by the same rules \u2014\nnpc: on any /fight act, or the NPC buttons on its card, ' + GM, 'gm'),
           ('reveal:Show / Hide', 'on /fight start, addnpc and side \u2014 an NPC\u2019s HP\nshown to the players or not, over the server setting, ' + GM, 'gm'),
           ('/fight status', 'show turn order and HP', 'player'),
-          ('/fight log [scroll:true]', 'repost the recap of the last finished fight in\nthis channel \u2014 only the fighters who actually\ntook part, and only that fight: a new fight always\nstarts a fresh recap. scroll:true hands it over as a\nparchment PDF in the scroll font'),
+          ('/fight log [scroll:true]', 'repost the recap of the last finished fight in\nthis channel \u2014 only the fighters who actually\ntook part, and only that fight: a new fight always\nstarts a fresh recap. scroll:true hands it over as a\nparchment PDF in standard type, as a run\u2019s story is'),
           ('/fight skip', 'skip the current turn — fighter stays in, ' + GM, 'gm'),
           ('/fight hp value:3 target_npc:Hollow tank', 'set HP mid-fight, sheet synced, ' + GM, 'gm'),
           ('/fight kick target_npc:Hollow tank', 'remove a fighter, fight continues, ' + GM, 'gm'),
@@ -422,7 +422,7 @@ PARTS['fight'] = [
 ('p', '<b>The turn clock:</b> a fight waits five quiet minutes on whoever it is waiting for, then reminds them \u2014 '
       'press <b>Still writing</b>, or just keep typing \u2014 and at fifteen the turn passes: skipped, or, where the ' + GM + ' has '
       'set it so, the bot attacks for them at whoever they last struck (else the weakest foe standing). A defence is never '
-      'skipped: the bot rolls it. A ' + GM + ' sets the minutes for a channel with <b>/session clock</b>.'),
+      'skipped: the bot rolls it. The reminder and the skip land on the second. A ' + GM + ' sets the minutes for a channel with <b>/session clock</b>.'),
 ('p', '<b>Knocked-down fighters:</b> anyone at 0 HP or less is left out when a fight starts or when NPCs '
       'are added, with a warning naming them. Restore NPCs with <b>/npc heal</b> or <b>/npc hp</b>, '
       'players with rests or <b>hpfull @Players</b>.'),
@@ -450,7 +450,7 @@ PARTS['fight'] = [
       'everyone falling back to rolling by hand.'),
 ('code', [('/roll dice:2d6+3 fight:true target:@Artorius', 'attack with 2d6+3'),
           ('/roll dice:1d100 fight:true', 'defend with a d100'),
-          ('/roll action:Grapple target:@Artorius', 'any fight ability straight from /roll \u2014 the\nsame menu as /fight act (pick Save to answer\na pending grapple, Insight for a feint, and so\non). No advantage option here \u2014 /fight act\nroll: carries that'),
+          ('/roll action:Grapple target:@Artorius', 'any fight ability straight from /roll \u2014 the\nsame menu as /fight act (pick Save to answer\na pending grapple, Insight for a feint, and so\non). mode: does not apply to a move, and the bot\nsays so \u2014 /fight act roll: carries advantage'),
           ('/roll stat:wis fight:true target:@Artorius', 'attack with WIS instead of STR')]),
 ('p', 'It writes into the same fight the normal commands use, so <b>/fight resolve</b> handles it exactly as '
       'ever \u2014 damage, criticals, carry-over effects and the recap. The die size is remembered, so a natural '
@@ -612,21 +612,22 @@ PARTS['quest'] = [
 ('h2', 'Your Party’s Thread'),
 ('p', 'When a run starts it opens its own thread in <b>quest-instances</b> with the whole party pulled in. That thread is where the quest happens: fights fought there log themselves on the quest’s timeline, the Game Master’s rally pings everyone in it, and the ending is written up there before it goes anywhere else. A player holds one seat at a time — you cannot be approved onto a second quest while a run is still live.'),
 ('h2', 'Instances — Encounters, Chapters and Older Quests'),
-('p', 'Not every session comes off the board. The Game Master can open a run with <b>/instance</b>: an <b>encounter</b> on the fly, a numbered <b>chapter</b> of a campaign, or a <b>quest from before the bot</b> picked up where it left off. No board, no applications — the Game Master ticks who is in it from the roster and opens it; it gets a thread of its own in quest-instances like any run, and pays out like one (an older quest pays only what the Game Master sets). The seats are the Game Master’s: there is no Join button, so if you want in, ask. An instance does not count as your one quest, so a party already out on a quest can still be jumped by bandits. A run may be <b>recorded</b>: then everything said in its thread goes into its log, not only what passes through the bot — the thread says so when it is.'),
+('p', 'Not every session comes off the board. The Game Master can open a run with <b>/instance</b>: an <b>encounter</b> on the fly, a numbered <b>chapter</b> of a campaign, or a <b>quest from before the bot</b> picked up where it left off. No board, no applications — the Game Master ticks who is in it from the roster and opens it; it gets a thread of its own in quest-instances like any run, and pays out like one (an older quest pays only what the Game Master sets). The seats are the Game Master’s: there is no Join button, so if you want in, ask. An instance does not count as your one quest, so a party already out on a quest can still be jumped by bandits. A run may be <b>recorded</b>: then everything said in its thread goes into its log, not only what passes through the bot — the thread says so when it is. An instance keeps a quest’s clock: a time check every quarter-hour and a summary on the hour.'),
 ('code', [('/instance list', 'every run going now, its kind, where, and its time so far')]),
 ('h2', 'Campaigns'),
 ('p', 'A campaign is the long arc — quests and encounters under one name. Its card shows the premise, what is done and your own part in it; the Game Master’s notes and status stay on their side.'),
 ('code', [('/campaign list', 'every campaign on the server'),
           ('/campaign show campaign:The Falconer’s War', 'the premise, what is done, and your part')]),
 ('h2', 'Roleplay on the Record (/rp)'),
-('p', 'Outside a fight the same boxes the fight buttons open are a command away: <b>/rp</b> opens them \u2014 what you do, what you say, a <b>stat to roll</b> from a dropdown of this server\u2019s own, and any <b>dice</b> \u2014 and <b>/rp action:\u2026 speech:\u2026 roll:\u2026 dice:\u2026</b> skips the box. The line goes out in your own name and face, shaped as the cards are: <i>the action</i>, then \u201cthe speech\u201d, then the roll beneath. A roll keeps the rules a typed one does \u2014 the Hero\u2019s advantage, a mark you carry, a deception that fooled you \u2014 and <b>rr</b> rerolls it as it would a typed one. If the Game Master has called a check on you here, a <b>stat roll answers it</b>: the check\u2019s own terms, its button darkened, its outcome under your words. Inside a run the words become a beat on the timeline and the roll a roll in its log, in the recap and in the story scroll that comes with the completion card.'),
+('p', 'Outside a fight the same boxes the fight buttons open are a command away: <b>/rp</b> opens them \u2014 what you do, what you say (4,000 characters a box), a <b>stat to roll</b> from a dropdown of this server\u2019s own, and any <b>dice</b> \u2014 and <b>/rp action:\u2026 speech:\u2026 roll:\u2026 dice:\u2026</b> skips the box. The line goes out in your own name and face, shaped as the cards are: <i>the action</i>, then \u201cthe speech\u201d, then the roll beneath; a line longer than one Discord message carries on in the next, the roll beneath the last. A roll keeps the rules a typed one does \u2014 the Hero\u2019s advantage, a mark you carry, a deception that fooled you \u2014 and <b>rr</b> rerolls it as it would a typed one. If the Game Master has called a check on you here, a <b>stat roll answers it</b>: the check\u2019s own terms, its button darkened, its outcome under your words. Inside a run the words become a beat on the timeline and the roll a roll in its log, in the recap and in the story scroll that comes with the completion card.'),
 ('p', 'Every line carries a <b>Reply</b> button, and so does every line an NPC says \u2014 press it and the same box opens as a reply. A reply wears a small line on top, <i>\u21AA replying to Name</i>, and that name is a link: tap it and you are taken to the line it answers. Several people can answer the same line; the button never moves. Beside it on your own lines sits <b>GM</b> \u2014 the Game Master\u2019s: they can answer your line as any NPC, and their answer links back to it the same way.'),
 ('code', [('/rp', 'opens the box'),
           ('/rp action:draws her blade speech:Not one step closer.', 'posts at once'),
           ('/rp speech:Stand aside. roll:str', 'with a stat roll \u2014 it answers a check called on you here'),
           ('/rp action:swings dice:1d8+2', 'with any dice'),
-          ('/edit', 'fix the words of a line of yours \u2014 the roll and the reply link stay as they were'),
-          ('/edit delete:true', 'take one back')]),
+          ('/edit', 'fix the words of a line of yours \u2014 the roll and the reply link stay as they were;\na line in several parts opens whole'),
+          ('/edit delete:true', 'take one back \u2014 every part of it')]),
+('note', 'A Game Master may put a clock on a scene with <b>/timer</b>: a card counts down in the channel, and when it runs out it rings, pinging whoever it names.'),
 ('h2', 'Taking Turns \u2014 Initiative'),
 ('p', 'When the Game Master calls for initiative, a card appears with a <b>Join</b> button \u2014 press it to take a place; '
       'when the players roll their own, it has a <b>Roll</b> button too, and Join rolls you on the spot. The order is d20 + DEX, '
@@ -638,7 +639,7 @@ PARTS['quest'] = [
 ('code', [('/session turn', 'the order, whose turn it is, which round'),
           ('/session turn action:next', 'Done, typed \u2014 for your own turn')]),
 ('h2', 'The Chronicle and the Review'),
-('p', 'When a run is completed, the Game Master’s telling of it lands in your own thread in <b>quest-chronicle</b> — one thread per adventurer, every quest they finished, told by whoever ran it — and the summary is linked on your standing page. The run’s thread then carries a review button: a score out of five and a line or two, for the Game Masters alone to read. <b>/quest record</b> lists what you have been on.'),
+('p', 'When a run is completed, the Game Master’s telling of it lands in your own thread in <b>quest-chronicle</b> — one thread per adventurer, every quest they finished, told by whoever ran it — and the summary is linked on your standing page. The run’s thread then carries a review button: a score out of ten and a line or two, for the Game Masters alone to read \u2014 one each, and only from those who played the run. When a run winds down, its room is shown the run hour by hour, the story so far as a PDF, and the same button. <b>/quest record</b> lists what you have been on.'),
 ]
 
 PARTS['gmquest'] = [
@@ -688,7 +689,7 @@ PARTS['gmquest'] = [
 ('p', 'Starting a quest with <b>/quest run start</b> begins a stopwatch. From then on the bot posts a public time '
       'check in the quest\u2019s run channel <b>every 15 minutes</b>, and <b>on the hour</b> a recap of everything '
       'that happened during it. Set the channel first with <b>/quest runchannel</b>, or there is nowhere for '
-      'them to go.'),
+      'them to go. An instance keeps the same clock.'),
 ('code', [('/quest run start number:1', 'the clock begins'),
           ('/quest run note number:1 text:They bribed the gatekeeper kind:Roleplay', 'mark a moment'),
           ('/quest run timeline number:1', 'the whole log so far'),
@@ -744,7 +745,8 @@ PARTS['gmquest'] = [
       'whoever they last swung at if still standing, else the weakest foe standing, with their best permitted stat. A defence '
       'is never skipped; the bot rolls it and the exchange resolves. With the other side all down, a quiet fighter is skipped, '
       'never set on a friend. A whole round gone by with nobody acting stops the clock, and it says so, until someone stirs; '
-      'a fight or an order already quiet six hours past its mark is left alone. A paused run holds the clock.'),
+      'a fight or an order already quiet six hours past its mark is left alone. A paused run holds the clock. The reminders '
+      'and the skips land on the second.'),
 ('code', [('/session clock remind:10 skip:30', 'this channel\u2019s clock \u2014 a slower table'),
           ('/session clock timeout:auto', 'a quiet fighter\u2019s attack is rolled for them'),
           ('/session clock reset:true', 'back to the server\u2019s clock'),
@@ -759,12 +761,12 @@ PARTS['gmquest'] = [
       '<b>/char view show full:true</b> both list the quests a character has finished, each one a link straight to its '
       'write-up, with how long it took and how long ago it was.'),
 ('h2', 'Ending a Run'),
-('code', [('/quest run winddown number:1', 'the story is over but the rewards are not settled:\nthe run stays live, its party is released to the rests\nand free to join other quests, and anyone kicked now is\nstill paid at completion. resume:true puts it back (GM)'),
-          ('/quest run complete number:1', 'finish — auto-award merits, list rewards. The run\u2019s\nstory rides on the card as a scroll PDF in the server\u2019s\nscroll font: the party, the length, every logged beat\nwith its roleplay words, your tale \u2014 woven, so /gm\nscroll can unfurl it again anywhere'),
+('code', [('/quest run winddown number:1', 'the story is over but the rewards are not settled:\nthe run stays live, its party is released to the rests\nand free to join other quests, and anyone kicked now is\nstill paid at completion. The run\u2019s room is shown, for\neveryone, the run hour by hour, the story so far as a\nPDF and Review this run. resume:true puts it back,\nand says only that (GM)'),
+          ('/quest run complete number:1', 'finish — auto-award merits, list rewards. The run\u2019s\nstory rides on the card as a PDF on parchment, in\nstandard type: the party, the length, every logged beat\nwith its roleplay words, your tale \u2014 woven, so /gm\nscroll can unfurl it again anywhere'),
           ('/quest run complete number:1 summary:\u2026', 'add your telling \u2014 it lands in each adventurer\u2019s thread in\nquest-chronicle; timings, events and payouts go to the\nGM-only gm-quest-log instead'),
           ('/quest run log number:1 text:\u2026', 'write or rewrite the tale afterwards \u2014 it is mirrored into\nevery adventurer\u2019s own chronicle thread, and rewriting edits\neach copy in place (GM)'),
           ('(\u21A9 Reopen, on a completion message)', 'five minutes to take a completion back: payout reversed,\nthis run\u2019s titles revoked, party released; fix it and\ncomplete again (GM)'),
-          ('(reviews)', 'a completed run posts a review button in its own\nthread; `/quest show` then carries the count, the\naverage and the latest few lines (GM)'),
+          ('(reviews)', 'a completed run posts a review button in its own\nthread, and a wind-down in its room \u2014 for those who\nplayed it, one review each; /quest show then carries\nthe count, the average and the latest few lines (GM)'),
           ('/quest archive number:1 summary:\u2026', 'the final shelf. Blank summary: opens a box for the final\nword \u2014 it goes on the record, into the run\u2019s thread and\nthe GM quest log, and marks the campaign card. A completed\nquest stays completed on everyone\u2019s record (GM)'),
           ('/quest delete number:1', 'remove a quest permanently: its board thread or\npost and its planning thread (applications and\nnotes included) and the party\u2019s room are deleted\nwith it \u2014 and any instances of it go the same way,\nthreads and all. A fight still running in the room\nis stood down first. If the quest is live, the\nconfirmation says so before you commit: the clock\nstops and the party is released. Its number returns\nto the pool: the next quest created takes the\nlowest free number, reborn with a clean history\n(the run ledger keeps counting for DM credit but\nno longer answers to that number)')]),
 ('h2', 'GM Style'),
@@ -789,7 +791,7 @@ PARTS['gmquest'] = [
           ('/session complete [summary:] [title:]', 'pays out, writes the chronicle, posts the review button\n\u2014 the ordinary completion; blank summary: offers one\ndrafted from the log (GM)'),
           ('/instance list', 'every run going now, its kind, where, and its time so far'),
           ('/instance preset save name:\u2026 merits:2 npcs:Hollow x3', 'a saved scene; `/instance start \u2026 preset:` runs it with the\nmerits set and the monsters summoned as temps;\n`preset list` \u00b7 `preset remove` (GM)')]),
-('note', 'An instance left quiet for six hours pings the GM roles in its room; it never ends itself. A preset’s <b>npcs:</b> are summoned from the 5e library where there is one — and where there is not, an NPC of that name is cloned as temporary fighters, so <b>Hollow x3</b> works on a Knightfall server from a single Hollow you made once.'),
+('note', 'An instance keeps a quest’s clock \u2014 a time check every quarter-hour, a summary on the hour \u2014 and one left quiet for six hours pings the GM roles in its room; it never ends itself. A preset’s <b>npcs:</b> are summoned from the 5e library where there is one — and where there is not, an NPC of that name is cloned as temporary fighters, so <b>Hollow x3</b> works on a Knightfall server from a single Hollow you made once.'),
 ('h2', 'Campaigns — the Long Arc'),
 ('code', [('/campaign create name:\u2026 description:\u2026', 'the long arc: quests and encounters under one name,\nwith a GM-only thread and a live card. add \u00b7 remove \u00b7\nnote \u00b7 status \u00b7 recap \u00b7 complete; `campaign:` on\n`/quest create` and `/instance start` links at birth;\n`as:chapter` numbers the parts (GM)'),
           ('/campaign add campaign:… quest:2', 'link a quest that already exists — old ones too'),
@@ -1455,6 +1457,10 @@ PARTS['gmroll'] = [
           ('/button group stat:wis dc:12 reason:\u2026', 'one check the whole party rolls \u2014 each presses once, the\nmessage keeps the tally, and Call it closes the scene\nwith how many got through. A natural 20 passes and a\nnatural 1 fails, whatever the total (GM)'),
           ('/target create name:Barricade [dc:12] [stat:Flat d20, STR, DEX] [dice:2d6+1] [hp:3] [for:@Players] [audience:@Artorius @Meliora @GMs] [success_flavour:\u2026] [fail_flavour:\u2026] [write:true]', 'plant something to swing at \u2014 no sheet, no roster. for: addresses one player, audience: several and/or a role \u2014 only they may swing, and the card names them. hp: is the hits it takes: with a DC a roll that meets it takes one off with no call, with no DC each pass you call does; it falls at 0. write:true opens a box for the scene and the two flavours. A d20 unless dice: says otherwise; stat: lists as few or as many stats as you like, one button each in that order \u2014 leave it out and all five are buttons; leave dc: out and every blow is your call. A press opens a short form \u2014 what they do, what they say, both optional \u2014 and the words land above the roll. A natural 20 beats it (Roll critically succeeds) and a natural 1 fails (Roll critically fails) on their own, posting your flavour if set; anything else says The roll succeeds / fails and asks YOU \u2014 the player passes the check, or fails it \u2014 each opening a What happens? form prefilled with your flavour (blank still sends the verdict). A fail posts the card again below with its buttons and a counter; secret:true asks in the GM channel and tells the players Roll succeeds / fails in theirs (GM)'),
           ('/target list', 'what still stands in this channel, with a Retire button per target to take it down without a swing (GM)')]),
+('h2', 'Timers'),
+('code', [('/timer set minutes:2 seconds:30 players:@Artorius @Meliora note:The bridge gives way', 'a countdown, 5 seconds to 24 hours: a card counts\ndown in the channel with Cancel (a GM\u2019s), and on time\nTime\u2019s up rings here, pinging the players and roles\nnamed, on the second. Due while the bot was away, it\nrings when it is back, marked late (GM)'),
+          ('/timer list', 'every timer running on the server, and where'),
+          ('/timer cancel number:1', 'call one off \u2014 the card says so (GM)')]),
 ('h2', 'Overrides'),
 ('code', [('/gm undo [steps:1-10]', 'rewind the last step in this channel: a fight exchange\n(attack, defence, Resolve, a reroll, an action), a target\nstrike or verdict, a group roll, a once-only press, a\ncalled check that cost HP \u2014 and the HP, rerolls, marks\nand stats those changed on sheets and NPCs. The table\nsees what was rewound and what moved; a fight gets its\nstatus and whose move it is posted again. Ten steps per\nchannel, a day at most; a fight that has ended is not\nrewound; the rewind is never a step itself, so two undos\nare two steps back. Audited and noted on the quest (GM)')]),
 ('code', [('/gm override skip [reason:]', 'pass the current turn in this channel\u2019s fight \u2014\nannounced as a GM ruling'),
@@ -1826,7 +1832,7 @@ PARTS['scrolls'] = [
 ('aud', 'gm'),
 ('h2', 'Scrolls'),
 ('code', [('/gm scroll', 'a modal for title and body; posts the parchment as an\nimage everyone can see plus a PDF with the writing\nwoven invisibly inside \u2014 the PDF survives Discord, so\nscrolls travel between servers on their own. file: hands\nany scroll PDF back: plain text out, plus a readable\nedition in standard type as image and woven PDF. A\nfile-name field on the modal names both files for\narchiving; the readable pair inherits it'),
-          ('/config mechanics scrollfont font:<file>', 'store an .otf/.ttf \u2014 the face /gm scroll props are\nwritten in; the reply renders a sample line to prove it'),
+          ('/config mechanics scrollfont font:<file>', 'store an .otf/.ttf \u2014 the face /gm scroll props and\nthe parchment sheet are written in; the reply renders a\nsample line to prove it. The run\u2019s story, the record\nand /fight log scroll:true are set in standard type'),
           ('/config channels scrollarchive', 'a library for every scroll\u2019s named PDF \u2014 point it\nat a FORUM and each GM\u2019s scrolls file in their own\nthread, opened automatically on first use;\na plain channel keeps the flat archive'),
           ('/config channels gmarchive forum:#gm-run-archive', 'the GM run archive: a thread per GM, headed with their\nruns, hours by kind and what is running now, its time so\nfar; a post per finished run \u2014 runtime, party, payout,\ntitles, the record, the story and record PDFs and both\ntranscripts. A review of the run answers its post. Set\nonce, it files every run already finished, oldest first;\ndisable:true stops it'),
           ('/gm scroll file:<pdf>', 'read a scroll PDF back as text, and unfurl a fresh copy in this server’s font')]),
@@ -1834,7 +1840,7 @@ PARTS['scrolls'] = [
 ('code', [('/dd message:\u2026 header:\u2026 user:@Players channels:#one #two', 'speak AS THE BOT \u2014 so a GM who also plays a character\nnever blurs the two. Plain words by default; a bold\nheader only if you write one; posted in every channel\nyou name, or here. Who said it goes to the roll-audit,\nnot the room (GM)')]),
 ('h2', 'Fixing What Was Said'),
 ('code', [('Edit (DDice)  \u2014 long-press a message \u2192 Apps', 'edit anything the bot posted \u2014 its own messages and NPC\nspeech from /npc say alike. The text opens prefilled,\nsave replaces it, and the roll-audit records what\nchanged (GM)'),
-          ('/edit [link:\u2026] [delete:true]', 'the same box without the Apps menu: a dropdown only\nyou see lists the last 25 lines the bot and its NPCs\nsaid here, newest first; pick one and the text opens\nprefilled; delete:true takes the picked line down\ninstead. link: a message link or id goes straight\nto it. Nothing shows in the channel. A player gets\nthe same for the lines they posted with /rp (GM)')]),
+          ('/edit [link:\u2026] [delete:true]', 'the same box without the Apps menu: a dropdown only\nyou see lists the last 25 lines the bot and its NPCs\nsaid here, newest first; pick one and the text opens\nprefilled; delete:true takes the picked line down\ninstead. link: a message link or id goes straight\nto it. Nothing shows in the channel. A player gets\nthe same for the lines they posted with /rp. A post\ncarried on into several messages is one post: every\npart opens in one form, and delete:true takes every\npart (GM)')]),
 ('p', 'Only messages the bot itself posted — its own, and NPC speech sent through <b>/npc say</b>. A line carrying only <b>Reply</b>, <b>GM</b> or <b>Interaction</b> is still words to fix, and keeps its buttons; a card with other buttons stays the bot\u2019s. A player editing their own <b>/rp</b> line sees only their words: the roll beneath and the reply link on top are the bot\u2019s and stay. The roll audit records what changed. A line said through a webhook that has since been deleted cannot be edited by anyone — Discord ties the edit to the webhook — so the bot says so: delete it and have the NPC say it again.'),
 ]
 
@@ -1944,7 +1950,7 @@ PARTS['rules5e'] = [
 ('p', 'Damage is the weapon\u2019s dice plus the ability modifier, and the card shows the working \u2014 <b>1d8 [5] +3</b> \u2014 so nobody has to take the total on trust. A weapon with no dice set swings 1d8.'),
 ('p', '<b>The turn clock</b> runs here as in every fight: five quiet minutes bring a reminder \u2014 press <b>Still writing</b>, '
       'or just keep typing \u2014 and at fifteen the turn passes: skipped, or, where the ' + GM + ' has set it so, an attack made for '
-      'you at the foe you last struck, else the weakest standing.'),
+      'you at the foe you last struck, else the weakest standing. The reminder and the skip land on the second.'),
 ('h2', 'Dying'),
 ('p', 'At nought hit points a 5e character is dying, not dead. <b>/dnd deathsave</b> rolls a d20 \u2014 ten or better is a success, under ten a failure, a natural one counts as two failures, and a natural twenty is not a save at all \u2014 they come back on a single hit point. Three successes and they are stable; three failures and a GM records it with <b>/existence kill</b>, or a healer argues with it first.'),
 ('p', 'Any healing that lifts them above nought clears the tally, wherever it came from \u2014 a spell, a rest, or a GM\u2019s hand.'),
@@ -1989,7 +1995,14 @@ PARTS['rules5e'] = [
 ('aud', 'gm'),
 ('p', 'For a Game Master the same holds. <b>/gm dc</b> offers the six abilities and the eighteen skills in one list, with <b>save:true</b> for a saving throw; NPCs on the card roll their modifier. <b>/npc create</b> and <b>/npc edit</b> take the six scores (1 to 30, the rest an ordinary 10); <b>/char set</b> takes a score and refuses Luck; <b>/char create</b>, Heroes and signature stats are left off the picker \u2014 <b>/dnd create</b> makes characters. The auto-pilot strikes as a player does, with a statblock\u2019s attack or the modifier and proficiency, against Armour Class, in both <b>/fight auto</b> modes; a 5e fight\u2019s strike row is STR, DEX, INT, WIS and CHA.'),
 ('aud', 'all'),
-('note', 'The Knightfall fight actions \u2014 grapple, feint, deflect, disarm and the holds \u2014 still roll the Knightfall way on a 5e server; everything else above is live.'),
+('h2', 'Moves in a 5e Fight'),
+('p', 'Grappling, disarming and feinting are 5e\u2019s on a 5e server. A move is your action for the turn; the bot rolls the other side, and the higher total wins \u2014 a tie changes nothing. No move wounds anyone.'),
+('code', [('/fight act action:Grapple target:@Players', 'Athletics against the better of their Athletics and\nAcrobatics; they answer with Save. Won, they are held:\nthey cannot move, and they may still strike'),
+          ('/fight act action:Escape', 'held, on your turn: the better of your Athletics and\nAcrobatics against the holder\u2019s Athletics'),
+          ('/fight act action:Release', 'the holder lets go, freely. A hold needs no keeping:\nthe holder strikes as they like, the captive included'),
+          ('/fight act action:Disarm target_npc:Hollow', 'an NPC\u2019s weapon: your attack roll against the better\nof its Athletics and Acrobatics; taken, its next turn\ngoes to retrieving it'),
+          ('/fight act action:Feint feint:"..." target:@Players', 'Deception against their Insight; taken in, your next\nattack on them has advantage')]),
+('note', 'Nobody answers a blow on a 5e server \u2014 Armour Class takes it \u2014 so Deflect, and Disarm or Grapple against a strike, are Knightfall\u2019s alone. The auto-pilot and the turn clock play by the same rules, and a Game Master moves for an NPC with npc:.'),
 ]
 
 PARTS['library5e'] = [
@@ -2384,6 +2397,12 @@ EXAMPLES = [
       'climbing, hiding, holding a door. One message, one answer.'),
 
 ('aud', 'gm'),
+('sec', 'A clock on the scene'),
+('code', [('/timer set minutes:2 seconds:30 players:@Artorius @Meliora note:The bridge gives way',
+           'A card counts down in the channel. On time it rings and pings them both.'),
+          ('/timer cancel number:1', 'Called off \u2014 the card says so.')]),
+
+('aud', 'gm'),
 ('sec', 'Remembering last time'),
 ('code', [('/quest run recap number:1', 'The bot writes up what happened, from its notes.'),
           ('/quest run recap number:1 post:true', 'Same, but it reads it out to the party.')]),
@@ -2422,7 +2441,7 @@ EXAMPLES = [
           ('/campaign show campaign:\u2026', 'Players see the premise, what is done, and their own part. GMs see everything.')]),
 
 ('sec', 'Wrapping up'),
-('code', [('/quest run winddown number:1', 'The story is over; rewards are not settled. The party may rest and join other quests while you decide.'),
+('code', [('/quest run winddown number:1', 'The story is over; rewards are not settled. The party may rest and join other quests while you decide. The room is shown the run hour by hour, the story so far and a Review button.'),
           ('/quest run complete number:1 summary:\u2026 title:\u2026', 'Pays everyone seated when the story ended \u2014 even someone kicked during the winddown.'),
           ('(press \u21A9 Reopen within five minutes)', 'Wrong number? The payout is reversed and the party released. Fix it, complete again.'),
           ('/quest archive number:1', 'A box opens for the final word. It goes on the record, into the thread, and the GM quest log.'),
@@ -2430,7 +2449,7 @@ EXAMPLES = [
 
 ('sec', 'Fixing what was said'),
 ('code', [('(long-press a bot message \u2192 Apps \u2192 Edit (DDice))', 'The text opens already filled in. Fix the spelling, save. Works on NPC speech too.'),
-          ('/edit', 'The same from a private list: the last lines the bot and its NPCs said here. Pick one, fix it, save. The table sees only the corrected line.'),
+          ('/edit', 'The same from a private list: the last lines the bot and its NPCs said here. Pick one, fix it, save. The table sees only the corrected line. A long post in parts opens as one.'),
           ('/edit delete:true', 'The list again; the pick comes down.')]),
 ('p', 'Only messages the bot itself posted. The roll-audit records what changed.'),
 

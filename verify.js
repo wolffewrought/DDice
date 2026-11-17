@@ -1410,7 +1410,11 @@ const EXPORTS = ['chunkLines', 'rulesFor', 'abilityNeeds', 'belowBar', 'resolveD
   // automatic roll at disadvantage and how it reads, the rules table.
   'flatMode', 'autoRoll', 'autoTag', 'autoDice', 'RULES',
   // Build O (2026-11-10): initiative's one rule, the marks a natural leaves.
-  'initiativeCompare', 'sortInitiative', 'initiativeFlags', 'initTag', 'joinNatLine'];
+  'initiativeCompare', 'sortInitiative', 'initiativeFlags', 'initTag', 'joinNatLine',
+  // Build Q (2026-11-17): the 2,000 net, the words of a long post, the
+  // voices, the run hour by hour, the timer's card, AC by name.
+  'splitLongLine', 'chunkText', 'fitPayloads', 'fitEditText', 'isEphemeralPayload', 'POST_MAX', 'POST_CUT', 'voiceName', 'unvoiceName',
+  'italicLines', 'rpBeatText', 'questEventLine', 'EVENT_LINE_MAX', 'hourBlocks', 'defStatLabel', 'timerCard', 'RP_BOX_MAX', 'partsWithTail', 'dropButtons'];
 
 let loaded = null;
 function loadIndex(src) {
@@ -1449,8 +1453,8 @@ function testBuilders(src) {
                      'help', 'library', 'npc', 'quest', 'quiz', 'roll', 'spell', 'standing']) {
       ok(`/${n} is registered`, !!by[n]);
     }
-    ok('twenty-nine commands registered \\u2014 /campaign joined 2026-09-24, /edit 2026-10-13, /rp and /existence 2026-10-15; /encounter became /instance and the old /instance /session 2026-11-06; /initiative 2026-11-10; /health and /heal 2026-11-15',
-      cmds.length === 29 && cmds.some(c => c.name === 'health') && cmds.some(c => c.name === 'heal') && cmds.some(c => c.name === 'initiative') && cmds.some(c => c.name === 'instance') && cmds.some(c => c.name === 'session') && !cmds.some(c => c.name === 'encounter') &&
+    ok('thirty commands registered \\u2014 /campaign joined 2026-09-24, /edit 2026-10-13, /rp and /existence 2026-10-15; /encounter became /instance and the old /instance /session 2026-11-06; /initiative 2026-11-10; /health and /heal 2026-11-15; /timer 2026-11-17',
+      cmds.length === 30 && cmds.some(c => c.name === 'timer') && cmds.some(c => c.name === 'health') && cmds.some(c => c.name === 'heal') && cmds.some(c => c.name === 'initiative') && cmds.some(c => c.name === 'instance') && cmds.some(c => c.name === 'session') && !cmds.some(c => c.name === 'encounter') &&
       cmds.some(c => c.name === 'campaign') && cmds.some(c => c.name === 'edit') && cmds.some(c => c.name === 'rp') && cmds.some(c => c.name === 'existence'));
     // /edit: the private route to the Edit (DDice) box. The list is the
     // bot's own and NPC lines only, buttons excluded, newest first, and a
@@ -1458,7 +1462,9 @@ function testBuilders(src) {
     ok('/edit lists only the bot\'s own and NPC lines \u2014 without buttons, or with only Reply, GM and Interaction \u2014 newest first, 25 at most',
       /m\.author\?\.id === interaction\.client\.user\.id \|\| m\.webhookId\) && String\(m\.content \|\| ''\)\.trim\(\) && \(!\(m\.components\?\.length\) \|\| onlyRoleplayButtons\(m\)\)/.test(src) &&
       /const RP_BUTTON_RE = \/\^\(npcreply\|npcx\|npctalk\|rpreply\|rpnpc\)\(:\|\$\)\/;/.test(src) &&
-      (src.match(/msg\.components\?\.length && !onlyRoleplayButtons\(msg\)/g) || []).length === 2 &&
+      (src.match(/msg\.components\?\.length && !onlyRoleplayButtons\(msg\)/g) || []).length === 1 &&
+      // A post in parts (build Q): every part asked, by the remover and the parts form alike
+      (src.match(/some\(m => m\.components\?\.length && !onlyRoleplayButtons\(m\)\)/g) || []).length === 2 &&
       /BigInt\(a\.id\) < BigInt\(b\.id\) \? 1 : -1/.test(src) && /\.slice\(0, 25\);\s*if \(!mine\.length\)/.test(src));
     ok('/edit, its dropdown and Edit (DDice) all open one modal, saved by one lane; delete:true takes a line down through one remover',
       // Since 2026-10-15 the link path and the dropdown each branch to the remover, so the opener is reached by ternary there.
@@ -1669,7 +1675,7 @@ function testBuilders(src) {
       /action \? `\*\$\{action\}\*` : null,\s*speech \? `\\u201C\$\{speech\}\\u201D` : null,/.test(src));
     ok('/target: both verdicts open the What-happens form, prefilled with the flavour set at creation; blank still sends the verdict; secret tells the players on its own line',
       /setCustomId\(`tgtnar:\$\{t\.message_id\}:\$\{fell \? 1 : 0\}`\)/.test(src) &&
-      /const preset = String\(\(fell \? t\.success_text : t\.fail_text\) \|\| ''\)\.slice\(0, 1000\);/.test(src) &&
+      /const preset = String\(\(fell \? t\.success_text : t\.fail_text\) \|\| ''\)\.slice\(0, RP_BOX_MAX\);/.test(src) &&
       /if \(preset\) input\.setValue\(preset\);/.test(src) &&
       /customId\.startsWith\('tgtnar:'\)\) \{\s*const \[, msgId, fellS\] = interaction\.customId\.split\(':'\);\s*return settleTargetVerdict\(interaction, msgId, fellS === '1'\)/.test(src) &&
       /let verdict = fell \? '\\u2705 \*\*The player passes the check \\u2014 Roll succeeds\.\*\*' : '\\u274C \*\*The player fails the check \\u2014 Roll fails\.\*\*';/.test(src) &&
@@ -2273,7 +2279,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         && /openFightRp\(interaction, 'breakfree', \{ npc: npcB \}/.test(src) && /case 'stay':\s*return handleFight\(interaction, \{ sub: 'act', action: 'stay'/.test(src)
         && /if \(fight\.phase === 'defend' && fight\.atk_kind === 'hold' && fight\.current_target === actorId\)\s*return runFightBreakFree\(/.test(src)
         && /if \(fight\.atk_kind === 'hold'\) \{\s*\/\/ A captive gone quiet stays in the hold/.test(src)
-        && /const flatH = fooledH \|\| fight\.atk_nat === 20;/.test(src) && /const flatB = fooledB \|\| fight\.atk_nat === 20;/.test(src) && /const flatE = fooledE \|\| hold\.nat === 20;/.test(src)
+        && /const flatH = fooledH \|\| fight\.atk_nat === 20;/.test(src) && /const flatB = fooledB \|\| fight\.atk_nat === 20;/.test(src) && /const flatE = fooledE \|\| \(!five && hold\.nat === 20\);/.test(src)
         && /\{name:'⛓️ Stay — let a kept hold stand',value:'stay'\}/.test(src));
     ok('the feint\u2019s naturals; fooled, the blow lands whatever the totals; the feinter pays either way, the defensive feinter too',
       /const fooled = fNat === 1 \? false : fNat === 20 \? true : nat === 20 \? false : nat === 1 \? true : fight\.atk_roll > total;/.test(src)
@@ -2307,7 +2313,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         && /const markDisarmUsed = \(gid, cid, fid\) => markRoundSpecial\(gid, cid, fid, 'disarmUsed', 'fooled'\);/.test(src)
         && !/hasBladeEquipped/.test(src));
     ok('every flat roll in a fight carries the rider: the auto-pilot\u2019s, the clock\u2019s, the hand\u2019s',
-      (src.match(/autoEdge\(/g) || []).length >= 8 && /const restrainedAuto = !!grappleHolderOf\(fight, attackerId\);/.test(src)
+      (src.match(/autoEdge\(/g) || []).length >= 8 && /const restrainedAuto = !fiveMoves\(gid\) && !!grappleHolderOf\(fight, attackerId\);/.test(src)
         && /const offBalanceAuto = !restrainedAuto && consumeFlatAtk\(gid, cid, attackerId\);/.test(src)
         && /mode = flatMode\(fooledA === 'dis' \? 'dis' : flatSwing, applySignatureMode\(sigRowA, stat, mode\)\);/.test(src)
         && /const flat = consumeFlatDef\(gid, cid, defenderId\) \|\| consumeFooled\(gid, cid, defenderId\) \|\| consumeFlatMark\(gid, defenderId\);/.test(src)
@@ -2342,7 +2348,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         && (src.match(/slipHold\(/g) || []).length === 4
         && /if \(nat === 1 && !canRethrow\(gid, fight, actorId\)\) \{\s*\/\/ A hold of 1 slips at once[\s\S]{0,900}?slipHold\(gid, cid, actorId, heldId, holderName, captiveName\)[\s\S]{0,300}?await passTurn\(/.test(src)
         && src.indexOf('slipHold(gid, cid, actorId, heldId, holderName, captiveName)') < src.indexOf("phase: 'defend', current_target: heldId, atk_kind: 'hold',")
-        && /if \(hold\.nat === 1\) \{[\s\S]{0,500}?slipHold\(gid, cid, holderId, actorId, holderName, actorName\)\);\s*const res = await passTurn\(/.test(src)
+        && /if \(!five && hold\.nat === 1\) \{[\s\S]{0,500}?slipHold\(gid, cid, holderId, actorId, holderName, actorName\)\);\s*const res = await passTurn\(/.test(src)
         && /const slipped = fight\.atk_nat === 1;/.test(src) && /if \(slipped\) \{\s*lines\.push\('', slipHold\(gid, cid, holderId, captiveId, holderName, capName\)\);/.test(src)
         // (build P: thrown again into a 1 it lands through the one door — the
         // answer counts as in, and nothing of the captive's is left open.)
@@ -2416,7 +2422,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /const pendingTurnRows = new Map\(\);/.test(src) &&
       /pendingTurnRows\.set\(`\$\{gid\}:\$\{cid\}`, nextF\.answerRows\);/.test(src) &&
       /function claimTurnRows\(channelId, text, opts\)/.test(src) &&
-      /const withRows = last \? claimTurnRows\(target\.id, chunks\[i\], opts\) : opts;/.test(src) &&
+      /const withRows = last \? claimTurnRows\(target\.id, chunks\[i\], opts\) : bare;/.test(src) &&
       /return first\(\{ content: text, \.\.\.claimTurnRows\(cid, text, opts\) \}\);/.test(src));
     ok('the grapple refusal carries a release button',
       /a grappler cannot strike their captive\. Let go and swing again/.test(src) &&
@@ -2428,7 +2434,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /async function runFightRelease\(\{ interaction, gid, cid, actorId, forceTargetId = null, flavour = null \}\)/.test(src));
     // ── Build A2 (2026-10-14, T's "Build all") ──────────────────────────────
     ok('the words from a fight form, a resolve and a target strike go into the chronicle as story, not dice',
-      /noteQuestActivity\(gidM, cidM, 'rp', `\$\{who\}: \$\{flavour\.replace\(\/\[\*_\]\+\/g, ''\)/.test(src) &&
+      /noteQuestActivity\(gidM, cidM, 'rp', `\$\{who\}: \$\{rpBeatText\(flavour\)\}`/.test(src) &&
       /if \(what\) \{ try \{ noteQuestActivity\(gidM, cidM, 'rp', what\.replace/.test(src) &&
       /if \(action \|\| speech\) \{ try \{ noteQuestActivity\(gidT, t\.channel_id, 'rp', `\$\{nmT\}: /.test(src));
     ok('a new sheet is told where to go next: the thread, the board, /help',
@@ -2502,10 +2508,12 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /if \(cfgT\.updates_forum && Date\.now\(\) - \(Number\(cfgT\.week_tale_at\) \|\| 0\) >= 7 \* 86400000\)/.test(src) &&
       /if \(headline && String\(headline\)\.includes\('\\u\{1F3C6\}'\)\) \{/.test(src));
     ok('the run\'s story rides on the completion card as a scroll of several sheets, woven like /gm scroll',
-      /function makeImagesPdf\(pages\)/.test(src) && /function renderScrollBook\(\{ family, title, body \}\)/.test(src) &&
+      /function makeImagesPdf\(pages\)/.test(src) && /function renderScrollBook\(\{ family, title, body, quality = null \}\)/.test(src) &&
       /function runStoryScroll\(gid, quest, \{ runnerName, partyNames, runMs, events, tale, sofar = false \}\)/.test(src) &&
       /function hasCanvas\(\)/.test(src) && /if \(hasCanvas\(\)\) \{\s*try \{ storyFile = runStoryScroll\(gid, quest, /.test(src) &&
-      /embedScrollData\(renderScrollBook\(\{ family, title, body \}\), \{ v: 1, kind: 'scroll', title, body, name: stem \}\)/.test(src) &&
+      /const fitted = scrollBookFitting\(\{ family, title, body \}\);\s*const pdf = embedScrollData\(fitted\.pdf, \{ v: 1, kind: 'scroll', title, body: fitted\.body, name: stem \}\)/.test(src) &&
+      // The summaries in the standard face (T, 2026-11-17), long ones lighter
+      (src.match(/const family = 'standard';/g) || []).length === 3 && /function scrollBookFitting\(\{ family, title, body \}\) \{\s*for \(const quality of \[null, 75, 60\]\)/.test(src) &&
       (src.match(/files: storyFiles/g) || []).length === 2);
     ok('/quest run ready: a card with a tick per seated player, one press each, the GM told at the last',
       /CREATE TABLE IF NOT EXISTS quest_ready/.test(src) && /setName\('ready'\)/.test(src) &&
@@ -2575,7 +2583,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /if \(!action && !speech && !roll && !dice\) \{/.test(src) && /return interaction\.showModal\(rpModal\(\{ gid, gm \}\)\);/.test(src) &&
       /CREATE TABLE IF NOT EXISTS rp_lines/.test(src) &&
       // A webhook pings whatever it is told to (audit, 2026-10-15): only the people a GM named, never a player's.
-      /const mentions = \{ parse: \[\], users: pings \};/.test(src) && /sent = await hook\.send\(\{ content: body, allowedMentions: mentions, components: \[row\] \}\);/.test(src) &&
+      /const mentions = \{ parse: \[\], users: pings \};/.test(src) && /try \{ sentAll\.push\(await hook\.send\(\{ content: pieces\[i\], allowedMentions: mentions, components: \[row\] \}\)\); \}/.test(src) &&
       /if \(toRaw && !gm\) return interaction\.reply/.test(src) && /if \(to\.length && !\(await isGm\(interaction\.guild, interaction\.user\.id\)\)\) to = \[\];/.test(src) &&
       /INSERT OR REPLACE INTO rp_lines \(guild_id, message_id, channel_id, user_id, at\)/.test(src) && /noteQuestActivity\(gid, chan\.id, 'rp', `\$\{name\}: /.test(src) &&
       /customId === 'rpform' \|\| interaction\.customId\.startsWith\('rpform:'\)\) return handleRpModal\(interaction\);/.test(src) && /if \(interaction\.commandName === 'rp'\) return await handleRp\(interaction\);/.test(src));
@@ -2617,7 +2625,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /function rpLineOwner\(gid, messageId\)/.test(src) && /async function mayEditLine\(interaction, messageId\)/.test(src) && /const EDIT_NOT_YOURS = /.test(src) &&
       /\.filter\(m => gm \|\| own\.has\(String\(m\.id\)\)\)/.test(src) && /if \(!gm && rpLineOwner\(gid, messageId\) !== interaction\.user\.id\)/.test(src) &&
       /if \(!\(await mayEditLine\(interaction, messageId\)\)\)/.test(src) && /if \(!\(await mayEditLine\(interaction, id\)\)\)/.test(src) &&
-      /hook\.deleteMessage\(msg\.id, inThread \? channel\.id : undefined\)/.test(src) && /DELETE FROM rp_lines WHERE guild_id=\? AND message_id=\?/.test(src) &&
+      /hook\.deleteMessage\(m\.id, inThread \? channel\.id : undefined\)/.test(src) && /DELETE FROM rp_lines WHERE guild_id=\? AND message_id=\?/.test(src) &&
       /function rpHeaderOf\(content\)/.test(src) && /function rpPartsOf\(content\)/.test(src) && /text = joinRpParts\(parts\.head, text, parts\.foot\);/.test(src) &&
       /const shown = playerOwn \? rpPartsOf\(msg\.content\)\.words : String\(msg\.content \|\| ''\);/.test(src) &&
       /if \(interaction\.isStringSelectMenu\?\.\(\) \|\| interaction\.isFromMessage\?\.\(\)\) \{\s*const swapped = await interaction\.update\(\{ content: '\\u2705 Taken down\.'/.test(src));
@@ -2694,7 +2702,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('auto rolls show both dice — the card, the audit, the ability lines — and a Hero on auto reaches for a live signature',
       /const diceBit = adv && roll\.dropped != null \? `\[\$\{nat\}, ~~\$\{roll\.dropped\}~~\]` : `\[\$\{nat\}\]`;/.test(src)
         && (src.match(/`1d20\$\{(\w+)\.adv \? ' \(adv\)' : ''\}`, \1, /g) || []).length
-          + (src.match(/`1d20\$\{autoTag\((\w+)\)\}`, \1, /g) || []).length === 15   // + the disarm grip (2026-11-10)
+          + (src.match(/`1d20\$\{autoTag\((\w+)\)\}`, \1, /g) || []).length === 17   // + the disarm grip (2026-11-10); + the 5e save and insight, auto and clock (build Q)
         && /rollLine: `🎲  \$\{notation\} → \$\{dropped != null \? `\[\$\{nat\}, ~~\$\{dropped\}~~\]` : `\[\$\{nat\}\]`\}/.test(src)
         && !/\[\$\{nat\}~~\$\{dropped\}~~\]/.test(src) && !/autoFightCard\([^\n]*!!\w+\.adv\)/.test(src)
         && /const sig = sigStat && hasSignatureAdvantage\(subject, sigStat\) \? sigStat : null;/.test(src));
@@ -2713,8 +2721,8 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /if \(qs\.status === 'active'\) return interaction\.reply/.test(src) &&
       /if \(sub === 'start'\) \{\s*const quest = await requireQuest\(interaction, gid, \(forced && typeof forced === 'object'\) \? forced\.number : null\);/.test(src));
     ok('/fight log scroll:true hands the recap over on parchment through the story scroll\'s renderer',
-      /setName\('scroll'\)\.setDescription\('true = the recap as a parchment PDF in the scroll font, as the run\\'s story is'\)/.test(src) &&
-      /const wantScroll = !!interaction\.options\?\.getBoolean\?\.\('scroll'\);\s*if \(wantScroll\) await interaction\.deferReply\(\);/.test(src) && (src.match(/renderScrollBook\(\{ family, title, body \}\)/g) || []).length === 4 &&
+      /setName\('scroll'\)\.setDescription\('true = the recap as a parchment PDF, as the run\\'s story is'\)/.test(src) &&
+      /const wantScroll = !!interaction\.options\?\.getBoolean\?\.\('scroll'\);\s*if \(wantScroll\) await interaction\.deferReply\(\);/.test(src) && (src.match(/scrollBookFitting\(\{ family, title, body/g) || []).length === 4 &&
       /const stem = fileSlug\(`fight \$\{dateLine\(arch\.ended_at\)/.test(src));
     ok('dice of the week: every player d20 dated for a fortnight, the chronicle telling the 20s, the 1s and the biggest total',
       /CREATE TABLE IF NOT EXISTS week_dice/.test(src) && /INSERT INTO week_dice \(guild_id, user_id, at, nat, total\)/.test(src) &&
@@ -2722,7 +2730,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       (src.match(/rollLine, nat, sides: 20, total,/g) || []).length === 2 &&
       /\*\*Dice of the week\*\*/.test(src) && /natural 20s: /.test(src) && /natural 1s: /.test(src) && /biggest d20 total: /.test(src));
     ok('the ledgers that only grow are pruned per guild on boot (the Deploy mend says so) and on /gm check run: /rp lines and the activity ledger past ninety days, the week\'s dice past fourteen \u2014 presses and group rolls are rules and stay',
-      /function pruneLedgers\(gid\)/.test(src) && /\[\['rp_lines', 'at', 90\], \['week_dice', 'at', 14\], \['story_run_log', 'at', 90\]\]/.test(src) && !/\['button_presses', 'at'/.test(src) &&
+      /function pruneLedgers\(gid\)/.test(src) && /\[\['rp_lines', 'at', 90\], \['post_parts', 'at', 90\], \['week_dice', 'at', 14\], \['story_run_log', 'at', 90\]\]/.test(src) && !/\['button_presses', 'at'/.test(src) &&
       /\{ const pr = pruneLedgers\(gid\); if \(pr\.length\) made\.push\(`ledgers trimmed: /.test(src) && /\{ const pr = pruneLedgers\(gid\); if \(pr\.length\) lines\.push\(/.test(src));
     // The speak-as box is the one modal built in the label style (discord.js
     // 14.27): three labels, the third a user picker read with getSelectedUsers.
@@ -2823,7 +2831,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('Edit (DDice) asks the channel for a webhook the table has forgotten',
       /async function ownWebhookForAsync\(client, gid, channel, webhookId\)/.test(src) &&
       /h\.id === webhookId && h\.owner\?\.id === client\.user\.id && h\.token/.test(src) &&
-      (src.match(/await ownWebhookForAsync\(interaction\.client, gid, /g) || []).length === 3 &&   // the remover asks too (2026-10-15)
+      (src.match(/await ownWebhookForAsync\(interaction\.client, gid, /g) || []).length === 5 &&   // the remover asks too (2026-10-15); the parts form and its save (build Q)
       /a webhook I no longer hold, so Discord will not let anyone edit it/.test(src));
     ok('the restructure migration is one-time',
       /npc_threads_2/.test(src));
@@ -2895,9 +2903,9 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /advantage on several dice now rolls the set twice \(2026-11-07\)\.\s*\n\s*mode = applyNextMark\(gid, uid, mode\);/.test(src) &&
       !/if \(stat\) mode = applyNextMark\(gid, uid, mode\);/.test(src));
     ok('a player\'s line cannot counterfeit or lose the bot\'s parts, and a rolled line stays up; /rp answers before the work',
-      /const BOT_LINE_RE = /.test(src) && (src.match(/BOT_LINE_RE\.test\(/g) || []).length === 3 &&
+      /const BOT_LINE_RE = /.test(src) && (src.match(/BOT_LINE_RE\.test\(/g) || []).length === 4 &&
       /if \(text\.length > 2000\)\s*\n\s*return interaction\.reply\(\{ ephemeral: true, content: `\\u274C Too long by/.test(src) &&
-      /if \(rpPartsOf\(msg\.content\)\.foot && !\(await isGm\(interaction\.guild, interaction\.user\.id\)\)\)/.test(src) &&
+      /if \(live\.some\(m => rpPartsOf\(m\.content\)\.foot\) && !\(await isGm\(interaction\.guild, interaction\.user\.id\)\)\)/.test(src) &&
       /await interaction\.deferReply\(\{ ephemeral: true \}\);\s*\n\s*const answer = \(content\) => interaction\.editReply/.test(src));
     ok('add is approve wearing instance clothes', /const map = \{ add: 'approve' \};/.test(src));
     ok('listing autocomplete values are numbers', /value: String\(q\.number\)/.test(src));
@@ -3764,9 +3772,9 @@ function testBuildN(src) {
     ok('Disarm on your own turn: a player’s on NPCs only, DEX against the better of their STR and DEX, ties to whoever holds the weapon, the naturals on both dice — the disarmer’s first; a 20 wounds 1, a 1 costs 2 and disarms you; the very next roll flat, whatever came of it',
       /async function runFightDisarmAttack\(\{ interaction, gid, cid, actorId = null, targetId, mode, flavour \}\)/.test(src)
         && /if \(!isNpcFighter\(uid\) && !isNpcFighter\(targetId\)\) return refuse\('⚔️ Disarming works on NPCs only\.'\);/.test(src)
-        && /const gripStat = sD > sS \? 'dex' : sS > sD \? 'str' : \(hasSignatureAdvantage\(npcRow, 'dex'\) \? 'dex' : 'str'\);/.test(src)
+        && /const gripStat = grip5 \? DND_SKILLS\[grip5\.skill\] : sD > sS \? 'dex' : sS > sD \? 'str' : \(hasSignatureAdvantage\(npcRow, 'dex'\) \? 'dex' : 'str'\);/.test(src)
         && /const won = nat === 1 \? false : nat === 20 \? true : g\.nat === 20 \? false : g\.nat === 1 \? true : total > g\.total;/.test(src)
-        && /\/\/ The price, whatever comes of it: the disarmer's very next roll is flat\.\s*setFooled\(gid, cid, uid\);/.test(src)
+        && /\/\/ The price, whatever comes of it: the disarmer's very next roll is flat\s*\/\/ \\u2014 Knightfall's; 5e has none\.\s*if \(!five\) setFooled\(gid, cid, uid\);/.test(src)
         && /const flatN = consumeFlatDef\(gid, cid, targetId\) \|\| consumeFooled\(gid, cid, targetId\) \|\| consumeFlatMark\(gid, targetId\);/.test(src)
         && /if \(which === 'disarm' && \(\(!asNpc && !isNpcFighter\(fid\)\) \|\| disarmedOf\(fight, fid\)\)\) continue;/.test(src)
         && /if \(forcedOf\(forced, 'attack'\) \|\| myTurn\) \{/.test(src)
@@ -3784,7 +3792,7 @@ function testBuildN(src) {
     ok('Retrieve: a button and its form for a player, a 🎭 one for a GM, the auto-pilot and the clock on their own; a skipped turn counts; the once-a-round answers re-arm',
       /if \(kind === 'retrieve'\) return \[new ActionRowBuilder\(\)\.addComponents\(\s*B\('fact:retrieve', /.test(src)
         && /if \(kind === 'retrieve'\) return \[new ActionRowBuilder\(\)\.addComponents\(N\('fnretrieve', /.test(src)
-        && /if \(disarmedOf\(fight, fid\)\) return fightAnswerRows\('retrieve', \{ forNpc: npc, auto, gid \}\);/.test(src)
+        && /if \(disarmedOf\(fight, fid\)\) return fightAnswerRows\('retrieve', \{ forNpc: npc, auto, gid, holding: Object\.values\(gmap\)\.includes\(fid\) \}\);/.test(src)
         && /async function runFightRetrieve\(\{ interaction, gid, cid, actorId, flavour = null \}\)/.test(src)
         && /async function retrievalTurn\(guild, gid, cid, actorId, deliver, flavour = null\) \{\s*if \(!consumeEffectFlag\(gid, cid, actorId, 'disarmed'\)\) return false;\s*consumeEffectFlag\(gid, cid, actorId, 'deflected'\);\s*consumeEffectFlag\(gid, cid, actorId, 'disarmUsed'\);/.test(src)
         && /async \(l\) => sendLong\(channel, l\)\)\) return true;/.test(src)
@@ -3809,8 +3817,8 @@ function testBuildN(src) {
         && /const mk = isNpcFighter\(fid\) \? getNpc\(gid, npcNameFromFighter\(fid\)\)\?\.next_mark : getChar\(gid, fid\)\?\.next_mark;/.test(src));
     ok('/deception opens a form — the pretence, the plan kept back until the dice have spoken, the words — with a mark that may be an NPC and a GM who may lie as one',
       /setCustomId\(`decept:\$\{token\}`\)/.test(src) && /if \(interaction\.customId\.startsWith\('decept:'\)\) return handleDeceptionSubmit\(interaction\);/.test(src)
-        && /field\('claim', 'What do you pretend\?', 300, true\)/.test(src) && /field\('plan', 'What are you really planning\? \(kept hidden\)', 300, true\)/.test(src)
-        && /field\('speech', 'What do you say\? \(optional\)', 500, false\)/.test(src)
+        && /field\('claim', 'What do you pretend\?', RP_BOX_MAX, true\)/.test(src) && /field\('plan', 'What are you really planning\? \(kept hidden\)', RP_BOX_MAX, true\)/.test(src)
+        && /field\('speech', 'What do you say\? \(optional\)', RP_BOX_MAX, false\)/.test(src)
         && src.indexOf("lines.push('', myLine, theirLine, '');") < src.indexOf('was really planning: _${plan}_')
         && /setName\('target_npc'\)\.setDescription\('Or an NPC/.test(src) && /setName\('npc'\)\.setDescription\('GM: deceive AS this NPC'\)/.test(src)
         && /interaction\.commandName === 'deception' \|\|/.test(src)
@@ -3869,6 +3877,127 @@ function testBuildO(mod, src) {
         && /if \(interaction\.commandName === 'initiative'\) return await handleSessionInitiative\(interaction\);/.test(src)
         && /ALTER TABLE turn_orders ADD COLUMN roll_mode TEXT/.test(src) && /ALTER TABLE turn_orders ADD COLUMN open INTEGER/.test(src)
         && /customId\.startsWith\('initrp:'\)\) return handleInitRpModal\(interaction\);/.test(src));
+  });
+}
+
+// Build Q (2026-11-17): the summaries in the standard face, /timer, every
+// roleplay box at 4,000 with long posts carried on into parts, the
+// wind-down post, the review kept to the party, an instance's clock, the
+// turn clock on the second, the 5e moves, and the fixes beside them.
+function testBuildQ(mod, src) {
+  return harness('build Q', (ok, eq) => {
+    const { splitLongLine, chunkText, fitPayloads, fitEditText, isEphemeralPayload, POST_MAX, POST_CUT, voiceName, unvoiceName,
+      italicLines, rpBeatText, questEventLine, EVENT_LINE_MAX, hourBlocks, defStatLabel, timerCard, RP_BOX_MAX, partsWithTail, dropButtons, autoRoll } = mod;
+    const words = (n, w = 'word') => Array.from({ length: n }, (_, i) => `${w}${i}`).join(' ');
+    // ── the 2,000 net ──
+    eq('Discord’s limit and the cut under it', [POST_MAX, POST_CUT, RP_BOX_MAX], [2000, 1990, 4000]);
+    const longItal = `*${words(900)}*`;
+    const pieces = splitLongLine(longItal);
+    ok('a line longer than a message breaks at spaces, every piece in its own marks, nothing lost',
+      pieces.length >= 3 && pieces.every(p => p.length <= POST_CUT && /^\*[^*]/.test(p) && /[^*]\*$/.test(p))
+        && pieces.map(p => p.slice(1, -1)).join(' ') === longItal.slice(1, -1));
+    const story = [words(120, 'a'), '', `_${words(700, 'b')}_`, '```', words(500, 'c'), '```', words(50, 'd')].join('\n');
+    const chunks = chunkText(story);
+    ok('a long post in parts: every part fits, the words all there in order, a code fence closed and opened again at a cut',
+      chunks.length >= 3 && chunks.every(c => c.length <= POST_MAX)
+        && chunks.join('\n').replace(/[*_`\s]+/g, ' ').trim() === story.replace(/[*_`\s]+/g, ' ').trim()
+        && chunks.every(c => (c.match(/```/g) || []).length % 2 === 0));
+    eq('a short post is left alone', fitPayloads({ content: 'short', components: [1] }), null);
+    const sendP = fitPayloads({ content: words(800), components: ['row'], files: ['f'], allowedMentions: { parse: [] }, reply: { messageReference: 'm' } });
+    ok('sent in parts: the buttons and files ride the last part, the reply the first, the mentions setting every part',
+      sendP.length >= 2 && sendP.slice(0, -1).every(p => !p.components && !p.files) && sendP[sendP.length - 1].components[0] === 'row'
+        && sendP[sendP.length - 1].files[0] === 'f' && !!sendP[0].reply && !sendP[1].reply && sendP.every(p => p.allowedMentions?.parse?.length === 0));
+    const editP = fitPayloads({ content: words(800), components: ['new'] }, { mode: 'edit' });
+    const updP = fitPayloads({ content: words(800), components: ['keep'] }, { mode: 'update' });
+    ok('an edit in parts clears the old buttons from the first and puts the new on the last; an update keeps them on the card it updates',
+      Array.isArray(editP[0].components) && editP[0].components.length === 0 && editP[editP.length - 1].components[0] === 'new'
+        && updP[0].components[0] === 'keep' && !updP[updP.length - 1].components);
+    const edited = fitEditText(`${'x'.repeat(2400)}\n\n✅ **Approved** by a GM`);
+    ok('an edit that cannot grow into a second message keeps its start and its foot — the verdict a card gains — and loses the middle',
+      edited.length <= POST_MAX && edited.endsWith('\n\n✅ **Approved** by a GM') && edited.includes('…') && fitEditText('short') === 'short');
+    ok('an answer only its asker sees is told apart, however it says so',
+      isEphemeralPayload({ ephemeral: true }) && isEphemeralPayload({ flags: 64 }) && isEphemeralPayload({ flags: [64] }) && !isEphemeralPayload({ flags: 0 }) && !isEphemeralPayload({ content: 'x' }));
+    const tailed = partsWithTail(words(600), '🎲 **Roll** 1d20 → [12] = **12**');
+    ok('a roleplay post in parts keeps its roll whole at the foot of the last part',
+      tailed.length >= 2 && tailed.every(c => c.length <= POST_CUT) && tailed[tailed.length - 1].endsWith('🎲 **Roll** 1d20 → [12] = **12**'));
+    ok('every roleplay box takes 4,000, and the hard cuts are gone from the routes that posted them',
+      (src.match(/setMaxLength\(RP_BOX_MAX\)/g) || []).length >= 8 && !/setMaxLength\(1800\)/.test(src)
+        && /function installLengthNet\(lib\)/.test(src) && /installLengthNet\(require\('discord\.js'\)\)/.test(src)
+        && /function armLength\(interaction\)/.test(src));
+    ok('the net is on every road: a channel’s send, a message’s edit, an interaction’s answers, and the NPC voice split by hand',
+      /'ThreadChannel', 'VoiceChannel', 'StageChannel', 'DMChannel'/.test(src) && /M\.edit = fitted;/.test(src)
+        && /for \(const k of \['reply', 'editReply', 'followUp', 'update'\]\)/.test(src) && /notePostParts\(/.test(src));
+    ok('a post in parts is one post: /edit opens every part in one form, a take-down takes every part',
+      /CREATE TABLE IF NOT EXISTS post_parts/.test(src) && /function openPartsEditModal\(/.test(src) && /boteditp:/.test(src)
+        && /async function saveBotEditParts\(/.test(src) && (src.match(/const group = postPartsOf\(gid, msg\.id\);/g) || []).length === 2);
+    // ── words ──
+    ok('an action in italics marks each of its lines, so a long one or one in paragraphs stays in italics',
+      italicLines('One.\n\nTwo.') === '*One.*\n\n*Two.*' && italicLines('  ') === '');
+    eq('a roleplay beat for the log keeps every word: marks dropped, lines joined', rpBeatText('*She runs.*\n“Wait!”'), 'She runs. · “Wait!”');
+    const evLine = questEventLine({ at_ms: 3600000 + 5 * 60000, kind: 'rp', text: 'y'.repeat(EVENT_LINE_MAX + 50) });
+    ok('a line of the log in chat shows its start; the log itself keeps the whole',
+      EVENT_LINE_MAX === 300 && /^`\s*1h 05m` 🎭 y+…$/.test(evLine) && evLine.length < EVENT_LINE_MAX + 30);
+    // ── voices ──
+    ok('an NPC named for Discord or Clyde gets its own voice: a hair space Discord accepts, taken out again wherever a name is read back',
+      voiceName('Discord Dan') === 'D iscord Dan' && voiceName('old clyde') === 'old c lyde' && voiceName('Garrick') === 'Garrick'
+        && unvoiceName(voiceName('Discord Clyde')) === 'Discord Clyde' && (src.match(/voiceName\(/g) || []).length >= 4);
+    // ── the wind-down ──
+    const H = 3600000;
+    const blocks = hourBlocks([{ at_ms: 10 * 60000, kind: 'rp', text: 'We hold the stair' }, { at_ms: 25 * 60000, kind: 'remind', text: 'Time check' },
+      { at_ms: 30 * 60000, kind: 'talk', text: 'brb' }, { at_ms: 3 * H + 5 * 60000, kind: 'note', text: 'The door gives' }], 3 * H + 20 * 60000);
+    const bt = blocks.join('\n');
+    ok('the run hour by hour: in order, quiet hours run together, the last hour so far, the clock’s own lines and table talk left out',
+      bt.indexOf('**Hour 1**') >= 0 && bt.indexOf('**Hours 2–3** — _quiet') > bt.indexOf('We hold the stair')
+        && bt.indexOf('**Hour 4** (so far)') > bt.indexOf('Hours 2') && bt.indexOf('The door gives') > bt.indexOf('Hour 4') && !/Time check|brb/.test(bt));
+    ok('a run with nothing logged still has its hour', hourBlocks([], 20 * 60000).join('\n').includes('**Hour 1** — _quiet, nothing logged._'));
+    ok('the wind-down posts in the run’s room for everyone — the hours, the story so far, Review — after the GM is answered, and never on a resume',
+      /async function postWindDown\(guild, gid, quest, ch, gmId = null\)/.test(src) && /setCustomId\(`fbq:\$\{live\.number\}`\)/.test(src)
+        && (src.match(/await postWindDown\(/g) || []).length >= 1 && /const \{ file \} = await runSoFarFile\(|\(\{ file \} = await runSoFarFile\(/.test(src));
+    ok('📝 Review is the party’s: one seated on the run, or since departed — once each; the press and the form both ask',
+      /function reviewRefusal\(gid, uid, runNum\)/.test(src) && (src.match(/reviewRefusal\(interaction\.guild\.id, interaction\.user\.id, /g) || []).length === 2);
+    // ── the clocks ──
+    ok('an instance keeps the clock a quest has: the hourly summary and the quarter-hour time check',
+      /\/\/ And the hourly summary and the quarter-hour time checks, as a\s*\/\/ quest has \(T, 2026-11-17: "have both"\)\.\s*\}\s*const now = questElapsed\(q\);/.test(src));
+    ok('the turn clock acts on the second: a wake set for the next mark due inside the minute, the minute tick behind it',
+      /function nextClockMark\(now = Date\.now\(\)\)/.test(src) && /function setClockWake\(client\)/.test(src)
+        && /const PRECISE_TIMERS = process\.env\.DDICE_PRECISE_TIMERS !== '0';/.test(src) && /\} finally \{ turnClockBusy = false; setClockWake\(client\); \}/.test(src));
+    // ── /timer ──
+    let card = null; try { card = timerCard({ id: 7, note: 'The bridge', due_at: 1800000000000, users: '["111111111111111111"]', roles: '["222222222222222222"]', gm_id: '333' }); } catch {}
+    ok('the timer’s card: its number and note, Discord’s own countdown, whom it rings for, Cancel — and no pings until it rings',
+      !!card && /^⏳ \*\*Timer #7\*\* — The bridge\nRings <t:1800000000:R> \(<t:1800000000:T>\) for <@111111111111111111> <@&222222222222222222>/.test(card.content)
+        && JSON.stringify(card.allowedMentions) === '{"parse":[]}');
+    ok('/timer: a GM’s, five seconds to a day, someone to ring; it rings once, pinging those named, late after an absence; Cancel is a GM’s',
+      /const TIMER_MIN_S = 5, TIMER_MAX_S = 24 \* 3600;/.test(src) && /if \(!\(await isGm\(interaction\.guild, uid\)\)\) return no\('\\u274C Timers are a GM\\u2019s\.'\);/.test(src)
+        && /UPDATE gm_timers SET state='rung', rung_at=\? WHERE id=\? AND state='running' AND due_at<=\?/.test(src)
+        && /allowedMentions: \{ users: timerJson\(t\.users\), roles: timerJson\(t\.roles\) \}/.test(src) && /Late: the bot was away/.test(src)
+        && /armTimers\(client\)\.catch/.test(src) && /'\\u274C Only a GM calls a timer off\.'/.test(src));
+    // ── the fight's fixes ──
+    ok('the kept hold’s Break free and Stay go once it is answered; a disarmed holder is offered Release on their turn',
+      /async function stripHoldCard\(client, gid, cid\)/.test(src) && /dropButtons\(m\.components, \['fbreak', 'fstay'\]\)/.test(src)
+        && (src.match(/stripHoldCard\(/g) || []).length >= 3);
+    const dropped = dropButtons([{ components: [{ customId: 'fbreak', label: 'B', style: 1 }, { customId: 'grpfree', label: 'R', style: 2 }] }, { components: [{ customId: 'fstay', label: 'S', style: 2 }] }], ['fbreak', 'fstay']);
+    ok('a card’s buttons rebuilt without the answered ones — a row left empty goes', dropped.length === 1);
+    ok('a called fight untouched for a day lapses, and its card says so',
+      /const CALL_LAPSE_MS = 24 \* 3600000;/.test(src) && /The fight call lapsed/.test(src) && /lapseFightCalls\(/.test(src.slice(src.indexOf('async function turnClockTick('))));
+    ok('/library srd is refused off 5e; /roll action: says mode: does not apply to a fight move',
+      /rulesL\.id !== 'dnd5e'/.test(src) && /content: MODE_NOT_A_FIGHT_MOVE/.test(src));
+    ok('an open /deception form lives an hour and a restart does not lose it',
+      /const DECEPTION_FORM_MS = 60 \* 60000;/.test(src) && /CREATE TABLE IF NOT EXISTS deception_forms/.test(src)
+        && /function takeDeceptionForm\(token\)/.test(src) && !/pendingDeceptions\.get\(token\)[\s\S]{0,40}pendingDeceptions\.delete\(token\);\s*if \(!p/.test(src.replace(/function takeDeceptionForm[\s\S]*?\n\}/, '')));
+    // ── 5e ──
+    ok('5e moves: the grab and the escape Athletics against the better of Athletics and Acrobatics, no wounds, a tie changes nothing; the holder may strike; Maintain is not a move',
+      /function bestSkill5e\(gid, fid, skills = \['athletics', 'acrobatics'\]\)/.test(src) && /On 5e a hold needs no keeping/.test(src)
+        && /if \(!fiveMoves\(gid\) && grappleHolderOf\(fight, targetId\) === actorId\)/.test(src) && /a tie keeps the hold/.test(src));
+    ok('5e: a feint is Deception against Insight for advantage on the next attack on them — spent by a hand’s strike, the bot’s and the clock’s alike',
+      /function feintEdgeOn\(gid, cid, attackerId, targetId, edge\)/.test(src) && (src.match(/feintEdgeOn\(gid, cid, attackerId, (targetId|target), autoEdge\(/g) || []).length === 2
+        && /consumeEffectFlag\(gid, cid, actorId, `feintEdge:\$\{targetId\}`\)\) \{ mode = mode === 'dis' \? 'normal' : 'adv'; feintEdgeUsed = true; \}/.test(src)
+        && autoRoll(0, 'feint').feint === true && autoRoll(0, 'feint').adv === true && !autoRoll(0, true).feint);
+    ok('5e: a disarm is the attack roll against the grip; the answers to a blow are not 5e’s; Armour Class reads as AC, never undefined',
+      /function attackBonus5e\(gid, fid\)/.test(src) && (src.match(/content: NOT_ON_5E_ANSWER/g) || []).length === 3
+        && defStatLabel('ac') === 'AC' && defStatLabel('dex') === 'DEX' && /\(\*\*\$\{defStatLabel\(fight\.def_stat\)\}\*\*\)/.test(src));
+    // ── the summaries' face ──
+    ok('the run’s story, the GM’s record and the fight log’s scroll are set in the standard face; the scroll font is for props and the sheet',
+      (src.match(/const family = 'standard';/g) || []).length === 3 && /function renderScrollBook\(\{ family, title, body, quality = null \}\)/.test(src));
   });
 }
 
@@ -4097,7 +4226,7 @@ function main() {
     }
     if (missing.length) console.log(`${C.yel}!${C.off} load                   ${C.dim}not exported: ${missing.join(', ')}${C.off}`);
 
-    for (const r of [testBuilders(src), testRules(mod), testPins(src), testBuildI(mod), testBuildJ(mod), testBuildK(mod), testBuildL(mod), testBuildN(src), testBuildO(mod, src)]) {
+    for (const r of [testBuilders(src), testRules(mod), testPins(src), testBuildI(mod), testBuildJ(mod), testBuildK(mod), testBuildL(mod), testBuildN(src), testBuildO(mod, src), testBuildQ(mod, src)]) {
       assertions += r.pass;
       if (r.fails.length) {
         failedSteps.push(r.name);

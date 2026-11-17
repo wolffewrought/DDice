@@ -106,43 +106,37 @@ New verbs join their group; the wall is history until a single group nears 25.
 | Patch discipline | house rule | exact-string anchors + count asserts + write-at-end; a failed assert persists nothing |
 
 ## At the ceiling right now
-1. **`/gm dc` customId — over 100 chars for long free text.** The one live
-   breach. HANDOFF.md §7.1 has the fix and the trade.
-2. **Quest modals — 5/5 rows.** Text fields are full; anything new rides options or customId.
+1. **Quest modals — 5/5 rows.** Text fields are full; anything new rides options or customId.
    The `/npc say` box and a GM's `/rp` box can reach 5/5 labels too (2026-11-06).
-3. **Applied forum tags — 5/thread** with GM hand-tags competing.
-4. **`/npc` 24/25 and `/quest` 23/25 leaves.** The next subcommand on either
+2. **Applied forum tags — 5/thread** with GM hand-tags competing.
+3. **`/npc` 24/25 and `/quest` 23/25 leaves.** The next subcommand on either
    must join a group. config and gm are already folded.
 
 ## Sharp edges to remember
 - A `customId` built from user text must budget the 100-char ceiling *and* exclude `:`.
 - A message's buttons are kept by an edit only because the edit sends content alone; `/edit` relies on it for lines carrying Reply, GM or Interaction.
-- Modal edit **truncates** any text field longer than 4000 that was authored inline.
 - Thread renames are near-once-per-10-min; never automate them.
 - Forum pin behaviour across six books needs one live verification.
-- NPC names containing "discord" would break their webhook voice.
 - Typing holds a turn only through the `GuildMessageTyping` intent (not privileged). A modal sends no typing: the press that opened a fight form holds the turn, and fifteen minutes inside an open form the clock acts.
-- The turn clock acts on the minute tick, so a turn passes up to a minute after its mark; after an outage every quiet turn is acted on at the first tick, one step each.
-- On a 5e server grapple, feint, deflect and disarm still roll the Knightfall way (STR, WIS, an opposed d20).
+- The turn clock acts on the second while the bot is up (a wake set after each minute tick for the next mark inside the minute); after an outage every quiet turn is acted on at the first tick, one step each.
 - `characters` has no name column: a 5e export carries the name, an import ignores it.
 - `/rp roll:` answers a called check only on a plain ability; a skill or a saving-throw card is answered by its own button.
 - The 🎭 GM answer box has no Interaction pick: the NPC's default activity button rides under the answer.
 - A held roll is run again from what was asked, not from the moment: a typed `rra` rerolls whatever roll is last by the time it is allowed, and a denied fight command answers in the channel (what would have been the player's alone is said aloud to them).
-- `/roll action:` ignores `mode:` (the fight bridge reads `roll:`), so it is never held — and never rolls with advantage either.
+- `/roll action:` ignores `mode:` (the fight bridge reads `roll:`), so it is never held — and never rolls with advantage either; since build Q it says so.
 - An allowed Roll that opens a form stays live until the form comes back or the ten minutes run out; a form opened in time still rolls with advantage after the button has gone.
 - A feint's or a deception's price in a fight is the fight's flag: it waits for the fighter's next fight roll, and goes with the fight if it ends first. Outside a fight it shares the sheet's one mark with a GM's 🔼 or 🔽: whichever is set later stands. An NPC's sheet mark is the same one slot.
-- The Break free and Stay buttons stay on the hold card after the answer; a late press is told no hold is waiting. A reroll of the hold's roll changes the total to beat; a 20 is read at the answer, and a 1 slips the hold at once.
+- The Break free and Stay buttons go from the hold card once it is answered — remembered in memory, so a card from before a restart keeps them, and a late press is told no hold is waiting. A reroll of the hold's roll changes the total to beat; a 20 is read at the answer, and a 1 slips the hold at once.
 - In a fight a feint re-arms on your own turn's action (an attack, a grab, a disarm, Maintain, Escape), flat or not; a defence roll does not, flat or not. A retrieval is no roll and re-arms nothing.
 - A 5e skill check or saving throw does not strip the stat for a flat mark (a 5e sheet only gets one from a GM's check outcome).
 - A custom `/roll` standing in for a fight roll counts its first die as the natural, read against 20 whatever the dice: a d100 that shows 20 is a natural 20, and lands whatever the totals.
-- A disarmed fighter's turn carries Retrieve alone: one holding someone types `/fight act action:Release` (still free) — there is no button for it that turn.
-- `/deception`'s form lives in memory for 15 minutes: a restart, or a late submit, says it has expired.
+- `/deception`'s form lives an hour, kept in `deception_forms` as well as memory; a submit after that says it has expired.
 - `/fight rr` of a flat attack that carried a banked +2 reads it from the numbers: with a stat of exactly 2 it labels the reroll as an honest roll (the total is right either way).
 - A natural on initiative marks the fighter's first turn, whenever it comes: one downed before it keeps the mark until their turn does come round; one who re-joins rolls afresh and keeps only the new roll's mark.
 - A skip — `/fight skip`, `/gm override skip`, the clock's — is the whole turn: a natural 20's second action goes with it. The clock's attack for a quiet fighter is one of the two.
 - Out of combat, `back` does not give back a natural 20's second Done or a natural 1's roleplay turn once spent.
 - A level initiative follows the moment each roll was made; an order rolled before 2026-11-10 carries no moments, so a newcomer level with someone in it goes after them.
-- A called fight's card has no clock: it stays open until Begin, Cancel or `/fight end`, and no other fight starts in that channel meanwhile. With sign-ups open it never begins on its own.
+- A called fight's card stays open until Begin, Cancel or `/fight end` — or a day with nobody touching it, when it lapses — and no other fight starts in that channel meanwhile. With sign-ups open it never begins on its own.
 - A called fight's Add NPCs takes NPCs only: a name with no NPC behind it is left out (an initiative order takes it, at d20 + 0).
 
 - (build P, 2026-11-17) A roll waiting on Reroll or Keep holds the exchange: nothing lands, and the turn clock keeps it at its skip mark. A GM's Resolve keeps every open roll; a player's keeps only their own.
@@ -151,3 +145,10 @@ New verbs join their group; the wall is history until a single group nears 25.
 - (build P) An NPC's own move picked by the auto-pilot goes through the players' runner; if the runner declines it, the NPC strikes or defends as ever.
 - (build P) A player's Disarm and Deflect still work on NPCs only; an NPC's work on anyone.
 - (build P) `/help category:rules` now prints the whole table across several private messages — it had been cut at 1,900 characters.
+
+- (build Q, 2026-11-17) A post over 2,000 goes as several messages, lines whole where they fit, a longer one broken at a space; the buttons and files ride the last part. An edit cannot grow into a second message: one over 2,000 keeps its start and its foot and loses the middle (`fitEditText`).
+- (build Q) A post's parts are known for 90 days (`post_parts`); after that `/edit` treats a part as a line of its own. A post in more than five parts opens five at a time, from the part picked. A part someone has deleted stops the parts form; a GM can take the rest down.
+- (build Q) `/timer` rings in the channel it was set in; with that channel gone it rings nowhere. One due while the bot was away rings at boot, marked late (over 15 seconds). Its card says when it rang or who called it off.
+- (build Q) The wind-down's hours are run time from the log (pauses excluded), not the wall clock; a run with nothing logged still shows its quiet hours.
+- (build Q) 5e moves: the other side of a contest is rolled by the bot (the grip, the escape's holder); an NPC's skills are its ability modifiers alone. A hold only marks them held: the bot has no movement to stop. A feint's advantage waits for the feinter's next attack on that target, and goes with the fight if it ends first.
+- (build Q) An NPC whose name holds "discord" or "clyde" speaks with a hair space after that word's first letter; copying its name out of Discord carries the hair space.

@@ -32,6 +32,8 @@
 
 require('dotenv').config();
 const { Client, GatewayIntentBits, SlashCommandBuilder, ContextMenuCommandBuilder, ApplicationCommandType, PermissionFlagsBits, MessageFlags, REST, Routes } = require('discord.js');
+// Every channel send through the 2,000 net (installLengthNet, below).
+try { installLengthNet(require('discord.js')); } catch (e) { console.error('[net] install -', e?.message || e); }
 
 // Refusals said often enough that they deserve one home.
 const MSG_NO_ACCESS = '❌ I can\'t access this channel.';
@@ -815,6 +817,26 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS roll_holds (
   channel_id TEXT, payload TEXT, at INTEGER,
   PRIMARY KEY (guild_id, token)
 )`); } catch (e) { console.error('roll_holds schema', e); }
+// A post longer than Discord's 2,000 goes out in parts (T, 2026-11-17): the
+// parts of each, in order, so /edit and the take-down treat them as one.
+try { db.exec(`CREATE TABLE IF NOT EXISTS post_parts (
+  guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+  part_id TEXT PRIMARY KEY, head_id TEXT NOT NULL, idx INTEGER NOT NULL, at INTEGER
+)`); } catch (e) { console.error('post_parts schema', e); }
+try { db.exec('CREATE INDEX IF NOT EXISTS post_parts_head ON post_parts (guild_id, head_id)'); } catch {}
+// A GM's timer (T, 2026-11-17): it pings the players named when its time is
+// up, on the second, and is kept here so a restart does not lose it.
+try { db.exec(`CREATE TABLE IF NOT EXISTS gm_timers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, card_msg_id TEXT,
+  gm_id TEXT, set_at INTEGER, due_at INTEGER NOT NULL, secs INTEGER,
+  users TEXT, roles TEXT, note TEXT,
+  state TEXT NOT NULL DEFAULT 'running', rung_at INTEGER
+)`); } catch (e) { console.error('gm_timers schema', e); }
+// An open /deception form, kept through a restart (T, 2026-11-17).
+try { db.exec(`CREATE TABLE IF NOT EXISTS deception_forms (
+  token TEXT PRIMARY KEY, guild_id TEXT NOT NULL, data TEXT NOT NULL, at INTEGER NOT NULL
+)`); } catch (e) { console.error('deception_forms schema', e); }
 // npc_lines (2026-10-20 to 2026-11-06) held each channel's newest NPC line,
 // whose row was the only one kept; every line keeps its row now, so it is
 // no longer made. A server that had it keeps an idle table, read by nothing.
@@ -825,6 +847,8 @@ try { db.exec("ALTER TABLE turn_orders ADD COLUMN roll_mode TEXT DEFAULT 'bot'")
 try { db.exec('ALTER TABLE turn_orders ADD COLUMN open INTEGER DEFAULT 1'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN rerolls_current INTEGER DEFAULT 0'); } catch {}
+// The last time anyone touched a called fight (T, 2026-11-17: a day untouched and it lapses).
+try { db.exec('ALTER TABLE fight_calls ADD COLUMN touched_at INTEGER'); } catch {}
 // A temporary NPC is a real fighter in every way the engine cares about —
 // same table, same lookups, so a fight can never miss one — but it keeps
 // out of the forum and the roster, and is swept when its fight ends
@@ -1244,16 +1268,213 @@ async function interactionChannel(interaction) {
 // Split content on line boundaries into pieces that fit Discord's 2000-char
 // hard limit. Shared by sendLong and replyLong so the two can't drift.
 function chunkLines(content, limit = 1900) {
-  const src = Array.isArray(content) ? content : String(content).split('\n');
-  const chunks = [];
-  let buf = '';
-  for (const line of src) {
-    const piece = line.length > limit ? line.slice(0, limit) : line;
-    if (buf.length + piece.length + 1 > limit) { chunks.push(buf); buf = piece; }
-    else { buf = buf ? buf + '\n' + piece : piece; }
+  // A line too long for one message is broken at a space now, never cut
+  // (T, 2026-11-17: the roleplay boxes hold 4,000).
+  const text = Array.isArray(content) ? content.join('\n') : String(content ?? '');
+  return text.trim() ? chunkText(text, limit) : [];
+}
+
+// ── Discord's 2,000 a message ──
+// The roleplay boxes hold Discord's 4,000 (T, 2026-11-17), so any post may
+// outgrow one message. A long one carries on in the next: lines kept whole
+// where they fit, a longer line broken at a space, a line in *…* or _…_
+// wrapped again on every piece, the buttons and files on the last part.
+// Nothing is cut, and nothing fails for its length.
+const POST_MAX = 2000;
+const POST_CUT = 1990;
+function splitLongLine(line, limit = POST_CUT, firstRoom = limit) {
+  const s = String(line ?? '');
+  if (s.length <= Math.min(limit, firstRoom)) return [s];
+  const pre = (/^[*_]{1,3}/.exec(s) || [''])[0];
+  const suf = [...pre].reverse().join('');
+  const wrapped = !!pre && s.length > pre.length * 2 && s.endsWith(suf);
+  const inner = wrapped ? s.slice(pre.length, s.length - suf.length) : s;
+  const marks = wrapped ? pre.length * 2 : 0;
+  const pieces = [];
+  let rest = inner;
+  for (;;) {
+    // The first piece fills what is left of the message it joins; the rest
+    // take a message each.
+    const room = Math.max(50, (pieces.length ? limit : Math.min(limit, firstRoom)) - marks);
+    if (rest.length <= room) break;
+    let cut = rest.lastIndexOf(' ', room);
+    if (cut < room / 2) cut = room;
+    if (/[\uD800-\uDBFF]/.test(rest[cut - 1] || '')) cut--;
+    pieces.push(rest.slice(0, cut).trimEnd());
+    rest = rest.slice(cut).trimStart();
   }
-  if (buf) chunks.push(buf);
-  return chunks;
+  if (rest.length) pieces.push(rest);
+  return wrapped ? pieces.map(p => `${pre}${p}${suf}`) : pieces;
+}
+function chunkText(text, limit = POST_CUT) {
+  const out = [];
+  let cur = null;
+  for (const line of String(text ?? '').split('\n')) {
+    const room = cur === null ? limit : limit - cur.length - 1;
+    if (line.length <= room) { cur = cur === null ? line : `${cur}\n${line}`; continue; }
+    // A line that fits a message of its own starts one, kept whole.
+    if (line.length <= limit) { out.push(cur); cur = line; continue; }
+    // Longer than a message: broken at spaces, the first piece filling this
+    // one when there is room worth filling.
+    const fill = cur !== null && room >= 200;
+    const pieces = splitLongLine(line, limit, fill ? room : limit);
+    pieces.forEach((piece, i) => {
+      if (i === 0 && fill) { cur = `${cur}\n${piece}`; return; }
+      if (cur !== null) out.push(cur);
+      cur = piece;
+    });
+  }
+  if (cur !== null) out.push(cur);
+  // A code fence left open at a cut is closed there and opened again after.
+  for (let i = 0; i < out.length - 1; i++) {
+    if ((out[i].match(/```/g) || []).length % 2) { out[i] += '\n```'; out[i + 1] = `\`\`\`\n${out[i + 1]}`; }
+  }
+  const kept = out.map(c => c.replace(/^\n+|\n+$/g, '')).filter(c => c.trim());
+  return kept.length ? kept : [''];
+}
+const dropUndefined = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined));
+// A payload too long for one message, as the payloads of its parts — or
+// null when it fits. mode 'send': buttons and files ride the last part;
+// 'edit': the first part replaces a message, so its old buttons go when
+// the payload brings new ones; 'update': the card being updated keeps them.
+function fitPayloads(payload, { mode = 'send' } = {}) {
+  const p = typeof payload === 'string' ? { content: payload } : payload;
+  if (!p || typeof p !== 'object' || typeof p.content !== 'string' || p.content.length <= POST_MAX) return null;
+  const chunks = chunkText(p.content);
+  const { content, components, files, embeds, attachments, poll, reply, messageReference, nonce, tts, fetchReply, withResponse, ...rest } = p;
+  const carry = dropUndefined({ components, files, embeds, attachments, poll });
+  return chunks.map((c, i) => {
+    const first = i === 0, last = i === chunks.length - 1;
+    const q = { ...rest, content: c };
+    if (first) Object.assign(q, dropUndefined({ reply, messageReference, nonce, tts, fetchReply, withResponse }));
+    if (mode === 'update' ? first : last) Object.assign(q, carry);
+    else if (first && mode === 'edit' && components !== undefined) q.components = [];
+    return q;
+  });
+}
+function isEphemeralPayload(p) {
+  if (!p || typeof p !== 'object') return false;
+  if (p.ephemeral === true) return true;
+  const f = p.flags;
+  if (f && typeof f.has === 'function') return !!f.has(64);
+  return ((Array.isArray(f) ? f.reduce((a, b) => a | Number(b), 0) : Number(f)) & 64) !== 0;
+}
+function notePostParts(gid, cid, msgs) {
+  const ids = (msgs || []).map(m => m?.id).filter(Boolean).map(String);
+  if (!gid || !cid || ids.length < 2) return;
+  try {
+    const ins = db.prepare('INSERT OR REPLACE INTO post_parts (guild_id, channel_id, part_id, head_id, idx, at) VALUES (?,?,?,?,?,?)');
+    const now = Date.now();
+    ids.forEach((id, i) => ins.run(String(gid), String(cid), id, ids[0], i, now));
+  } catch (e) { console.error('[parts] note -', e?.message || e); }
+}
+// The parts of the post a message belongs to, in order — null for a post
+// that fitted one message.
+function postPartsOf(gid, messageId) {
+  try {
+    const row = db.prepare('SELECT head_id FROM post_parts WHERE guild_id=? AND part_id=?').get(String(gid), String(messageId));
+    if (!row) return null;
+    const all = db.prepare('SELECT part_id, idx, channel_id FROM post_parts WHERE guild_id=? AND head_id=? ORDER BY idx').all(String(gid), row.head_id);
+    return all.length > 1 ? all : null;
+  } catch { return null; }
+}
+// Every send to a channel goes through the net: each channel class's own
+// send, wrapped once at load. An edit cannot grow into a second message,
+// so an over-long one loses its middle and keeps its foot (fitEditText).
+function installLengthNet(lib) {
+  const wrapSend = (C) => {
+    const proto = C?.prototype;
+    if (!proto || typeof proto.send !== 'function' || proto.send.ddiceFit) return;
+    const orig = proto.send;
+    const fitted = async function (payload) {
+      const parts = fitPayloads(payload);
+      if (!parts) return orig.call(this, payload);
+      const sent = [];
+      for (const q of parts) sent.push(await orig.call(this, q));
+      notePostParts(this.guildId ?? this.guild?.id, this.id, sent);
+      const last = sent[sent.length - 1];
+      try { if (last && typeof last === 'object') last.ddiceParts = sent; } catch {}
+      return last;
+    };
+    fitted.ddiceFit = true;
+    proto.send = fitted;
+  };
+  for (const name of ['BaseGuildTextChannel', 'BaseGuildVoiceChannel', 'TextChannel', 'NewsChannel', 'AnnouncementChannel',
+    'ThreadChannel', 'VoiceChannel', 'StageChannel', 'DMChannel', 'PartialGroupDMChannel']) {
+    try { wrapSend(lib?.[name]); } catch {}
+  }
+  const M = lib?.Message?.prototype;
+  if (M && typeof M.edit === 'function' && !M.edit.ddiceFit) {
+    const orig = M.edit;
+    const fitted = function (payload) {
+      if (typeof payload === 'string') payload = fitEditText(payload);
+      else if (payload && typeof payload.content === 'string') payload = { ...payload, content: fitEditText(payload.content) };
+      return orig.call(this, payload);
+    };
+    fitted.ddiceFit = true;
+    M.edit = fitted;
+  }
+}
+// An edit over 2,000 keeps its start and its end \u2014 a card's verdict is
+// added at the foot, \u2705 Approved and the like \u2014 and loses the middle.
+function fitEditText(text) {
+  const s = String(text ?? '');
+  if (s.length <= POST_MAX) return s;
+  const cut = s.lastIndexOf('\n\n');
+  const tail = cut > 0 && s.length - cut <= 400 ? s.slice(cut) : `\n${s.slice(-200)}`;
+  return `${s.slice(0, POST_MAX - tail.length - 1)}\u2026${tail}`;
+}
+// An interaction's answers go through the net too: its reply, its edit,
+// its follow-ups and its card update, wrapped on the interaction itself.
+function armLength(interaction) {
+  if (!interaction || interaction.ddiceArmed) return interaction;
+  interaction.ddiceArmed = true;
+  const orig = {};
+  for (const k of ['reply', 'editReply', 'followUp', 'update']) {
+    if (typeof interaction[k] === 'function') orig[k] = interaction[k].bind(interaction);
+  }
+  const followAll = async (parts, eph) => {
+    const sent = [];
+    for (const q of parts) sent.push(await orig.followUp(eph && !isEphemeralPayload(q) ? { ...q, ephemeral: true } : q));
+    return sent;
+  };
+  const remember = (all, eph) => {
+    const last = all[all.length - 1] ?? null;
+    interaction.ddiceLastPost = last;
+    if (!eph) notePostParts(interaction.guildId ?? interaction.guild?.id, interactionChannelId(interaction), all);
+    return last;
+  };
+  if (orig.reply) interaction.reply = async (payload) => {
+    const parts = fitPayloads(payload);
+    if (!parts) return orig.reply(payload);
+    const eph = isEphemeralPayload(parts[0]);
+    const first = await orig.reply(parts[0]);
+    const head = eph ? null : await interaction.fetchReply?.().catch(() => null);
+    const last = remember([head, ...(await followAll(parts.slice(1), eph))], eph);
+    return (payload?.fetchReply || payload?.withResponse) ? last : first;
+  };
+  if (orig.editReply) interaction.editReply = async (payload) => {
+    const parts = fitPayloads(payload, { mode: 'edit' });
+    if (!parts) return orig.editReply(payload);
+    const eph = !!interaction.ephemeral || isEphemeralPayload(payload);
+    const head = await orig.editReply(parts[0]);
+    return remember([head, ...(await followAll(parts.slice(1), eph))], eph);
+  };
+  if (orig.followUp) interaction.followUp = async (payload) => {
+    const parts = fitPayloads(payload);
+    if (!parts) return orig.followUp(payload);
+    const eph = isEphemeralPayload(parts[0]);
+    return remember(await followAll(parts, eph), eph);
+  };
+  if (orig.update) interaction.update = async (payload) => {
+    const parts = fitPayloads(payload, { mode: 'update' });
+    if (!parts) return orig.update(payload);
+    const eph = !!interaction.message?.flags?.has?.(64);
+    const r = await orig.update(parts[0]);
+    remember([interaction.message ?? null, ...(await followAll(parts.slice(1), eph))], eph);
+    return r;
+  };
+  return interaction;
 }
 
 // Chunked delivery to any channel or user — the career summary and long
@@ -1279,9 +1500,11 @@ function claimTurnRows(channelId, text, opts) {
 async function sendLong(target, content, { files = null, ...opts } = {}) {
   if (!target) return;
   const chunks = chunkLines(content);
+  // Buttons ride the last part only (T, 2026-11-17).
+  const { components: _c, embeds: _e, ...bare } = opts;
   for (let i = 0; i < chunks.length; i++) {
     const last = i === chunks.length - 1;
-    const withRows = last ? claimTurnRows(target.id, chunks[i], opts) : opts;
+    const withRows = last ? claimTurnRows(target.id, chunks[i], opts) : bare;
     await target.send({ content: chunks[i], ...(last && files ? { files } : {}), ...withRows })
       .catch(e => console.error('[sendLong] delivery failed -', e?.message || e));
   }
@@ -1305,12 +1528,16 @@ async function replyLong(interaction, content, opts = {}) {
   }
   // Chunk by lines, never mid-line unless a single line is itself too long.
   const chunks = chunkLines(Array.isArray(content) ? content : text, LIMIT);
-  await first({ content: chunks[0], ...(chunks.length === 1 ? claimTurnRows(cid, chunks[0], opts) : opts) });
+  // Buttons ride the last part only (T, 2026-11-17).
+  const { components: _c, embeds: _e, files: _f, ...bare } = opts;
+  await first({ content: chunks[0], ...(chunks.length === 1 ? claimTurnRows(cid, chunks[0], opts) : bare) });
   for (let i = 1; i < chunks.length; i++) {
     const last = i === chunks.length - 1;
-    await interaction.followUp({ content: chunks[i], ...(last ? claimTurnRows(cid, chunks[i], opts) : opts) }).catch(() => {});
+    await interaction.followUp({ content: chunks[i], ...(last ? claimTurnRows(cid, chunks[i], opts) : bare) }).catch(() => {});
   }
 }
+
+const MODE_NOT_A_FIGHT_MOVE = '\u2139\uFE0F `mode:` was left out \u2014 a fight move takes its advantage from the fight itself (a GM\u2019s \u{1F53C}, a Hero\u2019s signature stat), not from `/roll`.';
 
 // Parse "@Alice @Bob" (or raw ids) into an ordered, de-duplicated list of user ids.
 // An audience: one player (a bare id, as before), or `u:<id>` / `r:<id>`
@@ -1959,7 +2186,15 @@ async function handleRollSlash(interaction) {
   if (interaction.options.getBoolean('last')) return handleLastRoll(interaction);
   // The fight bridge: an ability picked here rides the exact /fight machinery.
   const fightAction = interaction.options.getString('action');
-  if (fightAction) return handleFight(interaction, fightAction);
+  if (fightAction) {
+    // mode: belongs to a plain roll; a fight move takes its advantage from
+    // the fight (T, 2026-11-17: it used to vanish without a word).
+    const askedMode = interaction.options.getString('mode');
+    const ran = await handleFight(interaction, fightAction);
+    if (askedMode && askedMode !== 'normal' && (interaction.replied || interaction.deferred))
+      await interaction.followUp({ ephemeral: true, content: MODE_NOT_A_FIGHT_MOVE }).catch(() => {});
+    return ran;
+  }
   const stat = interaction.options.getString('stat');
   let dice = (interaction.options.getString('dice') || '').trim();
   const mode = interaction.options.getString('mode') || 'normal';
@@ -2036,8 +2271,8 @@ async function handleRollSlash(interaction) {
       const f = getFight(gid, cid);
       const why = !f || f.state !== 'active' ? 'There is no fight running here.'
         : f.phase === 'attack' ? 'It is not your turn to attack.'
-        : f.atk_kind === 'grapple' ? 'That is a grapple — answer with `/fight act action:Save` (STR only).'
-        : f.atk_kind === 'feint' ? 'That is a feint — answer with `/fight act action:Insight` (WIS only).'
+        : f.atk_kind === 'grapple' ? `That is a grapple — answer with \`/fight act action:Save\` (${is5e(gid) ? 'Athletics or Acrobatics' : 'STR only'}).`
+        : f.atk_kind === 'feint' ? `That is a feint — answer with \`/fight act action:Insight\`${is5e(gid) ? '' : ' (WIS only)'}.`
         : f.atk_kind === 'hold' ? 'That is a kept hold — answer with Break free (`/fight act action:Escape`) or Stay.'
         : f.def_roll !== null ? 'That exchange already has both rolls — `/fight resolve` it.'
         : 'You are not the one being attacked.';
@@ -2143,13 +2378,16 @@ const RULES = [
   { key: 'twenty-twenty',  text: 'Twenty against twenty goes to whoever started the roll, everywhere: an attack over a parry, a disarm over the grip, a kept hold over the break, an escape over the hold, a lie over the insight.' },
   { key: 'sides',          text: 'NPCs fight as enemies unless a GM makes them friendly; a fight with NPCs ends when one side is all down, and the friendly ones win it with the players. The auto-pilot never attacks its own side; by hand anyone can be targeted.' },
   { key: 'resolve-gm',     text: 'In a fight with NPCs the ⚖️ Resolve is the GM’s; players alone resolve their own. On the auto-pilot the bot lands an exchange itself once you have kept or rerolled.' },
+  { key: 'moves-5e',       text: 'On a 5e server the moves are 5e\u2019s, each the turn\u2019s action, the higher total winning, a tie changing nothing, no wounds: a grapple is Athletics against the better of Athletics and Acrobatics, and the escape the same the other way; a hold only stops them moving, and its holder may strike them. A disarm is the attack roll against the better of Athletics and Acrobatics. A feint is Deception against Insight, and taken in, the feinter\u2019s next attack on them has advantage. Nobody answers a blow: Armour Class takes it.' },
   { key: 'npc-moves',      text: 'NPCs can use every move a player can, by the same rules — a GM by `npc:` or the \u{1F3AD} buttons, the auto-pilot now and then. A player’s Disarm and Deflect still work on NPCs only.' },
   { key: 'hp-gm',          text: 'HP is a GM’s to change: `/health adjust`. Brought to nothing mid-fight, a fighter is knocked out and their turn ends. White Knights heal with `/heal`.' },
   { key: 'initiative',     text: 'Initiative is d20 + DEX (the modifier on 5e), highest first. A natural 20 goes to the top whatever the totals, and its first turn holds two actions, any two; several 20s go higher DEX first, then whoever rolled first. A natural 1 goes to the bottom, and its first turn is roleplay only \u2014 your words, no roll or action, though you can still defend; several 1s go lower DEX lower, and on one DEX the first to roll a 1 sits lowest. Any other level total goes to whoever rolled first; nobody rerolls. Out of combat a 20\u2019s first turn takes two Dones and a 1\u2019s is a Roleplay turn. Join later and you roll the same way.' },
   { key: 'one-quest',      text: 'One quest at a time. A run that is winding down does not count; nor does anything opened with `/instance` \u2014 the GM seats those by hand.' },
   { key: 'winddown-kick',  text: 'Kicked while a run is winding down? You are still paid when it completes.' },
   { key: 'pause-round',    text: () => `A pause rounds the clock up to the next ${Math.round(QUARTER_MS / 60000)} minutes.` },
-  { key: 'encounter-idle', text: () => `An instance (encounter, chapter, older quest) quiet for ${Math.round(ENCOUNTER_IDLE_MS / 3600000)} hours reminds the room and pings the GMs; it never ends itself.` },
+  { key: 'encounter-idle', text: () => `An instance (encounter, chapter, older quest) keeps a quest\u2019s clock \u2014 the hourly summary, the quarter-hour time check \u2014 and quiet for ${Math.round(ENCOUNTER_IDLE_MS / 3600000)} hours reminds the room and pings the GMs; it never ends itself.` },
+  { key: 'review-party',   text: 'A run\u2019s \u{1F4DD} Review is for those who played it \u2014 seated, or since departed \u2014 one review each.' },
+  { key: 'call-lapse',     text: 'A fight called on a card and touched by nobody for a day lapses; `/fight start` calls another.' },
   { key: 'encounter-seats', text: 'An instance\'s seats are the GM\'s: there is no Join button. The GM picks the party when it starts, and `/session add` or `/session kick` after.' },
   { key: 'reopen',         text: 'A completion can be reopened by a GM within five minutes: the payout is reversed, that run\'s titles revoked.' },
   { key: 'rest-exclusion', text: 'A rest passes over anyone on an active quest or fight, and the fallen.' },
@@ -2160,6 +2398,8 @@ const ruleText = (r) => (typeof r.text === 'function' ? r.text() : r.text);
 // of stats comes from the ruleset — so a Knightfall server never meets them;
 // a 5e fight line no longer reads "1d20+undefined".
 const STAT_LABELS = { str:'STR', con:'CON', dex:'DEX', wis:'WIS', lck:'LCK', int:'INT', cha:'CHA' };
+// A defence's label: on 5e the blow meets Armour Class, which is no stat.
+const defStatLabel = (s) => (s === 'ac' ? 'AC' : (STAT_LABELS[s] ?? '?'));
 
 // ── The ruleset ────────────────────────────────────────────────────
 // What a system decides, in one place: its stats, how HP comes from them,
@@ -2441,6 +2681,45 @@ function abilityNeeds(gid, ability) {
 }
 // True when they fall short of it.
 function belowBar(row, bar) { return (Number(row?.[bar.stat]) || 0) < bar.need; }
+
+// \u2500\u2500 The 5e moves (T, 2026-11-17) \u2500\u2500
+// 5e has rules for two of the four; the feint is a house rule. On a 5e
+// server a grab and its escape are Athletics against the better of
+// Athletics and Acrobatics, a disarm is the attack roll against the same,
+// a feint is Deception against Insight and wins advantage on the next
+// attack on them. The totals decide \u2014 a tie leaves things as they were \u2014
+// with no wounds and no naturals of the Knightfall kind; a hold needs no
+// keeping and costs nothing a round; the answers to a blow (deflect, a
+// disarm or a grab as a defence) are not used, Armour Class doing that.
+// An NPC adds its ability modifier: a statblock's skills are not kept.
+const SKILL_NAMES_5E = { athletics: 'Athletics', acrobatics: 'Acrobatics', deception: 'Deception', insight: 'Insight' };
+function fiveMoves(gid) { return rulesFor(gid).defence === 'ac'; }
+function skill5e(gid, fid, skill) {
+  const row = isNpcFighter(fid) ? getNpc(gid, npcNameFromFighter(fid)) : getChar(gid, fid);
+  if (!row) return 0;
+  const mod = statBonusOf(gid, row, DND_SKILLS[skill] || 'str');
+  if (isNpcFighter(fid)) return mod;
+  let prof = {};
+  try { prof = JSON.parse(row.proficient || '{}') || {}; } catch {}
+  return mod + ((prof.skills || []).includes(skill) ? rulesFor(gid).profBonus(row) : 0);
+}
+// The better of two skills, chosen for them as a defence is.
+function bestSkill5e(gid, fid, skills = ['athletics', 'acrobatics']) {
+  let best = null;
+  for (const s of skills) { const b = skill5e(gid, fid, s); if (!best || b > best.bonus) best = { skill: s, bonus: b, label: SKILL_NAMES_5E[s] }; }
+  return best;
+}
+// The attack roll a disarm makes: a statblock's own bonus, else the better
+// of STR and DEX with proficiency.
+function attackBonus5e(gid, fid) {
+  const rules = rulesFor(gid);
+  const row = isNpcFighter(fid) ? getNpc(gid, npcNameFromFighter(fid)) : getChar(gid, fid);
+  if (!row) return 0;
+  const monster = rules.monsterAttack ? rules.monsterAttack(row) : null;
+  if (monster != null) return monster;
+  return Math.max(rules.statBonus(row, 'str'), rules.statBonus(row, 'dex')) + rules.profBonus(row);
+}
+const NOT_ON_5E_ANSWER = '\u{1F6E1}\uFE0F On a 5e server Armour Class takes the blow \u2014 there is no answer to give.';
 
 function rulesFor(gid) {
   let id = null;
@@ -8661,14 +8940,41 @@ async function npcWebhookIn(channel, gid, npcName, imageUrl) {
 
   // Every send wears the NPC's own face, whichever hook carries it.
   const bind = (client) => ({
-    send: (payload) => client.send({
-      ...(typeof payload === 'string' ? { content: payload } : payload),
-      username: npcName,
-      avatarURL: imageUrl ?? BLANK_AVATAR,
+    send: async (payload) => {
+      const whole = {
+        ...(typeof payload === 'string' ? { content: payload } : payload),
+        username: voiceName(npcName),
+        avatarURL: imageUrl ?? BLANK_AVATAR,
+        ...(threadId ? { threadId } : {}),
+      };
+      // A long line carries on in the next message, in the same voice
+      // (T, 2026-11-17); the buttons ride the last part.
+      const parts = fitPayloads(whole);
+      if (!parts) return client.send(whole);
+      const sent = [];
+      for (let i = 0; i < parts.length; i++) {
+        const q = parts[i];
+        try { sent.push(await client.send(q)); }
+        catch (err) {
+          // What is out stays out: a hook that cannot carry buttons takes the
+          // last part without them, rather than the caller saying it twice.
+          if (i < parts.length - 1 || !q.components || !/component|50006|owned|application/i.test(String(err?.message || ''))) throw err;
+          const { components: _drop, ...bare } = q;
+          sent.push(await client.send(bare));
+        }
+      }
+      notePostParts(gid, threadId || host.id, sent);
+      const last = sent[sent.length - 1];
+      try { if (last && typeof last === 'object') last.ddiceParts = sent; } catch {}
+      return last;
+    },
+    // An edit through the hook; a thread's line needs the thread named. It
+    // cannot grow into a second message, so an over-long one ends in an ellipsis.
+    edit: (messageId, payload) => client.editMessage(messageId, {
+      ...payload,
+      ...(typeof payload?.content === 'string' ? { content: fitEditText(payload.content) } : {}),
       ...(threadId ? { threadId } : {}),
     }),
-    // An edit through the hook; a thread's line needs the thread named.
-    edit: (messageId, payload) => client.editMessage(messageId, { ...payload, ...(threadId ? { threadId } : {}) }),
   });
 
   // 1 · the channel's shared hook, if we've already got one.
@@ -9296,6 +9602,14 @@ function expandNpcTokens(gid, str) {
   return { names, missingCats };
 }
 
+// Discord refuses a webhook name with "discord" or "clyde" in it, and the
+// line went out as the bot's (T, 2026-11-17). A hair space after the first
+// letter passes and reads the same; anything reading a name back drops it.
+function voiceName(name) {
+  return String(name || '').replace(/d(?=iscord)|c(?=lyde)/gi, (m) => `${m}\u200A`).slice(0, 80);
+}
+function unvoiceName(name) { return String(name || '').replace(/\u200A/g, ''); }
+
 // Post a message into a channel AS an NPC (via its webhook, with name + avatar),
 // matching how /npc posts. Falls back to a plain channel.send if the webhook fails.
 // Returns the sent message when the API hands one back (so callers can build
@@ -9306,7 +9620,7 @@ function noteNpcSpeech(gid, channel, npcName, said = '') {
   // (T's screenshot, 2026-08-23). Carry the words, trimmed to a beat.
   // An answer's jump header is not what was said (cold audit).
   const words = String(said || '').replace(/^-# \u21AA[^\n]*\n/, '').replace(/\s+/g, ' ').trim();
-  const beat = words ? `${npcName}: \u201c${words.slice(0, 120)}${words.length > 120 ? '\u2026' : ''}\u201d` : `${npcName} speaks`;
+  const beat = words ? `${npcName}: \u201c${words}\u201d` : `${npcName} speaks`;
   try { noteQuestActivity(gid, channel?.id, 'rp', beat); } catch {}
 }
 
@@ -9576,7 +9890,7 @@ async function npcAnswerOptions(interaction, gid) {
     const cached = chan?.messages?.cache ? [...chan.messages.cache.values()] : [];
     cached.sort((a, b) => Number(b.createdTimestamp || 0) - Number(a.createdTimestamp || 0));
     for (const m of cached) {
-      const nm = m.webhookId ? byLower.get(String(m.author?.username || '').toLowerCase()) : null;
+      const nm = m.webhookId ? byLower.get(unvoiceName(m.author?.username).toLowerCase()) : null;
       if (nm && !heard.includes(nm)) heard.push(nm);
     }
   } catch {}
@@ -9590,8 +9904,8 @@ function npcAnswerModal(gid, cid, mid, toName, options) {
   const modal = new ModalBuilder().setCustomId(`npcans:${cid}:${mid}`.slice(0, 100)).setTitle(`Answer ${toName}`.slice(0, 45));
   const who = new StringSelectMenuBuilder().setCustomId('who').setPlaceholder('Which NPC answers')
     .setMinValues(1).setMaxValues(1).setRequired(true).addOptions(options.slice(0, 25));
-  const actionInput = new TextInputBuilder().setCustomId('action').setPlaceholder('folds his arms').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(900);
-  const speechInput = new TextInputBuilder().setCustomId('speech').setPlaceholder('Who asks?').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(900);
+  const actionInput = new TextInputBuilder().setCustomId('action').setPlaceholder('folds his arms').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(RP_BOX_MAX);
+  const speechInput = new TextInputBuilder().setCustomId('speech').setPlaceholder('Who asks?').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(RP_BOX_MAX);
   const toPicker = new UserSelectMenuBuilder().setCustomId('to').setPlaceholder('Pick who the NPC addresses').setMinValues(0).setMaxValues(25).setRequired(false);
   modal.addLabelComponents(
     new LabelBuilder().setLabel('Who answers').setDescription('Those heard here lately first').setStringSelectMenuComponent(who),
@@ -9644,10 +9958,10 @@ function npcSayModal(npc, gid = null, { reply = null } = {}) {
     .setTitle(`${reply ? 'Answer as' : 'Speak as'} ${npc.name}`.slice(0, 45));
   const actionInput = new TextInputBuilder()
     .setCustomId('action').setPlaceholder('draws his blade').setStyle(TextInputStyle.Paragraph)
-    .setRequired(false).setMaxLength(900);
+    .setRequired(false).setMaxLength(RP_BOX_MAX);
   const speechInput = new TextInputBuilder()
     .setCustomId('speech').setPlaceholder('Halt! Who goes there, @Aldric?').setStyle(TextInputStyle.Paragraph)
-    .setRequired(false).setMaxLength(900);
+    .setRequired(false).setMaxLength(RP_BOX_MAX);
   const toPicker = new UserSelectMenuBuilder()
     .setCustomId('to').setPlaceholder('Pick who the NPC addresses').setMinValues(0).setMaxValues(25).setRequired(false);
   modal.addLabelComponents(
@@ -10528,7 +10842,7 @@ function composeNpcSay({ action, speech, raw, to = [] }) {
   const say = (speech || '').trim();
   if (raw && raw.trim()) parts.push(raw.trim());
   else {
-    if (act) parts.push(`*${act}*`);
+    if (act) parts.push(italicLines(act));
     if (say) {
       const alreadyQuoted = /^["\u201c][\s\S]*["\u201d]$/.test(say);
       parts.push(alreadyQuoted ? say : `"${say}"`);
@@ -10593,8 +10907,9 @@ async function handleNpcSayModal(interaction) {
   const tell = (content) => interaction.editReply({ content, allowedMentions: { parse: [] } });
   // An answer wears the jump header to the line it answers.
   const headA = replyTo ? await replyHeaderAt(interaction.client, gid, replyTo.cid, replyTo.mid) : '';
+  // However long, it goes: a long one carries on in the next message, in
+  // the same voice (T, 2026-11-17).
   const body = `${headA}${said0}`;
-  if (body.length > 1800) return tell('❌ Too long (max 1800 characters, the names under it included).');
   const offer = offeredActivity(gid, npc, pick);
 
   const chan = await interactionChannel(interaction);
@@ -11270,7 +11585,28 @@ async function handleDuelRejectModal(interaction) {
 // deceives as an NPC with `npc:`; an NPC can be the mark with
 // `target_npc:`, its insight rolled by the bot and its flat roll kept on
 // its sheet until it next rolls.
+// An open form lives an hour \u2014 the boxes hold 4,000 now, and a long lie
+// takes writing \u2014 and is kept in the database too, so a restart while it
+// is open no longer loses it (T, 2026-11-17).
 const pendingDeceptions = new Map();
+const DECEPTION_FORM_MS = 60 * 60000;
+function keepDeceptionForm(token, gid, p) {
+  pendingDeceptions.set(token, p);
+  try {
+    db.prepare('DELETE FROM deception_forms WHERE at < ?').run(Date.now() - DECEPTION_FORM_MS);
+    db.prepare('INSERT OR REPLACE INTO deception_forms (token, guild_id, data, at) VALUES (?,?,?,?)').run(token, gid, JSON.stringify(p), p.at);
+  } catch (e) { console.error('[deception] keep -', e?.message || e); }
+}
+// Taken once: whoever reads it, it is gone from both.
+function takeDeceptionForm(token) {
+  let p = pendingDeceptions.get(token) || null;
+  pendingDeceptions.delete(token);
+  try {
+    if (!p) { const row = db.prepare('SELECT data FROM deception_forms WHERE token=?').get(token); p = row ? JSON.parse(row.data) : null; }
+    db.prepare('DELETE FROM deception_forms WHERE token=?').run(token);
+  } catch { p = p || null; }
+  return p && Date.now() - Number(p.at) <= DECEPTION_FORM_MS ? p : null;
+}
 async function deceptionParties(interaction) {
   const gid = interaction.guild.id, uid = interaction.user.id, cid = interactionChannelId(interaction);
   const no = (refusal) => ({ refusal });
@@ -11315,28 +11651,27 @@ async function handleDeception(interaction) {
   const r = await deceptionParties(interaction);
   if (r.refusal) return interaction.reply({ ephemeral: true, content: r.refusal });
   const now = Date.now();
-  for (const [k, v] of pendingDeceptions) if (now - v.at > 15 * 60000) pendingDeceptions.delete(k);
+  for (const [k, v] of pendingDeceptions) if (now - v.at > DECEPTION_FORM_MS) pendingDeceptions.delete(k);
   const token = `${now.toString(36)}${Math.random().toString(36).slice(2, 7)}`;
-  pendingDeceptions.set(token, { at: now, uid: interaction.user.id, ...r.parties });
+  keepDeceptionForm(token, interaction.guild.id, { at: now, uid: interaction.user.id, ...r.parties });
   const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder: MR } = require('discord.js');
   const field = (id, label, max, required) => new MR().addComponents(new TextInputBuilder()
     .setCustomId(id).setLabel(label).setStyle(TextInputStyle.Paragraph).setRequired(required).setMaxLength(max));
   const m = new ModalBuilder().setCustomId(`decept:${token}`).setTitle(`Deceive ${r.parties.targetName}`.slice(0, 45))
     .addComponents(
-      field('claim', 'What do you pretend?', 300, true),
-      field('plan', 'What are you really planning? (kept hidden)', 300, true),
-      field('speech', 'What do you say? (optional)', 500, false));
+      field('claim', 'What do you pretend?', RP_BOX_MAX, true),
+      field('plan', 'What are you really planning? (kept hidden)', RP_BOX_MAX, true),
+      field('speech', 'What do you say? (optional)', RP_BOX_MAX, false));
   return interaction.showModal(m);
 }
 async function handleDeceptionSubmit(interaction) {
   const token = interaction.customId.slice('decept:'.length);
-  const p = pendingDeceptions.get(token);
-  pendingDeceptions.delete(token);
+  const p = takeDeceptionForm(token);
   if (!p) return interaction.reply({ ephemeral: true, content: '❌ That form has expired \u2014 run `/deception` again.' });
   if (p.uid !== interaction.user.id) return interaction.reply({ ephemeral: true, content: '❌ That form is not yours.' });
   const gid = interaction.guild.id, cid = interactionChannelId(interaction);
   const val = (id, max) => { try { return String(interaction.fields.getTextInputValue(id) || '').trim().slice(0, max); } catch { return ''; } };
-  const claim = val('claim', 300), plan = val('plan', 300), speech = val('speech', 500);
+  const claim = val('claim', RP_BOX_MAX), plan = val('plan', RP_BOX_MAX), speech = val('speech', RP_BOX_MAX);
   if (!claim) return interaction.reply({ ephemeral: true, content: '❌ A deception needs a pretence \u2014 what you pretend.' });
   // A fight may have started while the form was open.
   const fD = getFight(gid, cid);
@@ -11641,7 +11976,7 @@ function autoRoll(mod, adv = false) {
   if (adv) {
     const a = rollDie(20), b = rollDie(20);
     const nat = Math.max(a, b);
-    return { nat, total: nat + mod, adv: true, dropped: Math.min(a, b) };
+    return { nat, total: nat + mod, adv: true, dropped: Math.min(a, b), ...(adv === 'feint' ? { feint: true } : {}) };
   }
   const nat = rollDie(20);
   return { nat, total: nat + mod };
@@ -11903,7 +12238,7 @@ async function autoFightCard(guild, gid, fighter, kind, stat, nat, total, target
     const eff = statVal + (kind === 'atk' ? atkBonus : 0);
     const bonusTag = (kind === 'atk' && atkBonus) ? ` +${atkBonus} riposte` : '';
     const adv = !!roll?.adv;
-    const advTag = adv ? ' ⭐ (signature advantage)' : '';
+    const advTag = adv ? (roll?.feint ? ' \u{1F3AD} (advantage \u2014 the feint)' : ' ⭐ (signature advantage)') : '';
     const diceBit = adv && roll.dropped != null ? `[${nat}, ~~${roll.dropped}~~]` : `[${nat}]`;
     // When NPC stats are hidden, don't print the modifier — it would give the
     // exact stat away. The natural die and final total still show.
@@ -12085,7 +12420,8 @@ function recordExchange(log, ensure, attackerId, defenderId, atkNat, defNat, hit
   a.atk = a.atk || ROLL_TALLY();
   d.def = d.def || ROLL_TALLY();
   tally(a.atk, atkNat, meta.atkTotal);
-  tally(d.def, defNat, meta.defTotal);
+  // Armour Class is no roll: it is not counted among the defender's dice.
+  if (meta.defStat !== 'ac') tally(d.def, defNat, meta.defTotal);
 
   // Blow-by-blow entry.
   log.r = Array.isArray(log.r) ? log.r : [];
@@ -12129,7 +12465,7 @@ async function buildFightRecap(guild, gid, log, opts = {}) {
   }
   const hideNpc = !npcStatsVisible(gid);
   // NPC stat names stay hidden here exactly as they are on the roll cards.
-  const statTag = (fid, st) => (!st || (isNpcOf[fid] && hideNpc)) ? '' : ` ${STAT_LABELS[st] ?? ''}`;
+  const statTag = (fid, st) => (!st || (isNpcOf[fid] && hideNpc)) ? '' : ` ${st === 'ac' ? 'AC' : (STAT_LABELS[st] ?? '')}`;
 
   entries.sort((x, y) => (y[1].dealt ?? 0) - (x[1].dealt ?? 0));
 
@@ -12171,7 +12507,7 @@ async function buildFightRecap(guild, gid, log, opts = {}) {
     const nat = (v) => v === 20 ? `[**20**]💥` : v === 1 ? `[**1**]🔻` : `[${v}]`;
     for (const r of shown) {
       const res = r.h ? `💥 **${r.dm}**` : `🛡️ blocked`;
-      lines.push(`\`${String(r.n).padStart(2, ' ')}\` ${nameOf[r.a] ?? '?'} ⚔️${statTag(r.a, r.as)} ${nat(r.an)}→**${r.at ?? '?'}**  ·  ${nameOf[r.d] ?? '?'} 🛡️${statTag(r.d, r.ds)} ${nat(r.dn)}→**${r.dt ?? '?'}**  ·  ${res}`);
+      lines.push(`\`${String(r.n).padStart(2, ' ')}\` ${nameOf[r.a] ?? '?'} ⚔️${statTag(r.a, r.as)} ${nat(r.an)}→**${r.at ?? '?'}**  ·  ${nameOf[r.d] ?? '?'} 🛡️${statTag(r.d, r.ds)} ${r.ds === 'ac' ? '' : nat(r.dn)}→**${r.dt ?? '?'}**  ·  ${res}`);
     }
   }
   return lines;
@@ -12308,12 +12644,14 @@ async function autoNpcMove(guild, gid, cid, channel, fight, npcId, npcF, foes) {
   const fx = JSON.parse(fight.effect_state || '{}')[npcId] || {};
   const gmap = fightGrapples(fight);
   const can = [];
+  const five = fiveMoves(gid);
   if (gmap[npcId]) can.push('escape');                                // held: it struggles
-  else if (grappleHeldTargetOf(fight, npcId)) can.push('maintain');   // holding: it tightens the grip
+  else if (grappleHeldTargetOf(fight, npcId) && !five) can.push('maintain');   // holding: it tightens the grip
   else if (foes.length) {
-    if (!belowBar(row, abilityNeeds(gid, 'grapple')) && foes.some(f => !gmap[f])) can.push('grapple');
+    // Holding someone on 5e it has its hands full for another grab (T, 2026-11-17).
+    if (!grappleHeldTargetOf(fight, npcId) && !belowBar(row, abilityNeeds(gid, 'grapple')) && foes.some(f => !gmap[f])) can.push('grapple');
     if (!belowBar(row, abilityNeeds(gid, 'feint')) && !fx.feintUsed) can.push('feint');
-    if (rulesFor(gid).defence !== 'ac' && !belowBar(row, abilityNeeds(gid, 'disarm')) && foes.some(f => !disarmedOf(fight, f))) can.push('disarm');
+    if (!belowBar(row, abilityNeeds(gid, 'disarm')) && foes.some(f => !disarmedOf(fight, f))) can.push('disarm');
   }
   if (!can.length) return false;
   const move = autoPick(can);
@@ -12390,7 +12728,8 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   const npcFloor = fightFloor(fight);
   // \u2014 and never the one it holds: a grappler cannot strike its captive.
   const captiveId = grappleHeldTargetOf(fight, attackerId);
-  const opponents = foesOf(fight, attackerId, order).filter(fid => fid !== captiveId && (hpState[fid] ?? 0) > npcFloor && !isFallen(gid, fid));
+  // On 5e the one it holds is fair game (T, 2026-11-17).
+  const opponents = foesOf(fight, attackerId, order).filter(fid => (fiveMoves(gid) || fid !== captiveId) && (hpState[fid] ?? 0) > npcFloor && !isFallen(gid, fid));
   // One time in three it reaches for a move instead (T, 2026-11-15) \u2014 a
   // grab, a feint, a disarm; the grip tightened on a captive; a struggle
   // against a hold. Declined or unable, it strikes as ever.
@@ -12422,7 +12761,8 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   // or owing a flat roll, the swing is a straight d20. It let the first two
   // pass until 2026-11-09, when a disarm of 20 began leaving an NPC off-balance.
   const stat = chooseAutoStat(gid, attackerId, attacker.stats, 'atk');
-  const restrainedAuto = !!grappleHolderOf(fight, attackerId);
+  // On 5e the held swing as ever (T, 2026-11-17).
+  const restrainedAuto = !fiveMoves(gid) && !!grappleHolderOf(fight, attackerId);
   const offBalanceAuto = !restrainedAuto && consumeFlatAtk(gid, cid, attackerId);
   const fooledAuto = consumeFooled(gid, cid, attackerId) || consumeFlatMark(gid, attackerId);
   const flatAuto = restrainedAuto || offBalanceAuto || fooledAuto;
@@ -12433,7 +12773,7 @@ async function runAutoNpcTurn(guild, gid, cid, channel) {
   // the modifier and proficiency — never the raw score (2026-11-07).
   const R5 = rulesFor(gid);
   const atkMod = R5.defence === 'ac' ? autoAtkBonus5e(R5, attRow, stat) : (attacker.stats[stat] ?? 0);
-  const a = autoRoll((flatAuto ? 0 : atkMod) + atkBonus, autoEdge(fooledAuto === 'dis' ? 'dis' : flatAuto, attRow, stat));
+  const a = autoRoll((flatAuto ? 0 : atkMod) + atkBonus, feintEdgeOn(gid, cid, attackerId, targetId, autoEdge(fooledAuto === 'dis' ? 'dis' : flatAuto, attRow, stat)));
   mirrorAutoRoll(gid, cid, attacker.name, `1d20${autoTag(a)}`, a, a.total, flatAuto ? `fight attack (${STAT_LABELS[stat]}, flat d20)` : `fight attack (${STAT_LABELS[stat]})`);
 
   // 5e: nobody rolls to defend — the target's Armour Class takes the slot,
@@ -12487,6 +12827,17 @@ async function autoNpcDefend(guild, gid, cid, channel) {
     mirrorAutoRoll(gid, cid, defender.name, `1d20${autoTag(d)}`, d, d.total, flatH ? 'break free (STR, flat d20)' : 'break free (STR)');
     storeAnswer(gid, cid, { total: d.total, nat: d.nat, stat: 'str', mode: d.adv ? 'adv' : d.dis ? 'dis' : 'normal', df: fooledH ? 1 : flatH ? 2 : null });
     return `\u{1F513} **${defender.name} \u{1F3AD}** strains against the hold: ${fightTotalStr(d.total, d.nat, 20)}`;
+  }
+  if ((fight.atk_kind === 'grapple' || fight.atk_kind === 'feint') && fiveMoves(gid)) {
+    // On 5e the better of Athletics and Acrobatics, or Insight (T, 2026-11-17).
+    const grab = fight.atk_kind === 'grapple', tid = fight.current_target;
+    const flat5 = consumeFooled(gid, cid, tid) || consumeFlatMark(gid, tid);
+    const b = grab ? bestSkill5e(gid, tid) : { skill: 'insight', bonus: skill5e(gid, tid, 'insight'), label: 'Insight' };
+    const d = autoRoll(flat5 ? 0 : b.bonus, false);
+    mirrorAutoRoll(gid, cid, defender.name, `1d20${autoTag(d)}`, d, d.total, `${grab ? 'grapple save' : 'feint insight'} (${b.label}${flat5 ? ', flat d20' : ''})`);
+    storeAnswer(gid, cid, { total: d.total, nat: d.nat, stat: DND_SKILLS[b.skill] || 'wis', mode: 'normal', df: flat5 ? 1 : null });
+    return grab ? `\u{1F93C} **${defender.name} \u{1F3AD}** strains against the grab: ${fightTotalStr(d.total, d.nat, 20)}`
+      : `\u{1F441}\uFE0F **${defender.name} \u{1F3AD}** reads the feint: ${fightTotalStr(d.total, d.nat, 20)}`;
   }
   if (fight.atk_kind === 'grapple') {
     // Grapple saves are STR-only; the auto NPC rolls its own.
@@ -12559,13 +12910,16 @@ async function fighterStateLine(guild, gid, cid, fid) {
     return r ? `${r.name}${r.isNpc ? ' \u{1F3AD}' : ''}` : 'someone';
   };
   // Held BY someone: gmap maps captive -> holder.
-  if (gmap[fid]) bits.push(`\u{1FAA2} **held by ${await nameOf(gmap[fid])}** \u2014 cannot move, 1 wound a round, actions roll flat`);
+  // On 5e a hold only stops them moving (T, 2026-11-17).
+  const five = fiveMoves(gid);
+  if (gmap[fid]) bits.push(`\u{1FAA2} **held by ${await nameOf(gmap[fid])}** \u2014 ${five ? 'cannot move; Escape on their turn' : 'cannot move, 1 wound a round, actions roll flat'}`);
   // Holding someone: the other side of the same map.
   const captives = Object.entries(gmap).filter(([, h]) => h === fid).map(([t]) => t);
-  for (const c of captives) bits.push(`\u{1F91C} **holding ${await nameOf(c)}** \u2014 release freely, but no striking them`);
+  for (const c of captives) bits.push(`\u{1F91C} **holding ${await nameOf(c)}** \u2014 ${five ? 'release freely, or strike them' : 'release freely, but no striking them'}`);
 
   // Carried marks, so nobody is surprised by their own dice.
   const eff = JSON.parse(f.effect_state || '{}')[fid] || {};
+  for (const k of Object.keys(eff)) if (k.startsWith('feintEdge:') && eff[k]) bits.push(`\u{1F3AD} **advantage** on the next attack on ${await nameOf(k.slice(10))} \u2014 the feint`);
   if (eff.flatDef) bits.push('\u{1F4A2} **next defence is a flat d20**');
   if (eff.flatAtk) bits.push('\u{1F4A2} **next attack is a flat d20**');
   if (eff.holdPaid) bits.push('\u{1FAA2} this round\u2019s wound already paid');
@@ -12771,9 +13125,11 @@ function turnRowsFor(gid, fight, fid, { auto = false } = {}) {
   // A natural 1 on initiative: Roleplay alone (T, 2026-11-10) \u2014 before the
   // weapon, since the lost turn fetches it as a skipped one does.
   if (rpTurnOf(fight, fid)) return fightAnswerRows('roleplay', { forNpc: npc, auto, gid });
-  if (disarmedOf(fight, fid)) return fightAnswerRows('retrieve', { forNpc: npc, auto, gid });
   const gmap = fight ? fightGrapples(fight) : {};
-  const rowsFor = gmap[fid] ? ['escape', 'atk'] : Object.values(gmap).includes(fid) ? ['hold', 'atk'] : ['atk'];
+  if (disarmedOf(fight, fid)) return fightAnswerRows('retrieve', { forNpc: npc, auto, gid, holding: Object.values(gmap).includes(fid) });
+  // On 5e a hold needs no keeping: the holder's turn is an attack, with
+  // Release beside it (T, 2026-11-17).
+  const rowsFor = gmap[fid] ? ['escape', 'atk'] : Object.values(gmap).includes(fid) ? (fiveMoves(gid) ? ['atk', 'release'] : ['hold', 'atk']) : ['atk'];
   // An NPC's turn carries the same rows in the GM's \u{1F3AD} set (T, 2026-11-15).
   return rowsFor.flatMap(k => fightAnswerRows(k, { forNpc: npc, auto, held: !!gmap[fid], gid })).slice(0, 5);
 }
@@ -12916,6 +13272,8 @@ async function applyTurnEndStrain(guild, gid, cid, hpState, order, roster, floor
   // 2026-11-09): the turn's end costs nothing more, and the next round
   // starts unpaid \u2014 cleared whether or not they are still held.
   const paid = consumeEffectFlag(gid, cid, fid, 'holdPaid');
+  // On 5e a hold costs nothing a round (T, 2026-11-17).
+  if (fiveMoves(gid)) return { order };
   const f = getFight(gid, cid);
   const gmap = fightGrapples(f);
   if (!gmap[fid]) return { order };
@@ -13058,6 +13416,8 @@ async function settleBreak(guild, gid, cid, { holderId, captiveId, capF, nat, to
 // the hold's roll, or stay. Either way the grappler's turn then ends.
 // `roll` is the break ({ nat, total, mode, flat }); none is a stay.
 async function resolveBreakFree(guild, gid, cid, fight, { roll = null, flavour = null } = {}) {
+  // However it was answered \u2014 Stay, a break, the clock, the auto-pilot.
+  await stripHoldCard(guild?.client, gid, cid);
   const roster = fightOrder(fight);
   const holderId = roster[fight.turn_index];
   const captiveId = fight.current_target;
@@ -13176,7 +13536,7 @@ async function resolveExchange(guild, gid, cid, fight, { forceHit = false, midAc
 
   const lines = ['─────────────────────────────', '⚔️  **Exchange Resolved**', ''];
   lines.push(`${atkName} (**${STAT_LABELS[fight.atk_stat]}**): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
-  lines.push(`${defName} (**${STAT_LABELS[fight.def_stat]}**): ${fightTotalStr(fight.def_roll, fight.def_nat, 20)}`);
+  lines.push(`${defName} (**${defStatLabel(fight.def_stat)}**): ${fightTotalStr(fight.def_roll, fight.def_nat, 20)}`);
   for (const l of interjectLines) lines.push(l);
   lines.push('');
 
@@ -13327,6 +13687,22 @@ async function resolveGrappleSave(guild, gid, cid, fight, { nat, total, mode = '
   const atkName = atkF.name + (atkF.isNpc ? ' 🎭' : '');
   const defName = defF.name + (defF.isNpc ? ' 🎭' : '');
   const lines = ['─────────────────────────────', '🤼  **Grapple Resolved**', ''];
+  if (fiveMoves(gid)) {
+    // 5e (T, 2026-11-17): Athletics against their better, the totals alone;
+    // a tie leaves things as they were, so the grab fails. No wounds.
+    const best = bestSkill5e(gid, targetId);
+    lines.push(`${atkName} (**Athletics**): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
+    lines.push(`${defName} (**${best.label}**${mode === 'adv' ? ', advantage' : mode === 'dis' ? ', disadvantage' : ''}): ${fightTotalStr(total, nat, 20)}`, '');
+    const grabbed = fight.atk_roll > total;
+    if (grabbed) {
+      const gmap5 = fightGrapples(getFight(gid, cid));
+      gmap5[targetId] = attackerId;
+      setFightGrapples(gid, cid, gmap5);
+      lines.push(`🔒 **${defName}** is **grappled** by **${atkName}** \u2014 held fast until they break free.`);
+      lines.push(`_Held \u2022 \`/fight act action:Escape\` on their turn \u2014 Athletics or Acrobatics against ${atkName}'s Athletics \u2022 ${atkName} may \`/fight act action:Release\` freely._`);
+    } else lines.push(total === fight.atk_roll ? `💨 A tie \u2014 nothing changes, and **${defName}** is not held.` : `💨 **${defName}** slips the grab \u2014 no grapple.`);
+    return { ...(await passTurn(guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, attackerId)), grappled: grabbed };
+  }
   lines.push(`${atkName} (**STR**): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
   lines.push(`${defName} (**STR** save${mode === 'adv' ? ', advantage' : mode === 'dis' ? ', disadvantage' : ''}): ${fightTotalStr(total, nat, 20)}`);
   lines.push('');
@@ -13509,6 +13885,18 @@ async function resolveFeintInsight(guild, gid, cid, fight, { nat, total, mode = 
   const atkName = atkF.name + (atkF.isNpc ? ' 🎭' : '');
   const defName = defF.name + (defF.isNpc ? ' 🎭' : '');
   const lines = ['\u2500'.repeat(29), `\u{1F300}  **Feint** \u2014 ${atkName} vs ${defName}`, ''];
+  if (fiveMoves(gid)) {
+    // 5e (T, 2026-11-17): Deception against Insight, the totals alone, a tie
+    // to the one feinted at. Taken in, the feinter's next attack on them has
+    // advantage; the feint was their turn.
+    lines.push(`${atkName} (**Deception**): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
+    lines.push(`${defName} (**Insight**${mode === 'adv' ? ', advantage' : mode === 'dis' ? ', disadvantage' : ''}): ${fightTotalStr(total, nat, 20)}`, '');
+    const taken = fight.atk_roll > total;
+    if (taken) setEffectFlag(gid, cid, attackerId, `feintEdge:${targetId}`);
+    lines.push(taken ? `🎭 **${defName}** is taken in \u2014 **${atkName}**'s next attack on them has **advantage**.`
+      : `👁️ **${defName}** sees through the feint${total === fight.atk_roll ? ' \u2014 a tie goes to them' : ''}.`);
+    return { ...(await passTurn(guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, attackerId)), fooled: false };
+  }
   lines.push(`${atkName} (**WIS** feint): ${fightTotalStr(fight.atk_roll, fight.atk_nat, 20)}`);
   lines.push(`${defName} (**WIS** insight${mode === 'adv' ? ', advantage' : mode === 'dis' ? ', disadvantage' : ''}): ${fightTotalStr(total, nat, 20)}`);
   lines.push('');
@@ -13769,7 +14157,9 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
 
     // Grapple rules on the attack path: a holder cannot strike their captive,
     // and a held fighter swings on a flat d20 — no stat, no riposte, no edge.
-    if (grappleHolderOf(fight, targetId) === actorId) {
+    // On 5e a holder may strike the one they hold, and the held swing as
+    // ever (T, 2026-11-17).
+    if (!fiveMoves(gid) && grappleHolderOf(fight, targetId) === actorId) {
       // The bot already knows who they are holding, so make letting go one tap
       // rather than a retyped command (T, 2026-08-22).
       {
@@ -13780,7 +14170,7 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
             .setCustomId('grpfree').setLabel('\u{1F590}\uFE0F Release the hold').setStyle(RS.Secondary))] });
       }
     }
-    const restrained = !!grappleHolderOf(fight, actorId);
+    const restrained = !fiveMoves(gid) && !!grappleHolderOf(fight, actorId);
     // A deflection's trade-off: the very next attack roll is a flat d20.
     const offBalance = !restrained && consumeFlatAtk(gid, cid, actorId);
     const fooledA = consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
@@ -13791,12 +14181,14 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
     // Under 5e a monster adds the bonus off its statblock, and a character
     // adds their ability modifier plus proficiency — never the raw score.
     const rulesAtk = rulesFor(gid);
-    let statVal;
+    let statVal, feintEdgeUsed = false;
     if (flatSwing) statVal = 0;
     else if (rulesAtk.defence === 'ac') {
       const rowA = actor.isNpc ? getNpc(gid, actor.name) : getChar(gid, actorId);
       const rowD = targetF?.isNpc ? getNpc(gid, targetF.name) : (targetId ? getChar(gid, targetId) : null);
       mode = conditionMode(rulesAtk, rowA, rowD, mode);
+      // A feint that took them in: this attack on them has advantage (T, 2026-11-17).
+      if (targetId && consumeEffectFlag(gid, cid, actorId, `feintEdge:${targetId}`)) { mode = mode === 'dis' ? 'normal' : 'adv'; feintEdgeUsed = true; }
       const monster = rulesAtk.monsterAttack(rowA);
       statVal = monster != null ? monster
               : rulesAtk.statBonus(rowA, stat) + rulesAtk.profBonus(rowA);
@@ -13874,7 +14266,7 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
       const heldIndex = fight.turn_index;
       const fightAc = getFight(gid, cid);
       const res = await offerDefRp(interaction.guild, gid, fightAc, await resolveExchange(interaction.guild, gid, cid, fightAc, { midAction: usedSoFar < allowed }));
-      const head = `⚔️  **${actor.name}** strikes at **${targetF.name}** — ${fightTotalStr(total, nat, 20)} vs **AC ${ac}**`;
+      const head = `⚔️  **${actor.name}** strikes at **${targetF.name}** — ${fightTotalStr(total, nat, 20)} vs **AC ${ac}**${advNote}${feintEdgeUsed ? ' \u2014 \u{1F3AD} the feint pays off' : ''}`;
       const extra = [];
       const after = getFight(gid, cid);
       if (usedSoFar < allowed && after?.state === 'active' && !res.ended) {
@@ -13943,6 +14335,14 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
 // The edge an automatic roll takes: a botched trick's disadvantage, else a
 // signature's advantage unless the roll is flat.
 const autoEdge = (flat, row, stat) => (flat === 'dis' ? 'dis' : (!flat && hasSignatureAdvantage(row, stat)));
+// On 5e a feint that took the target in gives the feinter's next attack on
+// them advantage \u2014 the bot's strikes and the turn clock's spend it as a
+// hand's does (T, 2026-11-17). Advantage and disadvantage cancel. The roll
+// it makes is marked, so its card says why.
+function feintEdgeOn(gid, cid, attackerId, targetId, edge) {
+  if (!fiveMoves(gid) || !targetId || !consumeEffectFlag(gid, cid, attackerId, `feintEdge:${targetId}`)) return edge;
+  return edge === 'dis' ? false : 'feint';
+}
 // The audit tag of an automatic roll's mode.
 const autoTag = (r) => (r?.adv ? ' (adv)' : r?.dis ? ' (dis)' : '');
 // Two dice when two were thrown.
@@ -13995,7 +14395,7 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
   if (!turnOrder.includes(targetId)) return refuse('❌ That target is not in this fight.');
   if (targetId === actorId) return refuse('❌ You cannot target yourself.');
   if (grappleHeldTargetOf(fight, actorId)) return refuse('🤼 You are already holding someone — `/fight act action:Release` first.');
-  if (grappleHolderOf(fight, actorId)) return refuse('🤼 You are held — `/fight act action:Escape`, or act on a flat d20.');
+  if (grappleHolderOf(fight, actorId)) return refuse(fiveMoves(gid) ? '\u{1F93C} You are held \u2014 `/fight act action:Escape` first.' : '🤼 You are held — `/fight act action:Escape`, or act on a flat d20.');
   if (grappleHolderOf(fight, targetId)) return refuse('🤼 They are already held.');
 
   const hpState = fightHp(fight);
@@ -14017,7 +14417,9 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
   clearRoundFlag(gid, cid, actorId);
   const actor = await resolveFighter(interaction.guild, gid, actorId);
   const targetF = await resolveFighter(interaction.guild, gid, targetId);
-  const statVal = offBalance ? 0 : (actor.stats.str ?? 0);
+  // On 5e the grab is Athletics (T, 2026-11-17).
+  const five = fiveMoves(gid);
+  const statVal = offBalance ? 0 : five ? skill5e(gid, actorId, 'athletics') : (actor.stats.str ?? 0);
   const sigRowA = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
   mode = flatMode(offBalance, applySignatureMode(sigRowA, 'str', mode));
   mode = applyNextMark(gid, actorId, mode);
@@ -14027,7 +14429,7 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
   const advNote = (offBalance ? ' 🎭 flat d20' : '') + (mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '');
   const total = nat + statVal;
   const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
-  const lineFor = (show) => `🤼  1d20${show && !offBalance ? '+STR' : ''}${advNote} → ${diceBit}${show ? modStr : ''} = ${fightTotalStr(total, nat, 20)}`;
+  const lineFor = (show) => `🤼  1d20${show && !offBalance ? (five ? '+Athletics' : '+STR') : ''}${advNote} → ${diceBit}${show ? modStr : ''} = ${fightTotalStr(total, nat, 20)}`;
   const rollLine = lineFor(true);
   const publicLine = (actor.isNpc && !npcStatsVisible(gid)) ? lineFor(false) : rollLine;
   const targetName = targetF.name + (targetF.isNpc ? ' 🎭' : '');
@@ -14048,7 +14450,7 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
   const autoOn = !!fight.auto_npc;
   const saveHint = targetF.isNpc
     ? (autoOn ? `🤖 **${targetF.name}** saves automatically...` : `🤼 A GM saves for **${targetF.name}** with \`/fight act action:Save npc:${targetF.name}\`.`)
-    : `🤼 <@${targetId}> — \`/fight act action:Save\` (STR only) to resist the hold.`;
+    : `🤼 <@${targetId}> — \`/fight act action:Save\` (${five ? 'Athletics or Acrobatics, the better' : 'STR only'}) to resist the hold.`;
 
   upsertFight(gid, cid, {
     phase: 'defend', current_target: targetId, atk_kind: 'grapple',
@@ -14056,8 +14458,8 @@ async function runFightGrapple({ interaction, gid, cid, actorId, targetId, mode,
     def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
     atk_rerolled: 0, def_rerolled: 0, pend: null,
   });
-  if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'grapple STR');
-  const saveRows = fightAnswerRows('save', { forNpc: targetF.isNpc, auto: !!fight.auto_npc, pair: openRolls(gid, getFight(gid, cid)).length > 0 });
+  if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, five ? 'grapple Athletics' : 'grapple STR');
+  const saveRows = fightAnswerRows('save', { forNpc: targetF.isNpc, auto: !!fight.auto_npc, gid, pair: openRolls(gid, getFight(gid, cid)).length > 0 });
   let auditMsgId = null;
   if (actor.isNpc) {
     const npcMsg = await postAsNpc(chan, gid, actor.name, card);
@@ -14106,7 +14508,7 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
   }
   if (!turnOrder.includes(targetId)) return refuse('❌ That target is not in this fight.');
   if (targetId === actorId) return refuse('❌ You cannot target yourself.');
-  if (grappleHolderOf(fight, actorId)) return refuse('🤼 You are held — flat-d20 strikes or `/fight act action:Escape` only; no feinting from a hold.');
+  if (!fiveMoves(gid) && grappleHolderOf(fight, actorId)) return refuse('🤼 You are held — flat-d20 strikes or `/fight act action:Escape` only; no feinting from a hold.');
 
   const actor = await resolveFighter(interaction.guild, gid, actorId);
   const subjectRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
@@ -14123,7 +14525,9 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
     return refuse(floor > 0 ? '❌ That fighter has already yielded the bout.' : '❌ That target is already down.');
   }
 
-  const statVal = flatFeint ? 0 : (actor.stats.wis ?? 0);
+  // On 5e: Deception against Insight (T, 2026-11-17).
+  const five = fiveMoves(gid);
+  const statVal = flatFeint ? 0 : five ? skill5e(gid, actorId, 'deception') : (actor.stats.wis ?? 0);
   mode = flatMode(flatFeint, applySignatureMode(subjectRow, 'wis', mode));
   mode = applyNextMark(gid, actorId, mode);
   const modStr = statVal > 0 ? ` +${statVal}` : statVal < 0 ? ` ${statVal}` : '';
@@ -14131,7 +14535,7 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
   const advNote = (flatFeint ? ' 🎭 flat d20' : '') + (mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '');
   const total = nat + statVal;
   const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
-  const lineFor = (show) => `🎭  1d20${show && !flatFeint ? '+WIS' : ''}${advNote} → ${diceBit}${show ? modStr : ''} = ${fightTotalStr(total, nat, 20)}`;
+  const lineFor = (show) => `🎭  1d20${show && !flatFeint ? (five ? '+Deception' : '+WIS') : ''}${advNote} → ${diceBit}${show ? modStr : ''} = ${fightTotalStr(total, nat, 20)}`;
   const rollLine = lineFor(true);
   const publicLine = (actor.isNpc && !npcStatsVisible(gid)) ? lineFor(false) : rollLine;
   const targetName = targetF.name + (targetF.isNpc ? ' 🎭' : '');
@@ -14152,7 +14556,7 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
   const autoOn = !!fight.auto_npc;
   const insightHint = targetF.isNpc
     ? (autoOn ? `🤖 **${targetF.name}** checks its insight automatically...` : `🎭 A GM rolls insight for **${targetF.name}** with \`/fight act action:Insight npc:${targetF.name}\`.`)
-    : `🎭 <@${targetId}> — \`/fight act action:Insight\` (WIS only) to see through it.`;
+    : `🎭 <@${targetId}> — \`/fight act action:Insight\` (${five ? 'Insight' : 'WIS only'}) to see through it.`;
 
   setEffectFlag(gid, cid, actorId, 'feintUsed');
   spendDeception(gid, actorId);
@@ -14162,8 +14566,8 @@ async function runFightFeint({ interaction, gid, cid, actorId, targetId, feintTe
     def_roll: null, def_nat: null, def_stat: null, def_mode: 'normal',
     atk_rerolled: 0, def_rerolled: 0, pend: null,
   });
-  if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'feint WIS');
-  const insightRows = fightAnswerRows('insight', { forNpc: targetF.isNpc, auto: !!fight.auto_npc, pair: openRolls(gid, getFight(gid, cid)).length > 0 });
+  if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, five ? 'feint Deception' : 'feint WIS');
+  const insightRows = fightAnswerRows('insight', { forNpc: targetF.isNpc, auto: !!fight.auto_npc, gid, pair: openRolls(gid, getFight(gid, cid)).length > 0 });
   let auditMsgId = null;
   if (actor.isNpc) {
     const npcMsg = await postAsNpc(chan, gid, actor.name, card);
@@ -14199,14 +14603,15 @@ async function runFightInsight({ interaction, gid, cid, actorId, mode, flavour =
   // A flat already owed \u2014 fooled earlier, or a trick's price? Even the
   // insight rolls flat, at disadvantage after a botched trick.
   const fooledI = consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
-  const statVal = fooledI ? 0 : (actor.stats.wis ?? 0);
+  const fiveI = fiveMoves(gid);
+  const statVal = fooledI ? 0 : fiveI ? skill5e(gid, actorId, 'insight') : (actor.stats.wis ?? 0);
   const sigRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
   mode = flatMode(fooledI, applySignatureMode(sigRow, 'wis', mode));
   mode = applyNextMark(gid, actorId, mode);
   const { nat, dropped } = rollD20Mode(mode);
   const total = nat + statVal;
   const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
-  const rollLine = `🎭  1d20${fooledI ? '' : '+WIS'} (insight)${fooledI ? ' 🎭 flat d20' : ''}${mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : ''} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)}`;
+  const rollLine = `🎭  1d20${fooledI ? '' : fiveI ? '+Insight' : '+WIS'} (insight)${fooledI ? ' 🎭 flat d20' : ''}${mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : ''} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)}`;
   if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'feint insight WIS');
   recordRoll(gid, { userId: uid, channelId: cid, interaction,
     kind: isNpcFighter(actorId) ? 'npcs' : null, card: null,
@@ -14233,14 +14638,16 @@ async function runFightGrappleSave({ interaction, gid, cid, actorId, mode, flavo
   if (fight.def_roll != null) return refuse(ALREADY_ANSWERED);
   const actor = await resolveFighter(interaction.guild, gid, actorId);
   const fooledR = consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
-  const statVal = fooledR ? 0 : (actor.stats.str ?? 0);
+  // On 5e: the better of Athletics and Acrobatics (T, 2026-11-17).
+  const best5 = fiveMoves(gid) ? bestSkill5e(gid, actorId) : null;
+  const statVal = fooledR ? 0 : best5 ? best5.bonus : (actor.stats.str ?? 0);
   const sigRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
   mode = flatMode(fooledR, applySignatureMode(sigRow, 'str', mode));
   mode = applyNextMark(gid, actorId, mode);
   const { nat, dropped } = rollD20Mode(mode);
   const total = nat + statVal;
   const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
-  const rollLine = `🤼  1d20${fooledR ? '' : '+STR'} (save)${fooledR ? ' 🎭 flat d20' : ''}${mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : ''} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)}`;
+  const rollLine = `🤼  1d20${fooledR ? '' : best5 ? `+${best5.label}` : '+STR'} (save)${fooledR ? ' 🎭 flat d20' : ''}${mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : ''} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)}`;
   if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'grapple save STR');
   recordRoll(gid, { userId: uid, channelId: cid, interaction,
     kind: isNpcFighter(actorId) ? 'npcs' : null, card: null,
@@ -14272,15 +14679,17 @@ async function runFightMaintain(interaction, { flavour = null, actorId: asId = n
   if (npcM && !interaction.autoPilot && !(await isGm(interaction.guild, uid))) return refuse('\u274C Only GMs can act as an NPC.');
   const heldId = grappleHeldTargetOf(fight, actorId);
   if (!heldId) return refuse(npcM ? `\u{1F91C} **${npcM}** is not holding anyone.` : '\u{1F91C} You are not holding anyone.');
+  if (fiveMoves(gid)) return refuse('\u{1F91C} On 5e a hold needs no keeping \u2014 it stands until they break free or you let go. Strike as you like.');
   if (rpTurnOf(fight, actorId)) return refuse(rpTurnRefusal(npcM));
   if (disarmedOf(fight, actorId)) return refuse(disarmedRefusal(npcM));
   const chanM = await interactionChannel(interaction);
   if (!chanM) return refuse(MSG_NO_ACCESS_HERE);
   // An NPC's card goes to the room and the hand gets a quiet word; a
   // player's own is their reply.
+  let holdCard = null;
   const sayM = async (payload) => {
     if (!npcM) return interaction.reply(payload);
-    await chanM.send(payload).catch(() => {});
+    holdCard = await chanM.send(payload).catch(() => null);
     return interaction.reply({ content: `\u2705 Hold rolled as **${npcM}**.`, ephemeral: true });
   };
 
@@ -14352,10 +14761,44 @@ async function runFightMaintain(interaction, { flavour = null, actorId: asId = n
     components = fightAnswerRows('breakfree', { forNpc: true, pair: pairM });
   }
   await sayM({ content: lines.join('\n'), components, allowedMentions: captiveF.isNpc ? { parse: [] } : { users: [heldId] } });
+  if (!(captiveF.isNpc && autoOn)) {
+    if (!npcM) holdCard = interaction.ddiceLastPost || await interaction.fetchReply?.().catch(() => null) || null;
+    rememberHoldCard(gid, cid, holdCard);
+  }
   if (captiveF.isNpc && autoOn) {
     await new Promise(r => setTimeout(r, 1200));
     await runAutoNpcChain(interaction.guild, gid, cid, chanM);
   }
+}
+
+// The kept hold's card: its Break free and Stay go once the hold is
+// answered (T, 2026-11-17 \u2014 they stayed, and a late press was told no
+// hold was waiting). In memory: after a restart that answer still stands.
+const holdCards = new Map();
+function rememberHoldCard(gid, cid, msg) {
+  if (msg?.id) holdCards.set(`${gid}:${cid}`, { ch: msg.channelId || msg.channel_id || cid, id: msg.id });
+}
+async function stripHoldCard(client, gid, cid) {
+  const key = `${gid}:${cid}`, at = holdCards.get(key);
+  if (!at || !client) return;
+  holdCards.delete(key);
+  try {
+    const ch = await client.channels.fetch(at.ch).catch(() => null);
+    const m = ch?.messages ? await ch.messages.fetch(at.id).catch(() => null) : null;
+    if (m?.edit) await m.edit({ components: dropButtons(m.components, ['fbreak', 'fstay']) }).catch(() => {});
+  } catch {}
+}
+// A fetched card's rows rebuilt without some of its buttons.
+function dropButtons(components, drop) {
+  const { ActionRowBuilder, ButtonBuilder } = require('discord.js');
+  // A fetched row, or a builder's (its data under _d or data).
+  const partsOf = (row) => row?.components || row?._d?.components || row?.data?.components || [];
+  const dataOf = (c) => ({ id: c?.customId ?? c?._d?.customId ?? c?.data?.custom_id, label: c?.label ?? c?._d?.label ?? c?.data?.label,
+    style: c?.style ?? c?._d?.style ?? c?.data?.style, disabled: !!(c?.disabled ?? c?._d?.disabled ?? c?.data?.disabled) });
+  return (components || []).map(row => partsOf(row).map(dataOf).filter(c => c.id && !drop.includes(c.id)))
+    .filter(cs => cs.length)
+    .map(cs => new ActionRowBuilder().addComponents(...cs.map(c => new ButtonBuilder().setCustomId(c.id)
+      .setLabel(c.label).setStyle(c.style).setDisabled(c.disabled))));
 }
 
 // The captive breaks against a kept hold \u2014 by hand, or a GM for an NPC.
@@ -14387,6 +14830,7 @@ async function runFightBreakFree({ interaction, gid, cid, actorId, mode, flavour
     context: isNpcFighter(actorId) ? `fight \u00b7 GM as ${actor.name} \u{1F3AD} breaks against a hold` : 'fight \u00b7 breaks against a hold' });
   // df 2: flat only because the hold was a 20 \u2014 a hold thrown again can lift it.
   storeAnswer(gid, cid, { total, nat, stat: 'str', mode, words: flavour, df: fooledB ? 1 : flatB ? 2 : null });
+  await stripHoldCard(interaction.client, gid, cid);
   return finishRoll({ interaction, gid, cid, chan, actor, ack: `\u2705 Struggled as **${actor.name}**.`,
     shown: [`\u{1F513}  **Break free** \u2014 ${actor.name}${actor.isNpc ? ' \u{1F3AD}' : ''} strains against the hold`, '', actor.isNpc ? maskNpcRollLine(gid, rollLine) : rollLine] });
 }
@@ -14444,17 +14888,19 @@ async function runFightEscape({ interaction, gid, cid, actorId, mode, flavour = 
   }
   const actor = await resolveFighter(interaction.guild, gid, actorId);
   const holderF = await resolveFighter(interaction.guild, gid, holderId);
-  // The hold answers with a live roll of its own: STR vs STR every attempt.
+  // The hold answers with a live roll of its own: STR vs STR every attempt
+  // \u2014 on 5e the holder's Athletics (T, 2026-11-17).
+  const five = fiveMoves(gid);
   const holderRow = isNpcFighter(holderId) ? getNpc(gid, npcNameFromFighter(holderId)) : getChar(gid, holderId);
-  const hold = autoRoll(holderF.stats.str ?? 0, hasSignatureAdvantage(holderRow, 'str'));
-  mirrorAutoRoll(gid, cid, holderF.name, `1d20${autoTag(hold)}`, hold, hold.total, 'grapple hold (STR)');
+  const hold = five ? autoRoll(skill5e(gid, holderId, 'athletics'), false) : autoRoll(holderF.stats.str ?? 0, hasSignatureAdvantage(holderRow, 'str'));
+  mirrorAutoRoll(gid, cid, holderF.name, `1d20${autoTag(hold)}`, hold, hold.total, five ? 'grapple hold (Athletics)' : 'grapple hold (STR)');
   const actorName = actor.name + (actor.isNpc ? ' 🎭' : '');
   const holderName = holderF.name + (holderF.isNpc ? ' 🎭' : '');
   const hpState = fightHp(fight);
   const floor = fightFloor(fight);
   const escapeHead = `\u{1F91C}  **Escape** \u2014 ${actorName} against ${holderName}'s hold`;
-  const holdLine = `${holderName} (**STR** hold${hold.adv ? ', advantage' : ''}): ${fightTotalStr(hold.total, hold.nat, 20)}`;
-  if (hold.nat === 1) {
+  const holdLine = `${holderName} (**${five ? 'Athletics' : 'STR'}** hold${hold.adv ? ', advantage' : ''}): ${fightTotalStr(hold.total, hold.nat, 20)}`;
+  if (!five && hold.nat === 1) {
     // A hold of 1 slips (T, 2026-11-09): free at once, with no break to
     // roll and no wound; a flat they owe waits for their next roll.
     const lines = ['\u2500'.repeat(29), escapeHead, ''];
@@ -14477,15 +14923,16 @@ async function runFightEscape({ interaction, gid, cid, actorId, mode, flavour = 
   // A hold of 20 makes the break a flat d20 (T, 2026-11-09); so does a flat
   // they already carry, with its rider.
   const fooledE = consumeFooled(gid, cid, actorId) || consumeFlatMark(gid, actorId);
-  const flatE = fooledE || hold.nat === 20;
-  const statVal = flatE ? 0 : (actor.stats.str ?? 0);
+  const flatE = fooledE || (!five && hold.nat === 20);
+  const best5 = five ? bestSkill5e(gid, actorId) : null;
+  const statVal = flatE ? 0 : best5 ? best5.bonus : (actor.stats.str ?? 0);
   const sigRow = isNpcFighter(actorId) ? getNpc(gid, npcNameFromFighter(actorId)) : getChar(gid, actorId);
   mode = flatMode(fooledE === 'dis' ? 'dis' : flatE, applySignatureMode(sigRow, 'str', mode));
   mode = applyNextMark(gid, actorId, mode);
   const { nat, dropped } = rollD20Mode(mode);
   const total = nat + statVal;
   const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
-  const rollLine = `🤼  1d20${flatE ? ' \u{1F3AD} flat d20' : '+STR'}${mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : ''} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)} vs hold ${fightTotalStr(hold.total, hold.nat, 20)}`;
+  const rollLine = `🤼  1d20${flatE ? ' \u{1F3AD} flat d20' : best5 ? `+${best5.label}` : '+STR'}${mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : ''} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)} vs hold ${fightTotalStr(hold.total, hold.nat, 20)}`;
   if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'grapple escape STR');
   recordRoll(gid, { userId: uid, channelId: cid, interaction,
     kind: isNpcFighter(actorId) ? 'npcs' : null, card: null,
@@ -14502,8 +14949,8 @@ async function runFightEscape({ interaction, gid, cid, actorId, mode, flavour = 
   });
   return finishRoll({ interaction, gid, cid, chan, actor, ack: `✅ Escape rolled as **${actor.name}**.`,
     shown: [escapeHead, '', holdLine,
-      ...(hold.nat === 20 ? [`\u{1F7E1} The hold's natural 20 \u2014 **${actorName}** struggles on a flat d20.`] : []),
-      `${actorName} (**STR** escape${flatE ? ', flat d20' : ''}${mode === 'adv' ? ', advantage' : mode === 'dis' ? ', disadvantage' : ''}): ${fightTotalStr(total, nat, 20)}`] });
+      ...(!five && hold.nat === 20 ? [`\u{1F7E1} The hold's natural 20 \u2014 **${actorName}** struggles on a flat d20.`] : []),
+      `${actorName} (**${best5 ? best5.label : 'STR'}** escape${flatE ? ', flat d20' : ''}${mode === 'adv' ? ', advantage' : mode === 'dis' ? ', disadvantage' : ''}): ${fightTotalStr(total, nat, 20)}`] });
 }
 // An own-turn escape lands: the captive's roll and the hold's are on the row.
 async function settleEscape(guild, gid, cid, fight) {
@@ -14520,6 +14967,20 @@ async function settleEscape(guild, gid, cid, fight) {
   const floor = fightFloor(fight);
   const lines = ['\u2500'.repeat(29), `\u{1F91C}  **Escape** \u2014 ${actorName} against ${holderName}'s hold`, ''];
   withWords(lines, v.words || null);
+  if (fiveMoves(gid)) {
+    // 5e (T, 2026-11-17): the better of Athletics and Acrobatics against the
+    // holder's Athletics, the totals alone \u2014 a tie keeps the hold. No wound.
+    const best = bestSkill5e(gid, actorId);
+    lines.push(`${holderName} (**Athletics** hold): ${fightTotalStr(hold.total, hold.nat, 20)}`);
+    lines.push(`${actorName} (**${best.label}** escape${mode === 'adv' ? ', advantage' : mode === 'dis' ? ', disadvantage' : ''}): ${fightTotalStr(total, nat, 20)}`, '');
+    if (total > hold.total) {
+      const gmap5 = fightGrapples(getFight(gid, cid));
+      delete gmap5[actorId];
+      setFightGrapples(gid, cid, gmap5);
+      lines.push(`🔓 **${actorName}** breaks free of **${holderName}**!`);
+    } else lines.push(`\u26D3\uFE0F **${actorName}** is still held${total === hold.total ? ' \u2014 a tie keeps the hold' : ''}.`);
+    return passTurn(guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, actorId);
+  }
   lines.push(`${holderName} (**STR** hold${hold.adv ? ', advantage' : ''}): ${fightTotalStr(hold.total, hold.nat, 20)}`);
   if (hold.nat === 20) lines.push(`\u{1F7E1} The hold's natural 20 \u2014 **${actorName}** struggles on a flat d20.`);
   lines.push(`${actorName} (**STR** escape${flatE ? ', flat d20' : ''}${mode === 'adv' ? ', advantage' : mode === 'dis' ? ', disadvantage' : ''}): ${fightTotalStr(total, nat, 20)}`);
@@ -14670,6 +15131,7 @@ async function runFightDeflect({ interaction, gid, cid, actorId = null, stat = '
   // `uid` is whoever makes the move: the one pressing, or the NPC a GM acts
   // for (T, 2026-11-15: every move takes npc:); `pressId` is the hand.
   const uid = actorId || interaction.user.id, pressId = interaction.user.id;
+  if (fiveMoves(gid)) return interaction.reply({ ephemeral: true, content: NOT_ON_5E_ANSWER });
   const turn = await openFightTurn(interaction, gid, cid, actorId);
   if (turn.refused) return turn.refused;
   const { chan, fight, refuse } = turn;
@@ -14858,6 +15320,7 @@ async function runFightDisarm({ interaction, gid, cid, actorId = null, mode, fla
   // `uid` is whoever makes the move: the one pressing, or the NPC a GM acts
   // for (T, 2026-11-15: every move takes npc:); `pressId` is the hand.
   const uid = actorId || interaction.user.id, pressId = interaction.user.id;
+  if (fiveMoves(gid)) return interaction.reply({ ephemeral: true, content: NOT_ON_5E_ANSWER });
   const turn = await openFightTurn(interaction, gid, cid, actorId);
   if (turn.refused) return turn.refused;
   const { chan, fight, refuse } = turn;
@@ -15029,7 +15492,7 @@ async function runFightDisarmAttack({ interaction, gid, cid, actorId = null, tar
   if (belowBar(subject, barX)) return refuse(`⚔️ Disarming needs **${barX.label} ${barX.need}+** — the hands have to be quick.`);
 
   // Your roll: held, off-balance or owing a flat roll, it is a straight d20.
-  const restrained = !!grappleHolderOf(fight, uid);
+  const restrained = !fiveMoves(gid) && !!grappleHolderOf(fight, uid);
   const offBalance = !restrained && consumeFlatAtk(gid, cid, uid);
   const fooledX = consumeFooled(gid, cid, uid) || consumeFlatMark(gid, uid);
   const flatX = restrained || offBalance || fooledX;
@@ -15038,7 +15501,9 @@ async function runFightDisarmAttack({ interaction, gid, cid, actorId = null, tar
   const targetF = await resolveFighter(interaction.guild, gid, targetId);
   const actorName = actor.name + (actor.isNpc ? ' 🎭' : '');
   const targetName = targetF.name + (targetF.isNpc ? ' 🎭' : '');
-  const statVal = flatX ? 0 : (actor.stats.dex ?? 0);
+  // On 5e the attack roll (T, 2026-11-17).
+  const five = fiveMoves(gid);
+  const statVal = flatX ? 0 : five ? attackBonus5e(gid, uid) : (actor.stats.dex ?? 0);
   mode = flatMode(fooledX === 'dis' ? 'dis' : flatX, applySignatureMode(subject, 'dex', mode));
   mode = applyNextMark(gid, uid, mode);
   const { nat, dropped } = rollD20Mode(mode);
@@ -15046,9 +15511,9 @@ async function runFightDisarmAttack({ interaction, gid, cid, actorId = null, tar
   const diceBit = dropped !== null ? `[${nat}, ~~${dropped}~~]` : `[${nat}]`;
   const advNote = (restrained ? ' 🤼 restrained — flat' : offBalance ? ' 🛡️ off-balance — flat' : fooledX ? ' 🎭 flat d20' : '')
     + (mode === 'adv' ? ' (advantage)' : mode === 'dis' ? ' (disadvantage)' : '');
-  const diceText = `1d20${flatX ? '' : '+DEX'}${advNote} → ${diceBit}${statVal ? ` +${statVal}` : ''} = ${fightTotalStr(total, nat, 20)}`;
+  const diceText = `1d20${flatX ? '' : five ? '+attack' : '+DEX'}${advNote} → ${diceBit}${statVal ? (statVal > 0 ? ` +${statVal}` : ` ${statVal}`) : ''} = ${fightTotalStr(total, nat, 20)}`;
   const rollLine = `⚔️  ${diceText}`;
-  if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, 'disarm DEX');
+  if (!actor.isNpc) saveRoll(gid, cid, uid, `1d20+${statVal}`, five ? 'disarm attack' : 'disarm DEX');
   recordRoll(gid, { userId: pressId, channelId: cid, interaction,
     kind: actor.isNpc ? 'npcs' : null, card: null,
     input: `/fight act action:Disarm${actor.isNpc ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20,
@@ -15058,12 +15523,15 @@ async function runFightDisarmAttack({ interaction, gid, cid, actorId = null, tar
   // 2026-11-15), after the disarmer's own.
   const npcRow = targetF.isNpc ? getNpc(gid, targetF.name) : getChar(gid, targetId);
   const sS = targetF.stats.str ?? 0, sD = targetF.stats.dex ?? 0;
-  const gripStat = sD > sS ? 'dex' : sS > sD ? 'str' : (hasSignatureAdvantage(npcRow, 'dex') ? 'dex' : 'str');
+  // On 5e the grip is the better of Athletics and Acrobatics (T, 2026-11-17).
+  const grip5 = five ? bestSkill5e(gid, targetId) : null;
+  const gripStat = grip5 ? DND_SKILLS[grip5.skill] : sD > sS ? 'dex' : sS > sD ? 'str' : (hasSignatureAdvantage(npcRow, 'dex') ? 'dex' : 'str');
   const flatN = consumeFlatDef(gid, cid, targetId) || consumeFooled(gid, cid, targetId) || consumeFlatMark(gid, targetId);
-  const g = autoRoll(flatN ? 0 : (targetF.stats[gripStat] ?? 0), autoEdge(flatN, npcRow, gripStat));
-  mirrorAutoRoll(gid, cid, targetF.name, `1d20${autoTag(g)}`, g, g.total, `disarm grip (${flatN ? 'flat d20' : STAT_LABELS[gripStat]})`);
-  // The price, whatever comes of it: the disarmer's very next roll is flat.
-  setFooled(gid, cid, uid);
+  const g = grip5 ? autoRoll(flatN ? 0 : grip5.bonus, false) : autoRoll(flatN ? 0 : (targetF.stats[gripStat] ?? 0), autoEdge(flatN, npcRow, gripStat));
+  mirrorAutoRoll(gid, cid, targetF.name, `1d20${autoTag(g)}`, g, g.total, `disarm grip (${flatN ? 'flat d20' : grip5 ? grip5.label : STAT_LABELS[gripStat]})`);
+  // The price, whatever comes of it: the disarmer's very next roll is flat
+  // \u2014 Knightfall's; 5e has none.
+  if (!five) setFooled(gid, cid, uid);
 
   // Both rolls go onto the row \u2014 the grip is the bot's, so it stands \u2014
   // and the disarm lands through the one door (T, 2026-11-15): at once when
@@ -15072,13 +15540,13 @@ async function runFightDisarmAttack({ interaction, gid, cid, actorId = null, tar
     phase: 'defend', current_target: targetId, atk_kind: 'disarm',
     atk_roll: total, atk_nat: nat, atk_stat: 'dex', atk_mode: mode, atk_sides: 20, atk_rerolled: 0,
     def_roll: g.total, def_nat: g.nat, def_stat: gripStat, def_mode: g.adv ? 'adv' : g.dis ? 'dis' : 'normal', def_sides: 20, def_rerolled: 0,
-    pend: JSON.stringify({ db: 1, line: diceText, ...(flavour ? { words: flavour } : {}), ...(flatN ? { gflat: 1 } : {}) }),
+    pend: JSON.stringify({ db: 1, line: diceText, ...(flavour ? { words: flavour } : {}), ...(flatN ? { gflat: 1 } : {}), ...(grip5 ? { g5: grip5.label } : {}) }),
   });
   const showN = !targetF.isNpc || npcStatsVisible(gid);
   return finishRoll({ interaction, gid, cid, chan, actor, ack: `\u2705 Disarm rolled as **${actor.name}**.`,
     shown: [`\u2694\uFE0F  **Disarm** \u2014 ${actorName} goes for ${targetName}'s weapon`, '',
-      `**${actorName}** (**DEX**): ${actor.isNpc ? maskNpcRollLine(gid, diceText) : diceText}`,
-      `${targetName} (${showN ? `**${STAT_LABELS[gripStat]}** ` : ''}grip${flatN ? ', flat d20' : g.adv ? ', advantage' : g.dis ? ', disadvantage' : ''}): ${fightTotalStr(g.total, g.nat, 20)}`] });
+      `**${actorName}** (**${five ? 'attack' : 'DEX'}**): ${actor.isNpc ? maskNpcRollLine(gid, diceText) : diceText}`,
+      `${targetName} (${showN ? `**${grip5 ? grip5.label : STAT_LABELS[gripStat]}** ` : ''}grip${flatN ? ', flat d20' : g.adv ? ', advantage' : g.dis ? ', disadvantage' : ''}): ${fightTotalStr(g.total, g.nat, 20)}`] });
 }
 // An own-turn disarm lands: the disarmer's roll and the grip are on the row.
 async function settleDisarmAttack(guild, gid, cid, fight) {
@@ -15097,7 +15565,21 @@ async function settleDisarmAttack(guild, gid, cid, fight) {
 
   const showN = !targetF.isNpc || npcStatsVisible(gid);
   const lines = ['\u2500'.repeat(29), `\u2694\uFE0F  **Disarm** \u2014 ${actorName} goes for ${targetName}'s weapon`, ''];
-  if (v.words) lines.push(`_${v.words}_`, '');
+  withWords(lines, v.words || null);
+  if (fiveMoves(gid)) {
+    // 5e (T, 2026-11-17): the attack roll against their grip, the totals
+    // alone \u2014 a tie, they keep it. Taken, their next turn goes to
+    // retrieving it. No wounds, no price.
+    lines.push(`**${actorName}** (**attack**): ${actor.isNpc ? maskNpcRollLine(gid, v.line || '') : (v.line || '')}`);
+    lines.push(`${targetName} (${showN ? `**${v.g5 || 'Athletics'}** ` : ''}grip${flatN ? ', flat d20' : ''}): ${fightTotalStr(g.total, g.nat, 20)}`, '');
+    const took = total > g.total;
+    if (took) {
+      setEffectFlag(gid, cid, targetId, 'disarmed');
+      lines.push(`⚔️ The weapon spins from **${targetName}**'s grip \u2014 their next turn goes to retrieving it!`);
+    } else lines.push(`\u{1F6E1}\uFE0F **${targetName}** keeps hold of the weapon${total === g.total ? ' \u2014 a tie goes to the one holding it' : ''}.`);
+    try { noteQuestActivity(gid, cid, 'combat', `${actor.name} goes for ${targetF.name}'s weapon${took ? ' and takes it' : ''}`); } catch {}
+    return passTurn(guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, uid);
+  }
   lines.push(`**${actorName}** (**DEX**): ${actor.isNpc ? maskNpcRollLine(gid, v.line || '') : (v.line || '')}`);
   lines.push(`${targetName} (${showN ? `**${STAT_LABELS[gripStat]}** ` : ''}grip${flatN ? ', flat d20' : g.adv ? ', advantage' : g.dis ? ', disadvantage' : ''}): ${fightTotalStr(g.total, g.nat, 20)}`);
   lines.push('');
@@ -15174,6 +15656,7 @@ async function runFightGrappleDef({ interaction, gid, cid, actorId = null, mode,
   // `uid` is whoever makes the move: the one pressing, or the NPC a GM acts
   // for (T, 2026-11-15: every move takes npc:); `pressId` is the hand.
   const uid = actorId || interaction.user.id, pressId = interaction.user.id;
+  if (fiveMoves(gid)) return interaction.reply({ ephemeral: true, content: NOT_ON_5E_ANSWER });
   const turn = await openFightTurn(interaction, gid, cid, actorId);
   if (turn.refused) return turn.refused;
   const { chan, fight, refuse } = turn;
@@ -15365,11 +15848,11 @@ function fightRpModal(token, { title, claim = false, what = false } = {}) {
   const m = new ModalBuilder().setCustomId(`frp:${token}`).setTitle(String(title || 'Your move').slice(0, 45));
   const field = (id, label, style, max, required = false) =>
     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(style).setRequired(required).setMaxLength(max));
-  if (what) { m.addComponents(field('what', 'What happens? (optional)', TextInputStyle.Paragraph, 1000)); return m; }
-  if (claim) m.addComponents(field('claim', 'What do you pretend to do?', TextInputStyle.Paragraph, 200, true));
+  if (what) { m.addComponents(field('what', 'What happens? (optional)', TextInputStyle.Paragraph, RP_BOX_MAX)); return m; }
+  if (claim) m.addComponents(field('claim', 'What do you pretend to do?', TextInputStyle.Paragraph, RP_BOX_MAX, true));
   m.addComponents(
-    field('action', 'What do you do? (optional)', TextInputStyle.Short, 200),
-    field('speech', 'What do you say? (optional)', TextInputStyle.Paragraph, 500));
+    field('action', 'What do you do? (optional)', TextInputStyle.Paragraph, RP_BOX_MAX),
+    field('speech', 'What do you say? (optional)', TextInputStyle.Paragraph, RP_BOX_MAX));
   return m;
 }
 function openFightRp(interaction, kind, payload, opts = {}) {
@@ -15381,15 +15864,24 @@ function openFightRp(interaction, kind, payload, opts = {}) {
 // italics, the speech in quotes; null when both were left blank.
 function rpWords(interaction) {
   let action = '', speech = '';
-  try { action = String(interaction.fields.getTextInputValue('action') || '').trim().slice(0, 200); } catch {}
-  try { speech = String(interaction.fields.getTextInputValue('speech') || '').trim().slice(0, 500); } catch {}
-  return [action ? `*${action}*` : null, speech ? `\u201C${speech}\u201D` : null].filter(Boolean).join('\n') || null;
+  try { action = String(interaction.fields.getTextInputValue('action') || '').trim().slice(0, RP_BOX_MAX); } catch {}
+  try { speech = String(interaction.fields.getTextInputValue('speech') || '').trim().slice(0, RP_BOX_MAX); } catch {}
+  return [action ? italicLines(action) : null, speech ? `\u201C${speech}\u201D` : null].filter(Boolean).join('\n') || null;
 }
-// Words into a runner's lines: after the header, before the first blank.
+// Every roleplay box holds Discord's most (T, 2026-11-17).
+const RP_BOX_MAX = 4000;
+// An action in italics, each line in its own marks: a long one carried on
+// into a second message, or one in paragraphs, keeps them.
+function italicLines(text) {
+  return String(text || '').split('\n').map(l => l.trim()).map(l => (l ? `*${l}*` : '')).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+// Words into a runner's lines: after the header, before the first blank \u2014
+// each line in its own marks, for the same reason.
 function withWords(lines, flavour) {
   if (!flavour) return lines;
+  const block = String(flavour).split('\n').map(l => (l.trim() ? `_${l}_` : '')).join('\n');
   const i = lines.findIndex((l, k) => k > 0 && l === '');
-  if (i < 0) lines.push('', `_${flavour}_`); else lines.splice(i, 0, `_${flavour}_`);
+  if (i < 0) lines.push('', block); else lines.splice(i, 0, block);
   return lines;
 }
 const forcedOf = (forced, key) => (forced && typeof forced === 'object' ? forced[key] : null) ?? null;
@@ -15540,7 +16032,7 @@ const STRIKE_STATS_5E = ['str', 'dex', 'int', 'wis', 'cha'];
 // `pair` adds Reroll and Keep while a roll of the exchange is open (T,
 // 2026-11-15); the lone Reroll every prompt used to carry is gone — no
 // token, no prompt.
-function fightAnswerRows(kind, { forNpc = false, held = false, auto = false, gid = null, pair = false } = {}) {
+function fightAnswerRows(kind, { forNpc = false, held = false, auto = false, gid = null, pair = false, holding = false } = {}) {
   const five5 = is5e(gid);
   const tail = pair ? [pairRow()] : [];
   if (forNpc) {
@@ -15551,17 +16043,19 @@ function fightAnswerRows(kind, { forNpc = false, held = false, auto = false, gid
     // "NPCs can use every move"): fnact:<move> acts for the NPC the fight
     // is waiting on \u2014 its turn, or the answer it owes.
     const starts = () => new ActionRowBuilder().addComponents(
-      ...(held ? [] : [N('fnact:grapple', '\u{1F3AD} Grapple')]), N('fnact:feint', '\u{1F3AD} Feint'), ...(five5 ? [] : [N('fnact:disarm', '\u{1F3AD} Disarm')]));
+      ...(held ? [] : [N('fnact:grapple', '\u{1F3AD} Grapple')]), N('fnact:feint', '\u{1F3AD} Feint'), N('fnact:disarm', '\u{1F3AD} Disarm'));
     if (kind === 'atk' && five5) return [new ActionRowBuilder().addComponents(...STRIKE_STATS_5E.map(st => N(`fnatk:${st}`, `🎭 ${STAT_LABELS[st]}`))), starts()];
     if (kind === 'def') return [new ActionRowBuilder().addComponents(N('fndef:str', '\u{1F3AD} STR'), N('fndef:con', '\u{1F3AD} CON'), N('fndef:dex', '\u{1F3AD} DEX'), N('fndef:wis', '\u{1F3AD} WIS'), N('fndef:lck', '\u{1F3AD} LCK')), ...tail,
       new ActionRowBuilder().addComponents(N('fnact:deflect', '\u{1F3AD} Deflect'), N('fnact:disarm', '\u{1F3AD} Disarm'), N('fnact:grapple', '\u{1F3AD} Grapple'))];
     if (kind === 'atk') return [new ActionRowBuilder().addComponents(N('fnatk:str', '\u{1F3AD} STR'), N('fnatk:con', '\u{1F3AD} CON'), N('fnatk:dex', '\u{1F3AD} DEX'), N('fnatk:wis', '\u{1F3AD} WIS'), N('fnatk:lck', '\u{1F3AD} LCK')), starts()];
     if (kind === 'hold') return [new ActionRowBuilder().addComponents(N('fnact:maintain', '\u{1F3AD} Maintain the hold (STR)'), N('fnact:release', '\u{1F3AD} Release'))];
-    if (kind === 'escape') return [new ActionRowBuilder().addComponents(N('fnact:escape', '\u{1F3AD} Break free (STR)'))];
-    if (kind === 'save') return [new ActionRowBuilder().addComponents(N('fnact:save', '\u{1F3AD} Save (STR)'), ...(pair ? pairButtons() : []))];
-    if (kind === 'insight') return [new ActionRowBuilder().addComponents(N('fnact:insight', '\u{1F3AD} Insight (WIS)'), ...(pair ? pairButtons() : []))];
+    if (kind === 'escape') return [new ActionRowBuilder().addComponents(N('fnact:escape', `\u{1F3AD} Break free (${five5 ? 'Athletics/Acrobatics' : 'STR'})`))];
+    if (kind === 'save') return [new ActionRowBuilder().addComponents(N('fnact:save', `\u{1F3AD} Save (${five5 ? 'Athletics/Acrobatics' : 'STR'})`), ...(pair ? pairButtons() : []))];
+    if (kind === 'insight') return [new ActionRowBuilder().addComponents(N('fnact:insight', `\u{1F3AD} Insight${five5 ? '' : ' (WIS)'}`), ...(pair ? pairButtons() : []))];
+    if (kind === 'release') return [new ActionRowBuilder().addComponents(N('fnact:release', '\u{1F3AD} Release'))];
     if (kind === 'breakfree') return [new ActionRowBuilder().addComponents(N('fbreak', '\u{1F3AD} Break free (STR)'), N('fstay', '\u{1F3AD} Stay')), ...tail];
-    if (kind === 'retrieve') return [new ActionRowBuilder().addComponents(N('fnretrieve', '\u{1F3AD} Retrieve the weapon'))];
+    if (kind === 'retrieve') return [new ActionRowBuilder().addComponents(N('fnretrieve', '\u{1F3AD} Retrieve the weapon'),
+      ...(holding ? [N('fnact:release', '\u{1F3AD} Release')] : []))];
     if (kind === 'roleplay') return [new ActionRowBuilder().addComponents(N('fnroleplay', '\u{1F3AD} Roleplay'))];
     return tail;
   }
@@ -15589,7 +16083,9 @@ function fightAnswerRows(kind, { forNpc = false, held = false, auto = false, gid
     new ActionRowBuilder().addComponents(...STRIKE_STATS_5E.map(st => B(`fatk:${st}`, `${STAT_EMOJIS[st]} ${STAT_LABELS[st]}`))),
     new ActionRowBuilder().addComponents(...[
       ...(held ? [] : [B('fact:grapple', '🤼 Grapple', ButtonStyle.Secondary)]),
-      B('fact:feint', '🌀 Feint', ButtonStyle.Secondary)])];
+      B('fact:feint', '🌀 Feint', ButtonStyle.Secondary),
+      // The attack roll against their grip, on an NPC (T, 2026-11-17).
+      B('fact:disarm', '\u2694\uFE0F Disarm', ButtonStyle.Secondary)])];
   if (kind === 'atk') return [
     new ActionRowBuilder().addComponents(B('fatk:str', '\u{1F4AA} STR'), B('fatk:con', '\u{1FAC0} CON'), B('fatk:dex', '\u26A1 DEX'), B('fatk:wis', '\u{1F9E0} WIS'), B('fatk:lck', '\u{1F340} LCK')),
     new ActionRowBuilder().addComponents(...[
@@ -15600,8 +16096,11 @@ function fightAnswerRows(kind, { forNpc = false, held = false, auto = false, gid
       // On your own turn a disarm goes for an NPC's weapon (T, 2026-11-10).
       B('fact:disarm', '\u2694\uFE0F Disarm', ButtonStyle.Secondary)])];
   // Disarmed: the turn is the weapon's (T, 2026-11-10).
+  // Still holding someone: letting go is free, so it stays on the card (T,
+  // 2026-11-17 \u2014 it had to be typed).
   if (kind === 'retrieve') return [new ActionRowBuilder().addComponents(
-    B('fact:retrieve', '\u{1FAF4} Retrieve your weapon', ButtonStyle.Primary))];
+    B('fact:retrieve', '\u{1FAF4} Retrieve your weapon', ButtonStyle.Primary),
+    ...(holding ? [B('grpfree', '\u{1F590}\uFE0F Release', ButtonStyle.Secondary)] : []))];
   // A natural 1 on initiative: the first turn is words alone (T, 2026-11-10).
   if (kind === 'roleplay') return [new ActionRowBuilder().addComponents(
     B('fact:roleplay', '\u{1F3AD} Roleplay', ButtonStyle.Primary))];
@@ -15611,13 +16110,16 @@ function fightAnswerRows(kind, { forNpc = false, held = false, auto = false, gid
     B('fact:maintain', '\u{1F91C} Maintain the hold (STR)', ButtonStyle.Primary),
     B('grpfree', '\u{1F590}\uFE0F Release', ButtonStyle.Secondary))];
   if (kind === 'escape') return [new ActionRowBuilder().addComponents(
-    B('fact:escape', '\u{1F91C} Break free (STR)', ButtonStyle.Primary))];
+    B('fact:escape', `\u{1F91C} Break free (${five5 ? 'Athletics/Acrobatics' : 'STR'})`, ButtonStyle.Primary))];
+  // On 5e a holder's turn is a turn like any other, with letting go on it.
+  if (kind === 'release') return [new ActionRowBuilder().addComponents(
+    B('grpfree', '\u{1F590}\uFE0F Release', ButtonStyle.Secondary))];
   // The captive's answer to a kept hold (2026-11-09).
   if (kind === 'breakfree') return [new ActionRowBuilder().addComponents(
     B('fbreak', '\u{1F513} Break free (STR)', ButtonStyle.Primary),
     B('fstay', '\u26D3\uFE0F Stay', ButtonStyle.Secondary)), ...tail];
-  if (kind === 'save') return [new ActionRowBuilder().addComponents(B('fsave', '💪 Save (STR)'), ...pb)];
-  if (kind === 'insight') return [new ActionRowBuilder().addComponents(B('finsight', '👁️ Insight (WIS)'), ...pb)];
+  if (kind === 'save') return [new ActionRowBuilder().addComponents(B('fsave', `💪 Save (${five5 ? 'Athletics/Acrobatics' : 'STR'})`), ...pb)];
+  if (kind === 'insight') return [new ActionRowBuilder().addComponents(B('finsight', `👁️ Insight${five5 ? '' : ' (WIS)'}`), ...pb)];
   if (kind === 'resolve') return [new ActionRowBuilder().addComponents(B('fresolve', '⚖️ Resolve', ButtonStyle.Success), ...pb)];
   if (kind === 'pair') return tail;
   return [];
@@ -16615,7 +17117,7 @@ async function handleFight(interaction, forced) {
       if (!orderT.includes(targetIdT)) return '\u274C That target is not in this fight.';
       if (targetIdT === actorId) return '\u274C You cannot target yourself.';
       if (hpT[targetIdT] !== undefined && hpT[targetIdT] <= floorT) return floorT > 0 ? '\u274C That fighter has already yielded the bout.' : '\u274C That target is already down.';
-      if (grappleHolderOf(fight, targetIdT) === actorId) return '\u{1F93C} You are holding them \u2014 a grappler cannot strike their captive. Let go and swing again, or pick another target.';
+      if (!fiveMoves(gid) && grappleHolderOf(fight, targetIdT) === actorId) return '\u{1F93C} You are holding them \u2014 a grappler cannot strike their captive. Let go and swing again, or pick another target.';
       return null;
     };
     // Typed with no stat: the same buttons the turn card carries, to you
@@ -16692,8 +17194,8 @@ async function handleFight(interaction, forced) {
     const fight = getFight(gid, cid);
     if (!fight || fight.state !== 'active') return interaction.reply({ content: NO_ACTIVE_FIGHT, ephemeral: true });
     if (fight.phase !== 'defend') return interaction.reply({ content: '❌ No attack to defend against yet.', ephemeral: true });
-    if (fight.atk_kind === 'grapple') return interaction.reply({ content: '🤼 That is a grapple — answer with `/fight act action:Save` (STR only).', ephemeral: true });
-    if (fight.atk_kind === 'feint') return interaction.reply({ content: '🎭 That is a feint — answer with `/fight act action:Insight` (WIS only).', ephemeral: true });
+    if (fight.atk_kind === 'grapple') return interaction.reply({ content: `🤼 That is a grapple — answer with \`/fight act action:Save\` (${is5e(gid) ? 'Athletics or Acrobatics' : 'STR only'}).`, ephemeral: true });
+    if (fight.atk_kind === 'feint') return interaction.reply({ content: `🎭 That is a feint — answer with \`/fight act action:Insight\`${is5e(gid) ? '' : ' (WIS only)'}.`, ephemeral: true });
     if (fight.atk_kind === 'hold') return interaction.reply({ content: '\u{1FAA2} That is a kept hold \u2014 answer with \u{1F513} Break free (`/fight act action:Escape`) or \u26D3\uFE0F Stay.', ephemeral: true });
     // One answer per strike (audit, 2026-11-10): `/fight rr` rerolls it.
     if (fight.def_roll != null) return interaction.reply({ ephemeral: true, content: ALREADY_ANSWERED });
@@ -17355,12 +17857,14 @@ async function handleFight(interaction, forced) {
     if (wantScroll) {
       if (!hasCanvas()) return interaction.editReply({ content: '\u274C The parchment needs the canvas module, which this bot has not got.' });
       try {
-        let family; try { family = ensureScrollFont(gid) || 'standard'; } catch { family = 'standard'; }
+        // The standard face, not the server's saved script (T, 2026-11-17):
+        // a summary is read, a prop is admired.
+        const family = 'standard';
         const plain = (t) => String(t || '').replace(/<@[!&]?\d+>/g, 'someone').replace(/[*_`]+/g, '').replace(/[\p{Extended_Pictographic}\uFE0F]/gu, '').replace(/[ \t]+/g, ' ').trim();
         const title = `${archFloor > 0 ? 'A practice bout' : 'A fight'} \u2014 ${dateLine(arch.ended_at).replace(/^\[[^\]]*\] \[[^\]]*\] /, '')}`;
-        const body = lines.slice(1).map(plain).join('\n').slice(0, 12000);
         const stem = fileSlug(`fight ${dateLine(arch.ended_at).slice(1, 11).replace(/\//g, '-')}`, 'fight-recap');
-        const pdf = embedScrollData(renderScrollBook({ family, title, body }), { v: 1, kind: 'scroll', title, body, name: stem });
+        const fitted = scrollBookFitting({ family, title, body: lines.slice(1).map(plain).join('\n').slice(0, SCROLL_BODY_MAX) });
+        const pdf = embedScrollData(fitted.pdf, { v: 1, kind: 'scroll', title, body: fitted.body, name: stem });
         const { AttachmentBuilder } = require('discord.js');
         return interaction.editReply({ content: `\u{1F4DC} **The last ${archFloor > 0 ? 'bout' : 'fight'} here, on parchment** \u2014 ended ${formatHistDate(arch.ended_at)}.`,
           files: [new AttachmentBuilder(pdf, { name: `${stem}.pdf` })] });
@@ -17710,7 +18214,16 @@ const QUEST_EVENT_ICON = {
   roll: '\u{1F3B2}', talk: '\u{1F4AC}', turn: '\u{1F504}',
 };
 function questEventLine(e) {
-  return `\`${fmtElapsed(e.at_ms).padStart(7)}\` ${QUEST_EVENT_ICON[e.kind] ?? '•'} ${e.text || e.kind}`;
+  // The log keeps every word for the story (T, 2026-11-17); a line of it in
+  // chat \u2014 a summary, the record \u2014 shows the start.
+  const t = String(e.text || e.kind);
+  return `\`${fmtElapsed(e.at_ms).padStart(7)}\` ${QUEST_EVENT_ICON[e.kind] ?? '•'} ${t.length > EVENT_LINE_MAX ? `${t.slice(0, EVENT_LINE_MAX - 1)}\u2026` : t}`;
+}
+const EVENT_LINE_MAX = 300;
+// A roleplay beat for the run's log: the words whole, marks dropped, lines
+// joined with a dot.
+function rpBeatText(words) {
+  return String(words || '').replace(/[*_]+/g, '').replace(/\s*\n\s*/g, ' \u00b7 ').trim();
 }
 
 // Every quest currently underway in this channel — used to attach combat and
@@ -18005,14 +18518,16 @@ async function archiveHourly(client, guild) {
 }
 // The GM record as a scroll: the machine's account, timings to payout.
 function runRecordScroll(gid, quest, recordLines) {
-  let family; try { family = ensureScrollFont(gid) || 'standard'; } catch { family = 'standard'; }
+  // The standard face (T, 2026-11-17), as the story's.
+  const family = 'standard';
   const plain = (t) => String(t || '').replace(/<@[!&]?\d+>/g, 'someone').replace(/<#\d+>/g, 'a room').replace(/<t:\d+(:\w)?>/g, '')
     .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/[*_`~]+/g, '').replace(/[\p{Extended_Pictographic}\uFE0F]/gu, '').replace(/[ \t]+/g, ' ').trim();
   const body = (Array.isArray(recordLines) ? recordLines : String(recordLines || '').split('\n'))
-    .map(plain).filter(l => l && !/^\u2500+$/.test(l)).join('\n').slice(0, 12000) || 'Nothing was logged.';
+    .map(plain).filter(l => l && !/^\u2500+$/.test(l)).join('\n').slice(0, SCROLL_BODY_MAX) || 'Nothing was logged.';
   const title = `${questTag(quest)} \u2014 the record`;
   const stem = fileSlug(`${questTag(quest)} record`, 'run-record');
-  const pdf = embedScrollData(renderScrollBook({ family, title, body }), { v: 1, kind: 'scroll', title, body, name: stem });
+  const fitted = scrollBookFitting({ family, title, body });
+  const pdf = embedScrollData(fitted.pdf, { v: 1, kind: 'scroll', title, body: fitted.body, name: stem });
   return { pdf, name: `${stem}.pdf` };
 }
 // File one finished run under its GM. Returns the post, or null when there
@@ -18300,7 +18815,8 @@ async function questTick(client) {
               content: `\u23F3 **${questTag(q)}** has been quiet for ${Math.round(quiet / 3600000)}h ${gmRoles.map(r => `<@&${r}>`).join(' ')} \u2014 \`/session complete\` when it is done, or it keeps holding its party out of rests.` }).catch(() => {});
             updateQuest(guild.id, q.number, { idle_nagged_at: Date.now() });
           }
-          continue;   // encounters have no recap/reminder clock of their own
+          // And the hourly summary and the quarter-hour time checks, as a
+          // quest has (T, 2026-11-17: "have both").
         }
         const now = questElapsed(q);
 
@@ -18485,8 +19001,180 @@ async function turnClockTick(client) {
     await heldRollTick(client);
     await fightClockTick(client);
     await orderClockTick(client);
-  } finally { turnClockBusy = false; }
+    await lapseFightCalls(client);
+    await ringDueTimers(client);
+  } finally { turnClockBusy = false; setClockWake(client); }
 }
+// \u2500\u2500 The clock on the second (T, 2026-11-17) \u2500\u2500
+// The minute tick still runs; after each, the bot sets a wake for the next
+// mark due within the minute \u2014 a reminder, a skip, the auto-pilot taken up
+// again \u2014 so a turn passes on its mark, not up to a minute after. The
+// harness walks the clock by hand: DDICE_PRECISE_TIMERS=0 sets no wakes.
+const PRECISE_TIMERS = process.env.DDICE_PRECISE_TIMERS !== '0';
+let clockWake = null;
+function nextClockMark(now = Date.now()) {
+  const marks = [];
+  try {
+    for (const f of db.prepare("SELECT * FROM fights WHERE state='active' AND last_at IS NOT NULL").all()) {
+      const at = Number(f.last_at), clock = turnClockFor(f.guild_id, f.channel_id);
+      if (f.auto_npc) marks.push(at + 2 * 60000);
+      if (clock.remind && !Number(f.nudged)) marks.push(at + clock.remind * 60000);
+      if (clock.skip) marks.push(at + clock.skip * 60000);
+    }
+    for (const o of db.prepare("SELECT * FROM turn_orders WHERE state='running'").all()) {
+      const at = Math.max(Number(o.turn_started_at) || 0, Number(o.last_sign_at) || 0), clock = turnClockFor(o.guild_id, o.channel_id);
+      if (clock.remind && !o.reminded_at) marks.push(at + clock.remind * 60000);
+      if (clock.skip) marks.push(at + clock.skip * 60000);
+    }
+  } catch { return null; }
+  const soon = marks.filter(t => t > now && t <= now + QUEST_TICK_MS);
+  return soon.length ? Math.min(...soon) : null;
+}
+function setClockWake(client) {
+  if (!PRECISE_TIMERS || !client) return;
+  if (clockWake) { clearTimeout(clockWake); clockWake = null; }
+  const at = nextClockMark();
+  if (!at) return;
+  const wake = () => {
+    // Busy with the last tick: a second later.
+    if (turnClockBusy) { clockWake = setTimeout(wake, 1000); return; }
+    clockWake = null;
+    turnClockTick(client).catch(e => console.error('[turnclock] wake:', e?.message || e));
+  };
+  clockWake = setTimeout(wake, Math.max(0, at - Date.now()) + 250);
+}
+
+// \u2500\u2500 /timer (T, 2026-11-17) \u2500\u2500
+// "A /timer function for a GM to set that will ping designated players
+// after the designated time passes, i.e. 0 hours 2 minutes 30 seconds."
+// Five seconds to a day. The card counts down by itself (Discord's own
+// relative time) and carries Cancel, a GM's; at the time the room is told
+// and the players named are pinged, on the second \u2014 a timer of its own,
+// with the minute tick behind it for one a restart interrupted, which
+// rings on return, marked late.
+const TIMER_MIN_S = 5, TIMER_MAX_S = 24 * 3600;
+const TIMER_LATE_MS = 15000;
+const timerHandles = new Map();
+const timerRow = (id) => { try { return db.prepare('SELECT * FROM gm_timers WHERE id=?').get(id) || null; } catch { return null; } };
+const timerJson = (s) => { try { const v = JSON.parse(s || '[]'); return Array.isArray(v) ? v.map(String) : []; } catch { return []; } };
+const timerWho = (t) => [...timerJson(t.users).map(id => `<@${id}>`), ...timerJson(t.roles).map(id => `<@&${id}>`)].join(' ');
+const timerName = (t) => `**Timer #${t.id}**${t.note ? ` \u2014 ${t.note}` : ''}`;
+function timerCard(t) {
+  const due = Math.floor(Number(t.due_at) / 1000);
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  return {
+    content: `\u23F3 ${timerName(t)}\nRings <t:${due}:R> (<t:${due}:T>) for ${timerWho(t) || 'nobody'} \u00b7 set by <@${t.gm_id}>`,
+    components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`tmr:cancel:${t.id}`).setLabel('\u274C Cancel').setStyle(ButtonStyle.Danger))],
+    allowedMentions: { parse: [] },
+  };
+}
+async function timerCardSay(client, t, content) {
+  if (!t?.card_msg_id) return;
+  const ch = await client.channels.fetch(t.channel_id).catch(() => null);
+  const m = ch?.messages ? await ch.messages.fetch(t.card_msg_id).catch(() => null) : null;
+  if (m?.edit) await m.edit({ content, components: [], allowedMentions: { parse: [] } }).catch(() => {});
+}
+function armTimer(client, t) {
+  if (!PRECISE_TIMERS || !t || t.state !== 'running') return;
+  clearTimeout(timerHandles.get(t.id));
+  const h = setTimeout(() => { timerHandles.delete(t.id); ringTimer(client, t.id).catch(e => console.error('[timer] ring -', e?.message || e)); },
+    Math.max(0, Number(t.due_at) - Date.now()));
+  timerHandles.set(t.id, h);
+}
+// Rung once, whoever gets there first: the timer's own wake, the minute
+// tick, the boot.
+async function ringTimer(client, id) {
+  const now = Date.now();
+  let claimed = 0;
+  try { claimed = db.prepare("UPDATE gm_timers SET state='rung', rung_at=? WHERE id=? AND state='running' AND due_at<=?").run(now, id, now + 500).changes; } catch {}
+  if (!claimed) return false;
+  clearTimeout(timerHandles.get(id)); timerHandles.delete(id);
+  const t = timerRow(id);
+  if (!t) return false;
+  const due = Math.floor(Number(t.due_at) / 1000);
+  const late = now - Number(t.due_at) > TIMER_LATE_MS;
+  const ch = await client.channels.fetch(t.channel_id).catch(() => null);
+  if (ch?.send) {
+    await ch.send({ content: `\u23F0 **Time\u2019s up**${t.note ? ` \u2014 ${t.note}` : ''} ${timerWho(t)}${late ? `\n_Late: the bot was away \u2014 it was due <t:${due}:R>._` : ''}`,
+      allowedMentions: { users: timerJson(t.users), roles: timerJson(t.roles) } }).catch(e => console.error('[timer] post -', e?.message || e));
+  }
+  await timerCardSay(client, t, `\u231B ${timerName(t)} \u2014 rang <t:${Math.floor(now / 1000)}:R>${late ? ', late' : ''}.`);
+  return true;
+}
+async function ringDueTimers(client) {
+  let due = [];
+  try { due = db.prepare("SELECT id FROM gm_timers WHERE state='running' AND due_at<=?").all(Date.now()); } catch { return; }
+  for (const r of due) await ringTimer(client, r.id).catch(e => console.error('[timer] due -', e?.message || e));
+}
+// At boot: the overdue ring now (late), the rest are set again.
+async function armTimers(client) {
+  await ringDueTimers(client);
+  let live = [];
+  try { live = db.prepare("SELECT * FROM gm_timers WHERE state='running'").all(); } catch { return; }
+  for (const t of live) armTimer(client, t);
+}
+async function cancelTimer(client, t, byName) {
+  let n = 0;
+  try { n = db.prepare("UPDATE gm_timers SET state='cancelled', rung_at=? WHERE id=? AND state='running'").run(Date.now(), t.id).changes; } catch {}
+  if (!n) return false;
+  clearTimeout(timerHandles.get(t.id)); timerHandles.delete(t.id);
+  await timerCardSay(client, t, `\u2716 ${timerName(t)} \u2014 called off by ${byName}.`);
+  return true;
+}
+async function handleTimer(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const no = (content) => interaction.reply({ ephemeral: true, content });
+  if (!(await isGm(interaction.guild, uid))) return no('\u274C Timers are a GM\u2019s.');
+  const sub = interaction.options.getSubcommand();
+  if (sub === 'set') {
+    const h = interaction.options.getInteger('hours') ?? 0, m = interaction.options.getInteger('minutes') ?? 0, s = interaction.options.getInteger('seconds') ?? 0;
+    const secs = h * 3600 + m * 60 + s;
+    if (secs < TIMER_MIN_S || secs > TIMER_MAX_S) return no('\u274C A timer runs from 5 seconds to 24 hours \u2014 e.g. `minutes:2 seconds:30`.');
+    const raw = String(interaction.options.getString('players') || '');
+    const users = [...new Set([...raw.matchAll(/<@!?(\d{15,22})>/g)].map(x => x[1]))];
+    const roles = [...new Set([...raw.matchAll(/<@&(\d{15,22})>/g)].map(x => x[1]))];
+    if (!users.length && !roles.length) return no('\u274C Name who it pings \u2014 `players:@Artorius @Meliora`, or a role.');
+    const note = String(interaction.options.getString('note') || '').replace(/\s+/g, ' ').trim().slice(0, 200) || null;
+    const cid = interactionChannelId(interaction), now = Date.now();
+    const id = Number(db.prepare('INSERT INTO gm_timers (guild_id, channel_id, gm_id, set_at, due_at, secs, users, roles, note) VALUES (?,?,?,?,?,?,?,?,?)')
+      .run(gid, cid, uid, now, now + secs * 1000, secs, JSON.stringify(users), JSON.stringify(roles), note).lastInsertRowid);
+    const t = timerRow(id);
+    await interaction.reply(timerCard(t));
+    const card = interaction.ddiceLastPost || await interaction.fetchReply?.().catch(() => null);
+    if (card?.id) { try { db.prepare('UPDATE gm_timers SET card_msg_id=? WHERE id=?').run(String(card.id), id); } catch {} }
+    armTimer(interaction.client, timerRow(id));
+    return;
+  }
+  if (sub === 'list') {
+    const rows = db.prepare("SELECT * FROM gm_timers WHERE guild_id=? AND state='running' ORDER BY due_at").all(gid);
+    if (!rows.length) return no('\u23F3 No timers running.');
+    return replyLong(interaction, ['\u23F3 **Timers running**', ...rows.map(t =>
+      `#${t.id} \u00b7 ${t.note || '_no note_'} \u00b7 <#${t.channel_id}> \u00b7 rings <t:${Math.floor(Number(t.due_at) / 1000)}:R> for ${timerWho(t) || 'nobody'}`)],
+      { ephemeral: true, allowedMentions: { parse: [] } });
+  }
+  if (sub === 'cancel') {
+    const t = timerRow(interaction.options.getInteger('number'));
+    if (!t || t.guild_id !== gid || t.state !== 'running') return no('\u274C No timer of that number is running.');
+    const byName = await getDisplayName(interaction.guild, uid).catch(() => 'a GM');
+    await cancelTimer(interaction.client, t, byName);
+    return no(`\u2716 ${timerName(t)} is off.`);
+  }
+  return no('\u274C Unknown /timer command.');
+}
+// The card's Cancel: a GM's.
+async function handleTimerButton(interaction) {
+  const [, act, idS] = interaction.customId.split(':');
+  const id = Number(idS) || 0;
+  if (act !== 'cancel') return interaction.reply({ ephemeral: true, content: '\u23F3 That button has nothing left to do.' });
+  if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ ephemeral: true, content: '\u274C Only a GM calls a timer off.' });
+  const t = timerRow(id);
+  if (!t || t.state !== 'running') return interaction.reply({ ephemeral: true, content: '\u23F3 That timer has rung or been called off already.' });
+  const byName = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'a GM');
+  db.prepare("UPDATE gm_timers SET state='cancelled', rung_at=? WHERE id=? AND state='running'").run(Date.now(), id);
+  clearTimeout(timerHandles.get(id)); timerHandles.delete(id);
+  return interaction.update({ content: `\u2716 ${timerName(t)} \u2014 called off by ${byName}.`, components: [], allowedMentions: { parse: [] } });
+}
+
 // The clock stops on a fight or an order once a whole round has passed
 // with nobody acting — as many of its own moves in a row as there are
 // hands to wait on — and leaves alone whatever has been quiet six hours
@@ -18677,7 +19365,7 @@ async function clockStrike(guild, gid, cid, channel, mins, at = null) {
   if (moved()) return false;
   const attRow = attacker.isNpc ? getNpc(gid, attacker.name) : getChar(gid, attackerId);
   const stat = chooseAutoStat(gid, attackerId, attacker.stats, 'atk');
-  const restrained = !!grappleHolderOf(fight, attackerId);
+  const restrained = !fiveMoves(gid) && !!grappleHolderOf(fight, attackerId);
   const offBalance = !restrained && consumeFlatAtk(gid, cid, attackerId);
   const fooled = consumeFooled(gid, cid, attackerId) || consumeFlatMark(gid, attackerId);
   const flat = restrained || offBalance || fooled;
@@ -18685,7 +19373,7 @@ async function clockStrike(guild, gid, cid, channel, mins, at = null) {
   const atkBonus = consumeAtkBonus(gid, cid, attackerId, { flat: !!flat });
   const R = rulesFor(gid);
   const mod = (flat ? 0 : (R.defence === 'ac' ? autoAtkBonus5e(R, attRow, stat) : (attacker.stats[stat] ?? 0))) + atkBonus;
-  const a = autoRoll(mod, autoEdge(fooled === 'dis' ? 'dis' : flat, attRow, stat));
+  const a = autoRoll(mod, feintEdgeOn(gid, cid, attackerId, target, autoEdge(fooled === 'dis' ? 'dis' : flat, attRow, stat)));
   mirrorAutoRoll(gid, cid, attacker.name, `1d20${autoTag(a)}`, a, a.total, `fight attack (${flat ? 'flat d20' : STAT_LABELS[stat]}) — the turn clock`);
   const ac = R.defence === 'ac' ? R.targetNumber(targetF.isNpc ? getNpc(gid, targetF.name) : getChar(gid, target)) : null;
   upsertFight(gid, cid, {
@@ -18697,7 +19385,7 @@ async function clockStrike(guild, gid, cid, channel, mins, at = null) {
   const hide = attacker.isNpc && !npcStatsVisible(gid);
   const why = (restrained ? ' 🤼 restrained — flat' : offBalance ? ' 🛡️ off-balance — flat' : fooled ? ' 🎭 flat d20' : '')
     + (atkBonus ? ` \u2728 +${atkBonus} riposte` : '')
-    + (a.adv ? ' (advantage)' : a.dis ? ' (disadvantage)' : '');
+    + (a.adv ? (a.feint ? ' (advantage \u2014 \u{1F3AD} the feint)' : ' (advantage)') : a.dis ? ' (disadvantage)' : '');
   const lines = [
     `⏳ ${mins} minutes quiet — the bot attacks for **${attacker.name}${attacker.isNpc ? ' 🎭' : ''}**, at **${targetF.name}${targetF.isNpc ? ' 🎭' : ''}**${hide || flat ? '' : ` with **${STAT_LABELS[stat]}**`}.`,
     `⚔️  1d20${why} → ${autoDice(a)}${hide || !mod ? '' : (mod > 0 ? ` +${mod}` : ` ${mod}`)} = ${fightTotalStr(a.total, a.nat, 20)}`,
@@ -18737,6 +19425,20 @@ async function clockDefend(guild, gid, cid, channel, mins, at = null) {
     // A captive gone quiet stays in the hold (T, 2026-11-09).
     await say(`⏳ ${mins} minutes quiet — **${name}** stays in the hold.`);
     const r = await settleExchange(guild, gid, cid, fight);
+    await sendLong(channel, r.lines, { components: r.nextF?.answerRows ?? [] });
+    if (r.ended) await announceFightEnd(guild, gid, cid, channel, r.announce);
+    return true;
+  }
+  if ((fight.atk_kind === 'grapple' || fight.atk_kind === 'feint') && fiveMoves(gid)) {
+    // On 5e the better of Athletics and Acrobatics, or Insight (T, 2026-11-17).
+    const grab = fight.atk_kind === 'grapple';
+    const flatC = consumeFooled(gid, cid, id) || consumeFlatMark(gid, id);
+    const b = grab ? bestSkill5e(gid, id) : { skill: 'insight', bonus: skill5e(gid, id, 'insight'), label: 'Insight' };
+    const d = autoRoll(flatC ? 0 : b.bonus, false);
+    mirrorAutoRoll(gid, cid, defender.name, `1d20${autoTag(d)}`, d, d.total, `${grab ? 'grapple save' : 'feint insight'} (${b.label})${flatC ? ', flat d20' : ''} — the turn clock`);
+    await say(`⏳ ${mins} minutes quiet — the bot rolls **${name}**'s ${b.label}.`);
+    storeAnswer(gid, cid, { total: d.total, nat: d.nat, stat: DND_SKILLS[b.skill] || 'wis', mode: 'normal', db: 1, df: flatC ? 1 : null });
+    const r = await settleExchange(guild, gid, cid, getFight(gid, cid));
     await sendLong(channel, r.lines, { components: r.nextF?.answerRows ?? [] });
     if (r.ended) await announceFightEnd(guild, gid, cid, channel, r.announce);
     return true;
@@ -19662,8 +20364,8 @@ function initRpModal(key, cur) {
   const field = (id, label, style, max) => new ActionRowBuilder().addComponents(
     new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(style).setRequired(false).setMaxLength(max));
   return new ModalBuilder().setCustomId(`initrp:${key}`).setTitle(`${cur?.kind === 'player' ? 'Your first turn' : String(cur?.name || 'The turn')} \u2014 roleplay`.slice(0, 45))
-    .addComponents(field('action', 'What do you do? (optional)', TextInputStyle.Short, 200),
-      field('speech', 'What do you say? (optional)', TextInputStyle.Paragraph, 500));
+    .addComponents(field('action', 'What do you do? (optional)', TextInputStyle.Paragraph, RP_BOX_MAX),
+      field('speech', 'What do you say? (optional)', TextInputStyle.Paragraph, RP_BOX_MAX));
 }
 async function handleInitRpModal(interaction) {
   const gid = interaction.guild.id, cid = interactionChannelId(interaction), uid = interaction.user.id;
@@ -19676,7 +20378,7 @@ async function handleInitRpModal(interaction) {
   if (!(await isGm(interaction.guild, uid)) && !(cur?.kind === 'player' && cur.id === uid))
     return no(cur?.kind === 'player' ? `⏳ It is **${cur.name}**’s turn — only they or a GM can play it out.` : `🎭 **${cur?.name}** is the GM’s — only a GM can play that turn out.`);
   const words = rpWords(interaction);
-  if (words) { try { noteQuestActivity(gid, cid, 'rp', `${cur.name}: ${words.replace(/[*_]+/g, '').replace(/\s*\n\s*/g, ' \u00b7 ').trim().slice(0, 300)}`, uid); } catch {} }
+  if (words) { try { noteQuestActivity(gid, cid, 'rp', `${cur.name}: ${rpBeatText(words)}`, uid); } catch {} }
   if (interaction.isFromMessage?.()) await interaction.update({ components: [] }).catch(() => {});
   else await interaction.reply({ ephemeral: true, content: '🎭 Played out.' }).catch(() => {});
   const moved = await advanceTurnOrder(interaction.client, gid, cid, { how: 'rp', expectKey: key, words, channel: await interactionChannel(interaction) });
@@ -20065,7 +20767,8 @@ function liveFightCall(gid, cid) {
   return c && c.state === 'open' ? c : null;
 }
 function saveFightCall(gid, cid, fields) {
-  const keys = Object.keys(fields || {});
+  fields = { ...(fields || {}), touched_at: Date.now() };
+  const keys = Object.keys(fields);
   if (keys.length) db.prepare(`UPDATE fight_calls SET ${keys.map(k => `${k}=?`).join(',')} WHERE guild_id=? AND channel_id=?`).run(...keys.map(k => fields[k]), gid, cid);
   return getFightCall(gid, cid);
 }
@@ -20107,6 +20810,20 @@ async function refreshCallCard(ch, gid, c, content = null) {
     const m = await ch.messages.fetch(c.card_msg_id);
     if (m?.edit) await m.edit(content ? { content, components: [], allowedMentions: { parse: [] } } : fightCallView(gid, c));
   } catch {}
+}
+// A called fight with nobody touching it for a day lapses: it held the
+// channel against any other fight (T, 2026-11-17). Asked by the minute tick.
+const CALL_LAPSE_MS = 24 * 3600000;
+async function lapseFightCalls(client) {
+  let rows = [];
+  try { rows = db.prepare("SELECT * FROM fight_calls WHERE state='open' AND COALESCE(touched_at, created_at, 0) < ?").all(Date.now() - CALL_LAPSE_MS); } catch { return; }
+  for (const c of rows) {
+    try {
+      db.prepare("UPDATE fight_calls SET state='lapsed', touched_at=? WHERE guild_id=? AND channel_id=? AND state='open'").run(Date.now(), c.guild_id, c.channel_id);
+      const ch = await client.channels.fetch(c.channel_id).catch(() => null);
+      await refreshCallCard(ch, c.guild_id, c, '\u231B The fight call lapsed \u2014 a day went by with nobody touching it. `/fight start` calls another.');
+    } catch (e) { console.error('[fightcall] lapse -', e?.message || e); }
+  }
 }
 // Who may sign up for a called fight: a sheet, approved, standing above the
 // bout's floor, and not among the fallen.
@@ -21010,6 +21727,18 @@ async function handleCampaign(interaction) {
   }
 }
 
+// The run's review button is the party's (T, 2026-11-17): whoever was
+// seated on it \u2014 still there or since gone \u2014 and once each.
+function reviewRefusal(gid, uid, runNum) {
+  const q = runNum ? getQuest(gid, runNum) : null;
+  if (!q) return '\u274C That run is not on the books any more.';
+  let seat = null, had = null;
+  try { seat = db.prepare('SELECT state FROM quest_members WHERE guild_id=? AND number=? AND user_id=?').get(gid, runNum, uid); } catch {}
+  if (!seat || !['party', 'departed'].includes(seat.state)) return `\u{1F4DD} This review is for the party that played **${questTag(q)}**.`;
+  try { had = db.prepare("SELECT 1 FROM feedback_log WHERE guild_id=? AND user_id=? AND quest_number=? AND room='quests'").get(gid, uid, runNum); } catch {}
+  if (had) return `\u2705 You have reviewed **${questTag(q)}** already \u2014 thank you.`;
+  return null;
+}
 async function handleFeedback(interaction) {
   const gid = interaction.guild.id;
   const group = interaction.options.getSubcommandGroup(false);
@@ -21740,9 +22469,18 @@ async function sessionSummary(interaction, gid, run) {
   const share = !!interaction.options.getBoolean('share');
   await interaction.deferReply({ ephemeral: !share });
   const live = getQuest(gid, run.number) || run;
+  const { file, beatN, runMs } = await runSoFarFile(interaction.guild, gid, live, interaction.user.id);
+  const { AttachmentBuilder } = require('discord.js');
+  return interaction.editReply({ allowedMentions: { parse: [] }, files: [new AttachmentBuilder(file.pdf, { name: file.name })],
+    content: `\u{1F4DC} **${questTag(live)}** — the story so far: ${beatN} beat${beatN === 1 ? '' : 's'} over ${fmtElapsed(runMs)}. ${live.status === 'active' ? 'The run is still open; nothing was closed or paid.' : 'This run has already ended.'}${share ? '' : ' Only you can see this — `share:true` posts it in the room.'}` });
+}
+// The story so far as a file: the parchment scroll where it can be painted,
+// else the same record in plain print. /session summary and the wind-down
+// post share it (T, 2026-11-17).
+async function runSoFarFile(guild, gid, live, fallbackGmId = null) {
   const partyNames = [];
-  for (const id of getQuestMembers(gid, live.number, 'party')) partyNames.push(await getDisplayName(interaction.guild, id).catch(() => 'someone'));
-  const runnerName = await getDisplayName(interaction.guild, archiveGmOf(live) || interaction.user.id).catch(() => 'a GM');
+  for (const id of getQuestMembers(gid, live.number, 'party')) partyNames.push(await getDisplayName(guild, id).catch(() => 'someone'));
+  const runnerName = await getDisplayName(guild, archiveGmOf(live) || fallbackGmId).catch(() => 'a GM');
   const runMs = live.status === 'active' ? questElapsed(live) : (Number(live.elapsed_ms) || 0);
   const events = questEvents(gid, live.number);
   const beatN = events.filter(e => !['remind', 'recap', 'talk'].includes(e.kind)).length;
@@ -21754,14 +22492,61 @@ async function sessionSummary(interaction, gid, run) {
   if (!file) {
     // No parchment to paint on: the same record as plain printed text.
     const body = [`Run by ${runnerName}`, `The party: ${partyNames.join(', ') || 'nobody'}`, `It has run for ${fmtElapsed(runMs)} so far.`, '',
-      ...(beatN ? events.filter(e => !['remind', 'recap', 'talk'].includes(e.kind)).slice(0, 150)
+      ...(beatN ? events.filter(e => !['remind', 'recap', 'talk'].includes(e.kind)).slice(0, STORY_BEATS_MAX)
         .map(e => `${fmtElapsed(e.at_ms)}  ${String(e.text || e.kind).replace(/<@[!&]?\d+>/g, 'someone').replace(/[*_`]+/g, '').replace(/\s*\n\s*/g, ' ')}`)
-        : ['Nothing has been written down yet.'])].join('\n').slice(0, 12000);
+        : ['Nothing has been written down yet.'])].join('\n').slice(0, SCROLL_BODY_MAX);
     file = { pdf: makeTextPdf({ title: `${questTag(live)} — so far`, body }), name: `${fileSlug(`${questTag(live)} so far`, 'run-so-far')}.pdf` };
   }
-  const { AttachmentBuilder } = require('discord.js');
-  return interaction.editReply({ allowedMentions: { parse: [] }, files: [new AttachmentBuilder(file.pdf, { name: file.name })],
-    content: `\u{1F4DC} **${questTag(live)}** — the story so far: ${beatN} beat${beatN === 1 ? '' : 's'} over ${fmtElapsed(runMs)}. ${live.status === 'active' ? 'The run is still open; nothing was closed or paid.' : 'This run has already ended.'}${share ? '' : ' Only you can see this — `share:true` posts it in the room.'}` });
+  return { file, beatN, runMs };
+}
+// ── The wind-down post (T, 2026-11-17) ──
+// "Post in that instance all of the hourly summaries in order, the pdf
+// summary and a player facing review button \u2014 seen by everybody." In the
+// run's room: the run hour by hour, rebuilt from its log (an instance had no
+// live summaries before this build), the story so far, the party's review.
+function hourBlocks(events, nowMs) {
+  const HOUR = QUEST_RECAP_MS;
+  const ev = (events || []).filter(e => !['remind', 'recap', 'talk'].includes(e.kind));
+  const hours = Math.max(1, Math.ceil(Math.max(0, Number(nowMs) || 0) / HOUR));
+  const byHour = new Map();
+  for (const e of ev) {
+    const h = Math.min(hours - 1, Math.max(0, Math.floor((Number(e.at_ms) || 0) / HOUR)));
+    if (!byHour.has(h)) byHour.set(h, []);
+    byHour.get(h).push(e);
+  }
+  const out = [];
+  let quietFrom = null;
+  const quiet = (to) => {
+    if (quietFrom === null) return;
+    out.push('', quietFrom === to ? `\u{1F4FB} **Hour ${quietFrom + 1}** \u2014 _quiet, nothing logged._`
+      : `\u{1F4FB} **Hours ${quietFrom + 1}\u2013${to + 1}** \u2014 _quiet, nothing logged._`);
+    quietFrom = null;
+  };
+  for (let h = 0; h < hours; h++) {
+    const these = byHour.get(h);
+    if (!these) { if (quietFrom === null) quietFrom = h; continue; }
+    quiet(h - 1);
+    const sofar = h === hours - 1 && (Number(nowMs) || 0) % HOUR !== 0;
+    out.push('', `\u{1F4FB} **Hour ${h + 1}**${sofar ? ' (so far)' : ''}`, ...these.map(questEventLine));
+  }
+  quiet(hours - 1);
+  return out;
+}
+async function postWindDown(guild, gid, quest, ch, gmId = null) {
+  const live = getQuest(gid, quest.number) || quest;
+  const now = live.status === 'active' ? questElapsed(live) : (Number(live.elapsed_ms) || 0);
+  const lines = [`\u{1F6CC} **${questTag(live)}** is winding down. The story is told; rewards are being settled. The party may rest in the meantime.`,
+    '', `**The run, hour by hour** \u2014 ${fmtElapsed(now)} in all:`, ...hourBlocks(questEvents(gid, live.number), now)];
+  // What the log holds was written by players: it is shown, never sent as pings.
+  await sendLong(ch, lines, { allowedMentions: { parse: [] } });
+  let file = null;
+  try { ({ file } = await runSoFarFile(guild, gid, live, gmId)); } catch (e) { console.error('[winddown] story -', e?.message || e); }
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder } = require('discord.js');
+  const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`fbq:${live.number}`)
+    .setLabel('\u{1F4DD} Review this run').setStyle(ButtonStyle.Secondary));
+  await ch.send({ allowedMentions: { parse: [] }, components: [row],
+    ...(file ? { files: [new AttachmentBuilder(file.pdf, { name: file.name })] } : {}),
+    content: `\u{1F4DC} ${file ? 'The story so far rides with this.' : 'The story so far could not be written out just now \u2014 `/session summary` tries again.'} If you played, **\u{1F4DD} Review this run** tells the GMs how it went \u2014 a score out of ten and a few words, seen by them alone.` }).catch(e => console.error('[winddown] post -', e?.message || e));
 }
 
 // /session thread: the room, for a run that started before the forum was
@@ -22732,9 +23517,16 @@ async function handleQuest(interaction, forced) {
     const room = quest.run_thread_id || quest.run_channel_id;
     if (room) {
       const ch = await interaction.client.channels.fetch(room).catch(() => null);
-      if (ch) await ch.send({ allowedMentions: { parse: [] }, content: back
-        ? `\u25B6\uFE0F **${questTag(quest)}** is running again \u2014 rests will pass the party over once more.`
-        : `\u{1F6CC} **${questTag(quest)}** is winding down. The story is told; rewards are being settled. The party may rest in the meantime.` }).catch(() => {});
+      // Winding down, the room gets the run hour by hour, the story so far
+      // and the party's review button (T, 2026-11-17); the GM is answered
+      // first, as the scroll takes a moment to paint.
+      if (ch && back) await ch.send({ allowedMentions: { parse: [] }, content:
+        `\u25B6\uFE0F **${questTag(quest)}** is running again \u2014 rests will pass the party over once more.` }).catch(() => {});
+      else if (ch) {
+        await interaction.reply({ ephemeral: true, content: `\u2705 **${questTag(quest)}** is winding down \u2014 its party will be healed by the next rest. Finish with \`/quest run complete\` when the rewards are right.` });
+        await postWindDown(interaction.guild, gid, quest, ch, interaction.user.id).catch(e => console.error('[winddown]', e?.message || e));
+        return;
+      }
     }
     return interaction.reply({ ephemeral: true, content: back
       ? `\u2705 **${questTag(quest)}** is running again.`
@@ -26653,6 +27445,11 @@ async function handleLibrary(interaction) {
   if (!(await isGm(interaction.guild, uid))) {
     return interaction.reply({ content: '❌ The library is a GM tool.', ephemeral: true });
   }
+  // The picker hides it off 5e; this is the backstop (T, 2026-11-17: the
+  // rows were inert on a Knightfall server, and nothing said so).
+  const rulesL = rulesFor(gid);
+  if (rulesL.id !== 'dnd5e')
+    return interaction.reply({ ephemeral: true, content: `\u274C The library holds 5e monsters and spells; this server plays by **${rulesL.name}**.` });
   const sub = interaction.options.getSubcommand();
 
   if (sub === 'import' || sub === 'srd') {
@@ -28773,6 +29570,28 @@ const CHANGELOG = [
         detail: '' },
       { line: 'Fixed: a forfeit skipped the next fighter’s turn; the auto-pilot stayed switched on after an auto fight ended; the picker’s practice floor read a setting that did not exist',
         detail: '' },
+      { line: '`/timer set [hours:] [minutes:] [seconds:] players: [note:]` — a countdown card with ❌ Cancel; on time ⏰ Time’s up rings in the room, pinging the players or roles named · `/timer list` · `/timer cancel`',
+        detail: 'Five seconds to a day, GMs only. It rings on the second; one due while the bot was away rings when it is back, marked late.' },
+      { line: 'Every roleplay box holds 4,000 characters, and nothing posts cut: words longer than one Discord message carry on in the next, the buttons on the last',
+        detail: 'Fight forms, `/rp`, NPC voices and replies, targets and `/deception` alike. `/edit` opens every part of a long post in one form, and a take-down takes every part. The run’s log keeps every word; a summary line shows the first 300.' },
+      { line: 'A wind-down posts in the run’s room for everyone: the run hour by hour, the story so far as a PDF, and 📝 Review this run',
+        detail: 'Rebuilt from the log — quiet hours said, the last hour marked so far, time checks and table talk left out. Every kind of run; `resume:true` only says it runs again.' },
+      { line: '📝 Review is for those who played the run — seated, or since departed — one review each, on the completion card too',
+        detail: 'One who only applied, or was never on it, is told the review is for the party that played; a second press or a second form is told it has been sent already.' },
+      { line: 'Instances keep a quest’s clock: the hourly summary and the quarter-hour time check',
+        detail: 'The six-hour quiet reminder stays.' },
+      { line: 'The summaries are in standard type, still on parchment: the run’s story, your run record and `/fight log scroll:true`. The scroll font is for `/gm scroll` and the parchment sheet',
+        detail: 'Only the letters change: the parchment and the weave stay, so `/gm scroll file:` still unfurls a story, and a long night reads easily.' },
+      { line: 'The turn clock acts on the second: a reminder, a skip or the auto-pilot taken up again lands on its mark, not up to a minute after',
+        detail: 'After each minute’s tick the bot wakes again for the next mark due within the minute. After an outage every quiet turn is still acted on at the first tick.' },
+      { line: '5e moves: grapple and escape are Athletics against the better of Athletics and Acrobatics, no wounds, a tie changing nothing; disarm is the attack roll against that grip; a feint is Deception against Insight, for advantage on the next attack on them',
+        detail: 'A hold only stops them moving: the holder may strike the captive, Release lets go, and there is no Maintain. Deflect, and Disarm or Grapple against a strike, stay Knightfall’s — on 5e Armour Class takes the blow. The auto-pilot and the turn clock play by the same rules.' },
+      { line: 'A called fight untouched for a day lapses; a disarmed fighter holding someone gets Release on their turn; a kept hold’s Break free and Stay go once it is answered',
+        detail: 'A lapsed card says so and frees the channel for another fight. Letting go stays free. A hold card from before a restart keeps its buttons, and a late press is told no hold is waiting.' },
+      { line: '`/library` is refused off 5e; `/roll action:` says so when `mode:` does not apply; an open `/deception` form waits an hour and survives a restart',
+        detail: 'The library holds 5e monsters and spells; on a Knightfall server it now says so rather than filling rows nothing reads. The `/roll` note is the roller’s alone.' },
+      { line: 'Fixed: an NPC named with “Discord” or “Clyde” spoke as the bot; on 5e the exchange read Armour Class as “undefined”',
+        detail: 'Discord refuses those words in a webhook’s name; a hair space after the first letter passes and reads the same.' },
     ], player: [
       'Every fight roll you could reroll waits: \u{1F501} Reroll (a token) or ✅ Keep. Go quiet and it is kept. Called checks and `/deception` too',
       'Saves, holds, breaks, deflections, disarms and escapes can be rerolled now',
@@ -28783,6 +29602,14 @@ const CHANGELOG = [
       'A GM may hand you an effect — a grenade — with a \u{1F4A5} Use button; brace with Defend when one is aimed at you',
       'Twenty against twenty goes to whoever started the roll; `/deception` counts the 20s',
       'HP is the GM’s to change now; `!hp` is gone and `!heal` is `/heal`',
+      'Roleplay boxes hold 4,000 characters; a long post carries on into the next message',
+      'When a run winds down its room gets the run hour by hour, the story so far and 📝 Review',
+      '📝 Review is for those who played the run — one each',
+      'Instances get the hourly summary and the time checks a quest has',
+      'A GM may set a `/timer` that pings you when it runs out',
+      'The turn clock’s reminders and skips land on the second',
+      'On 5e: grapple and escape are Athletics against Athletics or Acrobatics, disarm is your attack roll, and a feint gives advantage on your next attack on them',
+      'Summaries are in plain type now, still on parchment',
     ] },
   { key: '2026-11-10', gm: [
       { line: 'Initiative, reworked: natural 20s go first and their first turn holds two actions; natural 1s go last and their first turn is roleplay only; a level total goes to whoever rolled first \u2014 no more rerolls',
@@ -29235,7 +30062,7 @@ async function announceChangelog(client, guild, opts = {}) {
 // one row per hand and never grew; roll_tally is lifetime counts by design.
 function pruneLedgers(gid) {
   const day = 86400000, out = [];
-  for (const [table, col, days] of [['rp_lines', 'at', 90], ['week_dice', 'at', 14], ['story_run_log', 'at', 90]]) {
+  for (const [table, col, days] of [['rp_lines', 'at', 90], ['post_parts', 'at', 90], ['week_dice', 'at', 14], ['story_run_log', 'at', 90]]) {
     try { const n = db.prepare(`DELETE FROM ${table} WHERE guild_id=? AND ${col} < ?`).run(gid, Date.now() - days * day).changes; if (n) out.push(`${table}: ${n} row(s) past ${days} days`); } catch {}
   }
   return out;
@@ -29910,7 +30737,7 @@ function makeImagesPdf(pages) {
 // A scroll of several sheets: the parchment and face of /gm scroll, the
 // body paginated so a long night is not cut at one sheet's end. Returns
 // the PDF (T, 2026-10-14: the run's story on the completion card).
-function renderScrollBook({ family, title, body }) {
+function renderScrollBook({ family, title, body, quality = null }) {
   const { createCanvas } = require('@napi-rs/canvas');
   const W = 1000, PAD = 90, titleSize = 62, bodySize = 40, lineH = Math.round(bodySize * 1.35);
   const std = family === 'standard' ? ensureStandardFont() : null;
@@ -29936,11 +30763,33 @@ function renderScrollBook({ family, title, body }) {
     }
     ctx.fillStyle = '#382c19'; ctx.font = fontOf(bodySize); ctx.textAlign = 'left';
     for (const ln of chunk) { y += lineH; if (ln) ctx.fillText(ln, PAD, y); }
-    pages.push({ jpeg: canvas.toBuffer('image/jpeg'), w: W, h: H });
+    pages.push({ jpeg: quality ? canvas.toBuffer('image/jpeg', quality) : canvas.toBuffer('image/jpeg'), w: W, h: H });
   }
   return makeImagesPdf(pages);
 }
 
+// How much of a run a scroll carries (T, 2026-11-17: the roleplay boxes
+// went to Discord's 4,000, so the story keeps every word and runs longer).
+const STORY_BEATS_MAX = 400;
+const SCROLL_BODY_MAX = 40000;
+// Discord takes a 10 MB file from the bot. The pages are pictures, so a
+// long scroll is painted again lighter, and only then cut short.
+const SCROLL_FILE_MAX = Math.floor(7.5 * 1024 * 1024);
+function scrollBookFitting({ family, title, body }) {
+  for (const quality of [null, 75, 60]) {
+    const pdf = renderScrollBook({ family, title, body, quality });
+    if (pdf.length <= SCROLL_FILE_MAX) return { pdf, body };
+  }
+  let keep = String(body || '').length;
+  while (keep > 2000) {
+    keep = Math.floor(keep * 0.75);
+    const cut = `${String(body).slice(0, keep).replace(/\n[^\n]*$/, '')}\n\n(The rest would not fit one scroll.)`;
+    const pdf = renderScrollBook({ family, title, body: cut, quality: 60 });
+    if (pdf.length <= SCROLL_FILE_MAX) return { pdf, body: cut };
+  }
+  const last = String(body || '').slice(0, 2000);
+  return { pdf: renderScrollBook({ family, title, body: last, quality: 60 }), body: last };
+}
 // Whether the parchment can be painted at all \u2014 asked once; without the
 // canvas the completion card simply goes out without its scroll.
 let canvasReady = null;
@@ -29953,13 +30802,15 @@ function hasCanvas() {
 // parchment, hung on the completion card. The writing rides inside the
 // PDF, so /gm scroll can unfurl it again anywhere (T, 2026-10-14).
 function runStoryScroll(gid, quest, { runnerName, partyNames, runMs, events, tale, sofar = false }) {
-  let family; try { family = ensureScrollFont(gid) || 'standard'; } catch { family = 'standard'; }
+  // The standard face, not the server's saved script (T, 2026-11-17): the
+  // script stays for /gm scroll's props and the parchment sheet.
+  const family = 'standard';
   const plain = (t) => String(t || '').replace(/<@[!&]?\d+>/g, 'someone').replace(/<#\d+>/g, 'a room')
     .replace(/[*_`]+/g, '').replace(/[\p{Extended_Pictographic}\uFE0F]/gu, '').replace(/[ \t]+/g, ' ').trim();
   // Table talk is not here: it has its own transcript (2026-11-07), and
   // left in it crowded the story out of the scroll's 150 beats.
   const talkN = events.filter(e => e.kind === 'talk' && !e.gone).length;
-  const beats = events.filter(e => !['remind', 'recap', 'talk'].includes(e.kind)).slice(0, 150)
+  const beats = events.filter(e => !['remind', 'recap', 'talk'].includes(e.kind)).slice(0, STORY_BEATS_MAX)
     .map(e => `${fmtElapsed(e.at_ms)}  ${plain(e.text || e.kind).replace(/\s*\n\s*/g, ' ')}`);
   const body = [
     `Run by ${plain(runnerName)}, ${dateLine(Date.now()).replace(/^\[[^\]]*\] \[[^\]]*\] /, '')}`,
@@ -29969,11 +30820,12 @@ function runStoryScroll(gid, quest, { runnerName, partyNames, runMs, events, tal
     ...(beats.length ? beats : [sofar ? 'Nothing has been written down yet.' : 'Nothing was written down.']),
     ...(talkN ? ['', `${talkN} line${talkN === 1 ? '' : 's'} of table talk were kept; they ride beside this scroll as a transcript.`] : []),
     ...(tale ? ['', plain(tale)] : []),
-  ].join('\n').slice(0, 12000);
+  ].join('\n').slice(0, SCROLL_BODY_MAX);
   // Asked for mid-run (/session summary), it says so on its face and in its name.
   const title = sofar ? `${questTag(quest)} \u2014 so far` : questTag(quest);
   const stem = fileSlug(sofar ? `${questTag(quest)} so far` : `${title} story`, 'run-story');
-  const pdf = embedScrollData(renderScrollBook({ family, title, body }), { v: 1, kind: 'scroll', title, body, name: stem });
+  const fitted = scrollBookFitting({ family, title, body });
+  const pdf = embedScrollData(fitted.pdf, { v: 1, kind: 'scroll', title, body: fitted.body, name: stem });
   return { pdf, name: `${stem}.pdf` };
 }
 
@@ -31499,9 +32351,9 @@ function rpModal({ gid = null, gm = false, title = 'Roleplay', replyTo = null } 
     .addOptions(R.stats.map(st => ({ label: `${R.labels?.[st] || st.toUpperCase()} \u2014 ${STAT_LONG[st] || st}`.slice(0, 100), value: st })));
   m.addLabelComponents(
     new LabelBuilder().setLabel('What you do (optional)').setTextInputComponent(new TextInputBuilder().setCustomId('action')
-      .setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(200).setPlaceholder('draws her blade and steps between them')),
+      .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(RP_BOX_MAX).setPlaceholder('draws her blade and steps between them')),
     new LabelBuilder().setLabel('What you say (optional)').setTextInputComponent(new TextInputBuilder().setCustomId('speech')
-      .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500).setPlaceholder('Not one step closer.')),
+      .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(RP_BOX_MAX).setPlaceholder('Not one step closer.')),
     new LabelBuilder().setLabel('Roll (optional)').setDescription('A stat roll answers a check the GM called on you here').setStringSelectMenuComponent(statPick),
     new LabelBuilder().setLabel('Dice (optional)').setDescription('Any dice, e.g. 2d6+1').setTextInputComponent(new TextInputBuilder().setCustomId('dice')
       .setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(15).setPlaceholder('2d6+1')),
@@ -31555,7 +32407,7 @@ async function handleRpModal(interaction) {
 function lineSpeaker(msg) {
   if (!msg) return null;
   const head = /^\u{1F3AD} \*\*([^\n]*)\*\*\n/u.exec(String(msg.content || ''));
-  const name = msg.webhookId ? msg.author?.username : (head ? head[1] : msg.author?.username);
+  const name = msg.webhookId ? unvoiceName(msg.author?.username) : (head ? head[1] : msg.author?.username);
   return name ? String(name).replace(/[\[\]()\n]/g, '').slice(0, 60) : null;
 }
 // The small line on a reply that jumps to what it answers.
@@ -31617,9 +32469,20 @@ async function replyHeaderAt(client, gid, cid, mid) {
   if (!chan || String(chan.guildId ?? chan.guild?.id) !== String(gid)) return '';
   return replyHeaderFor(chan, gid, mid);
 }
+// A post in parts with what closes it kept whole on the last: the words
+// broken where they must be, the tail after them, or on its own when the
+// last part has no room for it.
+function partsWithTail(main, tail, limit = POST_CUT) {
+  const chunks = String(main || '').trim() ? chunkText(main, limit) : [];
+  if (!tail) return chunks.length ? chunks : [''];
+  const last = chunks[chunks.length - 1];
+  if (last !== undefined && last.length + 2 + tail.length <= limit) chunks[chunks.length - 1] = `${last}\n\n${tail}`;
+  else chunks.push(...chunkText(tail, limit));
+  return chunks;
+}
 async function postRpLine(interaction, { action = '', speech = '', roll = '', dice = '', to = [], toInfo = null, replyTo = null }) {
   const gid = interaction.guild.id, uid = interaction.user.id;
-  const words = composeNpcSay({ action: String(action).slice(0, 200), speech: String(speech).slice(0, 500) });
+  const words = composeNpcSay({ action: String(action).slice(0, RP_BOX_MAX), speech: String(speech).slice(0, RP_BOX_MAX) });
   // The rolls are checked before anything posts.
   const stat = roll ? rpStatOf(gid, roll) : null;
   if (roll && !stat) return interaction.reply({ ephemeral: true, content: `\u274C **${roll}** is not a stat here \u2014 ${rulesFor(gid).stats.map(st => `\`${st}\``).join(', ')}.` });
@@ -31653,11 +32516,8 @@ async function postRpLine(interaction, { action = '', speech = '', roll = '', di
   const header = await replyHeaderFor(chan, gid, replyTo);
   const pings = [...new Set((to || []).map(String))].filter(id => id !== uid).slice(0, ADDRESS_CAP);
   const pingLine = pings.map(id => `<@${id}>`).join(' ');
-  // Settled before anything rolls, so a called check is never spent on a
-  // line that cannot post: room is kept for what goes beneath the words,
-  // and for the name line the bot puts on top when it posts itself.
-  const room = 1990 - header.length - words.length - pingLine.length - 4 - (name.length + 10);
-  if (room < (stat ? 700 : notation ? 160 : 0)) return answer('\u274C Too long \u2014 fewer words, or fewer people to name.');
+  // No room to keep any more: a long line carries on in the next message
+  // (T, 2026-11-17).
   // A stat roll answers a check the GM called on this player here, on the
   // card's own terms; anything else is an ordinary roll.
   const foot = [], rolled = [];
@@ -31677,34 +32537,54 @@ async function postRpLine(interaction, { action = '', speech = '', roll = '', di
     if (!dc) { const r = rollForRp(gid, uid, ch, { stat }); if (r) { foot.push(r.line); rolled.push(r); } }
   }
   if (notation) { const r = rollForRp(gid, uid, ch, { notation }); if (r) { foot.push(r.line); rolled.push(r); } }
-  let footText = foot.join('\n');
-  if (footText.length > room) footText = footText.slice(0, Math.max(0, room - 1)) + '\u2026';
+  const footText = foot.join('\n');
   const body = header + [words, footText, pingLine].filter(Boolean).join('\n\n');
+  // Too long for one message, it goes in parts (T, 2026-11-17): the name and
+  // the reply link open the first, the roll and the names close the last,
+  // whole \u2014 a roll never parted from its line.
+  const tail = [footText, pingLine].filter(Boolean).join('\n\n');
+  const piecesFor = (top) => ((top + body).length <= POST_CUT ? [top + body] : partsWithTail(`${top}${header}${words}`, tail));
   const face = interaction.member?.displayAvatarURL?.() || interaction.user?.displayAvatarURL?.() || null;
   // The webhook is not bound by the poster's permissions, so nothing it
   // says may ping but the people a GM named: a player's @everyone through
   // /rp would reach everyone (audit, 2026-10-15).
   const mentions = { parse: [], users: pings };
   const row = rpLineRow();
-  let sent = null;
+  let sent = null, sentAll = [];
   try {
     const hook = await npcWebhookIn(chan, gid, name, face);
     if (hook) {
-      try { sent = await hook.send({ content: body, allowedMentions: mentions, components: [row] }); }
-      catch (err) {
-        // A hook someone else made cannot carry buttons; the line still goes.
-        if (!/component|50006|owned|application/i.test(String(err?.message || ''))) throw err;
-        sent = await hook.send({ content: body, allowedMentions: mentions });
+      const pieces = piecesFor('');
+      for (let i = 0; i < pieces.length; i++) {
+        const last = i === pieces.length - 1;
+        if (!last) { sentAll.push(await hook.send({ content: pieces[i], allowedMentions: mentions })); continue; }
+        try { sentAll.push(await hook.send({ content: pieces[i], allowedMentions: mentions, components: [row] })); }
+        catch (err) {
+          // A hook someone else made cannot carry buttons; the line still goes.
+          if (!/component|50006|owned|application/i.test(String(err?.message || ''))) throw err;
+          sentAll.push(await hook.send({ content: pieces[i], allowedMentions: mentions }));
+        }
       }
+      sent = sentAll[sentAll.length - 1] ?? null;
     }
-  } catch (err) { console.error('[rp] webhook -', err?.message || err); sent = null; }
+  } catch (err) { console.error('[rp] webhook -', err?.message || err); sent = sentAll.length ? sentAll[sentAll.length - 1] : null; }
   if (!sent?.id) {
     // No webhook to be had here: the bot says it, with the name on top.
-    sent = await chan.send({ content: `\u{1F3AD} **${name}**\n${body}`, allowedMentions: mentions, components: [row] }).catch(() => null);
+    sentAll = [];
+    const pieces = piecesFor(`\u{1F3AD} **${name}**\n`);
+    for (let i = 0; i < pieces.length; i++) {
+      const m = await chan.send({ content: pieces[i], allowedMentions: mentions, ...(i === pieces.length - 1 ? { components: [row] } : {}) }).catch(() => null);
+      if (m) sentAll.push(m);
+    }
+    sent = sentAll[sentAll.length - 1] ?? null;
     if (!sent) return answer('\u274C I could not post in this channel \u2014 check my permissions here.');
   }
-  try { db.prepare('INSERT OR REPLACE INTO rp_lines (guild_id, message_id, channel_id, user_id, at) VALUES (?,?,?,?,?)').run(gid, String(sent.id), chan.id, uid, Date.now()); } catch {}
-  if (words) { try { noteQuestActivity(gid, chan.id, 'rp', `${name}: ${words.replace(/[*_]+/g, '').replace(/\s*\n\s*/g, ' \u00b7 ').trim().slice(0, 300)}`, uid); } catch {} }
+  // Every part is the player's, and the parts are one post.
+  for (const m of sentAll.length ? sentAll : [sent]) {
+    try { db.prepare('INSERT OR REPLACE INTO rp_lines (guild_id, message_id, channel_id, user_id, at) VALUES (?,?,?,?,?)').run(gid, String(m.id), chan.id, uid, Date.now()); } catch {}
+  }
+  notePostParts(gid, chan.id, sentAll);
+  if (words) { try { noteQuestActivity(gid, chan.id, 'rp', `${name}: ${rpBeatText(words)}`, uid); } catch {} }
   // Each roll: its beat in the run's account, the audit, the tallies; the
   // first is saved so `rr` rerolls it as it would a typed roll. A check
   // answered here wrote its beat already, as its button does.
@@ -31762,7 +32642,7 @@ function onlyRoleplayButtons(m) {
   return ids.length > 0 && ids.every(id => RP_BUTTON_RE.test(id));
 }
 function editLineLabel(m) {
-  const who = m.webhookId ? (m.author?.username || 'NPC') : 'DDice';
+  const who = m.webhookId ? (unvoiceName(m.author?.username) || 'NPC') : 'DDice';
   // The words, not the reply header or the bot's name line: every reply
   // would otherwise read the same (cold audit).
   const parts = rpPartsOf(m.content);
@@ -31792,10 +32672,19 @@ async function handleEdit(interaction) {
   // A GM sees everything the bot and its NPCs said; a player sees only the
   // lines they posted through /rp.
   const own = gm ? null : new Set(db.prepare('SELECT message_id FROM rp_lines WHERE guild_id=? AND channel_id=? AND user_id=?').all(gid, channel?.id || interaction.channelId, interaction.user.id).map(r => r.message_id));
+  // A post in parts is one line here, named by its first part (T, 2026-11-17).
+  const seen = new Map([...(fetched?.values?.() || [])].map(m => [String(m.id), m]));
+  const heads = new Set();
   const mine = [...(fetched?.values?.() || [])]
     .filter(m => (m.author?.id === interaction.client.user.id || m.webhookId) && String(m.content || '').trim() && (!(m.components?.length) || onlyRoleplayButtons(m)))
     .filter(m => gm || own.has(String(m.id)))
     .sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? 1 : -1))
+    .filter(m => {
+      const g = postPartsOf(gid, m.id), key = g ? String(g[0].part_id) : String(m.id);
+      if (heads.has(key)) return false;
+      heads.add(key); m.ddiceParts = g ? g.length : 0; m.ddiceHead = g ? (seen.get(key) || m) : m;
+      return true;
+    })
     .slice(0, 25);
   if (!mine.length)
     return interaction.reply({ ephemeral: true, content: gm
@@ -31804,7 +32693,10 @@ async function handleEdit(interaction) {
   const { ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
   const row = new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder().setCustomId(deleting ? 'editdel' : 'editpick').setPlaceholder('Which line?')
-      .addOptions(mine.map(m => ({ label: editLineLabel(m), value: m.id, emoji: m.webhookId ? '\u{1F3AD}' : '\u{1F3B2}' }))));
+      .addOptions(mine.map(m => {
+        const tag = m.ddiceParts ? ` (${m.ddiceParts} parts)` : '';
+        return { label: `${editLineLabel(m.ddiceHead || m).slice(0, 100 - tag.length)}${tag}`, value: m.id, emoji: m.webhookId ? '\u{1F3AD}' : '\u{1F3B2}' };
+      })));
   return interaction.reply({ ephemeral: true, components: [row],
     content: deleting
       ? `\u{1F5D1}\uFE0F **Which line comes down?** The last ${mine.length} ${gm ? 'the bot and its NPCs said' : 'you posted with `/rp`'} here, newest first \u2014 the pick is final.`
@@ -31823,25 +32715,37 @@ async function pickEditTarget(interaction, { deleting = false } = {}) {
 // hook the bot holds. Audited like an edit (T, 2026-10-15).
 async function deleteBotLine(interaction, msg, channel) {
   const gid = interaction.guild.id;
-  const hook = msg?.webhookId ? await ownWebhookForAsync(interaction.client, gid, channel, msg.webhookId) : null;
-  if (msg.webhookId && !hook)
+  // A post in parts comes down whole (T, 2026-11-17).
+  const group = postPartsOf(gid, msg.id);
+  const all = [];
+  if (group) { for (const p of group) all.push(String(p.part_id) === String(msg.id) ? msg : await channel.messages.fetch(p.part_id).catch(() => null)); }
+  else all.push(msg);
+  const live = all.filter(Boolean);
+  const hookId = live.find(m => m.webhookId)?.webhookId || null;
+  const hook = hookId ? await ownWebhookForAsync(interaction.client, gid, channel, hookId) : null;
+  if (hookId && !hook)
     return interaction.reply({ ephemeral: true, content: '\u274C That was said through a webhook I no longer hold, so Discord will not let me take it down.' });
-  if (msg.author?.id !== interaction.client.user.id && !hook)
+  if (live.some(m => m.author?.id !== interaction.client.user.id && !m.webhookId))
     return interaction.reply({ ephemeral: true, content: '\u274C I can only take down what I posted \u2014 my own messages and my NPCs\u2019 speech.' });
-  if (msg.components?.length && !onlyRoleplayButtons(msg))
+  if (live.some(m => m.components?.length && !onlyRoleplayButtons(m)))
     return interaction.reply({ ephemeral: true, content: '\u274C That message carries buttons; it is managed by the bot.' });
   // A roll once made stands: a player taking down a rolled line could roll
   // again for free (cold audit). Its words they can still change.
-  if (rpPartsOf(msg.content).foot && !(await isGm(interaction.guild, interaction.user.id)))
+  if (live.some(m => rpPartsOf(m.content).foot) && !(await isGm(interaction.guild, interaction.user.id)))
     return interaction.reply({ ephemeral: true, content: '\u274C A line with a roll stays \u2014 `/edit` can change its words; a GM can take it down.' });
-  const before = String(msg.content || '');
-  let gone;
-  if (msg.webhookId) {
-    const inThread = typeof channel.isThread === 'function' && channel.isThread();
-    gone = await hook.deleteMessage(msg.id, inThread ? channel.id : undefined).then(() => true).catch(() => false);
-  } else gone = await msg.delete().then(() => true).catch(() => false);
+  const before = String(live[0]?.content || '');
+  const inThread = typeof channel.isThread === 'function' && channel.isThread();
+  let gone = 0;
+  for (const m of live) {
+    const ok = m.webhookId
+      ? await hook.deleteMessage(m.id, inThread ? channel.id : undefined).then(() => true).catch(() => false)
+      : await m.delete().then(() => true).catch(() => false);
+    if (!ok) continue;
+    gone++;
+    try { db.prepare('DELETE FROM rp_lines WHERE guild_id=? AND message_id=?').run(gid, String(m.id)); } catch {}
+  }
   if (!gone) return interaction.reply({ ephemeral: true, content: '\u274C Discord refused to take it down.' });
-  try { db.prepare('DELETE FROM rp_lines WHERE guild_id=? AND message_id=?').run(gid, String(msg.id)); } catch {}
+  if (group) { try { db.prepare('DELETE FROM post_parts WHERE guild_id=? AND head_id=?').run(gid, String(group[0].part_id)); } catch {} }
   const who = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'someone');
   sendRollAudit(interaction.client, gid, `\u{1F5D1}\uFE0F Taken down \u2014 **${who}** in <#${channel.id}>: \u201c${before.slice(0, 80)}${before.length > 80 ? '\u2026' : ''}\u201d`);
   // From the dropdown, that private message becomes the receipt.
@@ -31858,8 +32762,11 @@ async function openEditModal(interaction, msg, channel) {
   // the webhook, and the bot keeps its id and token per channel. So a
   // webhook message counts as ours when the hook is ours (T, 2026-09-29) —
   // asked of the channel itself when the stored row has gone (2026-10-13).
-  const hook = msg?.webhookId ? await ownWebhookForAsync(interaction.client, gid, channel, msg.webhookId) : null;
   if (!msg) return interaction.reply({ ephemeral: true, content: '\u274C I cannot see that message.' });
+  // A post in parts opens whole, a box for each part (T, 2026-11-17).
+  const group = postPartsOf(gid, msg.id);
+  if (group) return openPartsEditModal(interaction, msg, channel, group);
+  const hook = msg?.webhookId ? await ownWebhookForAsync(interaction.client, gid, channel, msg.webhookId) : null;
   if (msg.webhookId && !hook)
     return interaction.reply({ ephemeral: true, content: '\u274C That was said through a webhook I no longer hold, so Discord will not let anyone edit it. Delete it and say it again \u2014 `/npc say` for an NPC, `/rp` for yourself.' });
   if (msg.author?.id !== interaction.client.user.id && !hook)
@@ -31877,6 +32784,88 @@ async function openEditModal(interaction, msg, channel) {
     new TextInputBuilder().setCustomId('text').setLabel('The message').setStyle(TextInputStyle.Paragraph)
       .setRequired(true).setMaxLength(4000).setValue(shown.slice(0, 4000))));
   return interaction.showModal(m);
+}
+// The parts of one post, five to a form (a form holds five boxes): the
+// player sees their words in each, the head on the first and the roll on
+// the last kept as they are; a GM sees each part whole.
+const EDIT_PARTS_MAX = 5;
+async function partsWindow(channel, group, msg) {
+  const at = Math.max(0, group.findIndex(p => String(p.part_id) === String(msg?.id)));
+  const start = Math.max(0, Math.min(at, group.length - EDIT_PARTS_MAX));
+  const win = group.slice(start, start + EDIT_PARTS_MAX);
+  const msgs = [];
+  for (const p of win) msgs.push(msg && String(p.part_id) === String(msg.id) ? msg : await channel?.messages?.fetch?.(p.part_id).catch(() => null) ?? null);
+  return { start, msgs };
+}
+async function openPartsEditModal(interaction, msg, channel, group) {
+  const gid = interaction.guild.id;
+  const { start, msgs } = await partsWindow(channel, group, msg);
+  if (msgs.some(m => !m)) return interaction.reply({ ephemeral: true, content: '\u274C Part of that post is gone \u2014 a GM can take the rest down.' });
+  const hookId = msgs.find(m => m.webhookId)?.webhookId || null;
+  const hook = hookId ? await ownWebhookForAsync(interaction.client, gid, channel, hookId) : null;
+  if (hookId && !hook)
+    return interaction.reply({ ephemeral: true, content: '\u274C That was said through a webhook I no longer hold, so Discord will not let anyone edit it.' });
+  if (msgs.some(m => m.author?.id !== interaction.client.user.id && !m.webhookId))
+    return interaction.reply({ ephemeral: true, content: '\u274C I can only edit what I posted \u2014 my own messages and my NPCs\u2019 speech.' });
+  if (msgs.some(m => m.components?.length && !onlyRoleplayButtons(m)))
+    return interaction.reply({ ephemeral: true, content: '\u274C That post carries buttons; its text is managed by the bot and should not be hand-edited.' });
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+  const playerOwn = !(await isGm(interaction.guild, interaction.user.id)) && rpLineOwner(gid, group[0].part_id) === interaction.user.id;
+  const m = new ModalBuilder().setCustomId(`boteditp:${channel.id}:${group[0].part_id}:${start}`).setTitle(playerOwn ? 'Edit your line' : 'Edit what the bot said');
+  msgs.forEach((pm, i) => {
+    const parts = rpPartsOf(pm.content);
+    const shown = playerOwn ? parts.words : String(pm.content || '');
+    const room = playerOwn ? POST_MAX - parts.head.length - parts.foot.length - 2 : POST_MAX;
+    m.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId(`p${i}`)
+      .setLabel(`Part ${start + i + 1} of ${group.length}`).setStyle(TextInputStyle.Paragraph)
+      .setRequired(true).setMaxLength(Math.min(4000, Math.max(1, room, shown.length))).setValue(shown.slice(0, 4000))));
+  });
+  return interaction.showModal(m);
+}
+async function saveBotEditParts(interaction) {
+  const [, channelId, headId, startS] = interaction.customId.split(':');
+  const gid = interaction.guild.id;
+  const no = (content) => interaction.reply({ ephemeral: true, content });
+  if (!(await mayEditLine(interaction, headId))) return no(EDIT_NOT_YOURS);
+  const group = postPartsOf(gid, headId);
+  if (!group) return no('\u274C That post is gone.');
+  const ch = await interaction.client.channels.fetch(channelId).catch(() => null);
+  const first = ch ? await ch.messages.fetch(group[Math.min(group.length - 1, Math.max(0, Number(startS) || 0))].part_id).catch(() => null) : null;
+  const { start, msgs } = await partsWindow(ch, group, first);
+  if (!ch || msgs.some(m => !m)) return no('\u274C Part of that post is gone.');
+  const playerOwn = !(await isGm(interaction.guild, interaction.user.id)) && rpLineOwner(gid, headId) === interaction.user.id;
+  const texts = msgs.map((_, i) => { try { return String(interaction.fields.getTextInputValue(`p${i}`) ?? ''); } catch { return ''; } });
+  if (texts.some(t => !t.trim())) return no('\u274C Nothing to save \u2014 a part cannot be emptied; take the whole line down instead.');
+  // Their words, nothing that passes for the bot's, never cut.
+  if (playerOwn && texts.some(t => BOT_LINE_RE.test(t)))
+    return no('\u274C A line of yours may not start with \u{1F3B2}, \u{1F3AF} or \u21AA \u2014 the roll and the reply link are the bot\u2019s and stay as they are.');
+  const out = msgs.map((pm, i) => { if (!playerOwn) return texts[i]; const parts = rpPartsOf(pm.content); return joinRpParts(parts.head, texts[i], parts.foot); });
+  const over = out.findIndex(t => t.length > POST_MAX);
+  if (over >= 0) return no(`\u274C Part ${start + over + 1} is too long by ${out[over].length - POST_MAX} \u2014 a message holds ${POST_MAX} characters.`);
+  const hookId = msgs.find(m => m.webhookId)?.webhookId || null;
+  const hook = hookId ? await ownWebhookForAsync(interaction.client, gid, ch, hookId) : null;
+  if (hookId && !hook) return no('\u274C That was said through a webhook I no longer hold.');
+  const inThread = typeof ch.isThread === 'function' && ch.isThread();
+  const before = msgs.map(m => String(m.content || '')).join(' ');
+  let changed = 0, refused = 0;
+  for (let i = 0; i < msgs.length; i++) {
+    if (out[i] === String(msgs[i].content || '')) continue;
+    const ok = msgs[i].webhookId
+      ? await hook.editMessage(msgs[i].id, { content: out[i], ...(inThread ? { threadId: ch.id } : {}) }).then(() => true).catch(() => false)
+      : await msgs[i].edit({ content: out[i] }).then(() => true).catch(() => false);
+    if (ok) changed++; else refused++;
+  }
+  if (refused && !changed) return no('\u274C Discord refused the edit.');
+  const after = out.join(' ');
+  const gmName = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'someone');
+  sendRollAudit(interaction.client, gid,
+    `\u270F\uFE0F Edit \u2014 **${gmName}** in <#${channelId}> (${group.length} parts): \u201c${before.slice(0, 80)}${before.length > 80 ? '\u2026' : ''}\u201d \u2192 \u201c${after.slice(0, 80)}${after.length > 80 ? '\u2026' : ''}\u201d`);
+  const done = refused ? `\u2705 Edited \u2014 ${refused} part${refused === 1 ? '' : 's'} Discord would not change.` : '\u2705 Edited.';
+  if (interaction.isFromMessage?.()) {
+    const swapped = await interaction.update({ content: done, components: [] }).then(() => true).catch(() => false);
+    if (swapped) return;
+  }
+  return interaction.reply({ ephemeral: true, content: done });
 }
 // The name line the bot puts above an /rp line it posted itself, and the
 // words beneath it.
@@ -32313,7 +33302,7 @@ async function fightStatusLines(guild, gid, cid, fight) {
     : fight.atk_kind === 'feint' ? 'Waiting for the insight'
     : 'Waiting for defence'}**`);
   if (fight.atk_roll) lines.push(`Latest attack roll: **${fight.atk_roll}** (${STAT_LABELS[fight.atk_stat] ?? '?'})`);
-  if (fight.def_roll) lines.push(`Latest defence roll: **${fight.def_roll}** (${STAT_LABELS[fight.def_stat] ?? '?'})`);
+  if (fight.def_roll) lines.push(`Latest defence roll: **${fight.def_roll}** (${defStatLabel(fight.def_stat)})`);
   return lines;
 }
 // Whose move it is, with their buttons \u2014 the turn line again without a
@@ -32666,8 +33655,8 @@ async function strikeTarget(interaction, msgId, pick) {
   if (!t) return interaction.reply({ ephemeral: true, content: TARGET_GONE });
   if (t.dead) return interaction.reply({ ephemeral: true, content: targetFallen(t) });
   if (!audienceAllows(t.owner, interaction)) return interaction.reply({ ephemeral: true, content: '\u274C That one is not addressed to you.' });
-  const action = String(interaction.fields?.getTextInputValue?.('action') || '').trim().slice(0, 200);
-  const speech = String(interaction.fields?.getTextInputValue?.('speech') || '').trim().slice(0, 500);
+  const action = String(interaction.fields?.getTextInputValue?.('action') || '').trim().slice(0, RP_BOX_MAX);
+  const speech = String(interaction.fields?.getTextInputValue?.('speech') || '').trim().slice(0, RP_BOX_MAX);
   // The stat pressed, as long as the card offers it; else the card's own
   // (one listed), else a flat d20.
   const offered = t.dice ? [] : targetStatList(t);
@@ -32700,7 +33689,7 @@ async function strikeTarget(interaction, msgId, pick) {
 
   const nmT = await getDisplayName(interaction.guild, uidT).catch(() => 'Someone');
   await logButtonPress(interaction, gidT, uidT, `${t.name}: ${total}${t.dc ? ` vs DC ${t.dc}` : ''}`, passed);
-  if (action || speech) { try { noteQuestActivity(gidT, t.channel_id, 'rp', `${nmT}: ${[action, speech ? `\u201C${speech}\u201D` : null].filter(Boolean).join(' \u00b7 ').slice(0, 300)}`, uidT); } catch {} }
+  if (action || speech) { try { noteQuestActivity(gidT, t.channel_id, 'rp', `${nmT}: ${rpBeatText([action, speech ? `\u201C${speech}\u201D` : null].filter(Boolean).join('\n'))}`, uidT); } catch {} }
   // The die's own verdicts carry the GM's prewritten flavour, since no
   // form will be opened for them.
   const flavour = decided ? (passed ? t.success_text : t.fail_text) : null;
@@ -32757,7 +33746,7 @@ async function settleTargetVerdict(interaction, msgId, fell) {
   const t = targetById(gidT, msgId);
   if (!t) return interaction.reply({ ephemeral: true, content: TARGET_GONE });
   if (t.dead) return interaction.reply({ ephemeral: true, content: targetFallen(t) });
-  const what = String(interaction.fields.getTextInputValue('what') || '').trim().slice(0, 1000);
+  const what = String(interaction.fields.getTextInputValue('what') || '').trim().slice(0, RP_BOX_MAX);
   let verdict = fell ? '\u2705 **The player passes the check \u2014 Roll succeeds.**' : '\u274C **The player fails the check \u2014 Roll fails.**';
   if (fell) {
     // Hit points: a pass takes one off, and only the last one beats it.
@@ -34211,7 +35200,7 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('forfeit').setDescription('Concede the fight'))
     .addSubcommand(s=>s.setName('status').setDescription('Show current fight status'))
     .addSubcommand(s=>s.setName('log').setDescription('Re-post the recap of the last finished fight in this channel')
-      .addBooleanOption(o=>o.setName('scroll').setDescription('true = the recap as a parchment PDF in the scroll font, as the run\'s story is').setRequired(false)))
+      .addBooleanOption(o=>o.setName('scroll').setDescription('true = the recap as a parchment PDF, as the run\'s story is').setRequired(false)))
     .addSubcommand(s=>s.setName('skip').setDescription('Skip the current turn without removing anyone (GM)'))
     .addSubcommand(s=>s.setName('end').setDescription('End the fight (GM only)')
       .addBooleanOption(o=>o.setName('all').setDescription('true = end every active fight on the server').setRequired(false))),
@@ -34667,6 +35656,19 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
     .addStringOption(o=>o.setName('dice').setDescription('Any dice to roll with it, e.g. 2d6+1').setRequired(false))
     .addStringOption(o=>o.setName('to').setDescription('GM: who it is for \u2014 @people, a group or a knight order, commas between').setRequired(false)),
 
+  // A countdown that pings the players named (T, 2026-11-17).
+  new SlashCommandBuilder()
+    .setName('timer').setDescription('A countdown that pings players when the time is up (GM)')
+    .addSubcommand(s=>s.setName('set').setDescription('Start one: it pings the players named when it runs out \u2014 5 seconds to 24 hours (GM)')
+      .addStringOption(o=>o.setName('players').setDescription('Who it pings \u2014 @players and @roles').setRequired(true))
+      .addIntegerOption(o=>o.setName('hours').setDescription('Hours, 0 to 24').setRequired(false).setMinValue(0).setMaxValue(24))
+      .addIntegerOption(o=>o.setName('minutes').setDescription('Minutes, 0 to 59').setRequired(false).setMinValue(0).setMaxValue(59))
+      .addIntegerOption(o=>o.setName('seconds').setDescription('Seconds, 0 to 59').setRequired(false).setMinValue(0).setMaxValue(59))
+      .addStringOption(o=>o.setName('note').setDescription('What it is for \u2014 said when it rings').setRequired(false).setMaxLength(200)))
+    .addSubcommand(s=>s.setName('list').setDescription('The timers still running on this server (GM)'))
+    .addSubcommand(s=>s.setName('cancel').setDescription('Stop a running timer (GM)')
+      .addIntegerOption(o=>o.setName('number').setDescription('Which timer').setRequired(true).setAutocomplete(true))),
+
   new SlashCommandBuilder()
     .setName('instance').setDescription('Open a run without the board \u2014 an encounter, a campaign chapter, an older quest (GM)')
     .addSubcommand(s=>s.setName('start').setDescription('Open one \u2014 pick the party; it gets its own thread (GM)')
@@ -34825,9 +35827,9 @@ const HELP_CATEGORIES = {
       '_Fights are turn-based exchanges — attacker rolls, defender answers, the clash resolves. GMs referee; NPCs fight through them or on autopilot._',
       '`/fight start players:@Artorius @Meliora @Zeus npcs:Hollow, Hollow tank` — begin a fight with any number of players and GM NPCs (the bot rolls DEX initiative: natural 20s go first with two actions on their first turn, natural 1s last with a roleplay-only first turn, and a level total goes to whoever rolled first \u2014 no rerolls)',
       '`/fight start ... manual:true` — keep the order you listed fighters in (no roll)',
-      '`/fight start ... roll:Players` — each player presses \u{1F3B2} Roll on a card for their own initiative, the bot rolling the NPCs at once; the fight begins when the last has rolled, or at \u2694\uFE0F Begin, the bot rolling for anyone left \u00b7 `signup:true` — an open card: players press \u{1F64B} Join (rolling on the spot with `roll:Players`), the GM adds NPCs, and Begin starts it; \u2716 Cancel or `/fight end` calls it off',
+      '`/fight start ... roll:Players` — each player presses \u{1F3B2} Roll on a card for their own initiative, the bot rolling the NPCs at once; the fight begins when the last has rolled, or at \u2694\uFE0F Begin, the bot rolling for anyone left \u00b7 `signup:true` — an open card: players press \u{1F64B} Join (rolling on the spot with `roll:Players`), the GM adds NPCs, and Begin starts it; \u2716 Cancel or `/fight end` calls it off, and a call nobody touches for a day lapses',
       '`/fight start ... practice:true` — friendly bout: fighters yield at 2 HP and are never driven below it',
-      'Every fight runs on the turn clock: whoever it waits on is reminded after 5 quiet minutes — ✍️ Still writing, or just keep typing — and at 15 the turn is skipped, or with `timeout:auto` the bot attacks for them, at whoever they last struck if still standing, else the weakest foe standing. A defence is never skipped: the bot rolls it. A whole round gone by with nobody acting stops the clock until someone stirs. `/session clock` sets a channel\'s minutes, `/config mechanics turnclock` the server\'s',
+      'Every fight runs on the turn clock: whoever it waits on is reminded after 5 quiet minutes — ✍️ Still writing, or just keep typing — and at 15 the turn is skipped, or with `timeout:auto` the bot attacks for them, at whoever they last struck if still standing, else the weakest foe standing. A defence is never skipped: the bot rolls it. A whole round gone by with nobody acting stops the clock until someone stirs. The reminder and the skip land on the second. `/session clock` sets a channel\'s minutes, `/config mechanics turnclock` the server\'s',
       '`/fight auto ... practice:true` — the same floor in any auto mode',
       '`/fight addnpc npc:Hollow, Hollow tank` — add one or more NPCs mid-fight',
       '`/fight order sequence:@Artorius, Hollow, @Meliora, @Zeus` — set the turn order, players and NPCs (GM)',
@@ -34836,7 +35838,7 @@ const HELP_CATEGORIES = {
       '`/fight atk stat:str npc:Hollow target:@Players` — GM attacks AS an NPC on its turn · or tap the 🎭 stat buttons the NPC\'s turn line carries (GM only)',
       '`/fight def stat:dex` — defend: the form opens (with `flavour:` it rolls at once); bare `/fight def` offers the stat buttons · GM defends as an NPC with `npc:Name`, or taps the 🎭 buttons on the NPC\'s defence prompt',
       '`roll:adv` / `roll:dis` on `/fight atk`, `def`, `act` or `rr` waits on a GM\'s yes like any roll you pick it for — name the stat with it, as the stat buttons roll plain; the turn clock waits meanwhile, and if the fight has moved on by the answer, nothing rolls',
-      'Every fight button opens a short form first — what you do, what you say, both optional — and the words land on the card; a blank form is a plain roll. A GM\'s ⚖️ Resolve asks what happens and posts it under the outcome',
+      'Every fight button opens a short form first — what you do, what you say, both optional — and the words land on the card; a blank form is a plain roll. A GM\'s ⚖️ Resolve asks what happens and posts it under the outcome. Each box holds 4,000 characters, and words longer than one Discord message carry on in the next, the buttons on the last',
       '`/fight act action:Grapple target:@Players` — STR 4+ (Knightfall). STR against the target\'s STR save (`/fight act action:Save`); meets-or-exceeds and the hold takes. A grab of 20 takes it whatever the save, for 2 wounds; a grab of 1 fails outright and leaves your next defence flat; a save of 20 slips free unless the grab was a 20 too, leaving the grappler\'s next attack flat and the saver +2. Held: immobile, 1 wound a round, actions on a flat d20 — you can still attack anyone, your grappler included',
       '↳ With an ordinary strike pending on you, 🤼 **Grapple** is your defence: STR against the attack, ties to the attack. Beat it and the blow does nothing and the striker is held — the wounds start once your turn has come round; a 20 holds whatever the totals and banks +2; fall short and the blow lands, a 1 adding its point. Not against a natural 20, a grab, a feint or a hold, nor from a hold or while holding someone',
       '🤜 **Maintain the hold** (the holder\'s button, on their turn) — the holder rolls STR and the captive answers: 🔓 **Break free** (STR against it; ties keep the hold) or ⛓️ **Stay** — by button, or `/fight act action:Escape` / `action:Stay`. Staying, or no answer by the turn clock, keeps the hold; an NPC on auto always struggles. A hold of 20 makes the break a flat d20 (staying, their next roll); a hold of 1 slips at once: the captive is free with no wound, and the holder\'s next roll is a flat d20 at disadvantage',
@@ -34844,13 +35846,15 @@ const HELP_CATEGORIES = {
       '`/fight act action:Release` — the holder lets go freely (no action); a grappler can never strike their own captive. GMs may part any hold with `target:`',
       '`/fight act action:Deflect` — shield deflection vs a PvE strike (shield + STR 4+, once per round, crits undeflectable): roll STR or DEX (`stat:`) to beat the attack roll, optionally `redirect_npc:` into another enemy for 1 damage — and the enemy loses its next turn retrieving the weapon. A natural 20 turns it whatever the totals, the named enemy takes 2, and your flat next attack gets +2; a natural 1 fails for 2 wounds. Either way your next attack is a flat d20 — after a 1, your next defence too',
       '`/fight act action:Disarm` — NPCs only, DEX 4+, no blade needed. Against an NPC\'s strike (once per round, not against a natural 20): DEX to beat the attack — no damage, and they spend their next turn retrieving the weapon; a miss lets the blow land for 1. On your own turn (`target_npc:` or the ⚔️ Disarm button): your DEX against their best of STR and DEX, ties to them. A 20 disarms whatever the totals and wounds them 1 (against a strike it also banks +2, even on a flat attack); a 1 fails for 2 wounds and disarms you. After any disarm your very next roll is a flat d20',
-      '🫴 **Retrieve** — disarmed, your next turn goes to fetching the weapon: press Retrieve (or `/fight act action:Retrieve`) and say what you do; no attack, grab, feint, disarm, escape or hold until you have. GMs retrieve for an NPC with its 🎭 button or `npc:`; the auto-pilot and the turn clock do it themselves, and a skipped turn counts',
+      '🫴 **Retrieve** — disarmed, your next turn goes to fetching the weapon: press Retrieve (or `/fight act action:Retrieve`) and say what you do; no attack, grab, feint, disarm, escape or hold until you have. GMs retrieve for an NPC with its 🎭 button or `npc:`; the auto-pilot and the turn clock do it themselves, and a skipped turn counts. Disarmed while holding someone, your turn offers \u{1F590}\uFE0F Release beside it',
       '\u{1F3AD} **Roleplay** — a natural 1 on initiative: your first turn is roleplay only. Press Roleplay (or `/fight act action:Roleplay`) and say what you do and say; no roll and no action, and the turn passes \u2014 you can still defend. GMs play an NPC\'s with its \u{1F3AD} button or `npc:`; the auto-pilot and the turn clock pass it on their own, and a skip spends it. A natural 20 on initiative holds two actions on its first turn, any two',
       '`/fight act action:Feint feint:"..."` — a deception in a fight (away from one it is `/deception`), and it spends either half of the fight. On your turn it is an attack: WIS against their insight, and if they fall for it the blow lands with normal damage and their very next roll is a flat d20. A feint of 20 fools them whatever the insight; a feint of 1 is a total failure. An insight of 20 sees through it unless the feint was a 20; an insight of 1 is fooled.',
       '↳ With a strike pending on you it is a defensive feint — WIS in place of your usual stat, though not against a natural 20, which lands whatever you roll — and if the blow misses, the attacker is taken in: their very next roll is a flat d20. A defensive feint of 1 is a total failure: the blow lands whatever the totals, unless the attack was a 1 too. The price of any feint, landed or not: your own very next roll is a flat d20 — at disadvantage too after a 1. WIS 4+; ties go to the target. One feint per honest roll: after a feint you must make an ordinary stat roll before feinting again — the flat roll a feint costs you counts.',
-      '`/deception target:@Players` (or `target_npc:`) — away from a fight, a form: what you pretend (shown), what you are really planning (shown once the dice have spoken), what you say. WIS against their insight; the totals decide, ties to them, and a natural 1 fails outright — no other natural counts. Win and their very next roll is a straight d20, be it a chat roll, `/roll`, a scene\'s roll, a called check or a fight somewhere else; your own very next roll is a flat d20 whatever happens, at disadvantage after a 1. No cooldown. GMs deceive as an NPC with `npc:`. Refused while you or they are fighting in the channel: there, it is a feint.',
+      '`/deception target:@Players` (or `target_npc:`) — away from a fight, a form: what you pretend (shown), what you are really planning (shown once the dice have spoken), what you say. WIS against their insight; the totals decide, ties to them, and a natural 1 fails outright — no other natural counts. Win and their very next roll is a straight d20, be it a chat roll, `/roll`, a scene\'s roll, a called check or a fight somewhere else; your own very next roll is a flat d20 whatever happens, at disadvantage after a 1. No cooldown. The form waits an hour, a restart and all. GMs deceive as an NPC with `npc:`. Refused while you or they are fighting in the channel: there, it is a feint.',
+      '**On a 5e server the moves are 5e\u2019s** \u2014 each your action for the turn, the higher total winning, a tie changing nothing, and no wounds. Grapple: Athletics against the better of their Athletics and Acrobatics (they answer with Save); held, they cannot move, and `/fight act action:Escape` on their turn is the same contest the other way. The holder strikes as they like, the captive included, and Release lets go \u2014 a hold needs no keeping. Disarm: your attack roll against the better of their Athletics and Acrobatics; taken, their next turn goes to retrieving it. Feint: Deception against their Insight; taken in, your next attack on them has advantage. Nobody answers a blow \u2014 Armour Class takes it \u2014 so Deflect, and Disarm or Grapple against a strike, are Knightfall\u2019s (5e)',
       '🔁 **Reroll** / ✅ **Keep** — every fight roll you could reroll waits on you before it lands; Reroll costs a token, once a roll; the turn clock keeps it if you go quiet. No token, no wait · `/fight rr` · `/fight keep` · GMs add `npc:` for an NPC, on its own tokens',
       '`/fight resolve` — resolve a clash; in a fight with NPCs it is the GM\'s, and on the auto-pilot the bot lands it once you have kept or rerolled',
+      '`/roll action:Grapple` \u2014 any fight move straight from `/roll`, the same menu as `/fight act`; `mode:` does not apply to a move, and the bot says so \u2014 `roll:` on `/fight act` carries advantage',
       '🎭 **React** — after each exchange the one it was aimed at may say how they take it; the fight does not wait (GMs for an NPC)',
       'NPCs are enemies unless friendly: `friendly:` on `/fight start`, `/fight addnpc`, `/fight auto`, `/session npcs`; `/fight side npc: side:` moves one. A fight with NPCs ends when one side is all down; the auto-pilot never attacks its own side (GM)',
       'NPCs use every move a player can — `npc:` on any `/fight act`, or the 🎭 buttons on their card; the auto-pilot reaches for one now and then (`/config mechanics npcspecial`, 0 = never) (GM)',
@@ -34868,7 +35872,7 @@ const HELP_CATEGORIES = {
       'NPC lists accept `category:Name` to add a whole category at once',
       'When a fight ends a public 🏁 result posts in the channel — victor, everyone\'s final HP, and a 📜 recap',
       'The recap covers both players and NPCs: roll averages, best/worst naturals, damage dealt and taken, and a blow-by-blow of every exchange',
-      '`/fight log [scroll:true]` — re-post the last finished fight\'s recap in this channel; `scroll:true` hands it over as a parchment PDF in the scroll font, as a run\'s story is',
+      '`/fight log [scroll:true]` — re-post the last finished fight\'s recap in this channel; `scroll:true` hands it over as a parchment PDF in standard type, as a run\'s story is',
       '`/fight skip` — skip the current turn; the fighter stays in the fight (GM)',
       '`/fight auto mode:NPCs only ...` — bot plays NPC turns, players play manually (GM)',
       '`/fight auto mode:Demo` — example showcase fight · `/fight end` — end the fight (GM)',
@@ -34891,8 +35895,8 @@ const HELP_CATEGORIES = {
       '_In 5e, an attack is measured against the target\'s Armour Class — nobody rolls to defend, and the blow resolves at once. A natural 20 always hits and rolls the weapon dice twice; a natural 1 always misses._',
       '`/config channels npcforum channel:#forum` — every NPC gets a page there, tagged with their categories so the sidebar filter sorts them (Admin)',
       '`/npc create name:X category:Enemy` · `/npc manage sync [name:]` — name a category as you make them and it is created if new; sync writes up everyone already made (GM)',
-      '`/library srd` · `/library summon name: [count:] [as:]` — keep monsters and spells once, then bring one out as an NPC ready to fight. The SRD set ships with the bot (GM)',
-      '`/library import file: | paste:` · `/library list` · `/library show` · `/library forget` — read in your own: one entry a line, `[MONSTER] Goblin | ac 15 | hp 7 | attack +4 | damage 1d6+2` (GM)',
+      '`/library srd` · `/library summon name: [count:] [as:]` — keep monsters and spells once, then bring one out as an NPC ready to fight. The SRD set ships with the bot (GM, 5e)',
+      '`/library import file: | paste:` · `/library list` · `/library show` · `/library forget` — read in your own: one entry a line, `[MONSTER] Goblin | ac 15 | hp 7 | attack +4 | damage 1d6+2` (GM, 5e)',
       '`/npc manage create5e name: ac: hp: attack: damage:` — a monster from its statblock; it then fights by its own numbers (GM, 5e)',
       '`/npc manage create5e name: ac: hp: attack: damage:` — a monster from its statblock: it fights with its own attack bonus and damage dice (GM, 5e)',
       '`/dnd condition [add:] [remove:] [clear:] [user:] [npc:]` — the fifteen SRD conditions; they bend the dice on their own, and one of each cancels out (5e)',
@@ -35011,7 +36015,7 @@ const HELP_CATEGORIES = {
       '`/quest run pause|resume number:N` \u2014 stop and restart the clock (a pause rounds it up to the quarter-hour); a paused run logs nothing until resumed',
       '`/quest run note number:N text:... kind:rp|combat|note [public:true]` \u2014 mark a moment in the run\'s account',
       '`/quest run timeline number:N` \u2014 the raw log \u00b7 `/quest run recap number:N [post:true]` \u2014 a "previously on\u2026" drafted from it, private until you post it (GM)',
-      '`/quest run winddown number:N [resume:true]` \u2014 the story is over but rewards are not settled: the run stays live, its party is released to the rests and free to join other quests, and anyone kicked now is still paid at completion (GM)',
+      '`/quest run winddown number:N [resume:true]` \u2014 the story is over but rewards are not settled: the run stays live, its party is released to the rests and free to join other quests, and anyone kicked now is still paid at completion. The run\u2019s room is shown, for everyone, the run hour by hour, the story so far as a PDF and \u{1F4DD} Review this run; `resume:true` only says it runs again (GM)',
       '`/quest run log number:N text:...` \u2014 your telling of a finished run, into each player\'s chronicle thread; rewrites edit in place (GM)',
       '`/quest archive number:N [summary:]` \u2014 the final shelf. Leave `summary:` blank and a box opens for the final word; it goes on the record, into the run\'s thread and the GM quest log, and marks the campaign card. A completed quest stays completed on everyone\'s record (GM)',
       '**\u21A9\uFE0F Reopen** \u2014 a completion message carries a Reopen button for five minutes: the payout is reversed, this run\'s titles revoked, the party released; fix it and complete again (GM)',
@@ -35026,10 +36030,10 @@ const HELP_CATEGORIES = {
       '`/session turn [action:] [who:]` — the order here: `show` for anyone, `next` (Done) for whoever\'s turn it is; `skip`, `back`, `pause`, `resume`, `close`, `add` (a newcomer rolls and takes their place by the same rule), `remove` and `end` are the GM\'s',
       '`/session clock [remind:] [skip:] [timeout:skip|auto] [reset:true]` — this channel\'s turn clock, for its fights and its initiative: minutes to the reminder (with ✍️ Still writing) and to the turn passing, 0 for never; `timeout:auto` has the bot attack for a quiet fighter instead of skipping them. Typing, a message or any press from the one it waits on holds the turn (GM)',
       '_One quest at a time: approving someone already seated on a live run prompts for a second press to override (audited), and a launch leaves them an applicant rather than double-booking them._',
-      '`/instance start name:... [as:] [merits:] [campaign:] [part:] [preset:] [record:true] [started:] [played:]` — open a run without the board: no listing, no applications. `as:` says what it is: **encounter** (the default) is a session on the fly; **chapter** is a numbered part of a campaign (`campaign:` needed, `part:` the next one if blank); **legacy** picks up a quest from before the bot (`started:` when it began, `played:` the time already played — `6h`, `2h30m` — banked into its clock) and pays only the merits you set. The bot lists every living character with HP and what is holding them; tick who is in it and press **Open** \u2014 it opens its own thread in quest-instances (where it was called if no forum is set), the party pulled in by mention. Nobody can join by themselves: `/session add` and `/session kick`. `/session complete` pays out, writes the chronicle and posts the review button. Instances do not count toward one-quest-at-a-time; one left quiet six hours reminds the room and pings the GMs (GM)',
+      '`/instance start name:... [as:] [merits:] [campaign:] [part:] [preset:] [record:true] [started:] [played:]` — open a run without the board: no listing, no applications. `as:` says what it is: **encounter** (the default) is a session on the fly; **chapter** is a numbered part of a campaign (`campaign:` needed, `part:` the next one if blank); **legacy** picks up a quest from before the bot (`started:` when it began, `played:` the time already played — `6h`, `2h30m` — banked into its clock) and pays only the merits you set. The bot lists every living character with HP and what is holding them; tick who is in it and press **Open** \u2014 it opens its own thread in quest-instances (where it was called if no forum is set), the party pulled in by mention. Nobody can join by themselves: `/session add` and `/session kick`. `/session complete` pays out, writes the chronicle and posts the review button. Instances do not count toward one-quest-at-a-time; each keeps a quest\u2019s clock \u2014 the hourly summary, the quarter-hour time check \u2014 and one left quiet six hours reminds the room and pings the GMs (GM)',
       '`/instance start quest:N [record:true|false]` \u2014 adopt a board quest that is already running: it gets its room if it has none, and the recording switch. `record:true` keeps every message typed in the run\'s own thread for its log as table talk, not only what goes through the bot — an edit corrects its line, a deletion marks it; at completion the corrected transcript rides with the story for everyone and the raw one, as first typed, goes to the GMs; never re-posted by the hourly recap; typed rolls stay in the roll log, and a run with no thread of its own is not recorded; off by default · `/instance list` — every run going, its kind, where, and its time so far (GM)',
       '`/campaign create name:... [description:]` \u2014 the long arc: quests, mini-quests and encounters under one name, with a GM-only thread in the campaigns forum. `campaign:` on `/quest create` or `/instance start` links at birth (`as:chapter` numbers the parts); `/campaign add|remove` afterwards — `add part:N` makes an instance that numbered chapter, and a chapter unlinked is an encounter again. `note` for beats between runs, `status` for where things stand, `recap` across every run, `complete` to close it. Players get `/campaign show` \u2014 the premise, what is done, and their own part (GM)',
-      '`/quest run complete number:N` — finish it; merits auto-awarded, other rewards listed; the run\'s story rides on the card as a scroll PDF \u2014 the party, the length, every logged beat with its roleplay words, your tale \u2014 in the server\'s scroll font (GM)',
+      '`/quest run complete number:N` — finish it; merits auto-awarded, other rewards listed; the run\'s story rides on the card as a PDF on parchment \u2014 the party, the length, every logged beat with its roleplay words, your tale \u2014 in standard type (GM)',
       '`/quest run ready number:N` \u2014 a ready check: one card with a tick per seated player and a \u2705 Ready button; each press turns their tick, the last says all ready and names you \u2014 and, if the run has not started, turns the button into \u25B6\uFE0F Start the run: your press is `/quest run start` (GM)',
       '`/quest delete number:N` — remove a quest (GM)',
     ],
@@ -35111,7 +36115,7 @@ const HELP_CATEGORIES = {
       '_The audit forum keeps one shelf per subject:_ 🎲 Player Rolls · 🛡️ GM Rolls · 🎭 NPC Rolls · 💬 NPC Say · 📜 Scrolls · 🎯 Called Checks · ⚖️ GM Overrides · 🤺 Duels · 🎖️ Advancement · 🕯️ The Fallen · 🧳 Items.',
       '`/config channels rollauditforum forum:#roll-audit` — split the mirror into books: player rolls, GM rolls, NPC rolls, NPC say (Admin)',
       'When NPC stats are hidden, fight cards mask the stat and modifier — the audit\'s NPC book gets the full card, every number revealed',
-      '`/config mechanics scrollfont font:<file>` — store an .otf/.ttf; the reply renders a sample line so you see it works. `/gm scroll` then writes props in it (Admin)',
+      '`/config mechanics scrollfont font:<file>` — store an .otf/.ttf; the reply renders a sample line so you see it works. `/gm scroll` then writes props in it, and the parchment sheet; the run\u2019s story, the record and `/fight log scroll:true` are set in standard type (Admin)',
       '`/config channels scrollarchive` — the 📜 Scrolls book in the roll-audit forum archives every scroll automatically, both directions, text + image + PDF; `channel:#x` overrides with a plain channel (Admin)',
       '`/npc manage export name:<npc>` / `/npc manage import file:<pdf>` — a villain packed as a woven parchment PDF; import applies directly, GM-as-approver — stats, class, hero flag, auto-pilot preferences and lore travel, standing and webhooks stay local',
       '`/npc create ... temp:true` \u00b7 `/library summon name:Goblin count:3 temp:true` \u2014 throwaway fighters: no forum page, hidden from `/npc list`, swept when their fight ends \u00b7 `/npc temp list|keep|clear`',
@@ -35137,16 +36141,17 @@ const HELP_CATEGORIES = {
     blurb: 'buttons, targets, group checks, roleplay, feedback, speaking as the bot',
     body: [
       '_Things a GM plants in the channel for the table to press, and the ways players talk back._',
-      '`/rp [action:] [speech:] [roll:] [dice:]` \u2014 roleplay as your character: bare opens the box (what you do, what you say, a stat to roll from this server\u2019s own, any dice); filled, it posts at once. The line goes out in your name and face, shaped as the cards are \u2014 *action*, \u201cspeech\u201d, then the roll beneath \u2014 and inside a run it is a \u{1F3AD} beat on the timeline and in the story scroll, the roll a roll in its log. A roll keeps the marks and signatures a typed one obeys, and `rr` rerolls it; a **stat roll answers a check the GM called on you here**, on the card\u2019s terms. Every line carries 💬 **Reply**, and beside it 🎭 **GM**: a GM answers the line as any NPC — those heard there lately first — the answer jumping back to it. A GM’s `/rp` also takes `to:` and its box a To picker; a player’s pings nobody. `/edit` fixes the words afterwards, `/edit delete:true` takes it back',
+      '`/rp [action:] [speech:] [roll:] [dice:]` \u2014 roleplay as your character: bare opens the box (what you do, what you say \u2014 4,000 characters each \u2014 a stat to roll from this server\u2019s own, any dice); filled, it posts at once, a long one carried on into the next message with the roll beneath the last. The line goes out in your name and face, shaped as the cards are \u2014 *action*, \u201cspeech\u201d, then the roll beneath \u2014 and inside a run it is a \u{1F3AD} beat on the timeline and in the story scroll, the roll a roll in its log. A roll keeps the marks and signatures a typed one obeys, and `rr` rerolls it; a **stat roll answers a check the GM called on you here**, on the card\u2019s terms. Every line carries 💬 **Reply**, and beside it 🎭 **GM**: a GM answers the line as any NPC — those heard there lately first — the answer jumping back to it. A GM’s `/rp` also takes `to:` and its box a To picker; a player’s pings nobody. `/edit` fixes the words afterwards, `/edit delete:true` takes it back',
       '`/button roll stat:dex dc:12 reason:...` \u2014 plant a check anyone may press; `dice:2d6+1` instead of a stat, `for:@Players` to address one person, `audience:@Artorius @Meliora @GMs` to address several players and/or a role (only they may press; the card names them all), `once:true` for one press each',
       '`/button group stat:wis dc:12 reason:...` \u2014 one check the whole party rolls; the message keeps the tally and \u2696\uFE0F Call it closes it with how many got through (GM)',
+      '`/timer set [hours:] [minutes:] [seconds:] players:@Artorius @Players [note:]` \u2014 a countdown, 5 seconds to 24 hours: the card counts down with \u274C Cancel, and on time \u23F0 Time\u2019s up rings here, pinging the players and roles named, on the second \u2014 due while the bot was away, it rings on its return, marked late \u00b7 `/timer list` \u00b7 `/timer cancel number:` (GM)',
       '`/target create name:Barricade [dc:12] [stat:Flat d20, STR, DEX] [dice:2d6+1] [hp:3] [for:@Players] [audience:@Artorius @Meliora @GMs] [success_flavour:] [fail_flavour:] [write:true]` \u2014 something to strike, with no sheet. `for:` addresses one player, `audience:` several and/or a role \u2014 only they may swing, and the card names them. `hp:` is the hits it takes: with a DC a roll that meets it takes one off with no call, with no DC each pass you call does; it falls at 0. `write:true` opens a box for the scene and the two flavours instead of typing them into options. A d20 unless `dice:` says otherwise; `stat:` lists as few or as many stats as you like, one button each in that order \u2014 leave it out and all five are buttons; leave `dc:` out and every blow is your call. A press opens a short form \u2014 what they do, what they say, both optional \u2014 and the words land above the roll. A natural 20 beats it (**Roll critically succeeds**) and a natural 1 fails (**Roll critically fails**) on their own, each posting your flavour if set; anything else says **The roll succeeds / fails** and asks you \u2014 **The player passes the check** / **The player fails the check** \u2014 each opening a *What happens?* form prefilled with your flavour (blank still sends the verdict). A fail posts the card again below with its buttons and a counter; `secret:true` asks in the GM log and tells the players **Roll succeeds / fails** in theirs \u00b7 `/target list` \u2014 what stands here, with a \u{1FAA6} button per target to retire it without a swing',
       '`/dd message:... [header:] [user:@Players] [channels:#one #two]` \u2014 speak AS THE BOT: plain words by default, a bold header only if you write one, in every channel you name (or here); who said it goes to the roll-audit, not the room (GM)',
       '**Edit (DDice)** \u2014 long-press any message the bot sent \u2192 Apps \u2192 Edit (DDice): the text opens prefilled, save replaces it, the roll-audit records what changed. Covers the bot\'s own messages and NPC speech from `/npc say` alike; a line said through a webhook that has since been deleted cannot be edited by anyone \u2014 delete it and say it again (GM)',
-      '`/edit [delete:true]` \u2014 the same box without the Apps menu: a dropdown only you see lists the last 25 lines the bot and its NPCs said here, newest first; pick one and the text opens prefilled; `delete:true` takes the picked line down instead. `link:` a message link or id goes straight to it. Nothing shows in the channel. Players get the same for their own `/rp` lines. A line carrying only Reply, GM or Interaction is listed and keeps its buttons; a player sees only their own words \u2014 the roll beneath and the reply link stay the bot\u2019s',
+      '`/edit [delete:true]` \u2014 the same box without the Apps menu: a dropdown only you see lists the last 25 lines the bot and its NPCs said here, newest first; pick one and the text opens prefilled; `delete:true` takes the picked line down instead. `link:` a message link or id goes straight to it. Nothing shows in the channel. Players get the same for their own `/rp` lines. A line carrying only Reply, GM or Interaction is listed and keeps its buttons; a player sees only their own words \u2014 the roll beneath and the reply link stay the bot\u2019s. A post carried on into several messages is one post: every part opens in one form, and `delete:true` takes every part down',
       '`/feedback send [room:] [quest:]` \u2014 name a room to go straight to the form, or leave it blank for a menu; score it out of ten, say your piece; only GMs see it. Name a run you were on (or ran) and the card says which',
       '`/feedback category add|remove|list` \u2014 the rooms feedback lands in (GM) \u00b7 `/button feedback` plants a standing feedback button',
-      '_A completed run posts its own \u{1F4DD} review button in its thread; `/quest show` then carries the count, the average \u2b50 and the latest lines._',
+      '_A completed run posts its own \u{1F4DD} review button in its thread, and so does a wind-down \u2014 for those who played the run, seated or since departed, one review each; `/quest show` then carries the count, the average \u2b50 and the latest lines._',
     ],
   },
 };
@@ -35270,6 +36275,7 @@ async function routeButton(interaction) {
     if (interaction.customId.startsWith('fcall:')) return handleFightCallButton(interaction);
     if (interaction.customId.startsWith('fclock:')) return handleFightClockButton(interaction);
     if (interaction.customId.startsWith('gfx:')) return handleGfxButton(interaction);
+    if (interaction.customId.startsWith('tmr:')) return handleTimerButton(interaction);
     if (interaction.customId.startsWith('rhold:')) return handleRollHoldButton(interaction);
     if (/^adv(ok|no|go):/.test(interaction.customId)) return handleHeldRollButton(interaction);
     if (interaction.customId.startsWith('actv:')) return handleActivityShelfButton(interaction);
@@ -35711,8 +36717,8 @@ async function routeButton(interaction) {
       const { ModalBuilder: TM, TextInputBuilder: TI, TextInputStyle: TIS, ActionRowBuilder: TAR } = require('discord.js');
       const m = new TM().setCustomId(`tgtrp:${t.message_id}:${pick}`).setTitle(`Strike at ${t.name}`.slice(0, 45));
       m.addComponents(
-        new TAR().addComponents(new TI().setCustomId('action').setLabel('What do you do? (optional)').setStyle(TIS.Short).setRequired(false).setMaxLength(200)),
-        new TAR().addComponents(new TI().setCustomId('speech').setLabel('What do you say? (optional)').setStyle(TIS.Paragraph).setRequired(false).setMaxLength(500)));
+        new TAR().addComponents(new TI().setCustomId('action').setLabel('What do you do? (optional)').setStyle(TIS.Paragraph).setRequired(false).setMaxLength(RP_BOX_MAX)),
+        new TAR().addComponents(new TI().setCustomId('speech').setLabel('What do you say? (optional)').setStyle(TIS.Paragraph).setRequired(false).setMaxLength(RP_BOX_MAX)));
       return interaction.showModal(m);
     }
 
@@ -35737,8 +36743,8 @@ async function routeButton(interaction) {
       // set at creation; blank sends the bare verdict (T, 2026-10-13).
       const fell = fellS === '1';
       const { ModalBuilder: VM, TextInputBuilder: VI, TextInputStyle: VIS, ActionRowBuilder: VAR } = require('discord.js');
-      const preset = String((fell ? t.success_text : t.fail_text) || '').slice(0, 1000);
-      const input = new VI().setCustomId('what').setLabel('What happens? (optional)').setStyle(VIS.Paragraph).setRequired(false).setMaxLength(1000);
+      const preset = String((fell ? t.success_text : t.fail_text) || '').slice(0, RP_BOX_MAX);
+      const input = new VI().setCustomId('what').setLabel('What happens? (optional)').setStyle(VIS.Paragraph).setRequired(false).setMaxLength(RP_BOX_MAX);
       if (preset) input.setValue(preset);
       const vm = new VM().setCustomId(`tgtnar:${t.message_id}:${fell ? 1 : 0}`).setTitle(`${fell ? 'Pass' : 'Fail'} \u2014 ${t.name}`.slice(0, 45));
       vm.addComponents(new VAR().addComponents(input));
@@ -35803,8 +36809,10 @@ async function routeButton(interaction) {
     }
 
     if (interaction.customId.startsWith('fbq:')) {
-      // Anyone in the run may speak; the press and everything after is
-      // ephemeral, so the party never sees who did.
+      // Those who played it may speak, once each (T, 2026-11-17); the press
+      // and everything after is ephemeral, so the party never sees who did.
+      const whyNot = reviewRefusal(interaction.guild.id, interaction.user.id, parseInt(interaction.customId.split(':')[1], 10) || 0);
+      if (whyNot) return interaction.reply({ ephemeral: true, content: whyNot });
       const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
       const m = new ModalBuilder().setCustomId(interaction.customId).setTitle('Feedback on this quest');
       m.addComponents(
@@ -35868,6 +36876,8 @@ async function routeButton(interaction) {
 }
 
 client.on('interactionCreate', async interaction => {
+  // Every answer through the 2,000 net (T, 2026-11-17).
+  armLength(interaction);
   // The undo journal brackets every interaction: what the channel looked
   // like before, what it looks like after, the difference kept (/gm undo).
   const frame = undoFrameOpen(interaction);
@@ -35919,6 +36929,15 @@ async function handleInteraction(interaction) {
       const REST_AMOUNTS = ['100%', '50%', '25%', '0%', '+25%', '+10%', '+1'];
       const serverEmojis = () => [...(interaction.guild?.emojis?.cache?.values?.() || [])].map(e => ({ name: `:${e.name}:`.slice(0, 100), value: `<${e.animated ? 'a' : ''}:${e.name}:${e.id}>`.slice(0, 100) }));
 
+      // /timer cancel: the timers still running here, soonest first.
+      if (acCmd === 'timer' && focusedOption.name === 'number') {
+        const rows = db.prepare("SELECT * FROM gm_timers WHERE guild_id=? AND state='running' ORDER BY due_at LIMIT 25").all(acGid);
+        return await interaction.respond(rows.map(t => {
+          const left = Math.max(0, Math.round((Number(t.due_at) - Date.now()) / 1000));
+          const leftTxt = left >= 3600 ? `${Math.floor(left / 3600)}h ${Math.floor((left % 3600) / 60)}m` : left >= 60 ? `${Math.floor(left / 60)}m ${left % 60}s` : `${left}s`;
+          return { name: `#${t.id} \u00b7 ${t.note || 'no note'} \u00b7 rings in ${leftTxt}`.slice(0, 100), value: Number(t.id) };
+        })).catch(() => {});
+      }
       if (acCmd === 'activity' && acSub === 'edit' && focusedOption.name === 'scene') {
         const st = getStory(acGid, acStr('name'));
         const src = st ? (st.draft_source || sourceOf(acGid, st.name) || '') : '';
@@ -36608,6 +37627,7 @@ async function handleInteraction(interaction) {
       return handleQuest(interaction, { sub: 'archive', number: numA, summary: text, skipSummary: true });
     }
     if (interaction.customId.startsWith('botedit:')) return saveBotEdit(interaction);
+    if (interaction.customId.startsWith('boteditp:')) return saveBotEditParts(interaction);
     if (interaction.customId === 'rpform' || interaction.customId.startsWith('rpform:')) return handleRpModal(interaction);
     if (interaction.customId.startsWith('tgtrp:')) {
       const [, msgId, pick] = interaction.customId.split(':');
@@ -36635,7 +37655,7 @@ async function handleInteraction(interaction) {
       if (flavour) {
         try {
           const who = p.npc || await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'Someone');
-          noteQuestActivity(gidM, cidM, 'rp', `${who}: ${flavour.replace(/[*_]+/g, '').replace(/\s*\n\s*/g, ' \u00b7 ').trim().slice(0, 300)}`, interaction.user.id);
+          noteQuestActivity(gidM, cidM, 'rp', `${who}: ${rpBeatText(flavour)}`, interaction.user.id);
         } catch {}
       }
       switch (p.kind) {
@@ -36680,8 +37700,8 @@ async function handleInteraction(interaction) {
         case 'release':
           return runFightRelease({ interaction, gid: gidM, cid: cidM, actorId: p.npc ? npcFighterId(p.npc) : interaction.user.id, flavour });
         case 'resolve': {
-          let what = ''; try { what = String(interaction.fields.getTextInputValue('what') || '').trim().slice(0, 1000); } catch {}
-          if (what) { try { noteQuestActivity(gidM, cidM, 'rp', what.replace(/\s*\n\s*/g, ' ').slice(0, 300), interaction.user.id); } catch {} }
+          let what = ''; try { what = String(interaction.fields.getTextInputValue('what') || '').trim().slice(0, RP_BOX_MAX); } catch {}
+          if (what) { try { noteQuestActivity(gidM, cidM, 'rp', what.replace(/\s*\n\s*/g, ' ').trim(), interaction.user.id); } catch {} }
           return handleFight(interaction, { sub: 'resolve', flavour: what || null });
         }
         case 'defrp': {
@@ -36713,6 +37733,11 @@ async function handleInteraction(interaction) {
       if (!scale || scale < 1 || scale > 10)
         return interaction.reply({ ephemeral: true, content: '\u274C The score needs to be a number from 1 to 10.' });
       const body = interaction.fields.getTextInputValue('body').trim();
+      if (isQuest) {
+        // A second form opened before the first came back is still one review.
+        const whyNot = reviewRefusal(interaction.guild.id, interaction.user.id, runNum);
+        if (whyNot) return interaction.reply({ ephemeral: true, content: whyNot });
+      }
       const extra = runRow ? `\u{1F5FA}\uFE0F Re: **${questTag(runRow)}**` : '';
       // The row is the archive; the card is the notice.
       try {
@@ -36943,6 +37968,7 @@ async function handleInteraction(interaction) {
     if (interaction.commandName === 'dd') return await handleDd(interaction);
     if (interaction.commandName === 'edit') return await handleEdit(interaction);
     if (interaction.commandName === 'rp') return await handleRp(interaction);
+    if (interaction.commandName === 'timer') return await handleTimer(interaction);
     if (interaction.commandName === 'existence') {
       const exSub = interaction.options.getSubcommand();
       if (exSub === 'kill') { const r = await handleGmKill(interaction);
@@ -37215,6 +38241,7 @@ client.once('clientReady', async () => {  // 'ready' is deprecated in favour of 
   startCharBlockSweep(client);
   startBackupScheduler();
   console.log('✅ Backup scheduler started');
+  armTimers(client).catch(e => console.error('[timer] boot -', e?.message || e));
 });
 
 // ── One system on every picker (2026-11-07, T) ─────────────────────────

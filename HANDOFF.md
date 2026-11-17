@@ -49,9 +49,9 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1358 as of 2026-11-17, build P) and no
+Green means every assertion passed (1402 as of 2026-11-17, build Q) and no
 scanner found an ERROR. Then run the probe: `node --experimental-sqlite
-probe.js` (347 probes: the fight, encounter, override, autocomplete and
+probe.js` (405 probes: the fight, encounter, override, autocomplete and
 every-leaf walks, the GM-gate walk, chat shorthands, scheduled ticks,
 junk-id lanes, SQL compile, forum seeding and sweep, one NPC one page, the
 A2 walk, the undo walk, the C walk, the D walk (activities: parser,
@@ -63,8 +63,8 @@ an NPC, a 5e guild end to end), the J walk (initiative and the turn clock),
 the K walk (held advantage, auto Heroes), the L walk (the naturals on the
 specials, a kept hold's answer, the trick's price, stray NPC sheets; and
 L2's slipped holds, a defensive feint of 1, `/deception` refused in a
-fight, the reroll's words, a cleared exchange; M's attacking 20), and a
-double-ack check). The probe carries a paper-thin fake
+fight, the reroll's words, a cleared exchange; M's attacking 20), the P
+and Q walks, and a double-ack check). The probe carries a paper-thin fake
 `@napi-rs/canvas` since A2 (text measures by length, drawing is a no-op, a
 buffer comes back) so the parchment paths run end to end; verify.js keeps
 the canvas absent on purpose, which is the other path.
@@ -206,16 +206,14 @@ back into the id.
 **2. `/npc` is at 24 of 25 leaves, `/quest` at 23.** The next subcommand on
 either must join a group, as `/config` and `/gm` already do.
 
-**3. `handleLibrary` has no ruleset gate.** A GM on a Knightfall server can
-`/library srd` and import 5e spells and monsters. The rows are inert there,
-so this may be intended — but the Knightfall books never document the
-command. Flagged as a NOTE, not a failure.
+**3. FIXED (build Q) — `/library` is refused off 5e.** The picker already hid
+it; `handleLibrary` now refuses on a Knightfall server and says why.
 
 **4. The test suite is a rebuild, not the original.** The pre-2026-08-10
 suite (~2,500 assertions) lived only in a sandbox and is gone. What exists
 now is 962 assertions covering structure, registration and ruleset
 arithmetic. Behavioural coverage of quests, fights, the audit ledger and the
-quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild.
+quiz system has not been re-accumulated. Add pins to the relevant harness in `verify.js` as each area is touched rather than attempting one large rebuild. (Build Q's probe walk added the question bank, the audit books' routing, rests and lore.)
 
 ---
 
@@ -372,6 +370,24 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 10zz · Build Q: /timer, 4,000 boxes and posts in parts, the wind-down post, 5e moves (2026-11-17)
+
+One combined build. Its What's new lines join today's entry, `2026-11-17` (build P's, already pushed): a second push in a day grows the day's entry, and `growChangelog` re-posts the thread whole, or adds "Added since this was posted" where someone has written in it. A new key would have to be tomorrow's date — a thread dated tomorrow sits above today's Deploy mend, and the tidy pass re-posts it on every boot until the dates catch up.
+
+- **The 2,000 net.** `POST_MAX`/`POST_CUT`; `splitLongLine` (breaks at spaces, re-wraps `*…*`/`_…_`), `chunkText` (fills, closes and reopens code fences), `fitPayloads(payload, { mode })` (`send`: buttons/files on the last part, reply on the first; `edit`: the first part clears old rows; `update`: the card keeps them). `installLengthNet(require('discord.js'))` wraps every channel class's `send` and `Message.prototype.edit` at load; `armLength(interaction)` wraps `reply`/`editReply`/`followUp`/`update` per interaction (ephemeral parts stay ephemeral). An edit cannot grow: `fitEditText` keeps the start and the foot (a card's verdict) and loses the middle. NPC webhooks are split by hand in the voice. `sendLong`/`replyLong` put rows on the last part.
+- **Posts in parts.** Table `post_parts(guild_id, channel_id, part_id, head_id, idx, at)` (pruned at 90 days); `notePostParts`, `postPartsOf`. `/edit` and Edit (DDice) on a part open `openPartsEditModal` (`boteditp:<ch>:<head>:<start>`, five parts a form via `partsWindow`), saved by `saveBotEditParts`; `deleteBotLine` takes every part. `/rp` builds its parts with `partsWithTail` (the roll whole at the foot of the last).
+- **4,000 boxes.** `RP_BOX_MAX` on every roleplay box (fight forms, `/rp`, targets, NPC say/answer, `/deception`); `italicLines`/`withWords` mark each line. The run log keeps every word (`rpBeatText`); `questEventLine` shows 300 (`EVENT_LINE_MAX`). Story caps: `STORY_BEATS_MAX` 400, `SCROLL_BODY_MAX` 40,000; `scrollBookFitting` re-renders at JPEG 75/60, then trims, to stay under 7.5 MB.
+- **Standard face.** The run's story, the GM run record and `/fight log scroll:true` render with `family = 'standard'` (parchment kept); the scroll font is for `/gm scroll` and the parchment sheet.
+- **Wind-down post.** `hourBlocks(events, nowMs)` (quiet hours run together, the last hour "so far", `remind`/`recap`/`talk` left out) and `postWindDown` (hours, then `runSoFarFile` — shared with `/session summary` — and `fbq:<n>`). The GM is answered first, then it posts; a resume posts only the line.
+- **Review.** `reviewRefusal(gid, uid, run)` — party or departed, one `feedback_log` row each — on the press and on the submit.
+- **Instances' clock.** `questTick` no longer `continue`s for encounters after the idle nag: recap and time check as a quest.
+- **Clock on the second.** `nextClockMark` (fights: auto restart, remind, skip; orders: remind, skip, within the next minute) and `setClockWake`, called at the end of every `turnClockTick`. `DDICE_PRECISE_TIMERS=0` turns the wakes (and timer wakes) off — the probe sets it and walks the ticks by hand.
+- **/timer.** Table `gm_timers`; `/timer set|list|cancel` (GM), autocomplete on `number`; card `timerCard` with `tmr:cancel:<id>`; `armTimer` (setTimeout), `ringTimer` (claimed by one UPDATE, so the wake, the tick and the boot never double-ring; late past 15 s), `ringDueTimers` in the minute tick, `armTimers` at boot.
+- **Fight fixes.** `stripHoldCard`/`rememberHoldCard`/`dropButtons` (Break free and Stay go once answered; in memory). A disarmed holder's turn rows carry Release (`fightAnswerRows('retrieve', { holding })`). `fight_calls.touched_at` + `lapseFightCalls` (a day). `/library` gated to 5e at run time. `MODE_NOT_A_FIGHT_MOVE` on `/roll action:` with `mode:`. `/deception` forms in `deception_forms` for an hour (`keepDeceptionForm`/`takeDeceptionForm`). `voiceName`/`unvoiceName` — a hair space after the d of "discord" and the c of "clyde" in a webhook name, stripped wherever a name is read back.
+- **5e moves.** `fiveMoves(gid)`, `skill5e`, `bestSkill5e` (Athletics/Acrobatics), `attackBonus5e`. Grapple/save/escape: Athletics against the better skill, strictly higher, no naturals, no wounds, no strain, no Maintain (refused), holder may strike the captive, `turnRowsFor` gives the holder `['atk','release']`. Disarm: attack roll against the better skill (`pend.g5` names it). Feint: Deception against Insight; taken in sets `feintEdge:<target>` on the feinter, spent by the next attack on them — by hand, by the auto-pilot or by the clock (`feintEdgeOn`, `autoRoll(…, 'feint')`). Deflect, Disarm-as-answer and Grapple-as-defence refused with `NOT_ON_5E_ANSWER`. Held fighters swing as ever on 5e in every strike path. `defStatLabel` shows AC as "AC" (it read "undefined" in the exchange), the fight log neither tallies AC as a defence roll nor shows its `[0]`.
+
+**Tests.** verify: a `build Q` harness (33) over the net's pure parts, the voices, the hours, the timer card, AC's label and the pins; 1,402 green. probe: the Build Q section (31 probes; FakeChannel throws over 2,000 like Discord, records `allowedMentions`; the fake canvas records fonts); 405 green.
 
 ## 10z · Build P: Reroll/Keep, sides and the cast, NPC moves, /gm effect, /health (2026-11-17)
 
