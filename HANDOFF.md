@@ -49,9 +49,9 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1448 as of 2026-11-17, build S) and no
+Green means every assertion passed (1452 as of 2026-11-17, build T) and no
 scanner found an ERROR. Then run the probe: `node --experimental-sqlite
-probe.js` (454 probes: the fight, encounter, override, autocomplete and
+probe.js` (459 probes: the fight, encounter, override, autocomplete and
 every-leaf walks, the GM-gate walk, chat shorthands, scheduled ticks,
 junk-id lanes, SQL compile, forum seeding and sweep, one NPC one page, the
 A2 walk, the undo walk, the C walk, the D walk (activities: parser,
@@ -64,7 +64,7 @@ the K walk (held advantage, auto Heroes), the L walk (the naturals on the
 specials, a kept hold's answer, the trick's price, stray NPC sheets; and
 L2's slipped holds, a defensive feint of 1, `/deception` refused in a
 fight, the reroll's words, a cleared exchange; M's attacking 20), the P,
-Q, R and S walks, and a double-ack check). The probe carries a paper-thin fake
+Q, R, S and T walks, and a double-ack check). The probe carries a paper-thin fake
 `@napi-rs/canvas` since A2 (text measures by length, drawing is a no-op, a
 buffer comes back) so the parchment paths run end to end; verify.js keeps
 the canvas absent on purpose, which is the other path.
@@ -371,6 +371,19 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 10zzzzz · Build T: the command books posted once (2026-11-17)
+
+After build S (pushed as `a90ca2c`). Its What's new lines join the `2026-11-17` entry; if it goes out on a later day, move them to that day's key.
+
+T found the books posted twice in ddice-pdf after build S went out: build R's at 19:59 and build S's at 21:21. The 19:59 post went up within a minute of build R's push — before build R could be running — so it was build Q's 15-minute check (`startDocsWatch`) landing in the deploy window: it posted build R's books, and the deploy stopped the process before `publishDocs` recorded the post. Build R's first check then posted and recorded its own; build S replaced that one. The unrecorded post had nothing pointing at it.
+
+- `publishDocs` records `docs_msg_id` / `docs_sha` the moment the post is sent, before touching the old one; the player copy records `docs_player_msg_id` the same way.
+- `clearOldDocsPosts(client, channel, keepId, re)`: the bot's own posts matching `DOCS_POST_RE` (“**Command reference updated**”) or `DOCS_PLAYER_POST_RE` (“**Player command reference**”), older than the one kept (by snowflake — a newer copy wins), among the channel's last fifty messages, deleted. Called after every post, for both channels.
+- `clearOldDocsCopies(client, gid)` runs once a start in `bootMend`, against the posts on record; how many it cleared joins the day's Deploy mend in gm-daily. Build T's own first start clears the 19:59 copy.
+- Docs: `/help` (config channels), the GM books' Publishing These Books note, What's new.
+
+**Tests.** verify: a `build T` harness (4 pins); 1,452 green, 18 warnings. probe: the T walk (5) — a push records the new post and clears the copy on record and the one never recorded, leaves the bot's other notices and anyone else's words, the player copy the same; a start clears older copies against the post on record, says so in the Deploy mend, and leaves a newer one; 459 green.
 
 ## 10zzzz · Build S: /narrate, the story follows /edit, /dd's box (2026-11-17)
 

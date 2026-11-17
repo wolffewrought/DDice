@@ -6068,6 +6068,68 @@ async function fire(over) {
     ok('nothing in the S walk threw', threwS.length === 0, threwS.slice(0, 3).join('\n        '));
   }
 
+  // ── Build T (2026-11-17): the command books posted once — recorded the
+  // moment they are out; every earlier copy of the bot's own cleared, on
+  // each post and once a start ──
+  if (dbHandle) {
+    const realErrT = console.error; const loggedT = [];
+    console.error = (...a) => { loggedT.push(a.map(x => (x && x.stack) ? x.stack.split('\n').slice(0, 2).join(' | ') : String(x)).join(' ')); };
+    const realFetchT = globalThis.fetch;
+    const cfgT0 = dbHandle.prepare("SELECT docs_channel, docs_repo, docs_player_channel, docs_msg_id, docs_player_msg_id, docs_sha FROM guild_config WHERE guild_id='G1'").get() || {};
+    try {
+      globalThis.fetch = async (url, opts = {}) => {
+        if (!/raw\.githubusercontent\.com\/owner\/books\//.test(String(url))) return { ok: false, status: 599, headers: { get: () => null } };
+        if (opts.method === 'HEAD') return { ok: true, status: 200, headers: { get: (k) => (k === 'etag' ? '"probe-v2"' : null) } };
+        return { ok: true, status: 200, headers: { get: () => null }, arrayBuffer: async () => new TextEncoder().encode('%PDF-1.4 probe').buffer };
+      };
+      const chD = new FakeChannel('CD1', 0, 'ddice-pdf', guild); channelsById.set('CD1', chD);
+      const chP = new FakeChannel('CP1', 0, 'player-pdf', guild); channelsById.set('CP1', chP);
+      const head = '\u{1F4DA} **Command reference updated** — a new build.\n_Latest build from `owner/books`. The previous post has been removed._';
+      const orphanA = await chD.send({ content: head });
+      const recB = await chD.send({ content: head });
+      const notice = await chD.send({ content: '\u{1F4DA} _Reading the command books again — whatever was wrong has cleared._' });
+      const userMsg = { id: nextId(), content: '**Command reference updated** — my own notes', channelId: 'CD1', author: { id: 'U2' }, delete: async () => { deleted.push(userMsg.id); } };
+      sent.push({ channel: 'CD1', content: userMsg.content, msg: userMsg }); sentById.set(userMsg.id, userMsg);
+      const pHead = '\u{1F4D8} **Player command reference** — latest version.';
+      const orphanP = await chP.send({ content: pHead });
+      const recQ = await chP.send({ content: pHead });
+      dbHandle.prepare("UPDATE guild_config SET docs_channel='CD1', docs_repo='owner/books', docs_player_channel='CP1', docs_msg_id=?, docs_player_msg_id=?, docs_sha='old' WHERE guild_id='G1'").run(recB.id, recQ.id);
+
+      // 1 · a new post: recorded, and every earlier copy of the bot's own cleared
+      let before = sent.length;
+      const push = await fire({ commandName: 'config', options: { _group: 'channels', _sub: 'docs', push: true }, userId: 'U1', channel: chD });
+      const newD = sent.slice(before).filter(x => x.channel === 'CD1').map(x => x.msg).find(m => /Command reference updated/.test(m.content));
+      const newP = sent.slice(before).filter(x => x.channel === 'CP1').map(x => x.msg).find(m => /Player command reference/.test(m.content));
+      const cfgT = dbHandle.prepare("SELECT docs_msg_id, docs_player_msg_id, docs_sha FROM guild_config WHERE guild_id='G1'").get();
+      ok('a new post of the books is recorded, and every earlier copy of the bot’s own goes — the one on record and the one never recorded',
+        !!newD && cfgT?.docs_msg_id === newD.id && deleted.includes(recB.id) && deleted.includes(orphanA.id) && /CD1/.test(JSON.stringify((push.replies || []).map(r => r.content || ''))),
+        `${newD?.id} vs ${cfgT?.docs_msg_id} · B gone ${deleted.includes(recB.id)} · A gone ${deleted.includes(orphanA.id)} · ${JSON.stringify((push.replies || []).map(r => r.content || '')).slice(0, 160)}`);
+      ok('…and nothing else: the bot’s other notices and anyone else’s words stay', !deleted.includes(notice.id) && !deleted.includes(userMsg.id), `${deleted.includes(notice.id)} ${deleted.includes(userMsg.id)}`);
+      ok('the player copy the same way', !!newP && cfgT?.docs_player_msg_id === newP.id && deleted.includes(recQ.id) && deleted.includes(orphanP.id),
+        `${newP?.id} vs ${cfgT?.docs_player_msg_id} · Q gone ${deleted.includes(recQ.id)} · P gone ${deleted.includes(orphanP.id)}`);
+
+      // 2 · a start clears what an interrupted post left, against the post on record; a newer copy wins
+      const orphanD = await chD.send({ content: head });
+      const recE = await chD.send({ content: head });
+      const newerF = await chD.send({ content: head });
+      dbHandle.prepare("UPDATE guild_config SET docs_msg_id=? WHERE guild_id='G1'").run(recE.id);
+      before = sent.length;
+      for (const fn of listeners.clientReady || listeners.ready || []) await fn().catch(() => {});
+      await (lastClient?.mendDone || null);
+      const mended = sent.slice(before).map(x => x.content).join('\n');
+      ok('a start clears every older copy of the books against the post on record, and says so in the Deploy mend; a newer copy is left',
+        deleted.includes(orphanD.id) && deleted.includes(newD.id) && !deleted.includes(recE.id) && !deleted.includes(newerF.id) && /\d+ earlier cop(?:y|ies) of the command books cleared/.test(mended),
+        `D ${deleted.includes(orphanD.id)} · C ${deleted.includes(newD.id)} · E ${deleted.includes(recE.id)} · F ${deleted.includes(newerF.id)} · ${(mended.match(/[^\n]*command books cleared[^\n]*/) || [''])[0]}`);
+    } finally {
+      globalThis.fetch = realFetchT;
+      dbHandle.prepare("UPDATE guild_config SET docs_channel=?, docs_repo=?, docs_player_channel=?, docs_msg_id=?, docs_player_msg_id=?, docs_sha=? WHERE guild_id='G1'")
+        .run(cfgT0.docs_channel ?? null, cfgT0.docs_repo ?? null, cfgT0.docs_player_channel ?? null, cfgT0.docs_msg_id ?? null, cfgT0.docs_player_msg_id ?? null, cfgT0.docs_sha ?? null);
+    }
+    const threwT = loggedT.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
+    console.error = realErrT;
+    ok('nothing in the T walk threw', threwT.length === 0, threwT.slice(0, 3).join('\n        '));
+  }
+
   // ── No button, modal or select id throws on a junk payload ──────────
   {
     const realErrJ = console.error; const loggedJ = [];

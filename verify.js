@@ -3972,6 +3972,27 @@ function testBuildS(mod, src) {
   });
 }
 
+// Build T (2026-11-17): the command books posted once — recorded the
+// moment they are out; every earlier copy of the bot's own cleared, on each
+// post and once a start.
+function testBuildT(src) {
+  return harness('build T', (ok) => {
+    ok('the new post is recorded the moment it is out, before the old one is touched; the player copy too',
+      /setConfig\(gid, \{ docs_msg_id: msg\.id, docs_sha: fingerprint \}\);\s*\n\s*if \(st\.msgId\) \{/.test(src)
+        && /setConfig\(gid, \{ docs_player_msg_id: pMsg\.id \}\);\s*\n\s*if \(st\.playerMsgId\) \{/.test(src)
+        && (src.match(/setConfig\(gid, \{ docs_msg_id: msg\.id/g) || []).length === 1);
+    ok('each post clears every earlier copy of the bot\'s own in its channel, on record or not',
+      /await clearOldDocsPosts\(client, channel, msg\.id, DOCS_POST_RE\)\.catch\(\(\) => 0\);/.test(src)
+        && /await clearOldDocsPosts\(client, pCh, pMsg\.id, DOCS_PLAYER_POST_RE\)\.catch\(\(\) => 0\);/.test(src));
+    ok('only the bot\'s own posts of that kind, only those older than the one kept, among the last fifty',
+      /if \(String\(m\.id\) === String\(keepId\) \|\| m\.author\?\.id !== client\.user\?\.id \|\| !re\.test\(String\(m\.content \|\| ''\)\)\) continue;/.test(src)
+        && /try \{ older = BigInt\(String\(m\.id\)\) < keep; \} catch \{ older = false; \}/.test(src) && /channel\.messages\.fetch\(\{ limit: 50 \}\)/.test(src)
+        && /const DOCS_POST_RE = \/\\\*\\\*Command reference updated\\\*\\\*\/;/.test(src) && /\\u\{1F4DA\} \*\*Command reference updated\*\*|📚 \*\*Command reference updated\*\*/.test(src)
+        && /const DOCS_PLAYER_POST_RE = \/\\\*\\\*Player command reference\\\*\\\*\/;/.test(src) && /📘 \*\*Player command reference\*\* — latest version\./.test(src));
+    ok('once a start, against the posts on record, said in the day\'s Deploy mend',
+      /const n = await clearOldDocsCopies\(client, gid\)\.catch\(\(\) => 0\); if \(n\) made\.push\(`\$\{n\} earlier cop\$\{n === 1 \? 'y' : 'ies'\} of the command books cleared`\);/.test(src));
+  });
+}
 function testBuildR(mod, src) {
   return harness('build R', (ok, eq) => {
     const { rpSegments, formSegments, segsToPost, composeNpcSay, RAW_PART_NOTE, cleanTalk, storyEntries, storyParas, printScroll,
@@ -4391,7 +4412,7 @@ function main() {
     }
     if (missing.length) console.log(`${C.yel}!${C.off} load                   ${C.dim}not exported: ${missing.join(', ')}${C.off}`);
 
-    for (const r of [testBuilders(src), testRules(mod), testPins(src), testBuildI(mod), testBuildJ(mod), testBuildK(mod), testBuildL(mod), testBuildN(src), testBuildO(mod, src), testBuildQ(mod, src), testBuildR(mod, src), testBuildS(mod, src)]) {
+    for (const r of [testBuilders(src), testRules(mod), testPins(src), testBuildI(mod), testBuildJ(mod), testBuildK(mod), testBuildL(mod), testBuildN(src), testBuildO(mod, src), testBuildQ(mod, src), testBuildR(mod, src), testBuildS(mod, src), testBuildT(src)]) {
       assertions += r.pass;
       if (r.fails.length) {
         failedSteps.push(r.name);

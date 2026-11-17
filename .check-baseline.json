@@ -1,8 +1,8 @@
 {
-  "at": "2026-11-17T21:08:26.565Z",
+  "at": "2026-11-17T21:36:45.390Z",
   "verify": {
     "green": true,
-    "assertions": 1448,
+    "assertions": 1452,
     "warnings": 18,
     "commands": 31,
     "subcommands": 300,
@@ -14,12 +14,12 @@
   },
   "probe": {
     "green": true,
-    "probes": 454,
+    "probes": 459,
     "failures": []
   },
   "shape": {
-    "bytes": 2749075,
-    "lines": 39650,
+    "bytes": 2752133,
+    "lines": 39696,
     "tables": [
       "activity_drafts",
       "activity_pages",
@@ -855,6 +855,9 @@
       "the heading\\",
       "it posts as Narration through the channel\\",
       "in a run\\",
+      "each post clears every earlier copy of the bot\\",
+      "only the bot\\",
+      "once a start, against the posts on record, said in the day\\",
       "the Raw note fits a placeholder and a label\\",
       "the name in bold, an action in italics, speech in its quotes",
       "printed with its three faces inside, on the parchment\\",

@@ -166,3 +166,4 @@ New verbs join their group; the wall is history until a single group nears 25.
 - (build S) A post in parts that loses a part in Discord itself keeps the words of the parts left, read again a moment after the deletion.
 - (build S) What `/dd` named (channels, a person) waits for its box an hour, in memory: after a restart the box asks for `/dd` again.
 - (build S) `/config` is at 6,599 of the builders' 6,600 tripwire (Discord's wall is 8,000): the next setting needs its channels group moved out, or the tripwire raised.
+- (build T, 2026-11-17) The command books' sweep reads a channel's last fifty messages: a stray copy further back stays until someone deletes it.

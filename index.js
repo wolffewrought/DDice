@@ -28854,6 +28854,41 @@ async function fetchDocFiles(st, only = DOC_FILES) {
   return files;
 }
 
+// Every earlier copy of the books the bot left in a channel, cleared — not
+// only the one on record. A post a restart cut short before it was recorded
+// (an old build's check landing in a deploy), or one Discord would not
+// delete, used to stay for good (T, 2026-11-17). Only the bot's own posts
+// of that kind, only those older than the one kept — a newer copy wins —
+// and only among the channel's last fifty messages.
+const DOCS_POST_RE = /\*\*Command reference updated\*\*/;
+const DOCS_PLAYER_POST_RE = /\*\*Player command reference\*\*/;
+async function clearOldDocsPosts(client, channel, keepId, re) {
+  if (!channel?.messages?.fetch || !keepId) return 0;
+  let keep;
+  try { keep = BigInt(String(keepId)); } catch { return 0; }
+  const got = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+  let n = 0;
+  for (const m of got?.values?.() || []) {
+    if (String(m.id) === String(keepId) || m.author?.id !== client.user?.id || !re.test(String(m.content || ''))) continue;
+    let older = false;
+    try { older = BigInt(String(m.id)) < keep; } catch { older = false; }
+    if (!older) continue;
+    if (await m.delete().then(() => true).catch(() => false)) n++;
+  }
+  return n;
+}
+// Once a start: both channels, against the posts on record.
+async function clearOldDocsCopies(client, gid) {
+  const st = docsSettings(gid);
+  let n = 0;
+  for (const [cid, keep, re] of [[st.channel, st.msgId, DOCS_POST_RE], [st.playerChannel, st.playerMsgId, DOCS_PLAYER_POST_RE]]) {
+    if (!cid || !keep) continue;
+    const ch = await client.channels.fetch(cid).catch(() => null);
+    n += await clearOldDocsPosts(client, ch, keep, re).catch(() => 0);
+  }
+  return n;
+}
+
 // Replace the standing post with a fresh one. Returns a short outcome line.
 async function publishDocs(client, guild, { reason = 'a new build', force = false } = {}) {
   const gid = guild.id;
@@ -28877,10 +28912,14 @@ async function publishDocs(client, guild, { reason = 'a new build', force = fals
       + `_Latest build from \`${st.repo}\`. The previous post has been removed._`,
     files, allowedMentions: { roles },
   });
+  // Recorded the moment it is out, so a restart from here on cannot leave
+  // it unknown (T, 2026-11-17).
+  setConfig(gid, { docs_msg_id: msg.id, docs_sha: fingerprint });
   if (st.msgId) {
     try { const old = await channel.messages.fetch(st.msgId); await old.delete(); } catch {}
   }
-  setConfig(gid, { docs_msg_id: msg.id, docs_sha: fingerprint });
+  // ...and every earlier copy of its own in the channel, on record or not.
+  await clearOldDocsPosts(client, channel, msg.id, DOCS_POST_RE).catch(() => 0);
   const out = { posted: true, url: `https://discord.com/channels/${gid}/${channel.id}/${msg.id}` };
 
   // The player book on its own, somewhere players can find it. Deliberately
@@ -28898,10 +28937,11 @@ async function publishDocs(client, guild, { reason = 'a new build', force = fals
         allowedMentions: { parse: [] },
         flags: MessageFlags.SuppressNotifications,
       });
+      setConfig(gid, { docs_player_msg_id: pMsg.id });
       if (st.playerMsgId) {
         try { const old = await pCh.messages.fetch(st.playerMsgId); await old.delete(); } catch {}
       }
-      setConfig(gid, { docs_player_msg_id: pMsg.id });
+      await clearOldDocsPosts(client, pCh, pMsg.id, DOCS_PLAYER_POST_RE).catch(() => 0);
       out.playerUrl = `https://discord.com/channels/${gid}/${pCh.id}/${pMsg.id}`;
     } catch (err) {
       console.error('[docs] player copy failed:', err?.message || err);
@@ -30202,6 +30242,8 @@ const CHANGELOG = [
         detail: 'For lines posted from this build on. A line deleted in Discord itself leaves the story as well, and a post in parts keeps what is left of it. Lines from before keep their first wording in the story.' },
       { line: '`/dd` left blank opens a box for paragraphs — Message, Header and someone to address; however long, it goes on in the next message',
         detail: 'The 1,800-character cut is gone. The header, the channels and the person named with the command carry into the box; if the bot restarts while such a box is open, it asks you to run `/dd` again rather than speak somewhere else.' },
+      { line: 'Fixed: the command books could be left posted twice in their channel — every earlier copy of the bot\u2019s own is now cleared, each time it posts and once every start',
+        detail: 'An old build\u2019s check could post the new books just as a deploy shut it down, before it recorded the post, so nothing ever removed it. The new post is now recorded the moment it is sent, and the bot clears any older copy it finds in the channel\u2019s last fifty messages, recorded or not \u2014 the player copy too. A start says how many it cleared in the day\u2019s Deploy mend.' },
     ], player: [
       'Every fight roll you could reroll waits: \u{1F501} Reroll (a token) or ✅ Keep. Go quiet and it is kept. Called checks and `/deception` too',
       'Saves, holds, breaks, deflections, disarms and escapes can be rerolled now',
@@ -30224,6 +30266,7 @@ const CHANGELOG = [
       'Roleplay boxes have a Raw box: `*action*` in asterisks, `"speech"` in quotes — posted in the order you write them',
       'The weekly chronicle has its own forum: **chronicle**',
       'The GM’s narration posts as **Narration** — press Reply under it to answer the telling',
+      'Fixed: an old copy of the player book could be left behind in its channel',
     ] },
   { key: '2026-11-10', gm: [
       { line: 'Initiative, reworked: natural 20s go first and their first turn holds two actions; natural 1s go last and their first turn is roleplay only; a level total goes to whoever rolled first \u2014 no more rerolls',
@@ -30804,6 +30847,9 @@ async function bootMend(client) {
     try {
       const made = await mendEverything(client, guild);
       { const pr = pruneLedgers(gid); if (pr.length) made.push(`ledgers trimmed: ${pr.join(', ')}`); }
+      // Earlier copies of the command books a cut-short post left behind,
+      // cleared once a start (T, 2026-11-17).
+      { const n = await clearOldDocsCopies(client, gid).catch(() => 0); if (n) made.push(`${n} earlier cop${n === 1 ? 'y' : 'ies'} of the command books cleared`); }
       made.push(registerStatusLine(gid));
       if (made.length) console.log(`[mend] ${guild.name}: ${made.join(' \u00b7 ')}`);
       // The boot that opens the update forums also clears the old posts
@@ -37254,7 +37300,7 @@ const HELP_CATEGORIES = {
       '`/gm bar` \u2014 pin a GM toolbar in this channel: \u{1F5FF} Plant target, \u{1F3AF} Call check, \u2694\uFE0F Start fight, \u{1F9ED} Status, \u23EA Undo \u2014 each opens the box its command would (a target by name, DC and stats, scene, hits, who may swing; the check window; players and NPCs for a fight); Status is this channel at a glance: the fight and everyone\'s HP, the targets standing, what waits on a GM; Undo is `/gm undo` (GM)',
       '`/gm undo [steps:1-10]` \u2014 rewind the last step in this channel: a fight exchange (attack, defence, Resolve, a reroll, an action), a target strike or verdict, a group roll, a once-only press, a called check that cost HP \u2014 and the HP, rerolls, marks and stats those changed on sheets and NPCs. The table sees what was rewound and what moved; a fight gets its status and whose move it is posted again. Ten steps deep per channel, a day at most; a fight that has ended is not rewound; audited and noted on the quest (GM)',
       '`/config channels questforum channel:#forum` — the board becomes a forum: one thread per quest, lifecycle mirrored in, archived on completion (Admin)',
-      '`/config channels charforum/memorial/questlog/docs` — a page per approved character · where fallen characters are remembered · where finished quest summaries post · publish the command PDFs to a GM channel (Admin)',
+      '`/config channels charforum/memorial/questlog/docs` — a page per approved character · where fallen characters are remembered · where finished quest summaries post · publish the command PDFs to a GM channel, one current post \u2014 any older copy of its own is cleared (Admin)',
       '`/config channels scrollarchive` — the scroll library; point it at a forum and each GM\'s scrolls file in their own 📜 thread, opened on first use (Admin)',
       '`/config channels gmarchive forum:#forum` — the GM run archive: a thread per GM, headed with their runs, hours by kind and what is running now; a post per finished run with its runtime, party, payout, the record, the story PDF (in parts if long), the record PDF and the raw transcript; a review answers its post. Set once, it files every run already finished; `/gm check build` makes it (Admin)',
       '`/config channels questthreads channel:#forum` — optional split: per-quest planning threads (and their stage tags) open here, so the planning forum holds only the books (Admin)',

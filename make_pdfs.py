@@ -1902,7 +1902,9 @@ PARTS['keeping'] = [
       'posted <b>silently</b>, with no role pinged and no notification raised, so a reference channel stays up '
       'to date without nagging anyone. It replaces its own previous post the same way.'),
 ('note', 'The new post goes up <b>before</b> the old one comes down, so a failure part-way leaves the channel '
-         'with a copy rather than none at all. The repository must be public and hold the six books under the '
+         'with a copy rather than none at all. Each time it posts, and once every time the bot starts, it also clears '
+         'any older copy of its own it finds in the channel \u2014 one a restart cut short before it was recorded '
+         'would otherwise stay for good. The repository must be public and hold the six books under the '
          'names this script gives them: <b>DDice-Commands-Player.pdf</b> and <b>DDice-Commands-GameMaster.pdf</b> '
          'for Knightfall, the same two prefixed <b>DnD5e-</b> for 5e, and the two '
          '<b>DDice-Examples</b> books. A table is handed the set for the rules it plays by, and the Examples either way.'),
