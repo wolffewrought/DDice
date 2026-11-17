@@ -152,3 +152,11 @@ New verbs join their group; the wall is history until a single group nears 25.
 - (build Q) The wind-down's hours are run time from the log (pauses excluded), not the wall clock; a run with nothing logged still shows its quiet hours.
 - (build Q) 5e moves: the other side of a contest is rolled by the bot (the grip, the escape's holder); an NPC's skills are its ability modifiers alone. A hold only marks them held: the bot has no movement to stop. A feint's advantage waits for the feinter's next attack on that target, and goes with the fight if it ends first.
 - (build Q) An NPC whose name holds "discord" or "clyde" speaks with a hair space after that word's first letter; copying its name out of Discord carries the hair space.
+
+- (build R, 2026-11-17) The story is printed in DejaVu Sans (Latin, Greek, Cyrillic): a character it lacks prints as "?", and emoji are left out.
+- (build R) Talk cut before build R is read back from the run's thread once, 150 lines a print at most (the rest the next time); a deleted or unreachable message keeps its cut line, marked so it is not asked for again.
+- (build R) Raw reads every `*…*` as an action, so emphasis inside a sentence (`I *really* think so`) splits it into lines; two stars are bold, not an action; a straight `"` opens speech only at the start of a word.
+- (build R) A `to:` choice holds 100 characters, Discord's ceiling: past that, type the rest by hand.
+- (build R) gm-daily's list heads its thread in one message: when a restart opened the thread early, what will not fit in the head follows beneath the restart reports.
+- (build R) gm-monthly's command use is the lifetime counts less the last report's; the first report counts from the beginning.
+- (build R) A since-date where none was kept: an applicant from before build R takes the quest's creation, a run winding down takes its last activity, a draft takes when it was last written.

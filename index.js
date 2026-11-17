@@ -971,10 +971,21 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN week_tale_at INTEGER'); } cat
 try { db.exec('ALTER TABLE guild_config ADD COLUMN changelog_seen TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN campaign_forum TEXT'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN updates_forum TEXT'); } catch {}       // players: What's new, a dated thread each
-try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_updates_forum TEXT'); } catch {}    // GMs: What's new and Deploy mend
-try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_digest_forum TEXT'); } catch {}     // GMs: the weekly digest, a thread per week
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_updates_forum TEXT'); } catch {}    // GMs: What's new (the Deploy mend is gm-daily's since build R)
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_digest_forum TEXT'); } catch {}     // GMs: gm-weekly (was gm-digest), a thread per week
 try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_digest_seeded_at INTEGER'); } catch {} // the boot that posted the first digest into it
 try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_updates_reseeded_at INTEGER'); } catch {} // the boot that re-posted What's new with the detail beneath
+// The forums split (T, 2026-11-17): gm-daily, gm-weekly (gm_digest_forum,
+// renamed in place), gm-monthly for the GMs, chronicle for the players.
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_daily_forum TEXT'); } catch {}      // GMs: a thread a day \u2014 the 08:00 list, restart reports beneath
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_monthly_forum TEXT'); } catch {}    // GMs: a thread a month, on the 1st
+try { db.exec('ALTER TABLE guild_config ADD COLUMN chronicle_forum TEXT'); } catch {}     // players: the Weekly chronicle
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_daily_day TEXT'); } catch {}        // the UK day whose thread gm_daily_thread is
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_daily_thread TEXT'); } catch {}
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_daily_listed TEXT'); } catch {}     // the UK day whose 08:00 list is written
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_monthly_month TEXT'); } catch {}    // the month last reported, YYYY-MM
+try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_monthly_counts TEXT'); } catch {}   // command counts at that report, so a month's use is the difference
+try { db.exec('ALTER TABLE guild_config ADD COLUMN forums_split_at INTEGER'); } catch {}   // the one-off move into gm-daily and chronicle
 // A target's row stays keyed by its first card; card_id is the card now
 // carrying the buttons (a fail posts a fresh one below), reason the scene
 // text that card repeats (T, 2026-10-13).
@@ -9614,14 +9625,19 @@ function unvoiceName(name) { return String(name || '').replace(/\u200A/g, ''); }
 // matching how /npc posts. Falls back to a plain channel.send if the webhook fails.
 // Returns the sent message when the API hands one back (so callers can build
 // audit jump links), otherwise a bare truthy/falsy success flag.
-// Speaking as an NPC in a quest's channel is a roleplay beat worth logging.
-function noteNpcSpeech(gid, channel, npcName, said = '') {
-  // A recap of twelve identical "X speaks" lines tells nobody anything
-  // (T's screenshot, 2026-08-23). Carry the words, trimmed to a beat.
-  // An answer's jump header is not what was said (cold audit).
-  const words = String(said || '').replace(/^-# \u21AA[^\n]*\n/, '').replace(/\s+/g, ' ').trim();
-  const beat = words ? `${npcName}: \u201c${words}\u201d` : `${npcName} speaks`;
-  try { noteQuestActivity(gid, channel?.id, 'rp', beat); } catch {}
+// Speaking as an NPC in a quest's channel is a roleplay beat worth logging:
+// the line's parts as posted (T, 2026-11-17), never the jump header or the
+// names pinged under it. A fight card in an NPC's name is not speech \u2014
+// the fight keeps its own record, and the words a form gave it are logged
+// when the form comes back \u2014 so postAsNpc logs only what it is handed.
+function noteNpcSpeech(gid, channel, npcName, segs) {
+  const list = (segs || []).filter(sg => sg && String(sg.t || '').trim());
+  if (!list.length) return;
+  try { noteQuestActivity(gid, channel?.id, 'rp', `${npcName}: ${segsBeat(list)}`, null, { parts: { who: npcName, segs: list } }); } catch {}
+}
+// Parts as the log keeps them: a mention named, never carried.
+function segsForLog(guild, segs) {
+  return (segs || []).map(sg => ({ k: sg.k, t: cleanTalk(guild, sg.t, { keepLines: true }) })).filter(sg => sg.t);
 }
 
 // ── NPC lines: who they may call, and the button under every one ─────────
@@ -9700,20 +9716,43 @@ function groupNamed(gid, word) {
   try { return db.prepare('SELECT name FROM subject_assocs WHERE guild_id=? AND name=? COLLATE NOCASE LIMIT 1').get(gid, String(word).trim())?.name || null; }
   catch { return null; }
 }
-// The box's Groups dropdown: the orders, then the groups, each only while
-// someone living stands in it \u2014 twenty-five at most, Discord's ceiling.
-function addressableGroups(gid) {
+// What `to:` offers as it is typed, on /npc say and /rp (T, 2026-11-17 \u2014
+// the boxes' Groups list moved here): the knight orders and the groups with
+// someone living in them, then people by name; the piece after the last
+// comma is the one completed, the ones before it kept.
+async function addresseeChoices(guild, gid, typed) {
+  const pieces = String(typed || '').split(',');
+  const last = pieces.pop().trim();
+  const head = pieces.map(x => x.trim()).filter(Boolean);
+  const want = last.replace(/^@/, '').toLowerCase();
+  const bare = (x) => String(x).replace(/^@/, '').toLowerCase();
+  const taken = new Set(head.map(bare));
+  const pool = [];
+  for (const k of Object.keys(KNIGHT_EMOJIS)) if (orderMembers(gid, k).length) pool.push(`${k}s`);
+  for (const g of assocGroupNames(gid)) if (groupMembers(gid, g).length) pool.push(String(g));
+  const people = new Map();
+  const add = (mb) => {
+    if (!mb || mb.user?.bot) return;
+    const n = mb.displayName || mb.user?.globalName || mb.user?.username;
+    if (n && !people.has(String(n).toLowerCase())) people.set(String(n).toLowerCase(), `@${n}`);
+  };
+  for (const mb of guild?.members?.cache?.values?.() || []) add(mb);
+  if (want && typeof guild?.members?.search === 'function') {
+    // Discord answers a popup in three seconds: the search gets one and a half.
+    const found = await Promise.race([guild.members.search({ query: want.slice(0, 32), limit: 10 }).catch(() => null), new Promise(r => setTimeout(() => r(null), 1500))]);
+    for (const mb of found?.values?.() || []) add(mb);
+  }
+  const hits = [...pool, ...people.values()].filter(x => !taken.has(bare(x)) && (!want || bare(x).includes(want)));
+  hits.sort((a, b) => (bare(a).startsWith(want) ? 0 : 1) - (bare(b).startsWith(want) ? 0 : 1));
   const out = [];
-  for (const k of Object.keys(KNIGHT_EMOJIS)) {
-    const n = orderMembers(gid, k).length;
-    if (n) out.push({ label: `${k}s`.slice(0, 100), value: `o:${k}`.slice(0, 100), description: `${n} living`, emoji: KNIGHT_EMOJIS[k] });
+  for (const x of hits) {
+    const v = [...head, x].join(', ');
+    if (v.length <= 100) out.push({ name: v, value: v });
+    if (out.length >= 25) break;
   }
-  for (const g of assocGroupNames(gid)) {
-    const n = groupMembers(gid, g).length;
-    if (n) out.push({ label: String(g).slice(0, 100), value: `g:${g}`.slice(0, 100), description: `${n} player${n === 1 ? '' : 's'}` });
-  }
-  return out.slice(0, 25);
+  return out;
 }
+// A Groups pick from a box opened before the list moved to `to:`.
 function expandGroupPick(gid, value) {
   const v = String(value || '');
   if (v.startsWith('o:')) return orderMembers(gid, v.slice(2));
@@ -9813,8 +9852,8 @@ function offeredActivity(gid, npc, pick) {
 }
 // Every line keeps its row: two people answering the same line each need
 // its Reply (T, 2026-11-06 \u2014 the newest-only rule is gone).
-async function postAsNpc(channel, gid, npcName, content, { interact = false, offer = null } = {}) {
-  noteNpcSpeech(gid, channel, npcName, content);
+async function postAsNpc(channel, gid, npcName, content, { interact = false, offer = null, beat = null } = {}) {
+  if (beat) noteNpcSpeech(gid, channel, npcName, beat);
   const npc = getNpc(gid, npcName);
   const guild = channel.guild;
   const resolved = guild ? await resolveNameMentions(guild, content).catch(() => ({ text: content, users: [] })) : { text: content, users: [] };
@@ -9898,7 +9937,8 @@ async function npcAnswerOptions(interaction, gid) {
   return [...heard.map(n => ({ label: n.slice(0, 100), value: npcKey(n), description: 'Heard here lately' })),
           ...rest.map(n => ({ label: n.slice(0, 100), value: npcKey(n) }))].slice(0, 25);
 }
-// The answer box: who answers, then the speak-as fields. Five fields at most.
+// The answer box: who answers, then the speak-as fields. Five fields at most
+// \u2014 the Raw box took the Groups list's place (T, 2026-11-17).
 function npcAnswerModal(gid, cid, mid, toName, options) {
   const { ModalBuilder, TextInputBuilder, TextInputStyle, LabelBuilder, UserSelectMenuBuilder, StringSelectMenuBuilder } = require('discord.js');
   const modal = new ModalBuilder().setCustomId(`npcans:${cid}:${mid}`.slice(0, 100)).setTitle(`Answer ${toName}`.slice(0, 45));
@@ -9911,15 +9951,16 @@ function npcAnswerModal(gid, cid, mid, toName, options) {
     new LabelBuilder().setLabel('Who answers').setDescription('Those heard here lately first').setStringSelectMenuComponent(who),
     new LabelBuilder().setLabel('Action (optional)').setTextInputComponent(actionInput),
     new LabelBuilder().setLabel('Speech (optional)').setDescription('@Name in the words pings them too').setTextInputComponent(speechInput),
-    new LabelBuilder().setLabel('To (optional)').setDescription('Up to 25, named under the words; only people are ever pinged').setUserSelectMenuComponent(toPicker),
+    rawLabel(),
+    new LabelBuilder().setLabel('To (optional)').setDescription('Up to 25, named under the words; a group or order: /npc say to:').setUserSelectMenuComponent(toPicker),
   );
-  const groups = addressableGroups(gid);
-  if (groups.length) {
-    const pickG = new StringSelectMenuBuilder().setCustomId('groups').setPlaceholder('Address a whole group or order?')
-      .setMinValues(0).setMaxValues(groups.length).setRequired(false).addOptions(groups);
-    modal.addLabelComponents(new LabelBuilder().setLabel('Groups (optional)').setDescription('Every living player in each one is pinged').setStringSelectMenuComponent(pickG));
-  }
   return modal;
+}
+// The Raw box, in the label-style boxes: longer writing in its parts.
+function rawLabel() {
+  const { TextInputBuilder, TextInputStyle, LabelBuilder } = require('discord.js');
+  return new LabelBuilder().setLabel('Raw (optional)').setDescription(RAW_PART_NOTE).setTextInputComponent(new TextInputBuilder()
+    .setCustomId('raw').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(RP_BOX_MAX).setPlaceholder(RAW_PART_EXAMPLE));
 }
 // GM: the speak-as box for that NPC; a player is told quietly whose it is.
 async function handleNpcInteractButton(interaction) {
@@ -9941,9 +9982,10 @@ async function handleNpcTalkButton(interaction) {
   if (!story || !storyIsLive(gid, story)) return interaction.reply({ content: `❌ What **${npc.name}** offered is no longer there.`, ephemeral: true });
   return handleStory(interaction, { sub: 'run', name: story.name, viaButton: true });
 }
-// The speak-as box: action, speech, a "To" picker of up to twenty-five
-// players (named last), the Groups dropdown when there are groups or orders,
-// and — when the server has activities — which one to offer
+// The speak-as box: action, speech, the Raw box (T, 2026-11-17: it took
+// the Groups list's place \u2014 a group or an order goes by /npc say to:),
+// a "To" picker of up to twenty-five players (named last), and — when the
+// server has activities — which one to offer
 // on this line, the NPC's `talk:` pre-selected. Built in the label style
 // discord.js 14.27 reads modals in (every field a label wrapping its
 // component, nothing in an action row) — `package.json` pins the floor at
@@ -9967,16 +10009,9 @@ function npcSayModal(npc, gid = null, { reply = null } = {}) {
   modal.addLabelComponents(
     new LabelBuilder().setLabel('Action (optional)').setTextInputComponent(actionInput),
     new LabelBuilder().setLabel('Speech (optional)').setDescription('@Name in the words pings them too').setTextInputComponent(speechInput),
-    new LabelBuilder().setLabel('To (optional)').setDescription('Up to 25, named under the words; only people are ever pinged').setUserSelectMenuComponent(toPicker),
+    rawLabel(),
+    new LabelBuilder().setLabel('To (optional)').setDescription('Up to 25, named under the words; a group or order: /npc say to:').setUserSelectMenuComponent(toPicker),
   );
-  // Whole groups at once: the knight orders and the server's associations,
-  // each expanded to the living players in it.
-  const groups = gid ? addressableGroups(gid) : [];
-  if (groups.length) {
-    const pickG = new StringSelectMenuBuilder().setCustomId('groups').setPlaceholder('Address a whole group or order?')
-      .setMinValues(0).setMaxValues(groups.length).setRequired(false).addOptions(groups);
-    modal.addLabelComponents(new LabelBuilder().setLabel('Groups (optional)').setDescription('Every living player in each one is pinged').setStringSelectMenuComponent(pickG));
-  }
   // The activities, when there are any: None, then the first twenty-four
   // live ones; the NPC's default pre-selected so a plain submit offers it.
   const live = gid ? listStories(gid).filter(st => storyIsLive(gid, st) && !isDemoStory(st.name)) : [];
@@ -10670,7 +10705,7 @@ async function handlePr(interaction) {
     // `to:` alone would be dropped by the box, which has pickers of its own.
     if (!action && !speech && !raw) {
       if (replyTo) return interaction.showModal(npcSayModal(npc, gid, { reply: replyTo }));
-      if (interaction.options.getString('to')) return interaction.reply({ ephemeral: true, content: '\u274C Nothing to say \u2014 add `speech:` or `action:` to go with `to:`, or leave everything blank for the box (it has a To picker and a Groups list).' });
+      if (interaction.options.getString('to')) return interaction.reply({ ephemeral: true, content: '\u274C Nothing to say \u2014 add `speech:`, `action:` or `raw:` to go with `to:`, or leave everything blank for the box (it has a To picker; groups and orders go by `to:`).' });
       return interaction.showModal(npcSayModal(npc, gid));
     }
 
@@ -10679,8 +10714,11 @@ async function handlePr(interaction) {
     const toR = await resolveAddressees(interaction.guild, gid, interaction.options.getString('to'));
     const said1 = composeNpcSay({ action, speech, raw, to: toR.ids.slice(0, ADDRESS_CAP) });
     if (!said1) return interaction.reply({ content: '❌ Nothing to post.', ephemeral: true });
+    // However long, it goes \u2014 a long one carries on in the next message
+    // (T, 2026-11-17); `raw:` is posted as typed and read into its parts
+    // for the record, as the box's Raw is.
     const body = `${replyHead}${said1}`;
-    if (body.length > 1800) return interaction.reply({ content: '❌ Message too long (max 1800 characters, the names under it included).', ephemeral: true });
+    const beat1 = segsForLog(interaction.guild, raw && raw.trim() ? rpSegments(raw) : formSegments({ action, speech }));
     const offerOpt = interaction.options.getString('offer');
     if (offerOpt && !/^(none|-|off)$/i.test(offerOpt.trim()) && !offeredActivity(gid, npc, offerOpt.trim()))
       return interaction.reply({ content: `❌ No live activity called **${offerOpt.trim()}** — \`/activity list\` shows what there is.`, ephemeral: true });
@@ -10688,7 +10726,7 @@ async function handlePr(interaction) {
 
     const chan = await interactionChannel(interaction);
     if (!chan) return interaction.reply({ content: MSG_NO_ACCESS, ephemeral: true });
-    const said = await postAsNpc(chan, gid, npc.name, body, { interact: true, offer });
+    const said = await postAsNpc(chan, gid, npc.name, body, { interact: true, offer, beat: beat1 });
     if (!said) return interaction.reply({ content: `❌ I couldn't post in this channel — check my permissions here.`, ephemeral: true });
     mirrorNpcSay(gid, { gmId: interaction.user.id, npcName: npc.name, channelId: chan.id,
       messageId: said?.id ?? null, text: body });
@@ -10836,17 +10874,14 @@ async function handlePr(interaction) {
 // italics, the speech in quotes, and whoever it is addressed to — any of
 // them absent without leaving a gap (T, 2026-10-24: "Action / Speech /
 // Ping"). Someone already named inside the words is not named again.
-function composeNpcSay({ action, speech, raw, to = [] }) {
+// `segs` (a box's parts, the Raw box's among them) are posted one to a
+// line in the order written; `raw:` on the command is posted as typed.
+function composeNpcSay({ action, speech, raw, to = [], segs = null }) {
   const parts = [];
-  const act = (action || '').trim();
-  const say = (speech || '').trim();
-  if (raw && raw.trim()) parts.push(raw.trim());
+  if (!segs && raw && raw.trim()) parts.push(raw.trim());
   else {
-    if (act) parts.push(italicLines(act));
-    if (say) {
-      const alreadyQuoted = /^["\u201c][\s\S]*["\u201d]$/.test(say);
-      parts.push(alreadyQuoted ? say : `"${say}"`);
-    }
+    const said = segsToPost(segs || formSegments({ action, speech }), { gap: '\n\n' });
+    if (said) parts.push(said);
   }
   const words = parts.join('\n');
   const pings = [...new Set((to || []).filter(Boolean).map(String))].filter(id => !words.includes(`<@${id}>`)).map(id => `<@${id}>`);
@@ -10889,9 +10924,14 @@ async function handleNpcSayModal(interaction) {
 
   const action = interaction.fields.getTextInputValue('action');
   const speech = interaction.fields.getTextInputValue('speech');
+  let raw = '';
+  try { raw = String(interaction.fields.getTextInputValue('raw') || ''); } catch { raw = ''; }
+  const segs = formSegments({ action, speech, raw });
   // The To picker names them under the words; the Interaction pick puts the
   // button under the line. Both read loosely — a box opened before a deploy
   // may lack the field, and the library returns nothing rather than throwing.
+  // A Groups pick is read only from a box opened before the list moved to
+  // `to:` (T, 2026-11-17).
   let picked = [];
   try { picked = [...(interaction.fields.getSelectedUsers?.('to', false)?.values?.() || [])].map(u => u.id); } catch { picked = []; }
   let groupPicks = [];
@@ -10899,8 +10939,8 @@ async function handleNpcSayModal(interaction) {
   const everyone = [...new Set([...picked, ...groupPicks.flatMap(v => expandGroupPick(gid, v))])];
   let pick;
   try { const v = interaction.fields.getStringSelectValues?.('offer'); pick = Array.isArray(v) && v.length ? v[0] : (v && v.length === 0 ? 'none' : undefined); } catch { pick = undefined; }
-  const said0 = composeNpcSay({ action, speech, to: everyone.slice(0, ADDRESS_CAP) });
-  if (!said0) return interaction.reply({ content: '❌ Both boxes were empty — nothing posted.', ephemeral: true });
+  const said0 = composeNpcSay({ segs, to: everyone.slice(0, ADDRESS_CAP) });
+  if (!said0) return interaction.reply({ content: '❌ Every box was empty — nothing posted.', ephemeral: true });
   // The header, the webhook and the post are several calls to Discord:
   // answered first, told after (cold audit).
   await interaction.deferReply({ ephemeral: true });
@@ -10914,7 +10954,7 @@ async function handleNpcSayModal(interaction) {
 
   const chan = await interactionChannel(interaction);
   if (!chan) return tell(MSG_NO_ACCESS);
-  const said = await postAsNpc(chan, gid, npc.name, body, { interact: true, offer });
+  const said = await postAsNpc(chan, gid, npc.name, body, { interact: true, offer, beat: segsForLog(interaction.guild, segs) });
   if (!said) return tell(`❌ I couldn't post in this channel — check my permissions here.`);
   mirrorNpcSay(gid, { gmId: interaction.user.id, npcName: npc.name, channelId: chan.id,
     messageId: said?.id ?? null, text: body });
@@ -15843,17 +15883,28 @@ function stashFightRp(kind, payload) {
   pendingFightRp.set(token, { at: now, kind, ...payload });
   return token;
 }
+// Every form with an action and a speech box has the Raw box after them
+// (T, 2026-11-17): longer writing, read into its parts in the order written.
 function fightRpModal(token, { title, claim = false, what = false } = {}) {
-  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+  const { ModalBuilder, TextInputStyle } = require('discord.js');
   const m = new ModalBuilder().setCustomId(`frp:${token}`).setTitle(String(title || 'Your move').slice(0, 45));
-  const field = (id, label, style, max, required = false) =>
-    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(style).setRequired(required).setMaxLength(max));
+  const field = (id, label, style, max, required = false) => rowField(id, label, { style, max, required });
   if (what) { m.addComponents(field('what', 'What happens? (optional)', TextInputStyle.Paragraph, RP_BOX_MAX)); return m; }
   if (claim) m.addComponents(field('claim', 'What do you pretend to do?', TextInputStyle.Paragraph, RP_BOX_MAX, true));
-  m.addComponents(
-    field('action', 'What do you do? (optional)', TextInputStyle.Paragraph, RP_BOX_MAX),
-    field('speech', 'What do you say? (optional)', TextInputStyle.Paragraph, RP_BOX_MAX));
+  m.addComponents(...rpRows());
   return m;
+}
+// One text field in an action row, the older box style.
+function rowField(id, label, { style = null, max = RP_BOX_MAX, required = false, placeholder = null } = {}) {
+  const { TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+  const ti = new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(style ?? TextInputStyle.Paragraph).setRequired(required).setMaxLength(max);
+  if (placeholder) ti.setPlaceholder(placeholder);
+  return new ActionRowBuilder().addComponents(ti);
+}
+// What you do, what you say, and Raw, as rows.
+function rpRows() {
+  return [rowField('action', 'What do you do? (optional)'), rowField('speech', 'What do you say? (optional)'),
+    rowField('raw', 'Raw (optional)', { placeholder: RAW_PART_NOTE })];
 }
 function openFightRp(interaction, kind, payload, opts = {}) {
   // An allowed roll's form: its submit settles the hold.
@@ -15861,13 +15912,111 @@ function openFightRp(interaction, kind, payload, opts = {}) {
   return interaction.showModal(fightRpModal(stashFightRp(kind, payload), opts));
 }
 // The words off a form, shaped for a card's flavour block: the action in
-// italics, the speech in quotes; null when both were left blank.
+// italics, the speech in quotes, then the Raw box's parts in the order they
+// were written; null when every box was left blank.
 function rpWords(interaction) {
-  let action = '', speech = '';
-  try { action = String(interaction.fields.getTextInputValue('action') || '').trim().slice(0, RP_BOX_MAX); } catch {}
-  try { speech = String(interaction.fields.getTextInputValue('speech') || '').trim().slice(0, RP_BOX_MAX); } catch {}
-  return [action ? italicLines(action) : null, speech ? `\u201C${speech}\u201D` : null].filter(Boolean).join('\n') || null;
+  return segsToPost(rpFormSegs(interaction), { quote: 'curly' }) || null;
 }
+// The same words as parts: Action, Speech, then Raw.
+function rpFormSegs(interaction) {
+  const val = (id) => { try { return String(interaction.fields.getTextInputValue(id) || '').slice(0, RP_BOX_MAX); } catch { return ''; } };
+  return formSegments({ action: val('action'), speech: val('speech'), raw: val('raw') });
+}
+
+// \u2500\u2500 Raw roleplay (T, 2026-11-17) \u2500\u2500
+// "*action* for action and "speech" for speech \u2026 posted in that order":
+// free writing read into its parts. An action is *\u2026* (or ***\u2026***, or _\u2026_
+// at a word's edge); speech is "\u2026", \u201C\u2026\u201D or \u201E\u2026\u201C; whatever stands
+// outside the marks is a plain line of its own. Two stars are bold, not an
+// action, and stay in the words. A mark opened at the start of a word and
+// never closed runs to the end of its line.
+const RAW_PART_NOTE = '*action* in asterisks, "speech" in quotes \u2014 posted in the order you write them';
+const RAW_PART_EXAMPLE = '*nods slowly* "Fine." The door creaks open behind her.';
+const SPEECH_CLOSERS = { '"': '"', '\u201C': '\u201D"', '\u201E': '\u201C\u201D"' };
+function rpSegments(text) {
+  const s = String(text ?? '').replace(/\r\n?/g, '\n');
+  const out = [];
+  const push = (k, t) => {
+    const v = String(t).split('\n').map(l => l.replace(/[ \t]+/g, ' ').trim()).filter(Boolean).join('\n');
+    if (v) out.push({ k, t: v });
+  };
+  let plain = '';
+  const flush = () => { for (const line of plain.split('\n')) push('p', line); plain = ''; };
+  const edge = (i) => i === 0 || /[\s([{>]/.test(s[i - 1]);
+  const lineEnd = (i) => { const n = s.indexOf('\n', i); return n < 0 ? s.length : n; };
+  const starRun = (i) => { let n = 0; while (s[i + n] === '*') n++; return n; };
+  // The star run that closes an action opened with n stars: bold inside it
+  // (a run of two) is passed over.
+  const closeStars = (from, n) => {
+    for (let j = from; j < s.length; j++) {
+      if (s[j] !== '*') continue;
+      const r = starRun(j);
+      if (n === 1 ? r !== 2 : r >= 3) return j;
+      j += r - 1;
+    }
+    return -1;
+  };
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '*') {
+      const n = starRun(i);
+      if (n === 2 || n > 3) {
+        // Bold, or a row of stars: words, kept as they are.
+        const close = n === 2 ? s.indexOf('**', i + 2) : -1;
+        const to = close > i ? close + 2 : i + n;
+        plain += s.slice(i, to); i = to; continue;
+      }
+      const end = closeStars(i + n, n);
+      if (end >= 0) { flush(); push('a', s.slice(i + n, end)); i = end + n; continue; }
+      if (edge(i)) { flush(); const e = lineEnd(i); push('a', s.slice(i + n, e)); i = e; continue; }
+      plain += c; i++; continue;
+    }
+    if (c === '_' && edge(i) && s[i + 1] !== '_') {
+      // Underscores italicise only at a word's edges, on one line.
+      let end = -1;
+      for (let j = i + 2, e = lineEnd(i); j < e; j++) if (s[j] === '_' && !/\s/.test(s[j - 1]) && !/[\w]/.test(s[j + 1] || '')) { end = j; break; }
+      if (end > 0) { flush(); push('a', s.slice(i + 1, end)); i = end + 1; continue; }
+      plain += c; i++; continue;
+    }
+    if (SPEECH_CLOSERS[c] && (c !== '"' || edge(i))) {
+      let end = -1;
+      for (const q of SPEECH_CLOSERS[c]) { const j = s.indexOf(q, i + 1); if (j > i && (end < 0 || j < end)) end = j; }
+      if (end > i) { flush(); push('s', s.slice(i + 1, end)); i = end + 1; continue; }
+      flush(); const e = lineEnd(i); push('s', s.slice(i + 1, e)); i = e; continue;
+    }
+    plain += c; i++;
+  }
+  flush();
+  return out;
+}
+// A form's boxes as parts: the Action box (marks at its lines' ends are
+// dropped, the box itself is the italics), the Speech box (its own quote
+// marks dropped, the post puts them back), then the Raw box read as above.
+function formSegments({ action = '', speech = '', raw = '' } = {}) {
+  const segs = [];
+  const act = String(action || '').split('\n').map(l => l.trim().replace(/^[*_]+(?=\S)/, '').replace(/(?<=\S)[*_]+$/, '')).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  if (act) segs.push({ k: 'a', t: act });
+  const sp0 = String(speech || '').trim();
+  const sp = (/^["\u201C\u201E][\s\S]*["\u201D\u201C]$/.test(sp0) && sp0.length > 1 ? sp0.slice(1, -1) : sp0).trim();
+  if (sp) segs.push({ k: 's', t: sp });
+  if (String(raw || '').trim()) segs.push(...rpSegments(raw));
+  return segs;
+}
+// Parts as a post: each on its own line, in order \u2014 an action in italics
+// (each of its lines in its own marks), speech in quote marks, a plain line
+// as written. A line said aloud (an NPC's, an /rp line) keeps the blank
+// line between its blocks it has had since 2026-10-24; a card's words sit
+// close.
+function segsToPost(segs, { quote = 'straight', gap = '\n' } = {}) {
+  const [o, c] = quote === 'curly' ? ['\u201C', '\u201D'] : ['"', '"'];
+  return (segs || []).map(sg => (sg.k === 'a' ? italicLines(sg.t) : sg.k === 's' ? `${o}${sg.t}${c}` : String(sg.t || '')))
+    .filter(Boolean).join(gap);
+}
+// A line written as words: what the log has always kept (a dot between parts).
+function segsBeat(segs) { return rpBeatText(segsToPost(segs, { quote: 'curly' })); }
+// Each line of the parts, for the guard on lines only the bot may begin.
+function segsLines(segs) { return (segs || []).flatMap(sg => String(sg.t || '').split('\n')); }
 // Every roleplay box holds Discord's most (T, 2026-11-17).
 const RP_BOX_MAX = 4000;
 // An action in italics, each line in its own marks: a long one carried on
@@ -17855,19 +18004,20 @@ async function handleFight(interaction, forced) {
     // scroll:true \u2014 the same recap on parchment, for a fight outside a
     // quest that would never get a story scroll (T, 2026-10-15).
     if (wantScroll) {
-      if (!hasCanvas()) return interaction.editReply({ content: '\u274C The parchment needs the canvas module, which this bot has not got.' });
       try {
-        // The standard face, not the server's saved script (T, 2026-11-17):
-        // a summary is read, a prop is admired.
-        const family = 'standard';
-        const plain = (t) => String(t || '').replace(/<@[!&]?\d+>/g, 'someone').replace(/[*_`]+/g, '').replace(/[\p{Extended_Pictographic}\uFE0F]/gu, '').replace(/[ \t]+/g, ' ').trim();
-        const title = `${archFloor > 0 ? 'A practice bout' : 'A fight'} \u2014 ${dateLine(arch.ended_at).replace(/^\[[^\]]*\] \[[^\]]*\] /, '')}`;
-        const stem = fileSlug(`fight ${dateLine(arch.ended_at).slice(1, 11).replace(/\//g, '-')}`, 'fight-recap');
-        const fitted = scrollBookFitting({ family, title, body: lines.slice(1).map(plain).join('\n').slice(0, SCROLL_BODY_MAX) });
-        const pdf = embedScrollData(fitted.pdf, { v: 1, kind: 'scroll', title, body: fitted.body, name: stem });
-        const { AttachmentBuilder } = require('discord.js');
-        return interaction.editReply({ content: `\u{1F4DC} **The last ${archFloor > 0 ? 'bout' : 'fight'} here, on parchment** \u2014 ended ${formatHistDate(arch.ended_at)}.`,
-          files: [new AttachmentBuilder(pdf, { name: `${stem}.pdf` })] });
+        // Printed, as a run's story is (T, 2026-11-17): every line, the names
+        // in bold; `filename:` names the file and heads its first page.
+        const own = scrollFileName(interaction.options?.getString?.('filename'));
+        const title = own?.heading || `${archFloor > 0 ? 'A practice bout' : 'A fight'} \u2014 ${dateLine(arch.ended_at).replace(/^\[[^\]]*\] \[[^\]]*\] /, '')}`;
+        const stem = own?.stem || fileSlug(`fight ${dateLine(arch.ended_at).slice(1, 11).replace(/\//g, '-')}`, 'fight-recap');
+        const paras = scrollParasOf(lines.slice(1));
+        const files = printScroll({ title, paras, stem });
+        files[0].pdf = embedScrollData(files[0].pdf, { v: 1, kind: 'scroll', title, body: scrollPlain(paras).slice(0, 4000), name: stem });
+        const batches = scrollFileBatches(files);
+        const sent = await interaction.editReply({ content: `\u{1F4DC} **The last ${archFloor > 0 ? 'bout' : 'fight'} here, on parchment** \u2014 ended ${formatHistDate(arch.ended_at)}${files.length > 1 ? `, in ${files.length} parts` : ''}.`,
+          files: batches[0] || [] });
+        for (const more of batches.slice(1)) await interaction.followUp({ files: more }).catch(() => {});
+        return sent;
       } catch (err) {
         console.error('[fight] log scroll -', err?.message || err);
         return interaction.editReply({ content: `\u274C The scroll wouldn't take ink \u2014 ${String(err?.message || err).slice(0, 120)}` });
@@ -18121,9 +18271,10 @@ function questAlreadyOn(gid, uid, exceptNumber = null) {
 }
 
 function setQuestMember(gid, number, uid, state) {
-  const ex = db.prepare('SELECT user_id FROM quest_members WHERE guild_id=? AND number=? AND user_id=?').get(gid, number, uid);
-  if (ex) db.prepare('UPDATE quest_members SET state=? WHERE guild_id=? AND number=? AND user_id=?').run(state, gid, number, uid);
-  else db.prepare('INSERT INTO quest_members (guild_id, number, user_id, state) VALUES (?,?,?,?)').run(gid, number, uid, state);
+  const ex = db.prepare('SELECT user_id, state FROM quest_members WHERE guild_id=? AND number=? AND user_id=?').get(gid, number, uid);
+  // state_at: when they came to stand where they stand (an applicant's wait).
+  if (ex) { if (ex.state !== state) db.prepare('UPDATE quest_members SET state=?, state_at=? WHERE guild_id=? AND number=? AND user_id=?').run(state, Date.now(), gid, number, uid); }
+  else db.prepare('INSERT INTO quest_members (guild_id, number, user_id, state, state_at) VALUES (?,?,?,?,?)').run(gid, number, uid, state, Date.now());
 }
 function removeQuestMember(gid, number, uid) {
   return db.prepare('DELETE FROM quest_members WHERE guild_id=? AND number=? AND user_id=?').run(gid, number, uid).changes;
@@ -18196,11 +18347,24 @@ try { db.exec('ALTER TABLE quest_events ADD COLUMN msg_id TEXT'); } catch {}
 try { db.exec('ALTER TABLE quest_events ADD COLUMN first_text TEXT'); } catch {}
 try { db.exec('ALTER TABLE quest_events ADD COLUMN gone INTEGER DEFAULT 0'); } catch {}
 try { db.exec('CREATE INDEX IF NOT EXISTS quest_events_msg ON quest_events(msg_id)'); } catch {}
-function logQuestEvent(gid, number, kind, text, actor = null, { msgId = null } = {}) {
+// Every word, in order (T, 2026-11-17): a line's parts \u2014 who, then each
+// action, speech and plain line as it was posted \u2014 ride beside its text
+// as JSON, and the story prints them so. `whole` is 1 for talk kept uncut,
+// -1 for talk from before that could not be read again; NULL is talk from
+// before, which was cut at 300 and is mended from its thread once.
+try { db.exec('ALTER TABLE quest_events ADD COLUMN parts TEXT'); } catch {}
+try { db.exec('ALTER TABLE quest_events ADD COLUMN whole INTEGER'); } catch {}
+// Since when a thing has waited on a GM (T, 2026-11-17: the standing list
+// gives each its date): a member's place, a run's winding down, a draft.
+try { db.exec('ALTER TABLE quest_members ADD COLUMN state_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE quests ADD COLUMN winding_at INTEGER'); } catch {}
+try { db.exec('ALTER TABLE stories ADD COLUMN draft_at INTEGER'); } catch {}
+function logQuestEvent(gid, number, kind, text, actor = null, { msgId = null, parts = null, whole = null } = {}) {
   const q = getQuest(gid, number);
   if (!q) return null;
-  db.prepare('INSERT INTO quest_events (guild_id,number,at_ms,kind,text,actor,wall_at,msg_id) VALUES (?,?,?,?,?,?,?,?)')
-    .run(gid, number, questElapsed(q), kind, text ?? null, actor, Date.now(), msgId);
+  const partsJson = parts == null ? null : (typeof parts === 'string' ? parts : JSON.stringify(parts));
+  db.prepare('INSERT INTO quest_events (guild_id,number,at_ms,kind,text,actor,wall_at,msg_id,parts,whole) VALUES (?,?,?,?,?,?,?,?,?,?)')
+    .run(gid, number, questElapsed(q), kind, text ?? null, actor, Date.now(), msgId, partsJson, whole);
   return true;
 }
 function questEvents(gid, number, sinceMs = null) {
@@ -18335,38 +18499,89 @@ function recordRoomTalk(message, content) {
   if (!rows.length || looksLikeTypedRoll(content, gid)) return;
   const name = (message.member?.displayName || message.author.globalName || message.author.username || 'Someone').slice(0, 60);
   const line = `${name}: ${cleanTalk(message.guild, content)}`;
+  // Every word of it, in its parts, for the story (T, 2026-11-17).
+  const parts = { who: name, segs: rpSegments(cleanTalk(message.guild, content, { keepLines: true })) };
   for (const r of rows) {
-    logQuestEvent(gid, r.number, 'talk', line, message.author.id, { msgId: String(message.id) });
+    logQuestEvent(gid, r.number, 'talk', line, message.author.id, { msgId: String(message.id), parts, whole: 1 });
     try { updateQuest(gid, r.number, { last_activity: Date.now() }); } catch {}
   }
 }
 // Talk as the log keeps it: a mention named rather than carried (nothing
-// shown again can ping anyone), @everyone and @here defused, one line.
-function cleanTalk(guild, content) {
-  return String(content || '')
+// shown again can ping anyone), @everyone and @here defused, one line \u2014
+// or, for its parts, its lines kept. Every word: the cut at 300 is gone
+// (T, 2026-11-17).
+function cleanTalk(guild, content, { keepLines = false } = {}) {
+  const t = String(content || '')
     .replace(/<@!?(\d+)>/g, (_, id) => `@${guild?.members?.cache?.get(id)?.displayName || 'someone'}`)
     .replace(/<@&(\d+)>/g, (_, id) => `@${guild?.roles?.cache?.get(id)?.name || 'role'}`)
     .replace(/<#(\d+)>/g, (_, id) => `#${guild?.channels?.cache?.get(id)?.name || 'channel'}`)
-    .replace(/@(everyone|here)/g, '@\u200b$1')
-    .replace(/\s+/g, ' ').trim().slice(0, 300);
+    .replace(/@(everyone|here)/g, '@\u200b$1');
+  return keepLines ? t.replace(/[ \t]+/g, ' ').replace(/ *\n */g, '\n').trim() : t.replace(/\s+/g, ' ').trim();
 }
 // An edit corrects the line and keeps its first wording; a deletion marks
 // it. Read from the raw gateway events, so a message from before a restart
 // (out of the cache) is followed too.
 let talkByMsgQ = null;
 function noteTalkEdited(d) {
-  talkByMsgQ ??= db.prepare("SELECT id, text, first_text FROM quest_events WHERE msg_id=? AND kind='talk'");
+  talkByMsgQ ??= db.prepare("SELECT id, text, first_text, parts, whole FROM quest_events WHERE msg_id=? AND kind='talk'");
   const rows = talkByMsgQ.all(String(d.id));
   if (!rows.length || typeof d.content !== 'string') return;
   const guild = client.guilds?.cache?.get?.(String(d.guild_id)) || null;
   const said = cleanTalk(guild, d.content);
+  const segs = rpSegments(cleanTalk(guild, d.content, { keepLines: true }));
   const who = d.member?.nick || d.author?.global_name || d.author?.username || null;
   for (const r of rows) {
     const prefix = who ? `${String(who).slice(0, 60)}: ` : String(r.text || '').slice(0, String(r.text || '').indexOf(': ') + 2);
     const now = `${prefix}${said}`;
-    if (now === r.text) continue;
-    db.prepare('UPDATE quest_events SET first_text=COALESCE(first_text, text), text=? WHERE id=?').run(now, r.id);
+    if (now === r.text && Number(r.whole) === 1) continue;
+    // The name the line's text carries now, else the one it was kept under.
+    let name = who ? String(who).slice(0, 60) : '';
+    if (!name) { try { name = JSON.parse(r.parts || 'null')?.who || ''; } catch {} }
+    if (!name) name = prefix.replace(/: $/, '') || 'Someone';
+    // The edit is the message whole, so a line cut before is whole again.
+    db.prepare('UPDATE quest_events SET first_text=CASE WHEN text=? THEN first_text ELSE COALESCE(first_text, text) END, text=?, parts=?, whole=1 WHERE id=?')
+      .run(now, now, JSON.stringify({ who: name, segs }), r.id);
   }
+}
+// Talk kept before build R was cut at 300 characters and folded onto one
+// line. Before a story is printed, each line that may have been cut is read
+// again from the run's thread, once: mended whole, or \u2014 when the message
+// is gone \u2014 marked so it is not asked for again.
+const TALK_OLD_CUT = 300;
+async function mendCutTalk(client, gid, quest, { max = 150 } = {}) {
+  const room = quest?.run_thread_id;
+  if (!client?.channels?.fetch || !room) return 0;
+  let rows = [];
+  try {
+    rows = db.prepare("SELECT id, text, msg_id FROM quest_events WHERE guild_id=? AND number=? AND kind='talk' AND whole IS NULL AND msg_id IS NOT NULL AND COALESCE(gone,0)=0 ORDER BY at_ms, id")
+      .all(gid, quest.number)
+      .filter(r => { const t = String(r.text || ''); const at = t.indexOf(': '); return t.length - (at >= 0 ? at + 2 : 0) >= TALK_OLD_CUT; });
+  } catch { return 0; }
+  if (!rows.length) return 0;
+  const thread = await client.channels.fetch(String(room)).catch(() => null);
+  if (!thread?.messages?.fetch) return 0;
+  const guild = thread.guild || client.guilds?.cache?.get?.(String(gid)) || null;
+  const mark = (id) => { try { db.prepare('UPDATE quest_events SET whole=-1 WHERE id=?').run(id); } catch {} };
+  let mended = 0;
+  for (const r of rows.slice(0, max)) {
+    let msg = null;
+    try { msg = await thread.messages.fetch(String(r.msg_id)); }
+    catch (e) {
+      // Gone, or out of reach for good: asked once, never again.
+      if ([10008, 10003, 50001].includes(Number(e?.code))) mark(r.id);
+      continue;
+    }
+    const content = String(msg?.content || '');
+    if (!content.trim()) { mark(r.id); continue; }
+    const t = String(r.text || ''), at = t.indexOf(': ');
+    const who = at > 0 ? t.slice(0, at) : String(msg.member?.displayName || msg.author?.username || 'Someone').slice(0, 60);
+    const segs = rpSegments(cleanTalk(guild, content, { keepLines: true }));
+    try {
+      db.prepare('UPDATE quest_events SET text=?, parts=?, whole=1 WHERE id=?').run(`${who}: ${cleanTalk(guild, content)}`, JSON.stringify({ who, segs }), r.id);
+      mended++;
+    } catch {}
+  }
+  return mended;
 }
 function noteTalkGone(ids) {
   const list = (ids || []).map(String).filter(Boolean).slice(0, 200);
@@ -18518,21 +18733,21 @@ async function archiveHourly(client, guild) {
 }
 // The GM record as a scroll: the machine's account, timings to payout.
 function runRecordScroll(gid, quest, recordLines) {
-  // The standard face (T, 2026-11-17), as the story's.
-  const family = 'standard';
-  const plain = (t) => String(t || '').replace(/<@[!&]?\d+>/g, 'someone').replace(/<#\d+>/g, 'a room').replace(/<t:\d+(:\w)?>/g, '')
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/[*_`~]+/g, '').replace(/[\p{Extended_Pictographic}\uFE0F]/gu, '').replace(/[ \t]+/g, ' ').trim();
-  const body = (Array.isArray(recordLines) ? recordLines : String(recordLines || '').split('\n'))
-    .map(plain).filter(l => l && !/^\u2500+$/.test(l)).join('\n').slice(0, SCROLL_BODY_MAX) || 'Nothing was logged.';
+  // Printed, as the story is (T, 2026-11-17): every line of it, the names
+  // in bold where the record marks them.
+  const lines = (Array.isArray(recordLines) ? recordLines : String(recordLines || '').split('\n'))
+    .filter(l => !/^\u2500+$/.test(String(l ?? '').trim()));
+  const found = scrollParasOf(lines);
+  const paras = found.length ? found : scrollParasOf(['Nothing was logged.']);
   const title = `${questTag(quest)} \u2014 the record`;
   const stem = fileSlug(`${questTag(quest)} record`, 'run-record');
-  const fitted = scrollBookFitting({ family, title, body });
-  const pdf = embedScrollData(fitted.pdf, { v: 1, kind: 'scroll', title, body: fitted.body, name: stem });
-  return { pdf, name: `${stem}.pdf` };
+  const files = printScroll({ title, paras, stem });
+  files[0].pdf = embedScrollData(files[0].pdf, { v: 1, kind: 'scroll', title, body: scrollPlain(paras).slice(0, 4000), name: stem });
+  return { pdf: files[0].pdf, name: files[0].name, files };
 }
 // File one finished run under its GM. Returns the post, or null when there
 // is no archive (the caller then keeps the raw transcript in the GM log).
-async function archiveFinishedRun(client, guild, gid, quest, { gmId, partyNames = [], runMs = 0, merits = 0, titles = [], record = [], storyFile = null, recordFile = null, talk = {} }) {
+async function archiveFinishedRun(client, guild, gid, quest, { gmId, partyNames = [], runMs = 0, merits = 0, titles = [], record = [], storyFile = null, storyFiles = null, recordFile = null, talk = {} }) {
   try {
     if (!gmId || !(await runArchiveForum(client, gid))) return null;
     const got = await ensureRunArchiveThread(client, guild, gid, gmId);
@@ -18549,9 +18764,10 @@ async function archiveFinishedRun(client, guild, gid, quest, { gmId, partyNames 
       ...(titles.length ? [`\u{1F3C5} ${titles.join(', ')}`] : []),
     ];
     const recordText = (Array.isArray(record) ? record.join('\n') : String(record || '')).slice(0, Math.max(200, 1850 - head.join('\n').length));
-    const { AttachmentBuilder } = require('discord.js');
-    const files = [storyFile, recordFile, talk?.corrected, talk?.raw].filter(Boolean)
-      .map(f => new AttachmentBuilder(f.pdf || f.attachment, { name: f.name }));
+    // The story in all its parts, the record, the raw talk (T, 2026-11-17:
+    // the corrected transcript is the story's now).
+    const batches = scrollFileBatches([...(storyFiles || (storyFile ? [storyFile] : [])), ...(recordFile?.files || (recordFile ? [recordFile] : [])), talk?.raw].filter(Boolean));
+    const files = batches[0] || [];
     // Reopened and finished again: the first post gives way to this one.
     if (q.archive_msg_id && q.archive_thread_id) {
       const t0 = await client.channels.fetch(q.archive_thread_id).catch(() => null);
@@ -18559,6 +18775,7 @@ async function archiveFinishedRun(client, guild, gid, quest, { gmId, partyNames 
       if (m0?.delete) await m0.delete().catch(() => {});
     }
     const post = await got.thread.send({ content: [...head, '', recordText].join('\n').slice(0, 1990), files, allowedMentions: { parse: [] } });
+    for (const more of batches.slice(1)) await got.thread.send({ files: more, allowedMentions: { parse: [] } }).catch(() => {});
     updateQuest(gid, q.number, { archive_gm: String(gmId), archive_thread_id: got.thread.id, archive_msg_id: post?.id ?? null });
     await refreshArchiveHeader(client, guild, gid, gmId);
     return post || null;
@@ -18601,6 +18818,8 @@ async function backfillRunArchive(client, guild, gid) {
       for (const id of party) partyNames.push(await nameOf(id));
       const runnerName = await nameOf(gmId);
       const runMs = Number(q.elapsed_ms) || 0;
+      // Talk cut at 300 before build R is read again from its thread, once.
+      await mendCutTalk(client, gid, q).catch(() => 0);
       const events = questEvents(gid, q.number);
       const record = [
         `\u{1F4DC} **${questTag(q)}** \u2014 quest summary`,
@@ -18609,13 +18828,11 @@ async function backfillRunArchive(client, guild, gid) {
         '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500',
         ...(events.filter(e => e.kind !== 'talk').map(questEventLine)),
       ];
-      let storyFile = null, recordFile = null;
-      if (hasCanvas()) {
-        try { storyFile = runStoryScroll(gid, q, { runnerName, partyNames, runMs, events, tale: '' }); } catch {}
-        try { recordFile = runRecordScroll(gid, q, record); } catch {}
-      }
+      let story = null, recordFile = null;
+      try { story = runStoryScroll(gid, q, { runnerName, partyNames, runMs, events, tale: '', nameOf: memberNameOf(guild) }); } catch {}
+      try { recordFile = runRecordScroll(gid, q, record); } catch {}
       const talk = runTranscripts(gid, q, { runnerName, partyNames, runMs });
-      if (!(await archiveFinishedRun(client, guild, gid, q, { gmId, partyNames, runMs, merits: Number(q.merit_reward) || 0, record, storyFile, recordFile, talk }))) failed++;
+      if (!(await archiveFinishedRun(client, guild, gid, q, { gmId, partyNames, runMs, merits: Number(q.merit_reward) || 0, record, storyFiles: story?.files || [], recordFile, talk: { raw: talk.raw } }))) failed++;
       if (ARCHIVE_PACE_MS) await new Promise(r => setTimeout(r, ARCHIVE_PACE_MS));
     }
     // A GM with runs going and none finished still gets a thread and header.
@@ -18635,10 +18852,10 @@ function startRunArchiveBackfill(client, gid, guild = null) {
   backfillRunArchive(client, g, gid).catch(() => {});
 }
 // Note something against whichever quest is running in this channel, if any.
-function noteQuestActivity(gid, cid, kind, text, actor = null) {
+function noteQuestActivity(gid, cid, kind, text, actor = null, opts = {}) {
   for (const q of activeQuestsInChannel(gid, cid)) {
     if (q.paused) continue;               // a paused quest records nothing
-    logQuestEvent(gid, q.number, kind, text, actor);
+    logQuestEvent(gid, q.number, kind, text, actor, opts);
     if (isEncounter(q)) { try { updateQuest(gid, q.number, { last_activity: Date.now() }); } catch {} }
   }
 }
@@ -18666,22 +18883,24 @@ function activityDigestLines(gid) {
     const top = db.prepare(`SELECT story, COUNT(*) AS c FROM story_run_log WHERE guild_id=? AND at>=? AND kind='start' GROUP BY story ORDER BY c DESC LIMIT 1`).get(gid, since);
     if (starts) L.push(`\u{1F3AE} **Activities** \u2014 ${starts} run${starts === 1 ? '' : 's'}, ${ends} finished${top ? `; most played: **${top.story}** (${top.c})` : ''}`);
   } catch {}
-  const drafts = listStories(gid).filter(st => st.draft_source && !st.retired);
-  if (drafts.length) L.push(`\u{1F4DD} **Drafts waiting:** ${drafts.map(st => { let n = 0; try { n = JSON.parse(st.draft_problems || '[]').length; } catch {} return `**${st.name}**${n ? ` (${n} problem${n === 1 ? '' : 's'})` : ' (ready to publish)'}`; }).join(', ')}`);
+  // The drafts are on the standing list beneath, each with its date and link.
   return L;
 }
+// gm-weekly (gm-digest until build R): the week's activities and drafts,
+// then everything waiting on a GM, each with its date and a link; the GMs
+// pinged (T, 2026-11-17).
 async function postWeeklyDigest(client, guild) {
   const gid = guild.id;
   const cfg = getConfig(gid) || {};
   if (!cfg.gm_digest_forum) return null;
   setConfig(gid, { gm_digest_at: Date.now() });
-  const out = stalledReport(guild);
+  const items = waitingItems(gid);
   const roles = getGmRoleIds(gid);
   const acts = activityDigestLines(gid);
   return postDatedThread(client, cfg.gm_digest_forum, 'Weekly digest', mondayOf(Date.now()),
     ['\u{1F5DE}\uFE0F **Weekly digest \u2014 waiting on a GM** ' + roles.map(r => `<@&${r}>`).join(' '), '',
-     ...(out.length ? out : ['Nothing is waiting on a GM this week.']),
-     ...(acts.length ? ['', ...acts] : [])],
+     ...(acts.length ? [...acts, ''] : []),
+     ...(items.length ? waitingLines(items) : ['Nothing is waiting on a GM this week.'])],
     { allowedMentions: { roles } });
 }
 
@@ -18764,13 +18983,190 @@ async function weekTaleLines(guild, since) {
 async function postWeekTale(client, guild) {
   const gid = guild.id;
   const cfg = getConfig(gid) || {};
-  if (!cfg.updates_forum) return null;
+  // Its own forum since build R: updates keeps What's new alone.
+  if (!cfg.chronicle_forum) return null;
   const since = Math.max(Number(cfg.week_tale_at) || 0, Date.now() - 7 * 86400000);
   setConfig(gid, { week_tale_at: Date.now() });
   const body = await weekTaleLines(guild, since);
   if (!body.length) return null;
-  return postDatedThread(client, cfg.updates_forum, 'Weekly chronicle', Date.now(),
+  return postDatedThread(client, cfg.chronicle_forum, 'Weekly chronicle', Date.now(),
     ['\u{1F4DC} **The week\u2019s chronicle**', '', ...body]);
+}
+
+// \u2500\u2500 gm-daily (T, 2026-11-17) \u2500\u2500
+// A thread a day, titled by the day. At 08:00 (UK) its head is what is
+// waiting on a GM \u2014 each with its date and a link \u2014 and nobody is
+// pinged; every restart that day reports beneath it (the Deploy mend). A
+// restart before eight opens the day's thread early, and the list fills
+// its head at eight.
+const DAILY_HOUR = 8;
+function ukDayKey(ms = Date.now()) {
+  const { y, m, d } = localDateParts(ms);
+  return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+}
+function ukHour(ms = Date.now()) {
+  return Number(new Intl.DateTimeFormat('en-GB', { timeZone: BOT_TZ, hour: 'numeric', hourCycle: 'h23' }).format(new Date(ms))) || 0;
+}
+// Midnight in the UK on a date, as an instant.
+function ukMidnight(y, m, d) {
+  const guess = Date.UTC(y, m - 1, d);
+  return guess - ukHour(guess) * 3600000;
+}
+function dailyHeadLines(gid) {
+  const items = waitingItems(gid);
+  return [`\u{1F5D3}\uFE0F **The day \u2014 waiting on a GM**${items.length ? ` \u00b7 ${items.length}` : ''}`, '',
+    ...(items.length ? waitingLines(items) : ['Nothing is waiting on a GM today.'])];
+}
+const DAILY_EARLY = '\u{1F5D3}\uFE0F **The day** \u2014 what is waiting on a GM lands here at 08:00.';
+const dailyMaking = new Map();
+function dailyThread(client, gid) {
+  if (dailyMaking.has(gid)) return dailyMaking.get(gid);
+  const p = dailyThreadNow(client, gid).finally(() => dailyMaking.delete(gid));
+  dailyMaking.set(gid, p);
+  return p;
+}
+async function dailyThreadNow(client, gid) {
+  const cfg = getConfig(gid) || {};
+  if (!cfg.gm_daily_forum) return null;
+  const day = ukDayKey();
+  if (cfg.gm_daily_day === day && cfg.gm_daily_thread) {
+    const t = await client.channels.fetch(cfg.gm_daily_thread).catch(() => null);
+    if (t?.send) { if (t.archived) await wakeThread(t).catch(() => {}); return t; }
+  }
+  const listNow = ukHour() >= DAILY_HOUR;
+  const t = await postDatedThread(client, cfg.gm_daily_forum, 'Daily', Date.now(), listNow ? dailyHeadLines(gid) : [DAILY_EARLY]);
+  if (!t) return null;
+  setConfig(gid, { gm_daily_day: day, gm_daily_thread: t.id, ...(listNow ? { gm_daily_listed: day } : {}) });
+  return t;
+}
+// Eight o'clock: the day's list heads the day's thread \u2014 made now, or, if
+// a restart opened it early, written into its head (what will not fit
+// follows beneath).
+async function postDailyList(client, guild) {
+  const gid = guild.id, cfg = getConfig(gid) || {};
+  const day = ukDayKey();
+  if (!cfg.gm_daily_forum || cfg.gm_daily_listed === day || ukHour() < DAILY_HOUR) return null;
+  setConfig(gid, { gm_daily_listed: day });
+  const opened = cfg.gm_daily_day === day && !!cfg.gm_daily_thread;
+  const t = await dailyThread(client, gid);
+  if (!t || !opened || getConfig(gid)?.gm_daily_thread !== cfg.gm_daily_thread) return t;
+  const chunks = chunkLines(dailyHeadLines(gid), 1900);
+  const head = await t.fetchStarterMessage?.().catch(() => null);
+  if (head?.edit && head.author?.id === client.user?.id) {
+    await head.edit({ content: chunks[0], allowedMentions: { parse: [] } }).catch(() => {});
+    for (const c of chunks.slice(1)) await t.send({ content: c, allowedMentions: { parse: [] } }).catch(() => {});
+  } else for (const c of chunks) await t.send({ content: c, allowedMentions: { parse: [] } }).catch(() => {});
+  return t;
+}
+// A restart's report \u2014 what the boot mended \u2014 beneath the day's list.
+async function postRestartReport(client, gid, made) {
+  if (!made?.length) return null;
+  const t = await dailyThread(client, gid);
+  if (!t) return null;
+  for (const c of chunkLines([`\u{1F527} **Deploy mend** \u00b7 <t:${Math.floor(Date.now() / 1000)}:t>`, '', ...made.map(l => `\u00b7 ${l}`)], 1900))
+    await t.send({ content: c, allowedMentions: { parse: [] } }).catch(() => {});
+  return t;
+}
+
+// \u2500\u2500 gm-monthly (T, 2026-11-17) \u2500\u2500
+// From 08:00 (UK) on the 1st, the month just gone, for the GMs, pinged:
+// runs and hours by GM, reviews and their average, campaigns, players quiet
+// thirty days, titles and merits, the fallen, activities and command use;
+// then everything still waiting that has stood since before the month,
+// oldest first, with dates and links.
+function lastMonth(ms = Date.now()) {
+  const { y, m } = localDateParts(ms);
+  const py = m === 1 ? y - 1 : y, pm = m === 1 ? 12 : m - 1;
+  return { key: `${py}-${String(pm).padStart(2, '0')}`, label: `${MONTH_NAMES[pm - 1]} ${py}`, start: ukMidnight(py, pm, 1), end: ukMidnight(y, m, 1) };
+}
+// When a player was last seen doing anything the bot keeps a date for.
+function lastSeenAt(gid, uid) {
+  let best = 0;
+  for (const sql of [
+    'SELECT MAX(at) AS t FROM rp_lines WHERE guild_id=? AND user_id=?',
+    'SELECT MAX(wall_at) AS t FROM quest_events WHERE guild_id=? AND actor=?',
+    'SELECT MAX(at) AS t FROM button_presses WHERE guild_id=? AND user_id=?',
+    'SELECT MAX(at) AS t FROM week_dice WHERE guild_id=? AND user_id=?',
+    'SELECT MAX(at) AS t FROM story_run_log WHERE guild_id=? AND user_id=?',
+    'SELECT MAX(at) AS t FROM feedback_log WHERE guild_id=? AND user_id=?',
+    "SELECT MAX(CAST(strftime('%s', saved_at) AS INTEGER)) * 1000 AS t FROM roll_history WHERE guild_id=? AND user_id=?",
+  ]) { try { best = Math.max(best, Number(db.prepare(sql).get(gid, uid)?.t) || 0); } catch {} }
+  return best || null;
+}
+function monthlyLines(gid, { start, end, label }) {
+  const all = (sql, ...a) => { try { return db.prepare(sql).all(gid, ...a); } catch { return []; } };
+  const at = (c) => (c ? `https://discord.com/channels/${gid}/${c}` : null);
+  const n = (k, one, many = `${one}s`) => `${k} ${k === 1 ? one : many}`;
+  const L = [];
+  const runs = all(`${ARCHIVE_RUN_SQL} AND q.status='completed' AND COALESCE(q.stage_at,0) >= ? AND COALESCE(q.stage_at,0) < ? ORDER BY q.stage_at`, start, end);
+  const byGm = new Map();
+  for (const r of runs) { const g = archiveGmOf(r) || '?'; const e = byGm.get(g) || { n: 0, ms: 0 }; e.n++; e.ms += Number(r.elapsed_ms) || 0; byGm.set(g, e); }
+  L.push(`\u{1F3B2} **Runs** \u2014 ${n(runs.length, 'run')} finished, ${fmtElapsed(runs.reduce((a, r) => a + (Number(r.elapsed_ms) || 0), 0))} in all`);
+  for (const [g, e] of [...byGm.entries()].sort((a, b) => b[1].ms - a[1].ms)) L.push(`\u00b7 ${g === '?' ? 'a GM unrecorded' : `<@${g}>`} \u2014 ${n(e.n, 'run')}, ${fmtElapsed(e.ms)}`);
+  const revs = all('SELECT scale FROM feedback_log WHERE guild_id=? AND at >= ? AND at < ?', start, end);
+  const scored = revs.filter(r => r.scale != null && Number.isFinite(Number(r.scale)));
+  L.push('', `\u{1F4DD} **Reviews** \u2014 ${revs.length}${scored.length ? `, averaging **${(scored.reduce((a, r) => a + Number(r.scale), 0) / scored.length).toFixed(1)}/10**` : ''}`);
+  const camps = all('SELECT * FROM campaigns WHERE guild_id=? ORDER BY created_at');
+  const begun = camps.filter(c => Number(c.created_at) >= start && Number(c.created_at) < end);
+  const done = camps.filter(c => Number(c.completed_at) >= start && Number(c.completed_at) < end);
+  L.push('', `\u{1F5FA}\uFE0F **Campaigns** \u2014 ${camps.filter(c => c.status === 'active').length} active; ${begun.length} begun and ${done.length} finished this month`);
+  for (const c of [...begun.map(c => [c, 'begun']), ...done.map(c => [c, 'finished'])].slice(0, 15))
+    L.push(`\u00b7 **${c[0].name}** \u2014 ${c[1]}${c[0].thread_id ? ` \u00b7 [jump](${at(c[0].thread_id)})` : ''}`);
+  const quietFrom = Date.now() - 30 * 86400000;
+  const quiet = [];
+  for (const c of all("SELECT user_id FROM characters WHERE guild_id=? AND died_at IS NULL AND COALESCE(approval_state, 'approved') NOT IN ('pending', 'rejected')")) {
+    if (isNpcFighter(String(c.user_id))) continue;
+    const seen = lastSeenAt(gid, c.user_id);
+    if (!seen || seen < quietFrom) quiet.push({ id: c.user_id, seen });
+  }
+  quiet.sort((a, b) => (a.seen || 0) - (b.seen || 0));
+  L.push('', `\u{1F4A4} **Players quiet thirty days** \u2014 ${quiet.length}`);
+  for (const p of quiet.slice(0, 25)) L.push(`\u00b7 <@${p.id}> \u2014 ${p.seen ? `last seen <t:${Math.floor(p.seen / 1000)}:d>` : 'nothing on record'}`);
+  if (quiet.length > 25) L.push(`\u00b7 \u2026and ${quiet.length - 25} more`);
+  const titles = all('SELECT subject_id, title FROM subject_titles WHERE guild_id=? AND at >= ? AND at < ? ORDER BY at', start, end);
+  const merits = all("SELECT COALESCE(SUM(amount),0) AS n, COUNT(DISTINCT user_id) AS p FROM history WHERE guild_id=? AND kind='merit' AND amount > 0 AND created_at >= ? AND created_at < ?", start, end)[0] || {};
+  L.push('', `\u{1F396}\uFE0F **Titles and merits** \u2014 ${n(titles.length, 'title')} granted; ${Number(merits.n) || 0} merits to ${n(Number(merits.p) || 0, 'player')}`);
+  for (const t of titles.slice(0, 15)) L.push(`\u00b7 ${isNpcFighter(t.subject_id) ? `**${npcNameFromFighter(t.subject_id)}** \u{1F3AD}` : `<@${t.subject_id}>`} \u2014 ${t.title}`);
+  const fallen = all('SELECT user_id FROM characters WHERE guild_id=? AND died_at >= ? AND died_at < ? ORDER BY died_at', start, end);
+  const fallenNpcs = all('SELECT name FROM npcs WHERE guild_id=? AND died_at >= ? AND died_at < ? ORDER BY died_at', start, end);
+  L.push('', `\u26B0\uFE0F **The fallen** \u2014 ${fallen.length + fallenNpcs.length}`);
+  for (const c of fallen.slice(0, 15)) L.push(`\u00b7 <@${c.user_id}>`);
+  for (const c of fallenNpcs.slice(0, 15)) L.push(`\u00b7 **${c.name}** \u{1F3AD}`);
+  const plays = all("SELECT kind, story FROM story_run_log WHERE guild_id=? AND at >= ? AND at < ? AND kind IN ('start','end')", start, end);
+  const starts = plays.filter(p => p.kind === 'start');
+  const most = new Map(); for (const p of starts) most.set(p.story, (most.get(p.story) || 0) + 1);
+  const top = [...most.entries()].sort((a, b) => b[1] - a[1])[0];
+  L.push('', `\u{1F3AE} **Activities** \u2014 ${n(starts.length, 'run')}, ${plays.length - starts.length} finished${top ? `; most played: **${top[0]}** (${top[1]})` : ''}`);
+  // Command use: the counts are lifetime, so a month is the difference
+  // from the last report's (the first report counts from the beginning).
+  let before = null;
+  try { before = JSON.parse(getConfig(gid)?.gm_monthly_counts || 'null'); } catch { before = null; }
+  const byCmd = new Map();
+  for (const r of all('SELECT command, leaf, count FROM command_uses WHERE guild_id=?')) {
+    const used = Number(r.count) - (before ? Number(before[`${r.command} ${r.leaf}`]) || 0 : 0);
+    if (used > 0) byCmd.set(r.command, (byCmd.get(r.command) || 0) + used);
+  }
+  const uses = [...byCmd.values()].reduce((a, b) => a + b, 0);
+  L.push('', `\u{1F4CA} **Command use**${before ? '' : ' \u2014 since counting began'} \u2014 ${n(uses, 'use')} of ${n(byCmd.size, 'command')}`);
+  for (const [c, k] of [...byCmd.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10)) L.push(`\u00b7 /${c} \u2014 ${k}`);
+  const old = waitingItems(gid).filter(it => it.since && it.since < start).sort((a, b) => a.since - b.since);
+  L.push('', `\u{1F4CC} **Still waiting from before ${label}** \u2014 ${old.length}`, ...(old.length ? old.map(it => waitingLine(it, { kind: true })) : ['Nothing.']));
+  return L;
+}
+async function postMonthly(client, guild) {
+  const gid = guild.id, cfg = getConfig(gid) || {};
+  if (!cfg.gm_monthly_forum) return null;
+  const mb = lastMonth();
+  if (cfg.gm_monthly_month === mb.key) return null;
+  if (localDateParts(Date.now()).d === 1 && ukHour() < DAILY_HOUR) return null;   // the 1st, from eight
+  setConfig(gid, { gm_monthly_month: mb.key });
+  const roles = getGmRoleIds(gid);
+  const t = await postDatedThread(client, cfg.gm_monthly_forum, `Monthly \u2014 ${mb.label}`, Date.now(),
+    [`\u{1F4C5} **${mb.label} \u2014 the month for the GMs** ${roles.map(r => `<@&${r}>`).join(' ')}`, '', ...monthlyLines(gid, mb)],
+    { allowedMentions: { roles } });
+  // The counts as they stand: next month's use is measured from here.
+  try { setConfig(gid, { gm_monthly_counts: JSON.stringify(Object.fromEntries(db.prepare('SELECT command, leaf, count FROM command_uses WHERE guild_id=?').all(gid).map(r => [`${r.command} ${r.leaf}`, r.count]))) }); } catch {}
+  return t;
 }
 
 let activityIdleAt = 0;
@@ -18783,9 +19179,12 @@ async function questTick(client) {
   for (const guild of client.guilds.cache.values()) {
     try {
       const cfgT = getConfig(guild.id) || {};
-      if (cfgT.updates_forum && Date.now() - (Number(cfgT.week_tale_at) || 0) >= 7 * 86400000)
+      if (cfgT.chronicle_forum && Date.now() - (Number(cfgT.week_tale_at) || 0) >= 7 * 86400000)
         await postWeekTale(client, guild);
     } catch (e) { console.error('[week-tale]', e?.message || e); }
+    // gm-daily at eight, gm-monthly on the 1st (T, 2026-11-17).
+    try { await postDailyList(client, guild); } catch (e) { console.error('[daily]', e?.message || e); }
+    try { await postMonthly(client, guild); } catch (e) { console.error('[monthly]', e?.message || e); }
     // Weekly digest of what is stalled, one dated thread a week in
     // gm-digest, titled by the Monday of the week it covers, so nothing
     // depends on someone noticing (T, 2026-09-29 / 10-11).
@@ -20360,12 +20759,9 @@ async function closeInitiative(interaction, gid, cid, { fromCard = false } = {})
 // A natural 1's first turn out of combat (T, 2026-11-10): what they do and
 // say, both optional; the turn passes with the words.
 function initRpModal(key, cur) {
-  const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
-  const field = (id, label, style, max) => new ActionRowBuilder().addComponents(
-    new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(style).setRequired(false).setMaxLength(max));
+  const { ModalBuilder } = require('discord.js');
   return new ModalBuilder().setCustomId(`initrp:${key}`).setTitle(`${cur?.kind === 'player' ? 'Your first turn' : String(cur?.name || 'The turn')} \u2014 roleplay`.slice(0, 45))
-    .addComponents(field('action', 'What do you do? (optional)', TextInputStyle.Paragraph, RP_BOX_MAX),
-      field('speech', 'What do you say? (optional)', TextInputStyle.Paragraph, RP_BOX_MAX));
+    .addComponents(...rpRows());
 }
 async function handleInitRpModal(interaction) {
   const gid = interaction.guild.id, cid = interactionChannelId(interaction), uid = interaction.user.id;
@@ -20378,7 +20774,7 @@ async function handleInitRpModal(interaction) {
   if (!(await isGm(interaction.guild, uid)) && !(cur?.kind === 'player' && cur.id === uid))
     return no(cur?.kind === 'player' ? `⏳ It is **${cur.name}**’s turn — only they or a GM can play it out.` : `🎭 **${cur?.name}** is the GM’s — only a GM can play that turn out.`);
   const words = rpWords(interaction);
-  if (words) { try { noteQuestActivity(gid, cid, 'rp', `${cur.name}: ${rpBeatText(words)}`, uid); } catch {} }
+  if (words) { try { const segsI = rpFormSegs(interaction); noteQuestActivity(gid, cid, 'rp', `${cur.name}: ${segsBeat(segsI)}`, uid, { parts: { who: cur.name, segs: segsForLog(interaction.guild, segsI) } }); } catch {} }
   if (interaction.isFromMessage?.()) await interaction.update({ components: [] }).catch(() => {});
   else await interaction.reply({ ephemeral: true, content: '🎭 Played out.' }).catch(() => {});
   const moved = await advanceTurnOrder(interaction.client, gid, cid, { how: 'rp', expectKey: key, words, channel: await interactionChannel(interaction) });
@@ -22152,38 +22548,106 @@ async function sweepQuestChannels(client, gid, quest) {
   await sweepCreateCard(client, gid, quest);
 }
 
-function stalledReport(guild) {
-  const gid = guild.id;
+// \u2500\u2500 What is waiting on a GM (T, 2026-11-17) \u2500\u2500
+// "All of these gm threads should have hyperlinks to everything that is
+// still standing and needs attention": one list behind gm-daily, gm-weekly,
+// gm-monthly, /gm queue and /gm check stalled \u2014 each thing with the date
+// it has stood since and a link to where it is settled.
+const WAITING_KINDS = [
+  ['sheets', '\u{1F4CB} **Character sheets**'], ['lore', '\u{1F4DC} **Lore**'], ['duels', '\u2694\uFE0F **Duels**'],
+  ['trades', '\u{1F91D} **Merit trades**'], ['applicants', '\u{1F9ED} **Quest applicants**'],
+  ['winding', '\u{1F6CC} **Winding down, not completed**'], ['quiet', '\u{1F3AF} **Encounters gone quiet**'],
+  ['staged', '\u{1F4E5} **Staged, never launched**'], ['campaigns', '\u{1F5FA}\uFE0F **Campaigns with nothing new in a month**'],
+  ['targets', '\u{1F5FF} **Targets standing over a day**'], ['drafts', '\u{1F4DD} **Activity drafts waiting**'],
+  ['reviews', '\u{1F4AC} **Reviews in the last seven days**'], ['failures', '\u26A0\uFE0F **Background jobs failing**'],
+];
+// /gm queue keeps to what waits on a decision; /gm check stalled to the rest.
+const QUEUE_KINDS = ['sheets', 'lore', 'duels', 'trades', 'applicants', 'failures'];
+function waitingItems(gid) {
   const now = Date.now();
+  const at = (c, m) => (c ? `https://discord.com/channels/${gid}/${c}${m ? `/${m}` : ''}` : null);
   const out = [];
-  const winding = db.prepare("SELECT * FROM quests WHERE guild_id=? AND status='active' AND COALESCE(winding_down,0)=1 ORDER BY number").all(gid);
-  if (winding.length) out.push(`\u{1F6CC} **Winding down, not completed** \u2014 ${winding.map(q => questTag(q)).join(', ')}`);
-  const quiet = db.prepare("SELECT * FROM quests WHERE guild_id=? AND status='active' AND kind='encounter' ORDER BY number").all(gid)
-    .filter(q => now - (Number(q.last_activity) || Number(q.started_at) || now) >= ENCOUNTER_IDLE_MS);
-  if (quiet.length) out.push(`\u{1F3AF} **Encounters gone quiet** \u2014 ${quiet.map(q => `${questTag(q)} (${Math.round((now - (Number(q.last_activity) || Number(q.started_at) || now)) / 3600000)}h)`).join(', ')}`);
-  const staged = db.prepare("SELECT * FROM quests WHERE guild_id=? AND instance_of IS NULL AND status='open' ORDER BY number").all(gid)
-    .filter(q => getQuestMembers(gid, q.number, 'party').length > 0);
-  if (staged.length) out.push(`\u{1F4CB} **Staged, never launched** \u2014 ${staged.map(q => `${questTag(q)} (${getQuestMembers(gid, q.number, 'party').length} seated)`).join(', ')}`);
-  const idleCamps = db.prepare("SELECT * FROM campaigns WHERE guild_id=? AND status='active'").all(gid)
-    .filter(c => { const es = campaignEntries(gid, c.id); const last = Math.max(0, ...es.map(q => Number(q.created_at) || 0)); return !es.length || now - Math.max(last, Number(c.created_at) || 0) > 30 * 86400000; });
-  if (idleCamps.length) out.push(`\u{1F5FA}\uFE0F **Campaigns with nothing new in a month** \u2014 ${idleCamps.map(c => c.name).join(', ')}`);
-  const fb = db.prepare('SELECT COUNT(*) AS n FROM feedback_log WHERE guild_id=? AND at > ?').get(gid, now - 7 * 86400000)?.n || 0;
-  if (fb) out.push(`\u{1F4DD} **${fb}** review${fb === 1 ? '' : 's'} in the last seven days \u2014 see gm-feedback`);
-  // Targets left standing more than a day: a forgotten door keeps its
-  // buttons live until someone retires it (T, 2026-10-14).
-  let oldTargets = [];
-  try { oldTargets = db.prepare('SELECT name, channel_id, at FROM temp_targets WHERE guild_id=? AND dead=0 AND at < ? ORDER BY at').all(gid, now - 86400000); } catch {}
-  if (oldTargets.length) out.push(`\u{1F5FF} **Targets standing over a day** \u2014 ${oldTargets.slice(0, 12).map(t => `${t.name} in <#${t.channel_id}> (${Math.round((now - t.at) / 86400000)}d)`).join(', ')}${oldTargets.length > 12 ? ` \u2026 and ${oldTargets.length - 12} more` : ''} \u2014 \`/target list\` there retires one`);
+  const add = (kind, label, since, url) => out.push({ kind, label, since: Number(since) || null, url: url || null });
+  const all = (sql, ...a) => { try { return db.prepare(sql).all(gid, ...a); } catch { return []; } };
+  // Approvals: a sheet links to its character page, the rest to their queue posts.
+  for (const p of listPendingSheets(gid)) {
+    const page = all('SELECT thread_id FROM char_pages WHERE guild_id=? AND user_id=?', p.user_id)[0]?.thread_id;
+    const row = all('SELECT approval_ch_id, approval_msg_id FROM characters WHERE guild_id=? AND user_id=?', p.user_id)[0] || {};
+    add('sheets', `<@${p.user_id}>\u2019s sheet${p.approval_post_ok === 0 ? ' \u2014 _its queue post never landed_' : ''}`, p.approval_requested_at,
+      page ? at(page) : at(row.approval_ch_id || approvalDestination(gid, 'sheets'), row.approval_msg_id));
+  }
+  for (const l of all("SELECT * FROM lore WHERE guild_id=? AND state='pending' ORDER BY submitted_at"))
+    add('lore', `<@${l.user_id}>\u2019s lore`, l.submitted_at, at(l.ch_id || approvalDestination(gid, 'lore'), l.msg_id));
+  for (const d of all("SELECT * FROM duels WHERE guild_id=? AND state='pending' ORDER BY created_at"))
+    add('duels', `\`#${d.id}\` opened by <@${d.opener}> \u00b7 ${duelFighters(d).length} standing in`, d.created_at, at(d.approval_ch_id || approvalDestination(gid, 'duels'), d.approval_msg_id));
+  for (const t of pendingMeritTrades(gid))
+    add('trades', `\`#${t.id}\` <@${t.from_user}> \u2192 <@${t.to_user}> \u00b7 **${t.amount}**`, t.created_at, at(t.ch_id, t.msg_id));
+  for (const q of all("SELECT * FROM quests WHERE guild_id=? AND status IN ('open','posted') ORDER BY number"))
+    for (const m of all("SELECT user_id, state_at FROM quest_members WHERE guild_id=? AND number=? AND state='applied'", q.number))
+      add('applicants', `<@${m.user_id}> \u2192 **${questTag(q)}**`, m.state_at || q.created_at, at(q.post_channel_id || q.plan_thread_id));
+  // Runs: their rooms.
+  for (const q of all("SELECT * FROM quests WHERE guild_id=? AND status='active' AND COALESCE(winding_down,0)=1 ORDER BY number"))
+    add('winding', `**${questTag(q)}**`, q.winding_at || q.last_activity || q.started_at, at(q.run_thread_id || q.run_channel_id));
+  for (const q of all("SELECT * FROM quests WHERE guild_id=? AND status='active' AND kind='encounter' ORDER BY number")) {
+    const last = Number(q.last_activity) || Number(q.started_at) || now;
+    if (now - last >= ENCOUNTER_IDLE_MS) add('quiet', `**${questTag(q)}** \u2014 ${Math.round((now - last) / 3600000)}h quiet`, last, at(q.run_thread_id || q.run_channel_id));
+  }
+  for (const q of all("SELECT * FROM quests WHERE guild_id=? AND instance_of IS NULL AND status='open' ORDER BY number")) {
+    const seated = all("SELECT state_at FROM quest_members WHERE guild_id=? AND number=? AND state='party'", q.number);
+    if (!seated.length) continue;
+    const first = Math.min(...seated.map(s => Number(s.state_at) || Infinity));
+    add('staged', `**${questTag(q)}** \u2014 ${seated.length} seated`, Number.isFinite(first) ? first : q.created_at, at(q.post_channel_id || q.plan_thread_id));
+  }
+  for (const c of all("SELECT * FROM campaigns WHERE guild_id=? AND status='active'")) {
+    const es = campaignEntries(gid, c.id);
+    const last = Math.max(Number(c.created_at) || 0, ...es.map(q => Number(q.created_at) || 0));
+    if (!es.length || now - last > 30 * 86400000) add('campaigns', `**${c.name}**`, last || c.created_at, at(c.thread_id));
+  }
+  // Targets left standing more than a day keep their buttons live (T, 2026-10-14).
+  for (const t of all('SELECT name, channel_id, message_id, card_id, at FROM temp_targets WHERE guild_id=? AND dead=0 AND at < ? ORDER BY at', now - 86400000))
+    add('targets', `**${t.name}** in <#${t.channel_id}> \u2014 \`/target list\` there retires it`, t.at, at(t.channel_id, t.card_id || t.message_id));
+  for (const st of listStories(gid).filter(s => s.draft_source && !s.retired)) {
+    let n = 0; try { n = JSON.parse(st.draft_problems || '[]').length; } catch {}
+    const page = activityPageRow(gid, st.name);
+    add('drafts', `**${st.name}**${n ? ` \u2014 ${n} problem${n === 1 ? '' : 's'}` : ' \u2014 ready to publish'}`, st.draft_at || page?.at || st.created_at, at(page?.thread_id));
+  }
+  for (const f of all('SELECT * FROM feedback_log WHERE guild_id=? AND at > ? ORDER BY at', now - 7 * 86400000)) {
+    const run = f.quest_number ? getQuest(gid, f.quest_number) : null;
+    add('reviews', `<@${f.user_id}>${f.scale != null ? ` \u00b7 \u2B50 ${f.scale}/10` : ''}${run ? ` on **${questTag(run)}**` : ''}`, f.at, at(feedbackDestination(gid, f.room)));
+  }
+  for (const f of all('SELECT * FROM job_failures WHERE guild_id=? ORDER BY at'))
+    add('failures', `**${f.job}** \u2014 \`${String(f.message || '').slice(0, 120)}\``, f.at, null);
   return out;
+}
+// One thing on the list: what it is, since when, where.
+function waitingLine(it, { kind = false } = {}) {
+  const icon = kind ? `${(WAITING_KINDS.find(k => k[0] === it.kind)?.[1] || '').split(' ')[0]} ` : '';
+  return `\u2022 ${icon}${it.label}${it.since ? ` \u00b7 since <t:${Math.floor(it.since / 1000)}:d>` : ''}${it.url ? ` \u00b7 [jump](${it.url})` : ''}`;
+}
+// The list by kind, each kind under its heading.
+function waitingLines(items) {
+  const out = [];
+  for (const [k, head] of WAITING_KINDS) {
+    const these = items.filter(i => i.kind === k);
+    if (!these.length) continue;
+    out.push(`${head} \u2014 ${these.length}`, ...these.map(it => waitingLine(it)), '');
+  }
+  while (out.length && out[out.length - 1] === '') out.pop();
+  return out;
+}
+// What has stalled, beside what waits on a decision: the runs, the
+// campaigns, the targets, the drafts, the reviews.
+function stalledReport(guild) {
+  return waitingLines(waitingItems(guild.id).filter(it => !QUEUE_KINDS.includes(it.kind)));
 }
 
 async function showStalled(interaction) {
   if (!(await isGm(interaction.guild, interaction.user.id)))
     return interaction.reply({ content: '\u274C The stalled view is for GMs.', ephemeral: true });
-  const out = await stalledReport(interaction.guild);
-  return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] }, content: out.length
-    ? ['\u{1F6A7} **Waiting on a GM**', '', ...out].join('\n').slice(0, 1900)
-    : '\u2705 Nothing is waiting on a GM.' });
+  const out = stalledReport(interaction.guild);
+  if (!out.length) return interaction.reply({ ephemeral: true, content: '\u2705 Nothing is waiting on a GM.' });
+  // Every one with its date and a link (T, 2026-11-17); a long list in parts.
+  return replyLong(interaction, ['\u{1F6A7} **Waiting on a GM**', '', ...out], { ephemeral: true, allowedMentions: { parse: [] } });
 }
 
 // The ready check's card: a line per seated player, ticked once they
@@ -22465,39 +22929,45 @@ async function sessionNpcs(interaction, gid, run) {
 // as a pdf without closing it"): the record so far as the scroll a finished
 // run hangs on its card. Nothing is closed, paid or posted; it answers its
 // GM alone unless share:true hangs it in the room.
+// The whole record, start to the last word (T, 2026-11-17), and `filename:`
+// names the file and heads its first page.
 async function sessionSummary(interaction, gid, run) {
   const share = !!interaction.options.getBoolean('share');
   await interaction.deferReply({ ephemeral: !share });
   const live = getQuest(gid, run.number) || run;
-  const { file, beatN, runMs } = await runSoFarFile(interaction.guild, gid, live, interaction.user.id);
-  const { AttachmentBuilder } = require('discord.js');
-  return interaction.editReply({ allowedMentions: { parse: [] }, files: [new AttachmentBuilder(file.pdf, { name: file.name })],
-    content: `\u{1F4DC} **${questTag(live)}** — the story so far: ${beatN} beat${beatN === 1 ? '' : 's'} over ${fmtElapsed(runMs)}. ${live.status === 'active' ? 'The run is still open; nothing was closed or paid.' : 'This run has already ended.'}${share ? '' : ' Only you can see this — `share:true` posts it in the room.'}` });
+  const { files, beatN, talkN, runMs } = await runSoFarFile(interaction.guild, gid, live, interaction.user.id, { filename: interaction.options.getString('filename') });
+  const batches = scrollFileBatches(files);
+  await interaction.editReply({ allowedMentions: { parse: [] }, files: batches[0] || [],
+    content: `\u{1F4DC} **${questTag(live)}** — the story so far: ${beatN} beat${beatN === 1 ? '' : 's'}${talkN ? ` and ${talkN} line${talkN === 1 ? '' : 's'} of talk` : ''} over ${fmtElapsed(runMs)}${files.length > 1 ? `, in ${files.length} parts` : ''}. ${live.status === 'active' ? 'The run is still open; nothing was closed or paid.' : 'This run has already ended.'}${share ? '' : ' Only you can see this — `share:true` posts it in the room.'}` });
+  for (const more of batches.slice(1)) await interaction.followUp({ ephemeral: !share, files: more, allowedMentions: { parse: [] } }).catch(() => {});
 }
 // The story so far as a file: the parchment scroll where it can be painted,
 // else the same record in plain print. /session summary and the wind-down
 // post share it (T, 2026-11-17).
-async function runSoFarFile(guild, gid, live, fallbackGmId = null) {
+async function runSoFarFile(guild, gid, live, fallbackGmId = null, { filename = null } = {}) {
   const partyNames = [];
   for (const id of getQuestMembers(gid, live.number, 'party')) partyNames.push(await getDisplayName(guild, id).catch(() => 'someone'));
   const runnerName = await getDisplayName(guild, archiveGmOf(live) || fallbackGmId).catch(() => 'a GM');
   const runMs = live.status === 'active' ? questElapsed(live) : (Number(live.elapsed_ms) || 0);
+  // Talk cut at 300 before build R is read again from its thread, once.
+  await mendCutTalk(guild?.client, gid, live).catch(() => 0);
   const events = questEvents(gid, live.number);
   const beatN = events.filter(e => !['remind', 'recap', 'talk'].includes(e.kind)).length;
-  let file = null;
-  if (hasCanvas()) {
-    try { file = runStoryScroll(gid, live, { runnerName, partyNames, runMs, events, tale: '', sofar: true }); }
-    catch (e) { console.error('[session] summary scroll -', e?.message || e); }
-  }
-  if (!file) {
-    // No parchment to paint on: the same record as plain printed text.
+  const talkN = events.filter(e => e.kind === 'talk' && !e.gone).length;
+  let files = null;
+  try { files = runStoryScroll(gid, live, { runnerName, partyNames, runMs, events, tale: '', sofar: true, filename, nameOf: memberNameOf(guild) }).files; }
+  catch (e) { console.error('[session] summary scroll -', e?.message || e); }
+  if (!files) {
+    // The printed scroll failed: the same record in plain print, every page.
+    const own = filename ? scrollFileName(filename) : null;
     const body = [`Run by ${runnerName}`, `The party: ${partyNames.join(', ') || 'nobody'}`, `It has run for ${fmtElapsed(runMs)} so far.`, '',
-      ...(beatN ? events.filter(e => !['remind', 'recap', 'talk'].includes(e.kind)).slice(0, STORY_BEATS_MAX)
-        .map(e => `${fmtElapsed(e.at_ms)}  ${String(e.text || e.kind).replace(/<@[!&]?\d+>/g, 'someone').replace(/[*_`]+/g, '').replace(/\s*\n\s*/g, ' ')}`)
-        : ['Nothing has been written down yet.'])].join('\n').slice(0, SCROLL_BODY_MAX);
-    file = { pdf: makeTextPdf({ title: `${questTag(live)} — so far`, body }), name: `${fileSlug(`${questTag(live)} so far`, 'run-so-far')}.pdf` };
+      ...(events.some(e => !['remind', 'recap'].includes(e.kind) && !(e.kind === 'talk' && e.gone))
+        ? events.filter(e => !['remind', 'recap'].includes(e.kind) && !(e.kind === 'talk' && e.gone))
+          .map(e => `${fmtElapsed(e.at_ms)} - ${String(e.text || e.kind).replace(/<@[!&]?\d+>/g, 'someone').replace(/[*_`]+/g, '').replace(/\s*\n\s*/g, ' ')}`)
+        : ['Nothing has been written down yet.'])].join('\n');
+    files = [{ pdf: makeTextPdf({ title: own?.heading || `${questTag(live)} — so far`, body }), name: `${own?.stem || fileSlug(`${questTag(live)} so far`, 'run-so-far')}.pdf` }];
   }
-  return { file, beatN, runMs };
+  return { files, file: files[0], beatN, talkN, runMs };
 }
 // ── The wind-down post (T, 2026-11-17) ──
 // "Post in that instance all of the hourly summaries in order, the pdf
@@ -22539,14 +23009,15 @@ async function postWindDown(guild, gid, quest, ch, gmId = null) {
     '', `**The run, hour by hour** \u2014 ${fmtElapsed(now)} in all:`, ...hourBlocks(questEvents(gid, live.number), now)];
   // What the log holds was written by players: it is shown, never sent as pings.
   await sendLong(ch, lines, { allowedMentions: { parse: [] } });
-  let file = null;
-  try { ({ file } = await runSoFarFile(guild, gid, live, gmId)); } catch (e) { console.error('[winddown] story -', e?.message || e); }
-  const { ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder } = require('discord.js');
+  let files = [];
+  try { ({ files } = await runSoFarFile(guild, gid, live, gmId)); } catch (e) { console.error('[winddown] story -', e?.message || e); }
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
   const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`fbq:${live.number}`)
     .setLabel('\u{1F4DD} Review this run').setStyle(ButtonStyle.Secondary));
-  await ch.send({ allowedMentions: { parse: [] }, components: [row],
-    ...(file ? { files: [new AttachmentBuilder(file.pdf, { name: file.name })] } : {}),
-    content: `\u{1F4DC} ${file ? 'The story so far rides with this.' : 'The story so far could not be written out just now \u2014 `/session summary` tries again.'} If you played, **\u{1F4DD} Review this run** tells the GMs how it went \u2014 a score out of ten and a few words, seen by them alone.` }).catch(e => console.error('[winddown] post -', e?.message || e));
+  const batches = scrollFileBatches(files);
+  await ch.send({ allowedMentions: { parse: [] }, components: [row], files: batches[0] || [],
+    content: `\u{1F4DC} ${files.length ? `The story so far rides with this${files.length > 1 ? `, in ${files.length} parts` : ''} \u2014 every beat and every word said.` : 'The story so far could not be written out just now \u2014 `/session summary` tries again.'} If you played, **\u{1F4DD} Review this run** tells the GMs how it went \u2014 a score out of ten and a few words, seen by them alone.` }).catch(e => console.error('[winddown] post -', e?.message || e));
+  for (const more of batches.slice(1)) await ch.send({ files: more, allowedMentions: { parse: [] } }).catch(() => {});
 }
 
 // /session thread: the room, for a run that started before the forum was
@@ -22584,7 +23055,7 @@ function draftEndingFromLog(gid, quest, names) {
     ...beats.slice(0, 14).map(b => `\u00b7 ${b.text.slice(0, 200)}${b.n > 1 ? ` (\u00d7${b.n})` : ''}`),
     beats.length > 14 ? `\u00b7 \u2026and ${beats.length - 14} more moments.` : '',
     rolls.length ? `They rolled ${rolls.length} times${wins + losses ? ` \u2014 ${wins} went their way, ${losses} did not` : ''}.` : '',
-    story.length && talk.length ? `${talk.length} line${talk.length === 1 ? '' : 's'} of table talk are kept in the transcript.` : '',
+    story.length && talk.length ? `${talk.length} line${talk.length === 1 ? '' : 's'} of table talk are kept in the story.` : '',
     'And there it ended.',
   // What the GM is shown is what Use this posts (cold audit: it was cut at
   // 1700 on screen and posted whole).
@@ -23509,7 +23980,7 @@ async function handleQuest(interaction, forced) {
     if (quest.status !== 'active')
       return interaction.reply({ ephemeral: true, content: `\u274C **${questTag(quest)}** is not running.` });
     const back = !!interaction.options.getBoolean('resume');
-    updateQuest(gid, quest.number, { winding_down: back ? 0 : 1 });
+    updateQuest(gid, quest.number, { winding_down: back ? 0 : 1, winding_at: back ? null : Date.now() });
     try {
       logQuestEvent(gid, quest.number, 'note',
         back ? 'Back to running' : 'Winding down \u2014 rewards being settled', interaction.user.id);
@@ -23694,6 +24165,8 @@ async function handleQuest(interaction, forced) {
     // The summary: the whole timeline, the party, and how long it took.
     const partyNames = [];
     for (const id of party) partyNames.push(await getDisplayNameCached(interaction.guild, id, nameCache));
+    // Talk cut at 300 before build R is read again from its thread, once.
+    await mendCutTalk(interaction.client, gid, getQuest(gid, number) || quest).catch(() => 0);
     const events = questEvents(gid, number);
     const runner = getQuest(gid, number)?.gm_id ?? uid;
     const runnerName = await getDisplayNameCached(interaction.guild, runner, nameCache);
@@ -23707,7 +24180,7 @@ async function handleQuest(interaction, forced) {
       `⏱️ **${fmtElapsed(runMs)}** · 👥 ${partyNames.join(', ')}`,
       '─────────────────────────────',
       ...(logged.length ? logged.map(questEventLine) : ['_Nothing was logged._']),
-      ...(talkN ? [`\u{1F4AC} ${talkN} line${talkN === 1 ? '' : 's'} of table talk recorded \u2014 in the transcripts.`] : []),
+      ...(talkN ? [`\u{1F4AC} ${talkN} line${talkN === 1 ? '' : 's'} of table talk recorded \u2014 every word in the story; the raw transcript is the GMs\u2019.`] : []),
     ];
     if (quest.merit_reward > 0) summary.push('', `🎖️ +${quest.merit_reward} merit each.`);
     if (quest.rewards) summary.push(`🎁 ${quest.rewards}`);
@@ -23763,36 +24236,31 @@ async function handleQuest(interaction, forced) {
       ? [`📒 [The GM record](${summaryUrl}) — timings, events and payouts, GM eyes only.`]      : ['_No quest log channel set, so the summary was not posted — a GM can set one with `/config channels questlog`._']));
     if (!logChId) lines.push(...summary.slice(2, 14));
 
-    // The run's story as a scroll, hung on the card (T, 2026-10-14). The
-    // parchment needs the canvas; without it the card goes out bare.
-    let storyFile = null;
-    if (hasCanvas()) {
-      try { storyFile = runStoryScroll(gid, quest, { runnerName, partyNames, runMs, events, tale }); }
-      catch (e) { console.error('[quest] story scroll -', e?.message || e); }
-    }
-    if (storyFile) lines.push(`\u{1F4DC} The run\u2019s story rides below as a scroll \u2014 the party, the night, every beat.`);
-    const { AttachmentBuilder: FbFile } = require('discord.js');
-    const storyFiles = storyFile ? [new FbFile(storyFile.pdf, { name: storyFile.name })] : [];
-    // The talk twice over (2026-11-07): the corrected transcript rides with
-    // the story for everyone; the raw one goes to the GMs.
+    // The run's story as a scroll, hung on the card (T, 2026-10-14): every
+    // beat and every word said, each whole and in order, printed \u2014 no
+    // canvas needed \u2014 and in numbered parts if it outgrows one file
+    // (T, 2026-11-17). The talk is in it, so no transcript rides beside it.
+    let story = null;
+    try { story = runStoryScroll(gid, quest, { runnerName, partyNames, runMs, events, tale, nameOf: memberNameOf(interaction.guild) }); }
+    catch (e) { console.error('[quest] story scroll -', e?.message || e); }
+    if (story) lines.push(`\u{1F4DC} The run\u2019s story rides below as a scroll \u2014 the party, the night, every beat and every word said${story.files.length > 1 ? `, in ${story.files.length} parts` : ''}.`);
+    const storyBatches = story ? scrollFileBatches(story.files) : [];
+    const storyFiles = storyBatches[0] || [];
+    // The raw talk \u2014 as first typed, every edit and deletion shown \u2014 is
+    // the GMs' alone.
     const talkT = runTranscripts(gid, quest, { runnerName, partyNames, runMs });
-    if (talkT.corrected) {
-      storyFiles.push(new FbFile(talkT.corrected.attachment, { name: talkT.corrected.name }));
-      lines.push(`\u{1F5D2}\uFE0F ${talkT.count} line${talkT.count === 1 ? '' : 's'} of table talk ride below as a transcript, as the thread reads now.`);
-    }
-    // The GM run archive: a post under whoever ran it \u2014 the record, both
-    // scrolls, both transcripts.
+    // The GM run archive: a post under whoever ran it \u2014 the record, the
+    // story in all its parts, the raw talk.
     let recordFile = null;
-    if (hasCanvas()) {
-      try { recordFile = runRecordScroll(gid, quest, summary); }
-      catch (e) { console.error('[quest] record scroll -', e?.message || e); }
-    }
+    try { recordFile = runRecordScroll(gid, quest, summary); }
+    catch (e) { console.error('[quest] record scroll -', e?.message || e); }
     const archivedPost = await archiveFinishedRun(interaction.client, interaction.guild, gid, quest, {
       gmId: runner, partyNames, runMs, merits: Number(quest.merit_reward) || 0, titles: earned ? [earned] : [],
-      record: summary, storyFile, recordFile, talk: talkT });
+      record: summary, storyFiles: story?.files || [], recordFile, talk: { raw: talkT.raw } });
     // No archive: the raw transcript waits in the GM quest log instead.
     if (!archivedPost && talkT.raw && logChId) {
       try {
+        const { AttachmentBuilder: FbFile } = require('discord.js');
         const logRaw = await interaction.client.channels.fetch(logChId);
         await logRaw.send({ content: `\u{1F5D2}\uFE0F **${questTag(quest)}** \u2014 the table talk, raw: as first typed, every edit and deletion shown.`,
           files: [new FbFile(talkT.raw.attachment, { name: talkT.raw.name })], allowedMentions: { parse: [] } });
@@ -23815,10 +24283,13 @@ async function handleQuest(interaction, forced) {
       try {
         const rc = await interaction.client.channels.fetch(home);
         await rc.send({ content: `${announce}\n\n\u{1F4DD} How was it? A word for the GMs helps the next run.`, components: [fbRow], files: storyFiles, allowedMentions: { parse: [] } });
+        for (const more of storyBatches.slice(1)) await rc.send({ files: more, allowedMentions: { parse: [] } }).catch(() => {});
       } catch {}
       return interaction.editReply({ content: `${announce}\n\n_(Also posted in <#${home}>, with the review button.)_`, allowedMentions: { parse: [] } });
     }
-    return interaction.editReply({ content: announce, components: [fbRow], files: storyFiles, allowedMentions: { parse: [] } });
+    const doneReply = await interaction.editReply({ content: announce, components: [fbRow], files: storyFiles, allowedMentions: { parse: [] } });
+    for (const more of storyBatches.slice(1)) await interaction.followUp({ files: more, allowedMentions: { parse: [] } }).catch(() => {});
+    return doneReply;
   }
 
   if (sub === 'delete') {
@@ -24250,8 +24721,8 @@ function saveActivity(gid, uid, text, { publish = 'auto', via = 'paste' } = {}) 
       db.prepare(`INSERT INTO stories (guild_id, name, author_id, start_scene, tally, created_at) VALUES (?,?,?,?,?,?)`)
         .run(gid, name, uid, 'start', null, Date.now());
     }
-    db.prepare('UPDATE stories SET draft_source=?, draft_problems=? WHERE guild_id=? AND name=? COLLATE NOCASE')
-      .run(raw, JSON.stringify(parsed.problems), gid, name);
+    db.prepare('UPDATE stories SET draft_source=?, draft_problems=?, draft_at=? WHERE guild_id=? AND name=? COLLATE NOCASE')
+      .run(raw, JSON.stringify(parsed.problems), Date.now(), gid, name);
     try { deleteStory(gid, draftName(name)); } catch {}
     queueActivityMirror(gid, name);
     const n = parsed.problems.length;
@@ -24279,7 +24750,7 @@ function saveActivity(gid, uid, text, { publish = 'auto', via = 'paste' } = {}) 
       db.prepare(`INSERT INTO stories (guild_id, name, author_id, start_scene, tally, created_at) VALUES (?,?,?,?,?,?)`)
         .run(gid, name, uid, parsed.start, parsed.tally ?? null, Date.now());
     }
-    db.prepare('UPDATE stories SET draft_source=?, draft_problems=NULL WHERE guild_id=? AND name=? COLLATE NOCASE').run(raw, gid, name);
+    db.prepare('UPDATE stories SET draft_source=?, draft_problems=NULL, draft_at=? WHERE guild_id=? AND name=? COLLATE NOCASE').run(raw, Date.now(), gid, name);
     queueActivityMirror(gid, name);
     out.status = 'waiting';
     const why = publish === 'draft' ? 'held back as a draft, as asked'
@@ -28634,10 +29105,16 @@ const SETUP_PLAN = [
     about: 'One thread per campaign \u2014 GM eyes only; the arc, its linked runs, and where things stand.' },
   { key: 'updates_forum',         name: 'updates',          forum: true,  gm: false, essential: false,
     about: 'What changed for players \u2014 one dated thread per update.' },
+  { key: 'chronicle_forum',       name: 'chronicle',        forum: true,  gm: false, essential: false,
+    about: 'The table\u2019s week, once a week: quests completed, titles granted, fights won, the fallen and the dice.' },
   { key: 'gm_updates_forum',      name: 'gm-updates',       forum: true,  gm: true,  essential: false,
-    about: 'What changed for GMs, and what each deploy mended \u2014 one dated thread each.' },
-  { key: 'gm_digest_forum',       name: 'gm-digest',        forum: true,  gm: true,  essential: false,
-    about: 'The weekly digest of what is waiting on a GM \u2014 one thread per week, titled by its Monday.' },
+    about: 'What changed for GMs \u2014 one dated thread per update.' },
+  { key: 'gm_daily_forum',        name: 'gm-daily',         forum: true,  gm: true,  essential: false,
+    about: 'A thread a day: at 08:00 what is waiting on a GM, each with its date and a link; the day\u2019s restart reports beneath.' },
+  { key: 'gm_digest_forum',       name: 'gm-weekly',        forum: true,  gm: true,  essential: false,
+    about: 'A thread a week, titled by its Monday: the week\u2019s activities, then everything waiting on a GM with dates and links. Pings the GMs.' },
+  { key: 'gm_monthly_forum',      name: 'gm-monthly',       forum: true,  gm: true,  essential: false,
+    about: 'A thread a month, on the 1st: runs and hours by GM, reviews, campaigns, quiet players, titles and merits, the fallen, activities, command use, then what has waited since before the month. Pings the GMs.' },
   { key: 'feedback_routes', json: 'forum', name: 'gm-feedback', forum: true, gm: true, essential: false,
     about: 'Player feedback, one thread per category \u2014 GM eyes only; players post with `/feedback send`.' },
   { key: 'gm_char_forum',         name: 'gm-character-sheets', forum: true, gm: true, essential: false,
@@ -29592,6 +30069,22 @@ const CHANGELOG = [
         detail: 'The library holds 5e monsters and spells; on a Knightfall server it now says so rather than filling rows nothing reads. The `/roll` note is the roller’s alone.' },
       { line: 'Fixed: an NPC named with “Discord” or “Clyde” spoke as the bot; on 5e the exchange read Armour Class as “undefined”',
         detail: 'Discord refuses those words in a webhook’s name; a hair space after the first letter passes and reads the same.' },
+      { line: 'The story PDF is the whole record now: every logged beat and every recorded message, each whole, in order, from the first to the last — no caps; past Discord’s file size it goes in numbered parts',
+        detail: '`/session summary`, the wind-down post, the completion card and the GM run archive all print it. Talk is no longer cut at 300 characters; a line cut before this build is read again from its thread once, the first time a story is printed. Deleted talk stays out; an edit stands as it always has. The PDF is printed as real text on the same parchment, its type carried inside the file: it needs no canvas, the words can be copied, and a long night stays a small file. The corrected transcript that rode beside the story is gone — the talk is in the story; the raw one, as first typed, still goes to the GM archive.' },
+      { line: 'The story reads by rule 1: “time - **Name**”, then each action in italics, each speech in quotes and anything else as written, in the order posted; one heading for a run of the same speaker, a blank line at each change; rolls, fights and notes are lines of their own',
+        detail: 'Runs from before read the same way: their lines are taken apart again from how they were written. The GM record and `/fight log scroll:true` are printed the same way, names in bold where the record marks them.' },
+      { line: '`filename:` on `/session summary` and `/fight log scroll:true` names the file and heads its first page',
+        detail: 'The heading is what you typed; the file takes it with dashes for spaces and without the characters a file name cannot hold. A story in parts is called it with “part 1 of 2” added, each part headed the same.' },
+      { line: 'A **Raw** box after What you do and What you say on every roleplay form — `/rp`, the fight forms, a target’s strike, a lost first turn, the NPC Speak as and Answer boxes: `*action*` in asterisks, `"speech"` in quotes, posted in the order you write them',
+        detail: 'Each part goes out on its own line — action, action, speech, speech, speech, action, as written — and the record keeps them so. Curly quotes count; what sits outside the marks is a plain line of its own; two stars are bold, not an action. A GM’s `/rp` box has Raw where Dice was (`/rp dice:` still rolls). `/npc say raw:` still posts exactly as typed, and the record reads it the same way.' },
+      { line: 'The NPC boxes’ Groups list moved to `/npc say to:`, which now completes as you type — people, knight orders and groups; `/rp to:` too',
+        detail: 'It completes the piece after the last comma and keeps the ones before. A box opened before this build still honours its Groups pick.' },
+      { line: 'Four forums where there were two: **gm-daily** (a thread a day — at 08:00 what is waiting on a GM, no ping; each restart’s Deploy mend beneath), **gm-weekly** (gm-digest, renamed in place), **gm-monthly** (on the 1st) and the players’ **chronicle**; updates and gm-updates keep What’s new alone',
+        detail: 'gm-monthly pings the GMs with the month gone: runs and hours by GM, reviews and their average, campaigns, players quiet thirty days, titles and merits, the fallen, activities and command use, then everything still waiting from before the month, oldest first. gm-weekly keeps its Monday thread and its ping. On the first boot the old Deploy mends move from gm-updates into gm-daily, merged a thread a day, oldest first, and the Weekly chronicles from updates into chronicle; a thread someone else wrote in stays where it is. What’s new is not posted again.' },
+      { line: 'Everything waiting on a GM has the date it has waited since and a link to it — in gm-daily, gm-weekly, gm-monthly, `/gm queue` and `/gm check stalled`',
+        detail: 'A sheet links to its character page; lore, duels and trades to their queue posts; applicants and staged parties to the quest; runs to their rooms; campaigns to their thread; targets to their card; drafts to their shelf thread; reviews to their gm-feedback room.' },
+      { line: 'Fixed: a fight card posted in an NPC’s name was logged as the NPC’s speech',
+        detail: 'Only what an NPC says through `/npc say` or its boxes goes into the record as its words now; its fight moves are there already, as the fight’s own lines.' },
     ], player: [
       'Every fight roll you could reroll waits: \u{1F501} Reroll (a token) or ✅ Keep. Go quiet and it is kept. Called checks and `/deception` too',
       'Saves, holds, breaks, deflections, disarms and escapes can be rerolled now',
@@ -29610,6 +30103,9 @@ const CHANGELOG = [
       'The turn clock’s reminders and skips land on the second',
       'On 5e: grapple and escape are Athletics against Athletics or Acrobatics, disarm is your attack roll, and a feint gives advantage on your next attack on them',
       'Summaries are in plain type now, still on parchment',
+      'The run’s story PDF holds every word now — everything that happened and everything said, in order, each speaker’s lines under their name',
+      'Roleplay boxes have a Raw box: `*action*` in asterisks, `"speech"` in quotes — posted in the order you write them',
+      'The weekly chronicle has its own forum: **chronicle**',
     ] },
   { key: '2026-11-10', gm: [
       { line: 'Initiative, reworked: natural 20s go first and their first turn holds two actions; natural 1s go last and their first turn is roleplay only; a level total goes to whoever rolled first \u2014 no more rerolls',
@@ -30068,6 +30564,117 @@ function pruneLedgers(gid) {
   return out;
 }
 
+// \u2500\u2500 The forums split (T, 2026-11-17), once \u2500\u2500
+// gm-digest becomes gm-weekly in place; every old Deploy mend leaves
+// gm-updates for gm-daily, merged a thread a day, oldest first; every
+// Weekly chronicle leaves updates for chronicle, oldest first. A thread
+// someone else has written in stays where it is. What's new is not posted
+// again. Waits, and tries again next boot, until both new forums exist.
+const snowflakeMs = (id) => { try { return Number((BigInt(id) >> 22n) + 1420070400000n); } catch { return Date.now(); } };
+// A forum's own dated threads, live and archived, every page of them.
+async function allDatedThreads(client, forum) {
+  const seen = new Map();
+  const take = (got) => {
+    for (const t of got?.threads?.values?.() || []) {
+      if (t.ownerId && t.ownerId !== client.user.id) continue;
+      const m = DATED_TITLE_RE.exec(t.name || '');
+      if (m) seen.set(t.id, { t, key: `${m[3]}${m[2]}${m[1]}`, kind: m[4] });
+    }
+  };
+  take(await forum.threads.fetchActive().catch(() => null));
+  let before;
+  for (let page = 0; page < 20; page++) {
+    const got = await forum.threads.fetchArchived?.({ limit: 100, ...(before ? { before } : {}) }).catch(() => null);
+    if (!got) break;
+    take(got);
+    const stamps = [...(got.threads?.values?.() || [])].map(t => Number(t.archiveTimestamp) || 0).filter(Boolean);
+    if (!got.hasMore || !stamps.length) break;
+    before = new Date(Math.min(...stamps)).toISOString();
+  }
+  return [...seen.values()].sort((a, b) => a.key.localeCompare(b.key) || (BigInt(a.t.id) < BigInt(b.t.id) ? -1 : 1));
+}
+// A thread's messages, oldest first \u2014 or null when anyone but the bot
+// has written in it.
+async function botOnlyMessages(client, t) {
+  const got = await t.messages.fetch({ limit: 100 }).catch(() => null);
+  const msgs = [...(got?.values?.() || [])].sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+  if (!msgs.length || msgs.some(m => m.author?.id !== client.user.id)) return null;
+  return msgs;
+}
+async function splitUpdateForums(client, gid) {
+  const cfg = getConfig(gid) || {};
+  if (Number(cfg.forums_split_at) > 0) return [];
+  const out = [];
+  const wait = () => (ARCHIVE_PACE_MS ? new Promise(r => setTimeout(r, ARCHIVE_PACE_MS)) : null);
+  // gm-digest is gm-weekly, and the about lines say what each forum holds now.
+  const weekly = cfg.gm_digest_forum ? await client.channels.fetch(cfg.gm_digest_forum).catch(() => null) : null;
+  if (weekly?.edit && weekly.name === 'gm-digest') {
+    const about = SETUP_PLAN.find(p => p.key === 'gm_digest_forum')?.about || '';
+    out.push(await weekly.edit({ name: 'gm-weekly', topic: about.slice(0, 1000) }).then(() => 'gm-digest is gm-weekly now').catch(() => 'gm-digest could not be renamed gm-weekly \u2014 rename it by hand'));
+  }
+  const gu = cfg.gm_updates_forum ? await client.channels.fetch(cfg.gm_updates_forum).catch(() => null) : null;
+  if (gu?.edit && /deploy mended/i.test(String(gu.topic || ''))) await gu.edit({ topic: (SETUP_PLAN.find(p => p.key === 'gm_updates_forum')?.about || '').slice(0, 1000) }).catch(() => {});
+  if (!cfg.gm_daily_forum || !cfg.chronicle_forum) return out;
+  let kept = 0;
+  // The old Deploy mends: a gm-daily thread a day, each report beneath.
+  const daily = await client.channels.fetch(cfg.gm_daily_forum).catch(() => null);
+  let days = 0, mends = 0;
+  if (gu?.threads?.fetchActive && daily?.threads?.create) {
+    const have = new Set((await allDatedThreads(client, daily)).map(x => x.t.name));
+    const byDay = new Map();
+    for (const x of (await allDatedThreads(client, gu)).filter(x => x.kind === 'Deploy mend')) {
+      if (!byDay.has(x.key)) byDay.set(x.key, []);
+      byDay.get(x.key).push(x);
+    }
+    for (const list of byDay.values()) {
+      const reports = [];
+      for (const x of list) {
+        const msgs = await botOnlyMessages(client, x.t);
+        if (!msgs) { kept++; continue; }
+        reports.push({ t: x.t, at: snowflakeMs(x.t.id), text: msgs.map(m => m.content || '').filter(Boolean).join('\n') });
+      }
+      if (!reports.length) continue;
+      const title = `${list[0].t.name.replace(/ \u00b7 Deploy mend$/, '')} \u00b7 Daily`.slice(0, 100);
+      // A day already moved (a restart midway) is not moved twice.
+      if (!have.has(title)) {
+        const t = await daily.threads.create({ name: title, autoArchiveDuration: 10080,
+          message: { content: '\u{1F5D3}\uFE0F **The day\u2019s restart reports** \u2014 moved here from gm-updates.', allowedMentions: { parse: [] } } }).catch(e => { console.error('[forums-split] daily', e?.message || e); return null; });
+        if (!t) continue;
+        for (const r of reports) for (const c of chunkLines(`-# <t:${Math.floor(r.at / 1000)}:t>\n${r.text}`, 1900)) await t.send({ content: c, allowedMentions: { parse: [] } }).catch(() => {});
+        await t.setArchived?.(true).catch(() => {});
+        await wait();
+      }
+      for (const r of reports) { if (await r.t.delete().then(() => true).catch(() => false)) mends++; await wait(); }
+      days++;
+    }
+  }
+  // The Weekly chronicles: chronicle, oldest first.
+  const up = cfg.updates_forum ? await client.channels.fetch(cfg.updates_forum).catch(() => null) : null;
+  const chron = await client.channels.fetch(cfg.chronicle_forum).catch(() => null);
+  let tales = 0;
+  if (up?.threads?.fetchActive && chron?.threads?.create) {
+    const have = new Set((await allDatedThreads(client, chron)).map(x => x.t.name));
+    for (const x of (await allDatedThreads(client, up)).filter(x => x.kind === 'Weekly chronicle')) {
+      const msgs = await botOnlyMessages(client, x.t);
+      if (!msgs) { kept++; continue; }
+      if (!have.has(x.t.name)) {
+        const t = await chron.threads.create({ name: x.t.name, autoArchiveDuration: 10080,
+          message: { content: msgs[0].content || '\u200b', allowedMentions: { parse: [] } } }).catch(e => { console.error('[forums-split] chronicle', e?.message || e); return null; });
+        if (!t) continue;
+        for (const m of msgs.slice(1)) await t.send({ content: m.content || '\u200b', allowedMentions: { parse: [] } }).catch(() => {});
+        await wait();
+      }
+      if (await x.t.delete().then(() => true).catch(() => false)) tales++;
+      await wait();
+    }
+  }
+  setConfig(gid, { forums_split_at: Date.now() });
+  if (mends) out.push(`${mends} old Deploy mend thread${mends === 1 ? '' : 's'} moved into gm-daily, ${days} day${days === 1 ? '' : 's'}`);
+  if (tales) out.push(`${tales} Weekly chronicle thread${tales === 1 ? '' : 's'} moved into chronicle`);
+  if (kept) out.push(`${kept} thread${kept === 1 ? '' : 's'} someone else had written in left where ${kept === 1 ? 'it was' : 'they were'}`);
+  return out;
+}
+
 async function bootMend(client) {
   for (const [gid, guild] of client.guilds.cache) {
     const cfg = getConfig(gid) || {};
@@ -30095,6 +30702,10 @@ async function bootMend(client) {
         reseed = true;
         made.push(`gm-updates: ${wiped} What\u2019s new thread(s) removed and the catalogue re-posted with the detail beneath (${CHANGELOG.length} entries)`);
       }
+      // The forums split (T, 2026-11-17), once: gm-digest is gm-weekly, the
+      // old Deploy mends move to gm-daily and the Weekly chronicles to
+      // chronicle.
+      made.push(...await splitUpdateForums(client, gid).catch(e => { console.error('[forums-split]', e?.message || e); return []; }));
       // What changed, if anything is new since the last boot.
       await announceChangelog(client, guild, { gmAll: reseed }).catch(e => console.error('[changelog]', e?.message || e));
       if (reseed) setConfig(gid, { gm_updates_reseeded_at: Date.now() });
@@ -30106,16 +30717,14 @@ async function bootMend(client) {
       if (after.gm_digest_forum && !after.gm_digest_seeded_at) {
         const posted = await postWeeklyDigest(client, guild).catch(e => { console.error('[digest]', e?.message || e); return null; });
         setConfig(gid, { gm_digest_seeded_at: Date.now() });
-        if (posted) made.push('the first weekly digest, posted in gm-digest');
+        if (posted) made.push('the first weekly digest, posted in gm-weekly');
       }
       // Dated threads sit in date order; one posted out of turn is re-posted.
       for (const fid of [after.gm_updates_forum, after.updates_forum])
         made.push(...await tidyDatedForum(client, fid).catch(e => { console.error('[dated-thread]', 'tidy', e?.message || e); return []; }));
-      // A deploy announces what it did, as a dated thread in gm-updates rather
-      // than only on the host's console (T, 2026-09-29 / 10-11) \u2014 posted last,
-      // so the day's report tops the forum above the day's What's new.
-      if (made.length) await postDatedThread(client, after.gm_updates_forum, 'Deploy mend', Date.now(),
-        ['\u{1F527} **Deploy mend**', '', ...made.map(l => `\u00b7 ${l}`)]);
+      // A deploy says what it did (T, 2026-09-29 / 10-11) \u2014 beneath the day's
+      // list in gm-daily since build R; gm-updates keeps What's new alone.
+      if (made.length) await postRestartReport(client, gid, made).catch(e => console.error('[daily] report -', e?.message || e));
     } catch (e) { console.log(`[mend] ${guild.name}: ${e?.message || e}`); }
   }
 }
@@ -30611,6 +31220,14 @@ function validateScrollData(o) {
 // This is DejaVu Sans (Bitstream Vera licence, embedding-free), subset to
 // Latin + common typographic marks, ~17 KB, registered once per process.
 const STANDARD_FONT_B64 = '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AosA2wKyAAAFFwCHBRcA4QUXAJYFFwCcBRcAZAUXAJ4FFwCPBRcAqAUXAIsFFwCBArIA8AKyAJ4GtADZBrQA2Qa0ANkEPwCTCAAAhwV5ABAFfQDJBZYAcwYpAMkFDgDJBJoAyQYzAHMGBADJAlwAyQJc/5YFPwDJBHUAyQbnAMkF/ADJBkwAcwTTAMkGTABzBY8AyQUUAIcE4//6BdsAsgV5ABAH6QBEBXsAPQTj//wFewBcAx8AsAKyAAADHwDHBrQA2QQA/+wEAACqBOcAewUUALoEZgBxBRQAcQTsAHEC0QAvBRQAcQUSALoCOQDBAjn/2wSiALoCOQDBB8sAugUSALoE5QBxBRQAugUUAHEDSgC6BCsAbwMjADcFEgCuBLwAPQaLAFYEvAA7BLwAPQQzAFgFFwEAArIBBAUXAQAGtADZAosAAAM1ATUFFwCsBRcAgQUXAF4FFwBSArIBBAQAAFwEAADXCAABGwPFAHME5QCeBrQA2QLjAGQIAAEbBAAA1QQAAMMGtADZAzUAXgM1AGIEAAFzBRcArgUXAJ4CiwDbBAABIwM1AIkDxQBgBOUAwQfBAIkHwQCJB8EAYgQ/AI8FeQAQBXkAEAV5ABAFeQAQBXkAEAV5ABAHywAIBZYAcwUOAMkFDgDJBQ4AyQUOAMkCXAA7AlwAogJc//4CXAAGBjMACgX8AMkGTABzBkwAcwZMAHMGTABzBkwAcwa0ARkGTABmBdsAsgXbALIF2wCyBdsAsgTj//wE1wDJBQoAugTnAHsE5wB7BOcAewTnAHsE5wB7BOcAewfbAHsEZgBxBOwAcQTsAHEE7ABxBOwAcQI5/8cCOQCQAjn/3gI5//QE5QBxBRIAugTlAHEE5QBxBOUAcQTlAHEE5QBxBrQA2QTlAEgFEgCuBRIArgUSAK4FEgCuBLwAPQUUALoEvAA9AjkAwQQAAMEEAADuBAAAtgQAAGQIAABkAosArgKLALIEJQCuBCUArggAAOwBVv6JAzUAPwQAALAEAACwBAAAsAQAALAEAAKNBAAAsAQAALAEAACwBAAAsAQAALAEAAKNBAAAsAYAAqMGAACoBgACowYAAqMGAACoBgACowYAAKgAAPzX/XP8tv0M/M8AAQAAB23+HQAADv731vpRDlkAAQAAAAAAAAAAAAAAAAAAAOEAAQQOAZAABQAABTMFmQAA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';
+// The printed scroll's three faces (build R): DejaVu Sans, Bold and Oblique
+// (Bitstream Vera licence, embedding-free), subset to Latin, Greek and
+// Cyrillic without hinting, each kept deflated \u2014 the way a PDF reads it.
+const SCROLL_FONT_Z = {
+  r: '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',
+  b: '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',
+  i: 'eNqcfQdYVEfX8M4tu1ZEQBCpywIrIs0V1hIBEREQAREREZEmIILSi4iIXdFYUIOIioQYJcYQYgwao0nsorEQYoyxxzfN2GMMsMN/Zu7dBdT3+77nj0H3np07c+bMOWdOm0GCJBJJb8liCStxDZniMsxp/4BkiWRnNUAjEtLjMv6+2m4Iz6/g+UVyXHaGRAZ/JDXm8NwnOa0w6cAvP1rB56MSybtrU2bHJdqHTXwgkWxOBJhHCgD67OsxDN5fCM+2Kek5BXzJR2nwfZVE0vNW2vyEuC/CNsN361MkEq41Pa4ggznKfgnP/tDeel5c+mxnj3E5EsmuhxIJo58xPzun47IkSiLZ3U6+lzCSJLyVS+JrAXvAyrC/vL+dvL88iZO0Z7Nm7Q/wVpneq2dZUgdoWQM9rOdbJLykp0SCVL2RwpBVyRTo1PmSqJphmU1uF/kWTSbejmZrGjG0P8XWMb9De9oz6q+AvhX90fw6xrYOGrYwjuQH2q2XSKQu/DGJmQTogFi5oYqVy+T0R2FIf9Ry+oMAyJamINs51ckoVInrw1C4Ld6XUp2MbyTvTsGH7FBgOK5XotAkNALfDEd2/DEch3bhuErcsA3Ho53kZxsKrkS7NGdwA2Dmi5u59VIjiVTSV+Iikdh5Ivfh9kpDPTTAyNgEyZyRkrWEz5wM0IAHtSUygX/dh9t6IZXMEjGRZTVJ2frLts5KY2xsIj4MCW/8Bt/7a3Ti6JwLU2yiz6ZGfrUfGd51SRwa9dFGaWlyeLQhE6W3ONEvxBA9/Nx5GIOnWuxf+cmDPrgZObEuQxo9fTl01nbLoj3/Mfj9d9YKaH2k4770Nv8EOMxEogAcVUAjG3v34QaqYcYDjBjD4fYKGylgqxrmgbp+7toGKRC6u2rXb0fgxz94UsaiyRPnLmGjgybNL4FPizskq3b+emTVjl+3tzlXc83MiU8rfkR9Ptv2A/4b3ZiT+u3H0YnHNMfmpp74eGbiMXyiAb7tXb/tGn4u7fsv/ABbSGI77vP3AcueBL+eiNKPYCFlZIYKpR5S2NgCOmpCOg+1JwK8TIC4ArYmyBOp2TM4orD4o3djvmDmOZUnX2lPTX2x/Cb+9/AhKwtnx/GXC4J3TlZM3OK3cLv9ePTexFRzxDFWkaeTSyrHMjN24Vdp+FnZlKk/HaxEBjnOszx8FwwLi7K1PeTiVpo4NCJS8yrk4gIgHOFJNJ/yJOVI4EaBFcl3O/EzNlVqAJwgQT1QfyMDE4U9464PLJmK/8FtQUHV0VHIEBlLDfDnmo/xw5343Lb9aHwVcmAmIAW81FGKnzHBQg8s9DCcUaqMDQZADyWoF+Imkg7wn/ghfoYmMlOQ0U6k3vYxPlaFf9B8ju8ABmOYQPYEULE/dNYXyewAQ17phNR8f1V/O/YE3oaSR+H6LFw/CiXjbaNQaBYK5W5/eyK+Ca9EhU3xJ75NaEKFeGUT9HVdIuFv8BzwDcxUPoDIntxd3p89wDhpmvdqmhknntM015EPdYwTmb+0wwCVSTDwnEStIgzf2Cy/X7oB78dfI2/4PhrdZiqYpYR2hiCcxYyZleY+s7SWvJsPfxXBuyx9V7G32a0ZY6BIaocPmyrSW4UUTGND+6ef8i3/phPN03Gfq6ezJcQbZgCcKiOcwhBO8UQmNlKZlBH4SO1hAHLJ6jVdmz1jZlvFyR+So6P/WRG0Wh2dnpsVuko9Y24u/wQ/03yNl2/duh3ptx1DxVu2VlVPDlmGcy9/sG9yyFJUduWDfYAp6FX2LmDUCzCVG/JqOxWCySxHgbdxmQJlN2GMAqzb36/jiv0P+Le21JHZ9QDdWgGYDiS8Da3ViOoJYF+ZwMwDjKRsvaaIOadoV8uZmpWZq+bN+m2Z3cJ7sScfZzFXNNf21jE+uZ/OjFvgO/as27DL+7IukX45oEA59EvYT9uPjOgbKSWEPdE3MHsYyhGphQ9kTOQ771Li6d++2L0oLzst7JctMV8n2MUcTzz1d9XGA1aNe46vLYk9l8bXW1vXb9542d62orjgatCokXZ2x4ermmpSMmsrlsQkOxCNbgfzWk5pQXheRbQ5VbcwSTYTH2+Rt4w756uJUbJqTRLCfEu7ai+uRrEnWKb9PsHfAfDfA+9bwwNoa90UuiBvK+JsyO2x0mz1d57ldulJUWbor6ujjibbRR+OOSHp+HBryEdRG/mWvXh9P71bx5a/iPYeb2191Mnpj/olG+zsmEeAaSmMdJRqwSEwVlc9R9UI031sykEetgBh9y/J2N5cmlV1BenbjNo69VKbZ8A3GV9cn5vkd2TOd4/S45OR3afBFYxDSfnj+mVb/uZGNdoPxu34z6nTmhs2tc0a64ekv3yPVm+o2Ek2J8kxkCoOZiyFB7kM9KocSVls0F53i1VqJHxLRGsp70j2FcD3mKi1Xbpj3FVj08WWKIiu9qDK0VZkpvU7F1c1bV+241zy2pzVn5Zlr2lYnVmAv9Zcwz99Mmcecvr1m+efo1OZ679cn7XiEOs7K6cyJ3HBrqeOB4ou4RfN9dX/2ti+l/b581MVyy4B9aIAG8K/loR6Xoisi4EhXSStOqbCJ+UAYkgRE1Ytym7U5qmXNJ6BJzIOXUtN9mtMufRkfnwK/rlh0rYzyzK2X12Stf2qHCiGpGjA1OmEYjE+fvjf+804j1CMrSvZ8ujTZVueAw6psE304RSiNUA4jdgOI0FRpDUPa+YUWHMdk52E6TBgFNCOWhlUD5mR1gebFXdL1x8neoXqI/YKllAtF8Pf4PaQ9ejJDEDuiL/R9orr0Yp5hn2CN+LyQ+jKHnQF+r2OYvkbbI1o54BCJH+u8wxp2orZmr1P6rr3Z+iOSIe0CSdlnxzCLnuwyyGUTrAE64kzAYqyEjlYDTKFWseA/WDz64cUQFWvTi2BsFuTm0FSU+ruI3MLU8JHGJgeszIInp8a7pseG3oqBWPMlY4csbU0+WB8uE9MdFFlzNLo6X6pI4MiJvjAaPl4p6ySr5YMl3jDaOLCScgmqlaxRDVK5DYcUZb6EjkoSxNYSGtJf0EG4IO+hGe1HAcIcQ/G755W/g1yOBO9UWm2fv2nv+BDuLUBHyzZWINmIr3S1tVhK/GZD/AxPPXK0TKU8hUaiz7Ac/DJ0nWnsma/+3X2o8Cg0xU/o4DQCUs1lubI9crvSFmctQJXN+I2/NG0mVlJc9B+NOEu+mBb1iK8Av+Cr+N8KdN6uypj0S97kgqBgh3lQMGHIEkyoonJ3gC2nQIUD/PsARrQ7KmJbW5h9+KZjC3f0uqISnApr6cxBXqrQQJB0CR6IFlE78g7tabEAYH5KDBvbyR+QFEMd/XyZxsXLsSf4duapyg8FY3/4vTSjRcjkdPuzxes4Fuqdmy4Ymy+c9ld3Mqc09zcuy0vjUnCnmsXxk0nPBYBts16WGuiAKi24WSifWOrJupGR+phxvx6h9hrxR9hTcw7Xs3nypCk0CX/+QJ8F39VlL0Ajby8+AEf3xIXU7s37emCCz9Mn/5YNRyNQMYNKPLd9zZMgJUmszsDs+stMSJzg64FuZTDxMg49nIUhRrgJ25FXj7e1Ionoot3wVqZgnKedABZ8A18+zjeVbhwAe/Slo9WoIRr58gcSL+9aL9Eb8m1BjaKYuvlGtMI5pxco05hXsnbx/AtddivTnO/TniLa4C3enZ5CwjKRso1mRFMqFxTX3aOtPev06jJKNFAqYtAKdjP7YjFzuoYkUgHJ5p8ul2diwnGB60Yg9Ll+PQu/Cs+8U3dXLx9LUK5DlHPVu96NmvyzB++Tz19G63co5kfEEIo9SvaXTZt6oQJ12ISCkvS8I2KK81O2vldFOenIi4Eoq4DimrKZ27mN+GbTWUaRVkTGHtVTGKrI3NGM1J4i7HrtE6gNTQk/CZBuB4nMXJtj4iRCjuwGkU04afubfdC5V4r18K7reX46fO6ymMiDmcEywJwQPKe0CNFoYjVR33bVzOrX2r2ryM4lDG5GnX7C+aaxkF4j22lfhUZiaxKZFOHhLkmb4+B/pv3ivOT1kObPmQlwBGC6SHgcegduRxgfJAa3zyJNYdOHcOnYJs2YB+1OvIW7QwHMididkq7jgiII6eIIX1U1XoK38SP8exW+L4NUID3erS+Ak4Mg7Vs1VlnNtJOnqdaDXVVMJRH2T17MLD9mUO1CM0Y430Wj8d/4VNFaSVoxFFkgN4pyFiMm/ig3R/MeVhw+d77u9P+yrt0v/U95IfMalDYsu3b8Ff49/344MqqCokgCdwlSk1DrZRL5GCeIFalFWzUfOEHfBLfw7lN6GIa3t9YnMm3HPviJX6k2cu7aC7V187JgZ7C8Ss6EyOJPdChq8AKutFQYfjG9Jj7vQcOxL/hk4VpxWjkVwR/UJIvm+6ZdJ+kGUKgHM0+RKErKivJBHAz7pOM/5CGd5+ndkaER3tIzKmfK0zDkLiUCtYZOZI1EbQZwyUhbttXJfm53lNHlLTkOuUtuF3UBKt95tLNozCzR/tWpedodvbLq8cpqGRzomY13/JlfdUvhFP6wF7fDLNVarUVUfxWiOpHeVeT0gURgwM2DGOuWTn7zMzPfwipLbxYjXfgW/lPCh3m357/1S8zthZeeg9NQ4Zzr/K1pzzUO5f6Txpq6f5++T38i4vr5fF+e1dGzbS38lhXchtZ2MPokUDhFKrVqY9ADKRC7rG15s8OSROSaJ6AtmhtAQsJPAbgr4PQ0oRKi9ZhVIPzzwCetsQwQWOa6nv3rNzyzTXn+qaDo2EB7t7Bbb1Aj7XnjgmxXLP++8dsWXs0vorv3P1GMW0Y9ApRF/6JYJ/JkcoQ5Antwa2nrzMtP7fvBmlq5zki3ZJTEkkPB0GeDEkzQ7oDIcWpk/6M6m4g43RRk4LHa66A0dvWi3tJfloduZttCvBpQCD5aq1m6En+VxBRR6YXkARdeqjZRryIZs3tP5kjIOsPGDMq67maMhbelpSKFOpBRoa3YdUNS68jE8bovmbGmvOwkppKJqn9mWYkc4b4lM3iaIIOFrwPOerDbbZoK2IbrdvGWHDL2/P5lsq2+XWV3EYYIQz82GiIacjoGwqwnuToINpr8Ri3PB6EI6VG6/9tXw/tDnT4MKai9gMORJHf7D1BXDNpORm3AXzZo0IvsCurgTxq5ijeiSPNHiPHvwZJjV7dWi/lSD/X2b3gaVKai6RgjzJW57A/9j/HWMF8mlEZzqU+ZsdDbMEZ4f10zAFyd86o7Ue8fz30gpZzT1gzaZIWGybwSmW7NAmvQXlEdsKBq2O5Itjxia/EKtSiEWTrgNRv+mIynYGt5oKKG20mXypZ/wUaCc67pBfDbFwa9VWidcqZmacv9brSeO/6/Pitd2yZEk1pXWLCJ6tP/uLWw9BoeoKzc51Sub9WPn1RYUlk4rWDBItAwKIBaNKfeE6CTS/Tca4n0vpwjOgAEdqzL5fnTt2iHjVuafa0zSNG+mlO+l7M2N+UP8//aHJ69TB5I3JpZPZvrJ0SMuVG+podk0PCfkLp0XN+O12DL+cFhycm1MF4SBIDIwfC/HU2SJeBZSIthF3WmAu089kSGrnLIyLmvcqgj2YqQvdNv/2kuCj83orgSs79kKur58hpfxS/t9nZ+ZBcfvvSAWSXGxqmIPODUXgLGM+QzM+ue7cmZE9F2qm6ayfPRgaeL9p7Ii8j8EhS2gdOBYfxlcOa35bmRJSPGO0Lc97qPmr83rjEB2f2IKf8kCkpcUz8vw9R/caaKZPDf55bVhU2acrPwsjcRphfT6KjO+1mXv7fZkmcpOssu75o9VUP1r19r5T7qKrgh2hFQnP6723FhcHXCo/d7cNs1rfpv+Ddj3ettx+qX1bhMfzQ4MG3L36CnPICQ3/52nkO0ZdlsPs20zkDZWHMfkgIPCrUKjIS22xRnzjD2Ai5mOErxw4frx9U38/++EWp0baQOQnr213YK+uDT1fDDHxwBHeKrpAz4VCmi7L1Qq+RUs124x0D7tRxNT6H/43b42/jWxHxyV1b/UkX8upO5M2d8FVy5l4H6+jFeQHLXIKmlhZ+8gcX2+6I7+PfLCw/Gzrk+GfhkdF3T21HDtlBYXNiD+DZqzaPGh7x+8I1m9EYmB1EgbmVMDtTKjWGOsKyhDW1hORylx5e2rNX6qzN160LCUPm+/1UsPn9nkytJprZ4eI/IDzm7B5NudRIUxWTXr3RNozwCvTMuEDPOn9OpoJO8xudGpWNNxqlRr83tVUTO98URzBqaKcnMaCaXkamrTWmiAvo0HgT2bk6fZw33tIlbYYVUkEXXGzbWv74hHH+VVHV0sG/S8SZPIB+ROtKJVpX+Y31TP5jjTfD3MY2qTBuey66pvlN08goNDfF90Q8BRsvvxFfgWb/PhS+k3nBmjm+QZ1un1UyYdl06sVlaWNpjx6JUSuuWhU1LoVPkavIpxuNionnshfs0A+/WbRhRw9Kvp2OnsZRied2a9YzO+28TGfMJh+52APxyYuz8hbuqZCHaFcJ8HhzlbRjd1ulH+RFjdcb7Sb9mN99kU7t05RzsfVxqdo1IlJF+u1PPCW+09sXdRSVZgOdKDM9Tj0I8Up4UXn8z2Cv+Be4sKT08PMli1JqvF1UFs+vLtBErFj86Ovl+NW0FYtRU8V7aNyrjZvjEgKPwSq3AvcfoiP9nzQjZb9XiwvCtowa6bs4b9oWd9CMpwPPFe0/ljc/8Ehyfs3g7Ebk1Mg0lFeFh4bcmbf2vbDgsFtoTlzi3aY9uBk0SUK85oC0F50ljuLOwNiGEps3tZZaq7U658lGBJ5bUPdN/nz/L5MXVttaH8Yth/GohbkHXpbkT9sMqproq3M1yLkgODw+Ye+/7WzY5u1o0qMN2yYHh/0s8hR7kM5WggRl3IVL2I3m/g7lP9tmEn4IaMq2HGXBHuqnf/tLzSlY97gUWQ/owQRWRgI9DO5ipZmIZhrXNfLnwmjDQpxEEVATsfHDb/vJRjcW4QcPpp/Ms519MmrlvluGXmuXoL6/zviY8zoweHDC1AR3jjFQZcQ13LGxPTbcI2d67Ghe364w5rOrljD2UsA+nt9JuQ1UHV2m0UT3Uf4gig+MMDbeHG/Ml0onTT1iVV+7WyrNr7LY5tk4hotdr6m2ce7rPapy8RITCHbGrkee+FtClVyY0yEulvRr9ppJp9uvPVYDE/fqmTJr848CE4OiLq/thY4CGye4+ZlMnXl2H5PWVl0fP3f3Bsso6JXECVqgV6loqSFF+YlaZuAJzdJXoAn92UZQM2DLgH+0Dlq9bs8dOOSCalo80TrISF1T4/Dr8E4Ru5z8tFWz1e2xYJM0Ebsc3u1NYkjkpZ7kfe6iBqPRzX/hxNuMEt9ovobyuVjNDc0pdBT7MsGMAZ6LtsDbF4Hzm+HtftS3EBSbFzgpBIP2xbuLN1qlTkobN/LViSMM803KtbmV4Qvmcur2PWwUsYdaYexIeLsntZdF6+4Rmypv/5xptGjPlrMTNXO52L3tN8r3skS0JK9wA3cN9Nlw3X6lh4SYcT/UfSm90HB1Z+yYRKOITHDXLCatirFSWRfOD5jcQ+bC81Pjgi0mHK2RyZyYXvGZY8w9N5RYuwyaoHZesxxsxZCt7dUbBxgkTxzoY//Cyn2g18gN6UXWvnZ/sj2HOU2dWJ7+3oui9UobC0AHcdgCHZBa6LIrB+qkFq+IpQt46+EG9pGAt6EOH5oPEuNkFE0hgmYkk2onIswPuEfPInhVjKVKXjA/IFQmc5FygLZZ4Jfvy3pQtD0tPDcssnAf5OfusmY5bthA0TYyTAoy9bZ/bjPM1Hvk+rQiK18loO3mFBFYPm/ri0Xr7G2IPFxHzRAZdJOQKQwgfKq0J3+IWLsTkTYxJn8AZf7GnM/i5m3qzcv6bY+J3B9Pnsp78T30tsdE7GPdGkJ8R3MMy3tOmtIQMv4d+jEI9NMBXMZUwRoLeVMSzmSJkEHCBvKmbhnn3S5Cg/VoNt7O+JO8aQU+w5XyW4HjIbaIaLDEBBSDCc1GAtGAGkI6EnJTdoYq5mXDkwWLkWNAqafCZeH0vT6bpyjGbpr0TuLoUz+geDRoRCJ73QQfv7ai3Ihtl8nND9k59Wmv4Z2GHDKX8/gXZN739rdoGNplgggBJG7Ax6bgP5rpNFM/bewHFAOxigxopMtUMWapd/lmBwe00gIXRjGm8naV/M8ZZyxOOw1H/G9+a/mDhwYP2XX52nrsUleHrqx/hKTPLKm+loRxR7kGms2UILWJmPEwkSlFs1kp5gmVamHL7RoxZ4suZX1nZ2s/+ErWpdE5Y0YVjLmUecnOzt7+UvYldY73O7nR27Mydu7IzKxi717J/m50vqdX9khoMtjezu5S9neeeaO8c0Z8l31JaWeLF2ZUVmZkVe0gkSuYdTz4MAOJzySknNVKEsGicgxzByJw8Xh2ZFMkjjVBu3t74M8Gol4Xjj1hJN/iMCQdiBsze6FKdAaPRGeKVNuLmECNL3NUc6hou0rCgGTUoAN8RWcu3FCQD6BMhaYX85KTkL8JdUw7xkB+6glkZHy0lrAL6sxHd9spxGTRm/uFkEzwANoxUWERc9eHTp46dRFqt/ZfPSp52UrL/pELpi7LcnB4fmZ8ZZh10IbRGSsO9gsqCluc56h8/uWEjajSbf5Ij8wZKlXGiGFxU9hLtUplXEBIlFHvd6bm+s0+6K6IUu84bWFRaz94Vkh8YS9VeGZg7Mde9pNV5acsYLaFvB/7TKrfaRvaEUOv+qJDEzrQpGyS6p8/fx42IQQ8Jn3AX6Q5kgCSA+RMjHWZCFulvZjHMdEaEyZ0koL7oXRGJgO08Q0CHaDdYuheWYFk6elpaenp+N+KCvyv8BnJKpbei4mJjY2Jubd02f2YmTNjomPuf+izxGfLhx9t917gM261349tbT8GrOIvzoNXWysrcFt6+jz4jPiKSiSFz8kxMTEPlpTej4mZNStm5r2ly+/PjIn5u1Ru/cmOXQesbEoszF9cvvLMHOYehlrYjbCSvcC+dKExNAFTL6bLfjgaub/pvxKGY8J2vBs0NnuHmbQmcovxqG2xc5f+evkQw8xM9NsYMDCkwnfrNr79Z+ZTE00oFzpxymi/lUUWY7B3xlifBYlrd3GGA2R+Y21sSszNFxaYqTV7ighvlUjWcZmQW5HSfJ8MGcqQWvyHOajEO9vtcLE+e0+Jd5BP/TnFOfwMv/wc1YShGt1HqjGtQGPGkIilIU0sQ5Jkb9seNkbzDdrS0aHNFBtIweqHDa7bOo+QBHWJJ762osr/wgGGiv5C0EqpjfZbIYWSxMxgdE7ylkVd9l8YoLioaN60yKT6A3NiB45zXr2/dHSAh892Pultq5r833gAx+OHnhODvJLzCyMy+veYFHD7SqwKV7G+sAcW8/HsE/4l3QNJBKySibDQ1PEvNwP9T7C57BiaFRzUhR+EaZloRRmYgpGEzpsXGjpvfoh3nqOz8+EVKw828vPnh4akp4eEZJS6OTtl+Sz74uDKFUfIqnZm+vt1z/Uj+Ngl369pptkuDhfX4WK0tA4tbdtDovyBTBVr9L9kt5lyXIIOm2i2GqM9o0eF+6mXTTENWuVdtM2b88EXsuahcOeIwR7jbGyLzM2zpntmkp1EzqxjnkG/YOMads9u//fU9rUpi9TFW7PiJobebvRe4j3QPcOrqCwuPsIkOik7LGzEwjH8RYP+cyImZRnox/iX7BxgVGg2KDrM0yvN39vdHSKciOG4R5yTGEciNmDSGZxZCYGkVWBtPQBb7SjsxPZE+XS3UF+PM4h+ihlyOryKk+ambz5kXdL4IceamvVSWJsPDbX3mThi+5yZZcZpOELaSzNhwPBBMxP37mXWtb9vaN7byqJX383GJuGBocERfpprhBrVHaO5rbDD9KUxeAX5QyuJAFG0FTeWIbfj+NK62oZzKBKCcElSq3/vssHSozubkSm8/Tvjjx6xfsKsQJeaQc6U9cOkngFCaxC8IfEL+ZvEVaKbtjblix0jHE2UIUPemWBqpZo2JDG7T5+l+vpj3C38SRZkJVPFnOFvE88abGeZFy0EkFddyH9g/J+N6y6aaK6xvZgEhxylxnGeRNRrDSIXW3bPbbM0TK/LK1PDwSghLmdfQvSCvR9u/hQi6Fs/sbfzvIzzBc1VNS/7h/fS85rRk/0bfsb3Dlb6LvdKzWuPLRK11XyttrJTI5boKuEfZqQSJbQrUWm/dislim21Q6V6687BNtn7II4JwzG6jxLQRis77svq+Cf6SiaeK9Mk6ttLIAGpL2PiWHeJ9vtd8L0AVwpwfZkki7SG7+VvvJ/d+T7gGYQz2CTgKpoLBmaW6VLrxLIlhWIkI6xjMCZx2Hk3w+Tzc3cfnluQPHVkf9NjlobB8+aGj0ufNflkChuPcVuJNhnsGxPVPRnc0SFkTmVzDeyJvwt45HHXUe5b4Dnd4Ok6eH4X+BNZjA6e2619sA6eTeASVtsPrLslnWmXdee15gYRcV0ql22f7uU9bZq313R8ymNkdVbW7oDxiO2a25VGeU2fNtYrMrLKLnN81u7dWSELbFvLddlepgOKi2QvaIzakGonQ7vO5CVN8LG14HOcr2QvyTVmkcxZuWbEHJLG9AzQPPvzIlvOq9ufsPo7xZQm7biFrHkEziU5XZijLV3rAqRHeYHmSSkN7UXaVhOavAHP6QZP18Hzu8GDdfDsTjgTQfsZIvTPjtbCWf0u8Jwu8B60fwGe3wVuQ/sX4NkEDrwI//FXYIr9aI6pS/6YehwC5cQ8ciL6DE1HcSvz8/HmVhy08pzFWeQQg0ItcH0SZJTDUbYuo3wM71qwcAFzdAO6jy02aP4Q88riPE9RHnIReQhT/Gj2kM7HVZgnH/5WeE43eLoOnt8NHqOD53aDB+vg2QQOu6+pxIuv4k4JvrysJ1L2RFDNxFdhNTqXj92xex46i0fkoSbUxAXBs7oQNWH3QnQONRVidwShALbjSMcxaaHUBGIJpmR+qEu43aQnLZ7R5kAJ14uZfxPRjxGraMCJ4c44bYr/oCPac2yfPuy59lxVeQJJGnp69W1bo1QuSCd5xSVXw5uirgwenEdyo1+VXQ/6OYprfmdMTU36oyynaUOZK+0NvuPe353x54IRM9u/Ca2dugeFrqysnDTpm4TTAfviP8WfQ7Y0PKwpgawFzahR2nqIvNtKafU6PKcbPF0Hz+8GD9bBs0U4zVzRfkaJ/ZRQniN5zZ00lzZA8J5IBp5uBLpcLePbIfGBBGaTCnwmkrPNTMf7Dy/MQmH4ALDYK5K0fcK0aK588kFKNtktoZ6UgyitBDQs8rDVlXbpUpndYmRiKrNLXgJwGGOPep46cF0qrTk7xNUtPwz/8VPQWi+rsWUTFla6BKvixn3/McNkJi6vHnTjMJd56taRctMxdj1Wxg32t1PGLA3df8d0YK2FZdYMp+BxjmHzxy06b9fDyDA4atWKtnKgBc1HSZOAFuCl6UslYxMlInRjF2iODtqlLQrUQUukah00tEtbfV0PKZ1QmVTXNpgUMRKorIrmTDyp99RZbfRauPr1JIrybcmzLp6U9D7LvrsQEivtTyFLtuGIU8SdZcfu9e0jZlmuzbBJbE7fe39E0s/LDnzTPa3GJOkSatrcC6pUKqOio6JJwuWdzjxMdmbevNrNndk2XC/m2WC+MTiXZLtgvr6UCgX5FKqjrp9A8/laaFUXaM78t7RFgV2g+rq2KRRKMgSmtO1TuheMhcpVEc46doHndMKZS51wFNgF/oT2LrRPIXCQj2gxayhkhrqUd3bWQit5pZ1SZWJnwhvScsYB2og1+8p3fMjE8L83nH4YFhT5rMxo1OCFeLc1mlB2PRaFKvCZgY7Thp7HS0sOvRjE5SbdzFulScxZ+OeJgoezcxby/MG5MXEXNqbPiseJ/fVx8+M169G4F75pIrZcLeW/EDqLUMlqiZZGK+nsQgUqZ2uh1V2gOdlvaYsCddB3ac8CNLRLW31dD0TOWfBdtkK93XwaKaD59AHg6Q1QEM+Fuf0S/tO00vq7+S+xwd/M2Dqin+931HCtXCPwvZJEq5CWYiRA1iXwr9XH2qCSoLoNYO9jl9vNHHXkCcuvs7QM8Yp/XjVt86iaiP3mFiGecc93TisfuT+CvaXZpZwx+qvHHFupsMHHW10c+q93WzRxgaQDsiDDVbUR+9XFvgsxyYm4D68LZ1WanXYKNAHJlPZktjQWTikTIVAx9W3QnLdBUWAXqL6ubQqBCtFm2jZK6CFGos2+/N/z0v+37Evx/5Z9kR3rxEhfh1FKTKeN6qa1ISXzJUfRaK0m41/q9Nv8QG1rLJujr0RBkidIDnEDG0mnjjTWt0dBmd8B1EdCW+Ns7hnfAq1DmC8kks7WAIcaAQJHhyicthfq9+i+ZSvaHE50PyMcWUtpKWiZnPzO1ulg7efzISgXerHVycUcaRL0HiipoL37duk9FNov4Ce81j5QagTtw8CHeb19ug6bgi7YbOjEBk3M19pXZ2hrO6E1d1vbWvqu1Ajg4yk8S+bTsR/gov0Hs9kg0Wb0q4AzzCROb8nokyinSkarvv/XzP44fMQM+Q06bFZpVvnv/5ziR2FFW7YUtba/nubX2cUqrV0MfLEbjdFqZsoXfiJ8axd7nKxGIbGggYr2kk5N7k84Yz6hrV+X1nQt3tKargXbKunSHmeTqkjKMd9SuNgeOGmjyEmzJa/332ntF3Bf6tau624jrB2thhQ5aQrFZjDthVYKiJxURnv3l3RpD70Mpr0X8krau9DeH+D+VFMHkbd07QXOm/hG/wLnGXftHyNSnQnwcO7Pjr9eaz8c4FM4I9RH157WVIr4y2n/Dtp9jlspwFkfCg+gvHYHonxPwQ40FGq6ZDreMhTrKUwAxDDnHZlbjucd91rvvXZ+jcZmzflr8LFuKHNrKN9y586d2rZPSHUmN7m29g45EwMKjiMcrBBy42DukdSMjKZcSTYCxgGnBk6IkEQNGIZlSxuX9DF3XrhlTop10eF/iq2LTQ6boFhrXO01NTE+7+sgVyEv76UKcg2ZNatWs5J7WbtgQS0+OnvYsPygPH/RuwqTxcAMc4lfBTMcorMITKVqoFQo2dsB/lRLKdaSarshAvd2OFNtR9r35f/WWQTzOyxAfwntVQJXv9F/H+Bq0INd++94hrNJnSrhxw4HCqftO54A3IWudEiHksIDtfgw82WhOu9wARtIvCPSP7pBIxWkhgIiUJCihlKLakEWkrhiGEM7B0cmWsAJuGM+jGFP+gb4RGYEgZP6WNZY5IIAOgdHihOp97gncHdHf4ITmiDKmiWpjqXc942kF7QfKvZvSeo6KDyTwoNovnASiU4Arq/VeygPxzBL/9T4o3+eYLfUw1wsNkMPNM80Bxi55rZ2LVplaYBXDrsW5UF/TjraxnWDT9LiRapv6fhj6fhC+8HYUqRtOHOTwifp1pq2Z7K4BR3zuvV/nrQH+KKOA2+2l+SjXRK7bu3LSHuA7+i4J7SHGCUECzlOjBOqWLAIaagDcmIovqkYxY7AAYmkNHhWVu3IdqitW1lV/I3m0V4mMqgoE6hGyrigV7EOGmwgkBLy7vLGnHXut3c2rl7pfgPqeGq885Paf2WOjsmP7/TiKW34HpQ2Lp2SLk2Htc/xkAE0RLeSp0SK7aGUcdGt5EqqNcO5CAoPkXT2nq6LEWh3PNK7sOOFdNGa26D1z4QPUYAZ4bcQNJXyQwyO4OGQF83SWvc3krG6KiLQCfqkKJ+YNVCDwfVCc00/HXL282mWbsmxVg39n36G/3GsPY9szruk/AXHxLKSStrnt3wDpUVs+Qx/1LPjVjsUuT9dsYJICHA7qZih2oaa6XJhjP9Wk7OSli5hjeVfULu0/K3lOePEQibm07dU6ehiGW7aWIZkPlJS7UEtZqo9BIt5fnZHZ6SE6A4S8wAqu3ax2+mOmE00QahE7FvqKpsLrYveaA3lldB6srY1zcxKeqymnjyZv0I4UwKJeAZ1Rt3AftRmZVTckYI9WDNt+RrNP26lHJwksIhkzsg1I8lJgrZjNZ8G79hxeH8RirnLOwYFzMPNnzdd4R3FWJyVwg8xR6+gnJXxccQTAIxkt2lFzDDJWBJH+C9Oq9Z40S6BsrNYsHuZj+xM+16Or6squD7DLuFq+u7/uMz+deXxP4N8oMJpyRmPhGfvHr/bZz8pIVxzRd2+lhQ7lZbQYieGMxs2gLqpSod5CXNSHn29GqyhFYtz0zIyiRcbLnq2D6AGyvvfcloDJfA5d1GQIm4DlSKVTooSu0jRFK0UkWpwKi2HqLSotHqH1BZ10TtTtFIEvScDN6hE22MGmi/qkcdUiqYIUvQDaU2rwLvhMpz2QuqOuuISLulsTXU59znlks7WEsolgUMkna3BO2+msdPhgndOYxQmAJVQnz1cgJp06VlsS7CuoLJPenalWIcLWNPWkRCVTaF7UEEQGU+Iz5fgXFKvRKBmBDqVQmmlOe3ZXey5hPZMqpuuSAl8qmAZc8vBt0Tk/Bm/gEZGaWW69ng5OVpexj2Wax5loJ5y/E9GUwb+R456ZmgeQa265us6zXFwOxly/hVq6FhvqJsSqvdlwh+pUKaitPdCxBohxVPkMGKROV7uJPxt9k72V5ZftYz1cXBaab6S/HjyO/G3639/9/fVwZWhIVfhA9RQdUbwqN1BYm4wVw9Jpy+ohnUITSUUiJB0tnbTxunAZn5E9QZtTfVGhAhfSq0OMd5Hbek3e6ea443e5wMfBkvOSua81vq+zlsN9rsptv5B0DNv9P1c0DNd+wa7G2r/tZijEOKtkNZgd0MFmRZz8O8YCqfV+rIcgI8QIpVSHi0EOK36EmwNJNhFkbS9EKnM0UUq87ki0l7rPRN+9iSto7q0Dta1zhY4Sai87yZDo6mF0/qaPM+gUKF1EPQyWrC5uJ9Qptg6UvQ96iiOXdun69oXcE10VKE9kYwZgmSYda1SBotKLti9YPFSzpOR88BiXfKs2IsHoFzZ2cmYliWHhm5TDp4Dby+G1TksnGDz6hrAJhqeqFNdmsDGfjE9wIZY4QBbh3CADbLt4+AAGz4DB9gyXzu/hs/iPxrwXnp+DcGRwQj2MI11SQTkhOIhOPNFN2u1UF9IkFexhy3rE5xdjAyRizm+0mSbkvLVAQFyqd68vh95hirrwYNTEta3/fnl1AjykRuyPhg+0iyk7nzSIOJJ82+cR0JyWiljLRF8BmsgFFP9liNJqLp9vJ5XHGpEHuGMZyz2r8n3tHjbqSTmftiEbXNq0Ri039J8c2ptbeFxqg2NiDakenwQXV9RdwJcIuhx9oqkU3tGYiOq4wj8mqRTyy3FRlTLEfhliajnwB4EexrdBTtY783q6dcqp7sWTROe4Tvus0+FMwPCqnu8eVRCDAnx/8ORAYc3TwzgG8KJASRZxP4OZW7i2TViGyHXZpt7pRv4lo/xN8gLMjJh3CPQx0n0xDTUj8GhCGbj5v1lJX+UkaT8X3+RusFKyNmbim3gXDAU7TLXy/evK/l1LfcIFYhteAdOT+pPa25VomWg0oZRUVVWeMTUeVY51sc2LV7GSP37+Y4LmFS2ubRYagw1AaN5X9aF1iPR7DmT2KS8KNW/AJVK+7m77BWZlJ7TliBt/QWQRtY1q31lV072rl3ZObuKpo31mTrVZ9xU/kV2dXV2zs6dOd7Tpvr4REQALc6BNzZazMSr3ji34IHi8729nJwsxtsNtJtglZwyadxshcKmX79lfXoHTRxeROYYyltwZlI1rb0j1TCwUAq6UCTpYaKbMFPj1NdaX6nqX2xZOsPOe5BLH3NDezejYovSaHsfPkqtb8QGhK3eaGWp1jfgJ4TDJ5hpKdB4Na2LkImV8OQ+htV1+NpqJqIBH19JlgMVkDoJ/AHv2LFGWzMvU+CrUJIPFf3wTTH7e8dtfjD5hhjC9c13S9nfyTprArER/qQjnHzDg2+pudF8rxROagNng87mykhMiskQ4nTwLkQB4TmTWvYQeZF+rD2bSvZkcmqMnE/kp1Scz4fjwx1NCOEV+efh3NcLJp6cH9PsFN7jXnZ5j9ZU0POpVRWN+Ydxx2GEDucf7v4WXJiRw9RrzxmBYxlac+wSl4OeYT16zhKk7T2wqeBbO8LN78G3/lgPPRPmwZ8k80Av6DyIh/ofOg8jMg+kB+8+hIx1X2o7E4tAJZOagH2Abm8eZKTXw2mLE9Ojp54CR8gHOT94oNenL+lFlFLo1b8zbgjPQhxQBt6humNZl3b2pB3YV/l5BCqelgdtYa71ysmpVcEb/5+qYTo6SJUelya7ChonARREGryTItHFbskOhObRXTgB/0QxE2tQoF0+fS6AdbOku28WMhJb5tBvlsE3z+k3Oche/GYx/WYRrP14+k0enCAVvlkg6D/wVKbTvXnhLAFeQuFZUAEQRd8oRc/EN+bRb+AWJOnP9Jvlkh/Fb+gMwOKRsJWyqzCDLf0IPLHDuXNmlDo2Os9UQp8VlBMJp7YJ2kw4iDsC2bC75RoH3EEPLpJYO2DFXYM2jHDeTc6TI3z2mrWse1sFG/0AmfB6bZV76SFibcSQjmDfuevT59GdMTb6DPYLrJIzUMGS3ivQXzjdLpNLYOdiGdjI1B6GBkpkbWLMwvYmt1baw3YHhXbfyjWecDLPv2a3Wh0P29juarU6Dup6R5WXjx//4AE+jU+Vb17z4D9sRh2zorYWP8D/qYX/0CBkVov8rzbDmb5dV5uvXmVONl8VY0d2FKMhOgzP0OehdD/Szh9mr6I6hA1vofO+eptMmtcT3iGnleEd584IAH12obMkdH4u3gwlnkjX2uQoiHqQLuw2eXvyHfo3m1nH6tW1ldRpvV/wPbR+LJHJC6Rn1Kbzki7Rkdy0K6o9925HStugHIAMgsYyP0GRiJyJxKvk5Aj8CFQItbhMBtO/rk7zXOdf0J7cO61E+jyKziEJnv9DzycPoNWdYOLIqMFhovIg9g2xOZQInGX34WpYKKIMjEmAUsYQo0jBGm3P2mbfK2TypvOV2VuVvSaFbcRZT5bl9R1+84t/rc5bPVma29f9xhf/Wp7n3h0wLfv0cJfS8GkD4NMpd+cl8Kld33hFwaExvqjf7pXGu3aZrCiEB/xs9wqTHYTP9ur4bCSlA8ilNA2wheiJ3EMNyolUoQNTwak+EjulTzKpAkwkNzP5D5vXjw1pCVHHha88ef7kutU1angKuv3gh35OK+qvXkApaBtOBi5aq8c+be+nt5bwEoFUXLjq/4jwCNw/JuX4X+l5HCC6h0TtwRD7C7QhiQHLgSpqA4mcsDJcEMXPUmj2Kk4iqdLlMg6t3u2iHOe7i4CQ19KhjrABXkBuyKWy8h27s0cbGhriUND5J8hm46bH5/fsiWtoKNuypREyXGtOncRN3+If14kxt2HEoieHR2l1zMQuFQwEXipa+pkUPrrjP7wD1T0J80jEch1d8RDQxMVUD26klnhCKIHmgA/xnELLBZ0jOU1bx8KY2VQbJXT40bjnFjEC0wHR8qvQdyLxXtFuGmmhI3KLwKoDPkauag+lvUAfsJGRq6GryhW5yoCZVK4q6l0q4UtyKMEQWElty/oh1LB8SorC0WNE4YpMxFbV4q9YMyvr6ZbzY3yt0dgM9/V/TJ3mMariozNoBNPz14cIzV/9xc9z5ragX5GdZvcNNwfXqvAhkXNnDEHM1ipkhBxWvsfyRL9hmN/PUjlgZk73QGQgtwbe4FjGzp41VlsbGvBqztBDZs0ik9jDyHE6qkP1AcNOIKkqCpt/bzrpFLIeo8ZD5SjVy/EP3PrOeNxfykLVTQl+lBiF/8Z2cGQ+4ABCo9Ag4zop8vsZ4bPAoRUQ3xsg2rmGwrFoVqgNRTfnM9ITmvgpjVOWGs1ys/Q7BXctBbGJbdWw4daxvot2EoqSiMJy0JzmNMtOUwS8saArCQENiVAC18mHmQiiSkntQQivtOemRT7WmBhIOs7G5ngM/3Dvk8dz53oo9/mErTN3R4dvpmqOBvilKQd7eW8pT0u3s/eftNCL7++XG+1ql7ESLvT6p2rHjipkeOEDb9uQdUjfDw+2CMi80JSVnZNz7Exscm9i1lJu6sMtpPe3CVrBg96CZi+kM4jmEP058pHiRtAkuJO2aHOai6Jm8cmgPTOtoyeFTMgPjnEblbPdYvOayfNGB743c/r0YJtZ06aFPsqYmjGFiR441tmzLiF44MAPLfr2dVaHutsNrVCNT/N1GmFgaPeRuZ7eDL+8XfEBIKv/4jCOeGygGeyAXnRMD7WxQBoFLDcc/pbLJCzD5C7zHm9iMj3u/X56viqlrJfJwJGamrRYZpHmoS2bZNv+IDqkBE0MKcgOnTYxiB+qsHMfOoRRoYdo+uHDeDNWYnrelsjPd+CVmIj5nM5sjkomZnG43T80tli5aHM4Px22mZqYkPtN0ESmtq2B898VIuZtYg+QlE0B0cYOHb9zx6S2cNaoP61NlDMCDWHHpP2zaFgXXgAhYms1yxyHqrdszUqMN1Ooy7dlRI5HJ57Exgb4f9bw5OmsWf4BnzYwp3FLSdWONVAeZp64s2oRbmcOft+M1+Cy71tavke5KK/5e1qtBAwI7he1/FipiTYkpDZEl9eZmw5KA7E86OXlsAYOkDludHatio3/njlPTurDbvWxcPJMl+MgYeyhx2Ywnnc0f6O8u/hqzbRjkOVwQVdwlMaP8SnFYG137IFJ/war1lc8uw+JESIsJsbMk1cntmlunmC+VBjPjbXMvcvPbt3OvtN+kht2etFOhoW9QayCBhsyl+4NkEPnxgMWkCsk5108RKlQuYnsIHNFqoWnUzesmD2oD8+HHhk+wKiffd2tjXCULnzh/tIM98T8pdMXZgWf/OSXHKL9XwFHLZHS2zbezlF2tjCIArjKmpXyMltgreVvYa2NU0ehGPxYZf/wsi07wFZTNtKO6SfXnB+jeoPL0OdoaKQt4k6FAafdPN6zzhgfxU91UXGISgoRbiTJ6LjOPYS5mtEooIKVviZqaiFX+SXnZrtuhR4wSj8Q0UF29kq7ArncZglOOHT0EBzfbdSE+ltbsQxa3lcqHetTz1S1R7J7QQvJgbYYuNuAWm+Unw3gLDhV4YTbeQ8hEiGl9hwqDd3nc+jC1xBF+fZCUUiIfc7hY06sRDlmDP45NVU5eMwYZJuaylYkRSlgQq/gz1E310TNAfbSrzebcrKzc5ro3zCvBKB5tnCelLcmHA73eph0ahcqDa8vBTMTP8/Ld3dHqUg6NXiSn834iYGhnxUWhk6a9MnSsWQ94mv0+vmq7HvAeljs2gUlzAZoVH8DxX5H4wGZWTgpKzOo+zoQPewJFpofFwdxVkIBm9dULS9TGMu6iCFzuiI53XawtxfRrEqF56hiJsH2u+AhHqCEn6amerh/WMZ+Ny/72LkcUKZnv1gwrxw1Vt3EfwkaFxlVLSGr+jFw8E+wqoaE47RbptqVRHdJ8InZbZYWaTnvoLfXkGQ8w5braYsjU80vCHJo0Nioub+R9EJ26mnQi6UoxTqkXXWiYCf0i46tGzTYJu+D4rDhZqJEWA798AD+85R3kD2V8hUjXT/L+zJpcf7SqKLsyrtNzSg272uQeQZWKoJ34VJA5p0ofVxZ7TBaDeUKjCKSR+0q025WroYG7KGxFstjcuYMUXoNH7ghfo672/6as8FfBJ9NTnVX7yneZ+0XMM/W3nNk5vLRbNNGTVjKzNuXM2bsWLYOrt96ursCz0MbtxGqWW5KN3/fJDj72PnsZOYT5Awy+wGeCjVVcUQr80Sb0K3XhDMhO7Eh0WdKWyY5EMddZ4JmDKyEPRgh60C067rmoPCIO1pRieYyOxBdAy0j+xCXMq7tv2EH8kBoOx1mnQy0hV2Gt6c0VBESm7gK9ic5gSGluwDS3IlMc1l0pFjh51l47ItjK0KSbBYeWeRWsfp+8BemdnH5z5nVmkVfBPnosS3tQ/V8wj9hSjUF7fMSFOAVknPV96TkPO0gIgeGHnA6UsaohsE/sBV4sCoDGQPKh0GHcFyO00+nv3OOuHMpsS790u1w59DT0U5ZOBY/GZhgwYT9ibzx109wCDNIcx/E/JMn5PlPzcdguwzBLVof01qqD/nbFOJdEnuvn9bem0bqoYilR+qhLLR6qI5ajdsFW7K4s22Sti1KsBGyLjAHwZJE02nPH1DdFQc0fCLeAUXvl2KgyB4otux8EWuKuPZypgR7rUDRmuq1ECrRrGbyNf7t98FGWsb8rXEju+Q02CUTpHawa9jRylrKeYIJJJMira4Wec9EfOYJjOkUB1Q8OTw/9F2L/oMUOQVLg1BDuKOv2aCgvS/b44NDg3Z8crV26nSLgRM98G9+MydO8pA7f7w+16b/wLGT2AzEjkkrn+Ye0LPXyQzcNHZi7vols1pa9qLdqOxYC5io2dsXz524tR/L4D8W11c5RRT5R4DEWAHW52Bv701Py2sNBsI9nGDXqbru7SYiquwJD6sha6cEj+9vmTjmBT6fc3SUVfGiT67ETA8P/7DhyV8Jc5JPzJ2o3rKhoITNeLmoboJP1La5Y6t7BhYgZfW8jO+JwVp8uqXlLrqK8JJr26v2kDUAW59/zD+kOSApsKwrNWEYoB8QjGMN7DwI0cCirD+wws96UdMiaz3LTanF8glVaCT/OXLM9UiaMiwjjO/vj5+v+0CTx6z5YB3q6z98UN2Aga44CxWNG+Q2c2vEIAMx8uFF+eAACu0W+aBYyIIhM5HNnSLZFnSA+qQjgUN4etuHgmoX0C1v6hTQJDqdowA3w1CkJvvVZKJIPD6kOuVMClG+75+ZPDMzLtVhsPfITLzn/Yy4dHt7zxFSI5ywrQpC6X9VbcPzRaViWLUN7WjNT84+fzY3ub2R9U/OPQv6hVrm96Q3QSb1iWY1BJVMtgAihnKQULUDmOOdIrrOVjrUttzOOgeO2IEkwo4Xl2Ody41q35RhHX5LlFVrdm9j46VarTQyYbWXrnwoyiqLDnxIzp7hYfxcbifkkkHfUD0KVNByO/CPq5ouFPwLFJF1OgTQSqnm2IbHfXsOvbr5zk7TPsGF1Ut7Sd8dmTF0ZtETvR7eOuiSngS64c6HVVZoYC/rJ1UJafifhdM3+oYvW9i0LyXtzpj+No/WZqShnl2AmjtJk6Kqq+mtZJFSX5q/IDoRlseeBnTkYnzHgEZ9DCB7YaBkBwQ3Bv+zaPOa/zxAo2lcx/fBt2ux/+4atfok5C281erYgTgDbRj0GY3iiDGdz/gAIdyDG5E/DfeQ/TkeLJQrYCnoaffnLqJNrvSmTqZEK1LMo83pacFewvZs7+XVEVwXfHgKsAYKfvpkLuGWJezt7Bw8j+7PZ3Jy23vCNrPJrJjuzmhEVRVcd/xXFYluS+bjMD4J9Be5mUyMab1plCisBS6Vu8pdQbru4Of520aP9Qk9uyDA18Q4qtNCNBmFv06eO37srx+jAjRbzjvmV+CL+POSivDuNknTD2g2Cv7rU3LSMQmspN9gl7Pvapm8gYENQ5QKLyBg9WNQod3gSZPmLfERx+/nO0wp6z3QZNSFh+4uX5bCFaEf27J7/TO/vviGPQRhCb3nR5eiRjEy1UAjMkqizfEqWAcJyCroNJBIUYvpDDYZK6bNqOWoNhbWaPEd6/ez69xcXF2trezthxb4zTB+B401x8dXm+8v+Hikm5uDtaOzi+u0kERuSfW7iT17GtSa6/XznDwfn1uv8dr0QXav3sa1Vvr9J84i67Gso523gPUwo5qiJwJqgJwIFk5PomdBOgAnZuXXbARePdLAaY3tf3xDPP5pP4aGap+4lXgGWqQZGjskTfGVX9gh9BPeyGwQn2CMBlq9ZyjcIkZuy1Uhrgq/04jSNPboq0a8nc1o38CcZidpZkLrO3CW8mP+FfXgQCIgTeXBc2D3MHC9NsiBYCGAlvBC9nb2zJ8L6jJvFCtb0WJ07eDuzDB84i7ynT5jlGdZiO28iz1SXK9cq8Z7XPlRmrVMwMQ5p6/16IV/xE81X+FIvAkFofPoSrF19PDLmtNyxuif9ev+7Q33t0mG4g1cEFdAvCGCMcTwyF/2CjUIJqCiAHGMwT8cRl/2UGh+OszUBgyuabZGTmcPR74TsNfXFQ3HF9DXikmay0x9iXxZ7Y9ncSi+jVejmJeE5oF4oswQaB5IgvPi7uqqpLEJpVDiIrj7wBCuKrLBdEYDXKHUUfdEc5oMWKZiTNF9dkb7d/h6yYYJ7y69eTR+xGSp/6NNzREu9sqKqLx/40/FK+QDhxdnRUfbu5xx6W8+LGdFRAyY8gF+rX6mg5g7+HHTf/asShxisnyg6+TFJmNjPv746KcxO9/9Fg5S7irxw8d3ffFBWrRb+pyU00+fRoyPHD0nPR8pZ0yNCEVj/ZZUVSxOgbn54qnSEuF0rVzU7tT+Arp12l9S8Q+dNAdXRBpPw09xfLrzqZ8uuvjduhxRF/Pd7fEuk38KcB4cVvFLw52sbL8p5c0I9YX76NxFs+w9UPzfY0eGQSmCYXZl2YudRQF2+mm9Hb1Ea/NH0K1yIS7L6shmRgLWhkSsrIXArKGHHRvXWLjP3dDF98TJxaXDN17HZdcXx+Tm1MEGHGz8zqOv0WA+0GDZYfwoduqKORUV21Bv5uGrUmbDMm+vlg1fzc5CHqhHC+GcGSDRL+gddV2iwdbUuBUHFRcXZJ25szNh3eC+Q8egoLmpg9MbcXNjTnB8/IafZk/o53xyl4bV6CWsu+wzOn0q8fIYt39fMmGJrm412dv8gh+eraGZqon818BJDkSbUibQkpayky4GLUZXELWz2W1I+W5Wn8Ezkr69g09OnLBm5R+f7PQOtpcFTr/YtHa1YzSpkstPycvjij7bdGiM94XdDYvLx7v3WW48bNqC9JSSr+3t8rJWlC66hZXknsKVPuMgYtgCtu1LrhJ8hynayJt2RzUx1m4udiKGchuKkpKqO+ErwJI2F65d0ZJILahEcpsxOzN+ndVoq6E2xoYyaY9eRsY2VpamQV5TBqMBTvo2O9bgf9ZF+bqPnTli66wlASNm7IibOVCvr7VtaPE8Pwc/t5GOZn343g6O6sBp6TFXMwM8C8NZ3wrj3vJB1mZy6wHm/Y2kvKmR28BhhUsmBtdXrXJWjC0PclbETC/x8/YaYWoy3NGeQb1kNoP8rW0HDho9eoyLl43jroiU0E0k0g2cNgFO+9uRe8EhUCrpRnbYVOiGTqcuQcYqaztuFByo/At/8pI1u7XcSjpucu3BIifbJxNTz6KByGhZYt8hp/AJzXeFLcgB9X54DL2Pnt5YViW3mj1p5iYPr91J326YWz3S88dDcBvD8s8/Awx+B657F7iOnPwAtn4LBkJhNKEwIhRnP3/1B370I7P8QuZAfvT4sm3JSosLntP3PfotO7KX9d4fNK/S97Xfw4+3oUI0/du5xaYmk8FSHzqsNKwqZ9oyR9faqlP4zpENJFZ8F+L8E/jHYFW4k/wK7CEs3b/6IbV2QzNEuq1NRKkncTTAo5TTehA0h5n3E1yq9Pg7PSNzL1PjCbYKubV5lqetzRco3Mc5MsvCwsrK1sdk4DtDTeR4IYLb103GT5C3npBP8LfuV4fO4xRmDPrSYpAN1+vL3jw/brAfLkUlExXjeL73l704m/72cI/niZ495HV18n5weugkrNQwoBexl6H6yM4BvQ1tszfQBje4C9pcQfsldGEvtkdlDf30TD0GGI42szA3G7jUw8py06thjoFLB5oOMjMbaTjAQ25khptu8pzRqACrtrlWAaMspTvh15M8QlBJYq5nysrW9eA4laU7bkVSd0sVx/VYJ2NN9cxxI07uwZvu3GlK4vKScaSGB2oYbElOC9kCRp1LK+YDhUyTXBvPYjvZQKcA2W342jw/9/gZy5f8XRihr2o8jP/F3y2PMp55sBrVZ79XM0Uxu2KerK/7pCNHS0rse48IOX60oIh3YrIDqyNs3Gqyav2C8auamqqUwzPmo1tXv+zVS/mpbQ+phvHyyAwGXfX16OHZU0hMSrh9bj9grKCnaO27YywRlWFXhA3fhrDT/djR7uqMxIILsV4GECe70ZHqYzpzRxkKmRUzNUSe6Dejv76d56YtafOV/RzGvLd5zhxezRQE7vPzcKtJ3RISTYJmVbEfJC0Wsf1QyUvbX00elzSeaNZA79SJQgTNC+SoQ6gPJPeL0iIEGRQjQGSC63BvMoQ4/99NqDf+07DJHd3xb/KHoOyzxNZqPjYRAmO5uAz6SIcoykL+krYPWpCg7WPhsI+NH+DHh1H/B8YfD0ObJhyewM3qkGS0ruAXZMD2kYE3kGh8x5e8L/gtLoJ98H/wWFyJ4iTmAdO7/M6uQX0mLaheIvgrMUXgxXhdfSsU8nWv+SrWT173VUQguZNIjGqaEC1jKKpmXVyTcQCpsDZE3UKbtx0KX4ttBiNr9EKOzXGvzeys10KcjN2FD7sHOXFkHfOTpKNLlLOzNkJ7lkp7tyQ8T5RIumaHkQ+NmIyG9j6At1zIuVDOAruaEs4L7mSgZgDlQBJMsLFRxKR+UZipYj4w18zoN2nKF4vDQuRhaXPxi0UlaV8eQX1mp9rbsQf69hqUEL1vw77ohEGmHxoYV1Uxg6uqjHv0oXEuGDEORrQVsnpAJ1D/DN32XOE6K9GSg7ikGMZAetZDHLJmoz50BPxibmKQfLz/YoKFZoY58wHBIjVFyR54v08PGEnzI4xk8KGpDoFeomexk3oWO4X6ROE0IDwf6zxxRnPmttqceOdd4j3JZSTam8qRE6zRz8gJ3zol6cDWTfhWBxS8YDm6DYl9K2yKfm29KxH2HD5AuG2P3kZOKmVoEmIAMvsMTURm1w9/gau2ncIvyQGNIkTu2mvAsai6tRZ2jasiNw0ivo/JG+xES2tBeNTdGSpypVPuaxw1Bj2QYzPjw8az5Zzpaxy1gfn817WvsdTZugyogTjenafE2kjgGe+u1CLnMhgVjb61ULjYDvK418W6nKHdb4xAT8VT94+63wAhwrO5B/QMziacxNcA9ckd+UyXskhB95G6JyFqLRcUJT/NvXjRL0FyzxUTxtuP6GPmshCvWkPqocLkXBlULUeg3UeiRuin4GcLFtRNnPgtsvFWBbmEaEZCoT1U2ucHLho/RazBaqP1uTncSxoxekx5YSbMqoZmTYkVKbO3llABESzXzl1Fwt5G/Q46fKJ5hW+MZy3l7fd4/2imxz8OTyCh+2nlXGM/dI1/8m7LV/j+47phTgcy3v2qecOl9dfiM1Ay2qWtA6c8OFx3Qum1KhM4TUQjWqwLxe/eW+qZmI4TEBProPe00Swf7CM8EM/AkNzUJpo55JclDIeb4lXgf3B3sJntPPw9XiG/F7M6140tyP+jLXtKH0d8ug0HsRPwX3dS7yBv9x68Y6PmvKZtRJ1LLWKgKkRTmR5SNvydWz8xcBjtJupPflsO0FBWBWMPIHEs4fYR+qsGuoysG5hduEazYg21ppkF+ec7R0XlujHJMTfhFxIIo425qR1tsFivXgSjkVs6hf51p986mYRzPhI1Uj/0XNBbGIPNzJ9Y4huGk9CabiwhVs38K3LDI0rtl7pqmpMUnke41UBb6UaiaMGkVhl1CCcTuZWUl6fh4/yfQnUN/OoNFXXvATlmNDaHmeMO5hYCA+0WNveEX7NFKvBaHfHx1+uwBMryRvROdHL/3nAH8ssuDD1QpxQIvwHjPhjOR1ORLyEecrPW6E9DwW1Z4ZSumt+QjZZ67Ms92FukKN/y/1nn9TnM7S69yd6E2LaQLWQgWwm8ZkamKR5qREuYzcBiDnH1dnjfJs8dqWq2AHfUzarzbLvlCf9wpd/jvvhzX0evAjScsUeDWlvwADQWH0d/vlEdBnr1Pahz/4WeoNTlg3vSQgh6Jyniis6vZ0f+rUlHm5vxXnx21vlZFzSLmpkXePLfjBmwkiVzT/NZewGL4PcQGKM/kEl7B7uKmaQht1zCuXnugXAbF9yzJ6OXhoq3rAn3aKg9xKu44INYIszceYn6KQZ+srpsoflQPP/RAvzUfvCq6oVHH1oMqjpxwfr7zz43Nik7vSLuZ/vC5/yTKw0LP5Jbndzwn999zC9Pd9ywZdmWPfkZ2UUDJ50abKOtxjop3GXfk/wGC0JIxJ/Et04+b8/HUNRz8jm7mlSRcXfb4OL4Nivuro4rCfe9EM/FDqDcR7lY9zs/6O/boPmQKKBSHGI1Qaj+Z7weH551XiRNQ3uhQBpCa9AkfBP9PTIShahCqMnHSMZodQW+dR7kiSoQrV6AfVDQFP+lyk1Xy/d6rZqI7wXhdyMIsTAF4i/QMTQ2uAN0Ba2fcwQ5aXm9ku31Xfz1+jToncoo9K6vvSdXW3MP0bKD1+Ei/uvtzVbKuLZJcq/8MLOxUBW7mU1rvTPMfmbd0CGpxBuCjJZ0Ia3s06P2CwdxE31e5WEL/qS+HbJl6E5gB2EozoCa8JDMhduqRgb0RgVNN1FvZW+8Gmfis//oqdAmNNasyQyN/FtvOICO2TRxNQ542Qg3/JvCqOnUSDc0UNGub4LY/V5+qCdyMikrM8Ga/V7+8Iv2Wkwa3lbB9jZdA2LInWt7t4uuIbInqhqQNPIenErmfUWZMlKJvxlG8D1I0hF9ehoVrAFLpykfzzoyfRRVpuz1JuYM/JaYxJxJpb6TUSXO8xbWr8f/a+074KI6tsZnbtldemfZZRd2WZYikbbAAoKAIhiDDRXFgg1RMYgtQmJsMUSNxoaJJYmaxBbAHhUUfJbYoiYSYxRLRI1BEl9MzDMW2Lvfmbm7sPKS//997/fBb3bunTtzpp4z7ZQcKy+hldqBQt0kpi8lc884sSDkrYLQOrEgYtllr4l7i3Y6KZZfOsA2WZtnUw1LVRhUBTW5T6H4EOsWRDup1mbmsVLNfBizmVpmQUk7cSSTThvlhFng3+YbEcskV6mcaiduH7mNZGRW2gyW1wht9ralzQZb0vwCZTbBdAdZW+Y70/12qtyWLcG/f8F4nihqHQROYKIvXwPn3KCcykhWx3B6CIe/zD0QwI/NyBBChT3C4+rQXZhYZtSnt97Rsn6Kg8JTM3oS+gBEOkcL64S1wugVl+qw6mHFQ6yuu7yM6OQ335VlQB4ulL5CLrYSIaQKwKZh2Y6KCx2g6ZJ6MFxRZ/SkEiFpRs/k59FfzcOR6biaea0837uHEGdasvRVO+Hi/K/4LNij3yvIIUIhcMEyfvC6CbizqRAOctZ9u6J+7FRhozDswsZzSSmmSWRGeQL9N5i2pMIyFuHASGJn5QYDbTxkaGJc34ITxwPb7tVomRDEyEdO6e8YgiOA/HBALGaBlcMWtvEE6J9+GtRiZt5TDkpeENnl60YYriWmxW3aguguqRvtwVS6DzfCigl2lRytaAqmq+5APTlecyGkwgXHiU1hjzXwSpoJIsAZ80XBf3ymS5C7TNNvLh6GZW8kyGM7m+YNuhnlvg6fKOzpHndPaGgIdglOwSHghajXTtjSe+i9ktBNM2s2MdhtlSd2s3vptXXxJR9N2NBnuPBP5kTT2d7be06/fyZrGxFepHz0GbCbILxbhO7E6IiSMjgasmqP0lNtUrAT8G4fcdl3heeZYHYO6zlhStKjCVsLJwjT8YGTmyUhN94wBkvUwrPvQRXv9JXC8hov5lXhqxHDjJnl80b4quv9fLLieqm1H2y2SJknU93MyEBZkHtfY73Vps/quFHlrQbSa3eFe7w71T/ubV0HSGEZEEeXnNZlwDuM9yfCbN/+m4QLYxOWZIcyj+vKB5QbW2cYwWMTlwr5N+JCBl3Cn3/XagBtwb7CPbzTqjeC9lQGnf9hZyENEPlYbPnBPILF+Z+tOljA9P1eUOKMk8LjO5kHM1cLipNMtnD8e7wAuE4eMc5Cf1NfJu6sUI6Lzpq+YvbgXaZHhAqqQXrgPnAfkrs3q7ZNqVHU2GfbsAGAgxpRKyee+eGM7cUjK45pvq6q3DXq5RklxhBJgHD9140VAfNwznfTF69mPhmTbRho3Ba5dOyCQWk+Pi/HZvr67TgQX9lrdnHaKKsU/0+ifnNMd4lE5IL76drBXabYB/DLfEX0D7ALWmcDN9lcdn6bXAWVmMsCrZnn3S3yFTT89F9wywVDqxTdAV2YI74Wbj/IPGhpib6m/kzsGaEc2vUWpGy08JZSCRPLviHOA//CPL5WXSfM8hoIVh9P+R3uXzCEluhCMdzbFKvXqebswSctufO1Hfe8xAJXMHaqwvXY4VpNtZBcvb0atrwmd+ZXgLHbFMw0tPazlv3XtrKTTYNonyy4JpcZlAssjvmmynyyWQY9dS2bGM7U+lfca1YoUrE1SRm4X6/V1Jkq62quicVuNXCjrGcANGV/W6kS8eQEIC21cExZ7DQRYJ9zUWqhW93+OqEbHfzsBavEJEhkUllJwNWRcEM3j54dhBMJBn00JRJkMLHerGhRRO4tHu9RhjfxRousGwizKzCceNC1JaEvXO9ZB8O9VHGzxqyakK2tGffKqgHbcmK9YoXr2wbMCC6uKaYBcZ5xOIgECAtJvDEkjTp29ulfiqrixm43PdjODzG15mVtHP1TIcxB5/rkmU4zCXl9Phz50wS4gU7Oymut2s54bhfjk3WFRds/1CiXtsREwG87sWdCiUAQ3dDBuiKyNaGhpo4ZVFdDUBlGp4E0rpBN0hwFGEVtePrCesIL6Dq7v/pa9XDh83UDDY7G6hhZJQ4lnYOvjEwcH5WEVcLjTroNlv6U8mLeeq0lb+L242vQoc8DoGtxQ11NOXuhZZNYAkuJpRrR4kBbiS2llmQ+D2gQE9URGLZFtxSfQcvMZt6ejmSyQNKQ6Q/gkOVEG+lly3CZLE3oLsTXCe+rmcBcfP6O8Ay0W2EcyDFrhMBQ4Qv2QrkAZudWEAIrYi1vAq7SIIZqr0G/c+LerjfwOCkpdfewoe2sNVuwNJF9RyTlSM/VWbJNuFaTa6HdOI7mRlAD6u4EdOwJnB2p2m69iKEdSrTousFK2GCvJSkd4BoD1szMdWXa93DkH11NZ1RMNH719Pq9ARXcrI1FW3oOgFuU4z0rciqvlTs7D7+YU5VhsTUlyYM8nOh52QuzoR5aOa7DmgFEzvioF6bAliPVgy/H40jcOCnTPRaWLv7jX3a4WFDN3rKZ+f4U0o5g1UcTPuo7Agbu6TVFG7pmmJ6Q/AEnueWUZhIeadESgocuABYKZAEeiqmoG4NHjCl5mv60xFSHD1yXpeJd+MC1muH3hKHsxi6TEgfg0a0G/Ithlz4Md4eh1yAEt+kpmgSyZWlDeaCrbjbakSgnG9G6JIZDW08F3C8EDgUNmRtFqyBU1Q5gMswVSErlOmJjqFKMqUdAZndQzSBGrTLd7VPRdGCxV5iQc0s1B0eGeJxYf8HfABLJ+Asha7lQdLb2yqt3hNzQpd44/NvRvb78coPQYqX7+0CuOhikVd5BIFnNuIh8b1C+LOgPNT0JkVICYntIpWs7pPLeuiJgxfrTX2mZaJXpDN8jF0fu0n5SJ5hn9HUFNlduVkZVzq2J5REh76cPyqnouXHypy8PhGPg5DZdB5RCDmzT5hdBT1F7telrcbHw+6ltdPO8cAYN6wWYayQfQu/RU6J27GqbcSiaga0/A2ABbGTfoeP9wzphPZ2BTtIZKJC5mosn3v0s8zOyvmHWmHUU32ynpIOAezcoghAcgzxXQZ7ulJejLU/CU08pg5ghHDPyToBgqSTDfNMP+TDt5DIBuTWWvOa8MtqC2mT+EeciC4ZHdLVYKeoqSgp0GA+E5IunU3Qw9Dyy21ccDL6mu30rf6rrG+XWpTrR8fTar18YB6/1OjpEuIg7pRjOHfukfQycFmXrh5ER4N0uaSmO23xeXA+0SfN7Er0FcWSV4N+RntNpzdIEzAfGclBxZCHpDbAA8xUJYwuVlSb8ogqplOAebM1IGmCYCmCeJFWMEE+FcLQQCAdDmK6hh/HraUwROhvRwCxILs81fQqrRpwoGGDh+P+wlm6rH5/pSsucg5u5Y8zr1rjTuL6qlj3M6yss39gKm29svKr1TPs3qe03abzqqeWb+RFuljm3f3MGq5Ng1hO+geQn2GlhnkrU0J4jKK0egekYF63zmX+F8FQaDr9wk4KxI0h5r7RIeevINIdvUXPMbPMOnCIcgxieEGP9C3Lgp8F4/FsgB261Hv8X1uUBRJt1edCO0My8YoEgBZEGI9MrwOWtMYEWCLD5ZUg5uDAax8FaEt62PLjEtlg7xMJBOigdZ2hLR3PXW0upu/3WClxL01mzEotEJDzN7mB0RxDTGW3SiWW3JBM6pKplm9lX2nKjddHSX7wnwHN+QQBTRD2LiPwO8ZfaGQbzMe02bK36SZjYnf1wsb+wqmF3g7BSjafAjczwdS2fcSPWkX6+CalcxfMNfZtGE6PWgpxatlBYlb07myScPIn8FsMbnuInrCzEk28Jw/Hm9Yz/OrwZQJrI3Q5sM+rZMk5LS2FV6Q2LOWzYMefNyqrZs6uY529WVr45u6pKjD2fvQx6u0ivRboBNyk2MJ/i+cxvRI4clUHoYmg/lrae7gCx3k0s3EA4Z6DhUvGL3vKVuU6jEOVnLIkluWWJ5dAezxqXXwg/pjJLAoHowj/HTMLfsBPpmIdYrfCNnQiwpOiQ+a69u8UeO7E70wVlEnpNbaK5i5oQbK3M4L8L/7s4sA+QTV+8oenwwo+bevbuXTyn3yuT5j+dvGjj/UPgevbpPWVO/1cmvcUOz+pdPBee5pnRog1NhxZ93PRhS/gm7pJ679qr2GH3uivCH/j6pMITO0bkA+/HHgh03Lfue+Exvj6x8PiO4flHTEcsX4UT7UkkTs/AwbEiqadTRod6DkAj0dj/oq7/RRs4bF204afadzbc75nVZ/Kcfr1enddy4f+4VWzr/d83FQYla6Pwl6L1U8IVxj0+J6yBIHKRDxQavjK/US1vQ8g9H5yGiZplIJxTieEkBFa7Q+iZNI0FUEGdHr5vsakKN0H4/uCGcwQqSQvfwM4GSTvMApNqgiHhXKpNOPgUKv0OMB2AWlfCeTWlvsSoKFO5+nDt+6A7W/3sGd4KMcBSAvMFtZSA2sy56IWPqDkXGyMuL8ZMwdSUwtxgnN+qwwts7CeANocmWGcXUTl0qjeAObSvJWI//9uzP8j6GOyF+IO9CIZIn9nR2ZKYfwSeCSMzVAB9BdlbCxd7Lda/pxdGKfgxwmhGZfqx6NChBeSEA1ZZ1wFuWLsdUzI5YfIr3kJQfRmgXMJoAFNX8Et3jtx17YBto5ZfzWRksYLM0ZXDtUahxG7jmqKjBcF5p0bfEp7ZnzKu5F0ddsSvGY1TfxxfA4bWx+WdODorusA468TxnFHE1HogxrOM46NmAWeyC1hbB3Na5ZIMupsl1tZhGIDhFFbHwq8O9BDDfyzXa+fmiqknjOemTT03DWydm6ENTUfwj0I9jhBUTLc8uOn6MY/0Uj46L0nh4qklt1gw1gUajOXSfLy4tJk70ZLcXMoMGkpeKppLCd38DPDRhb9Bz0UMIF0DmUmD2c5D8aLS+xU/l/I3hJmlP7ckcV/+XEos6wHsfiJsuGIPNoJxl2CjpJ9QUtrcksydAOC7hpIXAhxgm58BbHrLwutAisfN4GaUswuHEpAV90ul+N3Sn7kvW5J+JiVBMynsdygfoYVzj0qxE849yEXML+BFzjwD/sTX28fD3d7e3tHVw8fbl13TXIoXkyK0TkyLSgzu7OXtLQ+LiI7pyt6wt3d3U8p9lXKVCyRoLhVKaFm9lSHhMXFJyXEJoRCbtEkVnAgPs8x/UGZr5riqAv/TCh6ncytbFW1AiC0ipjN/nbkirnO8iCWi5wJzhXB7l5mfSLbxZ0XbeuTWDriaPcqYwYcOMzmC6pCgEJQ17AomwXRa2Gg6g0cJm4hqS8YmnYdtSiPhE8NaB6ztACN9KUiCzluLlwvKlcsEn44gvYQ+2FH4CR+Hc+GDwst01kSn4CTYnu5iRTZIOJIWz+IIE1+Ata3xyWDPEDcnZ6x42HWhxlsrzBEOyDN7OgWEx2SEMctSSz0BqndPRzvnUCHS1BoocXl3XXCnYHKkjn43/8p/BCOsu5iHvI0NkBUP+yKl9E0ULmfbeVPdPRirdLLcygNHWHWf2ru6uavdXJSu3he/7L/c0U/DeSsdlZ6l86p+0GQFcgYH3vf8j2+E2Ll7uLrI7ZzcVRr7uCHLzvvwN1xdlQZfNy9f+R3h91MPPR3lCm9HTz9Xd+X6i43Cu3GdVMn9/J0Js7w9DvhYZ++sVKrdHF39tq+tPu9jua1dIt6bWa0LcIVEcSy9Xf/Beo0OMS2aZawx6eL8tOnzfDiOGcoMtuxqiAC2AHpRzFlWvSisTig7vVM0EoQYUzHosGjiG160Xmb64HzoV3jnV0Hn+IZz585ZYVwWLT0Bpdc9/0a4sIH/U3gK30xZvDOS8810PxaB6Za1XZNPu+oiAZQchAUFxLnP1s0apEsO1LgHeQYnOMzWzh7ub+QTFFhjiC6a7K1QOjvFhRdN9gLI9ZCrr8W+FCwqhYWrlx4huWIZyRe0LZkvAAd9u7YlYciVDQuX1q/hnwp/7t1L4qzkfkX2YhxW1LbUennDO0vq1wAvgD1EwaYyXmJ+CjGoDlLb8prKShz7ZOW8qi4JqJ73+lL+aXKcMWnq/NehNaKg1fT89TadQUNBxxJ//QK05zeQ3w1aYnLaaKDzos6JtFaitcmwDJoNQ+O/yfaBuWECUGSMbP9kiINfL/jvDNoh56KLxJIvLsNb8Sn8gOEZL0bHRDDJTCmzijnCCKwfO4Bdw1ayj7gYric3kpsB56gfct/ySfwQfiXoM/lD4iwJkoyVzJEslWyRHJNckjySOkqzpFOl+6X3ZcGyJNl42SzZOlm17KKsWWayc7TT2hnt0u0G2H1gd8leYt/dfp79ZvuHDiqHSIeBDlMc5jgcd/jVUec42nG942HHZ056p35OY53mO21y+ofTVecg5xjn+c574P+si8wlwWWByz6XM66dXLu67nD9003p1skt2m272wG32+7YvbP7BPeZ7l+4X3JvBKEqhUdvj6ke8z1Wenzi0eBxz+N3D5OnnaeXZ1/PWZ4LPcs9N3pWeh70POH5jed1zyYvf68wL6NXd6++XsO8xnst9rrn9buXydvO28tb6/2K94feW733eNd6n/b+1vumvJd8kHyUfJJ8pny+/D35OvkW+R55q4/Mx8PHzyfUJ8YnxSfXp9LngM8xn/M+V3zuKDSKMIVR0U3RR5GrGKeYqpitWKRYrdikqFJUK75UfKO4rmhSPFQald2VfZXDlAXKaco5yneVHyg/Ve5Q1ihPKuuVN5XNyse+2NfJV+Gr9+3n+67vB76f+u70PeR7yvdb3x98f/b9U8WpXFUqVYgqRpWqylJNUM1QzVMtVa1VbVbtVtWqzqia1IzaWa1Q69VR6mR1T/VA9UL1MfUF9VX1j+qH6hY/iV+63xa/PX61fmf8vvNr9PvF74k/4+/sr/AP9I8AHvIM//7+w/0n+M/wf9//lP+3/jf9m/0fa7DGUeOj0WkiNImaDE22Jk9TqJmpma95T7NOs1mzW1OrOaO5pHmkDdYO127SVmmrtV9qL2r/GeAfEBnQLWBgwLSAuQFbAk4F/Etnr5PrAnVRugRdmm6ErlS3UPe+7mPdFt1R3Rndd7pbuibdQ50p0C7QK1Ad2CnQGJge2C9wRGBh4MzAOYHvBK4N3BV4MPAfgaf1Mr0rqAnrpI/WJ+oH60fqx+uL9Uv1q/Uf6X/R/xHUKagwaGbQW0HvBa0N2hy0O+hwsCw4PTg/+IsQFBIfMjbk05AjIddDnoXi0NDQ4tCS0G2hdzuFdBrTqaxTdRgbZggbH/ZR2PawfWFHws6GXQ7786X+L6156cJL1176qXNU50mdazs/DY8Nnxn+RXhtuCkiIiIjYlHEwUh9ZGHklsgbUdqojVGN0X7RpdHfGTob3jZsNZyOcY/JicmLKYiZHLMt5nZMc8zvMc9ilbEJsfNiF8Wujt0UWxVbHftHrDnOENclrntc37jBce/HnY97bgQjEUY/Y6Kxm3Ga8Q3jUuMR4ynjv+Lj4vvHj4h/M/7j+C3xO+L3x5+P/y7+RvyPCXxCVsLAhCkJ7yfsTbicyCW6JiYlTk7cn9ic+HuXtC5zu6zocqTLqS5/JEUkvZw0KGla0uqkfUlfJ32f9EvSH0ktyS7J8uTS5HnJ65OPJDckP+sa2DWy6+Cui7ue7fpnCk5xSumR0j/l7ZSlKatTNqVsT7mT6pWamZqdOiJ1QuqC1LWpVamHUo+nXkz9IfVB6vM0SZp7mi4tJi09LSdtWtqytM/TTqY1dpN18+8W3i2xW+9uBd2md2vq/mb3Jd3XdN/WfX/3Y93ru9/p/iTdIV2Rbkyfk745/XD6t+nNPVCPHj1G9SjqsbjHoR4PMvpnFGTMylic8XFGZcbVjKaMZ5n2mYGZUZn0bpCcLeZVD0nkp490SXqM/GWULDY+r0+w+k8aTQanDNkSWMHIREtQ5KYDFTBEd2Qs+pTdiU5KvkDLeTlKl65HhyTJaBRwOJ5k/dEG1t88HwhsMnxvgPgS5i4aDn4Js9dcCPELwOWDk4ED/nukBxcKbj64IwQeuKHMXlQIjiEwrI5LQa1Q0hL+dXM5PxsZwaptjiQUfGdkBIkRo8SAhks4ZARd4+CE3XwKhL8G4U0QpxX8LLAVe4n6A/nlEOaJHLm7aAjMMwATbZI2o5P8LPN2CJsP/iWoSzaUYSfUZy/NH5kfcAiXcU2Q3hP14gpQHvh53AOUx9SjJfDcjXdHPZkE4swK7lPxWXoO9STh3D0S3/ycpGF7wXsYkrM6tAC+vcbVonLJErSTqzWfA3eBM0A8OXrK7MWkjZwtbUnafie8rwUXBS4P3HASB9pbAWV7HcyB+7InoZ6/obk0DbQ9CYNvsyHOCRIGMHqB03KIAdjmewBjE8Buhu/5EL7Qml56DC20OC20fRZt979w0nPmzaQvSD/YOrEf2h30D7L2w7+5L7BCkmU+RPvCxpG+4G4CPHs0irT7Xznpn+AXiP1g68R+aHfQ/sOt/dDR0f69B3sG6AtbR/qC9Bn1oa607zv6UHc6Fv7Gp2MU+pzWH3w6Xh/8/30ynsmY+lsfxjqpj3QgaoTxnEfbmdT133zzIxiPv1nfwdqNkZtGwoXdZJxSPIGxCq43wRcaR/RDOrz35OaarzBZSEf6keTd0Ze8hcCSLNSBPBN8I23bwZdBWWUJEAdwkOCBxQ9peyd4Cbjxdz7BWcCbuRZ/AfiF4GvomCH99h/6BN8pzpExRnDOgvcU9zr4FL83oXlMvXCE1KNDWRZQfC9APODRHMC1bHDrRcd0Ab8KcOss+P3AgbYwAXQwCLMRMr3CJ6F4bgkaKLmHjvPh6DiTiPsxiZRexfMG6A+EnblxIA5Gxjf4hCaSfiO4S/CdjEGCu5IAVCpNRG+zb6A5koNogeQ2miZNRq8y+1GxlV5CH8bD81yKn1AvMn6gLuFkXJAxQL5ZaSXEiad4yUH5LonvpK6kjSC8gNBJ8GdI1ObDJD1tuwzUhRuA+kLbzoB8R3GfQDtBGO9rFoC+rYW+l5Pv3FA4U4A48B5K4x0kNrzNWwktAlnZg9xM81OKl/VoCrSzFqx7j4X4XeF9B4WZicZC/C3g50r2ITmpIwmnacAnYVCf0dzPaDD3L+TPr0GnJHVoGvEhTQL93hdpyTwAacbwkZB+LyogcwhbKSyCOG+D2yt5AHjFo5ekpagXpEmXuKFcqM8wySCo7y+wW5tjPsxdNzdLAs23eQTCDWtRd1qGuyiF64WK+L5QT9CfQPqOjA86/h9AGz1AuZSmkbmAzGFN0C+x5mZ4/5aMMUpLiW+ho5JeaBXtuw/QCDLu2mmqsFt21HxCNhz6qhcq5HdCHBg3XCOKhn4bbOn3eGvfS1LN+wk82QbzGl6LWDrGiIN0Es58gvS9ZUy09zuhYaTfCcy7MJZIv8cB7DdRo2wZipcdRYMln6MqyVKaD5TR/C/ZZzAPLjc/ofT5IUqF/u3NxaDe/CI4rwO6Jo0FvUlpSE3GNx3jl8FXm29J7MDvAu9kngSf0l0y7j9HSwl+Sq6gkWR+5KehidwhdFSajXpLF6OJ/Da0TNIf0pF88pGTpBbyvYik1nkAjjqnkvzh22iCs+1zglkhjTffkkZCXkagbZct5SG0vgvkcRspIV0EXb+Ag3kSpOxRjow68yPAP46sCZgl2BGcJ13rLAHc12NHcJ6cHhQX6lEtSQPxbnLVwN8JjqlAZfwgVAZwyiDNOfsL6JBTGTqE6xHHmOBUOBSsXNejaniuhudq5gByYA1oLnE4x9QEc/RAwJUGmNeDYd7Kh7nzM/Bfs/gzwa8i85n0JVRGHLwb4P13K60B2sOZisFlmepN2aaVpjIhyvSNuC6UFglwI+tU9qTxWY1TBpxDethunJnpUGVnvIKcHvMGfh2Kw37EN/cA7dMFjDvEcJCwLMs5MNw8xOxC6GihNW2/gh75RO99sBw0fnji9dIifBeCN7YDpzxBCBFNwZj6HOG3BRkPDTx5ojl4Ll7F+DKnmZtsCTuXfZddyn4Cu/GVmmDYaaVrqrQB2nJthXZfgHuQJNgjWE4tWGnQJkjlw5xirrJT2DfYtyHVMvYzboXGVRNpSbXCkooXU5lvm4+ad5nDhLeFGaZ7prumW6YfTDdNN0xVd8LvBN1R3z54u1vj5cZ/NB5szL0x/vqw60M6nC/8539S4ISC2nLkLDaS1p88Y+QNb+Izg5xxhuWZRUF4oOWZs3nmkQ9+w/IMHN14FZzTFaMpYIEYMAWNhxOQGdAOIXBvEwp+NHCQR4LmQA0aAzE0wNc5Eb5PBzcNjUOjURHoZtWAFabJED8cntJAN+6r4Ge3wZpO38aBPw7SzITffIhp/x/kGteW60DIaSbkVQhpJkNsUo7RkOZ/l2M6PBVCuhw41dZAThPgmUAbR1OMpjXSAJTJ8DsF4owBuBMhngbSF0Puo+m3jnAGUCjTwZKMGH8qhI77mziaDrFyaAmnw3sxzTUaymkA/nvb1Na0nTukhdFvfgzuKuWP+6s/uhuDcc3+D9y8Tl0=',
+};
 let standardFontReady = null; // null = untried, true/false = outcome
 function ensureStandardFont() {
   if (standardFontReady !== null) return standardFontReady ? 'DDice-Standard' : null;
@@ -30768,28 +31385,9 @@ function renderScrollBook({ family, title, body, quality = null }) {
   return makeImagesPdf(pages);
 }
 
-// How much of a run a scroll carries (T, 2026-11-17: the roleplay boxes
-// went to Discord's 4,000, so the story keeps every word and runs longer).
-const STORY_BEATS_MAX = 400;
-const SCROLL_BODY_MAX = 40000;
-// Discord takes a 10 MB file from the bot. The pages are pictures, so a
-// long scroll is painted again lighter, and only then cut short.
+// Discord takes a 10 MB file from the bot: a printed scroll past this goes
+// in numbered parts, each with its heading (T, 2026-11-17 \u2014 no caps).
 const SCROLL_FILE_MAX = Math.floor(7.5 * 1024 * 1024);
-function scrollBookFitting({ family, title, body }) {
-  for (const quality of [null, 75, 60]) {
-    const pdf = renderScrollBook({ family, title, body, quality });
-    if (pdf.length <= SCROLL_FILE_MAX) return { pdf, body };
-  }
-  let keep = String(body || '').length;
-  while (keep > 2000) {
-    keep = Math.floor(keep * 0.75);
-    const cut = `${String(body).slice(0, keep).replace(/\n[^\n]*$/, '')}\n\n(The rest would not fit one scroll.)`;
-    const pdf = renderScrollBook({ family, title, body: cut, quality: 60 });
-    if (pdf.length <= SCROLL_FILE_MAX) return { pdf, body: cut };
-  }
-  const last = String(body || '').slice(0, 2000);
-  return { pdf: renderScrollBook({ family, title, body: last, quality: 60 }), body: last };
-}
 // Whether the parchment can be painted at all \u2014 asked once; without the
 // canvas the completion card simply goes out without its scroll.
 let canvasReady = null;
@@ -30798,35 +31396,28 @@ function hasCanvas() {
   return canvasReady;
 }
 // The run's story as the players would keep it: the party, the night's
-// length and every logged beat \u2014 the roleplay words among them \u2014 on
-// parchment, hung on the completion card. The writing rides inside the
-// PDF, so /gm scroll can unfurl it again anywhere (T, 2026-10-14).
-function runStoryScroll(gid, quest, { runnerName, partyNames, runMs, events, tale, sofar = false }) {
-  // The standard face, not the server's saved script (T, 2026-11-17): the
-  // script stays for /gm scroll's props and the parchment sheet.
-  const family = 'standard';
-  const plain = (t) => String(t || '').replace(/<@[!&]?\d+>/g, 'someone').replace(/<#\d+>/g, 'a room')
-    .replace(/[*_`]+/g, '').replace(/[\p{Extended_Pictographic}\uFE0F]/gu, '').replace(/[ \t]+/g, ' ').trim();
-  // Table talk is not here: it has its own transcript (2026-11-07), and
-  // left in it crowded the story out of the scroll's 150 beats.
-  const talkN = events.filter(e => e.kind === 'talk' && !e.gone).length;
-  const beats = events.filter(e => !['remind', 'recap', 'talk'].includes(e.kind)).slice(0, STORY_BEATS_MAX)
-    .map(e => `${fmtElapsed(e.at_ms)}  ${plain(e.text || e.kind).replace(/\s*\n\s*/g, ' ')}`);
-  const body = [
-    `Run by ${plain(runnerName)}, ${dateLine(Date.now()).replace(/^\[[^\]]*\] \[[^\]]*\] /, '')}`,
-    `The party: ${partyNames.map(plain).join(', ') || 'nobody'}`,
+// length and everything the record holds \u2014 every beat and every recorded
+// message, each whole, in order (T, 2026-11-17) \u2014 printed on the parchment
+// and hung on the completion card; in numbered parts if it outgrows a file.
+// Asked for mid-run (/session summary, the wind-down) it says so on its
+// face and in its name, and a GM's `filename:` names the file and heads its
+// first page. Some of the writing rides inside the first file, so
+// /gm scroll can unfurl it again anywhere (T, 2026-10-14).
+function runStoryScroll(gid, quest, { runnerName, partyNames, runMs, events, tale, sofar = false, filename = null, nameOf = null }) {
+  const head = scrollParasOf([
+    `Run by ${runnerName}, ${dateLine(Date.now()).replace(/^\[[^\]]*\] \[[^\]]*\] /, '')}`,
+    `The party: ${partyNames.join(', ') || 'nobody'}`,
     sofar ? `It has run for ${fmtElapsed(runMs)} so far.` : `It ran for ${fmtElapsed(runMs)}.`,
-    '',
-    ...(beats.length ? beats : [sofar ? 'Nothing has been written down yet.' : 'Nothing was written down.']),
-    ...(talkN ? ['', `${talkN} line${talkN === 1 ? '' : 's'} of table talk were kept; they ride beside this scroll as a transcript.`] : []),
-    ...(tale ? ['', plain(tale)] : []),
-  ].join('\n').slice(0, SCROLL_BODY_MAX);
-  // Asked for mid-run (/session summary), it says so on its face and in its name.
-  const title = sofar ? `${questTag(quest)} \u2014 so far` : questTag(quest);
-  const stem = fileSlug(sofar ? `${questTag(quest)} so far` : `${title} story`, 'run-story');
-  const fitted = scrollBookFitting({ family, title, body });
-  const pdf = embedScrollData(fitted.pdf, { v: 1, kind: 'scroll', title, body: fitted.body, name: stem });
-  return { pdf, name: `${stem}.pdf` };
+  ]);
+  const story = storyParas(storyEntries(events, nameOf));
+  const paras = [...head, null, ...(story.length ? story : scrollParasOf([sofar ? 'Nothing has been written down yet.' : 'Nothing was written down.'])),
+    ...(tale ? [null, ...scrollParasOf(String(tale).split('\n'))] : [])];
+  const own = filename ? scrollFileName(filename) : null;
+  const title = own?.heading || (sofar ? `${questTag(quest)} \u2014 so far` : questTag(quest));
+  const stem = own?.stem || fileSlug(sofar ? `${questTag(quest)} so far` : `${questTag(quest)} story`, 'run-story');
+  const files = printScroll({ title, paras, stem });
+  files[0].pdf = embedScrollData(files[0].pdf, { v: 1, kind: 'scroll', title, body: scrollPlain(paras).slice(0, 4000), name: stem });
+  return { pdf: files[0].pdf, name: files[0].name, files };
 }
 
 // Base-14 text into a PDF string: escape the delimiters, tame the common
@@ -30860,49 +31451,467 @@ function wrapByCount(text, maxChars) {
 }
 // The readable edition as NATIVE PDF text: built-in Helvetica, cream ground,
 // gold rules, maroon diamonds and title — no font files involved anywhere,
-// so no registered OTF can leak in. The text is selectable, too.
+// so no registered OTF can leak in. The text is selectable, too. A long one
+// runs onto further pages rather than off the first (build R).
 function makeTextPdf({ title, body }) {
-  const W = 760, PAD = 80, bodySize = 16, lineH = 24, titleSize = 26;
+  const W = 760, PAD = 80, bodySize = 16, lineH = 24, titleSize = 26, MAXH = 2200;
   const bodyLines = wrapByCount(body, 72);
   const titleLines = title ? wrapByCount(title, 42) : [];
   const titleBlock = titleLines.length ? titleLines.length * 36 + 24 : 0;
-  const H = Math.min(2200, PAD * 2 + titleBlock + Math.max(bodyLines.length, 1) * lineH);
-  const ops = [];
-  ops.push(`0.953 0.914 0.824 rg 0 0 ${W} ${H} re f`);
-  ops.push(`0.541 0.427 0.231 RG 3 w 26 26 ${W - 52} ${H - 52} re S`);
-  ops.push(`1.5 w 38 38 ${W - 76} ${H - 76} re S`);
-  for (const [dx, dy] of [[26, 26], [W - 26, 26], [26, H - 26], [W - 26, H - 26]])
-    ops.push(`0.42 0.12 0.12 rg ${dx} ${dy - 10} m ${dx + 10} ${dy} l ${dx} ${dy + 10} l ${dx - 10} ${dy} l f`);
-  let y = H - PAD;
-  if (titleLines.length) {
-    ops.push('0.42 0.12 0.12 rg');
-    for (const tl of titleLines) {
-      const x = Math.max(PAD, (W - tl.length * titleSize * 0.5) / 2);
-      ops.push(`BT /F2 ${titleSize} Tf 1 0 0 1 ${x.toFixed(1)} ${y} Tm (${pdfEscape(tl)}) Tj ET`);
-      y -= 36;
+  const pages = [];
+  for (let i = 0, first = true; first || i < bodyLines.length; first = false) {
+    const cap = Math.max(4, Math.floor((MAXH - PAD * 2 - (first ? titleBlock : 0)) / lineH));
+    pages.push({ lines: bodyLines.slice(i, i + cap), first });
+    i += cap;
+  }
+  const sheets = pages.map(({ lines, first }) => {
+    const H = PAD * 2 + (first ? titleBlock : 0) + Math.max(lines.length, 1) * lineH;
+    const ops = [];
+    ops.push(`0.953 0.914 0.824 rg 0 0 ${W} ${H} re f`);
+    ops.push(`0.541 0.427 0.231 RG 3 w 26 26 ${W - 52} ${H - 52} re S`);
+    ops.push(`1.5 w 38 38 ${W - 76} ${H - 76} re S`);
+    for (const [dx, dy] of [[26, 26], [W - 26, 26], [26, H - 26], [W - 26, H - 26]])
+      ops.push(`0.42 0.12 0.12 rg ${dx} ${dy - 10} m ${dx + 10} ${dy} l ${dx} ${dy + 10} l ${dx - 10} ${dy} l f`);
+    let y = H - PAD;
+    if (first && titleLines.length) {
+      ops.push('0.42 0.12 0.12 rg');
+      for (const tl of titleLines) {
+        const x = Math.max(PAD, (W - tl.length * titleSize * 0.5) / 2);
+        ops.push(`BT /F2 ${titleSize} Tf 1 0 0 1 ${x.toFixed(1)} ${y} Tm (${pdfEscape(tl)}) Tj ET`);
+        y -= 36;
+      }
+      y -= 24;
     }
-    y -= 24;
-  }
-  ops.push('0.22 0.17 0.10 rg');
-  for (const ln of bodyLines) {
-    if (ln) ops.push(`BT /F1 ${bodySize} Tf 1 0 0 1 ${PAD} ${y} Tm (${pdfEscape(ln)}) Tj ET`);
-    y -= lineH;
-  }
-  const content = ops.join('\n');
+    ops.push('0.22 0.17 0.10 rg');
+    for (const ln of lines) {
+      if (ln) ops.push(`BT /F1 ${bodySize} Tf 1 0 0 1 ${PAD} ${y} Tm (${pdfEscape(ln)}) Tj ET`);
+      y -= lineH;
+    }
+    return { H, content: ops.join('\n') };
+  });
   const chunks = []; let off = 0; const offs = [];
   const push = (x) => { const b = Buffer.isBuffer(x) ? x : Buffer.from(x, 'latin1'); chunks.push(b); off += b.length; };
   const obj = (x) => { offs.push(off); push(x); };
   push('%PDF-1.4\n%\xE2\xE3\xCF\xD3\n');
   obj('1 0 obj\n<</Type/Catalog/Pages 2 0 R>>\nendobj\n');
-  obj('2 0 obj\n<</Type/Pages/Kids[3 0 R]/Count 1>>\nendobj\n');
-  obj(`3 0 obj\n<</Type/Page/Parent 2 0 R/MediaBox[0 0 ${W} ${H}]/Resources<</Font<</F1 5 0 R/F2 6 0 R>>>>/Contents 4 0 R>>\nendobj\n`);
-  obj(`4 0 obj\n<</Length ${content.length}>>\nstream\n${content}\nendstream\nendobj\n`);
-  obj('5 0 obj\n<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>\nendobj\n');
-  obj('6 0 obj\n<</Type/Font/Subtype/Type1/BaseFont/Helvetica-Bold>>\nendobj\n');
-  const xref = off;
-  push('xref\n0 7\n0000000000 65535 f \n' + offs.map(o => String(o).padStart(10, '0') + ' 00000 n \n').join(''));
-  push(`trailer\n<</Size 7/Root 1 0 R>>\nstartxref\n${xref}\n%%EOF\n`);
+  obj(`2 0 obj\n<</Type/Pages/Kids[${sheets.map((_, k) => `${5 + 2 * k} 0 R`).join(' ')}]/Count ${sheets.length}>>\nendobj\n`);
+  obj('3 0 obj\n<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>\nendobj\n');
+  obj('4 0 obj\n<</Type/Font/Subtype/Type1/BaseFont/Helvetica-Bold>>\nendobj\n');
+  sheets.forEach(({ H, content }, k) => {
+    obj(`${5 + 2 * k} 0 obj\n<</Type/Page/Parent 2 0 R/MediaBox[0 0 ${W} ${H}]/Resources<</Font<</F1 3 0 R/F2 4 0 R>>>>/Contents ${6 + 2 * k} 0 R>>\nendobj\n`);
+    obj(`${6 + 2 * k} 0 obj\n<</Length ${content.length}>>\nstream\n${content}\nendstream\nendobj\n`);
+  });
+  const xref = off, size = 5 + 2 * sheets.length;
+  push(`xref\n0 ${size}\n0000000000 65535 f \n` + offs.map(o => String(o).padStart(10, '0') + ' 00000 n \n').join(''));
+  push(`trailer\n<</Size ${size}/Root 1 0 R>>\nstartxref\n${xref}\n%%EOF\n`);
   return Buffer.concat(chunks);
+}
+
+// ── The printed scroll (T, 2026-11-17) ──────────────────────────────────────
+// A run's story, its GM record and a fight's log as real text on the
+// parchment rather than pictures of it: DejaVu Sans in three faces — plain,
+// bold and oblique, subset to Latin, Greek and Cyrillic — embedded in the
+// file, so every box prints it alike (no canvas needed), the words can be
+// found and copied, and a long night stays a small file. The sheet is the
+// parchment of /gm scroll — 1000 wide, up to 2600 tall, cream ground, burnt
+// corners, speckle, the double gold rule and the maroon cornerstones —
+// drawn rather than painted. Nothing is cut: a scroll too big for one
+// Discord file goes in numbered parts.
+let scrollFacesCache = null;
+function scrollFaces() {
+  if (scrollFacesCache) return scrollFacesCache;
+  const out = {};
+  for (const k of ['r', 'b', 'i']) out[k] = ttfFace(SCROLL_FONT_Z[k], { r: 'DDRAAA+DejaVuSans', b: 'DDBAAA+DejaVuSans-Bold', i: 'DDIAAA+DejaVuSans-Oblique' }[k]);
+  scrollFacesCache = out;
+  return out;
+}
+// What a TrueType face holds that a PDF needs: its metrics, every glyph's
+// advance, and which glyph each character is.
+function ttfFace(b64, name) {
+  const zbuf = Buffer.from(b64, 'base64');
+  const raw = require('zlib').inflateSync(zbuf);
+  const u16 = (o) => raw.readUInt16BE(o), i16 = (o) => raw.readInt16BE(o), u32 = (o) => raw.readUInt32BE(o);
+  const tab = {};
+  for (let k = 0, n = u16(4); k < n; k++) { const o = 12 + 16 * k; tab[raw.toString('latin1', o, o + 4)] = u32(o + 8); }
+  const upm = u16(tab.head + 18);
+  const bbox = [i16(tab.head + 36), i16(tab.head + 38), i16(tab.head + 40), i16(tab.head + 42)];
+  const ascent = i16(tab.hhea + 4), descent = i16(tab.hhea + 6), nHM = u16(tab.hhea + 34);
+  const numGlyphs = u16(tab.maxp + 4);
+  const adv = new Array(numGlyphs).fill(0);
+  for (let g = 0, last = 0; g < numGlyphs; g++) { if (g < nHM) last = u16(tab.hmtx + 4 * g); adv[g] = last; }
+  const gid = new Map();
+  for (let k = 0, n = u16(tab.cmap + 2); k < n; k++) {
+    const pid = u16(tab.cmap + 4 + 8 * k), eid = u16(tab.cmap + 6 + 8 * k), st = tab.cmap + u32(tab.cmap + 8 + 8 * k);
+    if (u16(st) !== 4 || !((pid === 3 && eid === 1) || pid === 0)) continue;
+    const seg = u16(st + 6) / 2, ends = st + 14, starts = ends + 2 * seg + 2, deltas = starts + 2 * seg, ranges = deltas + 2 * seg;
+    for (let s = 0; s < seg; s++) {
+      const end = u16(ends + 2 * s), start = u16(starts + 2 * s), delta = i16(deltas + 2 * s), ro = u16(ranges + 2 * s);
+      for (let c = start; c <= end && c < 0xFFFF; c++) {
+        let g = ro ? u16(ranges + 2 * s + ro + 2 * (c - start)) : c;
+        if (!ro || g) g = (g + delta) & 0xFFFF;
+        if (g && !gid.has(c)) gid.set(c, g);
+      }
+    }
+  }
+  const italic = raw.readInt32BE(tab.post + 4) / 65536;
+  return { name, zbuf, raw, upm, bbox, ascent, descent, adv, gid, italic, q: gid.get(63) || 0 };
+}
+// A character as the face draws it: its glyph, or a question mark.
+const glyphOf = (face, ch) => face.gid.get(ch.codePointAt(0)) ?? face.q;
+function faceWidth(face, text, size) {
+  let w = 0;
+  for (const ch of String(text)) w += face.adv[glyphOf(face, ch)];
+  return w * size / face.upm;
+}
+function faceHex(face, text) {
+  let h = '';
+  for (const ch of String(text)) h += glyphOf(face, ch).toString(16).padStart(4, '0');
+  return h;
+}
+// What the faces cannot draw goes, and Discord's own shorthands become words.
+function scrollClean(t) {
+  return String(t ?? '')
+    .replace(/<a?:(\w+):\d+>/g, '').replace(/<t:\d+(?::\w)?>/g, '')
+    .replace(/<@&\d+>/g, '@role').replace(/<@!?\d+>/g, '@someone').replace(/<#\d+>/g, '#a room')
+    .replace(/\[([^\]]*)\]\(<?https?:[^)\s]*>?\)/g, '$1')
+    .replace(/[\p{Extended_Pictographic}\u{1F1E6}-\u{1F1FF}\u{1F3FB}-\u{1F3FF}\u{E0020}-\u{E007F}\uFE0E\uFE0F\u200B-\u200F\u2060]/gu, '')
+    .replace(/\t/g, ' ').replace(/[\x00-\x08\x0B-\x1F\x7F]/g, '')
+    .replace(/ {2,}/g, ' ');
+}
+// Discord's marks inside a line, as the scroll prints them: **bold** in the
+// bold face, *italic* and _italic_ in the oblique, the rest in `base`;
+// every other mark reduced to its words.
+function scrollRuns(text, base = 'r') {
+  const t = scrollClean(text).replace(/^\s*(?:>\s+|#{1,3}\s+|-#\s+)/, '');
+  const out = [];
+  const re = /\*\*([^*]+?)\*\*|\*([^*\s][^*]*?)\*|(?<![\w])_([^_\n]+?)_(?![\w])/g;
+  let at = 0, m;
+  while ((m = re.exec(t))) {
+    if (m.index > at) out.push({ t: t.slice(at, m.index), s: base });
+    out.push(m[1] != null ? { t: m[1], s: 'b' } : { t: m[2] ?? m[3], s: base === 'i' ? 'r' : 'i' });
+    at = re.lastIndex;
+  }
+  if (at < t.length) out.push({ t: t.slice(at), s: base });
+  return out.map(r => ({ t: r.t.replace(/\*+|`+|~~|\|\|/g, ''), s: r.s })).filter(r => r.t);
+}
+// A paragraph of runs into lines no wider than the sheet, broken between
+// words and inside a word only when one word is wider than a line.
+function scrollWrap(runs, faces, size, maxW) {
+  const lines = [];
+  let cur = [], w = 0, space = null;
+  const width = (t, s) => faceWidth(faces[s], t, size);
+  const put = (t, s) => { const last = cur[cur.length - 1]; if (last && last.s === s) last.t += t; else cur.push({ t, s }); };
+  for (const r of runs || []) {
+    for (const m of String(r.t).matchAll(/\s+|\S+/g)) {
+      const tok = m[0];
+      if (/^\s/.test(tok)) { if (cur.length) space = r.s; continue; }
+      let word = tok, ww = width(word, r.s);
+      const sw = space ? width(' ', space) : 0;
+      if (cur.length && w + sw + ww > maxW) { lines.push(cur); cur = []; w = 0; space = null; }
+      while (ww > maxW - w && Array.from(word).length > 1) {
+        // A word wider than the line: as much as fits, the rest on.
+        const chars = Array.from(word);
+        let k = chars.length - 1;
+        while (k > 1 && width(chars.slice(0, k).join(''), r.s) > maxW - w - (cur.length && space ? width(' ', space) : 0)) k--;
+        if (cur.length && space) { put(' ', space); }
+        put(chars.slice(0, k).join(''), r.s);
+        lines.push(cur); cur = []; w = 0; space = null;
+        word = chars.slice(k).join(''); ww = width(word, r.s);
+      }
+      if (cur.length && space) { put(' ', space); w += width(' ', space); }
+      space = null;
+      put(word, r.s); w += ww;
+    }
+  }
+  if (cur.length) lines.push(cur);
+  return lines;
+}
+// The sheet's measures, /gm scroll's own.
+const PSCROLL = { W: 1000, PAD: 90, TITLE: 62, BODY: 40, LINE: 54, TLINE: 78, TGAP: 34, MAXH: 2600 };
+const PSCROLL_INK = '0.220 0.173 0.098', PSCROLL_RED = '0.420 0.122 0.122';
+// The speckle, drawn once and laid on every sheet: age spots in a fixed
+// scatter, faint as the painted ones.
+function speckleOps() {
+  let seed = 7;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+  const ops = ['/Gs gs 0.369 0.282 0.169 rg'];
+  for (let k = 0; k < 140; k++) {
+    const x = rnd() * PSCROLL.W, y = rnd() * PSCROLL.MAXH, r = 1 + rnd() * 2.4, c = r * 0.5523;
+    const f = (v) => v.toFixed(1);
+    ops.push(`${f(x + r)} ${f(y)} m ${f(x + r)} ${f(y + c)} ${f(x + c)} ${f(y + r)} ${f(x)} ${f(y + r)} c ${f(x - c)} ${f(y + r)} ${f(x - r)} ${f(y + c)} ${f(x - r)} ${f(y)} c ${f(x - r)} ${f(y - c)} ${f(x - c)} ${f(y - r)} ${f(x)} ${f(y - r)} c ${f(x + c)} ${f(y - r)} ${f(x + r)} ${f(y - c)} ${f(x + r)} ${f(y)} c f`);
+  }
+  return ops.join('\n');
+}
+// One sheet: the parchment, then the words. `lines` are wrapped lines of
+// runs (an empty one is a blank line); `title` lines head the first sheet.
+function scrollSheetOps(lines, titleLines, faces) {
+  const { W, PAD, TITLE, BODY, LINE, TLINE, TGAP } = PSCROLL;
+  const titleBlock = titleLines.length ? titleLines.length * TLINE + TGAP : 0;
+  const H = PAD * 2 + titleBlock + Math.max(lines.length, 1) * LINE;
+  const ops = [`0.953 0.914 0.824 rg 0 0 ${W} ${H} re f`];
+  // Burnt corners: a soft stain in each, kept to its own half of the sheet.
+  for (const [cx, cy] of [[0, 0], [W, 0], [0, H], [W, H]]) {
+    const half = cy === 0 ? `0 0 ${W} ${(H / 2).toFixed(1)}` : `0 ${(H / 2).toFixed(1)} ${W} ${(H / 2).toFixed(1)}`;
+    ops.push(`q ${half} re W n 1 0 0 1 ${cx} ${cy} cm /Sh sh Q`);
+  }
+  ops.push('q /Sp Do Q');
+  ops.push(`0.541 0.427 0.231 RG 3 w 26 26 ${W - 52} ${H - 52} re S 1.5 w 38 38 ${W - 76} ${H - 76} re S`);
+  const d = 9.9;
+  for (const [dx, dy] of [[26, 26], [W - 26, 26], [26, H - 26], [W - 26, H - 26]])
+    ops.push(`${PSCROLL_RED} rg ${dx} ${dy - d} m ${dx + d} ${dy} l ${dx} ${dy + d} l ${dx - d} ${dy} l h f`);
+  let y = PAD + (titleLines.length ? TITLE : BODY) * 0.2;
+  const text = (runs, x, yy, size, color) => {
+    const parts = [`BT ${color} rg 1 0 0 1 ${x.toFixed(2)} ${(H - yy).toFixed(2)} Tm`];
+    for (const r of runs) parts.push(`/F${r.s} ${size} Tf <${faceHex(faces[r.s], r.t)}> Tj`);
+    parts.push('ET');
+    ops.push(parts.join(' '));
+  };
+  for (const tl of titleLines) {
+    y += TLINE;
+    const w = tl.reduce((a, r) => a + faceWidth(faces[r.s], r.t, TITLE), 0);
+    text(tl, Math.max(PAD, (W - w) / 2), y, TITLE, PSCROLL_RED);
+  }
+  if (titleLines.length) y += TGAP;
+  for (const ln of lines) {
+    y += LINE;
+    if (ln.length) text(ln, PAD, y, BODY, PSCROLL_INK);
+  }
+  return { H, ops: ops.join('\n') };
+}
+// The sheets as a PDF: the three faces, the speckle and the corner stain
+// shared, a content stream a sheet.
+function scrollPdf(sheets, faces) {
+  const zlib = require('zlib');
+  const objs = [];
+  const add = (body) => { objs.push(body); return objs.length; };
+  const stream = (dict, data) => { objs.push({ dict, data: Buffer.isBuffer(data) ? data : Buffer.from(data, 'latin1') }); return objs.length; };
+  add(null); add(null);   // 1 the catalog, 2 the page tree
+  const fontRefs = {};
+  for (const k of ['r', 'b', 'i']) {
+    const f = faces[k], u = (v) => Math.round(v * 1000 / f.upm);
+    const ff = stream(`/Length1 ${f.raw.length}/Filter/FlateDecode`, f.zbuf);
+    const fd = add(`<</Type/FontDescriptor/FontName/${f.name}/Flags ${f.italic ? 96 : 32}/FontBBox[${f.bbox.map(u).join(' ')}]/ItalicAngle ${f.italic}/Ascent ${u(f.ascent)}/Descent ${u(f.descent)}/CapHeight 729/StemV ${k === 'b' ? 120 : 80}/FontFile2 ${ff} 0 R>>`);
+    const cid = add(`<</Type/Font/Subtype/CIDFontType2/BaseFont/${f.name}/CIDSystemInfo<</Registry(Adobe)/Ordering(Identity)/Supplement 0>>/FontDescriptor ${fd} 0 R/DW 1000/W[0[${Array.from(f.adv, u).join(' ')}]]/CIDToGIDMap/Identity>>`);
+    // The text can be found and copied: every glyph back to its character.
+    const pairs = new Map();
+    for (const [c, g] of [...f.gid.entries()].sort((a, b) => a[0] - b[0])) if (!pairs.has(g)) pairs.set(g, c);
+    const list = [...pairs.entries()];
+    const cmap = ['/CIDInit /ProcSet findresource begin', '12 dict begin', 'begincmap',
+      '/CIDSystemInfo <</Registry (Adobe) /Ordering (UCS) /Supplement 0>> def', '/CMapName /Adobe-Identity-UCS def', '/CMapType 2 def',
+      '1 begincodespacerange', '<0000> <FFFF>', 'endcodespacerange'];
+    for (let k2 = 0; k2 < list.length; k2 += 100) {
+      const chunk = list.slice(k2, k2 + 100);
+      cmap.push(`${chunk.length} beginbfchar`, ...chunk.map(([g, c]) => `<${g.toString(16).padStart(4, '0')}> <${c.toString(16).padStart(4, '0')}>`), 'endbfchar');
+    }
+    cmap.push('endcmap', 'CMapName currentdict /CMap defineresource pop', 'end', 'end');
+    const tu = stream('/Filter/FlateDecode', zlib.deflateSync(Buffer.from(cmap.join('\n'), 'latin1')));
+    fontRefs[k] = add(`<</Type/Font/Subtype/Type0/BaseFont/${f.name}/Encoding/Identity-H/DescendantFonts[${cid} 0 R]/ToUnicode ${tu} 0 R>>`);
+  }
+  const gs = add('<</Type/ExtGState/ca 0.06/CA 0.06>>');
+  const sp = stream(`/Type/XObject/Subtype/Form/BBox[0 0 ${PSCROLL.W} ${PSCROLL.MAXH}]/Resources<</ExtGState<</Gs ${gs} 0 R>>>>/Filter/FlateDecode`, zlib.deflateSync(Buffer.from(speckleOps(), 'latin1')));
+  // The stain: the painted gradient's colours over the cream, ring by ring.
+  const sh = add('<</ShadingType 3/ColorSpace/DeviceRGB/Coords[0 0 10 0 0 360]/Function<</FunctionType 2/Domain[0 1]/C0[0.809 0.744 0.637]/C1[0.953 0.914 0.824]/N 1>>/Extend[true false]>>');
+  const res = `<</Font<<${['r', 'b', 'i'].map(k => `/F${k} ${fontRefs[k]} 0 R`).join('')}>>/XObject<</Sp ${sp} 0 R>>/Shading<</Sh ${sh} 0 R>>>>`;
+  const kids = [];
+  for (const s of sheets) {
+    const c = stream('/Filter/FlateDecode', zlib.deflateSync(Buffer.from(s.ops, 'latin1')));
+    kids.push(add(`<</Type/Page/Parent 2 0 R/MediaBox[0 0 ${PSCROLL.W} ${s.H}]/Resources ${res}/Contents ${c} 0 R>>`));
+  }
+  objs[0] = '<</Type/Catalog/Pages 2 0 R>>';
+  objs[1] = `<</Type/Pages/Kids[${kids.map(k => `${k} 0 R`).join(' ')}]/Count ${kids.length}>>`;
+  const chunks = []; let off = 0; const offs = [];
+  const push = (x) => { const b = Buffer.isBuffer(x) ? x : Buffer.from(x, 'latin1'); chunks.push(b); off += b.length; };
+  push('%PDF-1.4\n%\xE2\xE3\xCF\xD3\n');
+  objs.forEach((o, i) => {
+    offs.push(off);
+    if (o && typeof o === 'object') { push(`${i + 1} 0 obj\n<<${o.dict}/Length ${o.data.length}>>\nstream\n`); push(o.data); push('\nendstream\nendobj\n'); }
+    else push(`${i + 1} 0 obj\n${o}\nendobj\n`);
+  });
+  const xref = off;
+  push(`xref\n0 ${objs.length + 1}\n0000000000 65535 f \n` + offs.map(o => String(o).padStart(10, '0') + ' 00000 n \n').join(''));
+  push(`trailer\n<</Size ${objs.length + 1}/Root 1 0 R>>\nstartxref\n${xref}\n%%EOF\n`);
+  return Buffer.concat(chunks);
+}
+// Wrapped lines onto sheets: the first carries the title, a heading never
+// ends a sheet without its first line, and no sheet opens on a blank.
+function scrollSheets(lines, titleLines) {
+  const { PAD, LINE, TLINE, TGAP, MAXH } = PSCROLL;
+  const sheets = [];
+  let i = 0, first = true;
+  while (i < lines.length || first) {
+    const tl = first ? titleLines : [];
+    const cap = Math.max(4, Math.floor((MAXH - PAD * 2 - (tl.length ? tl.length * TLINE + TGAP : 0)) / LINE));
+    while (!first && i < lines.length && !lines[i].runs.length) i++;
+    if (!first && i >= lines.length) break;
+    let end = Math.min(lines.length, i + cap);
+    // A character's heading is not left alone at the foot of a sheet.
+    if (end < lines.length && end - 1 > i && lines[end - 1].head) end--;
+    sheets.push({ lines: lines.slice(i, end).map(l => l.runs), titleLines: tl });
+    i = end; first = false;
+  }
+  return sheets;
+}
+// Paragraphs (runs, or null for a blank line) into the scroll's PDF, in
+// numbered parts when one file would be too big for Discord.
+function printScroll({ title, paras, stem }) {
+  const faces = scrollFaces();
+  const { W, PAD, BODY, TITLE } = PSCROLL;
+  const lines = [];
+  for (const p of paras || []) {
+    if (!p) { lines.push({ runs: [] }); continue; }
+    const runs = Array.isArray(p) ? p : p.runs;
+    const wrapped = scrollWrap(runs, faces, BODY, W - PAD * 2);
+    wrapped.forEach((ln, k) => lines.push({ runs: ln, head: !!p.head && k === wrapped.length - 1 }));
+    if (!wrapped.length) lines.push({ runs: [] });
+  }
+  while (lines.length && !lines[lines.length - 1].runs.length) lines.pop();
+  const titleOf = (t) => scrollWrap(scrollRuns(t, 'r'), faces, TITLE, W - PAD * 2);
+  const build = (part, of, slice) => {
+    const head = of > 1 ? `${title} — part ${part} of ${of}` : title;
+    const sheets = scrollSheets(slice, head ? titleOf(head) : []).map(s => scrollSheetOps(s.lines, s.titleLines, faces));
+    return scrollPdf(sheets, faces);
+  };
+  const limit = Number(process.env.DDICE_SCROLL_FILE_MAX) || SCROLL_FILE_MAX;
+  let of = 1, files = [build(1, 1, lines)];
+  // Too big for one file: split into parts by lines, each with its heading.
+  while (files.some(f => f.length > limit) && of < 64) {
+    of = Math.max(of + 1, Math.ceil(files.reduce((a, f) => a + f.length, 0) / (limit * 0.9)));
+    const per = Math.ceil(lines.length / of);
+    files = [];
+    for (let k = 0; k < of; k++) files.push(build(k + 1, of, lines.slice(k * per, (k + 1) * per)));
+  }
+  return files.map((pdf, k) => ({ pdf, part: k + 1, of: files.length,
+    name: `${stem}${files.length > 1 ? `-part-${k + 1}-of-${files.length}` : ''}.pdf` }));
+}
+// A scroll's words as plain lines, for what rides woven inside the file.
+function scrollPlain(paras) {
+  return (paras || []).map(p => (p ? (Array.isArray(p) ? p : p.runs).map(r => r.t).join('') : '')).join('\n');
+}
+
+// Parts of a scroll as Discord takes them: as many to a message as fit,
+// the rest following on.
+function scrollFileBatches(files, limit = 9 * 1024 * 1024) {
+  const { AttachmentBuilder } = require('discord.js');
+  const out = [];
+  let cur = [], size = 0;
+  for (const f of files || []) {
+    const data = f?.pdf || f?.attachment;
+    if (!data) continue;
+    if (cur.length && size + data.length > limit) { out.push(cur); cur = []; size = 0; }
+    cur.push(new AttachmentBuilder(data, { name: f.name })); size += data.length;
+  }
+  if (cur.length) out.push(cur);
+  return out;
+}
+// What a GM types for `filename:` (T, 2026-11-17): the file is called it
+// (what a file name cannot hold dropped, spaces as dashes) and its first
+// page is headed with it as typed.
+function scrollFileName(typed) {
+  const heading = String(typed || '').replace(/\.pdf\s*$/i, '').replace(/\s+/g, ' ').trim().slice(0, 100);
+  if (!heading) return null;
+  const stem = heading.replace(/[\\/:*?"<>|#%&{}$!'@+`=]+/g, '').replace(/[\x00-\x1F]+/g, '').replace(/\s+/g, '-')
+    .replace(/-{2,}/g, '-').replace(/^[-.]+|[-.]+$/g, '').slice(0, 80);
+  return { heading, stem: stem || 'scroll' };
+}
+// A member's name from the cache, for a mention in an old line.
+function memberNameOf(guild) {
+  return (id) => guild?.members?.cache?.get?.(String(id))?.displayName || null;
+}
+// Lines of text as the scroll's paragraphs: blank lines kept, but never two.
+function scrollParasOf(lines) {
+  const out = [];
+  for (const l of lines || []) {
+    const t = String(l ?? '');
+    if (!t.trim()) { if (out.length && out[out.length - 1] !== null) out.push(null); continue; }
+    out.push(scrollRuns(t, 'r'));
+  }
+  while (out.length && out[out.length - 1] === null) out.pop();
+  return out;
+}
+
+// \u2500\u2500 The story as printed (T, 2026-11-17, "rule 1") \u2500\u2500
+// A character's lines under "time - Name", the name in bold, then each
+// action in italics, each speech in quotes and anything else as written,
+// in the order posted; one heading for a run of the same character, at the
+// time of the first, and a blank line at each change of character. Rolls,
+// fights, notes and the GM's telling are lines of their own, "time - text".
+// Lines logged before their parts were kept are taken apart again, so an
+// old run reads the same way.
+function storyEntries(events, nameOf = null) {
+  const named = (t) => String(t ?? '').replace(/<@!?(\d+)>/g, (_, id) => `@${(nameOf && nameOf(id)) || 'someone'}`);
+  const out = [];
+  for (const e of events || []) {
+    if (['remind', 'recap'].includes(e.kind) || (e.kind === 'talk' && e.gone)) continue;
+    const at = Number(e.at_ms) || 0;
+    let parts = null;
+    if (e.parts) { try { parts = JSON.parse(e.parts); } catch { parts = null; } }
+    let en = null;
+    if (parts && Array.isArray(parts.segs)) {
+      const segs = parts.segs.filter(sg => sg && String(sg.t || '').trim()).map(sg => ({ k: sg.k, t: named(sg.t) }));
+      if (!segs.length) continue;
+      en = parts.who ? { at, who: String(parts.who), segs }
+        : { at, text: segs.map(sg => (sg.k === 's' ? `\u201C${sg.t}\u201D` : sg.t)).join(' ') };
+    } else en = oldStoryEntry(e, at, named);
+    if (en) out.push(en);
+  }
+  return out;
+}
+// A line logged before its parts were kept, taken apart again: talk read as
+// it was typed; a player's or a form's line as actions and quoted speech
+// with a dot between; an NPC's as its whole post in curly quotes, the names
+// pinged under it dropped. A fight card logged as an NPC's speech, the
+// GM's telling and everything else stand as lines of their own.
+function oldStoryEntry(e, at, named) {
+  const raw = String(e.text || '');
+  const npcLine = e.kind === 'rp' && !e.actor;
+  const text = named(npcLine ? raw.replace(/(?:\s*<@!?\d+>)+(\u201D)\s*$/, '$1') : raw).trim();
+  if (!text) return null;
+  const i = text.indexOf(': ');
+  const who = i > 0 ? text.slice(0, i).trim() : '';
+  const isWho = !!who && who.length <= 60 && !/[.!?"\u201C\u201D]/.test(who);
+  if (e.kind === 'talk') {
+    if (!isWho) return { at, text };
+    const segs = rpSegments(text.slice(i + 2));
+    return segs.length ? { at, who, segs } : null;
+  }
+  if (e.kind !== 'rp' || !isWho) return { at, text };
+  const said = text.slice(i + 2).trim();
+  if (npcLine && /^\u201C[\s\S]*\u201D$/.test(said)) {
+    const inner = said.slice(1, -1).trim();
+    if (/\u{1F3B2}|\u2694|\u{1F6E1}|\u{1F3AF}|\u2764|\u{1F4A5}|\u2192|\bvs\b|\bDC \d/u.test(inner)) return { at, text: `${who}: ${inner}` };
+    const segs = rpSegments(inner);
+    return segs.length ? { at, who, segs } : null;
+  }
+  const segs = said.split(' \u00b7 ').map(p => p.trim()).filter(Boolean)
+    .map(p => (/^\u201C[\s\S]*\u201D$/.test(p) ? { k: 's', t: p.slice(1, -1) } : { k: 'a', t: p }));
+  return segs.length ? { at, who, segs } : { at, text };
+}
+function storyParas(entries) {
+  const paras = [];
+  let prev = null;
+  const seg = (sg) => {
+    const lines = String(sg.t || '').split('\n').map(l => l.trim()).filter(Boolean);
+    if (!lines.length) return;
+    if (sg.k === 's') { lines[0] = `\u201C${lines[0]}`; lines[lines.length - 1] += '\u201D'; }
+    for (const l of lines) paras.push(scrollRuns(l, sg.k === 'a' ? 'i' : 'r'));
+  };
+  for (const en of entries || []) {
+    const time = fmtElapsed(en.at);
+    if (en.who) {
+      const key = `w:${String(en.who).toLowerCase()}`;
+      if (prev !== key) {
+        if (paras.length) paras.push(null);
+        paras.push({ runs: [{ t: `${time} - `, s: 'r' }, { t: scrollClean(en.who).trim() || 'Someone', s: 'b' }], head: true });
+      }
+      en.segs.forEach(seg);
+      prev = key;
+    } else {
+      if (prev && prev !== 'line') paras.push(null);
+      paras.push([{ t: `${time} - `, s: 'r' }, ...scrollRuns(en.text, 'r')]);
+      prev = 'line';
+    }
+  }
+  return paras;
 }
 
 function renderScroll({ family, title, body, pdf = false }) {
@@ -31028,88 +32037,15 @@ async function handleGmQueue(interaction) {
     return interaction.reply({ content: '❌ Only GMs can see the queue.', ephemeral: true });
   await interaction.deferReply({ ephemeral: true });
 
-  const jump = (chId, msgId) => (chId && msgId) ? ` · [jump](https://discord.com/channels/${gid}/${chId}/${msgId})` : '';
-  const ago = (t) => t ? ` · <t:${Math.floor(t / 1000)}:R>` : '';
-  const lines = [];
-  let total = 0;
-
-  // Character sheets
-  const sheets = listPendingSheets(gid);
-  if (sheets.length) {
-    total += sheets.length;
-    lines.push(`📋 **Character sheets** — ${sheets.length}`);
-    for (const p of sheets) {
-      lines.push(`• <@${p.user_id}>${ago(p.approval_requested_at)}`
-        + (p.approval_post_ok === 0 ? ' ⚠️ _queue post never landed_' : ''));
-    }
-    lines.push('');
+  // The standing list's own lines: each with its date and a link (T, 2026-11-17).
+  const items = waitingItems(gid).filter(it => QUEUE_KINDS.includes(it.kind));
+  const total = items.filter(it => it.kind !== 'failures').length;
+  if (!items.length) {
+    return interaction.editReply({ content: '✅ **Nothing waiting.** No sheets, lore, duels, trades or applicants outstanding.' });
   }
-
-  // Lore
-  const lore = db.prepare(`SELECT * FROM lore WHERE guild_id=? AND state='pending' ORDER BY submitted_at`).all(gid);
-  if (lore.length) {
-    total += lore.length;
-    lines.push(`📜 **Lore** — ${lore.length}`);
-    for (const l of lore) {
-      lines.push(`• <@${l.user_id}>${ago(l.submitted_at)}${jump(l.ch_id || approvalDestination(gid, 'lore'), l.msg_id)}`);
-    }
-    lines.push('');
-  }
-
-  // Duels
-  const duels = db.prepare(`SELECT * FROM duels WHERE guild_id=? AND state='pending' ORDER BY created_at`).all(gid);
-  if (duels.length) {
-    total += duels.length;
-    lines.push(`⚔️ **Duels** — ${duels.length}`);
-    for (const d of duels) {
-      lines.push(`• \`#${d.id}\` <@${d.opener}> · ${duelFighters(d).length} standing in`
-        + ago(d.created_at) + jump(d.approval_ch_id || approvalDestination(gid, 'duels'), d.approval_msg_id));
-    }
-    lines.push('');
-  }
-
-  // Merit trades
-  const trades = pendingMeritTrades(gid);
-  if (trades.length) {
-    total += trades.length;
-    lines.push(`🤝 **Merit trades** — ${trades.length}`);
-    for (const t of trades) {
-      lines.push(`• \`#${t.id}\` <@${t.from_user}> → <@${t.to_user}> · **${t.amount}**${ago(t.created_at)}${jump(t.ch_id, t.msg_id)}`);
-    }
-    lines.push('');
-  }
-
-  // Quest applicants
-  const openQuests = db.prepare(`SELECT * FROM quests WHERE guild_id=? AND status IN ('open','posted') ORDER BY number`).all(gid);
-  const withApplicants = [];
-  for (const q of openQuests) {
-    const applied = getQuestMembers(gid, q.number, 'applied');
-    if (applied.length) withApplicants.push([q, applied]);
-  }
-  if (withApplicants.length) {
-    const count = withApplicants.reduce((a, [, ap]) => a + ap.length, 0);
-    total += count;
-    lines.push(`🧭 **Quest applicants** — ${count}`);
-    for (const [q, applied] of withApplicants) {
-      lines.push(`• **${questTag(q)}** — ${applied.map(u => `<@${u}>`).join(', ')}`);
-    }
-    lines.push('');
-  }
-
-  // Anything that has gone wrong in the background
-  const fails = db.prepare('SELECT * FROM job_failures WHERE guild_id=? ORDER BY at').all(gid);
-  if (fails.length) {
-    lines.push(`⚠️ **Background jobs failing** — ${fails.length}`);
-    for (const f of fails) lines.push(`• **${f.job}** — \`${f.message}\`${ago(f.at)}`);
-    lines.push('');
-  }
-
-  if (!total && !fails.length) {
-    return interaction.editReply({ content: '✅ **Nothing waiting.** No sheets, lore, trades or applicants outstanding.' });
-  }
-  lines.unshift(`🗂️ **${total} thing${total === 1 ? '' : 's'} waiting on a GM**`, '');
-  lines.push('_Sheets and lore are decided on their queue posts · `/standing merit cancel` or the trade buttons · `/quest approve`._');
-  return replyLong(interaction, lines, { ephemeral: true });
+  const lines = [`🗂️ **${total} thing${total === 1 ? '' : 's'} waiting on a GM**`, '', ...waitingLines(items), '',
+    '_Sheets and lore are decided on their queue posts · `/standing merit cancel` or the trade buttons · `/quest approve`._'];
+  return replyLong(interaction, lines, { ephemeral: true, allowedMentions: { parse: [] } });
 }
 
 async function handleGmKill(interaction) {
@@ -32340,7 +33276,9 @@ async function ownWebhookForAsync(client, gid, channel, webhookId) {
 // a role play form appear? If there's none can it be /rp".)
 // The box (2026-11-06): action, speech, a stat to roll (the server's own,
 // by its ruleset) and dice; a GM's box adds a To picker. A reply's box
-// remembers the line it answers, so the post can jump back to it.
+// remembers the line it answers, so the post can jump back to it. Raw
+// follows the speech (T, 2026-11-17); a GM's box has it where Dice was \u2014
+// five fields are Discord's most \u2014 and `/rp dice:` still rolls.
 const STAT_LONG = { str: 'Strength', con: 'Constitution', dex: 'Dexterity', wis: 'Wisdom', lck: 'Luck', int: 'Intelligence', cha: 'Charisma' };
 function rpModal({ gid = null, gm = false, title = 'Roleplay', replyTo = null } = {}) {
   const { ModalBuilder, TextInputBuilder, TextInputStyle, LabelBuilder, UserSelectMenuBuilder, StringSelectMenuBuilder } = require('discord.js');
@@ -32354,10 +33292,11 @@ function rpModal({ gid = null, gm = false, title = 'Roleplay', replyTo = null } 
       .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(RP_BOX_MAX).setPlaceholder('draws her blade and steps between them')),
     new LabelBuilder().setLabel('What you say (optional)').setTextInputComponent(new TextInputBuilder().setCustomId('speech')
       .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(RP_BOX_MAX).setPlaceholder('Not one step closer.')),
+    rawLabel(),
     new LabelBuilder().setLabel('Roll (optional)').setDescription('A stat roll answers a check the GM called on you here').setStringSelectMenuComponent(statPick),
-    new LabelBuilder().setLabel('Dice (optional)').setDescription('Any dice, e.g. 2d6+1').setTextInputComponent(new TextInputBuilder().setCustomId('dice')
-      .setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(15).setPlaceholder('2d6+1')),
   );
+  if (!gm) m.addLabelComponents(new LabelBuilder().setLabel('Dice (optional)').setDescription('Any dice, e.g. 2d6+1').setTextInputComponent(new TextInputBuilder().setCustomId('dice')
+    .setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(15).setPlaceholder('2d6+1')));
   if (gm) m.addLabelComponents(new LabelBuilder().setLabel('To (optional)').setDescription('Up to 25, named under the words and pinged')
     .setUserSelectMenuComponent(new UserSelectMenuBuilder().setCustomId('to').setPlaceholder('Who it is for').setMinValues(0).setMaxValues(25).setRequired(false)));
   return m;
@@ -32391,17 +33330,19 @@ async function handleRp(interaction) {
 async function handleRpModal(interaction) {
   const action = String(interaction.fields.getTextInputValue('action') || '').trim();
   const speech = String(interaction.fields.getTextInputValue('speech') || '').trim();
+  let raw = '';
+  try { raw = String(interaction.fields.getTextInputValue('raw') || '').trim(); } catch { raw = ''; }
   let dice = '';
   try { dice = String(interaction.fields.getTextInputValue('dice') || '').trim(); } catch { dice = ''; }
   let roll = '';
   try { const v = interaction.fields.getStringSelectValues?.('roll'); roll = Array.isArray(v) && v.length ? String(v[0]) : ''; } catch { roll = ''; }
-  if (!action && !speech && !roll && !dice) return interaction.reply({ ephemeral: true, content: '\u274C Every box was empty \u2014 nothing posted.' });
+  if (!action && !speech && !raw && !roll && !dice) return interaction.reply({ ephemeral: true, content: '\u274C Every box was empty \u2014 nothing posted.' });
   // Only a GM's box has the picker, and only a GM's picks are honoured.
   let to = [];
   try { to = [...(interaction.fields.getSelectedUsers?.('to', false)?.values?.() || [])].map(u => u.id); } catch { to = []; }
   if (to.length && !(await isGm(interaction.guild, interaction.user.id))) to = [];
   const replyTo = interaction.customId.startsWith('rpform:') ? interaction.customId.slice('rpform:'.length) : null;
-  return postRpLine(interaction, { action, speech, roll, dice, to, toInfo: { ids: to, groups: [], missed: [] }, replyTo });
+  return postRpLine(interaction, { action, speech, raw, roll, dice, to, toInfo: { ids: to, groups: [], missed: [] }, replyTo });
 }
 // Who said a line: the name a webhook wore, or the bot's name line.
 function lineSpeaker(msg) {
@@ -32480,9 +33421,11 @@ function partsWithTail(main, tail, limit = POST_CUT) {
   else chunks.push(...chunkText(tail, limit));
   return chunks;
 }
-async function postRpLine(interaction, { action = '', speech = '', roll = '', dice = '', to = [], toInfo = null, replyTo = null }) {
+async function postRpLine(interaction, { action = '', speech = '', raw = '', roll = '', dice = '', to = [], toInfo = null, replyTo = null }) {
   const gid = interaction.guild.id, uid = interaction.user.id;
-  const words = composeNpcSay({ action: String(action).slice(0, RP_BOX_MAX), speech: String(speech).slice(0, RP_BOX_MAX) });
+  // Each part on its own line, in the order written (T, 2026-11-17).
+  const segs = formSegments({ action: String(action).slice(0, RP_BOX_MAX), speech: String(speech).slice(0, RP_BOX_MAX), raw: String(raw || '').slice(0, RP_BOX_MAX) });
+  const words = composeNpcSay({ segs });
   // The rolls are checked before anything posts.
   const stat = roll ? rpStatOf(gid, roll) : null;
   if (roll && !stat) return interaction.reply({ ephemeral: true, content: `\u274C **${roll}** is not a stat here \u2014 ${rulesFor(gid).stats.map(st => `\`${st}\``).join(', ')}.` });
@@ -32496,7 +33439,7 @@ async function postRpLine(interaction, { action = '', speech = '', roll = '', di
   if (!words && !stat && !notation) return interaction.reply({ ephemeral: true, content: '\u274C Nothing to post.' });
   // A line of the words may not pass for the bot's: a roll, a check, a
   // reply link. Only what the bot rolled sits there (cold audit).
-  if (BOT_LINE_RE.test(String(action)) || BOT_LINE_RE.test(String(speech)))
+  if (segsLines(segs).some(l => BOT_LINE_RE.test(l)))
     return interaction.reply({ ephemeral: true, content: '\u274C A line of yours may not start with \u{1F3B2}, \u{1F3AF} or \u21AA \u2014 those are the bot\u2019s, for real rolls and replies.' });
   let ch = null;
   if (stat || notation) {
@@ -32584,7 +33527,7 @@ async function postRpLine(interaction, { action = '', speech = '', roll = '', di
     try { db.prepare('INSERT OR REPLACE INTO rp_lines (guild_id, message_id, channel_id, user_id, at) VALUES (?,?,?,?,?)').run(gid, String(m.id), chan.id, uid, Date.now()); } catch {}
   }
   notePostParts(gid, chan.id, sentAll);
-  if (words) { try { noteQuestActivity(gid, chan.id, 'rp', `${name}: ${rpBeatText(words)}`, uid); } catch {} }
+  if (words) { try { noteQuestActivity(gid, chan.id, 'rp', `${name}: ${segsBeat(segs)}`, uid, { parts: { who: name, segs: segsForLog(interaction.guild, segs) } }); } catch {} }
   // Each roll: its beat in the run's account, the audit, the tallies; the
   // first is saved so `rr` rerolls it as it would a typed roll. A check
   // answered here wrote its beat already, as its button does.
@@ -33655,8 +34598,7 @@ async function strikeTarget(interaction, msgId, pick) {
   if (!t) return interaction.reply({ ephemeral: true, content: TARGET_GONE });
   if (t.dead) return interaction.reply({ ephemeral: true, content: targetFallen(t) });
   if (!audienceAllows(t.owner, interaction)) return interaction.reply({ ephemeral: true, content: '\u274C That one is not addressed to you.' });
-  const action = String(interaction.fields?.getTextInputValue?.('action') || '').trim().slice(0, RP_BOX_MAX);
-  const speech = String(interaction.fields?.getTextInputValue?.('speech') || '').trim().slice(0, RP_BOX_MAX);
+  const segsT = interaction.fields ? rpFormSegs(interaction) : [];
   // The stat pressed, as long as the card offers it; else the card's own
   // (one listed), else a flat d20.
   const offered = t.dice ? [] : targetStatList(t);
@@ -33689,14 +34631,13 @@ async function strikeTarget(interaction, msgId, pick) {
 
   const nmT = await getDisplayName(interaction.guild, uidT).catch(() => 'Someone');
   await logButtonPress(interaction, gidT, uidT, `${t.name}: ${total}${t.dc ? ` vs DC ${t.dc}` : ''}`, passed);
-  if (action || speech) { try { noteQuestActivity(gidT, t.channel_id, 'rp', `${nmT}: ${rpBeatText([action, speech ? `\u201C${speech}\u201D` : null].filter(Boolean).join('\n'))}`, uidT); } catch {} }
+  if (segsT.length) { try { noteQuestActivity(gidT, t.channel_id, 'rp', `${nmT}: ${segsBeat(segsT)}`, uidT, { parts: { who: nmT, segs: segsForLog(interaction.guild, segsT) } }); } catch {} }
   // The die's own verdicts carry the GM's prewritten flavour, since no
   // form will be opened for them.
   const flavour = decided ? (passed ? t.success_text : t.fail_text) : null;
   await interaction.reply({ content: [
     `\u2694\uFE0F <@${uidT}> strikes at **${t.name}** with ${withText}`,
-    action ? `*${action}*` : null,
-    speech ? `\u201C${speech}\u201D` : null,
+    segsToPost(segsT, { quote: 'curly' }) || null,
     line,
     decided ? (passed ? '\u2705 **A natural 20 \u2014 the player passes the check. Roll critically succeeds.**' : '\u274C **A natural 1 \u2014 the player fails the check. Roll critically fails.**')
       : t.dc ? (passed ? '\u2705 **The roll succeeds.**' : '\u274C **The roll fails.**') : '',
@@ -34976,7 +35917,7 @@ const slashCommands = [
       .addStringOption(o=>o.setName('action').setDescription('What the NPC does — posted in italics').setRequired(false))
       .addStringOption(o=>o.setName('speech').setDescription('What the NPC says — wrapped in quote marks').setRequired(false))
       .addStringOption(o=>o.setName('raw').setDescription('Post exactly as typed — overrides action/speech').setRequired(false))
-      .addStringOption(o=>o.setName('to').setDescription('Who it is for: @people, a group or a knight order, commas between \u2014 pinged under the words').setRequired(false))
+      .addStringOption(o=>o.setName('to').setDescription('Who it is for: @people, a group or a knight order, commas between \u2014 pinged under the words').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('offer').setDescription('An activity to offer on this line as an Interaction button — or none').setRequired(false).setAutocomplete(true))
       .addStringOption(o=>o.setName('reply').setDescription('Answer a line: its message link, or its id in this channel').setRequired(false)))
     .addSubcommand(s=>s.setName('roll').setDescription('Roll dice as an NPC — it posts under their name and face')
@@ -35200,7 +36141,8 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('forfeit').setDescription('Concede the fight'))
     .addSubcommand(s=>s.setName('status').setDescription('Show current fight status'))
     .addSubcommand(s=>s.setName('log').setDescription('Re-post the recap of the last finished fight in this channel')
-      .addBooleanOption(o=>o.setName('scroll').setDescription('true = the recap as a parchment PDF, as the run\'s story is').setRequired(false)))
+      .addBooleanOption(o=>o.setName('scroll').setDescription('true = the recap as a parchment PDF, as the run\'s story is').setRequired(false))
+      .addStringOption(o=>o.setName('filename').setDescription('With scroll:true \u2014 what the file is called, and the heading on its first page').setRequired(false).setMaxLength(100)))
     .addSubcommand(s=>s.setName('skip').setDescription('Skip the current turn without removing anyone (GM)'))
     .addSubcommand(s=>s.setName('end').setDescription('End the fight (GM only)')
       .addBooleanOption(o=>o.setName('all').setDescription('true = end every active fight on the server').setRequired(false))),
@@ -35375,7 +36317,8 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('summary').setDescription('The story so far as a scroll, without closing the run \u2014 private unless shared (GM)')
       .addStringOption(o=>o.setName('name').setDescription('The quest listing \u2014 blank in its own thread').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true))
-      .addBooleanOption(o=>o.setName('share').setDescription('true = post it in the room for everyone to read').setRequired(false)))
+      .addBooleanOption(o=>o.setName('share').setDescription('true = post it in the room for everyone to read').setRequired(false))
+      .addStringOption(o=>o.setName('filename').setDescription('What the file is called, and the heading on its first page').setRequired(false).setMaxLength(100)))
     .addSubcommand(s=>s.setName('initiative').setDescription('Call for initiative here: players join, you add NPCs, Close rolls the order (GM)')
       .addStringOption(o=>o.setName('players').setDescription('Put these in at once \u2014 @mention them').setRequired(false))
       .addStringOption(o=>o.setName('npcs').setDescription('NPCs and foes \u2014 Goblin x3, category:Bandits, any name').setRequired(false).setAutocomplete(true))
@@ -35654,7 +36597,7 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
     .addStringOption(o=>o.setName('speech').setDescription('What you say \u2014 shown in quotes').setRequired(false))
     .addStringOption(o=>o.setName('roll').setDescription('A stat to roll with it \u2014 answers a check the GM called on you here').setRequired(false).setAutocomplete(true))
     .addStringOption(o=>o.setName('dice').setDescription('Any dice to roll with it, e.g. 2d6+1').setRequired(false))
-    .addStringOption(o=>o.setName('to').setDescription('GM: who it is for \u2014 @people, a group or a knight order, commas between').setRequired(false)),
+    .addStringOption(o=>o.setName('to').setDescription('GM: who it is for \u2014 @people, a group or a knight order, commas between').setRequired(false).setAutocomplete(true)),
 
   // A countdown that pings the players named (T, 2026-11-17).
   new SlashCommandBuilder()
@@ -35752,11 +36695,11 @@ const HELP_CATEGORIES = {
       '**5 · Fights** — a GM opens one with `/fight start` and initiative sets the order. On your turn, tap a stat on the card (or `/fight atk stat:str`): with one foe it opens the form at once, with more a menu asks whom first. Every button — attack, defence, Grapple, Feint, Deflect, Disarm, the holds, Save, Insight — opens a short form, what you do and what you say, both optional; your words sit on the card. The defender answers with a stat of their own, either side may spend a token on 🔁 Reroll, and ⚖️ Resolve settles the exchange — a GM\'s press asks what happens. Every turn line carries everyone\'s HP. A quiet spell (ten minutes unless the GM sets otherwise) and the bot pings whoever the fight is waiting on, once a turn. When it all ends, a 🏁 result and a full recap post on their own.',
       '**6 · Duels** — `/duel opponent:@Players terms:first blood` raises one. A GM signs it off and starts the fight.',
       '**7 · Quests** — `/quest board` shows what\'s posted. Tap **Apply** on a quest post (or `/quest party apply number:N`), a GM approves the party, and merits pay out when it completes.',
-      '**Roleplay** — `/rp` opens the boxes the fight buttons do \u2014 what you do, what you say \u2014 with a **stat to roll** and any **dice** beside them, and posts it all in your name; `/rp action:… speech:… roll:… dice:…` skips the box. A stat roll answers a check the GM called on you there; `rr` rerolls an ordinary one. Every line, yours and the NPCs\u2019, carries \u{1F4AC} **Reply**: the box again, as a reply that links back to the line. Inside a run your words go on its timeline and into the story scroll. `/edit` fixes the words of a line of yours afterwards (the roll stays), `/edit delete:true` takes it back.',
+      '**Roleplay** — `/rp` opens the boxes the fight buttons do \u2014 what you do, what you say, and **Raw** for longer writing (`*action*` in asterisks, `"speech"` in quotes, each part posted on its own line in the order you write it) \u2014 with a **stat to roll** and any **dice** beside them, and posts it all in your name; `/rp action:… speech:… roll:… dice:…` skips the box. A stat roll answers a check the GM called on you there; `rr` rerolls an ordinary one. Every line, yours and the NPCs\u2019, carries \u{1F4AC} **Reply**: the box again, as a reply that links back to the line. Inside a run your words go on its timeline and into the story \u2014 every word, under your name. Every roleplay box has Raw: the fight forms, a target\u2019s strike, a lost first turn. `/edit` fixes the words of a line of yours afterwards (the roll stays), `/edit delete:true` takes it back.',
       '**8 · Activities** — minigames written for this server: branching scenes with rolls and rewards. `/activity list` to browse, `/activity run name:Fishing` to start one here. When a scene asks for a roll, just type the stat word — `wis`, or `wis steady does it` to add flavour — and the story moves.',
       '**9 · Renown & merits** — renown is the coin quests, encounters and activities pay out; spend it as the server allows (`/standing renown view`). Merits are lifetime honour that only climbs, and ranks hang off them (`/standing merit view`, `/standing rank list`). You can offer merit to a friend with `/standing merit give` — a GM signs it off. GMs move the coin with `/standing renown gain/loss`.',
       '**10 · Death** — characters can fall. That call belongs to a GM: a memorial is posted, the sheet locks, and the fallen keep their history. Revival is possible when the story allows it.',
-      '**11 · What changed** — the **updates** forum carries one dated thread per change the bot has had, newest at the top. When something looks different from what you remember, it says what changed and when.',
+      '**11 · What changed** — the **updates** forum carries one dated thread per change the bot has had, newest at the top. When something looks different from what you remember, it says what changed and when. Once a week the **chronicle** forum tells the table\u2019s week.',
       '',
       '_Lost mid-game? `/help category:X` for any group, `/char stat` for what each stat means, `/roll last:true` if you forgot what you just threw._',
     ],
@@ -35872,7 +36815,7 @@ const HELP_CATEGORIES = {
       'NPC lists accept `category:Name` to add a whole category at once',
       'When a fight ends a public 🏁 result posts in the channel — victor, everyone\'s final HP, and a 📜 recap',
       'The recap covers both players and NPCs: roll averages, best/worst naturals, damage dealt and taken, and a blow-by-blow of every exchange',
-      '`/fight log [scroll:true]` — re-post the last finished fight\'s recap in this channel; `scroll:true` hands it over as a parchment PDF in standard type, as a run\'s story is',
+      '`/fight log [scroll:true] [filename:]` — re-post the last finished fight\'s recap in this channel; `scroll:true` hands it over as a parchment PDF, printed as a run\'s story is; `filename:` names the file and heads its first page',
       '`/fight skip` — skip the current turn; the fighter stays in the fight (GM)',
       '`/fight auto mode:NPCs only ...` — bot plays NPC turns, players play manually (GM)',
       '`/fight auto mode:Demo` — example showcase fight · `/fight end` — end the fight (GM)',
@@ -35976,7 +36919,7 @@ const HELP_CATEGORIES = {
       '`/quest create` — bare, a five-field writing window opens (add `from:N` to seed it from an existing quest); with `name:` everything stays inline (GM)',
       '`/quest edit number:N` — the same window, prefilled — the natural editor; renames follow onto the board and planning threads. Numeric options (`merit_reward:` etc.) apply directly without the window (GM)',
       '`/quest post number:N [channel]` — post it with an Apply button; with a quest forum set, this opens the quest\'s own board thread (GM)',
-                              '`/gm queue` — everything waiting on a GM, in one place',
+                              '`/gm queue` — everything waiting on a decision, each with the date it has waited since and a link to it',
       '`/gm search` — find characters by order, class or status (GM)',
       '`/existence kill user:@Players` / `/existence revive user:@Players` — mark a character fallen and post their memorial, or bring them back; these were `/gm kill|revive` until 15/10 (GM)',
       '`/gm test quest/npc/list/forum/clean` — throwaway fixtures, a live forum exercise, and the broom that clears them (GM)',
@@ -35987,13 +36930,13 @@ const HELP_CATEGORIES = {
       '`/gm override skip` \u00b7 `/gm override dc hold:true` \u00b7 `/gm override interject user:@Players [stat:] [amount:\u00b1N] [mode:adv|dis|flat] [die:1-20] [note:]` \u2014 the referee\'s hand on the next roll, all audited (GM)',
       '`/config mechanics autorest action:Who is excluded` \u2014 who the next rest will pass over and why: the fallen, anyone on an active quest or fight, and what is holding them',
       '`/gm check run` — build anything missing: audit shelves, pipeline books and tags. Adopts what exists, so it is safe to run any time — pull it after an update adds a book. Trims the ledgers that only grow (`/rp` ownership past ninety days, the week\'s dice past fourteen), as every boot does (GM)',
-      '`/gm check status` — the setup mirror: every channel-backed feature, unset first with the command that sets it, then the set ones with links — stored ids are verified live; the last line says whether the slash commands registered on this boot, and the Deploy mend says the same (GM)',
+      '`/gm check status` — the setup mirror: every channel-backed feature, unset first with the command that sets it, then the set ones with links — stored ids are verified live; the last line says whether the slash commands registered on this boot, and the day\'s Deploy mend in gm-daily says the same (GM)',
       '`/gm bar` \u2014 pin a GM toolbar in this channel: \u{1F5FF} Plant target, \u{1F3AF} Call check, \u2694\uFE0F Start fight, \u{1F9ED} Status, \u23EA Undo \u2014 each opens the box its command would (a target by name, DC and stats, scene, hits, who may swing; the check window; players and NPCs for a fight); Status is this channel at a glance: the fight and everyone\'s HP, the targets standing, what waits on a GM; Undo is `/gm undo` (GM)',
       '`/gm undo [steps:1-10]` \u2014 rewind the last step in this channel: a fight exchange (attack, defence, Resolve, a reroll, an action), a target strike or verdict, a group roll, a once-only press, a called check that cost HP \u2014 and the HP, rerolls, marks and stats those changed on sheets and NPCs. The table sees what was rewound and what moved; a fight gets its status and whose move it is posted again. Ten steps deep per channel, a day at most; a fight that has ended is not rewound; audited and noted on the quest (GM)',
       '`/config channels questforum channel:#forum` — the board becomes a forum: one thread per quest, lifecycle mirrored in, archived on completion (Admin)',
       '`/config channels charforum/memorial/questlog/docs` — a page per approved character · where fallen characters are remembered · where finished quest summaries post · publish the command PDFs to a GM channel (Admin)',
       '`/config channels scrollarchive` — the scroll library; point it at a forum and each GM\'s scrolls file in their own 📜 thread, opened on first use (Admin)',
-      '`/config channels gmarchive forum:#forum` — the GM run archive: a thread per GM, headed with their runs, hours by kind and what is running now; a post per finished run with its runtime, party, payout, the record, the story and record PDFs and both transcripts; a review answers its post. Set once, it files every run already finished; `/gm check build` makes it (Admin)',
+      '`/config channels gmarchive forum:#forum` — the GM run archive: a thread per GM, headed with their runs, hours by kind and what is running now; a post per finished run with its runtime, party, payout, the record, the story PDF (in parts if long), the record PDF and the raw transcript; a review answers its post. Set once, it files every run already finished; `/gm check build` makes it (Admin)',
       '`/config channels questthreads channel:#forum` — optional split: per-quest planning threads (and their stage tags) open here, so the planning forum holds only the books (Admin)',
       '`/config channels questplanning channel:#gm-forum` — `/quest create` opens a private GM planning thread; every application and event mirrors there. Sets up the pipeline tags (🌱⏳✅📌🗄️🏁) and the 🎲 DM roster (Admin)',
       '`/quest stage number:N stage:` — move a quest through Concept / Awaiting Approval / Approved — or just press the **advance button** at the bottom of its planning thread; posting, archiving and completing re-tag automatically (GM)',
@@ -36015,25 +36958,25 @@ const HELP_CATEGORIES = {
       '`/quest run pause|resume number:N` \u2014 stop and restart the clock (a pause rounds it up to the quarter-hour); a paused run logs nothing until resumed',
       '`/quest run note number:N text:... kind:rp|combat|note [public:true]` \u2014 mark a moment in the run\'s account',
       '`/quest run timeline number:N` \u2014 the raw log \u00b7 `/quest run recap number:N [post:true]` \u2014 a "previously on\u2026" drafted from it, private until you post it (GM)',
-      '`/quest run winddown number:N [resume:true]` \u2014 the story is over but rewards are not settled: the run stays live, its party is released to the rests and free to join other quests, and anyone kicked now is still paid at completion. The run\u2019s room is shown, for everyone, the run hour by hour, the story so far as a PDF and \u{1F4DD} Review this run; `resume:true` only says it runs again (GM)',
+      '`/quest run winddown number:N [resume:true]` \u2014 the story is over but rewards are not settled: the run stays live, its party is released to the rests and free to join other quests, and anyone kicked now is still paid at completion. The run\u2019s room is shown, for everyone, the run hour by hour, the story so far as a PDF \u2014 every beat and every word said \u2014 and \u{1F4DD} Review this run; `resume:true` only says it runs again (GM)',
       '`/quest run log number:N text:...` \u2014 your telling of a finished run, into each player\'s chronicle thread; rewrites edit in place (GM)',
       '`/quest archive number:N [summary:]` \u2014 the final shelf. Leave `summary:` blank and a box opens for the final word; it goes on the record, into the run\'s thread and the GM quest log, and marks the campaign card. A completed quest stays completed on everyone\'s record (GM)',
       '**\u21A9\uFE0F Reopen** \u2014 a completion message carries a Reopen button for five minutes: the payout is reversed, this run\'s titles revoked, the party released; fix it and complete again (GM)',
       '`/instance preset save name:... [merits:] [npcs:Hollow x3, Hollow tank]` \u2014 a saved scene; `/instance start ... preset:` runs it with the merits set and the monsters summoned as temps \u00b7 `/instance preset list|remove` (GM)',
-      '`/gm check stalled` \u2014 what is waiting on a GM: winding-down runs, quiet encounters, staged parties never launched, idle campaigns, reviews this week, targets standing over a day. Once a week the same report is posted as a dated thread in the **gm-digest** forum, titled by its Monday (GM)',
+      '`/gm check stalled` \u2014 what has stalled: winding-down runs, quiet encounters, staged parties never launched, idle campaigns, targets standing over a day, drafts, the week\u2019s reviews \u2014 each with the date it has stood since and a link to it. The GM forums carry the whole list: **gm-daily** at 08:00 each day, no ping, the day\u2019s restart reports beneath; **gm-weekly** each week with the week\u2019s activities; **gm-monthly** on the 1st with the month\u2019s figures and what has waited since before it \u2014 those two ping the GMs (GM)',
       '`/gm check usage` \u2014 sixty days of command use, quietest first \u2014 a report only; nothing is removed by it \u00b7 `/gm check rehearse` \u2014 a private sparring thread against a dummy the bot runs, to try new buttons before the table sees them (GM)',
-      '`/help category:rules` \u2014 the live table rules, as the bot enforces them, for everyone. Every deploy posts **What\'s new** (the summary, then **In detail** beneath it) and **Deploy mend** as dated threads in the **gm-updates** forum, and the player half of the news in **updates** \u2014 the whole back-catalogue is there from the first boot; a day\'s entry that grows between two pushes is posted again whole. Once a week **updates** also gets the players\' **Weekly chronicle**: quests completed, titles granted, fights won, the fallen, and the dice of the week (natural 20s and 1s, the biggest total) \u2014 nothing on a quiet week',
+      '`/help category:rules` \u2014 the live table rules, as the bot enforces them, for everyone. Every deploy posts **What\'s new** (the summary, then **In detail** beneath it) as a dated thread in the **gm-updates** forum, and the player half of the news in **updates** \u2014 the whole back-catalogue is there from the first boot; a day\'s entry that grows between two pushes is posted again whole. What each restart mended, the **Deploy mend**, goes beneath the day\'s list in **gm-daily**. Once a week the **chronicle** forum gets the players\' **Weekly chronicle**: quests completed, titles granted, fights won, the fallen, and the dice of the week (natural 20s and 1s, the biggest total) \u2014 nothing on a quiet week',
       '`/session add|kick|rally|note|pause|resume|complete|show|thread [name:] [run:]` \u2014 work any run that is going, whatever opened it (a board run, an encounter, a chapter, an older quest), by NAME rather than number; leave `name:` blank inside its own thread. `add` seats (on an instance it is your word: a sheet and a pulse required) \u00b7 `kick` takes them out, still paid if the run is winding down \u00b7 `complete [summary:] [title:]` pays out; leave `summary:` blank and a summary drafted from the log is offered to use, edit or skip \u00b7 `thread` opens its room if it has none. `show` is open to everyone (GM)',
       '`/initiative` or `/session initiative [players:] [npcs:Goblin x3, category:Bandits] [roll:Bot|Players] [signup:] [remind:] [skip:] [timeout:]` — a card here: players press 🙋 Join (`signup:false` takes only those named), 🎭 Add NPCs is yours (copies with `x3`, a whole category, or any name), and 🎲 Close & roll rolls d20 + DEX for everyone and sets the order \u2014 or with `roll:Players` each player presses \u{1F3B2} Roll (Join rolls you on the spot), the bot rolls the NPCs, and Close rolls for anyone left; with only those named, the last roll sets it, and with the bot rolling the order is set at once. Natural 20s go first and their first turn takes two \u2705 Dones; natural 1s go last and their first turn is \u{1F3AD} Roleplay \u2014 their words, then it passes; a level total goes to whoever rolled first. Each turn then gets a card pinging whoever it is, with ✅ Done (theirs or yours), ⏭️ Skip, ⏸️ Pause and 🏁 End, and the rounds are counted; a run going here keeps the order, each round and every skipped turn on its timeline. One order a channel, waiting while a fight runs there (GM)',
       '`/session npcs action:add npcs:Hollow, Ghoul [friendly:]` — the run\'s cast: they join its fights and its initiative unless `cast:false` · `remove`, `reveal`, `list` (GM)',
-      '`/session summary [share:true]` — the run so far as a PDF, without closing it; private unless shared (GM)',
+      '`/session summary [share:true] [filename:]` — the run so far as a PDF, without closing it: every beat and every word said, first to last, in numbered parts if it outgrows one file; `filename:` names the file and heads its first page; private unless shared (GM)',
       '`/session turn [action:] [who:]` — the order here: `show` for anyone, `next` (Done) for whoever\'s turn it is; `skip`, `back`, `pause`, `resume`, `close`, `add` (a newcomer rolls and takes their place by the same rule), `remove` and `end` are the GM\'s',
       '`/session clock [remind:] [skip:] [timeout:skip|auto] [reset:true]` — this channel\'s turn clock, for its fights and its initiative: minutes to the reminder (with ✍️ Still writing) and to the turn passing, 0 for never; `timeout:auto` has the bot attack for a quiet fighter instead of skipping them. Typing, a message or any press from the one it waits on holds the turn (GM)',
       '_One quest at a time: approving someone already seated on a live run prompts for a second press to override (audited), and a launch leaves them an applicant rather than double-booking them._',
       '`/instance start name:... [as:] [merits:] [campaign:] [part:] [preset:] [record:true] [started:] [played:]` — open a run without the board: no listing, no applications. `as:` says what it is: **encounter** (the default) is a session on the fly; **chapter** is a numbered part of a campaign (`campaign:` needed, `part:` the next one if blank); **legacy** picks up a quest from before the bot (`started:` when it began, `played:` the time already played — `6h`, `2h30m` — banked into its clock) and pays only the merits you set. The bot lists every living character with HP and what is holding them; tick who is in it and press **Open** \u2014 it opens its own thread in quest-instances (where it was called if no forum is set), the party pulled in by mention. Nobody can join by themselves: `/session add` and `/session kick`. `/session complete` pays out, writes the chronicle and posts the review button. Instances do not count toward one-quest-at-a-time; each keeps a quest\u2019s clock \u2014 the hourly summary, the quarter-hour time check \u2014 and one left quiet six hours reminds the room and pings the GMs (GM)',
-      '`/instance start quest:N [record:true|false]` \u2014 adopt a board quest that is already running: it gets its room if it has none, and the recording switch. `record:true` keeps every message typed in the run\'s own thread for its log as table talk, not only what goes through the bot — an edit corrects its line, a deletion marks it; at completion the corrected transcript rides with the story for everyone and the raw one, as first typed, goes to the GMs; never re-posted by the hourly recap; typed rolls stay in the roll log, and a run with no thread of its own is not recorded; off by default · `/instance list` — every run going, its kind, where, and its time so far (GM)',
+      '`/instance start quest:N [record:true|false]` \u2014 adopt a board quest that is already running: it gets its room if it has none, and the recording switch. `record:true` keeps every message typed in the run\'s own thread for its log as table talk, every word, not only what goes through the bot — an edit corrects its line, a deletion takes it out; at completion it is in the story for everyone, under each speaker\'s name, and the raw transcript, as first typed, goes to the GMs; never re-posted by the hourly recap; typed rolls stay in the roll log, and a run with no thread of its own is not recorded; off by default · `/instance list` — every run going, its kind, where, and its time so far (GM)',
       '`/campaign create name:... [description:]` \u2014 the long arc: quests, mini-quests and encounters under one name, with a GM-only thread in the campaigns forum. `campaign:` on `/quest create` or `/instance start` links at birth (`as:chapter` numbers the parts); `/campaign add|remove` afterwards — `add part:N` makes an instance that numbered chapter, and a chapter unlinked is an encounter again. `note` for beats between runs, `status` for where things stand, `recap` across every run, `complete` to close it. Players get `/campaign show` \u2014 the premise, what is done, and their own part (GM)',
-      '`/quest run complete number:N` — finish it; merits auto-awarded, other rewards listed; the run\'s story rides on the card as a PDF on parchment \u2014 the party, the length, every logged beat with its roleplay words, your tale \u2014 in standard type (GM)',
+      '`/quest run complete number:N` — finish it; merits auto-awarded, other rewards listed; the run\'s story rides on the card as a PDF on parchment \u2014 the party, the length, every beat and every word said in order, each speaker\'s lines under their name, your tale \u2014 in numbered parts if it outgrows one file (GM)',
       '`/quest run ready number:N` \u2014 a ready check: one card with a tick per seated player and a \u2705 Ready button; each press turns their tick, the last says all ready and names you \u2014 and, if the run has not started, turns the button into \u25B6\uFE0F Start the run: your press is `/quest run start` (GM)',
       '`/quest delete number:N` — remove a quest (GM)',
     ],
@@ -36061,7 +37004,7 @@ const HELP_CATEGORIES = {
       '`/npc manage copy name:Hollow new_name:Hollow 2` — duplicate an NPC (GM)',
       '`/npc show name:Hollow` — full stat block for one NPC',
       '`/npc hero name:X stat:str` — make an NPC a Hero with a signature stat (GM)',
-      '`/npc say name:X speech:... [action:...] [to:...] [offer:Activity]` — speak or act as an NPC, no dice: action, speech, then who it is for, a blank line between. `to:` takes @people, a knight order or a group from `/standing association`, commas between \u2014 every living player in a group is pinged, fifty at most. The box has a **To** picker (up to twenty-five), a **Groups** list and an **Interaction** dropdown; `@Name` in the words pings that person too; only people are ever pinged, never a role or everyone. `reply:` takes a message link and answers that line, the jump link on top (GM)',
+      '`/npc say name:X speech:... [action:...] [raw:...] [to:...] [offer:Activity]` — speak or act as an NPC, no dice: action, speech, then who it is for, a blank line between; `raw:` posts exactly as typed. `to:` takes @people, a knight order or a group from `/standing association`, commas between, and completes as you type \u2014 every living player in a group is pinged, fifty at most. The box has **Raw** for longer writing (`*action*`, `"speech"`, each part on its own line in the order written), a **To** picker (up to twenty-five) and an **Interaction** dropdown; `@Name` in the words pings that person too; only people are ever pinged, never a role or everyone. `reply:` takes a message link and answers that line, the jump link on top (GM)',
       '↳ Under every NPC line, and it stays there: 💬 **Reply** (anyone \u2014 the roleplay box as a reply that links back to the line; a GM\u2019s box has the To picker), 🎭 **GM** (the speak-as box), and 🎮 **Interaction** when you offered an activity on that line — it starts for whoever presses. `/npc edit name:X talk:Activity` sets the default pick (GM)',
       '`/npc list category:Hollows` — list only one category\'s NPCs',
       '',
@@ -36115,7 +37058,7 @@ const HELP_CATEGORIES = {
       '_The audit forum keeps one shelf per subject:_ 🎲 Player Rolls · 🛡️ GM Rolls · 🎭 NPC Rolls · 💬 NPC Say · 📜 Scrolls · 🎯 Called Checks · ⚖️ GM Overrides · 🤺 Duels · 🎖️ Advancement · 🕯️ The Fallen · 🧳 Items.',
       '`/config channels rollauditforum forum:#roll-audit` — split the mirror into books: player rolls, GM rolls, NPC rolls, NPC say (Admin)',
       'When NPC stats are hidden, fight cards mask the stat and modifier — the audit\'s NPC book gets the full card, every number revealed',
-      '`/config mechanics scrollfont font:<file>` — store an .otf/.ttf; the reply renders a sample line so you see it works. `/gm scroll` then writes props in it, and the parchment sheet; the run\u2019s story, the record and `/fight log scroll:true` are set in standard type (Admin)',
+      '`/config mechanics scrollfont font:<file>` — store an .otf/.ttf; the reply renders a sample line so you see it works. `/gm scroll` then writes props in it, and the parchment sheet; the run\u2019s story, the record and `/fight log scroll:true` are printed in their own type, carried inside the file (Admin)',
       '`/config channels scrollarchive` — the 📜 Scrolls book in the roll-audit forum archives every scroll automatically, both directions, text + image + PDF; `channel:#x` overrides with a plain channel (Admin)',
       '`/npc manage export name:<npc>` / `/npc manage import file:<pdf>` — a villain packed as a woven parchment PDF; import applies directly, GM-as-approver — stats, class, hero flag, auto-pilot preferences and lore travel, standing and webhooks stay local',
       '`/npc create ... temp:true` \u00b7 `/library summon name:Goblin count:3 temp:true` \u2014 throwaway fighters: no forum page, hidden from `/npc list`, swept when their fight ends \u00b7 `/npc temp list|keep|clear`',
@@ -36642,7 +37585,7 @@ async function routeButton(interaction) {
         if (snap.merits) addMerits(gidR, id, -snap.merits);
         if (snap.title) revokeTitle(gidR, id, snap.title);
       }
-      updateQuest(gidR, numR, { status: 'active', winding_down: 1, paused: 1, completion_snapshot: null, elapsed_ms: snap.elapsed || 0 });
+      updateQuest(gidR, numR, { status: 'active', winding_down: 1, winding_at: Date.now(), paused: 1, completion_snapshot: null, elapsed_ms: snap.elapsed || 0 });
       logQuestEvent(gidR, numR, 'note', 'Completion reopened \u2014 payout reversed', interaction.user.id);
       const gmR = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'a GM');
       sendRollAudit(interaction.client, gidR, `\u21A9\uFE0F **${gmR}** reopened ${questTag(q)}: ${snap.merits || 0} merits reversed for ${(snap.party || []).length}${snap.title ? `, title \u201c${snap.title}\u201d revoked` : ''}`);
@@ -36714,11 +37657,9 @@ async function routeButton(interaction) {
       if (t.dead) return interaction.reply({ ephemeral: true, content: targetFallen(t) });
       if (!audienceAllows(t.owner, interaction)) return interaction.reply({ ephemeral: true, content: '\u274C That one is not addressed to you.' });
       const pick = interaction.customId.split(':')[1] || '-';
-      const { ModalBuilder: TM, TextInputBuilder: TI, TextInputStyle: TIS, ActionRowBuilder: TAR } = require('discord.js');
+      const { ModalBuilder: TM } = require('discord.js');
       const m = new TM().setCustomId(`tgtrp:${t.message_id}:${pick}`).setTitle(`Strike at ${t.name}`.slice(0, 45));
-      m.addComponents(
-        new TAR().addComponents(new TI().setCustomId('action').setLabel('What do you do? (optional)').setStyle(TIS.Paragraph).setRequired(false).setMaxLength(RP_BOX_MAX)),
-        new TAR().addComponents(new TI().setCustomId('speech').setLabel('What do you say? (optional)').setStyle(TIS.Paragraph).setRequired(false).setMaxLength(RP_BOX_MAX)));
+      m.addComponents(...rpRows());
       return interaction.showModal(m);
     }
 
@@ -37312,6 +38253,11 @@ async function handleInteraction(interaction) {
         const v = String(focusedOption.value || '').toLowerCase();
         return await interaction.respond(acPick(listStories(interaction.guild.id).map(r => r.name), v));
       }
+      // `to:` on /npc say and /rp: orders, groups and people, the last piece
+      // after a comma completed (T, 2026-11-17).
+      if (focusedOption.name === 'to' && ((acCmd === 'npc' && acSub === 'say') || acCmd === 'rp')) {
+        return await interaction.respond(await addresseeChoices(interaction.guild, acGid, acTyped));
+      }
       if (interaction.commandName === 'npc' && (focusedOption.name === 'talk' || focusedOption.name === 'offer')) {
         const v = String(focusedOption.value || '').toLowerCase();
         return await interaction.respond(acPick(['none', ...listStories(interaction.guild.id).map(r => r.name)], v));
@@ -37651,11 +38597,13 @@ async function handleInteraction(interaction) {
       if (p.heldId) settleHeldRoll(interaction.client, p.heldId).catch(() => {});
       const flavour = rpWords(interaction);
       const gidM = interaction.guild.id, cidM = interactionChannelId(interaction);
-      // The words go into the run's chronicle as the story, not the dice (T, 2026-10-14).
+      // The words go into the run's chronicle as the story, not the dice
+      // (T, 2026-10-14) \u2014 in their parts, as written (T, 2026-11-17).
       if (flavour) {
         try {
           const who = p.npc || await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'Someone');
-          noteQuestActivity(gidM, cidM, 'rp', `${who}: ${rpBeatText(flavour)}`, interaction.user.id);
+          const segsM = rpFormSegs(interaction);
+          noteQuestActivity(gidM, cidM, 'rp', `${who}: ${segsBeat(segsM)}`, interaction.user.id, { parts: { who, segs: segsForLog(interaction.guild, segsM) } });
         } catch {}
       }
       switch (p.kind) {
@@ -37701,7 +38649,8 @@ async function handleInteraction(interaction) {
           return runFightRelease({ interaction, gid: gidM, cid: cidM, actorId: p.npc ? npcFighterId(p.npc) : interaction.user.id, flavour });
         case 'resolve': {
           let what = ''; try { what = String(interaction.fields.getTextInputValue('what') || '').trim().slice(0, RP_BOX_MAX); } catch {}
-          if (what) { try { noteQuestActivity(gidM, cidM, 'rp', what.replace(/\s*\n\s*/g, ' ').trim(), interaction.user.id); } catch {} }
+          // The GM's telling stands as its own line in the story, not a speaker's.
+          if (what) { try { noteQuestActivity(gidM, cidM, 'rp', what.replace(/\s*\n\s*/g, ' ').trim(), interaction.user.id, { parts: { segs: segsForLog(interaction.guild, [{ k: 'p', t: what }]) } }); } catch {} }
           return handleFight(interaction, { sub: 'resolve', flavour: what || null });
         }
         case 'defrp': {

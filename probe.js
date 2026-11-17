@@ -151,6 +151,9 @@ class FakeChannel {
   isTextBased() { return true; }
   permissionsFor() { return { has: () => true }; }
   async setName(n) { this.name = n; }
+  // A forum renamed in place, its about line rewritten (build R).
+  async edit(o = {}) { if (o.name) this.name = o.name; if ('topic' in o) this.topic = o.topic; return this; }
+  async setArchived(v = true) { this.archived = !!v; return this; }
   async setAppliedTags(t) { this.appliedTags = t; }
   // Discord gives every tag an id; a tag sent without one is new and gets one here.
   async setAvailableTags(t) { this.availableTags = t.map(x => ({ ...x, id: x.id || nextId() })); }
@@ -1048,12 +1051,14 @@ async function fire(over) {
       const keyOf = (t) => { const m = /^\[(\d\d)\/(\d\d)\/(\d{4})\].* · (.+)$/.exec(t.name); return m ? `${m[3]}${m[2]}${m[1]}${m[4] === "What's new" ? 0 : 1}` : null; };
       const keys = live.map(keyOf);
       const ordered = keys.every((k, i) => k && (i === 0 || k >= keys[i - 1]));
-      ok('gm-updates reads in date order after the boot — What\'s new before Deploy mend on a day, the Deploy mend of the boot on top',
-        ordered && live.length > 0 && / · Deploy mend$/.test(live[live.length - 1].name), live.map(t => t.name).join(' | '));
-      ok('a dated thread that sat out of turn is re-posted into order and the old one deleted',
-        !!planted && deleted.includes(planted.id) && live.some(t => t.name === planted.name && t.id !== planted.id)
-          && sent.some(x => /re-posted into date order/.test(x.content)),
-        planted ? `planted ${planted.id} deleted=${deleted.includes(planted.id)}` : 'no gm-updates forum before the boot');
+      // Build R: gm-updates keeps What's new alone; the boot reports beneath the day's list in gm-daily.
+      ok('gm-updates reads in date order after the boot, What\'s new alone — no Deploy mend thread there any more',
+        ordered && live.length > 0 && live.every(t => / · What's new$/.test(t.name)), live.map(t => t.name).join(' | '));
+      const dailyF = dbHandle.prepare("SELECT gm_daily_forum FROM guild_config WHERE guild_id='G1'").get()?.gm_daily_forum;
+      const movedDay = threads.find(t => t.parentId === dailyF && !deleted.includes(t.id) && t.name === planted?.name.replace(/ · Deploy mend$/, ' · Daily'));
+      ok('an old Deploy mend thread leaves gm-updates for gm-daily — a thread for its day, its report beneath, the old one deleted',
+        !!planted && deleted.includes(planted.id) && !!movedDay && sent.some(x => x.channel === movedDay.id && /planted out of turn/.test(x.content)),
+        planted ? `planted ${planted.id} deleted=${deleted.includes(planted.id)} · moved ${movedDay?.name}` : 'no gm-updates forum before the boot');
       const dForum = dbHandle.prepare("SELECT gm_digest_forum, gm_digest_seeded_at FROM guild_config WHERE guild_id='G1'").get() || {};
       const seededDigests = threads.filter(t => t.parentId === dForum.gm_digest_forum && !deleted.includes(t.id));
       ok('the first boot with a digest forum posts this week\'s digest at once', !!dForum.gm_digest_seeded_at && seededDigests.length === 1 && / · Weekly digest$/.test(seededDigests[0].name), `${seededDigests.length} digest thread(s), seeded_at ${dForum.gm_digest_seeded_at}`);
@@ -1061,7 +1066,7 @@ async function fire(over) {
     ok('the forum-opening boot sweeps the bot\'s old update posts out of gm-quest-log and nothing else',
       !!oldPost && deleted.includes(oldPost.id) && !deleted.includes(keepPost.id) && !deleted.includes(humanPost.id),
       `old ${oldPost && deleted.includes(oldPost.id)} · summary kept ${keepPost && !deleted.includes(keepPost.id)} · human kept ${humanPost && !deleted.includes(humanPost.id)}`);
-    ok('the sweep is reported in the Deploy mend thread', threads.some(t => / · Deploy mend$/.test(t.name)) && sent.some(x => /1 old update post removed from/.test(x.content)));
+    ok('the sweep is reported in the day\'s Deploy mend, in gm-daily', threads.some(t => / · Daily$/.test(t.name)) && sent.some(x => /^🔧 \*\*Deploy mend\*\*/.test(x.content) && /1 old update post removed from/.test(x.content)));
     dbHandle.prepare("UPDATE guild_config SET gm_digest_at=0 WHERE guild_id='G1'").run();   // a week has passed
     const realErrT = console.error; const loggedT = [];
     console.error = (...a) => { loggedT.push(a.map(String).join(' ')); };
@@ -1091,7 +1096,11 @@ async function fire(over) {
     // The players' forum also carries the weekly chronicle (2026-10-14); only What's new is counted here.
     const gmAll = inForum(cfgU.gm_updates_forum), plT = inForum(cfgU.updates_forum).filter(t => / \u00b7 What's new$/.test(t.name));
     const gmT = gmAll.filter(t => / · What's new$/.test(t.name));
-    ok('the deploy mend is a dated thread in gm-updates, reporting what the boot built', gmAll.some(t => / · Deploy mend$/.test(t.name) && DATE_RE.test(t.name)), gmAll.map(t => t.name).join(' | '));
+    const dailyAll = inForum(dbHandle.prepare("SELECT gm_daily_forum FROM guild_config WHERE guild_id='G1'").get()?.gm_daily_forum);
+    const today = dailyAll.filter(t => / · Daily$/.test(t.name) && DATE_RE.test(t.name)).sort((a, b) => Number(a.id) - Number(b.id)).pop();
+    ok('the deploy mend reports what the boot built beneath the day\'s list, in gm-daily; none is a thread in gm-updates',
+      !!today && sent.some(x => x.channel === today.id && /^🔧 \*\*Deploy mend\*\*/.test(x.content)) && !gmAll.some(t => / · Deploy mend$/.test(t.name)),
+      `${today?.name} · ${gmAll.filter(t => / · Deploy mend$/.test(t.name)).length} mend thread(s) in gm-updates`);
     ok(`the back-catalogue is seeded once, oldest first, one dated thread per entry (${entries.length} entries)`,
       gmT.length === entries.length && gmT.every(t => DATE_RE.test(t.name)) && !!cfgU.updates_seeded_at && cfgU.changelog_seen === entries[0]
         && gmT.map(t => t.name.slice(1, 11)).join(',') === [...entries].reverse().map(k => k.split('-').reverse().join('/')).join(','),
@@ -1148,11 +1157,11 @@ async function fire(over) {
     ok('the players\' forum is untouched by the clean slate — no thread removed, none posted twice',
       plThreads.length > 0 && plThreads.every(t => before.includes(t.id) || t.parentId !== cfgR.gm_updates_forum) && new Set(plThreads.map(t => t.name)).size === plThreads.length,
       plThreads.map(t => t.name).join(' | '));
-    const mends = live(cfgR.gm_updates_forum).filter(t => / · Deploy mend$/.test(t.name)).sort((a, b) => Number(a.id) - Number(b.id));
-    const last = live(cfgR.gm_updates_forum).sort((a, b) => Number(a.id) - Number(b.id)).pop();
-    ok('the reseed boot\'s Deploy mend reports the clean slate and tops the forum',
-      !!last && / · Deploy mend$/.test(last.name) && msgsOf(last).some(c => /What.s new thread\(s\) removed and the catalogue re-posted/.test(c)) && mends.length >= 1,
-      last ? `${last.name}: ${msgsOf(last)[0]?.slice(0, 160)}` : 'no threads');
+    const dailyR = dbHandle.prepare("SELECT gm_daily_forum FROM guild_config WHERE guild_id='G1'").get()?.gm_daily_forum;
+    const mendR = sent.filter(x => live(dailyR).some(t => t.id === x.channel) && /^🔧 \*\*Deploy mend\*\*/.test(x.content) && !deleted.includes(x.msg.id)).pop();
+    ok('the reseed boot\'s Deploy mend, beneath the day\'s list in gm-daily, reports the clean slate',
+      !!mendR && /What.s new thread\(s\) removed and the catalogue re-posted/.test(mendR.content) && !live(cfgR.gm_updates_forum).some(t => / · Deploy mend$/.test(t.name)),
+      mendR ? mendR.content.slice(0, 160) : 'no Deploy mend in gm-daily');
   }
 
   // ── An entry that grew after its thread was posted (two pushes in a day) ──
@@ -1177,15 +1186,17 @@ async function fire(over) {
     if (plT && plRow) dbHandle.prepare("UPDATE changelog_posted SET lines=? WHERE guild_id='G1' AND key=? AND audience='player'").run(JSON.stringify(JSON.parse(plRow.lines).filter(l => l !== plLost.slice(2))), newest);
     let human = null;
     if (plT) { human = await plT.send('thanks for this'); human.author = { id: 'U1' }; }
-    const beforeMends = live(cfgG.gm_updates_forum).filter(t => / · Deploy mend$/.test(t.name)).length;
+    const dailyG = dbHandle.prepare("SELECT gm_daily_forum FROM guild_config WHERE guild_id='G1'").get()?.gm_daily_forum;
+    const mendsIn = () => sent.filter(x => live(dailyG).some(t => t.id === x.channel) && /^🔧 \*\*Deploy mend\*\*/.test(x.content) && !deleted.includes(x.msg.id));
+    const beforeMends = mendsIn().length;
     const realTimeoutG = globalThis.setTimeout; globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
     for (const fn of listeners.clientReady || listeners.ready || []) await fn().catch(e => bad.push('ready: ' + e.message));
     await (lastClient?.mendDone || null);
     globalThis.setTimeout = realTimeoutG;
     const gmNow = title(cfgG.gm_updates_forum);
     const gmRow = dbHandle.prepare("SELECT thread_id, lines FROM changelog_posted WHERE guild_id='G1' AND key=? AND audience='gm'").get(newest);
-    const mendsNow = live(cfgG.gm_updates_forum).filter(t => / · Deploy mend$/.test(t.name)).sort((a, b) => Number(a.id) - Number(b.id));
-    const mendText = mendsNow.length ? msgsOf(mendsNow[mendsNow.length - 1]).map(m => m.content).join('\n') : '';
+    const mendsNow = mendsIn();
+    const mendText = mendsNow.length ? mendsNow[mendsNow.length - 1].content : '';
     ok('a GM What\'s new thread that lacks a line the entry now has (and no ledger row) is deleted and posted again whole, the ledger written, the Deploy mend saying so',
       bad.length === 0 && !!gmT && !!gmLost && deleted.includes(gmT.id) && !!gmNow && gmNow.id !== gmT.id
         && msgsOf(gmNow).some(m => m.content.includes(gmLost)) && msgsOf(gmNow).some(m => m.content.startsWith('**In detail**'))
@@ -1525,7 +1536,7 @@ async function fire(over) {
     ok('a new sheet is told where to go next', /\u{1F9ED} \*\*Next:\*\*/u.test(saidOf(newSheet)) && /`\/help`/.test(saidOf(newSheet)), saidOf(newSheet).replace(/\s+/g, ' ').slice(-160));
     dbHandle.prepare("UPDATE temp_targets SET at=? WHERE guild_id='G1' AND name='Probe gate'").run(Date.now() - 2 * 86400000);
     const stalled = await fire({ commandName: 'gm', options: { _group: 'check', _sub: 'stalled' }, userId: 'U1' });
-    ok('a target standing over a day is in the stalled report', /Targets standing over a day/.test(saidOf(stalled)) && /Probe gate in <#C1> \(2d\)/.test(saidOf(stalled)), saidOf(stalled).replace(/\s+/g, ' ').slice(0, 160));
+    ok('a target standing over a day is in the stalled report, with the date it has stood since and a link to its card', /Targets standing over a day/.test(saidOf(stalled)) && /\*\*Probe gate\*\* in <#C1> — `\/target list` there retires it · since <t:\d+:d> · \[jump\]\(https:\/\/discord\.com\/channels\/G1\/C1\/\d+\)/.test(saidOf(stalled)), saidOf(stalled).replace(/\s+/g, ' ').slice(0, 220));
     // 6 · the weekly chronicle and the idle nudge, from the ticks
     dbHandle.prepare("INSERT OR IGNORE INTO subject_titles (guild_id, subject_id, title, source, granted_by, at) VALUES ('G1', 'U2', 'Idol-breaker', 'probe', 'U1', ?)").run(Date.now());
     dbHandle.prepare("INSERT INTO week_ledger (guild_id, at, kind, text) VALUES ('G1', ?, 'fight', 'userU1 wins!')").run(Date.now());
@@ -1533,13 +1544,13 @@ async function fire(over) {
     dbHandle.prepare("UPDATE guild_config SET week_tale_at=0, fight_nudge_min=NULL, turn_remind_min=NULL, turn_skip_min=NULL, turn_timeout=NULL WHERE guild_id='G1'").run();   // the server's own clock is wanted here, 5 and 15
     dbHandle.prepare("DELETE FROM turn_clocks WHERE guild_id='G1'").run();
     dbHandle.prepare(`UPDATE fights SET state='active', turn_order='["U1","U2"]', turn_index=0, phase='attack', current_target=NULL, nudged=0, last_at=? WHERE guild_id='G1' AND channel_id='C1'`).run(Date.now() - 11 * 60 * 1000);
-    const updForum = dbHandle.prepare("SELECT updates_forum FROM guild_config WHERE guild_id='G1'").get()?.updates_forum;
+    const updForum = dbHandle.prepare("SELECT chronicle_forum FROM guild_config WHERE guild_id='G1'").get()?.chronicle_forum;   // its own forum since build R
     const talesBefore = threads.filter(t => t.parentId === updForum && / · Weekly chronicle$/.test(t.name)).length;   // the tick walk above posted the first
     const nudgesBefore = sent.filter(x => /minutes? quiet/.test(x.content)).length;
     for (const t of ticks) { try { await t.fn(); } catch (e) { loggedA.push(`tick: ${e.message}`); } }
     const tales = threads.filter(t => t.parentId === updForum && / · Weekly chronicle$/.test(t.name));
     const taleText = tales.length ? sent.filter(x => x.channel === tales[tales.length - 1].id).map(x => x.content).join('\n') : '';
-    ok('the players\' weekly chronicle is a dated thread in updates: quests completed, titles granted, fights won, the fallen',
+    ok('the players\' weekly chronicle is a dated thread in chronicle: quests completed, titles granted, fights won, the fallen',
       tales.length === talesBefore + 1 && /Quests completed/.test(taleText) && /\*\*#910-Probe Tale\*\* — userU1, userU2 \(GM userU1\)/.test(taleText)
         && /Titles granted/.test(taleText) && /\*\*userU2\*\* — Idol-breaker/.test(taleText) && /Fights won/.test(taleText) && /userU1 wins!/.test(taleText)
         && /The fallen/.test(taleText) && taleText.includes(`**user${P4}**`),
@@ -1809,7 +1820,7 @@ async function fire(over) {
     // 7 · dice of the week in the chronicle, from the dated d20 ledger
     const diceRows = dbHandle.prepare("SELECT COUNT(*) AS c FROM week_dice WHERE guild_id='G1' AND user_id='U2' AND nat=1").get().c;
     dbHandle.prepare("UPDATE guild_config SET week_tale_at=0 WHERE guild_id='G1'").run();
-    const updForumC = dbHandle.prepare("SELECT updates_forum FROM guild_config WHERE guild_id='G1'").get()?.updates_forum;
+    const updForumC = dbHandle.prepare("SELECT chronicle_forum FROM guild_config WHERE guild_id='G1'").get()?.chronicle_forum;
     for (const t of ticks) { try { await t.fn(); } catch {} }
     const talesC = threads.filter(t => t.parentId === updForumC && / · Weekly chronicle$/.test(t.name));
     const taleTextC = talesC.length ? sent.filter(x => x.channel === talesC[talesC.length - 1].id).map(x => x.content).join('\n') : '';
@@ -2369,11 +2380,17 @@ async function fire(over) {
     ok('`to:` with nothing to say is refused, not dropped by the box', /Nothing to say/.test(saidOf(sayAlone)) && !modalOf(sayAlone), saidOf(sayAlone).slice(0, 80));
     const boxG = await fire({ isButton: true, customId: idsOf(lineG).find(id => id.startsWith('npcx:')), message: lineG, userId: 'U1', channel: chanH });
     before = sent.length;
+    // A box opened before build R still has its Groups list: a pick from it is honoured.
     await fire({ isModal: true, customId: 'npcsay:Dockmaster', fields: { action: '', speech: 'Falconers, to me.' }, users: { to: [] }, selects: { offer: [], groups: ['g:The Falconers', 'o:White Knight'] }, userId: 'U1', channel: chanH });
     const lineB = sinceIn('CH8', before).find(m => m.webhookId);
-    ok('the speak-as box carries a Groups list (orders and associations) beside a To picker of twenty-five; a picked group is pinged whole',
-      'groups' in modalFieldsOf(boxG) && 'to' in modalFieldsOf(boxG) && [P4, P3, P5].every(id => (lineB?.content || '').includes(`<@${id}>`)),
+    ok('the speak-as box has the Raw box where the Groups list was, beside a To picker of twenty-five; a group pick from a box opened before is still pinged whole',
+      'raw' in modalFieldsOf(boxG) && !('groups' in modalFieldsOf(boxG)) && 'to' in modalFieldsOf(boxG) && [P4, P3, P5].every(id => (lineB?.content || '').includes(`<@${id}>`)),
       `${JSON.stringify(Object.keys(modalFieldsOf(boxG)))} · ${JSON.stringify(lineB?.content)}`);
+    const acTo = async (cmd, typed) => ((await fire({ commandName: cmd, isAutocomplete: true, options: { ...(cmd === 'npc' ? { _sub: 'say' } : {}), _focused: 'to', _focusedValue: typed }, userId: 'U1', channel: chanH })).replies.find(r => r.autocomplete)?.autocomplete || []);
+    const acW = await acTo('npc', 'whit'), acF = await acTo('npc', '@Aldric, fal'), acA = await acTo('rp', 'ald');
+    ok('`to:` on /npc say and /rp completes as it is typed: the knight orders, the groups, people \u2014 the piece after the last comma, the ones before kept',
+      acW.some(c => c.value === 'White Knights') && acF.some(c => c.value === '@Aldric, The Falconers') && !acF.some(c => c.value === '@Aldric, @Aldric') && acA.some(c => c.value === '@Aldric'),
+      `${JSON.stringify(acW.map(c => c.value))} · ${JSON.stringify(acF.map(c => c.value))} · ${JSON.stringify(acA.map(c => c.value))}`);
     ok('every NPC line keeps its buttons now \u2014 the newest-only rule is gone', idsOf(lineG).some(id => id.startsWith('npcreply:')) && idsOf(lineB).some(id => id.startsWith('npcreply:')), `${JSON.stringify(idsOf(lineG))}`);
 
     // 6 · /rp rolls: a stat in the server's own terms, dice, saved for rr; a player's to: is refused
@@ -2602,7 +2619,7 @@ async function fire(over) {
     before = sent.length;
     const end951 = await fire({ commandName: 'session', options: { _sub: 'complete', name: 'Long Road', summary: 'They reached the city walls.' }, userId: 'U1', channel: chanI });
     for (let i = 0; i < 4; i++) await settle();
-    // The run's home is its own thread, so the story and the corrected talk post there, review button and all.
+    // The run's home is its own thread, so the story posts there, review button and all \u2014 the talk inside it (build R).
     const pubPost = sent.slice(before).filter(x => x.channel === room951?.id).map(x => x.msg).find(m => (m.files || []).length);
     const pubFiles = [...end951.replies.flatMap(x => x.files || []), ...(pubPost?.files || [])];
     const pubNames = pubFiles.map(f => f?.b?.name || '');
@@ -2612,12 +2629,11 @@ async function fire(over) {
     const corT = fileText(pubFiles, /talk\.txt$/), rawT = fileText(post951?.files, /-raw\.txt$/);
     const storyBuf = pubFiles.find(f => /story\.pdf$/.test(f?.b?.name || ''))?.a;
     let story = null; try { story = JSON.parse(storyBuf.slice(storyBuf.indexOf('DDICESCROLLv1') + 13).toString('utf8')); } catch {}
-    ok('a recorded run ends with its talk twice: the corrected transcript beside the story for everyone, the raw one only in the GM archive; the scroll keeps the story',
-      pubNames.some(n => /talk\.txt$/.test(n)) && !pubNames.some(n => /-raw\.txt$/.test(n)) && ['story.pdf', 'record.pdf', 'talk.txt', 'raw.txt'].every(x => postNames.some(n => n.endsWith(x)))
-        && /HeroU2: We ride at first light\./.test(corT) && !/Nobody saw that/.test(corT) && !/We ride at dawn/.test(corT)
-        && /HeroU2: We ride at dawn\.\n\s+↳ edited to: We ride at first light\./.test(rawT) && /HeroU2: Nobody saw that\.\n\s+↳ deleted/.test(rawT) && /1 edited, 1 deleted/.test(rawT)
-        && !/We ride/.test(story?.body || 'We ride') && /lines? of table talk were kept/.test(story?.body || ''),
-      `pub ${pubNames.join(',')} · post ${postNames.join(',')} · cor ${corT.replace(/\s+/g, ' ').slice(0, 140)} · raw ${rawT.replace(/\s+/g, ' ').slice(0, 200)} · story ${(story?.body || '').replace(/\s+/g, ' ').slice(0, 120)}`);
+    ok('a recorded run\'s talk is in its story \u2014 every word, as the thread reads now, under the speaker\'s name \u2014 with no transcript beside it; the raw one is the GM archive\'s alone, with the story and the record',
+      pubNames.some(n => /story\.pdf$/.test(n)) && !pubNames.some(n => /\.txt$/.test(n)) && ['story.pdf', 'record.pdf', 'raw.txt'].every(x => postNames.some(n => n.endsWith(x))) && !postNames.some(n => /talk\.txt$/.test(n))
+        && !corT && /HeroU2: We ride at dawn\.\n\s+↳ edited to: We ride at first light\./.test(rawT) && /HeroU2: Nobody saw that\.\n\s+↳ deleted/.test(rawT) && /1 edited, 1 deleted/.test(rawT)
+        && /\d+h \d\dm - HeroU2\n[^\n]*[\s\S]*?\nWe ride at first light\.\nHold the line\./.test(story?.body || '') && !/Nobody saw that|We ride at dawn/.test(story?.body || ''),
+      `pub ${pubNames.join(',')} · post ${postNames.join(',')} · raw ${rawT.replace(/\s+/g, ' ').slice(0, 200)} · story ${(story?.body || '').replace(/\s+/g, ' ').slice(0, 200)}`);
     const headerB = u1Thread?._starter?.content || '';
     ok('the run\'s post carries its runtime and party, and the header no longer counts it as running',
       /⏱️ \*\*\d+h \d\dm\*\*/.test(post951?.content || '') && /👥 /.test(post951?.content || '') && !/Long Road — \d/.test(headerB) && qrow(951)?.archive_msg_id === post951?.id,
@@ -5200,9 +5216,12 @@ async function fire(over) {
     canvasFonts.length = 0;
     const sum1 = await gmQ({ commandName: 'session', options: { _sub: 'summary' } });
     const fontsStory = [...canvasFonts];
-    ok('the run\u2019s story so far is set in the standard face even with a scroll font stored \u2014 the script is for props',
-      (sum1.replies.find(x => x.files)?.files || []).length === 1 && fontsStory.length > 0 && fontsStory.every(f => /DDice-Standard/.test(f)) && !fontsStory.some(f => /Scroll-G1/.test(f)),
-      `${flat1(saidOf(sum1)).slice(0, 120)} · fonts ${[...new Set(fontsStory)].join(' | ')}`);
+    const sumPdf = (sum1.replies.find(x => x.files)?.files || [])[0]?.a;
+    const sumText = sumPdf ? Buffer.from(sumPdf).toString('latin1') : '';
+    // Build R: printed, not painted \u2014 its three faces ride inside the file and no canvas is touched.
+    ok('the run\u2019s story so far is printed in its own embedded faces (DejaVu Sans, Bold, Oblique) even with a scroll font stored \u2014 no canvas, the script is for props',
+      (sum1.replies.find(x => x.files)?.files || []).length === 1 && fontsStory.length === 0 && ['DDRAAA+DejaVuSans', 'DDBAAA+DejaVuSans-Bold', 'DDIAAA+DejaVuSans-Oblique'].every(f => sumText.includes(`/BaseFont/${f}`)) && /\/FontFile2/.test(sumText) && !/Scroll-G1/.test(sumText),
+      `${flat1(saidOf(sum1)).slice(0, 120)} · canvas fonts ${[...new Set(fontsStory)].join(' | ')}`);
     dbHandle.prepare("UPDATE quests SET status='completed' WHERE guild_id='G1' AND number=975").run();
     dbHandle.prepare("UPDATE guild_config SET scroll_font=NULL WHERE guild_id='G1'").run();
 
@@ -5667,6 +5686,242 @@ async function fire(over) {
     const threwQ = loggedQ.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column|Invalid Form Body/.test(l));
     console.error = realErrQ;
     ok('nothing in the Q walk threw, and nothing went out over 2,000', threwQ.length === 0, threwQ.slice(0, 4).join('\n        '));
+  }
+
+  // ── Build R (2026-11-17): every word in the record, in its parts; the Raw
+  // box on every form; the story printed by rule 1, named, in parts; talk
+  // cut before mended once; the forums split — gm-daily, gm-weekly,
+  // gm-monthly, chronicle — and the waiting list with dates and links ──
+  if (dbHandle) {
+    const realErrR = console.error; const loggedR = [];
+    console.error = (...a) => { loggedR.push(a.map(x => (x && x.stack) ? x.stack.split('\n').slice(0, 2).join(' | ') : String(x)).join(' ')); };
+    const realNowR = Date.now, realFetchR = guild.members.fetch;
+    try {
+      const idsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+      const saidOf = (r) => (r?.replies || []).map(x => x.content || '').join('\n');
+      const modalOf = (r) => (r?.replies || []).find(x => x.modal)?.modal || null;
+      const modalFieldsOf = (r) => (r?.replies || []).find(x => x.modal)?.modalFields || {};
+      const settle = async () => { for (let i = 0; i < 80; i++) await new Promise(r => setImmediate(r)); };
+      const sinceIn = (cid, n) => sent.slice(n).filter(x => x.channel === cid).map(x => x.msg);
+      const flat1 = (t) => String(t || '').replace(/\s+/g, ' ');
+      const woven = (buf) => { try { const b = Buffer.from(buf); return JSON.parse(b.slice(b.indexOf('DDICESCROLLv1') + 13).toString('utf8')); } catch { return null; } };
+      const filesOf = (r) => (r?.replies || []).flatMap(x => x.files || []);
+      const segsOf = (row) => { try { return JSON.parse(row?.parts || 'null'); } catch { return null; } };
+      const tickR = async () => { for (const t of ticks.filter(t => /questTick/.test(String(t.fn)))) { try { await t.fn(); } catch (e) { loggedR.push(`tick: ${e.message}`); } } await settle(); };
+      const chR = new FakeChannel('CR1', 0, 'r-walk', guild); channelsById.set('CR1', chR);
+      const roomR = new FakeChannel('TR1', 11, 'r-room', guild); roomR._isThread = true; roomR.parentId = 'CR1'; channelsById.set('TR1', roomR);
+      const tR = Date.now() - 3600000;
+      dbHandle.prepare("INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, run_thread_id, gm_id, started_at, record_all, paused) VALUES ('G1', 990, 'Raw Road', 'active', 'quest', ?, 'CR1', 'TR1', 'U1', ?, 1, 0)").run(tR, tR);
+      const evR = (kind) => dbHandle.prepare("SELECT * FROM quest_events WHERE guild_id='G1' AND number=990 AND kind=? ORDER BY id").all(kind);
+      const RPL = '100000000000000301';
+      guild.members.fetch = async (uid) => { const mb = await realFetchR(uid); if (uid === RPL) { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+      const plainR = { id: RPL, displayName: `user${RPL}`, roles: { cache: new Map() }, permissions: { has: () => false } };
+      dbHandle.prepare("INSERT OR REPLACE INTO characters (guild_id, user_id, str, con, dex, wis, lck, hp_current, rerolls_current) VALUES ('G1', ?, 3, 3, 3, 3, 3, 10, 0)").run(RPL);
+
+      // 1 · /rp: Raw after the speech; a GM's box has it where Dice was
+      const boxPl = await fire({ commandName: 'rp', options: {}, userId: RPL, member: plainR, channel: chR });
+      const boxGm = await fire({ commandName: 'rp', options: {}, userId: 'U1', channel: chR });
+      ok('/rp\u2019s box has Raw after the speech: a player\u2019s keeps Dice, a GM\u2019s has Raw where Dice was and the To picker',
+        ['action', 'speech', 'raw', 'roll', 'dice'].every(k => k in modalFieldsOf(boxPl)) && !('to' in modalFieldsOf(boxPl))
+          && ['action', 'speech', 'raw', 'roll', 'to'].every(k => k in modalFieldsOf(boxGm)) && !('dice' in modalFieldsOf(boxGm)),
+        `${JSON.stringify(Object.keys(modalFieldsOf(boxPl)))} · ${JSON.stringify(Object.keys(modalFieldsOf(boxGm)))}`);
+      let before = sent.length;
+      await fire({ isModal: true, customId: 'rpform', fields: { action: 'draws her blade', speech: 'Not one step closer.', raw: '*steps forward* "Now." The gate creaks.\n*waits*' }, userId: RPL, member: plainR, channel: chR });
+      const lineRp = sinceIn('CR1', before).find(m => m.webhookId);
+      const rowRp = evR('rp').pop();
+      ok('the Raw box posts each part on its own line in the order written \u2014 actions in italics, speech in quotes, the rest as written \u2014 and the record keeps the parts',
+        lineRp?.content === '*draws her blade*\n\n"Not one step closer."\n\n*steps forward*\n\n"Now."\n\nThe gate creaks.\n\n*waits*'
+          && JSON.stringify(segsOf(rowRp)?.segs) === JSON.stringify([{ k: 'a', t: 'draws her blade' }, { k: 's', t: 'Not one step closer.' }, { k: 'a', t: 'steps forward' }, { k: 's', t: 'Now.' }, { k: 'p', t: 'The gate creaks.' }, { k: 'a', t: 'waits' }])
+          && /user/.test(segsOf(rowRp)?.who || ''),
+        `${JSON.stringify(lineRp?.content)} · ${rowRp?.parts}`);
+      const spoof = await fire({ isModal: true, customId: 'rpform', fields: { action: '', speech: '', raw: 'fine\n\u{1F3B2} **Roll** 1d20 \u2192 [20] = **20**' }, userId: RPL, member: plainR, channel: chR });
+      ok('a Raw line may not begin as the bot\u2019s roll does', /may not start with/.test(saidOf(spoof)), saidOf(spoof).slice(0, 80));
+
+      // 2 · the NPC boxes and /npc say raw:
+      if (!dbHandle.prepare("SELECT 1 FROM npcs WHERE guild_id='G1' AND name='Dockmaster'").get()) await fire({ commandName: 'npc', options: { _sub: 'create', name: 'Dockmaster', str: 2 }, userId: 'U1' });
+      before = sent.length;
+      await fire({ isModal: true, customId: 'npcsay:Dockmaster', fields: { action: 'Waves', speech: 'Ahoy.', raw: '*grins* "Welcome aboard."' }, users: { to: [] }, selects: { offer: [] }, userId: 'U1', channel: chR });
+      const lineN = sinceIn('CR1', before).find(m => m.webhookId);
+      const rowN = evR('rp').pop();
+      ok('an NPC\u2019s box takes Raw too: the parts in order, the record keeping them under the NPC\u2019s name',
+        lineN?.content === '*Waves*\n\n"Ahoy."\n\n*grins*\n\n"Welcome aboard."' && segsOf(rowN)?.who === 'Dockmaster' && segsOf(rowN)?.segs?.length === 4 && !rowN?.actor,
+        `${JSON.stringify(lineN?.content)} · ${rowN?.parts}`);
+      before = sent.length;
+      await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', raw: 'As typed, *exactly* "so".' }, userId: 'U1', channel: chR });
+      const lineN2 = sinceIn('CR1', before).find(m => m.webhookId);
+      const rowN2 = evR('rp').pop();
+      ok('/npc say raw: posts exactly as typed, and the record reads it into its parts as the box would',
+        lineN2?.content === 'As typed, *exactly* "so".' && JSON.stringify(segsOf(rowN2)?.segs) === JSON.stringify([{ k: 'p', t: 'As typed,' }, { k: 'a', t: 'exactly' }, { k: 's', t: 'so' }, { k: 'p', t: '.' }]),
+        `${JSON.stringify(lineN2?.content)} · ${rowN2?.parts}`);
+      const ansBox = await fire({ isButton: true, customId: 'rpnpc', message: lineRp, userId: 'U1', channel: chR });
+      ok('the answer box has Raw too, and no Groups list', ['who', 'action', 'speech', 'raw', 'to'].every(k => k in modalFieldsOf(ansBox)) && !('groups' in modalFieldsOf(ansBox)), JSON.stringify(Object.keys(modalFieldsOf(ansBox))));
+
+      // 3 · a target's strike form
+      await fire({ commandName: 'target', options: { _sub: 'create', name: 'Raw gate', stat: 'str', dc: 12 }, userId: 'U1', channel: chR });
+      const tg = dbHandle.prepare("SELECT * FROM temp_targets WHERE guild_id='G1' AND name='Raw gate' ORDER BY at DESC").get();
+      const tgCard = tg ? sentById.get(tg.card_id || tg.message_id) : null;
+      const tgPress = await fire({ isButton: true, customId: idsOf(tgCard)[0] || 'tgtatk', message: tgCard, userId: 'U2', channel: chR });
+      const realRandR = Math.random; Math.random = () => 0.5;
+      const tgHit = modalOf(tgPress) ? await fire({ isModal: true, fromMessage: true, customId: modalOf(tgPress), fields: { action: 'swings', speech: 'Have at you!', raw: '*ducks under* "Now!"' }, message: tgCard, userId: 'U2', channel: chR }) : { replies: [] };
+      Math.random = realRandR;
+      const rowTg = evR('rp').pop();
+      ok('a target\u2019s strike form has Raw: the card carries the parts in order and the record keeps them',
+        'raw' in modalFieldsOf(tgPress) && /\*swings\*\n\u201CHave at you!\u201D\n\*ducks under\*\n\u201CNow!\u201D/.test(saidOf(tgHit)) && JSON.stringify(segsOf(rowTg)?.segs?.map(s => s.k)) === '["a","s","a","s"]',
+        `${JSON.stringify(Object.keys(modalFieldsOf(tgPress)))} · ${flat1(saidOf(tgHit)).slice(0, 140)} · ${rowTg?.parts}`);
+
+      // 4 · talk kept whole; talk cut before, mended once
+      const mkR = (text, uid = 'U2') => ({ id: nextId(), content: text, author: { id: uid, bot: false, username: `user${uid}` }, guild, channel: roomR, channelId: 'TR1', member: { id: uid, displayName: `Hero${uid}`, roles: { cache: new Map() }, permissions: { has: () => true } }, attachments: { size: 0, first: () => null }, client, reply: async () => ({ id: nextId() }) });
+      const longTalk = `*leans on the rail* "${'The sea is wide and the night is long. '.repeat(14).trim()}" and then some.`;
+      const mT = mkR(longTalk);
+      for (const fn of listeners.messageCreate || []) await fn(mT);
+      await settle();
+      const rowT = dbHandle.prepare("SELECT * FROM quest_events WHERE guild_id='G1' AND number=990 AND kind='talk' AND msg_id=?").get(String(mT.id));
+      ok('talk is kept whole now \u2014 no cut at 300 \u2014 and in its parts', !!rowT && rowT.text.length > 500 && rowT.whole === 1 && JSON.stringify(segsOf(rowT)?.segs?.map(s => s.k)) === '["a","s","p"]',
+        `${rowT?.text?.length} chars · whole ${rowT?.whole} · ${String(rowT?.parts).slice(0, 120)}`);
+      const cutFull = 'Every word of this was said, and the old record cut it short. '.repeat(15).trim();
+      sentById.set('MCUT1', { id: 'MCUT1', content: cutFull, author: { id: 'U3' }, member: { displayName: 'HeroU3' }, channelId: 'TR1' });
+      dbHandle.prepare("INSERT INTO quest_events (guild_id, number, at_ms, kind, text, actor, wall_at, msg_id) VALUES ('G1', 990, 120000, 'talk', ?, 'U3', ?, 'MCUT1')").run(`HeroU3: ${cutFull.slice(0, 300)}`, Date.now());
+      dbHandle.prepare("INSERT INTO quest_events (guild_id, number, at_ms, kind, text, actor, wall_at, msg_id) VALUES ('G1', 990, 130000, 'talk', ?, 'U3', ?, 'MGONE1')").run(`HeroU3: ${'x'.repeat(300)}`, Date.now());
+
+      // 5 · the summary: rule 1, filename:, the faces inside
+      const sumR = await fire({ commandName: 'session', options: { _sub: 'summary', filename: 'The Night Watch' }, userId: 'U1', channel: chR });
+      const cutRow = dbHandle.prepare("SELECT * FROM quest_events WHERE msg_id='MCUT1'").get();
+      const goneRow = dbHandle.prepare("SELECT * FROM quest_events WHERE msg_id='MGONE1'").get();
+      ok('talk cut at 300 before build R is read again from its thread before the story is printed \u2014 once: mended whole, or marked when the message is gone',
+        cutRow?.whole === 1 && cutRow?.text === `HeroU3: ${cutFull}` && goneRow?.whole === -1, `${cutRow?.whole} ${cutRow?.text?.length} · gone ${goneRow?.whole}`);
+      const fR = filesOf(sumR), wR = woven(fR[0]?.a), bodyR = wR?.body || '';
+      ok('`filename:` on /session summary names the file and heads its first page', fR.length === 1 && fR[0]?.b?.name === 'The-Night-Watch.pdf' && wR?.title === 'The Night Watch', `${fR.map(f => f?.b?.name).join(',')} · ${wR?.title}`);
+      ok('the story is printed by rule 1: "time - Name", then each action, speech and line as written, in order; one heading for a run of the same speaker; a blank line at each change',
+        /\n\n\d+h \d\dm - HeroU3\nEvery word of this was said/.test(bodyR)
+          && /\n\n\d+h \d\dm - user\d+\ndraws her blade\n\u201CNot one step closer\.\u201D\nsteps forward\n\u201CNow\.\u201D\nThe gate creaks\.\nwaits\n\n\d+h \d\dm - Dockmaster\nWaves\n\u201CAhoy\.\u201D\ngrins\n\u201CWelcome aboard\.\u201D\nAs typed,\nexactly\n\u201Cso\u201D\n\.\n\n/.test(bodyR),
+        flat1(bodyR).slice(0, 600));
+      const pdfR = fR[0]?.a ? Buffer.from(fR[0].a).toString('latin1') : '';
+      ok('the story carries its own faces \u2014 DejaVu Sans, Bold and Oblique \u2014 and the words can be copied out of it',
+        ['DDRAAA+DejaVuSans', 'DDBAAA+DejaVuSans-Bold', 'DDIAAA+DejaVuSans-Oblique'].every(f => pdfR.includes(`/BaseFont/${f}`)) && (pdfR.match(/\/ToUnicode/g) || []).length === 3 && /\/MediaBox\[0 0 1000 \d+\]/.test(pdfR),
+        pdfR.slice(0, 80));
+      for (let k = 0; k < 140; k++) dbHandle.prepare("INSERT INTO quest_events (guild_id, number, at_ms, kind, text, actor, wall_at, parts) VALUES ('G1', 990, ?, 'rp', 'x', 'U2', ?, ?)").run(200000 + k, Date.now(), JSON.stringify({ who: `HeroU${k % 2 + 2}`, segs: [{ k: 'a', t: 'paces the deck and looks out over the dark water. '.repeat(6) }, { k: 's', t: 'Long words for a long night, and every one of them kept. '.repeat(6) }] }));
+      process.env.DDICE_SCROLL_FILE_MAX = '130000';
+      const sumP = await fire({ commandName: 'session', options: { _sub: 'summary' }, userId: 'U1', channel: chR });
+      delete process.env.DDICE_SCROLL_FILE_MAX;
+      const fP = filesOf(sumP);
+      ok('nothing is cut: a story too big for one file goes in numbered parts, each headed and within the limit',
+        fP.length >= 2 && fP.every((f, k) => new RegExp(`-part-${k + 1}-of-${fP.length}\\.pdf$`).test(f?.b?.name || '') && Buffer.from(f.a).length <= 138000) && !!woven(fP[0].a)?.title && new RegExp(`in ${fP.length} parts`).test(saidOf(sumP)),
+        `${fP.map(f => `${f?.b?.name} ${Buffer.from(f.a).length}`).join(', ')} · ${flat1(saidOf(sumP)).slice(0, 120)}`);
+      const logR = await fire({ commandName: 'fight', options: { _sub: 'log', scroll: true, filename: 'Bridge Fight' }, userId: 'U1', channel: channelsById.get('C1') });
+      const fL = filesOf(logR);
+      ok('`filename:` on /fight log scroll:true names the file and heads its first page; the recap is printed, no canvas needed',
+        fL[0]?.b?.name === 'Bridge-Fight.pdf' && woven(fL[0]?.a)?.title === 'Bridge Fight' && Buffer.from(fL[0].a).toString('latin1').includes('/BaseFont/DDBAAA+DejaVuSans-Bold'),
+        `${fL.map(f => f?.b?.name).join(',')} · ${flat1(saidOf(logR)).slice(0, 100)}`);
+
+      // 6 · the forums split, once
+      const cfgF = () => dbHandle.prepare("SELECT * FROM guild_config WHERE guild_id='G1'").get() || {};
+      const fc = cfgF();
+      const fGU = channelsById.get(fc.gm_updates_forum), fUP = channelsById.get(fc.updates_forum), fWK = channelsById.get(fc.gm_digest_forum);
+      const fDY = channelsById.get(fc.gm_daily_forum), fCH = channelsById.get(fc.chronicle_forum), fMO = channelsById.get(fc.gm_monthly_forum);
+      ok('the boot makes gm-daily, gm-monthly and chronicle; the weekly forum is gm-weekly', fDY?.name === 'gm-daily' && fMO?.name === 'gm-monthly' && fCH?.name === 'chronicle' && fWK?.name === 'gm-weekly',
+        JSON.stringify([fDY?.name, fMO?.name, fCH?.name, fWK?.name]));
+      if (fWK) fWK.name = 'gm-digest';
+      const mendA = fGU ? await fGU.threads.create({ name: '[03/11/2026] [WEEK 45] Tuesday 3rd of November 2026 · Deploy mend', message: { content: '\u{1F527} **Deploy mend**\n\n· first of the third' } }) : null;
+      const mendB = fGU ? await fGU.threads.create({ name: '[03/11/2026] [WEEK 45] Tuesday 3rd of November 2026 · Deploy mend', message: { content: '\u{1F527} **Deploy mend**\n\n· second of the third' } }) : null;
+      if (mendB) mendB.archived = true;
+      const mendC = fGU ? await fGU.threads.create({ name: '[04/11/2026] [WEEK 45] Wednesday 4th of November 2026 · Deploy mend', message: { content: '\u{1F527} **Deploy mend**\n\n· a GM answered this one' } }) : null;
+      if (mendC) { const hm = await mendC.send('noted, thanks'); hm.author = { id: 'U1' }; }
+      const taleA = fUP ? await fUP.threads.create({ name: '[08/11/2026] [WEEK 45] Sunday 8th of November 2026 · Weekly chronicle', message: { content: '\u{1F4DC} **The week\u2019s chronicle**\n\n· a quiet week told' } }) : null;
+      const SHEET7 = '100000000000000307';
+      dbHandle.prepare("INSERT OR REPLACE INTO characters (guild_id, user_id, str, con, dex, wis, lck, hp_current, rerolls_current, approval_state, approval_requested_at) VALUES ('G1', ?, 3, 3, 3, 3, 3, 10, 0, 'pending', ?)").run(SHEET7, Date.parse('2026-10-20T12:00:00Z'));
+      dbHandle.prepare("INSERT OR REPLACE INTO char_pages (guild_id, user_id, thread_id, url, title, at) VALUES ('G1', ?, 'PAGE7', NULL, 'x', ?)").run(SHEET7, Date.now());
+      dbHandle.prepare("INSERT OR REPLACE INTO lore (guild_id, user_id, body, state, submitted_at, msg_id, ch_id) VALUES ('G1', 'U3', 'A lore', 'pending', ?, 'LOREMSG', 'LORECH')").run(Date.parse('2026-11-15T12:00:00Z'));
+      dbHandle.prepare("UPDATE guild_config SET forums_split_at=NULL, gm_daily_day=NULL, gm_daily_thread=NULL, gm_daily_listed=NULL WHERE guild_id='G1'").run();
+      const at = (iso) => () => Date.parse(iso);
+      Date.now = at('2026-11-18T06:30:00Z');
+      const realTimeoutF = globalThis.setTimeout; globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
+      for (const fn of listeners.clientReady || listeners.ready || []) await fn().catch(e => loggedR.push('ready: ' + e.message));
+      await (lastClient?.mendDone || null);
+      globalThis.setTimeout = realTimeoutF;
+      const inF = (f) => threads.filter(t => t.parentId === f?.id && !deleted.includes(t.id));
+      const textIn = (t) => (t ? sent.filter(x => x.channel === t.id && !deleted.includes(x.msg.id)).map(x => x.content).join('\n') : '');
+      const day3 = inF(fDY).find(t => t.name === '[03/11/2026] [WEEK 45] Tuesday 3rd of November 2026 · Daily');
+      const day3Text = textIn(day3);
+      ok('the old Deploy mends leave gm-updates for gm-daily, a thread a day with each report beneath, oldest first; the originals go',
+        !!day3 && day3Text.indexOf('first of the third') > 0 && day3Text.indexOf('second of the third') > day3Text.indexOf('first of the third')
+          && deleted.includes(mendA?.id) && deleted.includes(mendB?.id) && day3.archived === true,
+        `${day3?.name} · ${flat1(day3Text).slice(0, 160)}`);
+      ok('a Deploy mend someone has written in stays in gm-updates', !!mendC && !deleted.includes(mendC.id), `${mendC?.id}`);
+      const taleMoved = inF(fCH).find(t => t.name === taleA?.name);
+      ok('the Weekly chronicles leave updates for chronicle; updates keeps What\'s new alone', !!taleMoved && deleted.includes(taleA?.id) && /a quiet week told/.test(textIn(taleMoved)) && !inF(fUP).some(t => / · Weekly chronicle$/.test(t.name)), `${taleMoved?.name}`);
+      ok('gm-digest is renamed gm-weekly in place, its about line rewritten', fWK?.name === 'gm-weekly' && /A thread a week/.test(fWK?.topic || ''), `${fWK?.name} · ${fWK?.topic}`);
+      const day18 = inF(fDY).find(t => t.id === cfgF().gm_daily_thread);
+      const day18Mend = sent.filter(x => x.channel === day18?.id && /^\u{1F527} \*\*Deploy mend\*\*/u.test(x.content)).pop()?.content || '';
+      ok('a restart before eight opens the day\u2019s thread in gm-daily, the list to come at eight, its report beneath \u2014 the move among what it says',
+        !!day18 && /^\[18\/11\/2026\] .* · Daily$/.test(day18.name) && /lands here at 08:00/.test(day18._starter?.content || '') && /old Deploy mend threads? moved into gm-daily/.test(day18Mend)
+          && /Weekly chronicle threads? moved into chronicle/.test(day18Mend) && /gm-digest is gm-weekly now/.test(day18Mend) && /left where it was/.test(day18Mend) && !cfgF().gm_daily_listed,
+        `${day18?.name} · head ${flat1(day18?._starter?.content).slice(0, 80)} · mend ${flat1(day18Mend).slice(0, 240)}`);
+
+      // 7 · gm-daily at eight, once a day (the sheet's page set again: the boot's mend walked the pages)
+      dbHandle.prepare("INSERT OR REPLACE INTO char_pages (guild_id, user_id, thread_id, url, title, at) VALUES ('G1', ?, 'PAGE7', NULL, 'x', ?)").run(SHEET7, Date.now());
+      Date.now = at('2026-11-18T08:05:00Z');
+      await tickR();
+      const head18 = day18?._starter?.content || '';
+      ok('at eight the day\u2019s list fills the head of the day\u2019s thread \u2014 each thing with the date it has stood since and a link \u2014 the restart report still beneath',
+        /The day \u2014 waiting on a GM/.test(head18) && new RegExp(`<@${SHEET7}>\u2019s sheet[^·\\n]* · since <t:\\d+:d> · \\[jump\\]\\(https://discord\\.com/channels/G1/PAGE7\\)`).test(head18)
+          && /Lore/.test(head18) && cfgF().gm_daily_listed === '2026-11-18' && !!day18Mend,
+        flat1(head18).slice(0, 260));
+      const dailyN = inF(fDY).length;
+      await tickR();
+      ok('the day\u2019s list is written once', inF(fDY).length === dailyN && cfgF().gm_daily_thread === day18?.id, `${inF(fDY).length} vs ${dailyN}`);
+      Date.now = at('2026-11-19T09:00:00Z');
+      await tickR();
+      const day19 = inF(fDY).find(t => /^\[19\/11\/2026\] .* · Daily$/.test(t.name));
+      ok('the next day, a new thread headed with that day\u2019s list', !!day19 && /The day \u2014 waiting on a GM/.test(day19._starter?.content || '') && cfgF().gm_daily_listed === '2026-11-19', day19?.name || 'none');
+
+      // 8 · gm-weekly: the week, then the whole list with dates and links
+      dbHandle.prepare("UPDATE guild_config SET gm_digest_at=0 WHERE guild_id='G1'").run();
+      await tickR();
+      const wk = inF(fWK).filter(t => / · Weekly digest$/.test(t.name)).sort((a, b) => Number(a.id) - Number(b.id)).pop();
+      const wkText = textIn(wk);
+      ok('gm-weekly: everything waiting on a GM, each with its date and a link', !!wk && /Weekly digest \u2014 waiting on a GM/.test(wkText) && /since <t:\d+:d> · \[jump\]/.test(wkText) && /Character sheets/.test(wkText), flat1(wkText).slice(0, 200));
+
+      // 9 · gm-monthly on the 1st, from eight
+      dbHandle.prepare("INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, stage_at, elapsed_ms, gm_id) VALUES ('G1', 991, 'Month Road', 'completed', 'quest', ?, ?, 7200000, 'U1')").run(Date.parse('2026-11-09T12:00:00Z'), Date.parse('2026-11-10T12:00:00Z'));
+      dbHandle.prepare("INSERT INTO feedback_log (guild_id, user_id, room, scale, body, quest_number, at) VALUES ('G1', 'U2', 'general', 8, 'good', 991, ?)").run(Date.parse('2026-11-12T12:00:00Z'));
+      dbHandle.prepare("INSERT OR IGNORE INTO subject_titles (guild_id, subject_id, title, source, granted_by, at) VALUES ('G1', 'U2', 'Month-hero', 'probe', 'U1', ?)").run(Date.parse('2026-11-13T12:00:00Z'));
+      dbHandle.prepare("UPDATE guild_config SET gm_monthly_month='2026-10' WHERE guild_id='G1'").run();
+      Date.now = at('2026-12-01T07:00:00Z');
+      const monthsN = inF(fMO).length;
+      await tickR();
+      ok('gm-monthly waits for eight on the 1st', inF(fMO).length === monthsN, `${inF(fMO).length} vs ${monthsN}`);
+      Date.now = at('2026-12-01T08:30:00Z');
+      await tickR();
+      const mo = inF(fMO).filter(t => / · Monthly \u2014 November 2026$/.test(t.name)).pop();
+      const moText = textIn(mo);
+      ok('on the 1st, gm-monthly tells the month gone: runs and hours by GM, reviews and their average, campaigns, quiet players, titles and merits, the fallen, activities, command use',
+        !!mo && /\*\*Runs\*\* \u2014 \d+ runs? finished/.test(moText) && /<@U1> \u2014 \d+ runs?, \d+h \d\dm/.test(moText) && /\*\*Reviews\*\* \u2014 \d+, averaging \*\*\d+\.\d\/10\*\*/.test(moText)
+          && /\*\*Campaigns\*\*/.test(moText) && /\*\*Players quiet thirty days\*\*/.test(moText) && /Month-hero/.test(moText) && /\*\*The fallen\*\*/.test(moText) && /\*\*Activities\*\*/.test(moText) && /\*\*Command use\*\*/.test(moText),
+        `${mo?.name} · ${flat1(moText).slice(0, 300)}`);
+      ok('\u2026then everything still waiting from before the month, oldest first, with its date and a link',
+        /Still waiting from before November 2026/.test(moText) && new RegExp(`<@${SHEET7}>\u2019s sheet[^·\\n]* · since <t:\\d+:d> · \\[jump\\]`).test(moText.slice(moText.indexOf('Still waiting'))) && !/<@U3>\u2019s lore/.test(moText.slice(moText.indexOf('Still waiting'))),
+        flat1(moText.slice(moText.indexOf('Still waiting'))).slice(0, 240));
+      await tickR();
+      ok('the month is told once', inF(fMO).filter(t => / · Monthly \u2014 November 2026$/.test(t.name)).length === 1, `${inF(fMO).length}`);
+      Date.now = realNowR;
+
+      // 10 · /gm queue and /gm check stalled: dates and links
+      const qR = await fire({ commandName: 'gm', options: { _sub: 'queue' }, userId: 'U1', channel: chR });
+      ok('/gm queue gives each thing waiting its date and a link \u2014 a sheet to its character page, lore to its queue post',
+        new RegExp(`<@${SHEET7}>\u2019s sheet[^·\\n]* · since <t:\\d+:d> · \\[jump\\]\\(https://discord\\.com/channels/G1/PAGE7\\)`).test(saidOf(qR)) && /<@U3>\u2019s lore · since <t:\d+:d> · \[jump\]\(https:\/\/discord\.com\/channels\/G1\/LORECH\/LOREMSG\)/.test(saidOf(qR)),
+        flat1(saidOf(qR)).slice(0, 260));
+      dbHandle.prepare("DELETE FROM characters WHERE guild_id='G1' AND user_id IN (?, ?)").run(SHEET7, RPL);
+      dbHandle.prepare("DELETE FROM char_pages WHERE guild_id='G1' AND user_id=?").run(SHEET7);
+      dbHandle.prepare("DELETE FROM lore WHERE guild_id='G1' AND msg_id='LOREMSG'").run();
+      dbHandle.prepare("UPDATE quests SET status='completed' WHERE guild_id='G1' AND number=990").run();
+    } finally {
+      Date.now = realNowR;
+      guild.members.fetch = realFetchR;
+      delete process.env.DDICE_SCROLL_FILE_MAX;
+    }
+    const threwR = loggedR.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
+    console.error = realErrR;
+    ok('nothing in the R walk threw', threwR.length === 0, threwR.slice(0, 3).join('\n        '));
   }
 
   // ── No button, modal or select id throws on a junk payload ──────────

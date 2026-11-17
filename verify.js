@@ -1414,7 +1414,11 @@ const EXPORTS = ['chunkLines', 'rulesFor', 'abilityNeeds', 'belowBar', 'resolveD
   // Build Q (2026-11-17): the 2,000 net, the words of a long post, the
   // voices, the run hour by hour, the timer's card, AC by name.
   'splitLongLine', 'chunkText', 'fitPayloads', 'fitEditText', 'isEphemeralPayload', 'POST_MAX', 'POST_CUT', 'voiceName', 'unvoiceName',
-  'italicLines', 'rpBeatText', 'questEventLine', 'EVENT_LINE_MAX', 'hourBlocks', 'defStatLabel', 'timerCard', 'RP_BOX_MAX', 'partsWithTail', 'dropButtons'];
+  'italicLines', 'rpBeatText', 'questEventLine', 'EVENT_LINE_MAX', 'hourBlocks', 'defStatLabel', 'timerCard', 'RP_BOX_MAX', 'partsWithTail', 'dropButtons',
+  // Build R (2026-11-17): the raw parser, the story by rule 1, the printed
+  // scroll and its names, the waiting list, the UK clock.
+  'rpSegments', 'formSegments', 'segsToPost', 'composeNpcSay', 'RAW_PART_NOTE', 'cleanTalk', 'storyEntries', 'storyParas', 'printScroll',
+  'scrollPlain', 'scrollFileName', 'makeTextPdf', 'waitingLine', 'waitingLines', 'ukMidnight', 'lastMonth', 'ukDayKey'];
 
 let loaded = null;
 function loadIndex(src) {
@@ -1572,11 +1576,12 @@ function testBuilders(src) {
       /const BOT_TZ = 'Europe\/London';/.test(src) &&
       /return `\[\$\{String\(d\)\.padStart\(2, '0'\)\}\/\$\{String\(m\)\.padStart\(2, '0'\)\}\/\$\{y\}\] \[WEEK \$\{isoWeek\(y, m, d\)\}\] \$\{weekday\} \$\{ordinalDay\(d\)\} of \$\{MONTH_NAMES\[m - 1\]\} \$\{y\}`;/.test(src) &&
       /async function postDatedThread\(client, forumId, kind, ms, content, extra = \{\}\)/.test(src) &&
-      // Six callers since 2026-10-14: the players' weekly chronicle joined
-      // What's new (×2), Deploy mend, the weekly digest and the helper itself.
-      (src.match(/postDatedThread\(/g) || []).length === 6);
-    ok('a deploy mend is a dated thread in gm-updates, and the forum-opening boot sweeps the old posts once',
-      /postDatedThread\(client, after\.gm_updates_forum, 'Deploy mend', Date\.now\(\),/.test(src) &&
+      // Seven since build R (2026-11-17): What's new (×2), the weekly digest,
+      // the players' chronicle, gm-daily, gm-monthly and the helper itself —
+      // the Deploy mend is a post in the day's gm-daily thread now.
+      (src.match(/postDatedThread\(/g) || []).length === 7);
+    ok('a deploy mend is a post beneath the day\'s list in gm-daily (build R), and the forum-opening boot sweeps the old posts once',
+      /if \(made\.length\) await postRestartReport\(client, gid, made\)/.test(src) && !/postDatedThread\(client, after\.gm_updates_forum, 'Deploy mend'/.test(src) &&
       /async function sweepOldUpdatePosts\(client, gid\)/.test(src) &&
       /if \(msg\.author\?\.id !== client\.user\?\.id\) continue;/.test(src) &&
       /if \(!after\.updates_seeded_at && \(after\.gm_updates_forum \|\| after\.updates_forum\)\)/.test(src));
@@ -1584,8 +1589,8 @@ function testBuilders(src) {
       /postDatedThread\(client, cfg\.gm_digest_forum, 'Weekly digest', mondayOf\(Date\.now\(\)\),/.test(src) &&
       /function mondayOf\(ms\)/.test(src) && (src.match(/await postWeeklyDigest\(client, guild\)/g) || []).length === 2 &&
       /!after\.gm_digest_seeded_at/.test(src));
-    ok('the deploy mend thread is posted after the changelog and the tidy pass, so the day\'s report tops gm-updates',
-      (() => { const i = src.indexOf("'Deploy mend', Date.now()"); const c = src.indexOf('await announceChangelog(client, guild, { gmAll: reseed })'); const t = src.indexOf('tidyDatedForum(client, fid)'); return i > 0 && c > 0 && t > 0 && c < t && t < i; })());
+    ok('the deploy mend is posted after the forums split, the changelog and the tidy pass, so it reports them all',
+      (() => { const i = src.indexOf('await postRestartReport(client, gid, made)'); const s = src.indexOf('made.push(...await splitUpdateForums(client, gid)'); const c = src.indexOf('await announceChangelog(client, guild, { gmAll: reseed })'); const t = src.indexOf('tidyDatedForum(client, fid)'); return i > 0 && s > 0 && c > 0 && t > 0 && s < c && c < t && t < i; })());
     ok('a dated thread out of date order is re-posted, deleted before it is re-created; one anyone else wrote in is left alone',
       /function tidyDatedForum\(client, forumId\)/.test(src) && /msgs\.some\(m => m\.author\?\.id !== client\.user\.id\)/.test(src) && /DATED_TITLE_RE\.exec\(t\.name/.test(src) &&
       (() => { const d = src.indexOf('const gone = await t.delete()'); const c = src.indexOf('const fresh = await forum.threads.create({ name: t.name'); return d > 0 && c > d; })());
@@ -1668,11 +1673,11 @@ function testBuilders(src) {
       /acCmd === 'target' && acSub === 'create' && focusedOption\.name === 'stat'\) return await interaction\.respond\(acLastOf\(targetStatChoicesOf\(acGid\)\)\)/.test(src));
     ok('/target: a press opens the action/speech form and the form strikes; the stat pressed rides the modal id',
       /customId === 'tgtatk' \|\| interaction\.customId\.startsWith\('tgtatk:'\)/.test(src) &&
-      /setCustomId\(`tgtrp:\$\{t\.message_id\}:\$\{pick\}`\)/.test(src) &&
-      /setCustomId\('action'\)\.setLabel\('What do you do\? \(optional\)'\)[\s\S]{0,80}?setRequired\(false\)/.test(src) &&
-      /setCustomId\('speech'\)\.setLabel\('What do you say\? \(optional\)'\)[\s\S]{0,80}?setRequired\(false\)/.test(src) &&
+      /setCustomId\(`tgtrp:\$\{t\.message_id\}:\$\{pick\}`\)\.setTitle\(`Strike at \$\{t\.name\}`\.slice\(0, 45\)\);\s*m\.addComponents\(\.\.\.rpRows\(\)\);/.test(src) &&
+      /return \[rowField\('action', 'What do you do\? \(optional\)'\), rowField\('speech', 'What do you say\? \(optional\)'\),\s*rowField\('raw', 'Raw \(optional\)', \{ placeholder: RAW_PART_NOTE \}\)\];/.test(src) &&
       /customId\.startsWith\('tgtrp:'\)\) \{\s*const \[, msgId, pick\] = interaction\.customId\.split\(':'\);\s*return strikeTarget\(interaction, msgId, pick\)/.test(src) &&
-      /action \? `\*\$\{action\}\*` : null,\s*speech \? `\\u201C\$\{speech\}\\u201D` : null,/.test(src));
+      // The card carries the parts in the order written (build R).
+      /const segsT = interaction\.fields \? rpFormSegs\(interaction\) : \[\];/.test(src) && /segsToPost\(segsT, \{ quote: 'curly' \}\) \|\| null,\s*line,/.test(src));
     ok('/target: both verdicts open the What-happens form, prefilled with the flavour set at creation; blank still sends the verdict; secret tells the players on its own line',
       /setCustomId\(`tgtnar:\$\{t\.message_id\}:\$\{fell \? 1 : 0\}`\)/.test(src) &&
       /const preset = String\(\(fell \? t\.success_text : t\.fail_text\) \|\| ''\)\.slice\(0, RP_BOX_MAX\);/.test(src) &&
@@ -2433,15 +2438,15 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /case 'release':\s*return runFightRelease\(\{ interaction, gid: gidM, cid: cidM, actorId: p\.npc \? npcFighterId\(p\.npc\) : interaction\.user\.id, flavour \}\);/.test(src) &&
       /async function runFightRelease\(\{ interaction, gid, cid, actorId, forceTargetId = null, flavour = null \}\)/.test(src));
     // ── Build A2 (2026-10-14, T's "Build all") ──────────────────────────────
-    ok('the words from a fight form, a resolve and a target strike go into the chronicle as story, not dice',
-      /noteQuestActivity\(gidM, cidM, 'rp', `\$\{who\}: \$\{rpBeatText\(flavour\)\}`/.test(src) &&
-      /if \(what\) \{ try \{ noteQuestActivity\(gidM, cidM, 'rp', what\.replace/.test(src) &&
-      /if \(action \|\| speech\) \{ try \{ noteQuestActivity\(gidT, t\.channel_id, 'rp', `\$\{nmT\}: /.test(src));
+    ok('the words from a fight form, a resolve and a target strike go into the chronicle as story, not dice \u2014 in their parts (build R)',
+      /noteQuestActivity\(gidM, cidM, 'rp', `\$\{who\}: \$\{segsBeat\(segsM\)\}`, interaction\.user\.id, \{ parts: \{ who, segs: segsForLog\(interaction\.guild, segsM\) \} \}\)/.test(src) &&
+      /if \(what\) \{ try \{ noteQuestActivity\(gidM, cidM, 'rp', what\.replace[^\n]*\{ parts: \{ segs: segsForLog\(interaction\.guild, \[\{ k: 'p', t: what \}\]\) \} \}/.test(src) &&
+      /if \(segsT\.length\) \{ try \{ noteQuestActivity\(gidT, t\.channel_id, 'rp', `\$\{nmT\}: \$\{segsBeat\(segsT\)\}`, uidT, \{ parts: \{ who: nmT, segs: segsForLog\(interaction\.guild, segsT\) \} \}\)/.test(src));
     ok('a new sheet is told where to go next: the thread, the board, /help',
       /const nextSteps = \(\(\) => \{/.test(src) && /return `\\n\\n\\u\{1F9ED\} \*\*Next:\*\* \$\{bits\.join\(' \\u00b7 '\)\}`;/.test(src) &&
       (src.match(/\$\{nextSteps\}/g) || []).length === 2 && /\? nextSteps : ''/.test(src));
-    ok('targets standing over a day are in the stalled report, with the way to retire them',
-      /Targets standing over a day/.test(src) && /\\`\/target list\\` there retires one/.test(src));
+    ok('targets standing over a day are in the stalled report, with the way to retire them, the date and a link to the card',
+      /Targets standing over a day/.test(src) && /\\`\/target list\\` there retires it`, t\.at, at\(t\.channel_id, t\.card_id \|\| t\.message_id\)\)/.test(src));
     ok('the boot and /gm check status both say whether the commands registered, from one line',
       /const registerStatus = new Map\(\);/.test(src) && /function registerStatusLine\(gid\)/.test(src) &&
       /registerStatus\.set\(guildId, \{ ok: true, count: commands\.length, at: Date\.now\(\), error: null \}\)/.test(src) &&
@@ -2499,21 +2504,20 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /return handleFight\(interaction, \{ sub: 'start', players, npcs, practice \}\);/.test(src) &&
       /forced\.practice\) \|\| \(interaction\.options\?\.getBoolean\?\.\('practice'\) \?\? false\)\) \? PRACTICE_FLOOR : 0;/.test(src) &&
       /Promise\.resolve\(\)\.then\(\(\) => msg\.pin\(\)\)/.test(src));
-    ok('the players\' weekly chronicle: quests, titles, fights won, the fallen \u2014 a dated thread in updates, nothing on a quiet week',
+    ok('the players\' weekly chronicle: quests, titles, fights won, the fallen \u2014 a dated thread in chronicle (build R), nothing on a quiet week',
       /CREATE TABLE IF NOT EXISTS week_ledger/.test(src) && /ALTER TABLE guild_config ADD COLUMN week_tale_at INTEGER/.test(src) &&
       /async function weekTaleLines\(guild, since\)/.test(src) && /async function postWeekTale\(client, guild\)/.test(src) &&
       /Quests completed\*\*/.test(src) && /Titles granted\*\*/.test(src) && /Fights won\*\*/.test(src) && /The fallen\*\*/.test(src) &&
       /if \(!body\.length\) return null;/.test(src) &&
-      /postDatedThread\(client, cfg\.updates_forum, 'Weekly chronicle', Date\.now\(\),/.test(src) &&
-      /if \(cfgT\.updates_forum && Date\.now\(\) - \(Number\(cfgT\.week_tale_at\) \|\| 0\) >= 7 \* 86400000\)/.test(src) &&
+      /postDatedThread\(client, cfg\.chronicle_forum, 'Weekly chronicle', Date\.now\(\),/.test(src) &&
+      /if \(cfgT\.chronicle_forum && Date\.now\(\) - \(Number\(cfgT\.week_tale_at\) \|\| 0\) >= 7 \* 86400000\)/.test(src) &&
       /if \(headline && String\(headline\)\.includes\('\\u\{1F3C6\}'\)\) \{/.test(src));
-    ok('the run\'s story rides on the completion card as a scroll of several sheets, woven like /gm scroll',
-      /function makeImagesPdf\(pages\)/.test(src) && /function renderScrollBook\(\{ family, title, body, quality = null \}\)/.test(src) &&
-      /function runStoryScroll\(gid, quest, \{ runnerName, partyNames, runMs, events, tale, sofar = false \}\)/.test(src) &&
-      /function hasCanvas\(\)/.test(src) && /if \(hasCanvas\(\)\) \{\s*try \{ storyFile = runStoryScroll\(gid, quest, /.test(src) &&
-      /const fitted = scrollBookFitting\(\{ family, title, body \}\);\s*const pdf = embedScrollData\(fitted\.pdf, \{ v: 1, kind: 'scroll', title, body: fitted\.body, name: stem \}\)/.test(src) &&
-      // The summaries in the standard face (T, 2026-11-17), long ones lighter
-      (src.match(/const family = 'standard';/g) || []).length === 3 && /function scrollBookFitting\(\{ family, title, body \}\) \{\s*for \(const quality of \[null, 75, 60\]\)/.test(src) &&
+    ok('the run\'s story rides on the completion card as a printed scroll of several sheets, woven like /gm scroll, in parts when it outgrows a file',
+      /function runStoryScroll\(gid, quest, \{ runnerName, partyNames, runMs, events, tale, sofar = false, filename = null, nameOf = null \}\)/.test(src) &&
+      /try \{ story = runStoryScroll\(gid, quest, \{ runnerName, partyNames, runMs, events, tale, nameOf: memberNameOf\(interaction\.guild\) \}\); \}/.test(src) &&
+      /const files = printScroll\(\{ title, paras, stem \}\);\s*files\[0\]\.pdf = embedScrollData\(files\[0\]\.pdf, \{ v: 1, kind: 'scroll', title, body: scrollPlain\(paras\)\.slice\(0, 4000\), name: stem \}\);/.test(src) &&
+      // No canvas and no caps (build R): every page printed, past Discord's file size in numbered parts.
+      !/function scrollBookFitting\(/.test(src) && !/STORY_BEATS_MAX|SCROLL_BODY_MAX/.test(src) && /name: `\$\{stem\}\$\{files\.length > 1 \? `-part-\$\{k \+ 1\}-of-\$\{files\.length\}` : ''\}\.pdf`/.test(src) &&
       (src.match(/files: storyFiles/g) || []).length === 2);
     ok('/quest run ready: a card with a tick per seated player, one press each, the GM told at the last',
       /CREATE TABLE IF NOT EXISTS quest_ready/.test(src) && /setName\('ready'\)/.test(src) &&
@@ -2579,7 +2583,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       (src.match(/if \(tieLines(?:A)?\.length\) lines0?\.push\('', \.\.\.tieLines(?:A)?\);/g) || []).length === 3);
     ok('/rp: a box or inline, posted in the player\'s name through the channel\'s webhook, kept in rp_lines, chronicled as a roleplay beat',
       /setName\('rp'\)/.test(src) && /async function handleRp\(interaction\)/.test(src) && /async function handleRpModal\(interaction\)/.test(src) &&
-      /async function postRpLine\(interaction, \{ action = '', speech = '', roll = '', dice = '', to = \[\], toInfo = null, replyTo = null \}\)/.test(src) &&
+      /async function postRpLine\(interaction, \{ action = '', speech = '', raw = '', roll = '', dice = '', to = \[\], toInfo = null, replyTo = null \}\)/.test(src) &&
       /if \(!action && !speech && !roll && !dice\) \{/.test(src) && /return interaction\.showModal\(rpModal\(\{ gid, gm \}\)\);/.test(src) &&
       /CREATE TABLE IF NOT EXISTS rp_lines/.test(src) &&
       // A webhook pings whatever it is told to (audit, 2026-10-15): only the people a GM named, never a player's.
@@ -2617,8 +2621,10 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /const ADDRESS_CAP = 50;/.test(src) && /async function resolveAddressees\(guild, gid, raw\)/.test(src) &&
       /const rest = text\.replace\(\/<@\[!&\]\?\\d\+>\|@everyone\|@here\/g, ','\);/.test(src) &&
       /async function memberNamedExactly\(guild, name\)/.test(src) && /for \(const sub of piece\.split\(\/\\s\+\(\?:and\|&\)\\s\+\/i\)\) await place\(sub, 1\);/.test(src) &&
-      /function groupMembers\(gid, name\)/.test(src) && /function orderMembers\(gid, order\)/.test(src) && /function addressableGroups\(gid\)/.test(src) &&
-      /\.addStringOption\(o=>o\.setName\('to'\)\.setDescription\('Who it is for: @people, a group or a knight order/.test(src) &&
+      /function groupMembers\(gid, name\)/.test(src) && /function orderMembers\(gid, order\)/.test(src) && /async function addresseeChoices\(guild, gid, typed\)/.test(src) &&
+      // The boxes' Groups list moved to `to:`, which completes as it is typed (build R).
+      /\.addStringOption\(o=>o\.setName\('to'\)\.setDescription\('Who it is for: @people, a group or a knight order[^\n]*\.setAutocomplete\(true\)\)/.test(src) &&
+      /if \(focusedOption\.name === 'to' && \(\(acCmd === 'npc' && acSub === 'say'\) \|\| acCmd === 'rp'\)\)/.test(src) &&
       /const everyone = \[\.\.\.new Set\(\[\.\.\.picked, \.\.\.groupPicks\.flatMap\(v => expandGroupPick\(gid, v\)\)\]\)\];/.test(src) &&
       /allowedMentions: \{ parse: \[\], users: resolved\.users\.slice\(0, ADDRESS_CAP\) \}/.test(src));
     ok('a player may fix or take back only their own /rp lines through /edit; GMs keep everything the bot said',
@@ -2671,7 +2677,8 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /\/\/ Reopened and finished again: the first post gives way to this one\./.test(src) &&
       /const archiveThreadOpening = new Map\(\);/.test(src) && /if \(!failed\) setConfig\(gid, \{ run_archive_backfilled: Date\.now\(\) \}\);/.test(src) &&
       /SELECT kind, text, at_ms, gone FROM quest_events/.test(src) && /questEvents\(gid, number\)\.filter\(e => !\(e\.kind === 'talk' && e\.gone\)\)/.test(src) &&
-      /replace\(\/\^-# \\u21AA\[\^\\n\]\*\\n\/, ''\)/.test(src));
+      // The story drops deleted talk; an answer's jump header was never words (build R: postAsNpc logs only the parts it is handed).
+      /if \(\['remind', 'recap'\]\.includes\(e\.kind\) \|\| \(e\.kind === 'talk' && e\.gone\)\) continue;/.test(src) && /if \(beat\) noteNpcSpeech\(gid, channel, npcName, beat\);/.test(src));
     ok('the rest of build I, 5e: the auto-fight shows the modifier it added, an NPC card shows the six and AC, /char set makes no bare sheet',
       (src.match(/⚡ \$\{it\.dex\} DEX = \*\*\$\{it\.total\}\*\*/g) || []).length === 2 && !/⚡ \$\{f\.stats\.dex\} DEX/.test(src) &&
       /\/\/ 5e \(cold audit\): no rerolls, no Luck, HP from the statblock\./.test(src) &&
@@ -2720,10 +2727,10 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /startsWith\('qstart:'\)\) \{/.test(src) && /return handleQuest\(interaction, \{ sub: 'start', group: 'run', number \}\);/.test(src) &&
       /if \(qs\.status === 'active'\) return interaction\.reply/.test(src) &&
       /if \(sub === 'start'\) \{\s*const quest = await requireQuest\(interaction, gid, \(forced && typeof forced === 'object'\) \? forced\.number : null\);/.test(src));
-    ok('/fight log scroll:true hands the recap over on parchment through the story scroll\'s renderer',
+    ok('/fight log scroll:true hands the recap over on parchment through the story scroll\'s printer, and filename: names it',
       /setName\('scroll'\)\.setDescription\('true = the recap as a parchment PDF, as the run\\'s story is'\)/.test(src) &&
-      /const wantScroll = !!interaction\.options\?\.getBoolean\?\.\('scroll'\);\s*if \(wantScroll\) await interaction\.deferReply\(\);/.test(src) && (src.match(/scrollBookFitting\(\{ family, title, body/g) || []).length === 4 &&
-      /const stem = fileSlug\(`fight \$\{dateLine\(arch\.ended_at\)/.test(src));
+      /const wantScroll = !!interaction\.options\?\.getBoolean\?\.\('scroll'\);\s*if \(wantScroll\) await interaction\.deferReply\(\);/.test(src) && (src.match(/printScroll\(\{ title, paras, stem \}\)/g) || []).length === 4 &&
+      /const stem = own\?\.stem \|\| fileSlug\(`fight \$\{dateLine\(arch\.ended_at\)/.test(src) && /const own = scrollFileName\(interaction\.options\?\.getString\?\.\('filename'\)\);/.test(src));
     ok('dice of the week: every player d20 dated for a fortnight, the chronicle telling the 20s, the 1s and the biggest total',
       /CREATE TABLE IF NOT EXISTS week_dice/.test(src) && /INSERT INTO week_dice \(guild_id, user_id, at, nat, total\)/.test(src) &&
       /if \(sides === 20 && single && Number\.isFinite\(nat\) && opts\.kind !== 'npcs' && !opts\.actor\) \{/.test(src) && /const story = out\.length > 0;/.test(src) &&
@@ -2738,20 +2745,23 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('the speak-as box: action, speech, a To picker of twenty-five, the Groups dropdown when there are any, the Interaction dropdown (None pre-selected unless the NPC has a talk: default) — read loosely on submit; it and the roleplay box are the label-style modals',
       /function npcSayModal\(npc, gid = null, \{ reply = null \} = \{\}\) \{\s*\n\s*const \{ ModalBuilder, TextInputBuilder, TextInputStyle, LabelBuilder, UserSelectMenuBuilder, StringSelectMenuBuilder \} = require\('discord\.js'\);/.test(src) &&
       /new UserSelectMenuBuilder\(\)\s*\n\s*\.setCustomId\('to'\)[^\n]*\.setMinValues\(0\)\.setMaxValues\(25\)\.setRequired\(false\);/.test(src) &&
-      /new StringSelectMenuBuilder\(\)\.setCustomId\('groups'\)/.test(src) && /const g = interaction\.fields\.getStringSelectValues\?\.\('groups'\);/.test(src) &&
-      /modal\.addLabelComponents\(\s*\n\s*new LabelBuilder\(\)\.setLabel\('Action \(optional\)'\)\.setTextInputComponent\(actionInput\),\s*\n\s*new LabelBuilder\(\)\.setLabel\('Speech \(optional\)'\)[^\n]*\.setTextInputComponent\(speechInput\),\s*\n\s*new LabelBuilder\(\)\.setLabel\('To \(optional\)'\)[^\n]*\.setUserSelectMenuComponent\(toPicker\),/.test(src) &&
+      // Build R: the Raw box where the Groups list was; a pick from a box opened before is still read.
+      !/new StringSelectMenuBuilder\(\)\.setCustomId\('groups'\)/.test(src) && /const g = interaction\.fields\.getStringSelectValues\?\.\('groups'\);/.test(src) &&
+      /modal\.addLabelComponents\(\s*\n\s*new LabelBuilder\(\)\.setLabel\('Action \(optional\)'\)\.setTextInputComponent\(actionInput\),\s*\n\s*new LabelBuilder\(\)\.setLabel\('Speech \(optional\)'\)[^\n]*\.setTextInputComponent\(speechInput\),\s*\n\s*rawLabel\(\),\s*\n\s*new LabelBuilder\(\)\.setLabel\('To \(optional\)'\)[^\n]*\.setUserSelectMenuComponent\(toPicker\),/.test(src) &&
       /new StringSelectMenuBuilder\(\)\.setCustomId\('offer'\)[^\n]*\n\s*\.setMinValues\(0\)\.setMaxValues\(1\)\.setRequired\(false\)\.addOptions\(options\);/.test(src) &&
       /const options = \[\{ label: 'None', value: 'none', default: !def \}\];/.test(src) &&
       /picked = \[\.\.\.\(interaction\.fields\.getSelectedUsers\?\.\('to', false\)\?\.values\?\.\(\) \|\| \[\]\)\]\.map\(u => u\.id\);/.test(src) &&
       /const v = interaction\.fields\.getStringSelectValues\?\.\('offer'\);/.test(src) &&
       // Nine since 2026-11-07: the initiative's Add NPCs box adds its two.
       // Eleven since 2026-11-15: a fight's Add NPCs box has Friendly and Their HP.
-      (src.match(/addLabelComponents\(/g) || []).length === 11);
+      // Ten since build R: the two Groups lists went; /rp's box adds Dice apart.
+      (src.match(/addLabelComponents\(/g) || []).length === 10);
     // Under every NPC line: Reply for players, GM for the speak-as box, and
     // Interaction only when the GM offered an activity on that line; the
     // line itself is action · speech · who it is for, a blank line between.
     ok('an NPC line is action, speech and the addressed players in three blocks; Reply and GM always, Interaction only when offered',
-      /function composeNpcSay\(\{ action, speech, raw, to = \[\] \}\)/.test(src) && /return parts\.join\('\\n\\n'\);/.test(src) &&
+      /function composeNpcSay\(\{ action, speech, raw, to = \[\], segs = null \}\)/.test(src) && /return parts\.join\('\\n\\n'\);/.test(src) &&
+      /const said = segsToPost\(segs \|\| formSegments\(\{ action, speech \}\), \{ gap: '\\n\\n' \}\);/.test(src) &&
       /\.filter\(id => !words\.includes\(`<@\$\{id\}>`\)\)\.map\(id => `<@\$\{id\}>`\);/.test(src) &&
       /setCustomId\(`npcreply:\$\{key\}`\)\.setLabel\('💬 Reply'\)/.test(src) && /setCustomId\(`npcx:\$\{key\}`\)\.setLabel\('🎭 GM'\)/.test(src) &&
       /if \(offer\) row\.addComponents\(new ButtonBuilder\(\)\.setCustomId\(`npctalk:\$\{key\}:\$\{activityKey\(offer\)\}`\)\.setLabel\('🎮 Interaction'\)/.test(src) &&
@@ -2889,8 +2899,8 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /function looksLikeTypedRoll\(content, gid = null\)/.test(src) &&
       /WHERE guild_id=\? AND run_thread_id=\? AND status='active' AND COALESCE\(record_all,0\)=1 AND COALESCE\(paused,0\)=0/.test(src));
     // The cold audit of build H (2026-11-06): what it found, pinned.
-    ok('recorded talk is its own kind: in the scroll, counted in the GM record, out of the hourly recap; nothing re-shown pings',
-      /logQuestEvent\(gid, r\.number, 'talk', line, message\.author\.id, \{ msgId: String\(message\.id\) \}\);/.test(src) &&
+    ok('recorded talk is its own kind: in the scroll, every word and in its parts (build R), counted in the GM record, out of the hourly recap; nothing re-shown pings',
+      /logQuestEvent\(gid, r\.number, 'talk', line, message\.author\.id, \{ msgId: String\(message\.id\), parts, whole: 1 \}\);/.test(src) &&
       /\.filter\(e => !\['remind', 'recap', 'talk'\]\.includes\(e\.kind\)\);/.test(src) &&
       /if \(ch\) await sendLong\(ch, lines, \{ allowedMentions: \{ parse: \[\] \} \}\);/.test(src) &&
       /const logged = events\.filter\(e => e\.kind !== 'talk'\);/.test(src) &&
@@ -2903,7 +2913,8 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /advantage on several dice now rolls the set twice \(2026-11-07\)\.\s*\n\s*mode = applyNextMark\(gid, uid, mode\);/.test(src) &&
       !/if \(stat\) mode = applyNextMark\(gid, uid, mode\);/.test(src));
     ok('a player\'s line cannot counterfeit or lose the bot\'s parts, and a rolled line stays up; /rp answers before the work',
-      /const BOT_LINE_RE = /.test(src) && (src.match(/BOT_LINE_RE\.test\(/g) || []).length === 4 &&
+      // Build R: every line of the parts, the Raw box's among them, is held to it.
+      /const BOT_LINE_RE = /.test(src) && (src.match(/BOT_LINE_RE\.test\(/g) || []).length === 3 && /if \(segsLines\(segs\)\.some\(l => BOT_LINE_RE\.test\(l\)\)\)/.test(src) &&
       /if \(text\.length > 2000\)\s*\n\s*return interaction\.reply\(\{ ephemeral: true, content: `\\u274C Too long by/.test(src) &&
       /if \(live\.some\(m => rpPartsOf\(m\.content\)\.foot\) && !\(await isGm\(interaction\.guild, interaction\.user\.id\)\)\)/.test(src) &&
       /await interaction\.deferReply\(\{ ephemeral: true \}\);\s*\n\s*const answer = \(content\) => interaction\.editReply/.test(src));
@@ -2936,8 +2947,8 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /const hereCid = interactionChannelId\(interaction\);/.test(src) &&
       // A name that does not resolve is rescued only in the run's own thread (cold audit, 2026-11-06).
       /if \(\(!askedName \|\| \(L\.err && hereRun\?\.run_thread_id === hereCid\)\) && hereRun\)/.test(src));
-    ok('a recap carries what was said, and collapses repeats',
-      /const beat = words \? `\$\{npcName\}: /.test(src) &&
+    ok('a recap carries what was said, in its parts, and collapses repeats',
+      /noteQuestActivity\(gid, channel\?\.id, 'rp', `\$\{npcName\}: \$\{segsBeat\(list\)\}`, null, \{ parts: \{ who: npcName, segs: list \} \}\)/.test(src) &&
       /if \(last && last\.text === b\) \{ last\.n\+\+; continue; \}/.test(src));
     // Players can join a running fight, mirroring addnpc; placement is
     // next-or-last because initiative is not stored once the order stands.
@@ -3884,6 +3895,85 @@ function testBuildO(mod, src) {
 // roleplay box at 4,000 with long posts carried on into parts, the
 // wind-down post, the review kept to the party, an instance's clock, the
 // turn clock on the second, the 5e moves, and the fixes beside them.
+// Build R (2026-11-17): every word, in its parts — the Raw box read in the
+// order written; the story printed by rule 1 with its faces inside, named,
+// in numbered parts past the file limit; the waiting list with dates and
+// links; the forums split.
+function testBuildR(mod, src) {
+  return harness('build R', (ok, eq) => {
+    const { rpSegments, formSegments, segsToPost, composeNpcSay, RAW_PART_NOTE, cleanTalk, storyEntries, storyParas, printScroll,
+      scrollPlain, scrollFileName, makeTextPdf, waitingLine, waitingLines, ukMidnight, lastMonth, ukDayKey } = mod;
+    // ── the parser ──
+    eq('a raw line read into its parts, in order', rpSegments('*draws sword* "Halt!" Behind him, the gate creaks. *steps forward*'),
+      [{ k: 'a', t: 'draws sword' }, { k: 's', t: 'Halt!' }, { k: 'p', t: 'Behind him, the gate creaks.' }, { k: 'a', t: 'steps forward' }]);
+    eq('curly and low quotes are speech too; the words between stay plain', rpSegments('“One” and „two“'), [{ k: 's', t: 'One' }, { k: 'p', t: 'and' }, { k: 's', t: 'two' }]);
+    eq('bold is words, not an action; an inch mark is not speech', rpSegments('**Warning:** he is 6\'2" tall'), [{ k: 'p', t: '**Warning:** he is 6\'2" tall' }]);
+    eq('a mark left open at a word\'s start runs to the end of its line', rpSegments('*nods slowly\n"Fine then\nand that was that'), [{ k: 'a', t: 'nods slowly' }, { k: 's', t: 'Fine then' }, { k: 'p', t: 'and that was that' }]);
+    eq('an action across lines stays one; underscores italicise only at a word\'s edge', rpSegments('*nods\nand walks* _waves_ my_var_name'), [{ k: 'a', t: 'nods\nand walks' }, { k: 'a', t: 'waves' }, { k: 'p', t: 'my_var_name' }]);
+    eq('a form: Action, Speech, then Raw — the marks the boxes give are not doubled', formSegments({ action: '*draws*', speech: '"Hi"', raw: '*smiles* "Ok"' }),
+      [{ k: 'a', t: 'draws' }, { k: 's', t: 'Hi' }, { k: 'a', t: 'smiles' }, { k: 's', t: 'Ok' }]);
+    eq('each part on its own line: close on a card, a blank between on a line said aloud',
+      [segsToPost(formSegments({ action: 'a', speech: 's', raw: 'p' }), { quote: 'curly' }), composeNpcSay({ segs: formSegments({ action: 'a', speech: 's', raw: 'p' }) })],
+      ['*a*\n“s”\np', '*a*\n\n"s"\n\np']);
+    ok('the Raw note fits a placeholder and a label\'s line, and says how', RAW_PART_NOTE.length <= 100 && /\*action\*/.test(RAW_PART_NOTE) && /"speech"/.test(RAW_PART_NOTE) && /order you write them/.test(RAW_PART_NOTE));
+    eq('talk is kept whole, and its lines for its parts', [cleanTalk(null, 'x '.repeat(400)).length, cleanTalk(null, 'one  \n  two', { keepLines: true })], [799, 'one\ntwo']);
+    // ── the story, rule 1 ──
+    const P = (who, segs) => JSON.stringify({ who, segs });
+    const ev = [
+      { at_ms: 0, kind: 'start', text: 'Run launched' },
+      { at_ms: 60000, kind: 'rp', actor: '1', text: 'x', parts: P('Ann', [{ k: 'a', t: 'waves' }, { k: 's', t: 'Hi' }]) },
+      { at_ms: 61000, kind: 'talk', actor: '1', text: 'x', parts: P('Ann', [{ k: 'p', t: 'brb' }]) },
+      { at_ms: 62000, kind: 'roll', text: 'Ann: Wisdom 14' },
+      { at_ms: 63000, kind: 'rp', actor: '2', text: 'Bob: sets his shield · “Hold.”' },
+      { at_ms: 64000, kind: 'rp', actor: null, text: 'Garrick: “*folds his arms* "Shut it." <@9>”' },
+      { at_ms: 64500, kind: 'rp', actor: null, text: 'Hollow: “⚔️ **Hollow** strikes — \u{1F3B2} 1d20 → 15 vs DEF 12”' },
+      { at_ms: 65000, kind: 'talk', text: 'Cid: gone', gone: 1 },
+      { at_ms: 66000, kind: 'recap', text: 'Hourly recap' },
+    ];
+    const paras = storyParas(storyEntries(ev));
+    eq('rule 1: "time - Name" over the words, one heading for a run of the same speaker, a blank line at each change; rolls lines of their own; old lines taken apart again; a card once logged as speech a line; deleted talk and recaps out',
+      scrollPlain(paras), '0h 00m - Run launched\n\n0h 01m - Ann\nwaves\n“Hi”\nbrb\n\n0h 01m - Ann: Wisdom 14\n\n0h 01m - Bob\nsets his shield\n“Hold.”\n\n0h 01m - Garrick\nfolds his arms\n“Shut it.”\n\n0h 01m - Hollow: Hollow strikes — 1d20 → 15 vs DEF 12');
+    const head = paras.find(p => p && p.head);
+    ok('the name in bold, an action in italics, speech in its quotes',
+      head?.runs?.[1]?.s === 'b' && head?.runs?.[1]?.t === 'Ann' && paras.some(p => Array.isArray(p) && p[0]?.s === 'i' && p[0]?.t === 'waves') && paras.some(p => Array.isArray(p) && p[0]?.t === '“Hi”' && p[0]?.s === 'r'));
+    // ── printed ──
+    const files = printScroll({ title: 'The Night Watch', paras, stem: 'night' });
+    const pdf = files[0].pdf.toString('latin1');
+    ok('printed with its three faces inside, on the parchment\'s measure, the stain and the rules drawn',
+      files.length === 1 && files[0].name === 'night.pdf' && /^%PDF-1\.4/.test(pdf) && ['DDRAAA+DejaVuSans', 'DDBAAA+DejaVuSans-Bold', 'DDIAAA+DejaVuSans-Oblique'].every(f => pdf.includes(`/BaseFont/${f}`))
+        && /\/MediaBox\[0 0 1000 \d+\]/.test(pdf) && /\/ShadingType 3/.test(pdf) && (pdf.match(/\/ToUnicode/g) || []).length === 3 && /%%EOF\n$/.test(pdf));
+    const realMax = process.env.DDICE_SCROLL_FILE_MAX;
+    process.env.DDICE_SCROLL_FILE_MAX = '112000';
+    const parts = printScroll({ title: 'Long', paras: Array.from({ length: 400 }, (_, k) => [{ t: `Line ${k} `.repeat(12), s: 'r' }]), stem: 'long' });
+    if (realMax === undefined) delete process.env.DDICE_SCROLL_FILE_MAX; else process.env.DDICE_SCROLL_FILE_MAX = realMax;
+    ok('nothing is cut: past the file limit a scroll goes in numbered parts, each within it',
+      parts.length >= 2 && parts.every((f, k) => f.name === `long-part-${k + 1}-of-${parts.length}.pdf` && f.pdf.length <= 112000 && f.of === parts.length && f.part === k + 1));
+    eq('filename: the file is called it and its first page headed with it as typed', [scrollFileName('The Night Watch'), scrollFileName('  a/b: c?.pdf '), scrollFileName('')],
+      [{ heading: 'The Night Watch', stem: 'The-Night-Watch' }, { heading: 'a/b: c?', stem: 'ab-c' }, null]);
+    const txt = makeTextPdf({ title: 'Long', body: Array.from({ length: 300 }, (_, k) => `line ${k}`).join('\n') }).toString('latin1');
+    ok('the plain print runs onto further pages rather than off the first', /\/Count [2-9]/.test(txt) && /\(line 299\)/.test(txt));
+    // ── the waiting list ──
+    const it = { kind: 'sheets', label: '<@1>’s sheet', since: Date.UTC(2026, 9, 20, 12), url: 'https://discord.com/channels/G/T' };
+    eq('a thing waiting: what it is, since when, where it is settled', waitingLine(it), '• <@1>’s sheet · since <t:1792497600:d> · [jump](https://discord.com/channels/G/T)');
+    ok('the list goes by kind, each under its heading', /^\u{1F4CB} \*\*Character sheets\*\* — 1\n• /u.test(waitingLines([it]).join('\n')));
+    // ── the UK clock ──
+    eq('midnight in the UK, summer and winter', [ukMidnight(2026, 7, 1), ukMidnight(2026, 12, 1)], [Date.UTC(2026, 5, 30, 23), Date.UTC(2026, 11, 1)]);
+    const lm = lastMonth(Date.UTC(2026, 11, 1, 9));
+    eq('the month gone, from the 1st', [lm.key, lm.label, lm.start, lm.end], ['2026-11', 'November 2026', Date.UTC(2026, 10, 1), Date.UTC(2026, 11, 1)]);
+    eq('the day as the UK has it', [ukDayKey(Date.UTC(2026, 6, 1, 23, 30)), ukDayKey(Date.UTC(2026, 11, 1, 23, 30))], ['2026-07-02', '2026-12-01']);
+    // ── wired ──
+    ok('every form with an action and a speech box has Raw after them: /rp, the fight forms, the target\'s strike, a lost first turn, both NPC boxes',
+      (src.match(/rawLabel\(\)/g) || []).length === 4 && (src.match(/\.\.\.rpRows\(\)/g) || []).length === 3 && /rowField\('raw', 'Raw \(optional\)', \{ placeholder: RAW_PART_NOTE \}\)/.test(src)
+        && /if \(!gm\) m\.addLabelComponents\(new LabelBuilder\(\)\.setLabel\('Dice \(optional\)'\)/.test(src));
+    ok('a fight card in an NPC\'s name is not logged as its speech: only a line handed its parts is',
+      /if \(beat\) noteNpcSpeech\(gid, channel, npcName, beat\);/.test(src) && (src.match(/postAsNpc\([^)]*beat/g) || []).length === 3);
+    ok('the forums split: gm-daily, gm-weekly (gm-digest renamed in place), gm-monthly and chronicle; the move runs once and leaves what others wrote in',
+      ["name: 'gm-daily'", "name: 'gm-weekly'", "name: 'gm-monthly'", "name: 'chronicle'"].every(n => src.includes(n)) && /if \(Number\(cfg\.forums_split_at\) > 0\) return \[\];/.test(src)
+        && /weekly\.edit\(\{ name: 'gm-weekly', topic: about\.slice\(0, 1000\) \}\)/.test(src) && /const msgs = await botOnlyMessages\(client, x\.t\);\s*if \(!msgs\) \{ kept\+\+; continue; \}/.test(src));
+    ok('every story is mended first: talk cut before build R is read again from its thread, once', (src.match(/await mendCutTalk\(/g) || []).length === 3);
+  });
+}
+
 function testBuildQ(mod, src) {
   return harness('build Q', (ok, eq) => {
     const { splitLongLine, chunkText, fitPayloads, fitEditText, isEphemeralPayload, POST_MAX, POST_CUT, voiceName, unvoiceName,
@@ -3952,7 +4042,7 @@ function testBuildQ(mod, src) {
     ok('a run with nothing logged still has its hour', hourBlocks([], 20 * 60000).join('\n').includes('**Hour 1** — _quiet, nothing logged._'));
     ok('the wind-down posts in the run’s room for everyone — the hours, the story so far, Review — after the GM is answered, and never on a resume',
       /async function postWindDown\(guild, gid, quest, ch, gmId = null\)/.test(src) && /setCustomId\(`fbq:\$\{live\.number\}`\)/.test(src)
-        && (src.match(/await postWindDown\(/g) || []).length >= 1 && /const \{ file \} = await runSoFarFile\(|\(\{ file \} = await runSoFarFile\(/.test(src));
+        && (src.match(/await postWindDown\(/g) || []).length >= 1 && /\(\{ files \} = await runSoFarFile\(guild, gid, live, gmId\)\)/.test(src));
     ok('📝 Review is the party’s: one seated on the run, or since departed — once each; the press and the form both ask',
       /function reviewRefusal\(gid, uid, runNum\)/.test(src) && (src.match(/reviewRefusal\(interaction\.guild\.id, interaction\.user\.id, /g) || []).length === 2);
     // ── the clocks ──
@@ -3997,7 +4087,9 @@ function testBuildQ(mod, src) {
         && defStatLabel('ac') === 'AC' && defStatLabel('dex') === 'DEX' && /\(\*\*\$\{defStatLabel\(fight\.def_stat\)\}\*\*\)/.test(src));
     // ── the summaries' face ──
     ok('the run’s story, the GM’s record and the fight log’s scroll are set in the standard face; the scroll font is for props and the sheet',
-      (src.match(/const family = 'standard';/g) || []).length === 3 && /function renderScrollBook\(\{ family, title, body, quality = null \}\)/.test(src));
+      // Printed since build R, in their own embedded faces: no canvas, no registered font to leak in.
+      !/const family = 'standard';/.test(src) && /const SCROLL_FONT_Z = \{/.test(src) && /function ttfFace\(b64, name\)/.test(src)
+        && /function renderScrollBook\(\{ family, title, body, quality = null \}\)/.test(src));
   });
 }
 
@@ -4226,7 +4318,7 @@ function main() {
     }
     if (missing.length) console.log(`${C.yel}!${C.off} load                   ${C.dim}not exported: ${missing.join(', ')}${C.off}`);
 
-    for (const r of [testBuilders(src), testRules(mod), testPins(src), testBuildI(mod), testBuildJ(mod), testBuildK(mod), testBuildL(mod), testBuildN(src), testBuildO(mod, src), testBuildQ(mod, src)]) {
+    for (const r of [testBuilders(src), testRules(mod), testPins(src), testBuildI(mod), testBuildJ(mod), testBuildK(mod), testBuildL(mod), testBuildN(src), testBuildO(mod, src), testBuildQ(mod, src), testBuildR(mod, src)]) {
       assertions += r.pass;
       if (r.fails.length) {
         failedSteps.push(r.name);

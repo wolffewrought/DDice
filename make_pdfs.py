@@ -63,7 +63,7 @@ PARTS['start'] = [
           ('/help category:rules', 'the live table rules as the bot enforces them \u2014 the same\nwords the books use, readable by everyone')]),
 ('note', 'Anywhere a command asks for something that already exists — an NPC, a quest, a weapon, a tag, an activity and its scenes, a category, a recovery schedule, an item someone is carrying, a title, a group, a spell, a saved sheet, a rest amount — a <b>dropdown appears as you type</b>, and you can still type past it freely. Where a new name is the point (create, add, save) what you typed leads the list.'),
 ('h2', 'Where the News Lands'),
-('p', 'A forum called <b>updates</b> carries one dated thread for every change the bot has had — titled by the day it landed, newest at the top — and every entry the bot has ever announced is there from the first. When something in this book looks different from what the bot does, the updates forum says what changed and when.'),
+('p', 'A forum called <b>updates</b> carries one dated thread for every change the bot has had — titled by the day it landed, newest at the top — and every entry the bot has ever announced is there from the first. When something in this book looks different from what the bot does, the updates forum says what changed and when. Once a week the <b>chronicle</b> forum tells the table’s week: quests completed, titles granted, fights won, the fallen and the dice.'),
 ]
 
 PARTS['roll'] = [
@@ -395,7 +395,7 @@ PARTS['fight'] = [
           ('/fight act action:Disarm npc:Hollow target:@Players', 'NPCs use every move a player can, by the same rules \u2014\nnpc: on any /fight act, or the NPC buttons on its card, ' + GM, 'gm'),
           ('reveal:Show / Hide', 'on /fight start, addnpc and side \u2014 an NPC\u2019s HP\nshown to the players or not, over the server setting, ' + GM, 'gm'),
           ('/fight status', 'show turn order and HP', 'player'),
-          ('/fight log [scroll:true]', 'repost the recap of the last finished fight in\nthis channel \u2014 only the fighters who actually\ntook part, and only that fight: a new fight always\nstarts a fresh recap. scroll:true hands it over as a\nparchment PDF in standard type, as a run\u2019s story is'),
+          ('/fight log [scroll:true] [filename:]', 'repost the recap of the last finished fight in\nthis channel — only the fighters who actually\ntook part, and only that fight: a new fight always\nstarts a fresh recap. scroll:true hands it over as a\nparchment PDF, printed as a run’s story is;\nfilename: names the file and heads its first page'),
           ('/fight skip', 'skip the current turn — fighter stays in, ' + GM, 'gm'),
           ('/fight hp value:3 target_npc:Hollow tank', 'set HP mid-fight, sheet synced, ' + GM, 'gm'),
           ('/fight kick target_npc:Hollow tank', 'remove a fighter, fight continues, ' + GM, 'gm'),
@@ -581,7 +581,7 @@ PARTS['gmfight'] = [
           ('/gm effect name:Rockfall wounds:1 pick:2 each:true uses:3', 'no holder: a hazard of yours; the holder picks 2;\na roll for each; three uses; uses_turn:false to keep\nthe turn')]),
 ('p', 'Each target defends: players press <b>Defend</b>, NPCs brace by themselves, and a GM may <b>Land it</b> early, the rest rolled for. A hit deals the wounds; a 20 doubles them and a defending 1 doubles them again; twenty against twenty goes to the thrower. It works outside a fight too.'),
 ('h2', 'Sides, the Cast, Resolve'),
-('p', '<b>/session npcs</b> keeps a run\u2019s cast \u2014 add, friendly, remove, reveal, list \u2014 and the cast joins the run\u2019s fights and initiative unless <b>cast:false</b>. NPCs are enemies unless friendly; a fight with NPCs ends when one side is all down. In such a fight <b>Resolve</b> is yours: a player\u2019s press is refused, and your press keeps every open roll. <b>/session summary</b> gives the run so far as a PDF without closing it.'),
+('p', '<b>/session npcs</b> keeps a run\u2019s cast \u2014 add, friendly, remove, reveal, list \u2014 and the cast joins the run\u2019s fights and initiative unless <b>cast:false</b>. NPCs are enemies unless friendly; a fight with NPCs ends when one side is all down. In such a fight <b>Resolve</b> is yours: a player\u2019s press is refused, and your press keeps every open roll. <b>/session summary</b> gives the run so far as a PDF without closing it — every beat and every word said, from the first to the last, in numbered parts if it outgrows one file; <b>filename:</b> names the file and heads its first page.'),
 ('h2', 'Advantage Waits on You'),
 ('p', 'When a player picks advantage or disadvantage themselves \u2014 any roll, in a fight or out of one, slash or '
       'typed \u2014 a card goes up in the channel naming them and the command, pinging the GM roles. <b>Allow</b> '
@@ -619,12 +619,13 @@ PARTS['quest'] = [
 ('code', [('/campaign list', 'every campaign on the server'),
           ('/campaign show campaign:The Falconer’s War', 'the premise, what is done, and your part')]),
 ('h2', 'Roleplay on the Record (/rp)'),
-('p', 'Outside a fight the same boxes the fight buttons open are a command away: <b>/rp</b> opens them \u2014 what you do, what you say (4,000 characters a box), a <b>stat to roll</b> from a dropdown of this server\u2019s own, and any <b>dice</b> \u2014 and <b>/rp action:\u2026 speech:\u2026 roll:\u2026 dice:\u2026</b> skips the box. The line goes out in your own name and face, shaped as the cards are: <i>the action</i>, then \u201cthe speech\u201d, then the roll beneath; a line longer than one Discord message carries on in the next, the roll beneath the last. A roll keeps the rules a typed one does \u2014 the Hero\u2019s advantage, a mark you carry, a deception that fooled you \u2014 and <b>rr</b> rerolls it as it would a typed one. If the Game Master has called a check on you here, a <b>stat roll answers it</b>: the check\u2019s own terms, its button darkened, its outcome under your words. Inside a run the words become a beat on the timeline and the roll a roll in its log, in the recap and in the story scroll that comes with the completion card.'),
+('p', 'Outside a fight the same boxes the fight buttons open are a command away: <b>/rp</b> opens them — what you do, what you say (4,000 characters a box), a <b>Raw</b> box for longer writing (<i>*action*</i> in asterisks, <b>"speech"</b> in quotes, each part posted on its own line in the order you write it), a <b>stat to roll</b> from a dropdown of this server’s own, and any <b>dice</b> — and <b>/rp action:\u2026 speech:\u2026 roll:\u2026 dice:\u2026</b> skips the box. The line goes out in your own name and face, shaped as the cards are: <i>the action</i>, then \u201cthe speech\u201d, then the roll beneath; a line longer than one Discord message carries on in the next, the roll beneath the last. A roll keeps the rules a typed one does \u2014 the Hero\u2019s advantage, a mark you carry, a deception that fooled you \u2014 and <b>rr</b> rerolls it as it would a typed one. If the Game Master has called a check on you here, a <b>stat roll answers it</b>: the check\u2019s own terms, its button darkened, its outcome under your words. Inside a run the words become a beat on the timeline and the roll a roll in its log, in the recap and in the story that comes with the completion card — every word of it, under your name. Every roleplay box has Raw: the fight buttons’ forms, a target’s strike and a lost first turn too.'),
 ('p', 'Every line carries a <b>Reply</b> button, and so does every line an NPC says \u2014 press it and the same box opens as a reply. A reply wears a small line on top, <i>\u21AA replying to Name</i>, and that name is a link: tap it and you are taken to the line it answers. Several people can answer the same line; the button never moves. Beside it on your own lines sits <b>GM</b> \u2014 the Game Master\u2019s: they can answer your line as any NPC, and their answer links back to it the same way.'),
 ('code', [('/rp', 'opens the box'),
           ('/rp action:draws her blade speech:Not one step closer.', 'posts at once'),
           ('/rp speech:Stand aside. roll:str', 'with a stat roll \u2014 it answers a check called on you here'),
           ('/rp action:swings dice:1d8+2', 'with any dice'),
+          ('Raw: *steps forward* "Now." The gate creaks.', 'in the box: posted as three lines — the action,\nthe speech, the rest — in the order written'),
           ('/edit', 'fix the words of a line of yours \u2014 the roll and the reply link stay as they were;\na line in several parts opens whole'),
           ('/edit delete:true', 'take one back \u2014 every part of it')]),
 ('note', 'A Game Master may put a clock on a scene with <b>/timer</b>: a card counts down in the channel, and when it runs out it rings, pinging whoever it names.'),
@@ -639,7 +640,7 @@ PARTS['quest'] = [
 ('code', [('/session turn', 'the order, whose turn it is, which round'),
           ('/session turn action:next', 'Done, typed \u2014 for your own turn')]),
 ('h2', 'The Chronicle and the Review'),
-('p', 'When a run is completed, the Game Master’s telling of it lands in your own thread in <b>quest-chronicle</b> — one thread per adventurer, every quest they finished, told by whoever ran it — and the summary is linked on your standing page. The run’s thread then carries a review button: a score out of ten and a line or two, for the Game Masters alone to read \u2014 one each, and only from those who played the run. When a run winds down, its room is shown the run hour by hour, the story so far as a PDF, and the same button. <b>/quest record</b> lists what you have been on.'),
+('p', 'When a run is completed, the Game Master’s telling of it lands in your own thread in <b>quest-chronicle</b> — one thread per adventurer, every quest they finished, told by whoever ran it — and the summary is linked on your standing page. The run’s thread then carries a review button: a score out of ten and a line or two, for the Game Masters alone to read \u2014 one each, and only from those who played the run. When a run winds down, its room is shown the run hour by hour, the story so far as a PDF, and the same button. The story holds every beat and every word said, in order: each speaker’s lines under their name, actions in italics, speech in quotes. <b>/quest record</b> lists what you have been on.'),
 ]
 
 PARTS['gmquest'] = [
@@ -671,6 +672,7 @@ PARTS['gmquest'] = [
           ('/session add name:X [run:] user:@Players', 'seat a player on a run \u2014 name autocompletes, running\nones first; run blank = the latest active one. On an\ninstance it is your word: a sheet and a pulse required'),
           ('(naming a run)', 'paste the thread\u2019s own name if you like \u2014 the number\nprefix and \u201cRun 001 \u2026\u201d suffix are ignored. In a run\u2019s own\nthread you may leave name: blank entirely \u2014 it means\nthat very run'),
           ('/session kick/rally/note/pause/resume/show/thread', 'the in-play leaves, for ANY run that is going \u2014 a board\nrun, an encounter, a chapter, an older quest. Most\nforward into /quest and behave as there; thread opens\nthe room itself, for a run that has none. Only show is\nopen to everyone \u2014 the rest are a GM\u2019s'),
+          ('/session summary [share:true] [filename:]', 'the run so far as a PDF, without closing it \u2014\nevery beat and every word said, first to last, in\nnumbered parts if it outgrows one file; filename:\nnames the file and heads its first page; private\nunless shared'),
           ('/session complete [summary:] [title:]', 'pay out and write the chronicle. Leave summary:\nblank and a summary drafted from the log is offered:\nuse it, edit it, or end without one'),
           ('(run names)', 'every launch is christened \u201c<Quest> Run 001 <GM>\u201d \u2014\nthe thread and the ledger wear the same name'),
           ('/quest thread number:1 \u00b7 /quest thread all:true', 'open a quest thread for one that hasn\u2019t got one.\nUse it for quests that started before the\ninstance forum was set \u2014 all:true catches every\nrunning quest at once. Anything that already has\na room is left alone'),
@@ -786,7 +788,7 @@ PARTS['gmquest'] = [
           ('/instance start name:The Siege as:chapter campaign:\u2026', 'Part 4 of the campaign, numbered for you; its card\nand the campaign card both say so (GM)'),
           ('/instance start name:\u2026 as:legacy started:12/09 played:6h merits:3', 'a quest from before the bot, on the books at last,\nits six hours already played on its clock (GM)'),
           ('/instance start quest:7 record:true', 'adopt a board quest that is already running: it gets\nits room if it has none, and the recording switch (GM)'),
-          ('record:true', 'on start or adopt: every message typed in the run\u2019s own\nthread goes into its log as table talk. An edit corrects its\nline and keeps the first wording; a deletion marks it. At\nthe end the corrected transcript rides with the story for\neveryone, the raw one \u2014 as first typed \u2014 goes to the GMs.\nCounted in the GM record, left out of the hourly recap.\nTyped rolls stay in the roll log. A run with no thread of\nits own is not recorded. Off unless you say so'),
+          ('record:true', 'on start or adopt: every message typed in the run’s own\nthread goes into its log as table talk, every word. An edit\ncorrects its line and keeps the first wording; a deletion\ntakes it out. At the end it is in the story for everyone,\nunder each speaker’s name; the raw transcript — as first\ntyped, edits and deletions shown — goes to the GMs.\nCounted in the GM record, left out of the hourly recap.\nTyped rolls stay in the roll log. A run with no thread of\nits own is not recorded. Off unless you say so'),
           ('/session add \u00b7 /session kick', 'the seats are yours: in its thread, or by name: (GM)'),
           ('/session complete [summary:] [title:]', 'pays out, writes the chronicle, posts the review button\n\u2014 the ordinary completion; blank summary: offers one\ndrafted from the log (GM)'),
           ('/instance list', 'every run going now, its kind, where, and its time so far'),
@@ -801,9 +803,10 @@ PARTS['gmquest'] = [
           ('/campaign recap campaign:…', 'a previously-on across every linked run'),
           ('/campaign complete campaign:…', 'close the arc'),
           ('/campaign show campaign:\u2026', 'players see the premise, what is done and their own part;\nGMs see everything')]),
-('h2', 'Stalled Work and the Weekly Digest'),
-('code', [('/gm check stalled', 'what is waiting on a GM: winding-down runs, quiet encounters, staged parties never launched, idle campaigns, reviews this week, targets standing over a day (GM)')]),
-('p', 'Once a week the same report is posted on its own, as a thread in the <b>gm-digest</b> forum titled by the Monday of the week it covers — so nothing depends on somebody remembering to ask. A quiet week posts too, saying so; the first boot with the forum posts the week’s digest at once.'),
+('h2', 'What Waits on a GM, and the GM Forums'),
+('code', [('/gm check stalled', 'what has stalled: winding-down runs, quiet encounters,\nstaged parties never launched, idle campaigns, targets\nstanding over a day, drafts, the week’s reviews — each\nwith the date it has stood since and a link to it (GM)'),
+          ('/gm queue', 'what waits on a decision — sheets, lore, duels,\ntrades, applicants — the same way (GM)')]),
+('p', 'Three GM forums carry the whole list, so nothing depends on somebody remembering to ask. <b>gm-daily</b>: a thread a day — at 08:00 (UK) its head is everything waiting on a GM, each with its date and a link, and nobody is pinged; every restart that day reports beneath it (the Deploy mend). <b>gm-weekly</b> (gm-digest until it was renamed): a thread a week, titled by its Monday — the week’s activities, then the whole list; it pings the GMs, and a quiet week says so. <b>gm-monthly</b>: on the 1st, the month gone — runs and hours by GM, reviews and their average, campaigns, players quiet thirty days, titles and merits, the fallen, activities and command use — then everything still waiting from before the month, oldest first; it pings the GMs.'),
 ('h2', 'Feedback Rooms'),
 ('code', [('/button feedback', 'plant a feedback button in this channel (GM)'),
           ('/feedback category add|remove|list', 'the rooms feedback lands in \u2014 seven to begin with;\nadd your own and its thread opens at once (GM)'),
@@ -983,8 +986,8 @@ PARTS['gmactivities'] = [
 ('p', 'Every run is logged \u2014 starts, rolls and their bands, choices, endings, quits \u2014 and kept ninety days. '
       'The shelf card and <b>/activity show</b> read it back: runs and finishes, where players stopped, which rolls '
       'fail more than six times in ten (the DC may be high). <b>/activity scores</b> ranks the best tally or quiz '
-      'score per player. The weekly chronicle ends with the week\u2019s activities and its best score; the GM digest '
-      'lists every draft still waiting on a GM.'),
+      'score per player. The weekly chronicle ends with the week’s activities and its best score; gm-daily, '
+      'gm-weekly and gm-monthly list every draft still waiting on a GM, with a link to its shelf thread.'),
 ('code', [('[ACTIVITY] Fishing', ''),
           ('TALLY renown', 'a running total, paid out at the end'),
           ('', ''),
@@ -1385,7 +1388,7 @@ PARTS['setup'] = [
 ('code', [('/gm check build', 'the one-command setup: makes every channel and forum the bot needs in the two categories, points the config at each, then fills them with the audit shelves, pipeline books and tags. Needs Manage Channels, for you and for the bot (GM)'),
           ('(pickers)', 'the check report offers channel pickers for unset\nconfigs \u2014 up to five at a time; a pick runs the\nreal config branch, tags and books included\n(Manage Server required)'),
           ('/gm check run', 'build anything missing — audit shelves, pipeline books, pipeline tags — and sweep every channel’s permissions, repairing what it can; never moves or renames anything, and names what only you can grant. Surviving threads are adopted by id, never remade, so run it as often as you like, and after any update that adds a book. Trims the ledgers that only grow \u2014 /rp ownership past ninety days, the week\u2019s dice past fourteen \u2014 as every boot does (GM)'),
-          ('/gm check status', 'which channels are set, which await; the last line\nsays whether the slash commands registered on this\nboot, and the Deploy mend says the same'),
+          ('/gm check status', 'which channels are set, which await; the last line\nsays whether the slash commands registered on this\nboot, and the day’s Deploy mend in gm-daily says\nthe same'),
           ('/gm bar', 'pin a GM toolbar in this channel: Plant target, Call\ncheck, Start fight, Status, Undo \u2014 each opens the box\nits command would (a target by name, DC and stats,\nscene, hits, who may swing; the check window; players\nand NPCs for a fight). Status is the channel at a\nglance: the fight and everyone\u2019s HP, the targets\nstanding, what waits on a GM. Undo is /gm undo'),
           ('/gm check restart', 'DELETE the whole setup and build it fresh — asks first, and the threads inside do not come back (GM)'),
           ('/gm check order', 'sidebar diagnostic — asks first: apply the plan order, or keep your layout and just report (GM)')]),
@@ -1397,6 +1400,7 @@ PARTS['setup'] = [
            ['character-pages · forum', 'A page for each approved character.'],
            ['the-fallen · channel', 'Those who did not come back, remembered by the table.'],
            ['updates · forum', 'What changed for players — one dated thread per update.'],
+           ['chronicle · forum', 'The table’s week, once a week: quests completed, titles granted, fights won, the fallen and the dice.'],
            ['player-pdf · channel', 'The player book alone, reposted whenever it changes.'],
            ['approvals · forum · GM', 'A thread apiece for sheets, trades, duels, lore and exports — each waiting on a GM.'],
            ['roll-audit · forum · GM', 'A shelf per subject: rolls, checks, duels, items and the rest.'],
@@ -1405,9 +1409,11 @@ PARTS['setup'] = [
            ['quest-planning · forum · GM', 'The pipeline books — concept, awaiting, approved, in progress, DMs, archived, completed.'],
            ['quest-threads · forum · GM', 'A planning thread per quest, so the books keep the planning forum to themselves.'],
            ['gm-quest-log · channel · GM', 'The machine’s account of every finished quest — timings, events, payouts, final words.'],
-           ['gm-run-archive · forum · GM', 'A thread per GM, a post per finished run: its runtime, party, payout, the record, the story, both transcripts.'],
-           ['gm-updates · forum · GM', 'What changed for GMs, and what each deploy mended — one dated thread each.'],
-           ['gm-digest · forum · GM', 'The weekly digest of what is waiting on a GM — one thread per week, titled by its Monday.'],
+           ['gm-run-archive · forum · GM', 'A thread per GM, a post per finished run: its runtime, party, payout, the record, the story, the raw transcript.'],
+           ['gm-updates · forum · GM', 'What changed for GMs — one dated thread per update.'],
+           ['gm-daily · forum · GM', 'A thread a day: at 08:00 what is waiting on a GM, with dates and links; the day’s restart reports beneath.'],
+           ['gm-weekly · forum · GM', 'A thread a week, titled by its Monday: the week’s activities, then everything waiting, with dates and links. Pings the GMs.'],
+           ['gm-monthly · forum · GM', 'A thread a month, on the 1st: the month’s figures, then what has waited since before it. Pings the GMs.'],
            ['gm-feedback · forum · GM', 'Player feedback, one thread per category; players post with /feedback send.'],
            ['gm-character-sheets · forum · GM', 'GM characters — the same five blocks and tags as the player forum, behind the GM category’s eyes only.'],
            ['campaigns · forum · GM', 'One thread per campaign — the arc, its linked runs, and where things stand.'],
@@ -1492,8 +1498,9 @@ PARTS['gmroll'] = [
 PARTS['gmchar'] = [
 ('aud', 'gm'),
 ('h2', 'The Queue'),
-('p', 'Everything waiting on a decision, in one place \u2014 character sheets, lore, merit trades and quest '
-      'applicants, with jump links to each. It also surfaces any background job that is failing.'),
+('p', 'Everything waiting on a decision, in one place — character sheets, lore, duels, merit trades and quest '
+      'applicants, each with the date it has waited since and a link to it: a sheet to its character page, the rest '
+      'to their queue posts. It also surfaces any background job that is failing.'),
 ('code', [('/gm queue', 'what is waiting')]),
 ('note', 'Pending lore had no listing anywhere else, so a submission whose queue post was deleted was '
          'effectively invisible. This finds it.'),
@@ -1692,23 +1699,27 @@ PARTS['npcs'] = [
 ('code', [('/npc say name:Garrick speech:Fine steel, fair prices.', 'speech \u2014 in quote marks'),
           ('/npc say name:Garrick action:polishes a blade', 'action \u2014 italic emote'),
           ('/npc say name:Garrick action:polishes a blade\n  speech:Fine steel.', 'both, stacked'),
-          ('/npc say name:Garrick', 'opens a writing box: action, speech, a To picker\nof up to 25, a Groups list, and which activity to offer'),
+          ('/npc say name:Garrick', 'opens a writing box: action, speech, Raw, a To\npicker of up to 25, and which activity to offer'),
+          ('/npc say name:Garrick raw:*grins* "Welcome aboard."', 'posted exactly as typed; the record reads its parts'),
           ('/npc say name:Garrick speech:Over here, @Aldric', '@Name in the text pings that person'),
           ('/npc say name:Garrick speech:Mind the ropes. to:@Aldric, @Brenna', 'to: names them under the words \u2014 several, commas between'),
-          ('/npc say name:Garrick speech:To arms! to:White Knights, The Falconers', 'a knight order or a group: every living player in it'),
+          ('/npc say name:Garrick speech:To arms! to:White Knights, The Falconers', 'a knight order or a group: every living player in it;\nto: completes as you type — people, orders, groups'),
           ('/npc say name:Garrick speech:Fancy a wager? offer:Haggling', 'an Interaction button under this line starts it'),
           ('/npc say name:Garrick speech:Move along. reply:<link>', 'answers the linked line, the jump link on top'),
           ('/npc edit name:Garrick talk:Haggling', 'the activity pre-picked whenever Garrick speaks')]),
 ('p', 'A line is laid out in three blocks with a blank line between: the <b>action</b> in italics, the '
-      '<b>speech</b> in quotes, then <b>who it is for</b>. An NPC may call players by name: the writing box has a '
-      '<b>To</b> picker \u2014 up to twenty-five players, named under the words \u2014 and a <b>Groups</b> list of the '
-      'knight orders and the server\u2019s associations, each expanded to the living players in it. <b>@Aldric</b> '
+      '<b>speech</b> in quotes, then <b>who it is for</b>. The box’s <b>Raw</b> field takes longer writing: '
+      '<i>*action*</i> in asterisks, "speech" in quotes, each part posted on its own line in the order written. An NPC '
+      'may call players by name: the writing box has a <b>To</b> picker — up to twenty-five players, named under '
+      'the words — and a knight order or a server association goes by <b>to:</b> on the command, which completes as '
+      'you type, each expanded to the living players in it. <b>@Aldric</b> '
       'written in the speech, in the box as well as on the command, becomes a real mention by server nickname, '
       'display name or username, longest match first. <b>to:</b> on the command takes all of it at once \u2014 '
       'mentions, names, an order or a group, commas between; a bare name is tried as an order or a group first, '
       '<b>@Name</b> as a person first. Fifty people at most on one line. Only <b>people</b> are ever pinged from an '
-      'NPC\u2019s mouth: never a role, never everyone, whatever is typed. A Game Master\u2019s own <b>/rp</b> takes '
-      '<b>to:</b> and a To picker the same way; a player\u2019s never pings.'),
+      'NPC’s mouth: never a role, never everyone, whatever is typed. A Game Master’s own <b>/rp</b> takes '
+      '<b>to:</b> and a To picker the same way, its Raw box where Dice was (<b>/rp dice:</b> still rolls); a '
+      'player’s never pings.'),
 ('p', 'Under every line an NPC says sit two buttons, and sometimes a third \u2014 everyone sees them; what they do '
       'depends on who presses. <b>Reply</b> opens the roleplay box titled as a reply to that NPC, for anyone (a '
       'Game Master replies as their own character, with the To picker); the reply carries a small '
@@ -1724,7 +1735,8 @@ PARTS['npcs'] = [
 ('p', 'Posts as the NPC through their webhook \u2014 their name and avatar, no dice rolled. Fill '
       '<b>action</b>, <b>speech</b>, or both: the action is italicised and the speech is wrapped in quote '
       'marks, a blank line between. Leave both blank and a <b>writing box</b> opens with roomy '
-      'multi-line fields \u2014 easier for longer roleplay. Use <b>raw</b> to post exactly as typed.'),
+      'multi-line fields — easier for longer roleplay. Use <b>raw</b> to post exactly as typed; the record still '
+      'reads it into its actions, speech and lines.'),
 ('h2', 'Rolling as an NPC'),
 ('code', [('/npc roll name:Hollow tank notation:1d20+8 label:strike\n  flavour:The hollow lunges', ''),
           ('/npc reroll name:Hollow tank [roll:adv]', 'reroll that NPC\u2019s last roll in this channel \u2014\nspends one of its LCK tokens'),
@@ -1832,9 +1844,9 @@ PARTS['scrolls'] = [
 ('aud', 'gm'),
 ('h2', 'Scrolls'),
 ('code', [('/gm scroll', 'a modal for title and body; posts the parchment as an\nimage everyone can see plus a PDF with the writing\nwoven invisibly inside \u2014 the PDF survives Discord, so\nscrolls travel between servers on their own. file: hands\nany scroll PDF back: plain text out, plus a readable\nedition in standard type as image and woven PDF. A\nfile-name field on the modal names both files for\narchiving; the readable pair inherits it'),
-          ('/config mechanics scrollfont font:<file>', 'store an .otf/.ttf \u2014 the face /gm scroll props and\nthe parchment sheet are written in; the reply renders a\nsample line to prove it. The run\u2019s story, the record\nand /fight log scroll:true are set in standard type'),
+          ('/config mechanics scrollfont font:<file>', 'store an .otf/.ttf \u2014 the face /gm scroll props and\nthe parchment sheet are written in; the reply renders a\nsample line to prove it. The run’s story, the record\nand /fight log scroll:true are printed in their own\ntype, carried inside the file'),
           ('/config channels scrollarchive', 'a library for every scroll\u2019s named PDF \u2014 point it\nat a FORUM and each GM\u2019s scrolls file in their own\nthread, opened automatically on first use;\na plain channel keeps the flat archive'),
-          ('/config channels gmarchive forum:#gm-run-archive', 'the GM run archive: a thread per GM, headed with their\nruns, hours by kind and what is running now, its time so\nfar; a post per finished run \u2014 runtime, party, payout,\ntitles, the record, the story and record PDFs and both\ntranscripts. A review of the run answers its post. Set\nonce, it files every run already finished, oldest first;\ndisable:true stops it'),
+          ('/config channels gmarchive forum:#gm-run-archive', 'the GM run archive: a thread per GM, headed with their\nruns, hours by kind and what is running now, its time so\nfar; a post per finished run — runtime, party, payout,\ntitles, the record, the story PDF (in parts if long), the\nrecord PDF and the raw transcript. A review answers its post. Set\nonce, it files every run already finished, oldest first;\ndisable:true stops it'),
           ('/gm scroll file:<pdf>', 'read a scroll PDF back as text, and unfurl a fresh copy in this server’s font')]),
 ('h2', 'Speaking as the Bot'),
 ('code', [('/dd message:\u2026 header:\u2026 user:@Players channels:#one #two', 'speak AS THE BOT \u2014 so a GM who also plays a character\nnever blurs the two. Plain words by default; a bold\nheader only if you write one; posted in every channel\nyou name, or here. Who said it goes to the roll-audit,\nnot the room (GM)')]),
@@ -1887,8 +1899,8 @@ PARTS['keeping'] = [
          'names this script gives them: <b>DDice-Commands-Player.pdf</b> and <b>DDice-Commands-GameMaster.pdf</b> '
          'for Knightfall, the same two prefixed <b>DnD5e-</b> for 5e, and the two '
          '<b>DDice-Examples</b> books. A table is handed the set for the rules it plays by, and the Examples either way.'),
-('h2', 'Updates and the Deploy Mend'),
-('p', 'Every deploy writes two dated threads into the <b>gm-updates</b> forum: <b>What’s new</b> — the one-line summary of each change first, then <b>In detail</b> beneath it: the line again, and under it what changed, why, what you do now and where it lands — and <b>Deploy mend</b>, what the boot built or repaired. The player half of the same news goes to the <b>updates</b> forum, and once a week so does the players’ <b>Weekly chronicle</b>: quests completed, titles granted, fights won, the fallen, and the dice of the week — natural 20s and 1s and who rolled them, the biggest d20 total — nothing on a quiet week. Each thread is titled by its date, <i>[11/10/2026] [WEEK 41] Sunday 11th of October 2026 · What’s new</i>, so the newest sits at the top and the week is readable at a glance. The first boot with the forums in place posts the whole back-catalogue, oldest first, and clears the old update posts out of gm-quest-log. Discord orders a forum by when each thread was made, so the Deploy mend goes up last and a dated thread found out of turn is re-posted into order on the next boot — unless someone has written in it. The mend also keeps the NPC forum to one page per NPC: a duplicate page is folded back into the recorded one and counted in the Deploy mend, unless someone other than the bot has written in it, in which case it is named and left alone. A day with two deploys gets one What’s new: an entry that has grown since its thread was posted is deleted and posted again whole — or, if someone has written in the thread, kept and given the new lines beneath — and the Deploy mend says so.'),
+('h2', 'Updates, gm-daily and the Deploy Mend'),
+('p', 'Every deploy posts <b>What’s new</b> as a dated thread in the <b>gm-updates</b> forum — the one-line summary of each change first, then <b>In detail</b> beneath it: the line again, and under it what changed, why, what you do now and where it lands. The player half of the same news goes to the <b>updates</b> forum. The players’ <b>Weekly chronicle</b> has its own forum, <b>chronicle</b>: quests completed, titles granted, fights won, the fallen, and the dice of the week — natural 20s and 1s and who rolled them, the biggest d20 total — nothing on a quiet week. What each boot built or repaired, the <b>Deploy mend</b>, is a post beneath the day’s list in <b>gm-daily</b>. Each thread is titled by its date, <i>[11/10/2026] [WEEK 41] Sunday 11th of October 2026 · What’s new</i>, so the newest sits at the top and the week is readable at a glance. The first boot with the forums in place posts the whole back-catalogue, oldest first, and clears the old update posts out of gm-quest-log. Discord orders a forum by when each thread was made, so a dated thread found out of turn is re-posted into order on the next boot — unless someone has written in it. The first boot of this arrangement moved the old Deploy mend threads from gm-updates into gm-daily, merged a thread a day, and the old Weekly chronicles into chronicle, oldest first; a thread someone else had written in stayed where it was. The mend also keeps the NPC forum to one page per NPC: a duplicate page is folded back into the recorded one and counted in the Deploy mend, unless someone other than the bot has written in it, in which case it is named and left alone. A day with two deploys gets one What’s new: an entry that has grown since its thread was posted is deleted and posted again whole — or, if someone has written in the thread, kept and given the new lines beneath — and the Deploy mend says so.'),
 ('h2', 'Checks and Reports'),
 ('code', [('/gm check roster busy:true', 'every player at a glance \u2014 HP, and whether a quest or a\nfight is holding them (red means the next rest will pass\nthem over); busy:true shows only those tied up (GM)'),
           ('/gm check usage', 'sixty days of command use, quietest first \u2014 a report\nonly; nothing is ever removed by it (GM)'),
@@ -2353,6 +2365,10 @@ EXAMPLES = [
           ('(a natural 20 or 1)', 'A 20 puts you first, with two actions on your first turn \u2014 Done after each. A 1 puts you last, and your first turn is the Roleplay button: say what you do, and the turn passes.'),
           ('(five quiet minutes)', 'You are reminded. Press Still writing, or just keep typing. At fifteen the turn passes.')]),
 
+('sec', 'Roleplay'),
+('code', [('/rp action:draws her blade speech:Not one step closer.', 'Posts in your name: the action in italics, the speech in quotes.'),
+          ('/rp', 'Opens the box. In Raw write *steps forward* "Now." The gate creaks. — it posts as three lines, in that order.')]),
+
 ('aud', 'gm'),
 ('sec', 'Calling initiative'),
 ('code', [('/session initiative npcs:Goblin x3', 'A card with a Join button. The players press it; three Goblins are in already.'),
@@ -2445,7 +2461,8 @@ EXAMPLES = [
           ('/quest run complete number:1 summary:\u2026 title:\u2026', 'Pays everyone seated when the story ended \u2014 even someone kicked during the winddown.'),
           ('(press \u21A9 Reopen within five minutes)', 'Wrong number? The payout is reversed and the party released. Fix it, complete again.'),
           ('/quest archive number:1', 'A box opens for the final word. It goes on the record, into the thread, and the GM quest log.'),
-          ('/gm check stalled', 'What is waiting on a GM: winding-down runs, quiet encounters, staged parties never launched, targets standing over a day. A weekly digest of the same lands in the gm-digest forum, one thread a week.')]),
+          ('/session summary filename:The Night Watch', 'The whole story so far as The-Night-Watch.pdf, headed The Night Watch — every beat and every word said.'),
+          ('/gm check stalled', 'What is waiting on a GM: winding-down runs, quiet encounters, staged parties never launched, targets standing over a day — each with its date and a link. gm-daily lists it all at eight each morning, gm-weekly each week and gm-monthly on the 1st.')]),
 
 ('sec', 'Fixing what was said'),
 ('code', [('(long-press a bot message \u2192 Apps \u2192 Edit (DDice))', 'The text opens already filled in. Fix the spelling, save. Works on NPC speech too.'),

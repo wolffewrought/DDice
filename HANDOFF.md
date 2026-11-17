@@ -49,9 +49,9 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1402 as of 2026-11-17, build Q) and no
+Green means every assertion passed (1426 as of 2026-11-17, build R) and no
 scanner found an ERROR. Then run the probe: `node --experimental-sqlite
-probe.js` (405 probes: the fight, encounter, override, autocomplete and
+probe.js` (436 probes: the fight, encounter, override, autocomplete and
 every-leaf walks, the GM-gate walk, chat shorthands, scheduled ticks,
 junk-id lanes, SQL compile, forum seeding and sweep, one NPC one page, the
 A2 walk, the undo walk, the C walk, the D walk (activities: parser,
@@ -63,8 +63,8 @@ an NPC, a 5e guild end to end), the J walk (initiative and the turn clock),
 the K walk (held advantage, auto Heroes), the L walk (the naturals on the
 specials, a kept hold's answer, the trick's price, stray NPC sheets; and
 L2's slipped holds, a defensive feint of 1, `/deception` refused in a
-fight, the reroll's words, a cleared exchange; M's attacking 20), the P
-and Q walks, and a double-ack check). The probe carries a paper-thin fake
+fight, the reroll's words, a cleared exchange; M's attacking 20), the P,
+Q and R walks, and a double-ack check). The probe carries a paper-thin fake
 `@napi-rs/canvas` since A2 (text measures by length, drawing is a no-op, a
 buffer comes back) so the parchment paths run end to end; verify.js keeps
 the canvas absent on purpose, which is the other path.
@@ -370,6 +370,21 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 10zzz · Build R: every word in the story, the Raw box, the forums split (2026-11-17)
+
+One combined build after build Q (pushed as `cdc8585`). Its What's new lines join the `2026-11-17` entry again (Q's, pushed today); if it goes out on a later day, move them to that day's key — a key dated ahead of the push would sit above the day's threads and be re-posted by the tidy pass until the dates catch up.
+
+- **The record keeps every word, in its parts.** `quest_events.parts` (JSON `{ who, segs: [{ k: 'a'|'s'|'p', t }] }`) and `quest_events.whole` (1 talk kept uncut; -1 talk from before that could not be read again; NULL talk from before build R, cut at 300). `logQuestEvent(…, { msgId, parts, whole })`; `noteQuestActivity(…, opts)` passes them on. `cleanTalk(guild, content, { keepLines })` no longer cuts. `recordRoomTalk` and `noteTalkEdited` keep the parts. `mendCutTalk(client, gid, quest)` reads each line that may have been cut (300 said characters or more) back from the run's thread once, 150 a call, before every story is printed: `runSoFarFile` (summary, wind-down), the completion, the archive backfill.
+- **Raw.** `rpSegments(text)`: `*…*`, `***…***`, `_…_` at a word's edge are actions; `"…"` (only from a word's start), `“…”`, `„…“` are speech; the rest are plain lines; `**…**` stays in the words; a mark opened at a word's start and never closed runs to its line's end. `formSegments({ action, speech, raw })` (the Action box's own marks dropped, the Speech box's quotes dropped), `segsToPost(segs, { quote, gap })` (a card's words close, `\n`; a said line `\n\n` — T's three blocks of 2026-10-24), `segsBeat` (the old log text), `segsLines` (`BOT_LINE_RE` per line), `segsForLog` (mentions named). Boxes: `rawLabel()` in `rpModal` (a GM's has it where Dice was), `npcSayModal` and `npcAnswerModal` (both lost the Groups select; `expandGroupPick` still reads a pick from a box opened before); `rpRows()`/`rowField()` in `fightRpModal`, the target's strike (`tgtrp`) and `initRpModal`. `rpWords`/`rpFormSegs` read all three boxes. `composeNpcSay({ …, segs })`; `/npc say raw:` posts as typed and its record is parsed; its 1,800 cap is gone (the length net splits). `postAsNpc(…, { beat })` logs only when handed parts, so a fight card in an NPC's name is no longer logged as its speech. `addresseeChoices(guild, gid, typed)` completes `to:` on `/npc say` and `/rp`: orders, groups, then people from the cache and `members.search` (given 1.5 s); the piece after the last comma.
+- **The printed scroll.** `SCROLL_FONT_Z`: DejaVu Sans, Bold and Oblique, Latin + Greek + Cyrillic, no hinting, zlib'd and base64 (~104 KB). `ttfFace` reads head/hhea/maxp/hmtx/cmap (format 4)/post; `scrollPdf` writes Type0/CIDFontType2 Identity-H faces with ToUnicode, the speckle once as a Form XObject (`/ca 0.06`), one radial shading for the burnt corners (each kept to its half of the sheet), the gold rules and diamonds as paths, the text via `faceHex`. `scrollWrap`, `scrollSheets` (a heading never left alone at a sheet's foot), `printScroll({ title, paras, stem })` → `[{ pdf, name, part, of }]`, split by lines into numbered parts while any file passes `SCROLL_FILE_MAX` (7.5 MB; `DDICE_SCROLL_FILE_MAX` overrides it for the tests). `scrollRuns` (bold and italic marks to runs), `scrollClean`, `scrollParasOf`, `scrollPlain` (the woven text), `scrollFileBatches` (a message's attachments ≤ 9 MB, the rest following), `scrollFileName` (the heading as typed; the stem without what a file name cannot hold, spaces as dashes). No canvas anywhere in it. `scrollBookFitting`, `STORY_BEATS_MAX` and `SCROLL_BODY_MAX` are gone; `renderScrollBook` stays for the activity shelf.
+- **Rule 1.** `storyEntries(events, nameOf)` — parts first; `oldStoryEntry` takes old lines apart (talk through `rpSegments`; a player's `action · “speech”`; an NPC's whole post in curly quotes, the pings after it dropped; an old fight card logged as an NPC's speech becomes a line) — and `storyParas` (heading `time - ` + the bold name, a blank line at each change, lines as `time - text`). `runStoryScroll(…, { sofar, filename, nameOf })` → `{ pdf, name, files }`; `runRecordScroll` and `/fight log scroll:true` print the same way. `makeTextPdf` runs onto further pages (the fallback and the career PDFs).
+- **filename:** on `/session summary` and `/fight log` (with `scroll:true`).
+- **Completion and archive.** The story's parts hang on the card (`storyBatches`, the rest as follow-ups); no corrected transcript; `archiveFinishedRun(…, { storyFiles, recordFile, talk: { raw } })`.
+- **Forums.** Plan: `chronicle_forum` (players), `gm_daily_forum`, `gm_digest_forum` named gm-weekly, `gm_monthly_forum`. Config: `gm_daily_day/thread/listed`, `gm_monthly_month`, `gm_monthly_counts`, `forums_split_at`. `dailyThread` (one maker at a time), `postDailyList` (08:00 UK; an early thread's head edited, the overflow beneath), `postRestartReport` (the Deploy mend, beneath). `postMonthly`/`monthlyLines` (`lastMonth`, `ukMidnight`, `ukDayKey`, `ukHour`, `lastSeenAt`; command use is the difference from the last report's counts). `postWeekTale` → chronicle. `postWeeklyDigest`: the activities, then the waiting list. `splitUpdateForums`, once: renames gm-digest, rewrites gm-updates' about line, moves the bot-only Deploy mends a day a thread (archived) and the Weekly chronicles (`allDatedThreads` pages the archive; `botOnlyMessages`), a day already moved (by title) not moved twice; it waits until both new forums exist.
+- **The waiting list.** `WAITING_KINDS`, `QUEUE_KINDS`, `waitingItems(gid)` (`{ kind, label, since, url }`), `waitingLine`, `waitingLines`; `stalledReport` is the kinds outside the queue. Behind `/gm queue`, `/gm check stalled`, gm-daily, gm-weekly and gm-monthly. New since-dates: `quest_members.state_at`, `quests.winding_at`, `stories.draft_at`.
+
+**Tests.** verify: a `build R` harness (24) — the parser, the story by rule 1, the printed file and its parts, the names, the waiting line, the UK clock, the wiring; 1,426 green. probe: the Build R walk (30 probes, `Date.now` stubbed for the forums: a restart at 06:30, the list at 08:05, the next day, the 1st at 07:00 and 08:30); FakeChannel learned `edit` and `setArchived`; 436 green.
 
 ## 10zz · Build Q: /timer, 4,000 boxes and posts in parts, the wind-down post, 5e moves (2026-11-17)
 
