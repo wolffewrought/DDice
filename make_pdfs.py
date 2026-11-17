@@ -620,14 +620,14 @@ PARTS['quest'] = [
           ('/campaign show campaign:The Falconer’s War', 'the premise, what is done, and your part')]),
 ('h2', 'Roleplay on the Record (/rp)'),
 ('p', 'Outside a fight the same boxes the fight buttons open are a command away: <b>/rp</b> opens them — what you do, what you say (4,000 characters a box), a <b>Raw</b> box for longer writing (<i>*action*</i> in asterisks, <b>"speech"</b> in quotes, each part posted on its own line in the order you write it), a <b>stat to roll</b> from a dropdown of this server’s own, and any <b>dice</b> — and <b>/rp action:\u2026 speech:\u2026 roll:\u2026 dice:\u2026</b> skips the box. The line goes out in your own name and face, shaped as the cards are: <i>the action</i>, then \u201cthe speech\u201d, then the roll beneath; a line longer than one Discord message carries on in the next, the roll beneath the last. A roll keeps the rules a typed one does \u2014 the Hero\u2019s advantage, a mark you carry, a deception that fooled you \u2014 and <b>rr</b> rerolls it as it would a typed one. If the Game Master has called a check on you here, a <b>stat roll answers it</b>: the check\u2019s own terms, its button darkened, its outcome under your words. Inside a run the words become a beat on the timeline and the roll a roll in its log, in the recap and in the story that comes with the completion card — every word of it, under your name. Every roleplay box has Raw: the fight buttons’ forms, a target’s strike and a lost first turn too.'),
-('p', 'Every line carries a <b>Reply</b> button, and so does every line an NPC says \u2014 press it and the same box opens as a reply. A reply wears a small line on top, <i>\u21AA replying to Name</i>, and that name is a link: tap it and you are taken to the line it answers. Several people can answer the same line; the button never moves. Beside it on your own lines sits <b>GM</b> \u2014 the Game Master\u2019s: they can answer your line as any NPC, and their answer links back to it the same way.'),
+('p', 'Every line carries a <b>Reply</b> button, and so does every line an NPC says and the Game Master’s <b>Narration</b> — press it and the same box opens as a reply. A reply wears a small line on top, <i>\u21AA replying to Name</i>, and that name is a link: tap it and you are taken to the line it answers. Several people can answer the same line; the button never moves. Beside it on your own lines sits <b>GM</b> \u2014 the Game Master\u2019s: they can answer your line as any NPC, and their answer links back to it the same way.'),
 ('code', [('/rp', 'opens the box'),
           ('/rp action:draws her blade speech:Not one step closer.', 'posts at once'),
           ('/rp speech:Stand aside. roll:str', 'with a stat roll \u2014 it answers a check called on you here'),
           ('/rp action:swings dice:1d8+2', 'with any dice'),
           ('Raw: *steps forward* "Now." The gate creaks.', 'in the box: posted as three lines — the action,\nthe speech, the rest — in the order written'),
-          ('/edit', 'fix the words of a line of yours \u2014 the roll and the reply link stay as they were;\na line in several parts opens whole'),
-          ('/edit delete:true', 'take one back \u2014 every part of it')]),
+          ('/edit', 'fix the words of a line of yours — the roll and the reply link stay as they were;\na line in several parts opens whole; the story follows'),
+          ('/edit delete:true', 'take one back — every part of it, and out of the story')]),
 ('note', 'A Game Master may put a clock on a scene with <b>/timer</b>: a card counts down in the channel, and when it runs out it rings, pinging whoever it names.'),
 ('h2', 'Taking Turns \u2014 Initiative'),
 ('p', 'When the Game Master calls for initiative, a card appears with a <b>Join</b> button \u2014 press it to take a place; '
@@ -1849,11 +1849,18 @@ PARTS['scrolls'] = [
           ('/config channels gmarchive forum:#gm-run-archive', 'the GM run archive: a thread per GM, headed with their\nruns, hours by kind and what is running now, its time so\nfar; a post per finished run — runtime, party, payout,\ntitles, the record, the story PDF (in parts if long), the\nrecord PDF and the raw transcript. A review answers its post. Set\nonce, it files every run already finished, oldest first;\ndisable:true stops it'),
           ('/gm scroll file:<pdf>', 'read a scroll PDF back as text, and unfurl a fresh copy in this server’s font')]),
 ('h2', 'Speaking as the Bot'),
-('code', [('/dd message:\u2026 header:\u2026 user:@Players channels:#one #two', 'speak AS THE BOT \u2014 so a GM who also plays a character\nnever blurs the two. Plain words by default; a bold\nheader only if you write one; posted in every channel\nyou name, or here. Who said it goes to the roll-audit,\nnot the room (GM)')]),
+('code', [('/dd message:\u2026 header:\u2026 user:@Players channels:#one #two', 'speak AS THE BOT \u2014 so a GM who also plays a character\nnever blurs the two. Plain words by default; a bold\nheader only if you write one; posted in every channel\nyou name, or here. Who said it goes to the roll-audit,\nnot the room (GM)'),
+          ('/dd', 'bare, a box opens: Message (4,000), Header and someone\nto address — the header, the channels and the person\nnamed with the command carry into it. However long,\nit goes on in the next message (GM)')]),
+('h2', 'Narration'),
+('p', '<b>/narrate</b> tells the scene in its own voice: the words go out as <b>Narration</b> under the bot’s picture, with a <b>Reply</b> under them like any roleplay line, so the table can answer the telling. Bare, it opens a box for paragraphs with a To picker; <b>text:</b> posts at once. In a run’s room the narration goes on that run’s record — recording on or off — and so into the timeline, the hourly recap, the previously-on and summary drafts, the GM record and the story. In the story it stands on its own as prose, a blank line about each paragraph; <b>/config mechanics narrator enabled:true</b> puts <i>0h 12m - Narration</i> over it instead, like any speaker.'),
+('code', [('/narrate', 'opens the box: Narration (4,000, paragraphs kept)\nand To, up to twenty-five (GM)'),
+          ('/narrate text:The rain thickens as the gate groans open.', 'posts at once (GM)'),
+          ('/narrate text:… to:@Artorius, @Meliora', 'pings the people named under it — @people, a\ngroup or a knight order, completed as you type (GM)'),
+          ('/config mechanics narrator enabled:true', 'narration under “time - Narration” in the story,\nlike any speaker; off by default (Admin)')]),
 ('h2', 'Fixing What Was Said'),
-('code', [('Edit (DDice)  \u2014 long-press a message \u2192 Apps', 'edit anything the bot posted \u2014 its own messages and NPC\nspeech from /npc say alike. The text opens prefilled,\nsave replaces it, and the roll-audit records what\nchanged (GM)'),
+('code', [('Edit (DDice)  — long-press a message → Apps', 'edit anything the bot posted — its own messages, NPC\nspeech from /npc say and narration alike. The text opens prefilled,\nsave replaces it, and the roll-audit records what\nchanged (GM)'),
           ('/edit [link:\u2026] [delete:true]', 'the same box without the Apps menu: a dropdown only\nyou see lists the last 25 lines the bot and its NPCs\nsaid here, newest first; pick one and the text opens\nprefilled; delete:true takes the picked line down\ninstead. link: a message link or id goes straight\nto it. Nothing shows in the channel. A player gets\nthe same for the lines they posted with /rp. A post\ncarried on into several messages is one post: every\npart opens in one form, and delete:true takes every\npart (GM)')]),
-('p', 'Only messages the bot itself posted — its own, and NPC speech sent through <b>/npc say</b>. A line carrying only <b>Reply</b>, <b>GM</b> or <b>Interaction</b> is still words to fix, and keeps its buttons; a card with other buttons stays the bot\u2019s. A player editing their own <b>/rp</b> line sees only their words: the roll beneath and the reply link on top are the bot\u2019s and stay. The roll audit records what changed. A line said through a webhook that has since been deleted cannot be edited by anyone — Discord ties the edit to the webhook — so the bot says so: delete it and have the NPC say it again.'),
+('p', 'Only messages the bot itself posted — its own, and NPC speech sent through <b>/npc say</b>. A line carrying only <b>Reply</b>, <b>GM</b> or <b>Interaction</b> is still words to fix, and keeps its buttons; a card with other buttons stays the bot\u2019s. A player editing their own <b>/rp</b> line sees only their words: the roll beneath and the reply link on top are the bot\u2019s and stay. The roll audit records what changed. A narration, <b>/rp</b> or NPC line fixed or taken down is fixed or taken out of the run’s story too; one deleted in Discord itself leaves the story as well, and a post in parts keeps what is left of it. A line said through a webhook that has since been deleted cannot be edited by anyone — Discord ties the edit to the webhook — so the bot says so: delete it and have the NPC say it again.'),
 ]
 
 PARTS['keeping'] = [
@@ -2091,7 +2098,7 @@ BOOKS = {
     ('Quests', ['quest', 'gmquest']),
     ('Standing', ['standing']),
     ('Activities and Quizzes', ['activities', 'gmactivities']),
-    ('Scrolls, the Bot’s Voice, and Fixing What Was Said', ['scrolls']),
+    ('Scrolls, the Bot’s Voice, Narration, and Fixing What Was Said', ['scrolls']),
     ('Keeping the Server', ['keeping']),
     ('The Fallen', ['fallen']),
     ('Reference', ['reference', 'reference-kf', 'feedback']),
@@ -2367,7 +2374,8 @@ EXAMPLES = [
 
 ('sec', 'Roleplay'),
 ('code', [('/rp action:draws her blade speech:Not one step closer.', 'Posts in your name: the action in italics, the speech in quotes.'),
-          ('/rp', 'Opens the box. In Raw write *steps forward* "Now." The gate creaks. — it posts as three lines, in that order.')]),
+          ('/rp', 'Opens the box. In Raw write *steps forward* "Now." The gate creaks. — it posts as three lines, in that order.'),
+          ('(press Reply under a Narration line)', 'The same box, as an answer to the Game Master’s telling.')]),
 
 ('aud', 'gm'),
 ('sec', 'Calling initiative'),
@@ -2393,6 +2401,13 @@ EXAMPLES = [
           ('/npc temp list', 'Every throwaway NPC still lying about.'),
           ('/npc temp keep name:Hollow', 'Keep one \u2014 it becomes permanent and gains a page.'),
           ('/npc temp clear', 'Sweep every temporary NPC away now.')]),
+
+('aud', 'gm'),
+('sec', 'Narrating the scene'),
+('code', [('/narrate', 'A box for paragraphs. What you write posts as Narration, with a Reply under it, and goes into the run’s story.'),
+          ('/narrate text:The rain thickens as the gate groans open. to:@Artorius', 'Posts at once, and pings Artorius under it.'),
+          ('/config mechanics narrator enabled:true', 'The story puts “0h 12m - Narration” over each telling; left off, the prose stands alone.'),
+          ('/dd', 'The bot’s own voice, for announcements — a box for paragraphs when message: is left blank.')]),
 
 ('aud', 'gm'),
 ('sec', 'Buttons and targets'),
@@ -2466,8 +2481,8 @@ EXAMPLES = [
 
 ('sec', 'Fixing what was said'),
 ('code', [('(long-press a bot message \u2192 Apps \u2192 Edit (DDice))', 'The text opens already filled in. Fix the spelling, save. Works on NPC speech too.'),
-          ('/edit', 'The same from a private list: the last lines the bot and its NPCs said here. Pick one, fix it, save. The table sees only the corrected line. A long post in parts opens as one.'),
-          ('/edit delete:true', 'The list again; the pick comes down.')]),
+          ('/edit', 'The same from a private list: the last lines the bot and its NPCs said here. Pick one, fix it, save. The table sees only the corrected line. A long post in parts opens as one; the story follows.'),
+          ('/edit delete:true', 'The list again; the pick comes down, and out of the story.')]),
 ('p', 'Only messages the bot itself posted. The roll-audit records what changed.'),
 
 ('aud', 'all'),

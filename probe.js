@@ -5924,6 +5924,150 @@ async function fire(over) {
     ok('nothing in the R walk threw', threwR.length === 0, threwR.slice(0, 3).join('\n        '));
   }
 
+  // ── Build S (2026-11-17): /narrate — live narration as Narration, kept in
+  // the story as prose or under the heading a server asks for; /edit and a
+  // deletion reach the story; /dd's box and no cut ──
+  if (dbHandle) {
+    const realErrS = console.error; const loggedS = [];
+    console.error = (...a) => { loggedS.push(a.map(x => (x && x.stack) ? x.stack.split('\n').slice(0, 2).join(' | ') : String(x)).join(' ')); };
+    const realFetchS = guild.members.fetch;
+    try {
+      const saidOf = (r) => (r?.replies || []).map(x => x.content || '').join('\n');
+      const modalOf = (r) => (r?.replies || []).find(x => x.modal) || null;
+      const settle = async () => { for (let i = 0; i < 80; i++) await new Promise(r => setImmediate(r)); };
+      const sinceIn = (cid, n) => sent.slice(n).filter(x => x.channel === cid).map(x => x.msg);
+      const idsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+      const segsOf = (row) => { try { return JSON.parse(row?.parts || 'null'); } catch { return null; } };
+      const woven = (buf) => { try { const b = Buffer.from(buf); return JSON.parse(b.slice(b.indexOf('DDICESCROLLv1') + 13).toString('utf8')); } catch { return null; } };
+      const filesOf = (r) => (r?.replies || []).flatMap(x => x.files || []);
+      const flatS = (t) => String(t || '').replace(/\s+/g, ' ');
+      const chS = new FakeChannel('CS1', 0, 's-walk', guild); chS.guildId = 'G1'; channelsById.set('CS1', chS);
+      const tS = Date.now() - 600000;
+      dbHandle.prepare("INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, gm_id, started_at, record_all, paused) VALUES ('G1', 992, 'Narrow Road', 'active', 'quest', ?, 'CS1', 'U1', ?, 0, 0)").run(tS, tS);
+      const evS = (kind) => dbHandle.prepare("SELECT * FROM quest_events WHERE guild_id='G1' AND number=992 AND kind=? ORDER BY id").all(kind);
+      // The every-leaf walk pressed the toggle on; the server's default is off.
+      dbHandle.prepare("UPDATE guild_config SET narrator_heading=0 WHERE guild_id='G1'").run();
+      const PLS = '100000000000000401';
+      guild.members.fetch = async (uid) => { const mb = await realFetchS(uid); if (uid === PLS) { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+      const plainS = { id: PLS, displayName: `user${PLS}`, roles: { cache: new Map() }, permissions: { has: () => false } };
+
+      // 1 · the box
+      const mN = modalOf(await fire({ commandName: 'narrate', options: {}, userId: 'U1', channel: chS }));
+      ok('/narrate bare opens the box: Narration and a To picker', mN?.modal === 'narrateform' && 'text' in (mN.modalFields || {}) && 'to' in (mN.modalFields || {}), JSON.stringify(mN));
+
+      // 2 · text: posts as Narration, Reply under it, on the record though the run records no talk
+      let before = sent.length;
+      const nar1 = await fire({ commandName: 'narrate', options: { text: 'The rain thickens as the gate groans open.' }, userId: 'U1', channel: chS });
+      const line1 = sinceIn('CS1', before).find(m => m.webhookId);
+      const row1 = evS('narration').pop();
+      ok('/narrate text: posts at once as Narration, with Reply and GM under it like a /rp line',
+        line1?.author?.username === 'Narration' && line1?.content === 'The rain thickens as the gate groans open.' && idsOf(line1).includes('rpreply') && idsOf(line1).includes('rpnpc') && /Narrated\./.test(saidOf(nar1)),
+        `${line1?.author?.username} · ${JSON.stringify(line1?.content)} · ${idsOf(line1)} · ${saidOf(nar1)}`);
+      ok('in a run’s room it goes on the record as narration, with its post — though the run records no talk',
+        !!row1 && row1.msg_id === String(line1?.id) && segsOf(row1)?.who === 'Narration' && JSON.stringify(segsOf(row1)?.segs) === JSON.stringify([{ k: 'p', t: 'The rain thickens as the gate groans open.' }]) && /Kept in the story of \*\*/.test(saidOf(nar1)),
+        `${row1?.msg_id} vs ${line1?.id} · ${row1?.parts} · ${saidOf(nar1)}`);
+
+      // 3 · the box: paragraphs and a ping
+      before = sent.length;
+      await fire({ isModal: true, customId: 'narrateform', fields: { text: 'Beyond it, the courtyard lies silent.\n\nThen a bell.' }, users: { to: ['U2'] }, userId: 'U1', channel: chS });
+      const line2 = sinceIn('CS1', before).find(m => m.webhookId);
+      const row2 = evS('narration').pop();
+      ok('the box keeps its paragraphs and pings the one picked under them; the record keeps the paragraphs, not the ping',
+        line2?.content === 'Beyond it, the courtyard lies silent.\n\nThen a bell.\n\n<@U2>' && (line2?.allowedMentions?.users || []).includes('U2')
+          && JSON.stringify(segsOf(row2)?.segs) === JSON.stringify([{ k: 'p', t: 'Beyond it, the courtyard lies silent.' }, { k: 'p', t: 'Then a bell.' }]),
+        `${JSON.stringify(line2?.content)} · ${JSON.stringify(line2?.allowedMentions)} · ${row2?.parts}`);
+
+      // 4 · only GMs; to: alone; to: completes
+      const refused = await fire({ commandName: 'narrate', options: { text: 'Mine now.' }, userId: PLS, member: plainS, channel: chS });
+      const toAlone = await fire({ commandName: 'narrate', options: { to: '@someone' }, userId: 'U1', channel: chS });
+      ok('only GMs narrate; to: alone asks for the words', /Only GMs narrate/.test(saidOf(refused)) && /Nothing to narrate/.test(saidOf(toAlone)), `${saidOf(refused)} · ${saidOf(toAlone)}`);
+      const acN = (await fire({ commandName: 'narrate', isAutocomplete: true, options: { _focused: 'to', _focusedValue: '' }, userId: 'U1', channel: chS })).replies.find(r => r.autocomplete);
+      ok('/narrate to: completes as /rp’s does', Array.isArray(acN?.autocomplete), JSON.stringify(acN).slice(0, 120));
+
+      // 5 · the story: prose on its own; the heading when asked
+      before = sent.length;
+      await fire({ isModal: true, customId: 'rpform', fields: { action: '', speech: 'Hold the line.', raw: '' }, userId: 'U1', channel: chS });
+      const lineRpS = sinceIn('CS1', before).find(m => m.webhookId);
+      const body1 = woven(filesOf(await fire({ commandName: 'session', options: { _sub: 'summary' }, userId: 'U1', channel: chS }))[0]?.a)?.body || '';
+      ok('in the story, narration stands on its own as prose — no name over it — a blank line about each paragraph',
+        /\n\nThe rain thickens as the gate groans open\.\n\nBeyond it, the courtyard lies silent\.\n\nThen a bell\.\n\n\d+h \d\dm - /.test(body1) && !/- Narration/.test(body1),
+        flatS(body1).slice(0, 400));
+      const tog0 = await fire({ commandName: 'config', options: { _group: 'mechanics', _sub: 'narrator' }, userId: 'U1', channel: chS });
+      const tog1 = await fire({ commandName: 'config', options: { _group: 'mechanics', _sub: 'narrator', enabled: true }, userId: 'U1', channel: chS });
+      const body2 = woven(filesOf(await fire({ commandName: 'session', options: { _sub: 'summary' }, userId: 'U1', channel: chS }))[0]?.a)?.body || '';
+      ok('/config mechanics narrator: bare, it says how it stands; enabled:true puts "time - Narration" over it, like any speaker',
+        /stands on its own/.test(saidOf(tog0)) && /heading on/.test(saidOf(tog1)) && Number(dbHandle.prepare("SELECT narrator_heading FROM guild_config WHERE guild_id='G1'").get()?.narrator_heading) === 1
+          && /\n\n\d+h \d\dm - Narration\nThe rain thickens as the gate groans open\.\nBeyond it, the courtyard lies silent\.\nThen a bell\.\n\n/.test(body2),
+        `${saidOf(tog0)} · ${saidOf(tog1)} · ${flatS(body2).slice(0, 300)}`);
+      await fire({ commandName: 'config', options: { _group: 'mechanics', _sub: 'narrator', enabled: false }, userId: 'U1', channel: chS });
+
+      // 6 · /edit reaches the story
+      await fire({ isModal: true, customId: `botedit:CS1:${line2?.id}`, fields: { text: 'Beyond it, the courtyard lies empty.\n\nThen a bell, twice.\n\n<@100000000000000402>' }, userId: 'U1', channel: chS });
+      const row2b = dbHandle.prepare('SELECT * FROM quest_events WHERE id=?').get(row2?.id);
+      ok('an /edit of a narration reaches the story: its paragraphs as they read now, the names pinged under them left out',
+        String(sentById.get(line2?.id)?.content || '').startsWith('Beyond it, the courtyard lies empty.') && JSON.stringify(segsOf(row2b)?.segs) === JSON.stringify([{ k: 'p', t: 'Beyond it, the courtyard lies empty.' }, { k: 'p', t: 'Then a bell, twice.' }])
+          && row2b?.text === 'Beyond it, the courtyard lies empty. Then a bell, twice.',
+        `${row2b?.text} · ${row2b?.parts}`);
+      await fire({ isModal: true, customId: `botedit:CS1:${lineRpS?.id}`, fields: { text: '"Hold the line, all of you."' }, userId: 'U1', channel: chS });
+      const rowRpS = dbHandle.prepare("SELECT * FROM quest_events WHERE guild_id='G1' AND number=992 AND kind='rp' AND msg_id=?").get(String(lineRpS?.id));
+      ok('an /edit of an /rp line reaches the story too, under the same name', JSON.stringify(segsOf(rowRpS)?.segs) === JSON.stringify([{ k: 's', t: 'Hold the line, all of you.' }]) && !!segsOf(rowRpS)?.who, String(rowRpS?.parts));
+
+      // 7 · a take-down and a deletion leave the story
+      if (!dbHandle.prepare("SELECT 1 FROM npcs WHERE guild_id='G1' AND name='Dockmaster'").get()) await fire({ commandName: 'npc', options: { _sub: 'create', name: 'Dockmaster', str: 2 }, userId: 'U1' });
+      before = sent.length;
+      await fire({ commandName: 'npc', options: { _sub: 'say', name: 'Dockmaster', speech: 'Mind the gate.' }, userId: 'U1', channel: chS });
+      const lineNpcS = sinceIn('CS1', before).find(m => m.webhookId);
+      const rowNpcS = dbHandle.prepare("SELECT * FROM quest_events WHERE guild_id='G1' AND number=992 AND kind='rp' AND msg_id=?").get(String(lineNpcS?.id));
+      const down = await fire({ commandName: 'edit', options: { link: `https://discord.com/channels/G1/CS1/${lineNpcS?.id}`, delete: true }, userId: 'U1', channel: chS });
+      const rowNpcS2 = rowNpcS ? dbHandle.prepare('SELECT * FROM quest_events WHERE id=?').get(rowNpcS.id) : null;
+      ok('an NPC’s line keeps its post on the record; /edit delete:true takes it out of the story', !!rowNpcS && rowNpcS.gone !== 1 && rowNpcS2?.gone === 1 && /Taken down/.test(saidOf(down)),
+        `${rowNpcS?.msg_id} · gone ${rowNpcS2?.gone} · ${saidOf(down)}`);
+      for (const fn of listeners.raw || []) fn({ t: 'MESSAGE_DELETE', d: { id: String(line1?.id), channel_id: 'CS1', guild_id: 'G1' } });
+      await settle();
+      const row1b = dbHandle.prepare('SELECT * FROM quest_events WHERE id=?').get(row1?.id);
+      const body3 = woven(filesOf(await fire({ commandName: 'session', options: { _sub: 'summary' }, userId: 'U1', channel: chS }))[0]?.a)?.body || '';
+      ok('a narration deleted in Discord itself leaves the story; what was edited reads as edited',
+        row1b?.gone === 1 && !/The rain thickens/.test(body3) && !/Mind the gate/.test(body3) && /the courtyard lies empty/.test(body3) && /Hold the line, all of you\./.test(body3),
+        `gone ${row1b?.gone} · ${flatS(body3).slice(0, 300)}`);
+
+      // 8 · a long one goes in parts, one post on the record
+      const longN = Array.from({ length: 6 }, (_, k) => `Paragraph ${k + 1}: ` + 'The wind keeps on across the moor, and nothing answers it. '.repeat(10).trim()).join('\n\n');
+      before = sent.length;
+      await fire({ isModal: true, customId: 'narrateform', fields: { text: longN }, users: { to: [] }, userId: 'U1', channel: chS });
+      const partsN = sinceIn('CS1', before).filter(m => m.webhookId);
+      const rowL = evS('narration').pop();
+      ok('a long narration goes on in the next message, every part as Narration; the record keeps it whole, with its first part',
+        partsN.length >= 2 && partsN.every(m => m.author?.username === 'Narration' && m.content.length <= 2000) && rowL?.msg_id === String(partsN[0]?.id) && segsOf(rowL)?.segs?.length === 6,
+        `${partsN.length} parts · ${partsN.map(m => m.content.length)} · ${rowL?.msg_id} vs ${partsN[0]?.id} · ${segsOf(rowL)?.segs?.length}`);
+
+      // 9 · /dd: the box, what the command named carried into it, no cut
+      const DDC = '100000000000000501';
+      const chDd = new FakeChannel(DDC, 0, 'announcements', guild); chDd.guildId = 'G1'; channelsById.set(DDC, chDd);
+      const mDd = modalOf(await fire({ commandName: 'dd', options: { header: 'Hear ye', channels: `<#${DDC}>` }, userId: 'U1', channel: chS }));
+      ok('/dd with message: blank opens a box — Message, Header (what was typed rides in it) and someone to address; the channels named wait for it',
+        mDd?.modal === 'ddform:p' && mDd.modalFields?.header === 'Hear ye' && 'message' in (mDd.modalFields || {}) && 'user' in (mDd.modalFields || {}), JSON.stringify(mDd));
+      const longDd = 'Hear this, all of you. '.repeat(110).trim();
+      before = sent.length;
+      const ddSay = await fire({ isModal: true, customId: 'ddform:p', fields: { message: longDd, header: 'Hear ye' }, users: { user: [] }, userId: 'U1', channel: chS });
+      const ddMsgs = sinceIn(DDC, before);
+      ok('the box speaks where the command said, however long — the rest goes on in the next message, nothing cut',
+        ddMsgs.length >= 2 && ddMsgs[0].content.startsWith('**Hear ye**\n') && flatS(ddMsgs.map(m => m.content).join('\n')).includes(longDd) && /Said in <#/.test(saidOf(ddSay)) && sinceIn('CS1', before).length === 0,
+        `${ddMsgs.length} · ${ddMsgs.map(m => m.content.length)} · ${saidOf(ddSay)}`);
+      const ddLost = await fire({ isModal: true, customId: 'ddform:p', fields: { message: 'Lost?' }, users: { user: [] }, userId: 'U5', channel: chS });
+      ok('a box whose channels were lost to a restart says so rather than speak here', /Run `\/dd` again/.test(saidOf(ddLost)), saidOf(ddLost));
+      before = sent.length;
+      const ddSlash = await fire({ commandName: 'dd', options: { message: longDd }, userId: 'U1', channel: chS });
+      ok('/dd message: no longer stops at 1,800 — every word goes, in parts', sinceIn('CS1', before).length >= 2 && flatS(sinceIn('CS1', before).map(m => m.content).join('\n')).includes(longDd),
+        `${sinceIn('CS1', before).length} · ${saidOf(ddSlash)}`);
+      dbHandle.prepare("UPDATE quests SET status='completed' WHERE guild_id='G1' AND number=992").run();
+    } finally {
+      guild.members.fetch = realFetchS;
+    }
+    const threwS = loggedS.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
+    console.error = realErrS;
+    ok('nothing in the S walk threw', threwS.length === 0, threwS.slice(0, 3).join('\n        '));
+  }
+
   // ── No button, modal or select id throws on a junk payload ──────────
   {
     const realErrJ = console.error; const loggedJ = [];

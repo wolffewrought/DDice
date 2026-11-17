@@ -49,9 +49,9 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1426 as of 2026-11-17, build R) and no
+Green means every assertion passed (1448 as of 2026-11-17, build S) and no
 scanner found an ERROR. Then run the probe: `node --experimental-sqlite
-probe.js` (436 probes: the fight, encounter, override, autocomplete and
+probe.js` (454 probes: the fight, encounter, override, autocomplete and
 every-leaf walks, the GM-gate walk, chat shorthands, scheduled ticks,
 junk-id lanes, SQL compile, forum seeding and sweep, one NPC one page, the
 A2 walk, the undo walk, the C walk, the D walk (activities: parser,
@@ -64,7 +64,7 @@ the K walk (held advantage, auto Heroes), the L walk (the naturals on the
 specials, a kept hold's answer, the trick's price, stray NPC sheets; and
 L2's slipped holds, a defensive feint of 1, `/deception` refused in a
 fight, the reroll's words, a cleared exchange; M's attacking 20), the P,
-Q and R walks, and a double-ack check). The probe carries a paper-thin fake
+Q, R and S walks, and a double-ack check). The probe carries a paper-thin fake
 `@napi-rs/canvas` since A2 (text measures by length, drawing is a no-op, a
 buffer comes back) so the parchment paths run end to end; verify.js keeps
 the canvas absent on purpose, which is the other path.
@@ -190,6 +190,7 @@ with the statement beneath them.
 | limits · `/npc` at 24/25, `/quest` at 23/25 | Real headroom warning. See §7. |
 | limits · two modals at 5/5 rows | LIMITS.md §2. No sixth field is possible. |
 | limits · two descriptions at 95 and 98 of 100 chars | Real headroom warning; both still fit. |
+| limits · `/config` serializes to ~6,599 of 8,000 | Real headroom warning since build S: the narrator toggle took `/config` to 6,599, one under the builders' 6,600 tripwire, with its descriptions trimmed to fit. The next setting trips both; the tripwire's own note says `/config`'s channels group moves out to a command of its own then — T's call. |
 | rulesets · `handleLibrary` ungated | See §7.3 — a judgement call, not a breach. |
 
 ---
@@ -370,6 +371,19 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 10zzzz · Build S: /narrate, the story follows /edit, /dd's box (2026-11-17)
+
+After build R (pushed as `a119e6b`). Its What's new lines join the `2026-11-17` entry again; if it goes out on a later day, move them to that day's key.
+
+- **`/narrate`** (GM): `text:` and `to:` (completed by `addresseeChoices`, as on `/rp` and `/npc say`), or bare for `narrateModal()` (`narrateform`: Narration, `RP_BOX_MAX`; To, a user picker of 25). `handleNarrate` / `handleNarrateModal` → `sendNarration` (deferred) → `postNarration`: through `npcWebhookIn(chan, gid, NARRATION_NAME, the bot's avatar)`, `rpLineRow()` under it (Reply and GM), `@Name` resolved as in an NPC's line, the picked pinged in a last paragraph; no webhook, the bot says it with `📜 **Narration**` on top (`NARRATION_HEAD_RE`). Logged with `noteQuestActivity(…, 'narration', narrationBeat(paras), gm, { msgId: first part, parts: { who: 'Narration', segs: narrationParas(…) }, whole: 1 })` — every paragraph a `p` seg, kept whole — on any run whose room it is, `record_all` or not (a paused run records nothing, as ever). `QUEST_EVENT_ICON.narration` is 📜.
+- **The story.** `storyEntries` turns a narration into `{ narr: true, segs }`; `storyParas(entries, { narrator })` prints it as prose with a blank line about each paragraph, or — `guild_config.narrator_heading` = 1, set by `/config mechanics narrator enabled:` — under `time - **Narration**` like a speaker (one heading for a run of narration, its paragraphs running on). `runStoryScroll` reads the setting. The previously-on and summary drafts, the campaign recap, the hourly recap, the hour blocks, the timeline and the GM record carry narration.
+- **Gone is gone, whatever the line.** `quest_events.gone` now marks any line taken back, not talk alone: the story, the record, the recaps, the drafts and the timeline skip it.
+- **A recorded line follows its post.** `/rp` lines (`postRpLine`) and NPC words (`postAsNpc`, now logging once posted, through `noteNpcSpeech(…, msgId)`) keep their first part's id in `msg_id`, as narration does. `followLineIntoRecord(guild, gid, headId, contents, { rp })` reads the post again (`lineSegsNow`: narration — the name line and the pings under it out; an `/rp` line — `rpPartsOf` words, the pings under them out; an NPC's — the reply link and the pings out) and rewrites the row; no words left, it is gone; a gone row is never brought back. Called by `saveBotEdit`, `saveBotEditParts` (every part as it reads now) and `deleteBotLine` (`markLineGone` when every part came down). `noteLinesGone` follows `MESSAGE_DELETE` / `_BULK` from the gateway: a single post gone, or a post in parts read again from the parts left.
+- **`/dd`.** `message:` optional; bare, `ddModal({ header, carried })` (Message, `RP_BOX_MAX`; Header, prefilled; Address, a user picker of one). What the command named (channels, the person) waits in `ddPending` (an hour) under `ddform:p`; lost to a restart, the box says so rather than speak here. `handleDd(interaction, given)` serves both; the 1,800 cut is gone (the length net splits), and the answer is deferred while it posts.
+- **Docs.** `/help` (Roleplay, Table Tools, config), the books (Speaking as the Bot, a new Narration section, Fixing What Was Said; the player's Reply paragraph and `/edit`; the examples' Roleplay and a new Narrating the scene), What's new.
+
+**Tests.** verify: a `build S` harness (15) — narration's words, the story both ways, a line read back, the wiring; pins moved for the count (31 commands), `/dd`, `to:`, the label count (12), gone lines, the recap, the fight-card log; 1,448 green, 18 warnings (the new one is `/config` at 6,599, §6). probe: the S walk (18) — the box, a post as Narration with Reply, the record with recording off, paragraphs and a ping, the GM gate, `to:` completion, the story both ways and the toggle, `/edit` on a narration and an `/rp` line, a take-down and a gateway deletion, a long narration in parts, `/dd`'s box, its carried channels, a lost box and the uncut slash; 454 green.
 
 ## 10zzz · Build R: every word in the story, the Raw box, the forums split (2026-11-17)
 

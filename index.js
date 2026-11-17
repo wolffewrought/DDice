@@ -986,6 +986,7 @@ try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_daily_listed TEXT'); } cat
 try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_monthly_month TEXT'); } catch {}    // the month last reported, YYYY-MM
 try { db.exec('ALTER TABLE guild_config ADD COLUMN gm_monthly_counts TEXT'); } catch {}   // command counts at that report, so a month's use is the difference
 try { db.exec('ALTER TABLE guild_config ADD COLUMN forums_split_at INTEGER'); } catch {}   // the one-off move into gm-daily and chronicle
+try { db.exec('ALTER TABLE guild_config ADD COLUMN narrator_heading INTEGER DEFAULT 0'); } catch {} // the story: "time - Narration" over narration (0: the prose alone)
 // A target's row stays keyed by its first card; card_id is the card now
 // carrying the buttons (a fail posts a fresh one below), reason the scene
 // text that card repeats (T, 2026-10-13).
@@ -3900,6 +3901,19 @@ async function handleConfig(interaction, forced) {
     }
     setConfig(gid, updates);
     return interaction.reply({ content: `✅ **${restName}** now restores:\n❤️ HP: **${describe(cur.hp)}**\n🔄 Rerolls: **${describe(cur.rr)}**\n🛡️ Heal: **${describe(cur.heal)}**`, ephemeral: true });
+  }
+
+  if (sub === 'narrator') {
+    // How narration reads in the story (T, 2026-11-17: a toggle, off by default).
+    const v = interaction.options?.getBoolean?.('enabled');
+    if (v === null || v === undefined) {
+      const cur = !!Number(getConfig(gid)?.narrator_heading);
+      return interaction.reply({ ephemeral: true, content: `\u{1F4DC} In the story, narration ${cur ? 'sits under `0h 12m - Narration`, like any speaker' : 'stands on its own, with no name over it (the default)'}. Change it with \`/config mechanics narrator enabled:${cur ? 'false' : 'true'}\`.` });
+    }
+    setConfig(gid, { narrator_heading: v ? 1 : 0 });
+    return interaction.reply({ ephemeral: true, content: v
+      ? '\u{1F4DC} **Narrator heading on.** In the story, narration sits under `0h 12m - Narration`, like any speaker.'
+      : '\u{1F4DC} **Narrator heading off.** In the story, narration stands on its own, with no name over it \u2014 the default.' });
   }
 
   if (sub === 'questspinoff') {
@@ -9630,14 +9644,104 @@ function unvoiceName(name) { return String(name || '').replace(/\u200A/g, ''); }
 // names pinged under it. A fight card in an NPC's name is not speech \u2014
 // the fight keeps its own record, and the words a form gave it are logged
 // when the form comes back \u2014 so postAsNpc logs only what it is handed.
-function noteNpcSpeech(gid, channel, npcName, segs) {
+function noteNpcSpeech(gid, channel, npcName, segs, msgId = null) {
   const list = (segs || []).filter(sg => sg && String(sg.t || '').trim());
   if (!list.length) return;
-  try { noteQuestActivity(gid, channel?.id, 'rp', `${npcName}: ${segsBeat(list)}`, null, { parts: { who: npcName, segs: list } }); } catch {}
+  try { noteQuestActivity(gid, channel?.id, 'rp', `${npcName}: ${segsBeat(list)}`, null, { msgId, parts: { who: npcName, segs: list } }); } catch {}
 }
 // Parts as the log keeps them: a mention named, never carried.
 function segsForLog(guild, segs) {
   return (segs || []).map(sg => ({ k: sg.k, t: cleanTalk(guild, sg.t, { keepLines: true }) })).filter(sg => sg.t);
+}
+
+// ── Narration (T, 2026-11-17) ──
+// "Have narration as a live narration a GM can use": the scene told in its
+// own voice, Narration, under the bot's picture, a Reply under it like a
+// /rp line, and kept on the record of the run whose room it is — as
+// narration, whether or not the run records its talk. The story prints it
+// as prose on its own, or under "time - Narration" when the server asks
+// for the heading (/config mechanics narrator).
+const NARRATION_NAME = 'Narration';
+const NARRATION_HEAD_RE = /^\u{1F4DC} \*\*Narration\*\*\n/u;
+// A post's last paragraph when it is only the people pinged under it.
+function stripPingTail(text) {
+  return String(text || '').replace(/(?:^|\n\n)(?:<@!?\d+>[ \t]*)+\s*$/, '').replace(/\s+$/, '');
+}
+// A narration's paragraphs as the record keeps them: each whole, its lines
+// kept, a mention named rather than carried.
+function narrationParas(guild, text) {
+  return String(text || '').replace(/\r/g, '').split(/\n[ \t]*\n+/)
+    .map(p => cleanTalk(guild, p, { keepLines: true }).trim()).filter(Boolean)
+    .map(t => ({ k: 'p', t }));
+}
+function narrationBeat(paras) {
+  return (paras || []).map(p => String(p.t || '').replace(/\s*\n\s*/g, ' ')).join(' ').trim();
+}
+
+// ── A recorded line follows its post (T, 2026-11-17) ──
+// A narration, an /rp line or an NPC's words keep the post they are, so an
+// /edit, a take-down or a deletion reaches the story: every part read again,
+// the bot's own lines left out — the name line, the reply link, the roll,
+// the names pinged under it. A line taken down is out of the story for good.
+function recordedLines(gid, headId) {
+  try { return db.prepare("SELECT id, kind, text, parts FROM quest_events WHERE guild_id=? AND msg_id=? AND kind IN ('rp','narration') AND COALESCE(gone,0)=0").all(String(gid), String(headId)); } catch { return []; }
+}
+function markLineGone(gid, headId) {
+  try { db.prepare("UPDATE quest_events SET gone=1 WHERE guild_id=? AND msg_id=? AND kind IN ('rp','narration')").run(String(gid), String(headId)); } catch {}
+}
+function lineSegsNow(guild, gid, headId, kind, content, { rp = null } = {}) {
+  const c = String(content || '').replace(/\r/g, '');
+  if (kind === 'narration') return narrationParas(guild, stripPingTail(c.replace(NARRATION_HEAD_RE, '')));
+  const own = rp === null ? !!rpLineOwner(gid, headId) : !!rp;
+  const words = own ? rpPartsOf(c).words : c.replace(RP_REPLY_RE, '');
+  return segsForLog(guild, rpSegments(stripPingTail(words)));
+}
+function followLineIntoRecord(guild, gid, headId, contents, { rp = null } = {}) {
+  const rows = recordedLines(gid, headId);
+  if (!rows.length) return 0;
+  const live = (contents || []).map(c => String(c ?? '')).filter(c => c.trim());
+  if (!live.length) { markLineGone(gid, headId); return rows.length; }
+  const content = live.join('\n');
+  let n = 0;
+  for (const r of rows) {
+    let who = '';
+    try { who = String(JSON.parse(r.parts || 'null')?.who || ''); } catch {}
+    const segs = lineSegsNow(guild, gid, headId, r.kind, content, { rp });
+    try {
+      if (!segs.length) db.prepare('UPDATE quest_events SET gone=1 WHERE id=?').run(r.id);
+      else {
+        const name = r.kind === 'narration' ? NARRATION_NAME : (who || String(r.text || '').split(': ')[0] || 'Someone');
+        const text = r.kind === 'narration' ? narrationBeat(segs) : `${name}: ${segsBeat(segs)}`;
+        db.prepare('UPDATE quest_events SET text=?, parts=?, whole=1 WHERE id=? AND COALESCE(gone,0)=0').run(text, JSON.stringify({ who: name, segs }), r.id);
+      }
+      n++;
+    } catch {}
+  }
+  return n;
+}
+// A recorded line deleted in Discord itself: out of the story — or, when
+// it was one part of a post in parts, the story keeps what is left.
+function noteLinesGone(gid, cid, ids) {
+  const down = new Set((ids || []).map(String).filter(Boolean));
+  if (!down.size) return;
+  const heads = new Map();
+  for (const id of down) {
+    const g = postPartsOf(gid, id);
+    const head = g ? String(g[0].part_id) : id;
+    if (!heads.has(head)) heads.set(head, g);
+  }
+  for (const [head, g] of heads) {
+    if (!recordedLines(gid, head).length) continue;
+    const rest = g ? g.filter(p => !down.has(String(p.part_id))) : [];
+    if (!rest.length) { markLineGone(gid, head); continue; }
+    (async () => {
+      const ch = await client.channels.fetch(String(rest[0].channel_id || cid)).catch(() => null);
+      if (!ch?.messages?.fetch) return;
+      const now = [];
+      for (const p of rest) { const m = await ch.messages.fetch(String(p.part_id)).catch(() => null); if (m) now.push(String(m.content || '')); }
+      followLineIntoRecord(ch.guild || client.guilds?.cache?.get?.(String(gid)) || null, gid, head, now);
+    })().catch(() => {});
+  }
 }
 
 // ── NPC lines: who they may call, and the button under every one ─────────
@@ -9853,7 +9957,6 @@ function offeredActivity(gid, npc, pick) {
 // Every line keeps its row: two people answering the same line each need
 // its Reply (T, 2026-11-06 \u2014 the newest-only rule is gone).
 async function postAsNpc(channel, gid, npcName, content, { interact = false, offer = null, beat = null } = {}) {
-  if (beat) noteNpcSpeech(gid, channel, npcName, beat);
   const npc = getNpc(gid, npcName);
   const guild = channel.guild;
   const resolved = guild ? await resolveNameMentions(guild, content).catch(() => ({ text: content, users: [] })) : { text: content, users: [] };
@@ -9887,6 +9990,12 @@ async function postAsNpc(channel, gid, npcName, content, { interact = false, off
       const plain = await channel.send({ ...payload, ...(row ? { components: [row] } : {}) }).catch(()=>null);
       sent = plain;
     }
+  }
+  // Logged once it is out, with the post it is, so an /edit follows it into
+  // the story (T, 2026-11-17).
+  if (beat && sent && typeof sent === 'object' && sent.id) {
+    const head = (Array.isArray(sent.ddiceParts) && sent.ddiceParts[0]) || sent;
+    noteNpcSpeech(gid, channel, npcName, beat, String(head.id));
   }
   return sent ?? (sent === null ? false : true);
 }
@@ -18375,7 +18484,7 @@ function questEvents(gid, number, sinceMs = null) {
 const QUEST_EVENT_ICON = {
   start: '🚩', pause: '⏸️', resume: '▶️', remind: '⏱️', recap: '📻',
   combat: '⚔️', rp: '🎭', activity: '🎮', note: '📝', end: '🏁',
-  roll: '\u{1F3B2}', talk: '\u{1F4AC}', turn: '\u{1F504}',
+  roll: '\u{1F3B2}', talk: '\u{1F4AC}', turn: '\u{1F504}', narration: '\u{1F4DC}',
 };
 function questEventLine(e) {
   // The log keeps every word for the story (T, 2026-11-17); a line of it in
@@ -18826,7 +18935,7 @@ async function backfillRunArchive(client, guild, gid) {
         `\u{1F3B2} Run by **${runnerName}**`,
         `\u23F1\uFE0F **${fmtElapsed(runMs)}** \u00b7 \u{1F465} ${partyNames.join(', ')}`,
         '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500',
-        ...(events.filter(e => e.kind !== 'talk').map(questEventLine)),
+        ...(events.filter(e => e.kind !== 'talk' && !e.gone).map(questEventLine)),
       ];
       let story = null, recordFile = null;
       try { story = runStoryScroll(gid, q, { runnerName, partyNames, runMs, events, tale: '', nameOf: memberNameOf(guild) }); } catch {}
@@ -19224,7 +19333,7 @@ async function questTick(client) {
         if (now - (Number(q.last_recap_ms) || 0) >= QUEST_RECAP_MS) {
           const since = Number(q.last_recap_ms) || 0;
           const events = questEvents(guild.id, q.number, since)
-            .filter(e => !['remind', 'recap', 'talk'].includes(e.kind));
+            .filter(e => !['remind', 'recap', 'talk'].includes(e.kind) && !e.gone);
           const lines = [`📻 **${questTag(q)}** — **${fmtElapsed(now)}** in. The last hour:`];
           lines.push(...(events.length ? events.map(questEventLine) : ['`      ` _Quiet hour — nothing logged._']));
           logQuestEvent(guild.id, q.number, 'recap', `Hourly recap — ${events.length} event${events.length === 1 ? '' : 's'}`);
@@ -22104,7 +22213,7 @@ async function handleCampaign(interaction) {
     const lines = [`\u{1F4D6} **Previously, on ${camp.name}\u2026**`, ''];
     for (const q of entries.slice(0, 8)) {
       const tale = db.prepare('SELECT text FROM quest_summaries WHERE guild_id=? AND number=? ORDER BY rowid DESC LIMIT 1').get(gid, q.number)?.text;
-      const beats = db.prepare("SELECT text FROM quest_events WHERE guild_id=? AND number=? AND kind IN ('rp','combat','note') ORDER BY at_ms LIMIT 3").all(gid, q.number).map(e => e.text).filter(Boolean);
+      const beats = db.prepare("SELECT text FROM quest_events WHERE guild_id=? AND number=? AND kind IN ('rp','narration','combat','note') AND COALESCE(gone,0)=0 ORDER BY at_ms LIMIT 3").all(gid, q.number).map(e => e.text).filter(Boolean);
       lines.push(`**${questTag(q)}** \u2014 ${tale ? tale.slice(0, 220) : (beats.length ? beats.join('; ').slice(0, 220) : '_nothing logged_')}`);
     }
     const notes = db.prepare('SELECT text FROM campaign_notes WHERE guild_id=? AND campaign_id=? ORDER BY at').all(gid, camp.id);
@@ -22952,7 +23061,7 @@ async function runSoFarFile(guild, gid, live, fallbackGmId = null, { filename = 
   // Talk cut at 300 before build R is read again from its thread, once.
   await mendCutTalk(guild?.client, gid, live).catch(() => 0);
   const events = questEvents(gid, live.number);
-  const beatN = events.filter(e => !['remind', 'recap', 'talk'].includes(e.kind)).length;
+  const beatN = events.filter(e => !['remind', 'recap', 'talk'].includes(e.kind) && !e.gone).length;
   const talkN = events.filter(e => e.kind === 'talk' && !e.gone).length;
   let files = null;
   try { files = runStoryScroll(gid, live, { runnerName, partyNames, runMs, events, tale: '', sofar: true, filename, nameOf: memberNameOf(guild) }).files; }
@@ -22961,8 +23070,8 @@ async function runSoFarFile(guild, gid, live, fallbackGmId = null, { filename = 
     // The printed scroll failed: the same record in plain print, every page.
     const own = filename ? scrollFileName(filename) : null;
     const body = [`Run by ${runnerName}`, `The party: ${partyNames.join(', ') || 'nobody'}`, `It has run for ${fmtElapsed(runMs)} so far.`, '',
-      ...(events.some(e => !['remind', 'recap'].includes(e.kind) && !(e.kind === 'talk' && e.gone))
-        ? events.filter(e => !['remind', 'recap'].includes(e.kind) && !(e.kind === 'talk' && e.gone))
+      ...(events.some(e => !['remind', 'recap'].includes(e.kind) && !e.gone)
+        ? events.filter(e => !['remind', 'recap'].includes(e.kind) && !e.gone)
           .map(e => `${fmtElapsed(e.at_ms)} - ${String(e.text || e.kind).replace(/<@[!&]?\d+>/g, 'someone').replace(/[*_`]+/g, '').replace(/\s*\n\s*/g, ' ')}`)
         : ['Nothing has been written down yet.'])].join('\n');
     files = [{ pdf: makeTextPdf({ title: own?.heading || `${questTag(live)} — so far`, body }), name: `${own?.stem || fileSlug(`${questTag(live)} so far`, 'run-so-far')}.pdf` }];
@@ -22976,7 +23085,7 @@ async function runSoFarFile(guild, gid, live, fallbackGmId = null, { filename = 
 // live summaries before this build), the story so far, the party's review.
 function hourBlocks(events, nowMs) {
   const HOUR = QUEST_RECAP_MS;
-  const ev = (events || []).filter(e => !['remind', 'recap', 'talk'].includes(e.kind));
+  const ev = (events || []).filter(e => !['remind', 'recap', 'talk'].includes(e.kind) && !e.gone);
   const hours = Math.max(1, Math.ceil(Math.max(0, Number(nowMs) || 0) / HOUR));
   const byHour = new Map();
   for (const e of ev) {
@@ -23041,7 +23150,7 @@ function draftEndingFromLog(gid, quest, names) {
   try { evs = db.prepare('SELECT kind, text, gone FROM quest_events WHERE guild_id=? AND number=? ORDER BY at_ms').all(gid, quest.number); } catch {}
   // Seating and leaving are bookkeeping, not story. Recorded talk is
   // counted, and stands in for the story only when nothing else was logged.
-  const story = evs.filter(e => ['rp', 'combat', 'note'].includes(e.kind)).map(e => String(e.text || '').trim())
+  const story = evs.filter(e => ['rp', 'narration', 'combat', 'note'].includes(e.kind) && !e.gone).map(e => String(e.text || '').trim())
     .filter(t => t && !/ (is seated|is taken out|departs before the payout)$/.test(t));
   const talk = evs.filter(e => e.kind === 'talk' && !e.gone).map(e => String(e.text || '').trim()).filter(Boolean);
   const raw = story.length ? story : talk;
@@ -23961,8 +24070,8 @@ async function handleQuest(interaction, forced) {
     const quest = await requireQuest(interaction, gid, forcedNum);
     if (!quest) return;
     const number = quest.number;
-    // A line of talk taken back is not shown again (cold audit).
-    const events = questEvents(gid, number).filter(e => !(e.kind === 'talk' && e.gone));
+    // A line taken back is not shown again (cold audit; an /edit take-down too).
+    const events = questEvents(gid, number).filter(e => !e.gone);
     if (!events.length) return interaction.reply({ content: `📜 **${questTag(quest)}** has nothing logged yet.`, ephemeral: true });
     return replyLong(interaction, [
       `📜 **${questTag(quest)}** — ${quest.paused ? '⏸️ paused at' : 'running,'} **${fmtElapsed(questElapsed(quest))}**`, '',
@@ -24022,7 +24131,7 @@ async function handleQuest(interaction, forced) {
     // Roleplay, combat and notes are the story; rolls are the weather.
     // Consecutive identical beats collapse: a scene where one NPC spoke
     // ten times should read as one line saying so, not ten saying nothing.
-    const storyB = evs.filter(e => ['rp', 'combat', 'note'].includes(e.kind)).map(e => e.text).filter(Boolean);
+    const storyB = evs.filter(e => ['rp', 'narration', 'combat', 'note'].includes(e.kind) && !e.gone).map(e => e.text).filter(Boolean);
     // Recorded talk fills in only when nothing else was logged.
     const rawBeats = storyB.length ? storyB : evs.filter(e => e.kind === 'talk' && !e.gone).map(e => e.text).filter(Boolean);
     const beats = [];
@@ -24173,7 +24282,7 @@ async function handleQuest(interaction, forced) {
     const styleLabel = gmStyleLabel(quest.gm_style);
     // Recorded table talk has its transcripts; the record counts it.
     const talkN = events.filter(e => e.kind === 'talk' && !e.gone).length;
-    const logged = events.filter(e => e.kind !== 'talk');
+    const logged = events.filter(e => e.kind !== 'talk' && !e.gone);
     const summary = [
       `📜 **${questTag(quest)}** — quest summary`,
       `🎲 Run by **${runnerName}**${styleLabel ? ` · ${styleLabel}` : ''}`,
@@ -30085,6 +30194,14 @@ const CHANGELOG = [
         detail: 'A sheet links to its character page; lore, duels and trades to their queue posts; applicants and staged parties to the quest; runs to their rooms; campaigns to their thread; targets to their card; drafts to their shelf thread; reviews to their gm-feedback room.' },
       { line: 'Fixed: a fight card posted in an NPC’s name was logged as the NPC’s speech',
         detail: 'Only what an NPC says through `/npc say` or its boxes goes into the record as its words now; its fight moves are there already, as the fight’s own lines.' },
+      { line: '`/narrate` — live narration: posted as **Narration** under the bot’s picture, with a Reply under it like a `/rp` line; bare, it opens a box for paragraphs with a To picker',
+        detail: '`text:` posts at once, a long one going on in the next message; `to:` takes @people, a group or a knight order and completes as you type. In a run’s room it goes on that run’s record as narration — recording on or off — and so into the story, the timeline, the hourly recap, the previously-on and summary drafts and the GM record.' },
+      { line: 'In the story, narration stands on its own as prose; `/config mechanics narrator enabled:true` puts `0h 12m - Narration` over it, like any speaker',
+        detail: 'Off by default. Standing alone, each paragraph has a blank line about it; under the heading, its paragraphs run on as a speaker’s lines do.' },
+      { line: '`/edit` reaches the story: a narration, `/rp` or NPC line fixed or taken down is fixed or taken out of the run’s story too',
+        detail: 'For lines posted from this build on. A line deleted in Discord itself leaves the story as well, and a post in parts keeps what is left of it. Lines from before keep their first wording in the story.' },
+      { line: '`/dd` left blank opens a box for paragraphs — Message, Header and someone to address; however long, it goes on in the next message',
+        detail: 'The 1,800-character cut is gone. The header, the channels and the person named with the command carry into the box; if the bot restarts while such a box is open, it asks you to run `/dd` again rather than speak somewhere else.' },
     ], player: [
       'Every fight roll you could reroll waits: \u{1F501} Reroll (a token) or ✅ Keep. Go quiet and it is kept. Called checks and `/deception` too',
       'Saves, holds, breaks, deflections, disarms and escapes can be rerolled now',
@@ -30106,6 +30223,7 @@ const CHANGELOG = [
       'The run’s story PDF holds every word now — everything that happened and everything said, in order, each speaker’s lines under their name',
       'Roleplay boxes have a Raw box: `*action*` in asterisks, `"speech"` in quotes — posted in the order you write them',
       'The weekly chronicle has its own forum: **chronicle**',
+      'The GM’s narration posts as **Narration** — press Reply under it to answer the telling',
     ] },
   { key: '2026-11-10', gm: [
       { line: 'Initiative, reworked: natural 20s go first and their first turn holds two actions; natural 1s go last and their first turn is roleplay only; a level total goes to whoever rolled first \u2014 no more rerolls',
@@ -31409,7 +31527,7 @@ function runStoryScroll(gid, quest, { runnerName, partyNames, runMs, events, tal
     `The party: ${partyNames.join(', ') || 'nobody'}`,
     sofar ? `It has run for ${fmtElapsed(runMs)} so far.` : `It ran for ${fmtElapsed(runMs)}.`,
   ]);
-  const story = storyParas(storyEntries(events, nameOf));
+  const story = storyParas(storyEntries(events, nameOf), { narrator: !!Number(getConfig(gid)?.narrator_heading) });
   const paras = [...head, null, ...(story.length ? story : scrollParasOf([sofar ? 'Nothing has been written down yet.' : 'Nothing was written down.'])),
     ...(tale ? [null, ...scrollParasOf(String(tale).split('\n'))] : [])];
   const own = filename ? scrollFileName(filename) : null;
@@ -31841,10 +31959,17 @@ function storyEntries(events, nameOf = null) {
   const named = (t) => String(t ?? '').replace(/<@!?(\d+)>/g, (_, id) => `@${(nameOf && nameOf(id)) || 'someone'}`);
   const out = [];
   for (const e of events || []) {
-    if (['remind', 'recap'].includes(e.kind) || (e.kind === 'talk' && e.gone)) continue;
+    if (['remind', 'recap'].includes(e.kind) || e.gone) continue;
     const at = Number(e.at_ms) || 0;
     let parts = null;
     if (e.parts) { try { parts = JSON.parse(e.parts); } catch { parts = null; } }
+    if (e.kind === 'narration') {
+      // The GM's telling: its paragraphs, each whole (T, 2026-11-17).
+      const segs = (parts && Array.isArray(parts.segs) ? parts.segs : [{ k: 'p', t: String(e.text || '') }])
+        .map(sg => ({ k: 'p', t: named(sg?.t).trim() })).filter(sg => sg.t);
+      if (segs.length) out.push({ at, narr: true, segs });
+      continue;
+    }
     let en = null;
     if (parts && Array.isArray(parts.segs)) {
       const segs = parts.segs.filter(sg => sg && String(sg.t || '').trim()).map(sg => ({ k: sg.k, t: named(sg.t) }));
@@ -31886,7 +32011,7 @@ function oldStoryEntry(e, at, named) {
     .map(p => (/^\u201C[\s\S]*\u201D$/.test(p) ? { k: 's', t: p.slice(1, -1) } : { k: 'a', t: p }));
   return segs.length ? { at, who, segs } : { at, text };
 }
-function storyParas(entries) {
+function storyParas(entries, { narrator = false } = {}) {
   const paras = [];
   let prev = null;
   const seg = (sg) => {
@@ -31897,6 +32022,27 @@ function storyParas(entries) {
   };
   for (const en of entries || []) {
     const time = fmtElapsed(en.at);
+    const linesOf = (sg) => String(sg.t || '').split('\n').map(l => l.trim()).filter(Boolean);
+    if (en.narr) {
+      // Narration: prose on its own, a blank line about each paragraph; with
+      // the server's narrator heading, "time - Narration" over it like any
+      // speaker (T, 2026-11-17: a toggle, off by default).
+      if (narrator) {
+        if (prev !== 'narr') {
+          if (paras.length) paras.push(null);
+          paras.push({ runs: [{ t: `${time} - `, s: 'r' }, { t: NARRATION_NAME, s: 'b' }], head: true });
+        }
+        for (const sg of en.segs) for (const l of linesOf(sg)) paras.push(scrollRuns(l, 'r'));
+        prev = 'narr';
+      } else {
+        for (const sg of en.segs) {
+          if (paras.length) paras.push(null);
+          for (const l of linesOf(sg)) paras.push(scrollRuns(l, 'r'));
+        }
+        prev = 'narr-alone';
+      }
+      continue;
+    }
     if (en.who) {
       const key = `w:${String(en.who).toLowerCase()}`;
       if (prev !== key) {
@@ -33527,7 +33673,7 @@ async function postRpLine(interaction, { action = '', speech = '', raw = '', rol
     try { db.prepare('INSERT OR REPLACE INTO rp_lines (guild_id, message_id, channel_id, user_id, at) VALUES (?,?,?,?,?)').run(gid, String(m.id), chan.id, uid, Date.now()); } catch {}
   }
   notePostParts(gid, chan.id, sentAll);
-  if (words) { try { noteQuestActivity(gid, chan.id, 'rp', `${name}: ${segsBeat(segs)}`, uid, { parts: { who: name, segs: segsForLog(interaction.guild, segs) } }); } catch {} }
+  if (words) { try { noteQuestActivity(gid, chan.id, 'rp', `${name}: ${segsBeat(segs)}`, uid, { msgId: String((sentAll[0] || sent).id), parts: { who: name, segs: segsForLog(interaction.guild, segs) } }); } catch {} }
   // Each roll: its beat in the run's account, the audit, the tallies; the
   // first is saved so `rr` rerolls it as it would a typed roll. A check
   // answered here wrote its beat already, as its button does.
@@ -33678,6 +33824,9 @@ async function deleteBotLine(interaction, msg, channel) {
     return interaction.reply({ ephemeral: true, content: '\u274C A line with a roll stays \u2014 `/edit` can change its words; a GM can take it down.' });
   const before = String(live[0]?.content || '');
   const inThread = typeof channel.isThread === 'function' && channel.isThread();
+  const headId = group ? String(group[0].part_id) : String(msg.id);
+  const wasRp = !!rpLineOwner(gid, headId);
+  const downIds = new Set();
   let gone = 0;
   for (const m of live) {
     const ok = m.webhookId
@@ -33685,9 +33834,14 @@ async function deleteBotLine(interaction, msg, channel) {
       : await m.delete().then(() => true).catch(() => false);
     if (!ok) continue;
     gone++;
+    downIds.add(String(m.id));
     try { db.prepare('DELETE FROM rp_lines WHERE guild_id=? AND message_id=?').run(gid, String(m.id)); } catch {}
   }
-  if (!gone) return interaction.reply({ ephemeral: true, content: '\u274C Discord refused to take it down.' });
+  if (!gone) return interaction.reply({ ephemeral: true, content: '❌ Discord refused to take it down.' });
+  // The story follows: a line taken down whole is out of it; one Discord
+  // left part of stands as what is left (T, 2026-11-17).
+  if (gone === live.length) markLineGone(gid, headId);
+  else followLineIntoRecord(interaction.guild, gid, headId, live.filter(m => !downIds.has(String(m.id))).map(m => String(m.content || '')), { rp: wasRp });
   if (group) { try { db.prepare('DELETE FROM post_parts WHERE guild_id=? AND head_id=?').run(gid, String(group[0].part_id)); } catch {} }
   const who = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'someone');
   sendRollAudit(interaction.client, gid, `\u{1F5D1}\uFE0F Taken down \u2014 **${who}** in <#${channel.id}>: \u201c${before.slice(0, 80)}${before.length > 80 ? '\u2026' : ''}\u201d`);
@@ -33791,14 +33945,26 @@ async function saveBotEditParts(interaction) {
   const inThread = typeof ch.isThread === 'function' && ch.isThread();
   const before = msgs.map(m => String(m.content || '')).join(' ');
   let changed = 0, refused = 0;
+  const okAt = new Set();
   for (let i = 0; i < msgs.length; i++) {
     if (out[i] === String(msgs[i].content || '')) continue;
     const ok = msgs[i].webhookId
       ? await hook.editMessage(msgs[i].id, { content: out[i], ...(inThread ? { threadId: ch.id } : {}) }).then(() => true).catch(() => false)
       : await msgs[i].edit({ content: out[i] }).then(() => true).catch(() => false);
-    if (ok) changed++; else refused++;
+    if (ok) { changed++; okAt.add(i); } else refused++;
   }
-  if (refused && !changed) return no('\u274C Discord refused the edit.');
+  if (refused && !changed) return no('❌ Discord refused the edit.');
+  // The story follows: every part as it reads now (T, 2026-11-17).
+  try {
+    const now = [];
+    for (let k = 0; k < group.length; k++) {
+      const w = k - start;
+      if (w >= 0 && w < msgs.length) { now.push(okAt.has(w) ? out[w] : String(msgs[w].content || '')); continue; }
+      const pm = await ch.messages.fetch(group[k].part_id).catch(() => null);
+      now.push(pm ? String(pm.content || '') : '');
+    }
+    followLineIntoRecord(interaction.guild, gid, String(group[0].part_id), now);
+  } catch {}
   const after = out.join(' ');
   const gmName = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'someone');
   sendRollAudit(interaction.client, gid,
@@ -33864,7 +34030,9 @@ async function saveBotEdit(interaction) {
   } else {
     ok2 = await msg.edit({ content: text.slice(0, 4000) }).then(() => true).catch(() => false);
   }
-  if (!ok2) return interaction.reply({ ephemeral: true, content: '\u274C Discord refused the edit.' });
+  if (!ok2) return interaction.reply({ ephemeral: true, content: '❌ Discord refused the edit.' });
+  // The story follows the edit (T, 2026-11-17).
+  followLineIntoRecord(interaction.guild, gid, String(messageId), [msg.webhookId ? text.slice(0, 2000) : text.slice(0, 4000)]);
   const gmName = await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'someone');
   sendRollAudit(interaction.client, gid,
     `\u270F\uFE0F Edit \u2014 **${gmName}** in <#${channelId}>: \u201c${before.slice(0, 80)}${before.length > 80 ? '\u2026' : ''}\u201d \u2192 \u201c${text.slice(0, 80)}${text.length > 80 ? '\u2026' : ''}\u201d`);
@@ -33876,32 +34044,176 @@ async function saveBotEdit(interaction) {
   return interaction.reply({ ephemeral: true, content: '\u2705 Edited.' });
 }
 
-async function handleDd(interaction) {
+// ── /narrate (T, 2026-11-17) ──
+// Live narration for a GM: typed in `text:`, or \u2014 left blank \u2014 a box for
+// paragraphs with a To picker. Posted as Narration under the bot's picture,
+// in parts when long, with a Reply under it like a /rp line; kept on the
+// record of the run whose room it is, recording on or off.
+function narrateModal() {
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, LabelBuilder, UserSelectMenuBuilder } = require('discord.js');
+  const m = new ModalBuilder().setCustomId('narrateform').setTitle('Narration');
+  m.addLabelComponents(
+    new LabelBuilder().setLabel('Narration').setDescription('Paragraphs as you write them \u2014 posted as Narration, kept in the story')
+      .setTextInputComponent(new TextInputBuilder().setCustomId('text').setStyle(TextInputStyle.Paragraph)
+        .setRequired(true).setMaxLength(RP_BOX_MAX).setPlaceholder('The rain thickens as the gate groans open.')),
+    new LabelBuilder().setLabel('To (optional)').setDescription('Up to 25, named under it and pinged')
+      .setUserSelectMenuComponent(new UserSelectMenuBuilder().setCustomId('to').setPlaceholder('Who it is for').setMinValues(0).setMaxValues(25).setRequired(false)),
+  );
+  return m;
+}
+async function postNarration(interaction, chan, { text, to = [] }) {
+  const gid = interaction.guild.id;
+  const words = String(text || '').replace(/\r/g, '').trim();
+  const pings = [...new Set((to || []).map(String))].filter(id => !words.includes(`<@${id}>`)).slice(0, ADDRESS_CAP);
+  const body = [words, pings.map(id => `<@${id}>`).join(' ')].filter(Boolean).join('\n\n');
+  // @Name in the words becomes a mention, as in an NPC's line; only people
+  // are ever pinged.
+  const resolved = await resolveNameMentions(interaction.guild, body).catch(() => ({ text: body, users: [] }));
+  const users = [...new Set([...pings, ...(resolved.users || []).map(String)])].slice(0, ADDRESS_CAP);
+  const payload = { content: resolved.text, allowedMentions: { parse: [], users } };
+  const face = interaction.client?.user?.displayAvatarURL?.() || null;
+  const row = rpLineRow();
+  let sent = null;
+  try {
+    const hook = await npcWebhookIn(chan, gid, NARRATION_NAME, face);
+    if (hook) {
+      try { sent = await hook.send({ ...payload, components: [row] }); }
+      catch (err) {
+        // A hook someone else made cannot carry buttons; the words still go.
+        if (!/component|50006|owned|application/i.test(String(err?.message || ''))) throw err;
+        sent = await hook.send(payload);
+      }
+    }
+  } catch (err) { console.error('[narrate] webhook -', err?.message || err); sent = null; }
+  if (!sent?.id) {
+    // No webhook to be had here: the bot says it, with the name on top.
+    sent = await chan.send({ ...payload, content: `\u{1F4DC} **${NARRATION_NAME}**\n${payload.content}`, components: [row] }).catch(() => null);
+  }
+  if (!sent?.id) return null;
+  const head = (Array.isArray(sent.ddiceParts) && sent.ddiceParts[0]) || sent;
+  const paras = narrationParas(interaction.guild, words);
+  if (paras.length) {
+    try {
+      noteQuestActivity(gid, chan.id, 'narration', narrationBeat(paras), interaction.user.id,
+        { msgId: String(head.id), parts: { who: NARRATION_NAME, segs: paras }, whole: 1 });
+    } catch {}
+  }
+  return sent;
+}
+async function handleNarrate(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ ephemeral: true, content: '\u274C Only GMs narrate.' });
+  const text = (interaction.options.getString('text') || '').trim();
+  const toRaw = (interaction.options.getString('to') || '').trim();
+  if (!text) {
+    if (toRaw) return interaction.reply({ ephemeral: true, content: '\u274C Nothing to narrate \u2014 add `text:` to go with `to:`, or leave everything blank for the box (it has a To picker).' });
+    return interaction.showModal(narrateModal());
+  }
+  const toR = toRaw ? await resolveAddressees(interaction.guild, gid, toRaw) : null;
+  return sendNarration(interaction, { text, to: toR ? toR.ids : [], toInfo: toR });
+}
+async function handleNarrateModal(interaction) {
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ ephemeral: true, content: '\u274C Only GMs narrate.' });
+  const text = String(interaction.fields.getTextInputValue('text') || '').trim();
+  if (!text) return interaction.reply({ ephemeral: true, content: '\u274C The box was empty \u2014 nothing posted.' });
+  let to = [];
+  try { to = [...(interaction.fields.getSelectedUsers?.('to', false)?.values?.() || [])].map(u => u.id); } catch { to = []; }
+  return sendNarration(interaction, { text, to });
+}
+async function sendNarration(interaction, { text, to = [], toInfo = null }) {
+  // Touching Discord can be slow: the answer is deferred first, so the box
+  // never reads "not responding" with the words already out.
+  await interaction.deferReply({ ephemeral: true });
+  const answer = (content) => interaction.editReply({ content, allowedMentions: { parse: [] } });
+  const chan = await interactionChannel(interaction);
+  if (!chan?.send) return answer(MSG_NO_ACCESS_HERE);
+  const sent = await postNarration(interaction, chan, { text, to });
+  if (!sent) return answer('\u274C I could not post in this channel \u2014 check my permissions here.');
+  const runs = activeQuestsInChannel(interaction.guild.id, chan.id).filter(q => !q.paused);
+  return answer([
+    '\u{1F4DC} Narrated.',
+    runs.length ? `Kept in the story of ${runs.map(q => `**${questTag(q)}**`).join(', ')}.` : '',
+    '`/edit` fixes the words or takes it back \u2014 the story follows.',
+    toInfo ? addressNote({ total: (toInfo.ids || []).length, groups: toInfo.groups || [], missed: toInfo.missed || [], empty: toInfo.empty || [], dropped: toInfo.dropped || 0 }) : '',
+  ].filter(Boolean).join('\n'));
+}
+
+// /dd left blank: a box for paragraphs (T, 2026-11-17). The header typed
+// rides in it; the channels and the person named wait for it here, and a
+// box whose wait was lost to a restart says so rather than speak elsewhere.
+const ddPending = new Map();
+function ddModal({ header = '', carried = false } = {}) {
+  const { ModalBuilder, TextInputBuilder, TextInputStyle, LabelBuilder, UserSelectMenuBuilder } = require('discord.js');
+  const m = new ModalBuilder().setCustomId(carried ? 'ddform:p' : 'ddform').setTitle('Speak as the bot');
+  const head = new TextInputBuilder().setCustomId('header').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(100).setPlaceholder('A bold line above it');
+  if (header) head.setValue(String(header).slice(0, 100));
+  m.addLabelComponents(
+    new LabelBuilder().setLabel('Message').setDescription('Paragraphs as you write them; a long one goes on in the next message')
+      .setTextInputComponent(new TextInputBuilder().setCustomId('message').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(RP_BOX_MAX)),
+    new LabelBuilder().setLabel('Header (optional)').setDescription('A bold line above the words').setTextInputComponent(head),
+    new LabelBuilder().setLabel('Address (optional)').setDescription(carried ? 'Someone named above the words \u2014 blank keeps anyone you named' : 'Someone named above the words, and pinged')
+      .setUserSelectMenuComponent(new UserSelectMenuBuilder().setCustomId('user').setPlaceholder('Someone to address by name').setMinValues(0).setMaxValues(1).setRequired(false)),
+  );
+  return m;
+}
+async function handleDdModal(interaction) {
+  const gid = interaction.guild.id;
+  if (!(await isGm(interaction.guild, interaction.user.id)))
+    return interaction.reply({ content: '\u274C Only GMs can speak as the bot.', ephemeral: true });
+  const key = `${gid}:${interaction.user.id}`;
+  const pend = ddPending.get(key) || null;
+  ddPending.delete(key);
+  if (interaction.customId === 'ddform:p' && !pend)
+    return interaction.reply({ ephemeral: true, content: '\u274C What you named with the command was lost \u2014 the bot restarted while the box was open. Run `/dd` again.' });
+  const message = String(interaction.fields.getTextInputValue('message') || '').trim();
+  if (!message) return interaction.reply({ ephemeral: true, content: '\u274C The box was empty \u2014 nothing said.' });
+  let header = '';
+  try { header = String(interaction.fields.getTextInputValue('header') || '').trim(); } catch { header = ''; }
+  let picked = null;
+  try { picked = [...(interaction.fields.getSelectedUsers?.('user', false)?.values?.() || [])][0]?.id || null; } catch { picked = null; }
+  return handleDd(interaction, { message, header, userId: picked || pend?.userId || null, ids: pend?.ids || [] });
+}
+
+async function handleDd(interaction, given = null) {
   // Speaking AS the bot, in the room. Plain by default: no header, no
   // voice, just the words \u2014 a header only if the GM writes one, and as
   // many channels as they name (T, 2026-09-13).
   const gid = interaction.guild.id;
   if (!(await isGm(interaction.guild, interaction.user.id)))
     return interaction.reply({ content: '\u274C Only GMs can speak as the bot.', ephemeral: true });
-  const message = interaction.options.getString('message').trim();
-  const header = (interaction.options.getString('header') || '').trim().slice(0, 100);
-  const target = interaction.options.getUser('user');
-  const raw = (interaction.options.getString('channels') || '').trim();
+  // From the box, what it carried; from the command, its options.
+  const message = given ? String(given.message || '').trim() : (interaction.options.getString('message') || '').trim();
+  const header = (given ? String(given.header || '') : (interaction.options.getString('header') || '')).trim().slice(0, 100);
+  const target = given ? (given.userId ? { id: String(given.userId) } : null) : interaction.options.getUser('user');
+  const raw = given ? '' : (interaction.options.getString('channels') || '').trim();
 
   // Channels: mentions (<#id>) or bare ids; nothing named means here.
   const ids = [...raw.matchAll(/<#(\d+)>|\b(\d{15,22})\b/g)].map(m => m[1] || m[2]);
-  const wanted = ids.length ? [...new Set(ids)] : [interaction.channel?.id].filter(Boolean);
+  if (!given && !message) {
+    const carried = ids.length > 0 || !!target;
+    const now = Date.now();
+    for (const [k, v] of ddPending) if (now - v.at > 3600000) ddPending.delete(k);
+    if (carried) ddPending.set(`${gid}:${interaction.user.id}`, { ids: [...new Set(ids)], userId: target?.id || null, at: now });
+    return interaction.showModal(ddModal({ header, carried }));
+  }
+  const named = given?.ids?.length ? given.ids : ids;
+  const wanted = named.length ? [...new Set(named)] : [interaction.channel?.id].filter(Boolean);
   const rooms = [];
   for (const id of wanted) {
     const ch = await interaction.client.channels.fetch(id).catch(() => null);
     if (ch?.send && ch.guildId === gid) rooms.push(ch);
   }
-  if (!rooms.length) return interaction.reply({ ephemeral: true, content: '\u274C None of those are channels I can speak in.' });
+  if (!rooms.length) return interaction.reply({ ephemeral: true, content: '❌ None of those are channels I can speak in.' });
+  // Several rooms, a long message in parts: the answer waits on all of it.
+  await interaction.deferReply({ ephemeral: true });
 
   const body = [
     header ? `**${header}**` : null,
     target ? `<@${target.id}>` : null,
-    message.slice(0, 1800),
+    // However long: a long one goes on in the next message (T, 2026-11-17).
+    message,
   ].filter(Boolean).join('\n');
 
   const said = [], failed = [];
@@ -33916,8 +34228,8 @@ async function handleDd(interaction) {
   sendRollAudit(interaction.client, gid,
     `\u{1F4EC} DD \u2014 **${gmName}** in ${said.join(' ') || '(nowhere)'}${header ? ` \u00b7 header \u201c${header}\u201d` : ''}: ${message.slice(0, 120)}${message.length > 120 ? '\u2026' : ''}`);
 
-  return interaction.reply({ ephemeral: true, content: [
-    said.length ? `\u2705 Said in ${said.join(', ')}.` : '',
+  return interaction.editReply({ content: [
+    said.length ? `✅ Said in ${said.join(', ')}.` : '',
     failed.length ? `\u274C Could not post in ${failed.join(', ')} \u2014 check my permissions there.` : '',
   ].filter(Boolean).join('\n') });
 }
@@ -35608,6 +35920,8 @@ const slashCommands = [
       .addBooleanOption(o=>o.setName('remove').setDescription('true = forget the stored font').setRequired(false)));
       g.addSubcommand(s=>s.setName('questspinoff').setDescription('Approving on the board births a numbered run and clears the entry')
       .addBooleanOption(o=>o.setName('enabled').setDescription('true = board quests spin off runs on the first approval').setRequired(true)));
+      g.addSubcommand(s=>s.setName('narrator').setDescription('Narration in the story: under a heading, or prose alone')
+      .addBooleanOption(o=>o.setName('enabled').setDescription('true = "time - Narration" over it; off by default').setRequired(false)));
       g.addSubcommand(s=>s.setName('cleanwebhooks').setDescription('Free up spare NPC voices — Discord only allows so many per channel'));
       return g;
     }),
@@ -36541,10 +36855,16 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
 
   new SlashCommandBuilder()
     .setName('dd').setDescription('Speak as the bot \u2014 keeps the game separate from you (GM)')
-    .addStringOption(o=>o.setName('message').setDescription('What to say').setRequired(true))
+    .addStringOption(o=>o.setName('message').setDescription('What to say — blank opens a box for paragraphs').setRequired(false))
     .addStringOption(o=>o.setName('header').setDescription('A bold line above it \u2014 blank for none').setRequired(false))
     .addUserOption(o=>o.setName('user').setDescription('Someone to address by name').setRequired(false))
-    .addStringOption(o=>o.setName('channels').setDescription('Where to say it \u2014 #one #two #three; blank means here').setRequired(false)),
+    .addStringOption(o=>o.setName('channels').setDescription('Where to say it — #one #two #three; blank means here').setRequired(false)),
+
+  // Live narration (T, 2026-11-17): the scene in its own voice, kept in the story.
+  new SlashCommandBuilder()
+    .setName('narrate').setDescription('Narrate the scene — posted as Narration, kept in the run’s story; blank opens a box (GM)')
+    .addStringOption(o=>o.setName('text').setDescription('What happens — blank opens a box for paragraphs').setRequired(false))
+    .addStringOption(o=>o.setName('to').setDescription('Who it is for: @people, a group or a knight order, commas between — pinged under it').setRequired(false).setAutocomplete(true)),
 
   // /edit — the Edit (DDice) box without the Apps menu: a dropdown only the
   // GM sees of the last lines the bot and its NPCs said here; a pick opens
@@ -36695,7 +37015,7 @@ const HELP_CATEGORIES = {
       '**5 · Fights** — a GM opens one with `/fight start` and initiative sets the order. On your turn, tap a stat on the card (or `/fight atk stat:str`): with one foe it opens the form at once, with more a menu asks whom first. Every button — attack, defence, Grapple, Feint, Deflect, Disarm, the holds, Save, Insight — opens a short form, what you do and what you say, both optional; your words sit on the card. The defender answers with a stat of their own, either side may spend a token on 🔁 Reroll, and ⚖️ Resolve settles the exchange — a GM\'s press asks what happens. Every turn line carries everyone\'s HP. A quiet spell (ten minutes unless the GM sets otherwise) and the bot pings whoever the fight is waiting on, once a turn. When it all ends, a 🏁 result and a full recap post on their own.',
       '**6 · Duels** — `/duel opponent:@Players terms:first blood` raises one. A GM signs it off and starts the fight.',
       '**7 · Quests** — `/quest board` shows what\'s posted. Tap **Apply** on a quest post (or `/quest party apply number:N`), a GM approves the party, and merits pay out when it completes.',
-      '**Roleplay** — `/rp` opens the boxes the fight buttons do \u2014 what you do, what you say, and **Raw** for longer writing (`*action*` in asterisks, `"speech"` in quotes, each part posted on its own line in the order you write it) \u2014 with a **stat to roll** and any **dice** beside them, and posts it all in your name; `/rp action:… speech:… roll:… dice:…` skips the box. A stat roll answers a check the GM called on you there; `rr` rerolls an ordinary one. Every line, yours and the NPCs\u2019, carries \u{1F4AC} **Reply**: the box again, as a reply that links back to the line. Inside a run your words go on its timeline and into the story \u2014 every word, under your name. Every roleplay box has Raw: the fight forms, a target\u2019s strike, a lost first turn. `/edit` fixes the words of a line of yours afterwards (the roll stays), `/edit delete:true` takes it back.',
+      '**Roleplay** — `/rp` opens the boxes the fight buttons do \u2014 what you do, what you say, and **Raw** for longer writing (`*action*` in asterisks, `"speech"` in quotes, each part posted on its own line in the order you write it) \u2014 with a **stat to roll** and any **dice** beside them, and posts it all in your name; `/rp action:… speech:… roll:… dice:…` skips the box. A stat roll answers a check the GM called on you there; `rr` rerolls an ordinary one. Every line, yours, the NPCs’ and the GM’s **Narration**, carries \u{1F4AC} **Reply**: the box again, as a reply that links back to the line. Inside a run your words go on its timeline and into the story \u2014 every word, under your name. Every roleplay box has Raw: the fight forms, a target\u2019s strike, a lost first turn. `/edit` fixes the words of a line of yours afterwards (the roll stays), `/edit delete:true` takes it back — the story follows either way.',
       '**8 · Activities** — minigames written for this server: branching scenes with rolls and rewards. `/activity list` to browse, `/activity run name:Fishing` to start one here. When a scene asks for a roll, just type the stat word — `wis`, or `wis steady does it` to add flavour — and the story moves.',
       '**9 · Renown & merits** — renown is the coin quests, encounters and activities pay out; spend it as the server allows (`/standing renown view`). Merits are lifetime honour that only climbs, and ranks hang off them (`/standing merit view`, `/standing rank list`). You can offer merit to a friend with `/standing merit give` — a GM signs it off. GMs move the coin with `/standing renown gain/loss`.',
       '**10 · Death** — characters can fall. That call belongs to a GM: a memorial is posted, the sheet locks, and the fallen keep their history. Revival is possible when the story allows it.',
@@ -37069,6 +37389,7 @@ const HELP_CATEGORIES = {
       '`/config channels approvals list:true` — every sheet still waiting, read from the database so nothing is lost if a post failed',
       '`/config channels approvalforum forum:#gm-approvals` — one forum, a thread per approval type: sheets, trades, duels, lore, exports (Admin)',
       '`/config mechanics npcstats enabled:true` — reveal NPC stat blocks on roll cards · hidden by default (Admin)',
+      '`/config mechanics narrator enabled:true` — in the story, narration under `0h 12m - Narration`, like any speaker; off (the default), the prose stands on its own (Admin)',
       '`/config channels npcchannel #channel` — set the NPC avatar channel',
       '`/config mechanics rest type:Short Rest hp:50% rerolls:0%` — tune what a rest restores (use % of max or a flat number)',
       '`/config mechanics questspinoff enabled:true` — turns the board into a job wall (Admin). The first approval starts a numbered run, like `#002.2`.',
@@ -37081,7 +37402,7 @@ const HELP_CATEGORIES = {
   },
   tools: {
     title: '\u{1F9F0} Table Tools',
-    blurb: 'buttons, targets, group checks, roleplay, feedback, speaking as the bot',
+    blurb: 'buttons, targets, group checks, roleplay, narration, feedback, speaking as the bot',
     body: [
       '_Things a GM plants in the channel for the table to press, and the ways players talk back._',
       '`/rp [action:] [speech:] [roll:] [dice:]` \u2014 roleplay as your character: bare opens the box (what you do, what you say \u2014 4,000 characters each \u2014 a stat to roll from this server\u2019s own, any dice); filled, it posts at once, a long one carried on into the next message with the roll beneath the last. The line goes out in your name and face, shaped as the cards are \u2014 *action*, \u201cspeech\u201d, then the roll beneath \u2014 and inside a run it is a \u{1F3AD} beat on the timeline and in the story scroll, the roll a roll in its log. A roll keeps the marks and signatures a typed one obeys, and `rr` rerolls it; a **stat roll answers a check the GM called on you here**, on the card\u2019s terms. Every line carries 💬 **Reply**, and beside it 🎭 **GM**: a GM answers the line as any NPC — those heard there lately first — the answer jumping back to it. A GM’s `/rp` also takes `to:` and its box a To picker; a player’s pings nobody. `/edit` fixes the words afterwards, `/edit delete:true` takes it back',
@@ -37089,9 +37410,10 @@ const HELP_CATEGORIES = {
       '`/button group stat:wis dc:12 reason:...` \u2014 one check the whole party rolls; the message keeps the tally and \u2696\uFE0F Call it closes it with how many got through (GM)',
       '`/timer set [hours:] [minutes:] [seconds:] players:@Artorius @Players [note:]` \u2014 a countdown, 5 seconds to 24 hours: the card counts down with \u274C Cancel, and on time \u23F0 Time\u2019s up rings here, pinging the players and roles named, on the second \u2014 due while the bot was away, it rings on its return, marked late \u00b7 `/timer list` \u00b7 `/timer cancel number:` (GM)',
       '`/target create name:Barricade [dc:12] [stat:Flat d20, STR, DEX] [dice:2d6+1] [hp:3] [for:@Players] [audience:@Artorius @Meliora @GMs] [success_flavour:] [fail_flavour:] [write:true]` \u2014 something to strike, with no sheet. `for:` addresses one player, `audience:` several and/or a role \u2014 only they may swing, and the card names them. `hp:` is the hits it takes: with a DC a roll that meets it takes one off with no call, with no DC each pass you call does; it falls at 0. `write:true` opens a box for the scene and the two flavours instead of typing them into options. A d20 unless `dice:` says otherwise; `stat:` lists as few or as many stats as you like, one button each in that order \u2014 leave it out and all five are buttons; leave `dc:` out and every blow is your call. A press opens a short form \u2014 what they do, what they say, both optional \u2014 and the words land above the roll. A natural 20 beats it (**Roll critically succeeds**) and a natural 1 fails (**Roll critically fails**) on their own, each posting your flavour if set; anything else says **The roll succeeds / fails** and asks you \u2014 **The player passes the check** / **The player fails the check** \u2014 each opening a *What happens?* form prefilled with your flavour (blank still sends the verdict). A fail posts the card again below with its buttons and a counter; `secret:true` asks in the GM log and tells the players **Roll succeeds / fails** in theirs \u00b7 `/target list` \u2014 what stands here, with a \u{1FAA6} button per target to retire it without a swing',
-      '`/dd message:... [header:] [user:@Players] [channels:#one #two]` \u2014 speak AS THE BOT: plain words by default, a bold header only if you write one, in every channel you name (or here); who said it goes to the roll-audit, not the room (GM)',
+      '`/dd message:... [header:] [user:@Players] [channels:#one #two]` \u2014 speak AS THE BOT: plain words by default, a bold header only if you write one, in every channel you name (or here); leave `message:` blank for a box of paragraphs — however long, it goes on in the next message; who said it goes to the roll-audit, not the room (GM)',
+      '`/narrate [text:] [to:]` — live narration: posted as **Narration** under the bot\u2019s picture, with \u{1F4AC} Reply under it like a `/rp` line; bare, it opens a box for paragraphs (4,000) with a To picker of twenty-five; `to:` takes @people, a group or a knight order, commas between, and completes as you type. In a run\u2019s room it goes on that run\u2019s record as narration, recording on or off \u2014 the story, the timeline, the hourly recap, the drafts. In the story it stands on its own as prose, or under `0h 12m - Narration` with `/config mechanics narrator enabled:true` (GM)',
       '**Edit (DDice)** \u2014 long-press any message the bot sent \u2192 Apps \u2192 Edit (DDice): the text opens prefilled, save replaces it, the roll-audit records what changed. Covers the bot\'s own messages and NPC speech from `/npc say` alike; a line said through a webhook that has since been deleted cannot be edited by anyone \u2014 delete it and say it again (GM)',
-      '`/edit [delete:true]` \u2014 the same box without the Apps menu: a dropdown only you see lists the last 25 lines the bot and its NPCs said here, newest first; pick one and the text opens prefilled; `delete:true` takes the picked line down instead. `link:` a message link or id goes straight to it. Nothing shows in the channel. Players get the same for their own `/rp` lines. A line carrying only Reply, GM or Interaction is listed and keeps its buttons; a player sees only their own words \u2014 the roll beneath and the reply link stay the bot\u2019s. A post carried on into several messages is one post: every part opens in one form, and `delete:true` takes every part down',
+      '`/edit [delete:true]` \u2014 the same box without the Apps menu: a dropdown only you see lists the last 25 lines the bot and its NPCs said here, newest first; pick one and the text opens prefilled; `delete:true` takes the picked line down instead. `link:` a message link or id goes straight to it. Nothing shows in the channel. Players get the same for their own `/rp` lines. A line carrying only Reply, GM or Interaction is listed and keeps its buttons; a player sees only their own words \u2014 the roll beneath and the reply link stay the bot\u2019s. A post carried on into several messages is one post: every part opens in one form, and `delete:true` takes every part down. A narration, `/rp` or NPC line fixed or taken down is fixed or taken out of the run\u2019s story too; one deleted in Discord itself leaves it as well',
       '`/feedback send [room:] [quest:]` \u2014 name a room to go straight to the form, or leave it blank for a menu; score it out of ten, say your piece; only GMs see it. Name a run you were on (or ran) and the card says which',
       '`/feedback category add|remove|list` \u2014 the rooms feedback lands in (GM) \u00b7 `/button feedback` plants a standing feedback button',
       '_A completed run posts its own \u{1F4DD} review button in its thread, and so does a wind-down \u2014 for those who played the run, seated or since departed, one review each; `/quest show` then carries the count, the average \u2b50 and the latest lines._',
@@ -38253,9 +38575,9 @@ async function handleInteraction(interaction) {
         const v = String(focusedOption.value || '').toLowerCase();
         return await interaction.respond(acPick(listStories(interaction.guild.id).map(r => r.name), v));
       }
-      // `to:` on /npc say and /rp: orders, groups and people, the last piece
-      // after a comma completed (T, 2026-11-17).
-      if (focusedOption.name === 'to' && ((acCmd === 'npc' && acSub === 'say') || acCmd === 'rp')) {
+      // `to:` on /npc say, /rp and /narrate: orders, groups and people, the
+      // last piece after a comma completed (T, 2026-11-17).
+      if (focusedOption.name === 'to' && ((acCmd === 'npc' && acSub === 'say') || acCmd === 'rp' || acCmd === 'narrate')) {
         return await interaction.respond(await addresseeChoices(interaction.guild, acGid, acTyped));
       }
       if (interaction.commandName === 'npc' && (focusedOption.name === 'talk' || focusedOption.name === 'offer')) {
@@ -38575,6 +38897,8 @@ async function handleInteraction(interaction) {
     if (interaction.customId.startsWith('botedit:')) return saveBotEdit(interaction);
     if (interaction.customId.startsWith('boteditp:')) return saveBotEditParts(interaction);
     if (interaction.customId === 'rpform' || interaction.customId.startsWith('rpform:')) return handleRpModal(interaction);
+    if (interaction.customId === 'narrateform') return handleNarrateModal(interaction);
+    if (interaction.customId === 'ddform' || interaction.customId.startsWith('ddform:')) return handleDdModal(interaction);
     if (interaction.customId.startsWith('tgtrp:')) {
       const [, msgId, pick] = interaction.customId.split(':');
       return strikeTarget(interaction, msgId, pick).catch(e => console.error('[target]', e?.message || e));
@@ -38915,6 +39239,7 @@ async function handleInteraction(interaction) {
     if (interaction.commandName === 'session') return await handleSession(interaction);
     if (interaction.commandName === 'initiative') return await handleSessionInitiative(interaction);
     if (interaction.commandName === 'dd') return await handleDd(interaction);
+    if (interaction.commandName === 'narrate') return await handleNarrate(interaction);
     if (interaction.commandName === 'edit') return await handleEdit(interaction);
     if (interaction.commandName === 'rp') return await handleRp(interaction);
     if (interaction.commandName === 'timer') return await handleTimer(interaction);
@@ -38997,8 +39322,8 @@ client.on('raw', (packet) => {
     const t = packet?.t, d = packet?.d;
     if (!d?.guild_id) return;
     if (t === 'MESSAGE_UPDATE' && typeof d.content === 'string' && !d.author?.bot) noteTalkEdited(d);
-    else if (t === 'MESSAGE_DELETE') noteTalkGone([d.id]);
-    else if (t === 'MESSAGE_DELETE_BULK') noteTalkGone(d.ids || []);
+    else if (t === 'MESSAGE_DELETE') { noteTalkGone([d.id]); noteLinesGone(String(d.guild_id), String(d.channel_id || ''), [d.id]); }
+    else if (t === 'MESSAGE_DELETE_BULK') { noteTalkGone(d.ids || []); noteLinesGone(String(d.guild_id), String(d.channel_id || ''), d.ids || []); }
     // Typing is a sign of life for the turn clock (2026-11-07).
     else if (t === 'TYPING_START' && d.user_id && d.channel_id) {
       const g = String(d.guild_id), u = String(d.user_id);

@@ -1418,7 +1418,9 @@ const EXPORTS = ['chunkLines', 'rulesFor', 'abilityNeeds', 'belowBar', 'resolveD
   // Build R (2026-11-17): the raw parser, the story by rule 1, the printed
   // scroll and its names, the waiting list, the UK clock.
   'rpSegments', 'formSegments', 'segsToPost', 'composeNpcSay', 'RAW_PART_NOTE', 'cleanTalk', 'storyEntries', 'storyParas', 'printScroll',
-  'scrollPlain', 'scrollFileName', 'makeTextPdf', 'waitingLine', 'waitingLines', 'ukMidnight', 'lastMonth', 'ukDayKey'];
+  'scrollPlain', 'scrollFileName', 'makeTextPdf', 'waitingLine', 'waitingLines', 'ukMidnight', 'lastMonth', 'ukDayKey',
+  // Build S (2026-11-17): narration's words, a line read back after an edit.
+  'stripPingTail', 'narrationParas', 'narrationBeat', 'lineSegsNow', 'NARRATION_NAME'];
 
 let loaded = null;
 function loadIndex(src) {
@@ -1457,8 +1459,8 @@ function testBuilders(src) {
                      'help', 'library', 'npc', 'quest', 'quiz', 'roll', 'spell', 'standing']) {
       ok(`/${n} is registered`, !!by[n]);
     }
-    ok('thirty commands registered \\u2014 /campaign joined 2026-09-24, /edit 2026-10-13, /rp and /existence 2026-10-15; /encounter became /instance and the old /instance /session 2026-11-06; /initiative 2026-11-10; /health and /heal 2026-11-15; /timer 2026-11-17',
-      cmds.length === 30 && cmds.some(c => c.name === 'timer') && cmds.some(c => c.name === 'health') && cmds.some(c => c.name === 'heal') && cmds.some(c => c.name === 'initiative') && cmds.some(c => c.name === 'instance') && cmds.some(c => c.name === 'session') && !cmds.some(c => c.name === 'encounter') &&
+    ok('thirty-one commands registered \\u2014 /campaign joined 2026-09-24, /edit 2026-10-13, /rp and /existence 2026-10-15; /encounter became /instance and the old /instance /session 2026-11-06; /initiative 2026-11-10; /health and /heal 2026-11-15; /timer and /narrate 2026-11-17',
+      cmds.length === 31 && cmds.some(c => c.name === 'narrate') && cmds.some(c => c.name === 'timer') && cmds.some(c => c.name === 'health') && cmds.some(c => c.name === 'heal') && cmds.some(c => c.name === 'initiative') && cmds.some(c => c.name === 'instance') && cmds.some(c => c.name === 'session') && !cmds.some(c => c.name === 'encounter') &&
       cmds.some(c => c.name === 'campaign') && cmds.some(c => c.name === 'edit') && cmds.some(c => c.name === 'rp') && cmds.some(c => c.name === 'existence'));
     // /edit: the private route to the Edit (DDice) box. The list is the
     // bot's own and NPC lines only, buttons excluded, newest first, and a
@@ -1484,7 +1486,7 @@ function testBuilders(src) {
     // (rewritten 2026-09-13: plain by default \u2014 no header unless written,
     // no NPC voice at all, and as many channels as the GM names.)
     ok('/dd is plain by default and speaks in every channel named',
-      /async function handleDd\(interaction\)/.test(src) &&
+      /async function handleDd\(interaction, given = null\)/.test(src) &&
       /setName\('header'\)\.setDescription\('A bold line above it/.test(src) &&
       /header \? `\*\*\$\{header\}\*\*` : null,/.test(src) &&
       /const ids = \[\.\.\.raw\.matchAll\(\/<#\(\\d\+\)>\|\\b\(\\d\{15,22\}\)\\b\/g\)\]/.test(src) &&
@@ -2624,7 +2626,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /function groupMembers\(gid, name\)/.test(src) && /function orderMembers\(gid, order\)/.test(src) && /async function addresseeChoices\(guild, gid, typed\)/.test(src) &&
       // The boxes' Groups list moved to `to:`, which completes as it is typed (build R).
       /\.addStringOption\(o=>o\.setName\('to'\)\.setDescription\('Who it is for: @people, a group or a knight order[^\n]*\.setAutocomplete\(true\)\)/.test(src) &&
-      /if \(focusedOption\.name === 'to' && \(\(acCmd === 'npc' && acSub === 'say'\) \|\| acCmd === 'rp'\)\)/.test(src) &&
+      /if \(focusedOption\.name === 'to' && \(\(acCmd === 'npc' && acSub === 'say'\) \|\| acCmd === 'rp' \|\| acCmd === 'narrate'\)\)/.test(src) &&
       /const everyone = \[\.\.\.new Set\(\[\.\.\.picked, \.\.\.groupPicks\.flatMap\(v => expandGroupPick\(gid, v\)\)\]\)\];/.test(src) &&
       /allowedMentions: \{ parse: \[\], users: resolved\.users\.slice\(0, ADDRESS_CAP\) \}/.test(src));
     ok('a player may fix or take back only their own /rp lines through /edit; GMs keep everything the bot said',
@@ -2676,9 +2678,10 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /'approvalforum', 'gmarchive'\]\);/.test(src) && /const chA = forced\?\.channel \?\? interaction\.options\?\.getChannel\?\.\('forum'\);/.test(src) &&
       /\/\/ Reopened and finished again: the first post gives way to this one\./.test(src) &&
       /const archiveThreadOpening = new Map\(\);/.test(src) && /if \(!failed\) setConfig\(gid, \{ run_archive_backfilled: Date\.now\(\) \}\);/.test(src) &&
-      /SELECT kind, text, at_ms, gone FROM quest_events/.test(src) && /questEvents\(gid, number\)\.filter\(e => !\(e\.kind === 'talk' && e\.gone\)\)/.test(src) &&
-      // The story drops deleted talk; an answer's jump header was never words (build R: postAsNpc logs only the parts it is handed).
-      /if \(\['remind', 'recap'\]\.includes\(e\.kind\) \|\| \(e\.kind === 'talk' && e\.gone\)\) continue;/.test(src) && /if \(beat\) noteNpcSpeech\(gid, channel, npcName, beat\);/.test(src));
+      /SELECT kind, text, at_ms, gone FROM quest_events/.test(src) && /questEvents\(gid, number\)\.filter\(e => !e\.gone\)/.test(src) &&
+      // The story drops what was taken back (build S: any line, not talk alone); an answer's jump
+      // header was never words (build R: postAsNpc logs only the parts it is handed, once posted since build S).
+      /if \(\['remind', 'recap'\]\.includes\(e\.kind\) \|\| e\.gone\) continue;/.test(src) && /noteNpcSpeech\(gid, channel, npcName, beat, String\(head\.id\)\);/.test(src));
     ok('the rest of build I, 5e: the auto-fight shows the modifier it added, an NPC card shows the six and AC, /char set makes no bare sheet',
       (src.match(/⚡ \$\{it\.dex\} DEX = \*\*\$\{it\.total\}\*\*/g) || []).length === 2 && !/⚡ \$\{f\.stats\.dex\} DEX/.test(src) &&
       /\/\/ 5e \(cold audit\): no rerolls, no Luck, HP from the statblock\./.test(src) &&
@@ -2755,7 +2758,8 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       // Nine since 2026-11-07: the initiative's Add NPCs box adds its two.
       // Eleven since 2026-11-15: a fight's Add NPCs box has Friendly and Their HP.
       // Ten since build R: the two Groups lists went; /rp's box adds Dice apart.
-      (src.match(/addLabelComponents\(/g) || []).length === 10);
+      // Twelve since build S: /narrate's box and /dd's.
+      (src.match(/addLabelComponents\(/g) || []).length === 12);
     // Under every NPC line: Reply for players, GM for the speak-as box, and
     // Interaction only when the GM offered an activity on that line; the
     // line itself is action · speech · who it is for, a blank line between.
@@ -2901,9 +2905,9 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     // The cold audit of build H (2026-11-06): what it found, pinned.
     ok('recorded talk is its own kind: in the scroll, every word and in its parts (build R), counted in the GM record, out of the hourly recap; nothing re-shown pings',
       /logQuestEvent\(gid, r\.number, 'talk', line, message\.author\.id, \{ msgId: String\(message\.id\), parts, whole: 1 \}\);/.test(src) &&
-      /\.filter\(e => !\['remind', 'recap', 'talk'\]\.includes\(e\.kind\)\);/.test(src) &&
+      /\.filter\(e => !\['remind', 'recap', 'talk'\]\.includes\(e\.kind\) && !e\.gone\);/.test(src) &&
       /if \(ch\) await sendLong\(ch, lines, \{ allowedMentions: \{ parse: \[\] \} \}\);/.test(src) &&
-      /const logged = events\.filter\(e => e\.kind !== 'talk'\);/.test(src) &&
+      /const logged = events\.filter\(e => e\.kind !== 'talk' && !e\.gone\);/.test(src) &&
       (src.match(/files: storyFiles, allowedMentions: \{ parse: \[\] \}/g) || []).length === 2 &&
       /\|\| !!parseStatShorthand\(c, gid\)/.test(src));
     ok('a DEX check is a stat, not notation, and a bad notation spends no mark; whatever /rp rolls next spends the mark, dice too (2026-11-07)',
@@ -2948,7 +2952,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       // A name that does not resolve is rescued only in the run's own thread (cold audit, 2026-11-06).
       /if \(\(!askedName \|\| \(L\.err && hereRun\?\.run_thread_id === hereCid\)\) && hereRun\)/.test(src));
     ok('a recap carries what was said, in its parts, and collapses repeats',
-      /noteQuestActivity\(gid, channel\?\.id, 'rp', `\$\{npcName\}: \$\{segsBeat\(list\)\}`, null, \{ parts: \{ who: npcName, segs: list \} \}\)/.test(src) &&
+      /noteQuestActivity\(gid, channel\?\.id, 'rp', `\$\{npcName\}: \$\{segsBeat\(list\)\}`, null, \{ msgId, parts: \{ who: npcName, segs: list \} \}\)/.test(src) &&
       /if \(last && last\.text === b\) \{ last\.n\+\+; continue; \}/.test(src));
     // Players can join a running fight, mirroring addnpc; placement is
     // next-or-last because initiative is not stored once the order stands.
@@ -2958,7 +2962,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       (() => {
         const hi = src.indexOf('const HELP_CATEGORIES');
         const h = src.slice(hi, src.indexOf('\n};', hi));
-        return ['/button roll', '/button group', '/target create', '/dd message', '/feedback send',
+        return ['/button roll', '/button group', '/target create', '/dd message', '/narrate', '/feedback send',
                 '/quest run winddown', '/quest run recap', '/quest run note', '/session add',
                 '/gm override interject', 'pages|roster', '/fight add', 'temp:true', '/npc temp',
                 '/standing title', '/standing association', 'Who is excluded', 'Maintain the hold',
@@ -3899,6 +3903,75 @@ function testBuildO(mod, src) {
 // order written; the story printed by rule 1 with its faces inside, named,
 // in numbered parts past the file limit; the waiting list with dates and
 // links; the forums split.
+// Build S (2026-11-17): /narrate \u2014 live narration as Narration, kept in
+// the story as prose (or under a heading the server asks for); /edit and a
+// deletion reach the story; /dd's box and no cut.
+function testBuildS(mod, src) {
+  return harness('build S', (ok, eq) => {
+    const { stripPingTail, narrationParas, narrationBeat, lineSegsNow, storyEntries, storyParas, scrollPlain, NARRATION_NAME } = mod;
+    // ── narration's words ──
+    eq('the names pinged under a post are not its words', [stripPingTail('The gate opens.\n\n<@1> <@22>'), stripPingTail('Hello <@1>'), stripPingTail('<@1>')], ['The gate opens.', 'Hello <@1>', '']);
+    eq('a narration is kept as its paragraphs, each whole, a mention named', narrationParas(null, 'The rain thickens.\nThe gate groans.\n\n\nBeyond it, silence. <@5>'),
+      [{ k: 'p', t: 'The rain thickens.\nThe gate groans.' }, { k: 'p', t: 'Beyond it, silence. @someone' }]);
+    eq('its line on the timeline runs on', narrationBeat([{ k: 'p', t: 'A.\nB.' }, { k: 'p', t: 'C.' }]), 'A. B. C.');
+    // ── the story ──
+    const N = (segs) => JSON.stringify({ who: 'Narration', segs });
+    const ev = [
+      { at_ms: 0, kind: 'start', text: 'Run launched' },
+      { at_ms: 60000, kind: 'narration', text: 'x', parts: N([{ k: 'p', t: 'The rain thickens.\nThe gate groans.' }, { k: 'p', t: 'Beyond it, silence.' }]) },
+      { at_ms: 61000, kind: 'rp', actor: '1', text: 'x', parts: JSON.stringify({ who: 'Ann', segs: [{ k: 's', t: 'Hold.' }] }) },
+      { at_ms: 62000, kind: 'narration', text: 'x', parts: N([{ k: 'p', t: 'Thunder.' }]) },
+      { at_ms: 63000, kind: 'narration', text: 'x', gone: 1, parts: N([{ k: 'p', t: 'Taken back.' }]) },
+      { at_ms: 64000, kind: 'rp', actor: '1', text: 'x', gone: 1, parts: JSON.stringify({ who: 'Ann', segs: [{ k: 's', t: 'Taken back too.' }] }) },
+    ];
+    eq('narration stands on its own as prose, a blank line about each paragraph; a line taken back is out, whatever it was',
+      scrollPlain(storyParas(storyEntries(ev))), '0h 00m - Run launched\n\nThe rain thickens.\nThe gate groans.\n\nBeyond it, silence.\n\n0h 01m - Ann\n“Hold.”\n\nThunder.');
+    const on = storyParas(storyEntries(ev), { narrator: true });
+    eq('with the narrator heading, "time - Narration" over it like any speaker, its paragraphs running on',
+      scrollPlain(on), '0h 00m - Run launched\n\n0h 01m - Narration\nThe rain thickens.\nThe gate groans.\nBeyond it, silence.\n\n0h 01m - Ann\n“Hold.”\n\n0h 01m - Narration\nThunder.');
+    ok('the heading\'s name in bold', on.some(p => p && p.head && p.runs?.[1]?.t === NARRATION_NAME && p.runs?.[1]?.s === 'b'));
+    // ── a line read back after an edit ──
+    eq('a narration read again: the name line on top and the names pinged under it left out',
+      lineSegsNow(null, 'G', 'M', 'narration', '\u{1F4DC} **Narration**\nThe rain.\n\nThe gate.\n\n<@1> <@2>'), [{ k: 'p', t: 'The rain.' }, { k: 'p', t: 'The gate.' }]);
+    eq('an /rp line read again: the name line, the reply link, the roll and the pings left out',
+      lineSegsNow(null, 'G', 'M', 'rp', '\u{1F3AD} **Ann**\n-# ↪ replying\n*waves*\n"Hi"\n\n\u{1F3B2} 1d20 → 14\n\n<@1>', { rp: true }), [{ k: 'a', t: 'waves' }, { k: 's', t: 'Hi' }]);
+    eq('an NPC\'s line read again: the reply link and the names under it left out',
+      lineSegsNow(null, 'G', 'M', 'rp', '-# ↪ Ann: Hi\n*nods*\n\n"Fine."\n\n<@1>', { rp: false }), [{ k: 'a', t: 'nods' }, { k: 's', t: 'Fine.' }]);
+    // ── the wiring ──
+    ok('/narrate: GM-only; bare, the box \u2014 Narration (4,000) and a To picker of twenty-five; text: posts at once; to: completes as on /rp',
+      /\.setName\('narrate'\)\.setDescription\('Narrate the scene[^\n]*\(GM\)'\)\s*\n\s*\.addStringOption\(o=>o\.setName\('text'\)[^\n]*\.setRequired\(false\)\)\s*\n\s*\.addStringOption\(o=>o\.setName\('to'\)[^\n]*\.setAutocomplete\(true\)\),/.test(src)
+        && /if \(interaction\.commandName === 'narrate'\) return await handleNarrate\(interaction\);/.test(src) && /if \(interaction\.customId === 'narrateform'\) return handleNarrateModal\(interaction\);/.test(src)
+        && /new ModalBuilder\(\)\.setCustomId\('narrateform'\)\.setTitle\('Narration'\)/.test(src) && /\.setCustomId\('text'\)\.setStyle\(TextInputStyle\.Paragraph\)\s*\n\s*\.setRequired\(true\)\.setMaxLength\(RP_BOX_MAX\)/.test(src)
+        && (src.match(/Only GMs narrate\./g) || []).length === 2 && /return interaction\.showModal\(narrateModal\(\)\);/.test(src));
+    ok('it posts as Narration through the channel\'s voice, a Reply under it, the bot saying it with the name on top when there is no webhook',
+      /const hook = await npcWebhookIn\(chan, gid, NARRATION_NAME, face\);/.test(src) && /const row = rpLineRow\(\);/.test(src)
+        && /content: `\\u\{1F4DC\} \*\*\$\{NARRATION_NAME\}\*\*\\n\$\{payload\.content\}`/.test(src) && /const NARRATION_HEAD_RE = \/\^\\u\{1F4DC\} \\\*\\\*Narration\\\*\\\*\\n\/u;/.test(src));
+    ok('in a run\'s room it is on the record as narration, with its post \u2014 recording on or off \u2014 and the answer waits on the posting',
+      /noteQuestActivity\(gid, chan\.id, 'narration', narrationBeat\(paras\), interaction\.user\.id,\s*\n\s*\{ msgId: String\(head\.id\), parts: \{ who: NARRATION_NAME, segs: paras \}, whole: 1 \}\);/.test(src)
+        && /async function sendNarration\(interaction, \{ text, to = \[\], toInfo = null \}\) \{[\s\S]{0,200}?await interaction\.deferReply\(\{ ephemeral: true \}\);/.test(src)
+        && /narration: '\\u\{1F4DC\}',/.test(src));
+    ok('the story prints it as prose, or under the heading the server asks for; the drafts, the recaps and the record carry it; a line taken back is out of all of them',
+      /storyParas\(storyEntries\(events, nameOf\), \{ narrator: !!Number\(getConfig\(gid\)\?\.narrator_heading\) \}\)/.test(src)
+        && /ALTER TABLE guild_config ADD COLUMN narrator_heading INTEGER DEFAULT 0/.test(src) && /setConfig\(gid, \{ narrator_heading: v \? 1 : 0 \}\);/.test(src)
+        && /g\.addSubcommand\(s=>s\.setName\('narrator'\)/.test(src)
+        && (src.match(/evs\.filter\(e => \['rp', 'narration', 'combat', 'note'\]\.includes\(e\.kind\) && !e\.gone\)/g) || []).length === 2
+        && /kind IN \('rp','narration','combat','note'\) AND COALESCE\(gone,0\)=0/.test(src) && (src.match(/!\['remind', 'recap', 'talk'\]\.includes\(e\.kind\) && !e\.gone/g) || []).length === 3);
+    ok('/edit reaches the story: an edit, a part edit and a take-down follow into the record; a deletion in Discord too; /rp and NPC lines keep their posts',
+      /followLineIntoRecord\(interaction\.guild, gid, String\(messageId\), \[msg\.webhookId \? text\.slice\(0, 2000\) : text\.slice\(0, 4000\)\]\);/.test(src)
+        && /followLineIntoRecord\(interaction\.guild, gid, String\(group\[0\]\.part_id\), now\);/.test(src)
+        && /if \(gone === live\.length\) markLineGone\(gid, headId\);/.test(src)
+        && /noteLinesGone\(String\(d\.guild_id\), String\(d\.channel_id \|\| ''\), \[d\.id\]\);/.test(src)
+        && /\{ msgId: String\(\(sentAll\[0\] \|\| sent\)\.id\), parts: \{ who: name, segs: segsForLog\(interaction\.guild, segs\) \} \}/.test(src)
+        && /UPDATE quest_events SET text=\?, parts=\?, whole=1 WHERE id=\? AND COALESCE\(gone,0\)=0/.test(src));
+    ok('/dd: message: may be left blank for a box \u2014 Message, Header, someone to address \u2014 what the command named waits for it; no cut; the answer waits on the posting',
+      /\.addStringOption\(o=>o\.setName\('message'\)\.setDescription\('What to say [^\n]*\.setRequired\(false\)\)/.test(src)
+        && /if \(!given && !message\) \{/.test(src) && /return interaction\.showModal\(ddModal\(\{ header, carried \}\)\);/.test(src)
+        && /if \(interaction\.customId === 'ddform:p' && !pend\)/.test(src) && !/message\.slice\(0, 1800\)/.test(src)
+        && /if \(interaction\.customId === 'ddform' \|\| interaction\.customId\.startsWith\('ddform:'\)\) return handleDdModal\(interaction\);/.test(src)
+        && /\/\/ Several rooms, a long message in parts: the answer waits on all of it\.\s*\n\s*await interaction\.deferReply\(\{ ephemeral: true \}\);/.test(src));
+  });
+}
+
 function testBuildR(mod, src) {
   return harness('build R', (ok, eq) => {
     const { rpSegments, formSegments, segsToPost, composeNpcSay, RAW_PART_NOTE, cleanTalk, storyEntries, storyParas, printScroll,
@@ -3966,7 +4039,7 @@ function testBuildR(mod, src) {
       (src.match(/rawLabel\(\)/g) || []).length === 4 && (src.match(/\.\.\.rpRows\(\)/g) || []).length === 3 && /rowField\('raw', 'Raw \(optional\)', \{ placeholder: RAW_PART_NOTE \}\)/.test(src)
         && /if \(!gm\) m\.addLabelComponents\(new LabelBuilder\(\)\.setLabel\('Dice \(optional\)'\)/.test(src));
     ok('a fight card in an NPC\'s name is not logged as its speech: only a line handed its parts is',
-      /if \(beat\) noteNpcSpeech\(gid, channel, npcName, beat\);/.test(src) && (src.match(/postAsNpc\([^)]*beat/g) || []).length === 3);
+      /if \(beat && sent && typeof sent === 'object' && sent\.id\) \{/.test(src) && (src.match(/postAsNpc\([^)]*beat/g) || []).length === 3);
     ok('the forums split: gm-daily, gm-weekly (gm-digest renamed in place), gm-monthly and chronicle; the move runs once and leaves what others wrote in',
       ["name: 'gm-daily'", "name: 'gm-weekly'", "name: 'gm-monthly'", "name: 'chronicle'"].every(n => src.includes(n)) && /if \(Number\(cfg\.forums_split_at\) > 0\) return \[\];/.test(src)
         && /weekly\.edit\(\{ name: 'gm-weekly', topic: about\.slice\(0, 1000\) \}\)/.test(src) && /const msgs = await botOnlyMessages\(client, x\.t\);\s*if \(!msgs\) \{ kept\+\+; continue; \}/.test(src));
@@ -4318,7 +4391,7 @@ function main() {
     }
     if (missing.length) console.log(`${C.yel}!${C.off} load                   ${C.dim}not exported: ${missing.join(', ')}${C.off}`);
 
-    for (const r of [testBuilders(src), testRules(mod), testPins(src), testBuildI(mod), testBuildJ(mod), testBuildK(mod), testBuildL(mod), testBuildN(src), testBuildO(mod, src), testBuildQ(mod, src), testBuildR(mod, src)]) {
+    for (const r of [testBuilders(src), testRules(mod), testPins(src), testBuildI(mod), testBuildJ(mod), testBuildK(mod), testBuildL(mod), testBuildN(src), testBuildO(mod, src), testBuildQ(mod, src), testBuildR(mod, src), testBuildS(mod, src)]) {
       assertions += r.pass;
       if (r.fails.length) {
         failedSteps.push(r.name);

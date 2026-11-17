@@ -160,3 +160,9 @@ New verbs join their group; the wall is history until a single group nears 25.
 - (build R) gm-daily's list heads its thread in one message: when a restart opened the thread early, what will not fit in the head follows beneath the restart reports.
 - (build R) gm-monthly's command use is the lifetime counts less the last report's; the first report counts from the beginning.
 - (build R) A since-date where none was kept: an applicant from before build R takes the quest's creation, a run winding down takes its last activity, a draft takes when it was last written.
+- (build S, 2026-11-17) Narration speaks through the channel's shared webhook as "Narration" with the bot's picture; where no webhook can be had, the bot says it with "📜 **Narration**" on top.
+- (build S) `/edit` reaches the story only for lines posted from build S on: older `/rp` and NPC lines carry no post on the record and keep their first wording in the story.
+- (build S) An edit that leaves a line no words — only the names pinged — takes it out of the story; a line taken out never comes back.
+- (build S) A post in parts that loses a part in Discord itself keeps the words of the parts left, read again a moment after the deletion.
+- (build S) What `/dd` named (channels, a person) waits for its box an hour, in memory: after a restart the box asks for `/dd` again.
+- (build S) `/config` is at 6,599 of the builders' 6,600 tripwire (Discord's wall is 8,000): the next setting needs its channels group moved out, or the tripwire raised.
