@@ -1449,8 +1449,8 @@ function testBuilders(src) {
                      'help', 'library', 'npc', 'quest', 'quiz', 'roll', 'spell', 'standing']) {
       ok(`/${n} is registered`, !!by[n]);
     }
-    ok('twenty-seven commands registered \\u2014 /campaign joined 2026-09-24, /edit 2026-10-13, /rp and /existence 2026-10-15; /encounter became /instance and the old /instance /session 2026-11-06; /initiative 2026-11-10',
-      cmds.length === 27 && cmds.some(c => c.name === 'initiative') && cmds.some(c => c.name === 'instance') && cmds.some(c => c.name === 'session') && !cmds.some(c => c.name === 'encounter') &&
+    ok('twenty-nine commands registered \\u2014 /campaign joined 2026-09-24, /edit 2026-10-13, /rp and /existence 2026-10-15; /encounter became /instance and the old /instance /session 2026-11-06; /initiative 2026-11-10; /health and /heal 2026-11-15',
+      cmds.length === 29 && cmds.some(c => c.name === 'health') && cmds.some(c => c.name === 'heal') && cmds.some(c => c.name === 'initiative') && cmds.some(c => c.name === 'instance') && cmds.some(c => c.name === 'session') && !cmds.some(c => c.name === 'encounter') &&
       cmds.some(c => c.name === 'campaign') && cmds.some(c => c.name === 'edit') && cmds.some(c => c.name === 'rp') && cmds.some(c => c.name === 'existence'));
     // /edit: the private route to the Edit (DDice) box. The list is the
     // bot's own and NPC lines only, buttons excluded, newest first, and a
@@ -1509,7 +1509,7 @@ function testBuilders(src) {
       /key: 'attack-nat20'/.test(src) && /const hit = atkNat === atkSides \|\| atkRoll >= defRoll;/.test(src)
         && /if \(fight\.atk_nat === 20\) return refuse\('[^']*A \*\*natural 20\*\* cannot be deflected/.test(src)
         && /if \(fight\.atk_nat === 20\) return refuse\('[^']*A \*\*natural 20\*\* cannot be disarmed/.test(src)
-        && src.indexOf("cannot be disarmed") < src.indexOf("const disarmed = nat === 20 || (nat !== 1 && total > fight.atk_roll);")
+        && src.indexOf("cannot be disarmed") < src.indexOf("const disarmed = !unstoppable && (nat === 20 || (nat !== 1 && total > fight.atk_roll));")
         && /f0\.current_target === meId && !f0\.atk_kind && f0\.atk_nat === 20\) \{\s*return interaction\.reply\(\{ ephemeral: true, content: '[^']*A \*\*natural 20\*\* cannot be read/.test(src)
         && src.indexOf('cannot be read') < src.indexOf("setEffectFlag(gid, cid, meId, 'feintDef');")
         && /if \(hit && fight\.def_nat <= rrMax && \(fight\.atk_nat !== 20 \|\| fight\.def_nat === 1\)\) await tryReroll\(defenderId, 'def'\);/.test(src)
@@ -1521,7 +1521,8 @@ function testBuilders(src) {
     ok('RULES: ties keep the hold on grapple, escape and a kept hold; the naturals speak first',
       /key: 'grapple-hold'/.test(src) &&
       /const grappled = aNat === 1 \? false : aNat === 20 \? true : nat === 20 \? false : fight\.atk_roll >= total;/.test(src) &&
-      /const free = nat === 20 \|\| \(nat !== 1 && total > holdTotal\);/.test(src) &&
+      // (build P: whoever starts the roll wins twenty against twenty — a kept hold of 20 holds.)
+      /const clash = nat === 20 && holdNat === 20;\s*const free = !clash && \(nat === 20 \|\| \(nat !== 1 && total > holdTotal\)\);/.test(src) &&
       (src.match(/await settleBreak\(/g) || []).length === 2);
     ok('RULES: one quest at a time exempts winding-down runs and encounters',
       /key: 'one-quest'/.test(src) && /COALESCE\(q\.kind, 'quest'\) != 'encounter'/.test(src) && /COALESCE\(q\.winding_down, 0\) = 0\s*\n\s*LIMIT 1/.test(src));
@@ -2026,8 +2027,9 @@ function testBuilders(src) {
       /const clash = atkNat === atkSides && defNat === defSides;/.test(src) &&
       /if \(defNat === defSides && !clash\) return \{ hit: false, dmg: 0, detail: 'parried' \};/.test(src) &&
       /const hit = atkNat === atkSides \|\| atkRoll >= defRoll;/.test(src) && /Twenty meets twenty!/.test(src));
-    ok('the damage numbers are untouched: 1, +1, +1, 4',
-      /let dmg = 1;\s*\n\s*if \(atkNat === atkSides\) dmg \+= 1;\s*\n\s*if \(defNat === 1\) dmg \+= 1;\s*\n\s*if \(atkNat === atkSides && defNat === 1\) dmg \+= 1;/.test(src));
+    ok('the damage ladder (2026-11-15): a base \u2014 1, or a custom effect\u2019s \u2014 doubled by an attacking 20 and again by a defending 1; at a base of 1 the old numbers, 1, 2, 2, 4',
+      /let dmg = Math\.max\(1, Math\.floor\(Number\(ctx\?\.base\) \|\| 1\)\);\s*\n\s*if \(atkNat === atkSides\) dmg \*= 2;\s*\n\s*if \(defNat === 1\) dmg \*= 2;/.test(src)
+        && /damage: \(atkRoll, atkNat, atkSides, defRoll, defNat, defSides, ctx = \{\}\) => \{/.test(src));
     ok('the riposte banks on every defending 20 — the carry has no mutual exception, in the manual fight or the auto one',
       /if \(defNat === 20\) \{\s*\n\s*ensure\(defenderId\)\.rollBonus = 2;/.test(src) &&
       !/defNat === 20 && atkNat !== 20/.test(src) && !/d\.nat === 20 && a\.nat !== 20/.test(src) &&
@@ -2133,8 +2135,8 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /held by \$\{await nameOf\(gmap\[fid\]\)\}/.test(src) &&
       /holding \$\{await nameOf\(c\)\}/.test(src) &&
       /\$\{turnPing\(gid, nextF\)\}\$\{hpLine\}\$\{state\}/.test(src));
-    ok('every turn line carries everyone\'s HP (NPCs only when the table may see their stats) and the fighter\'s conditions tick when their turn comes round',
-      /async function fightHpLine\(guild, gid, cid, order\)/.test(src) && /const show = npcStatsVisible\(gid\);/.test(src) &&
+    ok('every turn line carries everyone\'s HP (an NPC\'s only when its HP is shown) and the fighter\'s conditions tick when their turn comes round',
+      /async function fightHpLine\(guild, gid, cid, order\)/.test(src) && /\$\{r\.isNpc && !npcHpShown\(gid, r\.name\) \? /.test(src) &&
       /function tickConditions\(gid, cid, fid, name\)/.test(src) && /for \(const l of tickConditions\(gid, cid, order\[index\], nextF\.name\)\) lines\.push\(l\);/.test(src) &&
       /async function gmCondition\(interaction\)/.test(src) && /if \(gmSub === 'condition'\) return await gmCondition\(interaction\);/.test(src) &&
       /slot\.conditions = \[\.\.\.others, \{ text, turns: turns \|\| null \}\]\.slice\(0, 8\);/.test(src));
@@ -2219,9 +2221,9 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         return /fact:deflect/.test(defBlock) && /fact:disarm/.test(defBlock) && /fact:grapple/.test(defBlock)
             && !/fact:deflect/.test(atkBlock) && /fact:disarm/.test(atkBlock) && /fact:grapple/.test(atkBlock) && !/fact:feint/.test(defBlock);
       })() &&
-      /return handleFight\(interaction, \{ sub: 'act', action: p\.kind, targetId: pendingAttacker, flavour \}\);/.test(src) &&
+      /return handleFight\(interaction, \{ sub: 'act', action: p\.kind, targetId: pendingAttacker, npc: p\.npc \|\| null, flavour \}\);/.test(src) &&
       /\? String\(forced\.action\)\.toLowerCase\(\)/.test(src) &&
-      /async function offerAbilityTarget\(interaction, which\)/.test(src) &&
+      /async function offerAbilityTarget\(interaction, which, asNpc = null\)/.test(src) &&
       /startsWith\('frp:'\)/.test(src));
     // A button's path must pass through the same rules as the command's:
     // the feint modal goes via handleFight, and the grapple select never
@@ -2233,7 +2235,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('a plain attack sets its own kind',
       (src.match(/atk_sides: 20,\s*\n\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*atk_kind: null,/g) || []).length >= 2);
     ok('the feint modal obeys the once-per-fight rule and the WIS bar',
-      /return handleFight\(interaction, \{ sub: 'act', action: 'feint', targetId: p\.targetId, feintText: claim, flavour \}\);/.test(src) &&
+      /return handleFight\(interaction, \{ sub: 'act', action: 'feint', targetId: p\.targetId, feintText: claim, npc: p\.npc \|\| null, flavour \}\);/.test(src) &&
       /\? forced\.feintText : null\) \|\| interaction\.options\?\.getString\?\.\('feint'\)/.test(src));
     ok('the grapple select hands straight to the runner',
       !/Going for the hold/.test(src));
@@ -2244,9 +2246,9 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     // (rewritten 2026-11-09: the captive answers the grip — break free or
     // stay — and the grappler's turn ends on the answer.)
     ok('keeping a hold is a STR roll the captive answers, and the holder\u2019s turn ends on the answer',
-      /async function runFightMaintain\(interaction, \{ flavour = null \} = \{\}\)/.test(src) &&
+      /async function runFightMaintain\(interaction, \{ flavour = null, actorId: asId = null \} = \{\}\)/.test(src) &&
       /phase: 'defend', current_target: heldId, atk_kind: 'hold',/.test(src) &&
-      /components = fightAnswerRows\('breakfree'\);/.test(src) &&
+      /components = fightAnswerRows\('breakfree', \{ pair: pairM \}\);/.test(src) &&
       /async function resolveBreakFree\(guild, gid, cid, fight, \{ roll = null, flavour = null \} = \{\}\)[\s\S]{0,4200}?return passTurn\(guild, gid, cid, hpState, order, roster, floor, lines, holderId\);/.test(src));
     // Build L (2026-11-09): the naturals on every special, a kept hold's
     // answer, the held wound once a round, the price of a trick.
@@ -2267,7 +2269,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         && /const res = await passTurn\(guild, gid, cid, hpState, \[\.\.\.turnOrder\], turnOrder, floor, lines, actorId\);\s*await deliver\(lines\);/.test(src)
         && /const res = await passTurn\(interaction\.guild, gid, cid, hpState, \[\.\.\.turnOrder\], turnOrder, fightFloor\(fight\), lines, attackerId\);/.test(src));
     ok('a kept hold: the captive or a GM for an NPC answers by button or slash; a quiet captive stays; an NPC on auto struggles; a hold of 20 makes the break flat',
-      /\['fsave', 'finsight', 'fresolve', 'frr', 'fbreak', 'fstay', 'fnretrieve', 'fnroleplay'\]\.includes\(interaction\.customId\)/.test(src)
+      /\['fsave', 'finsight', 'fresolve', 'frr', 'fkeep', 'fbreak', 'fstay', 'fnretrieve', 'fnroleplay'\]\.includes\(interaction\.customId\)/.test(src)
         && /openFightRp\(interaction, 'breakfree', \{ npc: npcB \}/.test(src) && /case 'stay':\s*return handleFight\(interaction, \{ sub: 'act', action: 'stay'/.test(src)
         && /if \(fight\.phase === 'defend' && fight\.atk_kind === 'hold' && fight\.current_target === actorId\)\s*return runFightBreakFree\(/.test(src)
         && /if \(fight\.atk_kind === 'hold'\) \{\s*\/\/ A captive gone quiet stays in the hold/.test(src)
@@ -2289,16 +2291,17 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         && /function consumeFooled\(gid, cid, fid\) \{[\s\S]{0,400}?delete slot\.fooled; delete slot\.fooledDis;[\s\S]{0,200}?return dis \? 'dis' : true;/.test(src)
         && /return ch\.next_mark === 'flatdis' \? 'dis' : true;/.test(src)
         && /const flatMode = \(flat, mode\) => \(flat === 'dis' \? 'dis' : flat \? 'normal' : mode\);/.test(src));
-    ok('/deception (2026-11-10): the totals decide, ties to the mark; a 1 fails outright and no other natural counts; both rolls spend a flat mark, an NPC\u2019s too; the deceiver pays; no cooldown',
-      /const botched = a\.nat === 1;\s*const fooled = !botched && a\.r\.total > d\.r\.total;/.test(src)
+    ok('/deception: the naturals speak first, as a feint\u2019s do (2026-11-15) \u2014 a 1 fails outright, a 20 fools whatever the insight, then the mark\u2019s 20 sees through and their 1 is taken in; otherwise the totals, ties to the mark; both rolls spend a flat mark, an NPC\u2019s too; the deceiver pays; no cooldown',
+      /const botched = a\.nat === 1;\s*const fooled = botched \? false : a\.nat === 20 \? true : d\.nat === 20 \? false : d\.nat === 1 \? true : a\.r\.total > d\.r\.total;/.test(src)
+        && /Twenty meets twenty\*\* \\u2014 the lie wins\./.test(src) && /on the insight \\u2014 taken in completely\./.test(src)
         && /const flatMe = consumeFlatMark\(gid, p\.deceiverId\), flatThem = consumeFlatMark\(gid, p\.targetId\);/.test(src)
         && /chargeTrick\(gid, cid, p\.deceiverId, botched\);/.test(src) && /setFlatMark\(gid, p\.targetId, 'flat'\);/.test(src)
         && (() => { const h = src.slice(src.indexOf('async function deceptionParties('), src.indexOf('function fightTotalStr(')); return h.length > 2000 && !/deceptionSpent|spendDeception/.test(h); })());
     ok('deflect: a 20 turns it whatever the totals, 2 into the named enemy; a 1 fails for 2, the next defence flat too',
-      /const deflected = nat === 20 \|\| \(nat !== 1 && total > fight\.atk_roll\);/.test(src) && /const dmgR = nat === 20 \? 2 : 1;/.test(src)
+      /const deflected = !unstoppable && \(nat === 20 \|\| \(nat !== 1 && total > fight\.atk_roll\)\);/.test(src) && /const dmgR = nat === 20 \? 2 : 1;/.test(src)
         && /const dmgS = nat === 1 \? 2 : 1;\s*if \(nat === 1\) setEffectFlag\(gid, cid, uid, 'flatDef'\);/.test(src));
     ok('disarm against a strike (2026-11-10): a 20 disarms, wounds 1 and banks +2 that rides a flat attack; a 1 fails for 2 and disarms the disarmer; any disarm leaves the very next roll flat; no blade asked',
-      /const disarmed = nat === 20 \|\| \(nat !== 1 && total > fight\.atk_roll\);/.test(src)
+      /const disarmed = !unstoppable && \(nat === 20 \|\| \(nat !== 1 && total > fight\.atk_roll\)\);/.test(src)
         && /if \(disarmed\) \{\s*setEffectFlag\(gid, cid, attackerId, 'disarmed'\);\s*if \(nat === 20\) \{\s*bankRiposte\(gid, cid, uid, \{ onFlat: true \}\);\s*const prevA = hpState\[attackerId\] \?\? 0;\s*const nhA = applyFightDamage\(prevA, 1, floor\);/.test(src)
         && /const dmgD = nat === 1 \? 2 : 1;\s*if \(nat === 1\) setEffectFlag\(gid, cid, uid, 'disarmed'\);/.test(src)
         && /const markDisarmUsed = \(gid, cid, fid\) => markRoundSpecial\(gid, cid, fid, 'disarmUsed', 'fooled'\);/.test(src)
@@ -2309,9 +2312,15 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         && /mode = flatMode\(fooledA === 'dis' \? 'dis' : flatSwing, applySignatureMode\(sigRowA, stat, mode\)\);/.test(src)
         && /const flat = consumeFlatDef\(gid, cid, defenderId\) \|\| consumeFooled\(gid, cid, defenderId\) \|\| consumeFlatMark\(gid, defenderId\);/.test(src)
         && /const effMode = mode;/.test(src));
-    ok('a save, an insight or a break that ends the fight names the winner; the auto chain goes on past one that settles itself',
-      (src.match(/if \(r\.ended\) (return )?(await )?announceFightEnd\(/g) || []).length >= 9
-        && /if \(afterD\?\.state === 'active' && afterD\.phase === 'attack'\) continue;/.test(src));
+    // (build P: every special lands through finishRoll or settleExchange, so
+    // the sites are fewer; the auto chain stores an NPC's answer, waits while
+    // a roll may be thrown again, and lands it itself otherwise.)
+    ok('a save, an insight or a break that ends the fight names the winner; the auto chain lands a stored answer and plays on',
+      (src.match(/if \(r\.ended\) (return )?(await )?announceFightEnd\(/g) || []).length >= 7
+        && /async function finishRoll\([\s\S]{0,2500}?if \(r\.ended\) return announceFightEnd\(guild, gid, cid, chan, r\.announce\);/.test(src)
+        && /async function afterRollClosed\([\s\S]{0,1800}?if \(r\.ended\) return announceFightEnd\(guild, gid, cid, chan, r\.announce\);/.test(src)
+        && /if \(!defended\) return;\s*await sleep\(900\);/.test(src)
+        && /if \(openRolls\(gid, fight\)\.length\) return;\s*const cont = await autoResolveExchange\(guild, gid, cid, channel\);/.test(src));
     ok('NPC fighters are npc: in the sheet helpers \u2014 no sheet is written for one \u2014 and a stray goes with its page before the pages are walked',
       ['applyNextMark(gid, uid, mode)', 'deceptionSpent(gid, fid)', 'spendDeception(gid, fid)', 'noteHonestRoll(gid, fid)', 'consumeFlatMark(gid, uid)']
         .every(f => new RegExp(`function ${f.replace(/[()]/g, '\\$&')} \\{[\\s\\S]{0,260}?isNpcFighter\\(String\\(`).test(src))
@@ -2331,12 +2340,15 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('a hold of 1 slips at once \u2014 kept, escaped or rerolled: free, no wound, the grappler\u2019s next roll flat at disadvantage',
       /function slipHold\(gid, cid, holderId, captiveId, holderName, capName\) \{\s*const gmap = fightGrapples\(getFight\(gid, cid\)\);\s*delete gmap\[captiveId\];\s*setFightGrapples\(gid, cid, gmap\);\s*setFooled\(gid, cid, holderId, true\);/.test(src)
         && (src.match(/slipHold\(/g) || []).length === 4
-        && /if \(nat === 1\) \{\s*\/\/ A hold of 1 slips at once[\s\S]{0,700}?slipHold\(gid, cid, actorId, heldId, holderName, captiveName\)[\s\S]{0,300}?await passTurn\(/.test(src)
+        && /if \(nat === 1 && !canRethrow\(gid, fight, actorId\)\) \{\s*\/\/ A hold of 1 slips at once[\s\S]{0,900}?slipHold\(gid, cid, actorId, heldId, holderName, captiveName\)[\s\S]{0,300}?await passTurn\(/.test(src)
         && src.indexOf('slipHold(gid, cid, actorId, heldId, holderName, captiveName)') < src.indexOf("phase: 'defend', current_target: heldId, atk_kind: 'hold',")
-        && /if \(hold\.nat === 1\) \{[\s\S]{0,200}?slipHold\(gid, cid, holderId, actorId, holderName, actorName\)\);\s*r = \{ order: \[\.\.\.turnOrder\] \};/.test(src)
+        && /if \(hold\.nat === 1\) \{[\s\S]{0,500}?slipHold\(gid, cid, holderId, actorId, holderName, actorName\)\);\s*const res = await passTurn\(/.test(src)
         && /const slipped = fight\.atk_nat === 1;/.test(src) && /if \(slipped\) \{\s*lines\.push\('', slipHold\(gid, cid, holderId, captiveId, holderName, capName\)\);/.test(src)
-        && /if \(kind === 'hold' && nat === 1\) \{\s*const rs = await resolveBreakFree\(interaction\.guild, gid, cid, getFight\(gid, cid\), \{\}\);/.test(src)
-        && !/holdNat/.test(src));
+        // (build P: thrown again into a 1 it lands through the one door — the
+        // answer counts as in, and nothing of the captive's is left open.)
+        && /return !!fight && \(fight\.def_roll != null \|\| \(fight\.atk_kind === 'hold' && fight\.atk_nat === 1\)\);/.test(src)
+        && /if \(fight\.def_stat === 'ac' \|\| \(!atk && fight\.atk_kind === 'hold' && fight\.atk_nat === 1\)\) return false;/.test(src)
+        && /if \(fight\.atk_kind === 'hold'\)\s*return resolveBreakFree\(guild, gid, cid, fight, \{ roll: fight\.def_roll != null \? /.test(src));
     ok('a defensive feint of 1 fails outright: the blow lands whatever the totals, and an attack of 1 still fumbles',
       /const feintDefPending = !!JSON\.parse\(getFight\(gid, cid\)\?\.effect_state \|\| '\{\}'\)\[defenderId\]\?\.feintDef;/.test(src)
         && src.indexOf('const forced = forceHit || (feintDefPending') < src.indexOf("if (consumeEffectFlag(gid, cid, defenderId, 'feintDef')) {")
@@ -2349,8 +2361,10 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         && /setDescription\('Try to deceive someone, away from a fight \(in one, feint\)[^']*a form follows'\)/.test(src)
         && !/their next roll in this fight is a straight d20/.test(src));
     ok('a reroll says which roll it was and who answers it: a grab, a feint, a hold, a defensive feint; /fight resolve only when both rolls are in',
-      /const what = kind === 'grapple' \? 'the grapple' : kind === 'feint' \? 'the feint' : kind === 'hold' \? 'the hold'\s*: isAttacker \? 'attack' : JSON\.parse\(fight\.effect_state \|\| '\{\}'\)\[uid\]\?\.feintDef \? 'the defensive feint' : 'defence';/.test(src)
-        && /: \(isAttacker \? fight\.def_roll : fight\.atk_roll\) != null \? '\u26A1 Use \\`\/fight resolve\\` to resolve this exchange\.'/u.test(src)
+      /const what = atkR\s*\? \(kind === 'grapple' \? 'the grapple' : kind === 'feint' \? 'the feint' : kind === 'hold' \? 'the hold'/.test(src)
+        && /: JSON\.parse\(fight\.effect_state \|\| '\{\}'\)\[rollerId\]\?\.feintDef \? 'the defensive feint' : 'defence'\);/.test(src)
+        && /if \(next === 'resolve'\) return \{ next, line: resolvePrompt\(fight\), users: \[\], components: fightAnswerRows\('resolve'\) \};/.test(src)
+        && /return afterRollClosed\(\{ interaction, gid, cid, chan, head: lines \}\);/.test(src)
         && /answers with the STR save/.test(src) && /Waiting on \$\{tgt\}'s defence\./.test(src));
     ok('no pending grapple, feint or hold outlives its exchange: a fight\u2019s end and its starts, a kick, a forfeit, the auto-pilot\u2019s swing, a custom roll',
       /upsertFight\(gid, cid, \{ \.\.\.FRESH_EXCHANGE, state: 'idle'/.test(src)
@@ -2364,7 +2378,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         && src.indexOf("f0.current_target === meId && f0.atk_kind === 'hold'") < src.indexOf("setEffectFlag(gid, cid, meId, 'feintDef');"));
     ok('a held fighter is offered no Grapple button',
       /\.\.\.\(held \? \[\] : \[B\('fact:grapple'/.test(src) &&
-      /fightAnswerRows\(k, \{ held: !!gmap\[fid\], gid \}\)/.test(src));
+      /fightAnswerRows\(k, \{ forNpc: npc, auto, held: !!gmap\[fid\], gid \}\)/.test(src));
     ok('there is an attack button row, routed like the defence one',
       /if \(kind === 'atk'\) return \[/.test(src) &&
       /B\('fatk:str'/.test(src) &&
@@ -2385,12 +2399,14 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /return openFightRp\(interaction, which, \{\}, \{ title: which === 'deflect' \? 'Deflect' : 'Disarm' \}\);/.test(src) &&
       /return openFightRp\(interaction, 'save', \{\}, /.test(src) && /return openFightRp\(interaction, 'insight', \{\}, /.test(src) &&
       /return openFightRp\(interaction, 'release', \{\}, \{ title: 'Let go' \}\);/.test(src) &&
-      /if \(await isGm\(interaction\.guild, uidF\)\) return openFightRp\(interaction, 'resolve', \{\}, \{ title: 'Resolve \\u2014 what happens\?', what: true \}\);/.test(src) &&
+      /if \(await isGm\(interaction\.guild, uidF\)\) \{\s*if \(fF\.phase !== 'defend' \|\| !answerIn\(fF\)\) return refuseF\([^)]*\);\s*return openFightRp\(interaction, 'resolve', \{\}, \{ title: 'Resolve \\u2014 what happens\?', what: true \}\);/.test(src) &&
       /if \(!flavour\) return openFightRp\(interaction, 'atk', \{ stat, targetId, mode, npc: /.test(src) &&
       (src.match(/forcedOf\(forced, 'flavour'\)/g) || []).length >= 10 &&
       /N\('fnatk:str', /.test(src) && /N\('fndef:str', /.test(src) &&
       /nextF\.answerRows = turnRowsFor\(gid, getFight\(gid, cid\), order\[index\], \{ auto: autoNpc \}\);/.test(src) &&
-      /if \(npc\) return fightAnswerRows\('atk', \{ forNpc: true, auto, gid \}\);/.test(src) &&
+      // (build P: an NPC's card carries the GM's set of every move, and its turn the same rows a player's does.)
+      /N\('fnact:grapple', /.test(src) && /N\('fnact:deflect', /.test(src) && /N\('fnact:maintain', /.test(src) && /N\('fnact:save', /.test(src) &&
+      /if \(interaction\.customId\.startsWith\('fnact:'\)\) \{/.test(src) && /if \(interaction\.isStringSelectMenu\?\.\(\) && interaction\.customId\.startsWith\('fightactn:'\)\) \{/.test(src) &&
       /return openFightRp\(interaction, 'grappledef', \{\}, \{ title: 'Grapple the blow' \}\);/.test(src) &&
       /return openFightRp\(interaction, 'disarmatk', \{ targetId \}, \{ title: 'Disarm' \}\);/.test(src) &&
       /return openFightRp\(interaction, 'retrieve', \{\}, \{ title: 'Retrieve your weapon' \}\);/.test(src));
@@ -2408,7 +2424,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('the release press finds the captive itself, then opens the form; the one release path runs it',
       /const heldR = grappleHeldTargetOf\(fightR, interaction\.user\.id\);/.test(src) &&
       /You are not holding anyone/.test(src) &&
-      /case 'release':\s*return runFightRelease\(\{ interaction, gid: gidM, cid: cidM, actorId: interaction\.user\.id, flavour \}\);/.test(src) &&
+      /case 'release':\s*return runFightRelease\(\{ interaction, gid: gidM, cid: cidM, actorId: p\.npc \? npcFighterId\(p\.npc\) : interaction\.user\.id, flavour \}\);/.test(src) &&
       /async function runFightRelease\(\{ interaction, gid, cid, actorId, forceTargetId = null, flavour = null \}\)/.test(src));
     // ── Build A2 (2026-10-14, T's "Build all") ──────────────────────────────
     ok('the words from a fight form, a resolve and a target strike go into the chronicle as story, not dice',
@@ -2442,11 +2458,11 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     ok('a quiet fighter\'s attack goes to whoever they last struck, still standing, else the weakest foe standing; a fight remembers who each last swung at',
       /function clockTargetFor\(gid, fight, attackerId\)/.test(src) &&
       /last = JSON\.parse\(fight\.last_targets \|\| '\{\}'\)\[attackerId\] \|\| null;/.test(src) &&
-      /const twoSides = all\.some\(id => isNpcFighter\(id\)\) && all\.some\(id => !isNpcFighter\(id\)\);/.test(src) &&
-      /const foe = \(id\) => !twoSides \|\| isNpcFighter\(id\) !== isNpcFighter\(attackerId\);/.test(src) &&
+      /const twoSides = fightIsSided\(fight\);/.test(src) &&
+      /const foe = \(id\) => !twoSides \|\| sideOfFighter\(fight, id\) !== sideOfFighter\(fight, attackerId\);/.test(src) &&
       /return pool\.reduce\(\(best, id\) => \(\(hp\[id\] \?\? 0\) < \(hp\[best\] \?\? 0\) \? id : best\), pool\[0\]\);/.test(src) &&
       /ALTER TABLE fights ADD COLUMN last_targets TEXT DEFAULT '\{\}'/.test(src) && /lt\[atk\] = fields\.current_target;/.test(src) &&
-      /grapples: '\{\}', last_targets: '\{\}', \.\.\.fields \}\);/.test(src));
+      /grapples: '\{\}', last_targets: '\{\}', sides: '\{\}', \.\.\.fields \}\);/.test(src));
     ok('signs of life hold the turn: typing (the typing intent), a message, any press or command from the one it waits on',
       /GatewayIntentBits\.GuildMessageTyping\]/.test(src) && /t === 'TYPING_START' && d\.user_id && d\.channel_id/.test(src) &&
       /noteTurnLife\(message\.guild\.id, /.test(src) && /noteTurnLife\(interaction\.guild\.id, interactionChannelId\(interaction\), /.test(src) &&
@@ -2487,7 +2503,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /if \(headline && String\(headline\)\.includes\('\\u\{1F3C6\}'\)\) \{/.test(src));
     ok('the run\'s story rides on the completion card as a scroll of several sheets, woven like /gm scroll',
       /function makeImagesPdf\(pages\)/.test(src) && /function renderScrollBook\(\{ family, title, body \}\)/.test(src) &&
-      /function runStoryScroll\(gid, quest, \{ runnerName, partyNames, runMs, events, tale \}\)/.test(src) &&
+      /function runStoryScroll\(gid, quest, \{ runnerName, partyNames, runMs, events, tale, sofar = false \}\)/.test(src) &&
       /function hasCanvas\(\)/.test(src) && /if \(hasCanvas\(\)\) \{\s*try \{ storyFile = runStoryScroll\(gid, quest, /.test(src) &&
       /embedScrollData\(renderScrollBook\(\{ family, title, body \}\), \{ v: 1, kind: 'scroll', title, body, name: stem \}\)/.test(src) &&
       (src.match(/files: storyFiles/g) || []).length === 2);
@@ -2575,7 +2591,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /if \(rolled\[0\]\) saveRoll\(gid, chan\.id, uid, rolled\[0\]\.notation, rolled\[0\]\.label\);/.test(src) &&
       /noteQuestActivity\(gid, chan\.id, 'roll', `\$\{name\}: \$\{r\.label\} \$\{r\.result\.total\}`, uid\);/.test(src) &&
       /const card = await findOpenDcCard\(chan, uid, stat\);/.test(src) && /startsWith\(`dcroll:\$\{uid\}:\$\{stat\}:`\)/.test(src) &&
-      (src.match(/await rollCalledCheck\(/g) || []).length === 2 && (src.match(/await settleCalledCheck\(/g) || []).length === 2 &&
+      (src.match(/await rollCalledCheck\(/g) || []).length === 2 && (src.match(/await settleCalledCheck\(/g) || []).length === 3 &&
       /await card\.msg\.edit\?\.\(\{ components: darkenButton\(card\.msg\.components, card\.customId\) \}\)/.test(src) &&
       /await interaction\.update\(\{ components: darkenButton\(interaction\.message\.components, interaction\.customId\) \}\);/.test(src));
     // Reply under every line (2026-11-06): every /rp line and every NPC line
@@ -2631,7 +2647,7 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       (src.match(/const moved = \(\) => at != null && Number\(getFight\(gid, cid\)\?\.last_at\) !== at;/g) || []).length === 3 &&
       /\/\/ A move made while the names were fetched stands; nothing is spent\.\s*if \(moved\(\)\) return false;/.test(src));
     ok('a lost auto-pilot chain is taken up again; a fallen defender\'s exchange is called off; an order ends only when its room is gone',
-      /isNpcFighter\(w\.id\) && quiet >= 2 \* 60000 && quiet < CLOCK_DORMANT_MS\)/.test(src) &&
+      /\(w\.what === 'resolve' \|\| \(w\.what !== 'keep' && isNpcFighter\(w\.id\)\)\) && quiet >= 2 \* 60000 && quiet < CLOCK_DORMANT_MS\)/.test(src) &&
       /has fallen — the attack on them is called off, and the turn moves on\./.test(src) &&
       /if \(code === 10003 \|\| code === 50001\) saveTurnOrder\(gid, cid, \{ state: 'ended', ended_at: now \}\);/.test(src));
     ok('an order\'s buttons carry its stamp, a turn\'s its serial; only player mentions are seated; /session turn answers before it works',
@@ -2682,8 +2698,8 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
         && /rollLine: `🎲  \$\{notation\} → \$\{dropped != null \? `\[\$\{nat\}, ~~\$\{dropped\}~~\]` : `\[\$\{nat\}\]`\}/.test(src)
         && !/\[\$\{nat\}~~\$\{dropped\}~~\]/.test(src) && !/autoFightCard\([^\n]*!!\w+\.adv\)/.test(src)
         && /const sig = sigStat && hasSignatureAdvantage\(subject, sigStat\) \? sigStat : null;/.test(src));
-    ok('the temp sweep is case-blind, and spares NPCs standing in an initiative order',
-      /new Set\(\[\.\.\.fightingNpcNames\(gid\), \.\.\.orderNpcNames\(gid\)\]\.map\(n => String\(n\)\.toLowerCase\(\)\)\)/.test(src) &&
+    ok('the temp sweep is case-blind, and spares NPCs standing in an initiative order or held in a live run\u2019s cast (2026-11-15)',
+      /new Set\(\[\.\.\.fightingNpcNames\(gid\), \.\.\.orderNpcNames\(gid\), \.\.\.castNpcNames\(gid\)\]\.map\(n => String\(n\)\.toLowerCase\(\)\)\)/.test(src) &&
       /fightingNpcNames\(gid\)\.has\(t\.name\)/.test(src) && !/fightingNpcNames\(gid\)\.has\(t\.name\.toLowerCase\(\)\)/.test(src));
     ok('the undo journal keeps one lane per channel: the first frame in a busy spell snapshots, the last out writes one entry under the first\'s label \u2014 never chunked',
       /const undoLanes = new Map\(\);/.test(src) &&
@@ -2721,7 +2737,8 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
       /picked = \[\.\.\.\(interaction\.fields\.getSelectedUsers\?\.\('to', false\)\?\.values\?\.\(\) \|\| \[\]\)\]\.map\(u => u\.id\);/.test(src) &&
       /const v = interaction\.fields\.getStringSelectValues\?\.\('offer'\);/.test(src) &&
       // Nine since 2026-11-07: the initiative's Add NPCs box adds its two.
-      (src.match(/addLabelComponents\(/g) || []).length === 9);
+      // Eleven since 2026-11-15: a fight's Add NPCs box has Friendly and Their HP.
+      (src.match(/addLabelComponents\(/g) || []).length === 11);
     // Under every NPC line: Reply for players, GM for the speak-as box, and
     // Interaction only when the GM offered an activity on that line; the
     // line itself is action · speech · who it is for, a blank line between.
@@ -3125,8 +3142,12 @@ ok('block order is a contract — a disordered thread rebuilds in sequence',
     // builder at 6196 after seven descriptions were trimmed for A2. The
     // only fold left would rename commands (kill/revive/heal into a group),
     // which is T's call, not a tripwire's; a quarter of the wall is still spare.
+    // Raised 6400→6600 (2026-11-15, build P): /config mechanics npcspecial
+    // landed with /config at 6513. A setting belongs with the settings, and
+    // no wording there is idle; the wall is still 1,400 away. The next trip
+    // is the moment /config's channels group moves out to a command of its own.
     ok('the largest command keeps clear headroom under the 8000 wall',
-      Math.max(...budget.map(([, sz]) => sz)) <= 6400);
+      Math.max(...budget.map(([, sz]) => sz)) <= 6600);
   });
 }
 
@@ -3506,7 +3527,7 @@ function testPins(src) {
     // — the runtime gates stay as the backstop for /npc create5e and kin.
     ok('registration filters whole commands by ruleset',
       /const DND5E_ONLY = \['dnd', 'spell', 'library'\];/.test(src) &&
-      /const KNIGHTFALL_ONLY = \['duel', 'deception'\];/.test(src) &&
+      /const KNIGHTFALL_ONLY = \['duel', 'deception', 'heal'\];/.test(src) &&
       /commands = commands\.filter\(cmd => !hidden\.includes\(cmd\.name\)\);/.test(src));
     ok('registration filters the picker per ruleset and injects nothing — the /pr choice map is gone',
       /commands = commands\.filter\(cmd => !hidden\.includes\(cmd\.name\)\);/.test(src) &&
@@ -3650,7 +3671,10 @@ function testBuildJ(mod) {
     const f = { state: 'active', turn_order: '["U1","npc:Orc"]', turn_index: 1, phase: 'attack', current_target: null, def_roll: null };
     eq('a fight waits on its attacker', fw(f), { id: 'npc:Orc', what: 'attack' });
     eq('in a defence, on the defender', fw({ ...f, phase: 'defend', current_target: 'U1' }), { id: 'U1', what: 'defend' });
-    eq('both rolls in, on a resolve', fw({ ...f, phase: 'defend', current_target: 'U1', def_roll: 12 }), { id: 'U1', what: 'resolve' });
+    // (build P: with NPCs in it the Resolve is a GM's; players alone resolve their own.)
+    eq('both rolls in, on a resolve — a GM’s, in a fight with NPCs', fw({ ...f, phase: 'defend', current_target: 'U1', def_roll: 12 }), { id: 'U1', what: 'resolve', gm: true });
+    eq('players alone resolve their own', fw({ ...f, turn_order: '["U1","U2"]', phase: 'defend', current_target: 'U1', def_roll: 12 }), { id: 'U1', what: 'resolve', gm: false });
+    eq('a kept hold slipping on a 1 counts as answered', fw({ ...f, turn_order: '["U1","U2"]', phase: 'defend', current_target: 'U1', atk_kind: 'hold', atk_nat: 1 }), { id: 'U1', what: 'resolve', gm: false });
     ok('an idle fight waits on nobody', fw({ ...f, state: 'idle' }) === null && fw(null) === null);
   });
 }
@@ -3709,18 +3733,19 @@ function testBuildN(src) {
       /function defGrappleRefusal\(fight, uid\)/.test(src)
         && /if \(fight\.atk_nat === 20\) return '🤼 A \*\*natural 20\*\* cannot be grappled/.test(src)
         && /if \(grappleHolderOf\(fight, fightOrder\(fight\)\[fight\.turn_index\]\)\) return '🤼 They are already held\.';/.test(src)
-        && /const seized = nat === 20 \|\| \(nat !== 1 && total > fight\.atk_roll\);/.test(src)
+        && /const seized = !unstoppable && \(nat === 20 \|\| \(nat !== 1 && total > fight\.atk_roll\)\);/.test(src)
         && /if \(nat === 20\) \{\s*bankRiposte\(gid, cid, uid\);/.test(src)
         && /const flatG = consumeFlatDef\(gid, cid, uid\) \|\| consumeFooled\(gid, cid, uid\) \|\| consumeFlatMark\(gid, uid\);/.test(src)
         && /const barG = abilityNeeds\(gid, 'grapple'\);\s*if \(belowBar\(subject, barG\)\)[^\n]*\n\s*const turnOrder = fightOrder\(fight\);\s*const attackerId/.test(src));
     ok('the striker seized is held from that moment, with no wound as its turn ends; a grab that falls short resolves the exchange as a failed defence',
-      /passTurn\(interaction\.guild, gid, cid, hpState, \[\.\.\.turnOrder\], turnOrder, floor, lines, attackerId, \{ strain: false \}\)/.test(src)
+      /return passTurn\(guild, gid, cid, hpState, \[\.\.\.turnOrder\], turnOrder, floor, lines, attackerId, \{ strain: false \}\);/.test(src)
         && /async function passTurn\(guild, gid, cid, hpState, order, roster, floor, lines, actorId, \{ strain = true \} = \{\}\) \{\s*const again = await keepTurnForExtra\([^\n]*\n\s*if \(again\) return again;\s*const st = strain \? await applyTurnEndStrain\(/.test(src)
-        && /upsertFight\(gid, cid, \{ def_roll: total, def_nat: nat, def_stat: 'str', def_mode: mode, def_sides: 20 \}\);\s*const res = await resolveExchange\(interaction\.guild, gid, cid, getFight\(gid, cid\), \{ forceHit: true \}\);/.test(src));
+        && /storeAnswer\(gid, cid, \{ total, nat, stat: 'str', mode, ans: 'grappledef', line: diceText, words: flavour, df: flatG \? 1 : null \}\);/.test(src)
+        && /const res = await resolveExchange\(guild, gid, cid, fight, \{ forceHit: true \}\);\s*return \{ \.\.\.res, lines: \[\.\.\.lines, \.\.\.res\.lines\] \};/.test(src));
     ok('Grapple with a strike pending on you is the defence — typed, /roll, the button — and a target picked on the attack picker is always the grab',
-      /if \(forcedOf\(forced, 'defend'\) \|\| \(!npcActAs && !pickedG && fG\?\.state === 'active' && fG\.phase === 'defend' && fG\.current_target === uid\)\) \{\s*return runFightGrappleDef\(/.test(src)
+      /if \(forcedOf\(forced, 'defend'\) \|\| \(!pickedG && fG\?\.state === 'active' && fG\.phase === 'defend' && fG\.current_target === actorId\)\) \{\s*return runFightGrappleDef\(/.test(src)
         && /if \(which === 'grapple' && fF\.phase === 'defend' && fF\.current_target === uidF\) \{\s*const whyG = defGrappleRefusal\(fF, uidF\);/.test(src)
-        && /case 'grappledef':\s*return handleFight\(interaction, \{ sub: 'act', action: 'grapple', defend: true, flavour \}\);/.test(src));
+        && /case 'grappledef':\s*return handleFight\(interaction, \{ sub: 'act', action: 'grapple', defend: true, npc: p\.npc \|\| null, flavour \}\);/.test(src));
     ok('a deflected NPC loses its next turn to the weapon; a deflection of 20 banks +2 that rides the flat next attack',
       /if \(deflected\) \{\s*\/\/ Thrown off[^\n]*\n[^\n]*\n[^\n]*\n\s*setEffectFlag\(gid, cid, attackerId, 'disarmed'\);\s*if \(nat === 20\) bankRiposte\(gid, cid, uid, \{ onFlat: true \}\);/.test(src)
         && /const markDeflectUsed = \(gid, cid, fid\) => markRoundSpecial\(gid, cid, fid, 'deflected', 'flatAtk'\);/.test(src));
@@ -3733,17 +3758,22 @@ function testBuildN(src) {
         && /const a = autoRoll\(\(flatAuto \? 0 : atkMod\) \+ atkBonus, /.test(src)
         && /const mod = \(flat \? 0 : \(R\.defence === 'ac' \? autoAtkBonus5e\(R, attRow, stat\) : \(attacker\.stats\[stat\] \?\? 0\)\)\) \+ atkBonus;/.test(src)
         && !/flatSwing \? 0 : consumeAtkBonus|flatAuto \? 0 : consumeAtkBonus|flat \? 0 : consumeAtkBonus/.test(src)
-        && /const flatRip = isAttacker && effMod === 2 && rawStat !== 0 && rawStat !== 2;/.test(src));
-    ok('Disarm on your own turn: NPCs only, DEX against the better of their STR and DEX, ties to the NPC, no naturals on its die; a 20 wounds 1, a 1 costs 2 and disarms you; the very next roll flat, whatever came of it',
-      /async function runFightDisarmAttack\(\{ interaction, gid, cid, targetId, mode, flavour \}\)/.test(src)
-        && /if \(!isNpcFighter\(targetId\)\) return refuse\('⚔️ Disarming works on NPCs only\.'\);/.test(src)
+        && /const flatRip = atkR && effMod === 2 && rawStat !== 0 && rawStat !== 2;/.test(src));
+    // (build P: the grip's naturals count, after the disarmer's own — whoever
+    // starts the roll wins twenty against twenty; an NPC may go for anyone's.)
+    ok('Disarm on your own turn: a player’s on NPCs only, DEX against the better of their STR and DEX, ties to whoever holds the weapon, the naturals on both dice — the disarmer’s first; a 20 wounds 1, a 1 costs 2 and disarms you; the very next roll flat, whatever came of it',
+      /async function runFightDisarmAttack\(\{ interaction, gid, cid, actorId = null, targetId, mode, flavour \}\)/.test(src)
+        && /if \(!isNpcFighter\(uid\) && !isNpcFighter\(targetId\)\) return refuse\('⚔️ Disarming works on NPCs only\.'\);/.test(src)
         && /const gripStat = sD > sS \? 'dex' : sS > sD \? 'str' : \(hasSignatureAdvantage\(npcRow, 'dex'\) \? 'dex' : 'str'\);/.test(src)
-        && /const won = nat === 20 \|\| \(nat !== 1 && total > g\.total\);   \/\/ ties go to the NPC/.test(src)
+        && /const won = nat === 1 \? false : nat === 20 \? true : g\.nat === 20 \? false : g\.nat === 1 \? true : total > g\.total;/.test(src)
         && /\/\/ The price, whatever comes of it: the disarmer's very next roll is flat\.\s*setFooled\(gid, cid, uid\);/.test(src)
         && /const flatN = consumeFlatDef\(gid, cid, targetId\) \|\| consumeFooled\(gid, cid, targetId\) \|\| consumeFlatMark\(gid, targetId\);/.test(src)
-        && /if \(which === 'disarm' && \(!isNpcFighter\(fid\) \|\| disarmedOf\(fight, fid\)\)\) continue;/.test(src)
+        && /if \(which === 'disarm' && \(\(!asNpc && !isNpcFighter\(fid\)\) \|\| disarmedOf\(fight, fid\)\)\) continue;/.test(src)
         && /if \(forcedOf\(forced, 'attack'\) \|\| myTurn\) \{/.test(src)
-        && /NPCs are disarmed; they do not disarm\./.test(src));
+        // (build P: an NPC disarms as a player does — a GM's hand with npc:, or the auto-pilot's.)
+        && !/NPCs are disarmed; they do not disarm\./.test(src)
+        && /return runFightDisarmAttack\(\{ interaction, gid, cid, actorId: npcActAs \? actorId : null, targetId: targetX, mode, flavour \}\);/.test(src)
+        && /return runFightDisarm\(\{ interaction, gid, cid, actorId: npcActAs \? actorId : null, mode, flavour \}\);/.test(src));
     ok('disarmed, the turn is the weapon’s: attack, grab, feint, hold, escape, a custom roll and the pickers refuse it before any flat roll is spent',
       (src.match(/if \(disarmedOf\(fight, actorId\)\) return refuse\(disarmedRefusal\(/g) || []).length === 5
         && src.indexOf('if (disarmedOf(fight, actorId)) return refuse(disarmedRefusal(isNpcFighter(actorId)') < src.indexOf('const offBalance = !restrained && consumeFlatAtk(gid, cid, actorId);')
@@ -3763,7 +3793,8 @@ function testBuildN(src) {
         && /case 'retrieve':\s*return handleFight\(interaction, \{ sub: 'act', action: 'retrieve', npc: p\.npc \|\| null, flavour \}\);/.test(src));
     ok('one answer per strike: a second defence, deflect, disarm, feint or grapple is refused before anything is spent',
       /const ALREADY_ANSWERED = /.test(src)
-        && (src.match(/if \(fight\.def_roll != null\) return refuse\(ALREADY_ANSWERED\);/g) || []).length === 2
+        // (build P: a save, an insight, a break and a Stay answer once as well.)
+        && (src.match(/if \(fight\.def_roll != null\) return refuse\(ALREADY_ANSWERED\);/g) || []).length === 6
         && /if \(fight\.def_roll != null\) return interaction\.reply\(\{ ephemeral: true, content: ALREADY_ANSWERED \}\);/.test(src)
         && /if \(fight\.def_roll != null\) return ALREADY_ANSWERED;/.test(src)
         && src.indexOf("f0.atk_kind && f0.def_roll != null") < src.indexOf("setEffectFlag(gid, cid, meId, 'feintDef');")
@@ -3820,7 +3851,7 @@ function testBuildO(mod, src) {
       /async function keepTurnForExtra\(guild, gid, cid, hpState, order, roster, floor, lines, actorId\)/.test(src)
         && (src.match(/midAction \? null : await keepTurnForExtra\(/g) || []).length === 2
         && /\{ midAction: usedSoFar < allowed \}/.test(src)
-        && /const again = await keepTurnForExtra\(interaction\.guild, gid, cid, hpState, order, turnOrder, floor, lines, attackerId\);/.test(src)
+        && /const again = await keepTurnForExtra\(guild, gid, cid, hpState, order, turnOrder, floor, lines, attackerId\);/.test(src)
         && /if \(!again\) for \(const l of tickConditions\(/.test(src));
     ok('a natural 1’s first turn: Roleplay alone, every other action refused first; the auto-pilot and the clock pass it; a skip spends it, and a 20’s second action',
       /if \(rpTurnOf\(fight, fid\)\) return fightAnswerRows\('roleplay', \{ forNpc: npc, auto, gid \}\);/.test(src)
@@ -3886,9 +3917,10 @@ function testBuildL(mod) {
         && /leaves the grappler's next attack a flat d20 and the saver \+2 on theirs/.test(text('grapple'))
         && /Against an ordinary strike a grapple is your defence: STR against the attack, ties to the attack\./.test(text('grapple'))
         && /the wounds starting once your turn has come round/.test(text('grapple')));
-    ok('the rules say /deception: a form, the totals, a 1 fails, no cooldown, NPCs either side (2026-11-10)',
+    // (build P: the naturals count as in a fight — the 20s and the insight's 1 too.)
+    ok('the rules say /deception: a form, the naturals as in a fight, then the totals, no cooldown, NPCs either side',
       /^`\/deception` is WIS against WIS away from a fight, through a form/.test(text('deception'))
-        && /The totals decide, ties to the mark; a natural 1 fails outright, and no other natural counts\./.test(text('deception'))
+        && /The naturals count as in a fight: your 20 fools whatever the insight, your 1 fails outright; their 20 sees through it and their 1 is taken in; twenty against twenty goes to whoever started it\. Otherwise the totals, ties to the mark\./.test(text('deception'))
         && /No cooldown\./.test(text('deception')) && /A GM can deceive as an NPC, and an NPC can be the mark\./.test(text('deception')));
     ok('the rules say a wound is a point of damage, a captive can still attack, a hold of 1 slips, a defensive feint of 1 fails, and a feint is the fight\u2019s trick',
       /A wound is the same thing: 1 damage, 1 HP\./.test(text('damage'))

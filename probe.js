@@ -757,6 +757,9 @@ async function fire(over) {
     const forum = new FakeChannel('FORUM1', 15, 'quest-instances', guild);
     channelsById.set(forum.id, forum);
     setConfigProbe('quest_instance_forum', 'FORUM1');
+    // The auto-pilot's taste for moves (build P) is off for every walk but
+    // the ones that probe it: each walk's dice are scripted for plain blows.
+    dbHandle.prepare("UPDATE guild_config SET npc_special=0 WHERE guild_id='G1'").run();
     const openEncounter = async (label, options, users) => {
       const r0 = await press(`${label} (picker)`, { commandName: 'instance', options: { _sub: 'start', ...options } });
       const rows = r0.replies[0]?.components || [];
@@ -987,7 +990,7 @@ async function fire(over) {
     const bad = [];
     const mk = (text, uid = 'U1') => ({ content: text, author: { id: uid, bot: false }, guild, channel: chan, channelId: chan.id, member: { id: uid, roles: { cache: new Map() }, permissions: { has: () => true } }, attachments: { size: 0, first: () => null }, client,
       reply: async (p) => { replies.push(norm(p)); return { id: nextId() }; } });
-    const lines = ['r 1d20+3 perception', 'ra 1d20', 'rd 1d20', '!r', 'r', 'rr', 'rra', 'rrd', '?r 1d20 dc:12', 'h @U2', 'heal @U2', 'hp', 'hp +2', 'hp 5 @U2', 'rerolls', 'srest', 'lrest', 'srest @U2', 'hpfull @U2', 'hphalf @U2', 'gmr 1d20+5 stealth', 'gmrs 1d20', '1d20', '2d6+1', 'str', 'dexa', 'wisd', '?lck', '!roll 3d6'];
+    const lines = ['r 1d20+3 perception', 'ra 1d20', 'rd 1d20', '!r', 'r', 'rr', 'rra', 'rrd', '?r 1d20 dc:12', 'h @U2', 'heal @U2', '!hp', 'hp +2', 'hp 5 @U2', 'rerolls', 'srest', 'lrest', 'srest @U2', 'hpfull @U2', 'hphalf @U2', 'gmr 1d20+5 stealth', 'gmrs 1d20', '1d20', '2d6+1', 'str', 'dexa', 'wisd', '?lck', '!roll 3d6'];
     for (const text of lines) {
       replies.length = 0; loggedC.length = 0; const sentBefore = sent.length;
       try { for (const fn of listeners.messageCreate || []) await fn(mk(text)); }
@@ -1581,10 +1584,10 @@ async function fire(over) {
     const u1 = await fire({ commandName: 'gm', options: { _sub: 'undo' }, userId: 'U1' });
     const postedU1 = sent.slice(before).map(x => x.msg);
     const rowU1 = fightRow();
-    ok('/gm undo rewinds the resolve: the HP comes back, the fight row stands as it did before the press, the table is told what moved, the status and the defence prompt are posted again',
+    ok('/gm undo rewinds the resolve: the HP comes back, the fight row stands as it did before the press, the table is told what moved, the status and what the exchange waits on are posted again',
       new RegExp(`⏪ \\*\\*Rewound one step\\*\\* by <@U1>: \\*\\*fight form\\*\\* by <@U2>`).test(saidOf(u1)) && new RegExp(`❤️ userU2 ${hpHit}→7`).test(saidOf(u1))
         && hpOf('U2') === 7 && rowU1?.phase === 'defend' && rowU1?.def_roll === beforeResolve.def_roll && rowU1?.hp_state === beforeResolve.hp_state
-        && postedU1.some(m => /\*\*Fight Status\*\*/.test(m.content)) && postedU1.some(m => /attacks \*\*userU2\*\* with STR/.test(m.content) && idsOf(m).includes('fdef:con')),
+        && postedU1.some(m => /\*\*Fight Status\*\*/.test(m.content)) && postedU1.some(m => /Nothing lands yet|fight resolve/.test(m.content) && idsOf(m).includes('fresolve') && !idsOf(m).includes('fdef:con')),
       `${saidOf(u1).replace(/\s+/g, ' ').slice(0, 160)} · row ${JSON.stringify(rowU1)} · posted ${postedU1.map(m => m.content.replace(/\s+/g, ' ').slice(0, 40)).join(' | ')}`);
     const u2 = await fire({ commandName: 'gm', options: { _sub: 'undo', steps: 2 }, userId: 'U1' });
     const rowU2 = fightRow();
@@ -2724,6 +2727,8 @@ async function fire(over) {
     const exp5 = await f5({ commandName: 'char', options: { _sub: 'export', format: 'text' }, userId: 'U51' });
     const block5 = saidOf(exp5);
     dbHandle.prepare("UPDATE guild_config SET approval_channel_id='C5A' WHERE guild_id='G5'").run();
+    // The auto-pilot's taste for moves (build P) is off here too: this walk's auto fights are plain blows against Armour Class.
+    dbHandle.prepare("UPDATE guild_config SET npc_special=0 WHERE guild_id='G5'").run();
     const kfBlock = '[TTRPG SHEET]\nNAME:Knight\nORDER:\nCLASS:\nSTR:4\nCON:3\nDEX:3\nWIS:3\nLCK:3\n';
     const impKf = await f5({ commandName: 'char', options: { _sub: 'import', summary: kfBlock }, userId: 'U52' });
     before = sent.length;
@@ -3617,21 +3622,25 @@ async function fire(over) {
     const said1 = saidOf(l1.done);
     const rB = await withDice([7], () => fT({ commandName: 'roll', options: { stat: 'str' }, userId: LB, ...asL(LB) }));
     const mB2 = markOf(LB);
-    const l2 = await lie(LA, { target: LB }, [20, 13], { claim: 'and the ford is shallow', plan: 'drown them' });   // flat 20 against 21
+    const l2 = await lie(LA, { target: LB }, [20, 13], { claim: 'and the ford is shallow', plan: 'drown them' });   // flat 20 against 21: a 20 fools whatever the insight
     const mA2 = markOf(LA);
-    const lT = await lie(LA, { target: LB }, [10, 2], { claim: 'trust me', plan: 'nothing' });   // flat 10 against 10
-    const l1x = await lie(LA, { target: LB }, [1, 1], { claim: 'I am the king', plan: 'take the crown' });   // a 1 fails; their 1 fools no one
+    const lT = await lie(LA, { target: LB }, [10, 10], { claim: 'trust me', plan: 'nothing' });   // flat 10 against a fooled mark's flat 10
+    const l20d = await lie(LA, { target: LB }, [15, 20], { claim: 'the well is sweet', plan: 'poison' });   // the mark's 20 sees through
+    const l1d = await lie(LA, { target: LB }, [5, 1], { claim: 'I am unarmed', plan: 'the knife' });   // the mark's 1 is taken in
+    const l1x = await lie(LA, { target: LB }, [1, 1], { claim: 'I am the king', plan: 'take the crown' });   // a 1 fails; their 1 then fools no one
     const mA3 = markOf(LA), mB3 = markOf(LB);
     const rA = await withDice([15, 4], () => fT({ commandName: 'roll', options: { stat: 'str' }, userId: LA, ...asL(LA) }));
     const mA4 = markOf(LA);
-    ok('/deception opens a form, then the totals decide: the pretence and the words shown, the plan only after the dice; fooled, the mark’s next roll is flat and /roll strips the stat; no cooldown — a second lie at once is rolled; a 20 counts for nothing more, ties go to the mark, a 1 falls apart and their 1 fools no one; the price a flat d20, at disadvantage after a 1',
+    ok('/deception opens a form, then the dice decide: the pretence and the words shown, the plan only after the dice; fooled, the mark’s next roll is flat and /roll strips the stat; no cooldown — a second lie at once is rolled; the naturals speak first (2026-11-15): a 20 fools whatever the insight, the mark’s 20 sees through, their 1 is taken in; ties go to the mark, a 1 falls apart and their 1 then fools no one; the price a flat d20, at disadvantage after a 1',
       !!l1.done && /^decept:/.test(modalOf(l1.open)) && Object.keys(l1.open.replies[0]?.modalFields || {}).join(',') === 'claim,plan,speech'
         && /_the bridge is safe_/.test(said1) && /💬 “After you, friend\.”/.test(said1) && /believes it — their very next roll, anywhere, is a straight d20/.test(said1)
         && said1.indexOf('cut the ropes behind them') > said1.indexOf('believes it') && /was really planning: _cut the ropes behind them_/.test(said1)
         && mB === 'flat' && mA === 'flat' && /The price: \*\*user\d+\*\*'s very next roll is a flat d20\._/.test(said1)
         && /flat d20/.test(allOf(rB)) && /\[7\]/.test(allOf(rB)) && mB2 === null
-        && !!l2.done && /sees straight through it/.test(saidOf(l2.done)) && !/Twenty|natural 20/.test(saidOf(l2.done)) && /flat d20/.test(saidOf(l2.done)) && mA2 === 'flat'
+        && !!l2.done && /\*\*A natural 20\*\* — the lie lands whatever they read/.test(saidOf(l2.done)) && /believes it/.test(saidOf(l2.done)) && /flat d20/.test(saidOf(l2.done)) && mA2 === 'flat'
         && /sees straight through it — ties go to the mark/.test(saidOf(lT.done))
+        && /sees straight through it — a natural 20/.test(saidOf(l20d.done)) && !/believes it/.test(saidOf(l20d.done))
+        && /\*\*A natural 1\*\* on the insight — taken in completely/.test(saidOf(l1d.done)) && /believes it/.test(saidOf(l1d.done))
         && /the lie falls apart, a total failure/.test(saidOf(l1x.done)) && !/believes it/.test(saidOf(l1x.done)) && mA3 === 'flatdis' && mB3 === null && /flat d20, at disadvantage\._/.test(saidOf(l1x.done))
         && /flat d20/.test(allOf(rA)) && /\[4, ~~15~~\]|\[15, 4\]|~~15~~/.test(allOf(rA)) && mA4 === null,
       `${JSON.stringify(l1.open.replies[0] || {}).slice(0, 160)} · ${flat1(said1).slice(0, 420)} · ${mA}/${mB} · ${allOf(rB).slice(0, 160)} · ${mB2} · ${flat1(saidOf(l2.done)).slice(0, 200)} ${mA2} · ${flat1(saidOf(lT.done)).slice(0, 200)} · ${flat1(saidOf(l1x.done)).slice(0, 240)} · ${mA3}/${mB3} · ${allOf(rA).slice(0, 200)} · ${mA4}`);
@@ -3729,6 +3738,10 @@ async function fire(over) {
         && f16g.atk_kind === 'grapple' && f16g.atk_nat === 9
         && /rerolls \*\(reroll\)\* — attack with STR!/.test(saidOf(rrA)) && /Waiting on \*\*user\d+\*\*'s defence/.test(saidOf(rrA)) && !/fight resolve/.test(saidOf(rrA)),
       `${flat1(saidOf(rrH)).slice(0, 300)} · ${heldBy(LB)} ${JSON.stringify(fxA16)} @${f16.turn_index}/${f16.phase} · ${flat1(saidOf(rrG)).slice(0, 200)} · ${f16g.atk_kind}/${f16g.atk_nat} · ${flat1(saidOf(rrA)).slice(0, 200)}`);
+    // The tokens are spent here on purpose: from this point on a roll with a
+    // token in hand waits on its Reroll or Keep (build P), and the walks
+    // below are the at-once ones.
+    dbHandle.prepare("UPDATE characters SET rerolls_current=0 WHERE guild_id='G1' AND user_id=?").run(LA);
 
     // 17 · in a fight the trick is a feint: /deception is refused to anyone
     // fighting in the channel, before anything is spent; a feint pressed
@@ -4044,11 +4057,14 @@ async function fire(over) {
     const f2a = fightO();
     const a2 = await withDice([10], () => fO({ commandName: 'fight', options: { _sub: 'atk', stat: 'str', target: OC, flavour: 'a cut' }, userId: OA, ...asO(OA) }));
     const d2 = await withDice([5], () => fO({ commandName: 'fight', options: { _sub: 'def', stat: 'dex', flavour: 'a parry' }, userId: OC, ...asO(OC) }));
-    const r2 = await fO({ commandName: 'fight', options: { _sub: 'resolve' }, userId: OC, ...asO(OC) });
+    // In a fight with NPCs the Resolve is the GM's (build P); the player's is refused.
+    const r2p = await fO({ commandName: 'fight', options: { _sub: 'resolve' }, userId: OC, ...asO(OC) });
+    const r2 = await fO({ commandName: 'fight', options: { _sub: 'resolve' }, userId: 'U1' });
     const f2b = fightO();
     ok('a natural 20’s first turn holds two actions: the grab’s end keeps the turn (“acts again”, the turn line called afresh), the strike’s end passes it; a natural 1 still saves and defends',
       /acts again — the second action of a natural 20 on initiative/.test(saidOf(s2)) && new RegExp(`\\*\\*${NA}\\*\\*'s turn to attack!`).test(saidOf(s2))
         && f2a.turn_index === 0 && f2a.phase === 'attack' && !fxO(OA).extraAction && JSON.parse(f2a.grapples || '{}')[OB] === OA
+        && /Resolve\*\* is the GM/.test(saidOf(r2p))
         && f2b.turn_index === 1 && f2b.phase === 'attack' && !/acts again/.test(saidOf(r2)) && /Ohound/.test(saidOf(r2)),
       `${flat1(saidOf(g2)).slice(0, 80)} · ${flat1(saidOf(s2)).slice(0, 300)} · @${f2a.turn_index}/${f2a.phase} ${f2a.grapples} · ${flat1(saidOf(a2)).slice(0, 60)} · ${flat1(saidOf(d2)).slice(0, 60)} · ${flat1(saidOf(r2)).slice(0, 200)} @${f2b.turn_index}`);
 
@@ -4268,6 +4284,846 @@ async function fire(over) {
     const threwO = loggedO.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
     console.error = realErrO;
     ok('nothing in the O walk threw', threwO.length === 0, threwO.slice(0, 3).join('\n        '));
+  }
+
+  // ── Build P (2026-11-15): /health adjust and /heal, the typed !hp gone, an
+  // NPC's HP kept the GM's; sides and a run's cast; Reroll and Keep on every
+  // roll, Resolve the GM's; NPC moves and the auto-pilot's specials; custom
+  // effects; /session summary ──
+  if (dbHandle) {
+    const realErrP = console.error; const loggedP = [];
+    console.error = (...a) => { loggedP.push(a.map(x => (x && x.stack) ? x.stack.split('\n').slice(0, 2).join(' | ') : String(x)).join(' ')); };
+    const idsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+    const saidOf = (r) => (r?.replies || []).map(x => x.content || '').join('\n');
+    const allOf = (r) => (r?.replies || []).map(x => JSON.stringify(x)).join(' ');
+    const modalOf = (r) => (r?.replies || []).find(x => x.modal)?.modal || null;
+    const flat1 = (t) => String(t || '').replace(/\s+/g, ' ');
+    const settle = async () => { for (let i = 0; i < 60; i++) await new Promise(r => setImmediate(r)); };
+    const newIn = (cid, n) => sent.slice(n).filter(x => x.channel === cid).map(x => x.msg);
+    const textOf = (msgs) => msgs.map(m => `${m.content} ${JSON.stringify(m.components || [])}`).join('\n');
+    const realRandP = Math.random;
+    const withDice = async (nats, fn) => {
+      const q = nats.map(n => (n - 0.5) / 20);
+      Math.random = () => (q.length ? q.shift() : 0.525);
+      try { const r = await fn(); await settle(); return r; } finally { Math.random = realRandP; }
+    };
+    const PA = '100000000000000101', PB = '100000000000000102', PW = '100000000000000103', PC = '100000000000000104';
+    const NPA = `user${PA}`, NPB = `user${PB}`, NPW = `user${PW}`, NPC_ = `user${PC}`;
+    const PLAIN = [PA, PB, PW, PC];
+    const plainOf = (id) => ({ id, displayName: `user${id}`, roles: { cache: new Map() }, permissions: { has: () => false } });
+    const realFetchP = guild.members.fetch;
+    guild.members.fetch = async (uid) => { const mb = await realFetchP(uid); if (PLAIN.includes(uid)) { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+    const asP = (uid) => (PLAIN.includes(uid) ? { member: plainOf(uid) } : {});
+    const putCharP = (id, { str = 4, dex = 3, wis = 3, hp = 10, order = null, rr = 0 } = {}) => dbHandle.prepare("INSERT OR REPLACE INTO characters (guild_id, user_id, str, con, dex, wis, lck, hp_current, order_name, rerolls_current) VALUES ('G1', ?, ?, 5, ?, ?, 1, ?, ?, ?)").run(id, str, dex, wis, hp, order, rr);
+    const putNpcP = (name, { str = 3, dex = 2, wis = 1, hp = 6, lck = 1 } = {}) => dbHandle.prepare("INSERT OR REPLACE INTO npcs (guild_id, name, str, con, dex, wis, lck, hp_current) VALUES ('G1', ?, ?, 3, ?, ?, ?, ?)").run(name, str, dex, wis, lck, hp);
+    const charP = (id) => dbHandle.prepare("SELECT * FROM characters WHERE guild_id='G1' AND user_id=?").get(id);
+    const npcP = (name) => dbHandle.prepare("SELECT * FROM npcs WHERE guild_id='G1' AND name=?").get(name);
+    putCharP(PA); putCharP(PB); putCharP(PC); putCharP(PW, { wis: 6, order: 'White Knight' });
+    putNpcP('Pfoe'); putNpcP('Pally'); putNpcP('Pgob', { hp: 4 });
+    // The auto-pilot's taste for specials is off unless a probe turns it on.
+    dbHandle.prepare("UPDATE guild_config SET npc_special=0 WHERE guild_id='G1'").run();
+    const chP = new FakeChannel('CP1', 0, 'p-walk', guild); channelsById.set(chP.id, chP);
+    const fP = (over, ch = chP) => fire({ channel: ch, ...over });
+    const asGm = (o, ch = chP) => fP({ userId: 'U1', ...o }, ch);
+    const asPl = (uid, o, ch = chP) => fP({ userId: uid, ...asP(uid), ...o }, ch);
+    const fightP = (cid = 'CP1') => dbHandle.prepare("SELECT * FROM fights WHERE guild_id='G1' AND channel_id=?").get(cid);
+    const setP = (o, cid = 'CP1') => { const ks = Object.keys(o); dbHandle.prepare(`UPDATE fights SET ${ks.map(k => `${k}=?`).join(', ')} WHERE guild_id='G1' AND channel_id=?`).run(...ks.map(k => (o[k] !== null && typeof o[k] === 'object') ? JSON.stringify(o[k]) : o[k]), cid); };
+    const orderP = (cid = 'CP1') => JSON.parse(fightP(cid)?.turn_order || '[]');
+    const hpP = (id, cid = 'CP1') => JSON.parse(fightP(cid)?.hp_state || '{}')[id];
+    const sidesP = (cid = 'CP1') => JSON.parse(fightP(cid)?.sides || '{}');
+    const FRESHP = { phase: 'attack', current_target: null, atk_kind: null, atk_roll: null, atk_nat: null, atk_stat: null, def_roll: null, def_nat: null, def_stat: null, atk_rerolled: 0, def_rerolled: 0, pend: null, grapples: {} };
+    const press = (id, uid, ch = chP, msg = null) => fire({ channel: ch, isButton: true, customId: id, message: msg || { id: nextId(), content: 'x', components: [] }, userId: uid, ...asP(uid) });
+    const submit = (modal, uid, ch = chP, fields = { action: '', speech: '' }, extra = {}) => fire({ channel: ch, isModal: true, customId: modal || 'frp:none', fields, userId: uid, ...asP(uid), ...extra });
+    const endP = (cid = 'CP1') => dbHandle.prepare("UPDATE fights SET state='idle', turn_order='[]', sides='{}', pend=NULL, grapples='{}', effect_state='{}', auto_npc=0 WHERE guild_id='G1' AND channel_id=?").run(cid);
+    const gmEnd = async (ch = chP) => {
+      const r = await asGm({ commandName: 'fight', options: { _sub: 'end' } }, ch);
+      const id = (r.replies || []).flatMap(x => idsOf(x)).find(i => i.startsWith('confirm:'));
+      if (id) await fire({ channel: ch, isButton: true, customId: id, message: { id: nextId(), content: 'x', components: [] }, userId: 'U1' });
+      await settle();
+    };
+    let n0 = 0;
+
+    // 1 · /health adjust: a GM's alone; heals to the maximum and no further;
+    // outside a fight a wound stops at nought; an NPC's HP stays hidden in
+    // the room while the GM is told the numbers
+    const h0 = await asPl(PA, { commandName: 'health', options: { _sub: 'adjust', amount: 2, target: PB } });
+    dbHandle.prepare("UPDATE characters SET hp_current=1 WHERE guild_id='G1' AND user_id=?").run(PB);
+    const h1 = await asGm({ commandName: 'health', options: { _sub: 'adjust', amount: 99, target: PB } });
+    const maxP = charP(PB).hp_current;
+    const h2 = await asGm({ commandName: 'health', options: { _sub: 'adjust', amount: 1, target: PB } });
+    const h3 = await asGm({ commandName: 'health', options: { _sub: 'adjust', amount: -3, target: PB, note: 'the fall' } });
+    const h4 = await asGm({ commandName: 'health', options: { _sub: 'adjust', amount: -99, target: PB } });
+    const hpAfter4 = charP(PB).hp_current;
+    const h5 = await asGm({ commandName: 'health', options: { _sub: 'adjust', amount: -1, npc: 'Pfoe' } });
+    const h6 = await asGm({ commandName: 'health', options: { _sub: 'adjust', amount: 1, target: PB, npc: 'Pfoe' } });
+    ok('/health adjust is a GM’s alone; it heals to the maximum and no further, a wound outside a fight stops at nought, the note is shown, and a hidden NPC’s numbers go to the GM alone',
+      /Only GMs can change HP/.test(saidOf(h0)) && h0.replies[0]?.ephemeral === true
+        && maxP > 1 && new RegExp(`\\*\\*${`user${PB}`}\\*\\* regains \\*\\*${maxP - 1}\\*\\* HP`).test(saidOf(h1)) && new RegExp(`HP: \\*\\*1 → ${maxP}\\*\\*`).test(saidOf(h1))
+        && /already at full HP/.test(saidOf(h2)) && charP(PB) && /loses \*\*3\*\* HP — the fall\./.test(saidOf(h3))
+        && hpAfter4 === 0 && new RegExp(`loses \\*\\*${maxP - 3}\\*\\* HP`).test(saidOf(h4))
+        && /\*\*Pfoe 🎭\*\* loses \*\*1\*\* HP/.test(saidOf(h5)) && !/5|6/.test(h5.replies[0]?.content || '') && /🔒 \*\*Pfoe\*\*: 6 → 5/.test(saidOf(h5)) && h5.replies[1]?.ephemeral === true && npcP('Pfoe').hp_current === 5
+        && /exactly one of/.test(saidOf(h6)),
+      `${flat1(saidOf(h0)).slice(0, 60)} · max ${maxP} · ${flat1(saidOf(h1)).slice(0, 120)} · ${flat1(saidOf(h2)).slice(0, 60)} · ${flat1(saidOf(h3)).slice(0, 90)} · ${hpAfter4} ${flat1(saidOf(h4)).slice(0, 80)} · ${flat1(allOf(h5)).slice(0, 260)} · ${flat1(saidOf(h6)).slice(0, 50)}`);
+    dbHandle.prepare("UPDATE characters SET hp_current=10 WHERE guild_id='G1' AND user_id=?").run(PB);
+    dbHandle.prepare("UPDATE npcs SET hp_current=6 WHERE guild_id='G1' AND name='Pfoe'").run();
+
+    // 2 · /heal: the White Knight's, once typed; the old words point the way
+    const k0 = await asPl(PA, { commandName: 'heal', options: { target: PB } });
+    dbHandle.prepare("UPDATE characters SET hp_current=2 WHERE guild_id='G1' AND user_id=?").run(PB);
+    const k1 = await withDice([20], () => asPl(PW, { commandName: 'heal', options: { target: PB } }));
+    const hpK1 = charP(PB).hp_current;
+    const k2 = await withDice([3], () => asPl(PW, { commandName: 'heal', options: { target: PB } }));
+    const k3 = await asPl(PW, { commandName: 'heal', options: { target: PW } });
+    const typed = async (text, uid = PA) => {
+      const got = [];
+      const msg = { content: text, author: { id: uid, bot: false }, guild, channel: chP, channelId: chP.id, member: plainOf(uid), attachments: { size: 0, first: () => null }, client,
+        reply: async (p) => { got.push(typeof p === 'string' ? p : (p?.content || '')); return { id: nextId() }; } };
+      for (const fn of listeners.messageCreate || []) { try { await fn(msg); } catch (e) { loggedP.push(`typed ${text}: ${e.message}`); } }
+      return got.join('\n');
+    };
+    const t1 = await typed('!hp -3'), t2 = await typed('!heal @someone'), t3 = await typed('hp is low again'), t4 = await typed('!h');
+    ok('/heal is the White Knight’s heal: others are refused, a natural 20 restores 2 and spends no charge, a low roll spends one and heals nothing, never oneself; the typed !hp and !heal answer with where they went, and talk about hp is left alone',
+      /Only \*\*White Knights\*\*/.test(saidOf(k0)) && hpK1 === 4 && /Natural 20! 2 HP restored/.test(saidOf(k1)) && /No charge consumed/.test(saidOf(k1))
+        && charP(PB).hp_current === 4 && /No heal\. 1 charge consumed/.test(saidOf(k2)) && /cannot heal yourself/.test(saidOf(k3))
+        && /`!hp` has gone/.test(t1) && /\/health adjust/.test(t1) && /`!heal` is `\/heal` now/.test(t2) && t3 === '' && /`!heal` is `\/heal` now/.test(t4),
+      `${flat1(saidOf(k0)).slice(0, 60)} · ${hpK1} ${flat1(saidOf(k1)).slice(-260)} · ${flat1(saidOf(k2)).slice(0, 100)} · ${flat1(saidOf(k3)).slice(0, 40)} · [${t1}] [${t2}] [${t3}] [${t4}]`);
+    dbHandle.prepare("UPDATE characters SET hp_current=10 WHERE guild_id='G1' AND user_id=?").run(PB);
+
+    // 3 · sides at the start: enemies by default, friendly as said; the list
+    // and the board mark the friendly; the picker hides an NPC's HP from a
+    // player and shows it to the GM, the other side first
+    const s1 = await asGm({ commandName: 'fight', options: { _sub: 'start', players: `<@${PA}> <@${PB}>`, npcs: 'Pfoe, Pgob', friendly: 'Pally', manual: true } });
+    const sd1 = sidesP(), ord1 = orderP();
+    const board = await asGm({ commandName: 'fight', options: { _sub: 'status' } });
+    const pickPl = await asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str' } });
+    const pickText = JSON.stringify(pickPl.replies);
+    setP({ turn_index: ord1.indexOf('npc:Pally') });
+    const pickGm = await asGm({ commandName: 'fight', options: { _sub: 'atk', stat: 'str', npc: 'Pally' } });
+    const pickGmText = JSON.stringify(pickGm.replies);
+    setP({ turn_index: 0 });
+    ok('/fight start takes enemies and friendly NPCs: the friendly are marked in the list and on the board, the sides are kept; the picker shows a player how an NPC looks and never its HP, the GM the numbers, and lists the other side first',
+      sd1['npc:Pally'] === 'ally' && !sd1['npc:Pfoe'] && !sd1['npc:Pgob'] && ord1.length === 5
+        && /\*\*Pally\*\* 🎭 🤝/.test(saidOf(s1)) && /🤝 fights beside the players/.test(saidOf(s1)) && !/\*\*Pfoe\*\* 🎭 🤝/.test(saidOf(s1))
+        && /\*\*Pally 🎭\*\* 🤝/.test(saidOf(board)) && /🤝 fights beside the players/.test(saidOf(board))
+        && /unhurt · NPC/.test(pickText) && !/\d+ HP · NPC/.test(pickText) && /unhurt · NPC · friendly/.test(pickText)
+        && pickText.indexOf('Pfoe') < pickText.indexOf(`user${PB}`) && pickText.indexOf('Pgob') < pickText.indexOf('Pally')
+        && /6 HP · NPC/.test(pickGmText) && /4 HP · NPC/.test(pickGmText),
+      `${JSON.stringify(sd1)} · ${ord1.join(',')} · ${flat1(saidOf(s1)).slice(0, 260)} · ${flat1(saidOf(board)).slice(0, 200)} · ${flat1(pickText).slice(0, 420)} · ${flat1(pickGmText).slice(0, 260)}`);
+
+    // 4 · the auto-pilot keeps to its side: a friendly NPC strikes the enemy
+    // and never a player; an enemy goes for the party; a GM's hand that
+    // drops the last enemy ends it for the side left standing
+    endP();
+    const realTO4 = globalThis.setTimeout;
+    globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
+    n0 = sent.length;
+    // initiative PA 2, Pfoe 10, Pally 19 → Pally, Pfoe, PA; Pally: pick, strike 15; Pfoe defends 5; Pfoe: pick (20 → the last of its foes, PA), strike 12
+    const a4 = await withDice([2, 10, 19, 10, 15, 5, 20, 12], async () => { const r = await asGm({ commandName: 'fight', options: { _sub: 'auto', mode: 'npconly', players: `<@${PA}>`, npcs: 'Pfoe', friendly: 'Pally' } }); for (let i = 0; i < 12; i++) await settle(); return r; });
+    globalThis.setTimeout = realTO4;
+    const f4 = fightP(), text4 = `${saidOf(a4)}\n${textOf(newIn('CP1', n0))}`;
+    const k4 = await asGm({ commandName: 'health', options: { _sub: 'adjust', amount: -99, npc: 'Pfoe' } });
+    await settle();
+    const f4b = fightP(), end4 = `${saidOf(k4)}\n${textOf(newIn('CP1', n0))}`;
+    ok('on the auto-pilot a friendly NPC strikes the enemy and never a player, and the enemy goes for the party; the GM’s hand dropping the last enemy ends the fight for everyone left on the other side',
+      JSON.parse(f4?.sides || '{}')['npc:Pally'] === 'ally' && JSON.parse(f4?.turn_order || '[]').join(',') === `npc:Pally,npc:Pfoe,${PA}`
+        && /\*\*Pally 🎭\*\* 🤝/.test(text4) && /Pally 🎭 attacks Pfoe 🎭/.test(text4) && new RegExp(`Pfoe 🎭 attacks ${NPA}`).test(text4) && JSON.parse(f4.hp_state)['npc:Pfoe'] === 5
+        && f4.phase === 'defend' && f4.current_target === PA && JSON.parse(f4.turn_order)[f4.turn_index] === 'npc:Pfoe'
+        && !new RegExp(`Pally 🎭 attacks ${NPA}`).test(text4)
+        && /\*\*Pfoe 🎭\*\* has been knocked down/.test(end4) && f4b.state === 'idle'
+        && new RegExp(`🏆 \\*\\*Pally 🎭\\*\\* and \\*\\*${NPA}\\*\\* win the fight!`).test(end4),
+      `${f4?.sides} · @${f4?.turn_index}/${f4?.phase}→${f4?.current_target} · ${f4?.hp_state} · ${flat1(text4).slice(0, 700)} ·· ${flat1(end4).slice(-420)} · ${f4b?.state}`);
+    dbHandle.prepare("UPDATE npcs SET hp_current=6 WHERE guild_id='G1' AND name IN ('Pfoe','Pally')").run();
+    dbHandle.prepare("UPDATE characters SET hp_current=10 WHERE guild_id='G1' AND user_id IN (?,?)").run(PA, PB);
+
+    // 5 · a fighter brought to nothing by the GM is out there and then: a
+    // bystander just leaves the order; one a strike was waiting on voids it
+    // and the attacker acts again; one whose turn it was passes it on
+    await asGm({ commandName: 'fight', options: { _sub: 'start', players: `<@${PA}> <@${PB}>`, npcs: 'Pfoe, Pgob, Pally', manual: true } });
+    const d1 = await asGm({ commandName: 'health', options: { _sub: 'adjust', amount: -99, npc: 'Pgob' } });
+    const f5a = fightP();
+    const atk5 = await withDice([12], () => asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Pfoe', flavour: 'a cut' } }));
+    const f5b = fightP();
+    const d2 = await asGm({ commandName: 'health', options: { _sub: 'adjust', amount: -99, npc: 'Pfoe' } });
+    const f5c = fightP();
+    const d3 = await asGm({ commandName: 'health', options: { _sub: 'adjust', amount: -99, target: PA } });
+    const f5d = fightP();
+    const d4 = await asGm({ commandName: 'health', options: { _sub: 'adjust', amount: -99, npc: 'Pally' } });
+    await settle();
+    const f5e = fightP();
+    ok('/health adjust mid-fight knocks out at nought: a bystander leaves the order and the turn stays; the target of a waiting strike voids it and the attacker acts again; the one whose turn it was passes it; and the last one standing wins',
+      /\*\*Pgob 🎭\*\* has been knocked down/.test(saidOf(d1)) && JSON.parse(f5a.turn_order).join(',') === `${PA},${PB},npc:Pfoe,npc:Pally` && f5a.turn_index === 0 && !/turn to attack/.test(saidOf(d1))
+        && f5b.phase === 'defend' && f5b.current_target === 'npc:Pfoe'
+        && /The strike that was waiting on them is void/.test(saidOf(d2)) && new RegExp(`\\*\\*${NPA}\\*\\*'s turn to attack`).test(saidOf(d2)) && f5c.phase === 'attack' && f5c.atk_roll === null && JSON.parse(f5c.turn_order).join(',') === `${PA},${PB},npc:Pally` && f5c.turn_index === 0
+        && new RegExp(`\\*\\*${NPA}\\*\\* has been knocked down`).test(saidOf(d3)) && new RegExp(`\\*\\*${NPB}\\*\\*'s turn to attack`).test(saidOf(d3)) && JSON.parse(f5d.turn_order).join(',') === `${PB},npc:Pally` && f5d.turn_index === 0
+        && f5e.state === 'idle' && new RegExp(`🏆 \\*\\*${NPB}\\*\\* wins the fight!`).test(`${saidOf(d4)}\n${textOf(newIn('CP1', n0))}`)
+        && charP(PA).hp_current === 0 && npcP('Pgob').hp_current === 0,
+      `${flat1(saidOf(d1)).slice(0, 160)} [${f5a.turn_order}@${f5a.turn_index}] · ${flat1(saidOf(atk5)).slice(0, 60)} ${f5b.phase}→${f5b.current_target} · ${flat1(saidOf(d2)).slice(0, 300)} [${f5c.turn_order}@${f5c.turn_index}/${f5c.phase}] · ${flat1(saidOf(d3)).slice(0, 300)} [${f5d.turn_order}@${f5d.turn_index}] · ${flat1(saidOf(d4)).slice(0, 200)} ${f5e.state}`);
+    dbHandle.prepare("UPDATE npcs SET hp_current=6 WHERE guild_id='G1' AND name IN ('Pfoe','Pally')").run();
+    dbHandle.prepare("UPDATE npcs SET hp_current=4 WHERE guild_id='G1' AND name='Pgob'").run();
+    dbHandle.prepare("UPDATE characters SET hp_current=10 WHERE guild_id='G1' AND user_id IN (?,?)").run(PA, PB);
+
+    // 6 · /fight side moves an NPC and shows or hides its HP; /fight addnpc
+    // takes friendly ones; what was said about HP ends with the fight
+    await asGm({ commandName: 'fight', options: { _sub: 'start', players: `<@${PA}>`, npcs: 'Pfoe, Pgob', manual: true } });
+    const sPl = await asPl(PA, { commandName: 'fight', options: { _sub: 'side', npc: 'Pgob', side: 'friendly' } });
+    const sF = await asGm({ commandName: 'fight', options: { _sub: 'side', npc: 'Pgob', side: 'friendly', reveal: true } });
+    const sd6 = sidesP(), rev6 = npcP('Pgob').reveal;
+    const pick6 = JSON.stringify((await asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str' } })).replies);
+    const sShow = await asGm({ commandName: 'fight', options: { _sub: 'side', npc: 'Pgob' } });
+    const sLast = await asGm({ commandName: 'fight', options: { _sub: 'side', npc: 'Pfoe', side: 'friendly' } });
+    const sBack = await asGm({ commandName: 'fight', options: { _sub: 'side', npc: 'Pfoe', side: 'enemy' } });
+    const addF = await withDice([9], () => asGm({ commandName: 'fight', options: { _sub: 'addnpc', friendly: 'Pally', reveal: false } }));
+    const sd6b = sidesP(), rev6b = npcP('Pally').reveal;
+    const addNone = await asGm({ commandName: 'fight', options: { _sub: 'addnpc' } });
+    await gmEnd();
+    ok('/fight side is the GM’s: it moves an NPC across and shows or hides its HP — the picker then gives a player the number; turning the last enemy says nobody is left to fight; /fight addnpc takes friendly: and reveal:; and what was said about HP is forgotten when the fight ends',
+      /Only GMs set an NPC/.test(saidOf(sPl)) && sd6['npc:Pgob'] === 'ally' && rev6 === 1 && /now fights beside the players/.test(saidOf(sF)) && /HP is shown to everyone/.test(saidOf(sF))
+        && /4 HP · NPC · friendly/.test(pick6) && /unhurt · NPC/.test(pick6)
+        && /fights beside the players; its HP is shown to everyone/.test(saidOf(sShow))
+        && /Nobody is left on the other side/.test(saidOf(sLast)) && /now fights against the players/.test(saidOf(sBack))
+        && sd6b['npc:Pally'] === 'ally' && rev6b === 0 && /\*\*Pally\*\* 🤝/.test(saidOf(addF)) && /Name at least one NPC/.test(saidOf(addNone))
+        && npcP('Pgob').reveal === null && npcP('Pally').reveal === null && fightP().state === 'idle',
+      `${flat1(saidOf(sPl)).slice(0, 40)} · ${JSON.stringify(sd6)} rev ${rev6} · ${flat1(saidOf(sF)).slice(0, 140)} · ${flat1(pick6).slice(0, 300)} · ${flat1(saidOf(sShow)).slice(0, 120)} · ${flat1(saidOf(sLast)).slice(0, 200)} · ${JSON.stringify(sd6b)} rev ${rev6b} · ${flat1(saidOf(addF)).slice(0, 160)} · ${npcP('Pgob').reveal}/${npcP('Pally').reveal}`);
+
+    // 7 · a run's cast: /session npcs keeps it, a fight and an initiative in
+    // the run's room take it in with its sides, cast:false leaves it out,
+    // and every NPC list completes after every comma
+    const chP2 = new FakeChannel('CP2', 0, 'p-run', guild); channelsById.set(chP2.id, chP2);
+    dbHandle.prepare("INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, gm_id, started_at) VALUES ('G1', 960, 'Cast Road', 'active', 'quest', ?, 'CP2', 'U1', ?)").run(Date.now(), Date.now());
+    const c0 = await asPl(PA, { commandName: 'session', options: { _sub: 'npcs', add: 'Pfoe' } }, chP2);
+    const c1 = await asGm({ commandName: 'session', options: { _sub: 'npcs', add: 'Pfoe, Pgob', friendly: 'Pally', reveal: true } }, chP2);
+    const castRow = () => JSON.parse(dbHandle.prepare("SELECT npc_cast FROM quests WHERE guild_id='G1' AND number=960").get().npc_cast || '[]');
+    const cast1 = castRow();
+    const c2 = await asGm({ commandName: 'session', options: { _sub: 'npcs' } }, chP2);
+    const st7 = await asGm({ commandName: 'fight', options: { _sub: 'start', players: `<@${PA}>`, manual: true } }, chP2);
+    const ord7 = orderP('CP2'), sd7 = sidesP('CP2'), rev7 = npcP('Pfoe').reveal;
+    await gmEnd(chP2);
+    const rev7b = npcP('Pfoe').reveal;
+    const st7b = await asGm({ commandName: 'fight', options: { _sub: 'start', players: `<@${PA}> <@${PB}>`, cast: false, manual: true } }, chP2);
+    const ord7b = orderP('CP2');
+    await gmEnd(chP2);
+    const c3 = await asGm({ commandName: 'session', options: { _sub: 'npcs', remove: 'Pgob, Nobody' } }, chP2);
+    const cast3 = castRow();
+    const c4 = await asGm({ commandName: 'session', options: { _sub: 'npcs', add: 'Pally' } }, chP2);
+    const cast4 = castRow();
+    await asGm({ commandName: 'session', options: { _sub: 'npcs', friendly: 'Pally' } }, chP2);
+    const in7 = await withDice([10, 11, 12], () => asGm({ commandName: 'initiative', options: { players: `<@${PA}>`, signup: false } }, chP2));
+    const ordI = JSON.parse(dbHandle.prepare("SELECT order_json FROM turn_orders WHERE guild_id='G1' AND channel_id='CP2'").get()?.order_json || '[]').map(e => e.name);
+    await asGm({ commandName: 'session', options: { _sub: 'turn', action: 'end' } }, chP2);
+    const acOf = async (o, ch = chP2) => ((await fP({ isAutocomplete: true, userId: 'U1', ...o }, ch)).replies.find(x => x.autocomplete)?.autocomplete || []).map(c => c.value);
+    const ac1 = await acOf({ commandName: 'fight', options: { _sub: 'addnpc', _focused: 'npc', _focusedValue: 'Pfoe, pg' } });
+    const ac2 = await acOf({ commandName: 'fight', options: { _sub: 'start', _focused: 'friendly', _focusedValue: 'Pfoe,Pgob,  pal' } });
+    const ac3 = await acOf({ commandName: 'initiative', options: { _focused: 'npcs', _focusedValue: 'Pally, ' } });
+    const ac6 = await acOf({ commandName: 'fight', options: { _sub: 'auto', _focused: 'npcs', _focusedValue: '' } });
+    const ac4 = await acOf({ commandName: 'session', options: { _sub: 'npcs', _focused: 'remove', _focusedValue: '' } });
+    const ac5 = await acOf({ commandName: 'session', options: { _sub: 'npcs', _focused: 'add', _focusedValue: 'Pfoe x2, p' } });
+    ok('/session npcs keeps a run’s cast with its sides and whether its HP shows; a fight in the run’s room takes the cast in (cast:false leaves it out) and an initiative does too; remove takes one out and naming one again moves its side; every NPC list completes after every comma',
+      /Only GMs/.test(saidOf(c0)) && cast1.length === 3 && cast1.find(e => e.name === 'Pally')?.side === 'ally' && cast1.find(e => e.name === 'Pfoe')?.side === 'foe'
+        && /Enemies: Pfoe, Pgob/.test(saidOf(c2)) && /Friendly: Pally/.test(saidOf(c2)) && /Their HP is shown to the players/.test(saidOf(c2))
+        && ord7.length === 4 && sd7['npc:Pally'] === 'ally' && !sd7['npc:Pfoe'] && rev7 === 1 && rev7b === 1 && /\*\*Pally\*\* 🎭 🤝/.test(saidOf(st7))
+        && ord7b.join(',') === `${PA},${PB}`
+        && cast3.map(e => e.name).join(',') === 'Pfoe,Pally' && /Out of the cast: Pgob/.test(saidOf(c3)) && /\*\*Nobody\*\* is not in the cast/.test(saidOf(c3))
+        && cast4.find(e => e.name === 'Pally')?.side === 'foe' && /Now against the players: Pally/.test(saidOf(c4))
+        && ordI.includes('Pfoe') && ordI.includes('Pally') && ordI.length === 3
+        && ac1.includes('Pfoe, Pgob') && !ac1.some(v => /Pfoe, Pfoe/.test(v))
+        && ac2.includes('Pfoe, Pgob, Pally') && ac3[0] === 'Pally, Pfoe' && !ac3.includes('Pally, Pally') && ac6[0] === 'Pfoe' && ac6[1] === 'Pally'
+        && ac4.join(',') === 'Pfoe,Pally' && ac5.some(v => v === 'Pfoe x2, Pgob') && !ac5.some(v => v === 'Pfoe x2, Pfoe'),
+      `${flat1(saidOf(c0)).slice(0, 30)} · ${JSON.stringify(cast1)} · ${flat1(saidOf(c2)).slice(0, 200)} · ${ord7.join(',')} ${JSON.stringify(sd7)} rev ${rev7}/${rev7b} · ${ord7b.join(',')} · ${flat1(saidOf(c3)).slice(0, 160)} · ${JSON.stringify(cast4)} ${flat1(saidOf(c4)).slice(0, 100)} · init ${ordI.join(',')} ${flat1(saidOf(in7)).slice(0, 80)} · ac1 ${ac1.slice(0, 4).join(' | ')} · ac2 ${ac2.slice(0, 3).join(' | ')} · ac3 ${ac3.slice(0, 4).join(' | ')} · ac4 ${ac4.join(' | ')} · ac5 ${ac5.slice(0, 4).join(' | ')}`);
+
+    // 8 · /session summary: the story so far as a file, the run left open
+    try { dbHandle.prepare("INSERT INTO quest_events (guild_id, quest_number, at_ms, kind, text) VALUES ('G1', 960, 60000, 'note', 'The gate is barred.')").run(); } catch (e) { loggedP.push(`quest_events seed: ${e.message}`); }
+    const sm0 = await asPl(PA, { commandName: 'session', options: { _sub: 'summary' } }, chP2);
+    const sm1 = await asGm({ commandName: 'session', options: { _sub: 'summary' } }, chP2);
+    const sm2 = await asGm({ commandName: 'session', options: { _sub: 'summary', share: true } }, chP2);
+    const run8 = dbHandle.prepare("SELECT status FROM quests WHERE guild_id='G1' AND number=960").get();
+    ok('/session summary hands its GM the story so far as a PDF without closing the run — private unless share:true',
+      /Only GMs/.test(saidOf(sm0)) && (sm1.replies.find(x => x.files)?.files || []).length === 1 && /the story so far/.test(saidOf(sm1)) && /Only you can see this/.test(saidOf(sm1)) && /still open; nothing was closed or paid/.test(saidOf(sm1))
+        && (sm2.replies.find(x => x.files)?.files || []).length === 1 && !/Only you can see this/.test(saidOf(sm2)) && run8.status === 'active',
+      `${flat1(saidOf(sm0)).slice(0, 40)} · ${flat1(saidOf(sm1)).slice(0, 240)} · files ${(sm1.replies.find(x => x.files)?.files || []).length} · ${flat1(saidOf(sm2)).slice(0, 120)} · ${run8.status}`);
+
+    // 9 · /config mechanics npcspecial: the auto-pilot's taste for specials
+    const ns0 = await asGm({ commandName: 'config', options: { _group: 'mechanics', _sub: 'npcspecial' } });
+    const ns1 = await asGm({ commandName: 'config', options: { _group: 'mechanics', _sub: 'npcspecial', chance: 50 } });
+    const ns2 = await asGm({ commandName: 'config', options: { _group: 'mechanics', _sub: 'npcspecial' } });
+    await asGm({ commandName: 'config', options: { _group: 'mechanics', _sub: 'npcspecial', chance: 0 } });
+    ok('/config mechanics npcspecial shows and sets how often the auto-pilot uses a special move; 0 is never',
+      /\*\*never\*\*/.test(saidOf(ns0)) && /\*\*50\*\* times in 100/.test(saidOf(ns1)) && /\*\*50\*\* times in 100/.test(saidOf(ns2))
+        && dbHandle.prepare("SELECT npc_special FROM guild_config WHERE guild_id='G1'").get().npc_special === 0,
+      `${flat1(saidOf(ns0)).slice(0, 120)} · ${flat1(saidOf(ns1)).slice(0, 120)} · ${flat1(saidOf(ns2)).slice(0, 80)}`);
+    dbHandle.prepare("UPDATE quests SET status='completed' WHERE guild_id='G1' AND number=960").run();
+    dbHandle.prepare("UPDATE npcs SET reveal=NULL WHERE guild_id='G1'").run();
+
+    // ── stage 3: Reroll and Keep, the GM's Resolve, a reaction under the outcome ──
+    const tok = (id, n) => dbHandle.prepare("UPDATE characters SET rerolls_current=? WHERE guild_id='G1' AND user_id=?").run(n, id);
+    const pendP = (cid = 'CP1') => JSON.parse(fightP(cid)?.pend || '{}');
+    const armP = (order, extra = {}) => {
+      endP();
+      dbHandle.prepare("UPDATE characters SET hp_current=10, next_mark=NULL WHERE guild_id='G1' AND user_id IN (?,?,?,?)").run(PA, PB, PW, PC);
+      setP({ ...FRESHP, state: 'active', turn_order: order, turn_index: 0, hp_state: Object.fromEntries(order.map(id => [id, 10])), effect_state: {}, sides: {}, rr_state: {}, auto_npc: 0, last_at: Date.now(), nudged: 0, clock_idle: 0, ...extra });
+    };
+    const idsIn = (r) => (r?.replies || []).flatMap(x => idsOf(x));
+    const act = (uid, o) => asPl(uid, { commandName: 'fight', options: { _sub: 'act', ...o } });
+    const tickAllP = async () => { for (const t of ticks.filter(t => /turnClockTick/.test(String(t.fn)))) { try { await t.fn(); } catch (e) { loggedP.push(`tick: ${e.message}`); } } };
+    const quietP = (mins, cid = 'CP1') => dbHandle.prepare("UPDATE fights SET last_at=?, nudged=0, clock_idle=0 WHERE guild_id='G1' AND channel_id=?").run(Date.now() - mins * 60000, cid);
+
+    // 10 · players alone: the pair rides the attack's prompt and the
+    // defence's reply; nothing lands while a roll is open; a player's Resolve
+    // keeps their own roll and no more; a kept roll cannot be thrown again;
+    // one reroll a roll; with nothing open the old Resolve lands it; the one
+    // it was aimed at is offered a reaction, theirs alone, and the fight
+    // does not wait on it
+    tok(PA, 2); tok(PB, 1);
+    armP([PA, PB]);
+    const a10 = await withDice([10], () => asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str', target: PB, flavour: 'a cut' } }));   // 14
+    const d10 = await withDice([5], () => asPl(PB, { commandName: 'fight', options: { _sub: 'def', stat: 'dex', flavour: 'a parry' } }));   // 8
+    const early10 = await asPl(PB, { commandName: 'fight', options: { _sub: 'resolve' } });
+    const f10a = fightP(), pend10a = pendP();
+    const rrKept10 = await asPl(PB, { commandName: 'fight', options: { _sub: 'rr' } });
+    const notMine10 = await press('fkeep', PB);
+    const rr10 = await withDice([18], () => press('frr', PA));   // 22
+    const f10b = fightP();
+    const again10 = await press('frr', PA);
+    const keepNone10 = await press('fkeep', PA);
+    const hpB10 = hpP(PB);
+    const res10 = await asPl(PA, { commandName: 'fight', options: { _sub: 'resolve' } });
+    const f10c = fightP();
+    const rpWrong10 = await press(`fdrp:${PB}`, PA);
+    const rpP10 = await press(`fdrp:${PB}`, PB);
+    const msg10 = { id: nextId(), content: 'x', components: [{ components: [{ customId: 'fatk:str' }] }, { components: [{ customId: `fdrp:${PB}` }] }] };
+    msg10.edit = async (o) => { msg10.edited = o; return msg10; };
+    const rpS10 = await submit(modalOf(rpP10), PB, chP, { action: 'staggers back', speech: 'Is that all?' }, { message: msg10, fromMessage: true });
+    const f10d = fightP();
+    ok('players alone: Reroll and Keep ride the attack’s prompt and the defence’s reply, and nothing lands while a roll is open; a player’s Resolve keeps their own roll only; a kept roll stands; one reroll a roll; with nothing open Resolve lands it',
+      idsIn(a10).includes('frr') && idsIn(a10).includes('fkeep') && idsIn(a10).includes('fdef:str')
+        && new RegExp(`Nothing lands yet — <@${PA}> and <@${PB}> may 🔁 \\*\\*Reroll\\*\\* or ✅ \\*\\*Keep\\*\\*`).test(saidOf(d10))
+        && ['fresolve', 'frr', 'fkeep'].every(i => idsIn(d10).includes(i))
+        && new RegExp(`✅ \\*\\*${NPB}\\*\\* keeps the roll\\.`).test(saidOf(early10)) && new RegExp(`Nothing lands yet — <@${PA}> may`).test(saidOf(early10))
+        && f10a.phase === 'defend' && pend10a.dk === 1 && !pend10a.ak
+        && /That roll was kept — it stands/.test(saidOf(rrKept10)) && /not yours to keep/.test(saidOf(notMine10)) && charP(PB).rerolls_current === 1
+        && /rerolls \*\(reroll\)\* — attack with STR!/.test(saidOf(rr10)) && /Use `\/fight resolve` to resolve this exchange/.test(saidOf(rr10)) && !/GM’s to press/.test(saidOf(rr10))
+        && idsIn(rr10).includes('fresolve') && !idsIn(rr10).includes('frr')
+        && charP(PA).rerolls_current === 1 && f10b.atk_roll === 22 && f10b.atk_rerolled === 1 && f10b.phase === 'defend'
+        && /already rerolled this attack/.test(saidOf(again10)) && /No roll here is waiting/.test(saidOf(keepNone10))
+        && new RegExp(`hits \\*\\*${NPB}\\*\\* for \\*\\*1\\*\\* damage`).test(saidOf(res10)) && hpP(PB) === hpB10 - 1 && f10c.phase === 'attack' && f10c.turn_index === 1 && !f10c.pend,
+      `${idsIn(a10).join(',')} · ${flat1(saidOf(d10)).slice(-160)} ${idsIn(d10).join(',')} · ${flat1(saidOf(early10))} · ${f10a.phase} ${JSON.stringify(pend10a)} · ${flat1(saidOf(rrKept10))} · ${flat1(saidOf(notMine10)).slice(0, 80)} · ${flat1(saidOf(rr10)).slice(0, 260)} ${idsIn(rr10).join(',')} · ${charP(PA).rerolls_current} ${f10b.atk_roll}/${f10b.atk_rerolled} · ${flat1(saidOf(again10))} · ${flat1(saidOf(keepNone10))} · ${flat1(saidOf(res10)).slice(0, 300)} ${hpP(PB)}/${hpB10} @${f10c.turn_index}/${f10c.phase} ${f10c.pend}`);
+    ok('under the outcome the one the blow was aimed at is offered 🎭: the button is theirs alone, its form’s words are said aloud and the button goes; nothing in the fight moves',
+      new RegExp(`-# 🎭 \\*\\*${NPB}\\*\\* may say how they take it — the fight does not wait\\.`).test(saidOf(res10)) && idsIn(res10).includes(`fdrp:${PB}`)
+        && saidOf(res10).indexOf('may say how they take it') < saidOf(res10).indexOf('turn to attack!')
+        && /belongs to whoever the blow was aimed at/.test(saidOf(rpWrong10)) && /^frp:/.test(modalOf(rpP10) || '')
+        && new RegExp(`🎭 \\*\\*${NPB}\\*\\*`).test(saidOf(rpS10)) && /staggers back/.test(saidOf(rpS10)) && /Is that all\?/.test(saidOf(rpS10))
+        && msg10.edited?.components?.length === 1
+        && f10d.phase === 'attack' && f10d.turn_index === 1 && f10d.last_at === f10c.last_at,
+      `${flat1(saidOf(res10)).slice(-330)} · ${idsIn(res10).join(',')} · ${flat1(saidOf(rpWrong10))} · ${modalOf(rpP10)} · ${flat1(saidOf(rpS10))} · ${JSON.stringify(msg10.edited || null).slice(0, 120)} · @${f10d.turn_index}/${f10d.phase}`);
+
+    // 11 · a fight with NPCs, run by hand: a player cannot Resolve, throw an
+    // NPC's roll again or keep it; a GM's 🔁 with no roll of their own is the
+    // NPC's, on the NPC's own tokens; /fight rr npc: and /fight keep npc:;
+    // two NPC rolls open asks whose; a GM's Keep takes the NPCs' rolls
+    tok(PA, 0); tok(PB, 0);
+    dbHandle.prepare("UPDATE npcs SET rerolls_current=NULL, hp_current=6 WHERE guild_id='G1' AND name IN ('Pfoe','Pgob','Pally')").run();
+    armP([PA, 'npc:Pfoe', 'npc:Pgob'], { rr_state: { 'npc:Pfoe': 2, 'npc:Pgob': 1 } });
+    const a11 = await withDice([12], () => asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Pfoe', flavour: 'a cut' } }));   // 16
+    n0 = sent.length;
+    const d11 = await withDice([3], () => asGm({ commandName: 'fight', options: { _sub: 'def', stat: 'dex', npc: 'Pfoe', flavour: 'ducks' } }));   // 5
+    const wait11 = newIn('CP1', n0);
+    const plRes11 = await press('fresolve', PA);
+    const plRr11 = await press('frr', PA);
+    const plKeep11 = await press('fkeep', PA);
+    const plNpc11 = await asPl(PA, { commandName: 'fight', options: { _sub: 'rr', npc: 'Pfoe' } });
+    const gmRr11 = await withDice([15], () => press('frr', 'U1'));   // 17
+    const f11a = fightP(), npcTok11 = npcP('Pfoe').rerolls_current;
+    const gmRr11b = await asGm({ commandName: 'fight', options: { _sub: 'rr', npc: 'Pfoe' } });
+    const gmRes11 = await asGm({ commandName: 'fight', options: { _sub: 'resolve' } });
+    const f11b = fightP(), hpF11 = hpP('npc:Pfoe');
+    // Pfoe's turn: its attack is open on its last token; the player answers; the GM keeps it by name
+    const na11 = await withDice([9], () => asGm({ commandName: 'fight', options: { _sub: 'atk', npc: 'Pfoe', stat: 'str', target: PA, flavour: 'claws' } }));   // 12
+    n0 = sent.length;
+    const pd11 = await withDice([10], () => asPl(PA, { commandName: 'fight', options: { _sub: 'def', stat: 'dex', flavour: 'sidesteps' } }));   // 13
+    const keepN11 = await asGm({ commandName: 'fight', options: { _sub: 'keep', npc: 'Pfoe' } });
+    const pend11 = pendP();
+    await asGm({ commandName: 'fight', options: { _sub: 'resolve' } });
+    // Pgob's turn, on Pfoe: both rolls are NPCs' and both are open
+    setP({ rr_state: { 'npc:Pfoe': 1, 'npc:Pgob': 1 } });
+    await withDice([10], () => asGm({ commandName: 'fight', options: { _sub: 'atk', npc: 'Pgob', stat: 'str', target_npc: 'Pfoe', flavour: 'bites' } }));
+    await withDice([10], () => asGm({ commandName: 'fight', options: { _sub: 'def', stat: 'dex', npc: 'Pfoe', flavour: 'ducks' } }));
+    const ask11 = await press('frr', 'U1');
+    const pick11 = await withDice([16], () => press('frrn:def', 'U1'));
+    const f11c = fightP();
+    const gmKeep11 = await press('fkeep', 'U1');
+    const pend11c = pendP();
+    ok('a fight with NPCs, by hand: Resolve is the GM’s — a player’s is refused, and so are an NPC’s Reroll and Keep; a GM’s 🔁 with no roll of their own throws the NPC’s again on the NPC’s own tokens, once; /fight rr npc: and /fight keep npc: name it; two NPC rolls open ask whose; a GM’s Keep takes the NPCs’',
+      !idsIn(a11).includes('frr') && wait11.some(m => /Nothing lands yet — \*\*Pfoe 🎭\*\* \(a GM's press\) may/.test(m.content) && ['fresolve', 'frr', 'fkeep'].every(i => idsOf(m).includes(i)))
+        && /Resolve\*\* is the GM’s to press/.test(saidOf(plRes11)) && /No rerolls remaining/.test(saidOf(plRr11)) && /not yours to keep/.test(saidOf(plKeep11)) && /Only GMs reroll for an NPC/.test(saidOf(plNpc11))
+        && /\*\*Pfoe 🎭\*\* rerolls \*\(reroll\)\* — defence! \(1 left\)/.test(saidOf(gmRr11)) && /In a fight with NPCs it is the GM’s to press/.test(saidOf(gmRr11))
+        && f11a.def_roll === 17 && f11a.def_rerolled === 1 && JSON.parse(f11a.rr_state)['npc:Pfoe'] === 1 && npcTok11 === 1
+        && /\*\*Pfoe\*\* has already rerolled this defence/.test(saidOf(gmRr11b))
+        && f11b.phase === 'attack' && f11b.turn_index === 1 && hpF11 === 10
+        && idsIn(na11).concat(newIn('CP1', 0).slice(-6).flatMap(m => idsOf(m))).includes('frr')
+        && /Nothing lands yet — \*\*Pfoe 🎭\*\* \(a GM's press\) may/.test(saidOf(pd11))
+        && /✅ \*\*Pfoe 🎭\*\* keeps the roll\./.test(saidOf(keepN11)) && /Use `\/fight resolve`/.test(saidOf(keepN11)) && pend11.ak === 1
+        && /Whose roll is thrown again\?/.test(saidOf(ask11)) && idsIn(ask11).includes('frrn:atk') && idsIn(ask11).includes('frrn:def')
+        && /\*\*Pfoe 🎭\*\* rerolls \*\(reroll\)\* — defence! \(0 left\)/.test(saidOf(pick11)) && /Nothing lands yet — \*\*Pgob 🎭\*\*/.test(saidOf(pick11)) && f11c.def_rerolled === 1 && f11c.phase === 'defend'
+        && /✅ \*\*Pgob 🎭\*\* keeps the roll\./.test(saidOf(gmKeep11)) && pend11c.ak === 1,
+      `${idsIn(a11).join(',')} · ${wait11.map(m => flat1(m.content).slice(0, 110) + ' ' + idsOf(m).join(',')).join(' | ')} · ${flat1(saidOf(plRes11))} · ${flat1(saidOf(plRr11))} · ${flat1(saidOf(plKeep11)).slice(0, 60)} · ${flat1(saidOf(plNpc11))} · ${flat1(saidOf(gmRr11)).slice(0, 260)} · ${f11a.def_roll}/${f11a.def_rerolled} ${f11a.rr_state} ${npcTok11} · ${flat1(saidOf(gmRr11b))} · @${f11b.turn_index}/${f11b.phase} ${hpF11} · ${flat1(saidOf(pd11)).slice(-150)} · ${flat1(saidOf(keepN11)).slice(0, 200)} ${JSON.stringify(pend11)} · ${flat1(saidOf(ask11))} ${idsIn(ask11).join(',')} · ${flat1(saidOf(pick11)).slice(0, 240)} · ${flat1(saidOf(gmKeep11)).slice(0, 160)} ${JSON.stringify(pend11c)}`);
+
+    // 12 · the moves that settle themselves wait too: a save, a deflection,
+    // a disarm, an escape and a kept hold of 1 stand until thrown again or
+    // kept — and each can be thrown again, which the old flow never allowed
+    tok(PA, 6); tok(PB, 6);
+    armP([PA, PB]);
+    const g12 = await withDice([12], () => act(PA, { action: 'grapple', target: PB, flavour: 'a grab' }));   // 16
+    const s12 = await withDice([3], () => act(PB, { action: 'save' }));   // 7
+    const f12a = fightP();
+    const s12b = await withDice([19], () => press('frr', PB));   // 23
+    const s12c = await press('fkeep', PA);
+    const f12b = fightP();
+    // a deflection thrown again
+    dbHandle.prepare("UPDATE characters SET weapon1='Longsword', weapon2='Kite shield' WHERE guild_id='G1' AND user_id=?").run(PA);
+    armP(['npc:Pfoe', PA]);
+    await withDice([8], () => asGm({ commandName: 'fight', options: { _sub: 'atk', npc: 'Pfoe', stat: 'str', target: PA, flavour: 'claws' } }));   // 11
+    const df12 = await withDice([10], () => act(PA, { action: 'deflect' }));   // 14
+    const f12c = fightP(), pend12c = pendP();
+    const df12b = await withDice([2], () => press('frr', PA));   // 6: beaten aside
+    const f12d = fightP(), hpA12 = hpP(PA);
+    // a disarm on your own turn thrown again into a 20
+    dbHandle.prepare("UPDATE characters SET dex=4 WHERE guild_id='G1' AND user_id=?").run(PA);
+    armP([PA, 'npc:Pfoe']);
+    const x12 = await withDice([9, 15], () => act(PA, { action: 'disarm', target_npc: 'Pfoe', flavour: 'a twist' }));
+    const f12e = fightP();
+    const x12b = await withDice([20], () => press('frr', PA));
+    const f12f = fightP(), fx12 = JSON.parse(f12f.effect_state || '{}'), hpF12 = hpP('npc:Pfoe');
+    dbHandle.prepare("UPDATE characters SET dex=3 WHERE guild_id='G1' AND user_id=?").run(PA);
+    // an escape on your own turn, thrown again
+    armP([PA, PB], { grapples: { [PA]: PB } });
+    const e12 = await withDice([10, 5], () => act(PA, { action: 'escape', flavour: 'twists' }));
+    const f12g = fightP();
+    const e12b = await withDice([17], () => press('frr', PA));
+    const f12h = fightP();
+    // a kept hold of 1: waits on the grappler; kept, it slips; thrown again, it holds and the captive answers
+    armP([PA, PB], { grapples: { [PB]: PA } });
+    const m12P = await press('fact:maintain', PA);
+    const m12 = await withDice([1], () => submit(modalOf(m12P), PA));
+    const f12i = fightP();
+    const stay12 = await act(PB, { action: 'stay' });
+    const m12k = await press('fkeep', PA);
+    const f12j = fightP();
+    armP([PA, PB], { grapples: { [PB]: PA } });
+    const m12P2 = await press('fact:maintain', PA);
+    await withDice([1], () => submit(modalOf(m12P2), PA));
+    const m12r = await withDice([12], () => press('frr', PA));   // 16
+    const f12k = fightP();
+    ok('a save waits like any roll: thrown again by the one who made it, landed once the grab is kept; a deflection thrown again lands as the new roll says',
+      idsIn(g12).includes('fsave') && idsIn(g12).includes('frr') && idsIn(g12).includes('fkeep')
+        && new RegExp(`Nothing lands yet — <@${PA}> and <@${PB}> may`).test(saidOf(s12)) && f12a.phase === 'defend' && f12a.def_roll === 7 && f12a.atk_kind === 'grapple'
+        && /rerolls \*\(reroll\)\* — the save with STR!/.test(saidOf(s12b)) && new RegExp(`Nothing lands yet — <@${PA}> may`).test(saidOf(s12b)) && !idsIn(s12b).includes('fresolve')
+        && new RegExp(`✅ \\*\\*${NPA}\\*\\* keeps the roll\\.`).test(saidOf(s12c)) && /Grapple Resolved/.test(saidOf(s12c)) && /slips the hold/.test(saidOf(s12c))
+        && f12b.phase === 'attack' && f12b.turn_index === 1 && !JSON.parse(f12b.grapples || '{}')[PB]
+        && new RegExp(`Nothing lands yet — <@${PA}> may`).test(saidOf(df12)) && f12c.def_roll === 14 && pend12c.ans === 'deflect' && f12c.phase === 'defend'
+        && /rerolls \*\(reroll\)\* — the deflection with STR!/.test(saidOf(df12b)) && /The shield is beaten aside/.test(saidOf(df12b)) && /\*\(reroll\)\* vs atk \*\*11\*\*/.test(saidOf(df12b))
+        && f12d.phase === 'attack' && hpA12 === 9,
+      `${idsIn(g12).join(',')} · ${flat1(saidOf(s12)).slice(-170)} @${f12a.phase}/${f12a.def_roll} · ${flat1(saidOf(s12b)).slice(0, 220)} · ${flat1(saidOf(s12c)).slice(0, 330)} @${f12b.turn_index}/${f12b.phase} ${f12b.grapples} · ${flat1(saidOf(df12)).slice(-170)} ${f12c.def_roll} ${JSON.stringify(pend12c)} · ${flat1(saidOf(df12b)).slice(0, 460)} · ${f12d.phase} ${hpA12}`);
+    ok('a disarm and an escape on your own turn wait on their maker and can be thrown again — the bot’s grip and hold stand; a kept hold of 1 waits on the grappler: kept, it slips; thrown again, the captive answers',
+      new RegExp(`Nothing lands yet — <@${PA}> may`).test(saidOf(x12)) && f12e.atk_kind === 'disarm' && f12e.phase === 'defend' && f12e.atk_roll === 13 && f12e.def_roll === 18
+        && /rerolls \*\(reroll\)\* — the disarm with DEX!/.test(saidOf(x12b)) && new RegExp(`A natural 20 — \\*\\*${NPA}\\*\\* tears the weapon from \\*\\*Pfoe 🎭\\*\\*'s grip`).test(saidOf(x12b))
+        && f12f.phase === 'attack' && f12f.turn_index === 1 && fx12['npc:Pfoe']?.disarmed === true && fx12[PA]?.fooled === true && hpF12 === 9
+        && new RegExp(`Nothing lands yet — <@${PA}> may`).test(saidOf(e12)) && f12g.atk_kind === 'escape' && f12g.phase === 'defend' && f12g.def_roll === 14 && f12g.atk_roll === 9
+        && /rerolls \*\(reroll\)\* — the escape with STR!/.test(saidOf(e12b)) && /breaks free/i.test(saidOf(e12b)) && !JSON.parse(f12h.grapples || '{}')[PA] && f12h.phase === 'attack' && f12h.turn_index === 1
+        && /A natural 1 — the grip slips, unless it is thrown again/.test(saidOf(m12)) && new RegExp(`Nothing lands yet — <@${PA}> may`).test(saidOf(m12)) && !idsIn(m12).includes('fbreak')
+        && f12i.phase === 'defend' && f12i.atk_kind === 'hold' && f12i.atk_nat === 1 && !!JSON.parse(f12i.grapples || '{}')[PB]
+        && /slipping|thrown again/.test(saidOf(stay12))
+        && new RegExp(`✅ \\*\\*${NPA}\\*\\* keeps the roll\\.`).test(saidOf(m12k)) && /the grip slips/.test(saidOf(m12k)) && !JSON.parse(f12j.grapples || '{}')[PB] && f12j.phase === 'attack' && f12j.turn_index === 1
+        && /rerolls \*\(reroll\)\* — the hold with STR!/.test(saidOf(m12r)) && /answers — 🔓 Break free or ⛓️ Stay/.test(saidOf(m12r)) && f12k.phase === 'defend' && f12k.atk_roll === 16 && !!JSON.parse(f12k.grapples || '{}')[PB],
+      `${flat1(saidOf(x12)).slice(-220)} ${f12e.atk_kind}/${f12e.atk_roll}/${f12e.def_roll} · ${flat1(saidOf(x12b)).slice(0, 420)} @${f12f.turn_index}/${f12f.phase} ${JSON.stringify(fx12)} ${hpF12} · ${flat1(saidOf(e12)).slice(-220)} ${f12g.atk_kind}/${f12g.atk_roll}/${f12g.def_roll} · ${flat1(saidOf(e12b)).slice(0, 420)} ${f12h.grapples} @${f12h.turn_index} · ${flat1(saidOf(m12)).slice(-240)} ${idsIn(m12).join(',')} · ${f12i.phase}/${f12i.atk_kind}/${f12i.atk_nat} · ${flat1(saidOf(stay12))} · ${flat1(saidOf(m12k)).slice(0, 300)} ${f12j.grapples} · ${flat1(saidOf(m12r)).slice(0, 260)} ${f12k.phase}/${f12k.atk_roll}`);
+
+    // 13 · on the auto-pilot: the NPC's answer comes at once and then the
+    // player's roll waits on them; kept, the bot lands it and plays on; its
+    // strike on a player with a token waits on their Keep and no Resolve;
+    // with no token it lands as it always did
+    const realTO13 = globalThis.setTimeout;
+    globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
+    const many = async (n = 12) => { for (let i = 0; i < n; i++) await settle(); };
+    tok(PA, 2); tok(PB, 0);
+    armP([PA, 'npc:Pfoe'], { auto_npc: 1 });
+    n0 = sent.length;
+    const a13 = await withDice([10, 5], async () => { const r = await asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Pfoe', flavour: 'a cut' } }); await many(); return r; });   // 14; Pfoe defends on a 5
+    const f13a = fightP(), new13a = newIn('CP1', n0);
+    n0 = sent.length;
+    const k13 = await withDice([10, 12], async () => { const r = await press('fkeep', PA); await many(); return r; });   // lands; Pfoe: pick, strike
+    const f13b = fightP(), new13b = newIn('CP1', n0), hpF13 = hpP('npc:Pfoe');
+    const d13 = await withDice([15], async () => { const r = await asPl(PA, { commandName: 'fight', options: { _sub: 'def', stat: 'dex', flavour: 'sidesteps' } }); await many(); return r; });   // 18
+    const f13c = fightP();
+    const plRes13 = await press('fresolve', PA);
+    n0 = sent.length;
+    const k13b = await withDice([], async () => { const r = await press('fkeep', PA); await many(); return r; });
+    const f13d = fightP(), new13d = newIn('CP1', n0);
+    // no token: nothing waits
+    tok(PA, 0);
+    armP([PA, 'npc:Pfoe'], { auto_npc: 1 });
+    n0 = sent.length;
+    await withDice([10, 5, 10, 12], async () => { const r = await asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Pfoe', flavour: 'a cut' } }); await many(); return r; });
+    const f13e = fightP(), hpF13e = hpP('npc:Pfoe');
+    const d13z = await withDice([15], async () => { const r = await asPl(PA, { commandName: 'fight', options: { _sub: 'def', stat: 'dex', flavour: 'sidesteps' } }); await many(); return r; });
+    const f13f = fightP(), text13z = `${saidOf(d13z)}\n${textOf(newIn('CP1', n0))}`;
+    globalThis.setTimeout = realTO13;
+    ok('on the auto-pilot the NPC answers at once and the player’s roll then waits on them: kept, the bot lands it and plays on; the NPC’s strike waits on the player’s Keep, never a Resolve; with no token in hand nothing waits',
+      f13a.phase === 'defend' && f13a.def_roll != null && f13a.current_target === 'npc:Pfoe'
+        && new13a.some(m => new RegExp(`Nothing lands yet — <@${PA}> may`).test(m.content) && idsOf(m).includes('frr') && idsOf(m).includes('fkeep') && !idsOf(m).includes('fresolve'))
+        && new RegExp(`✅ \\*\\*${NPA}\\*\\* keeps the roll\\.`).test(saidOf(k13)) && hpF13 === 9
+        && new13b.some(m => new RegExp(`hits \\*\\*Pfoe 🎭\\*\\* for \\*\\*1\\*\\* damage`).test(m.content)) && !new13b.some(m => idsOf(m).includes('fdrp:npc:Pfoe'))
+        && new13b.some(m => /press a stat to defend, or `\/fight def`\./.test(m.content)) && !new13b.some(m => /then `\/fight resolve`/.test(m.content))
+        && f13b.phase === 'defend' && f13b.current_target === PA && f13b.turn_index === 1
+        && new RegExp(`Nothing lands yet — <@${PA}> may`).test(saidOf(d13)) && idsIn(d13).includes('fkeep') && !idsIn(d13).includes('fresolve') && f13c.phase === 'defend'
+        && /Resolve\*\* is the GM’s to press/.test(saidOf(plRes13))
+        && f13d.phase === 'attack' && f13d.turn_index === 0 && new13d.some(m => /turn to attack!/.test(m.content) && idsOf(m).includes(`fdrp:${PA}`)) && charP(PA).rerolls_current === 0
+        && f13e.phase === 'defend' && f13e.current_target === PA && hpF13e === 9 && f13f.phase === 'attack' && f13f.turn_index === 0
+        && !/Nothing lands yet/.test(text13z) && !/fight resolve/.test(saidOf(d13z)),
+      `${f13a.phase}/${f13a.def_roll}/${f13a.current_target} · ${new13a.map(m => flat1(m.content).slice(0, 90) + ' [' + idsOf(m).join(',') + ']').join(' | ')} ·· ${flat1(saidOf(k13))} hp ${hpF13} · ${new13b.map(m => flat1(m.content).slice(0, 130) + ' [' + idsOf(m).join(',') + ']').join(' | ')} · @${f13b.turn_index}/${f13b.phase}→${f13b.current_target} ·· ${flat1(saidOf(d13)).slice(-130)} [${idsIn(d13).join(',')}] ${f13c.phase} · ${flat1(saidOf(plRes13))} ·· @${f13d.turn_index}/${f13d.phase} ${new13d.map(m => flat1(m.content).slice(0, 120) + ' [' + idsOf(m).join(',') + ']').join(' | ')} ·· ${f13e.phase}→${f13e.current_target} ${hpF13e} · @${f13f.turn_index}/${f13f.phase} · ${flat1(text13z).slice(0, 300)}`);
+
+    // 14 · the clock: a roll left open is reminded with its two buttons and
+    // then kept — the exchange resolves as it stands, no token spent; a
+    // Resolve that is the GM's is asked of the GMs
+    tok(PA, 2); tok(PB, 0);
+    armP([PA, PB]);
+    await withDice([10], () => asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str', target: PB, flavour: 'a cut' } }));   // 14
+    await withDice([5], () => asPl(PB, { commandName: 'fight', options: { _sub: 'def', stat: 'dex', flavour: 'a parry' } }));   // 8
+    quietP(11); n0 = sent.length; await tickAllP(); await settle();
+    const remind14 = newIn('CP1', n0);
+    quietP(16); n0 = sent.length; await tickAllP(); await settle();
+    const out14 = textOf(newIn('CP1', n0)), f14 = fightP();
+    tok(PA, 0);
+    armP([PA, 'npc:Pfoe']);
+    await withDice([10], () => asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Pfoe', flavour: 'a cut' } }));
+    await withDice([5], () => asGm({ commandName: 'fight', options: { _sub: 'def', stat: 'dex', npc: 'Pfoe', flavour: 'ducks' } }));
+    quietP(11); n0 = sent.length; await tickAllP(); await settle();
+    const remind14b = newIn('CP1', n0);
+    ok('the turn clock treats silence as a Keep: an open roll is reminded with Reroll and Keep, then kept, and the exchange resolves as it stands with no token spent; a Resolve that is the GM’s is asked of a GM',
+      remind14.some(m => new RegExp(`minutes quiet — \\*\\*${NPA}\\*\\* may still 🔁 Reroll or ✅ Keep their roll\\.`).test(m.content) && /it is kept, and the exchange resolves as it stands/.test(m.content)
+          && idsOf(m).includes('frr') && idsOf(m).includes('fkeep') && !idsOf(m).includes('fclock:hold'))
+        && /the rolls are kept, and the exchange resolves as it stands/.test(out14) && new RegExp(`hits \\*\\*${NPB}\\*\\* for \\*\\*1\\*\\* damage`).test(out14)
+        && f14.phase === 'attack' && f14.turn_index === 1 && charP(PA).rerolls_current === 0
+        && remind14b.some(m => /\*\*Pfoe 🎭\*\* has an exchange waiting on a GM’s ⚖️ Resolve\./.test(m.content) && idsOf(m).includes('fresolve')),
+      `${remind14.map(m => flat1(m.content).slice(0, 220) + ' [' + idsOf(m).join(',') + ']').join(' | ')} ·· ${flat1(out14).slice(0, 400)} @${f14.turn_index}/${f14.phase} ·· ${remind14b.map(m => flat1(m.content).slice(0, 200) + ' [' + idsOf(m).join(',') + ']').join(' | ')}`);
+
+    // 15 · the reaction is a GM's for an NPC; the last blow of a fight carries
+    // it on the end card
+    tok(PA, 0); tok(PB, 0);
+    armP([PA, 'npc:Pfoe']);
+    await withDice([15], () => asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Pfoe', flavour: 'a cut' } }));
+    await withDice([3], () => asGm({ commandName: 'fight', options: { _sub: 'def', stat: 'dex', npc: 'Pfoe', flavour: 'ducks' } }));
+    const res15 = await asGm({ commandName: 'fight', options: { _sub: 'resolve' } });
+    const plRp15 = await press('fdrp:npc:Pfoe', PA);
+    const gmRp15 = await press('fdrp:npc:Pfoe', 'U1');
+    const gmRpS15 = await submit(modalOf(gmRp15), 'U1', chP, { action: 'snarls', speech: '' });
+    armP([PA, PB], { hp_state: { [PA]: 10, [PB]: 1 } });
+    dbHandle.prepare("UPDATE characters SET hp_current=1 WHERE guild_id='G1' AND user_id=?").run(PB);
+    await withDice([15], () => asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str', target: PB, flavour: 'the last cut' } }));
+    await withDice([2], () => asPl(PB, { commandName: 'fight', options: { _sub: 'def', stat: 'dex', flavour: 'too slow' } }));
+    n0 = sent.length;
+    const end15 = await asPl(PA, { commandName: 'fight', options: { _sub: 'resolve' } });
+    await settle();
+    const endMsgs15 = newIn('CP1', n0), f15 = fightP();
+    dbHandle.prepare("UPDATE characters SET hp_current=10, died_at=NULL WHERE guild_id='G1' AND user_id=?").run(PB);
+    ok('an NPC’s reaction is a GM’s to give, in the NPC’s name; the last blow of a fight carries the button on the end card',
+      /A GM may say how \*\*Pfoe\*\* takes it — the fight does not wait\./.test(saidOf(res15)) && idsIn(res15).includes('fdrp:npc:Pfoe')
+        && /a GM’s to answer/.test(saidOf(plRp15)) && /^frp:/.test(modalOf(gmRp15) || '')
+        && /🎭 \*\*Pfoe 🎭\*\*/.test(saidOf(gmRpS15)) && /snarls/.test(saidOf(gmRpS15))
+        && f15.state === 'idle' && endMsgs15.some(m => idsOf(m).includes(`fdrp:${PB}`) && new RegExp(`\\*\\*${NPB}\\*\\* may say how they take it`).test(m.content)),
+      `${flat1(saidOf(res15)).slice(-300)} [${idsIn(res15).join(',')}] · ${flat1(saidOf(plRp15))} · ${modalOf(gmRp15)} · ${flat1(saidOf(gmRpS15))} ·· ${f15.state} ${flat1(saidOf(end15)).slice(0, 200)} | ${endMsgs15.map(m => flat1(m.content).slice(-260) + ' [' + idsOf(m).join(',') + ']').join(' | ')}`);
+
+    // 16 · whoever starts the roll wins twenty against twenty: the disarmer
+    // over the grip, the grappler's kept hold over the break, the captive's
+    // own escape over the hold; the grip's own naturals count after the
+    // disarmer's
+    tok(PA, 0); tok(PB, 0);
+    dbHandle.prepare("UPDATE characters SET dex=4 WHERE guild_id='G1' AND user_id=?").run(PA);
+    armP([PA, 'npc:Pfoe']);
+    const x16a = await withDice([20, 20], () => act(PA, { action: 'disarm', target_npc: 'Pfoe', flavour: 'a twist' }));
+    const fx16a = JSON.parse(fightP().effect_state || '{}');
+    armP([PA, 'npc:Pfoe']);
+    const x16b = await withDice([15, 20], () => act(PA, { action: 'disarm', target_npc: 'Pfoe', flavour: 'a twist' }));   // 19 against a grip of 20
+    const fx16b = JSON.parse(fightP().effect_state || '{}');
+    armP([PA, 'npc:Pfoe']);
+    const x16c = await withDice([2, 1], () => act(PA, { action: 'disarm', target_npc: 'Pfoe', flavour: 'a twist' }));   // 6 against a grip of 1
+    const fx16c = JSON.parse(fightP().effect_state || '{}');
+    dbHandle.prepare("UPDATE characters SET dex=3 WHERE guild_id='G1' AND user_id=?").run(PA);
+    armP([PA, PB], { grapples: { [PB]: PA } });
+    const m16P = await press('fact:maintain', PA);
+    await withDice([20], () => submit(modalOf(m16P), PA));
+    const b16 = await withDice([20], () => act(PB, { action: 'escape', flavour: 'heaves' }));
+    const f16 = fightP(), hpB16 = hpP(PB);
+    armP([PA, PB], { grapples: { [PA]: PB } });
+    const e16 = await withDice([20, 20], () => act(PA, { action: 'escape', flavour: 'heaves' }));
+    const f16e = fightP();
+    ok('twenty meets twenty goes to whoever started the roll: the disarmer takes the weapon, a kept hold of 20 holds against a break of 20, a captive’s own escape of 20 breaks a hold of 20; a grip of 20 holds and a grip of 1 loses it whatever the totals',
+      /Twenty meets twenty\*\* — the disarm was theirs to start, and it takes the weapon/.test(saidOf(x16a)) && fx16a['npc:Pfoe']?.disarmed === true
+        && /A natural 20 on the grip — \*\*Pfoe 🎭\*\* keeps hold whatever the totals/.test(saidOf(x16b)) && !fx16b['npc:Pfoe']?.disarmed
+        && /A natural 1 on the grip — the weapon goes whatever the totals/.test(saidOf(x16c)) && fx16c['npc:Pfoe']?.disarmed === true
+        && new RegExp(`Twenty meets twenty\\*\\* — the hold was \\*\\*${NPA}\\*\\*'s to start, and it holds`).test(saidOf(b16)) && JSON.parse(f16.grapples || '{}')[PB] === PA && hpB16 === 9
+        && /A natural 20 — \*\*user\d+\*\* bursts free/.test(saidOf(e16)) && !JSON.parse(f16e.grapples || '{}')[PA],
+      `${flat1(saidOf(x16a)).slice(-420)} ${JSON.stringify(fx16a)} ·· ${flat1(saidOf(x16b)).slice(-300)} ${JSON.stringify(fx16b)} ·· ${flat1(saidOf(x16c)).slice(-300)} ${JSON.stringify(fx16c)} ·· ${flat1(saidOf(b16)).slice(0, 520)} ${f16.grapples} ${hpB16} ·· ${flat1(saidOf(e16)).slice(0, 420)} ${f16e.grapples}`);
+
+    // ── stage 4: every move is an NPC's too — by a GM's hand, and the auto-pilot's ──
+    dbHandle.prepare("INSERT OR REPLACE INTO npcs (guild_id, name, str, con, dex, wis, lck, hp_current, weapon1, weapon2) VALUES ('G1', 'Pknight', 5, 3, 5, 5, 0, 10, 'Longsword', 'Tower shield')").run();
+    const fxP = (id, cid = 'CP1') => JSON.parse(fightP(cid)?.effect_state || '{}')[id] || {};
+    const heldP = (id, cid = 'CP1') => JSON.parse(fightP(cid)?.grapples || '{}')[id] || null;
+    const actGm = (o) => asGm({ commandName: 'fight', options: { _sub: 'act', ...o } });
+
+    // 17 · a GM makes the moves as an NPC, typed: a disarm on its own turn
+    // goes for a player's weapon; a deflection turns a player's blow into
+    // another player; a disarm and a grab answer a strike; the hold is kept
+    // by name; a player cannot use npc:
+    tok(PA, 0); tok(PB, 0);
+    armP(['npc:Pknight', PA]);
+    const plNpc17 = await act(PA, { action: 'disarm', npc: 'Pknight', target: PA });
+    const x17 = await withDice([15, 5], () => actGm({ action: 'disarm', npc: 'Pknight', target: PA, flavour: 'hooks the hilt' }));   // 20 against a grip of 9
+    const f17a = fightP(), fx17a = fxP(PA), text17a = `${saidOf(x17)}\n${textOf(newIn('CP1', n0))}`;
+    armP([PA, 'npc:Pknight', PB]);
+    await withDice([8], () => asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Pknight', flavour: 'a cut' } }));   // 12
+    n0 = sent.length;
+    const df17 = await withDice([15], () => actGm({ action: 'deflect', npc: 'Pknight', target: PB, flavour: 'shield up' }));   // 20
+    const text17b = textOf(newIn('CP1', n0)), hpB17 = hpP(PB), fx17b = fxP(PA), f17b = fightP();
+    armP([PA, 'npc:Pknight']);
+    await withDice([8], () => asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Pknight', flavour: 'a cut' } }));
+    n0 = sent.length;
+    await withDice([15], () => actGm({ action: 'disarm', npc: 'Pknight', flavour: 'a twist' }));
+    const text17c = textOf(newIn('CP1', n0)), fx17c = fxP(PA);
+    armP([PA, 'npc:Pknight']);
+    await withDice([8], () => asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Pknight', flavour: 'a cut' } }));
+    n0 = sent.length;
+    await withDice([15], () => actGm({ action: 'grapple', npc: 'Pknight', flavour: 'catches the arm' }));
+    const text17d = textOf(newIn('CP1', n0)), held17 = heldP(PA), f17d = fightP();
+    n0 = sent.length;
+    const m17 = await withDice([12], () => actGm({ action: 'maintain', npc: 'Pknight', flavour: 'squeezes' }));   // 17
+    const text17e = textOf(newIn('CP1', n0)), f17e = fightP();
+    ok('a GM makes every move as an NPC with npc: — a disarm on its own turn goes for a player’s weapon, a deflection turns a player’s blow into another player, a disarm and a grab answer a strike, the hold is kept by name; a player cannot',
+      /Only GMs can act as an NPC/.test(saidOf(plNpc17))
+        && /\*\*Disarm\*\* — Pknight 🎭 goes for user\d+'s weapon/.test(text17a) && /hooks the hilt/.test(text17a) && new RegExp(`The weapon spins from \\*\\*${NPA}\\*\\*'s grip`).test(text17a)
+        && fx17a.disarmed === true && f17a.turn_index === 1 && f17a.phase === 'attack' && /Disarm rolled as \*\*Pknight\*\*/.test(saidOf(x17))
+        && /\*\*Deflect\*\* — Pknight 🎭 shields against user\d+/.test(text17b) && new RegExp(`turns the blow aside — and into \\*\\*${NPB}\\*\\* for \\*\\*1\\*\\* damage`).test(text17b) && hpB17 === 9
+        && fx17b.disarmed === true && f17b.turn_index === 1 && /Deflected as \*\*Pknight\*\*/.test(saidOf(df17))
+        && /\*\*Disarm\*\* — Pknight 🎭 vs user\d+/.test(text17c) && new RegExp(`The blade spins from \\*\\*${NPA}\\*\\*'s grip`).test(text17c) && fx17c.disarmed === true
+        && new RegExp(`\\*\\*Pknight 🎭\\*\\* catches the blow and seizes \\*\\*${NPA}\\*\\*`).test(text17d) && held17 === 'npc:Pknight' && f17d.turn_index === 1 && f17d.phase === 'attack'
+        && /\*\*Hold\*\* — Pknight 🎭 tightens their grip on user\d+/.test(text17e) && /squeezes/.test(text17e) && /fbreak/.test(text17e) && /Hold rolled as \*\*Pknight\*\*/.test(saidOf(m17))
+        && f17e.phase === 'defend' && f17e.atk_kind === 'hold' && f17e.atk_roll === 17 && f17e.current_target === PA,
+      `${flat1(saidOf(plNpc17))} · ${flat1(text17a).slice(0, 420)} ${JSON.stringify(fx17a)} @${f17a.turn_index} · ${flat1(text17b).slice(0, 420)} ${hpB17} ${JSON.stringify(fx17b)} @${f17b.turn_index} · ${flat1(text17c).slice(0, 320)} ${JSON.stringify(fx17c)} · ${flat1(text17d).slice(0, 320)} ${held17} @${f17d.turn_index} · ${flat1(text17e).slice(0, 320)} ${f17e.phase}/${f17e.atk_kind}/${f17e.atk_roll}`);
+
+    // 18 · the NPC's card carries the moves as buttons, the GM's alone: its
+    // turn, its answer to a strike, its save, its hold; a pick, a form, then
+    // the same path the slash walks
+    armP(['npc:Pknight', PA]);
+    const sk18 = await asGm({ commandName: 'fight', options: { _sub: 'status' } });
+    setP({ turn_index: 1 });
+    const turn18 = await asGm({ commandName: 'gm', options: { _group: 'override', _sub: 'skip' } });   // PA's turn is skipped: Pknight's comes round
+    const turnIds18 = idsIn(turn18).concat(newIn('CP1', 0).slice(-3).flatMap(m => idsOf(m)));
+    const plPress18 = await press('fnact:grapple', PA);
+    const pick18 = await press('fnact:grapple', 'U1');
+    const sel18 = await fire({ channel: chP, isSelect: true, customId: 'fightactn:grapple:U1', values: [PA], userId: 'U1' });
+    n0 = sent.length;
+    const sub18 = await withDice([14], () => submit(modalOf(sel18), 'U1', chP, { action: 'lunges low', speech: '' }));   // 19
+    const text18a = textOf(newIn('CP1', n0)), f18a = fightP();
+    // the save a player's grab asks of an NPC, by its button
+    armP([PA, 'npc:Pknight']);
+    const g18 = await withDice([10], () => act(PA, { action: 'grapple', target_npc: 'Pknight', flavour: 'a grab' }));   // 14
+    const savP18 = await press('fnact:save', 'U1');
+    n0 = sent.length;
+    await withDice([3], () => submit(modalOf(savP18), 'U1', chP, { action: 'strains', speech: '' }));   // 8
+    const text18b = textOf(newIn('CP1', n0)), held18 = heldP('npc:Pknight');
+    // a strike on the NPC: the prompt carries its answers; Deflect by its button
+    armP([PA, 'npc:Pknight']);
+    const a18 = await withDice([8], () => asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Pknight', flavour: 'a cut' } }));
+    const defIds18 = idsIn(a18).concat(newIn('CP1', 0).slice(-2).flatMap(m => idsOf(m)));
+    const dfP18 = await press('fnact:deflect', 'U1');
+    n0 = sent.length;
+    await withDice([18], () => submit(modalOf(dfP18), 'U1', chP, { action: 'shield high', speech: '' }));
+    const text18c = textOf(newIn('CP1', n0)), wrong18 = await press('fnact:save', 'U1');
+    ok('an NPC’s card carries the moves as 🎭 buttons, a GM’s alone: Grapple, Feint and Disarm on its turn, Deflect, Disarm and Grapple against a strike, Save against a grab; a pick and a form, then the slash path',
+      ['fnatk:str', 'fnact:grapple', 'fnact:feint', 'fnact:disarm'].every(i => turnIds18.includes(i))
+        && /Only GMs act for an NPC/.test(saidOf(plPress18)) && /fightactn:grapple:U1/.test(allOf(pick18)) && /Pick who \*\*Pknight\*\* grabs/.test(saidOf(pick18)) && /^frp:/.test(modalOf(sel18) || '')
+        && /Attempts to grapple user\d+/.test(text18a) && /lunges low/.test(text18a) && /fsave/.test(text18a) && /Grappled as \*\*Pknight\*\*/.test(saidOf(sub18))
+        && f18a.phase === 'defend' && f18a.atk_kind === 'grapple' && f18a.current_target === PA && f18a.atk_roll === 19
+        && idsIn(g18).includes('fnact:save') && /^frp:/.test(modalOf(savP18) || '') && /Grapple Resolved/.test(text18b) && /strains/.test(text18b) && held18 === PA
+        && ['fndef:str', 'fnact:deflect', 'fnact:disarm', 'fnact:grapple'].every(i => defIds18.includes(i))
+        && /\*\*Deflect\*\* — Pknight 🎭 shields against user\d+/.test(text18c) && /shield high/.test(text18c) && /turns the blow aside/.test(text18c)
+        && /That move answers a strike — nothing is pending on an NPC/.test(saidOf(wrong18)),
+      `${turnIds18.join(',')} · ${flat1(saidOf(plPress18))} · ${flat1(allOf(pick18)).slice(0, 200)} · ${modalOf(sel18)} · ${flat1(text18a).slice(0, 300)} ${flat1(saidOf(sub18))} ${f18a.phase}/${f18a.atk_kind}/${f18a.atk_roll} · ${idsIn(g18).join(',')} ${modalOf(savP18)} ${flat1(text18b).slice(0, 260)} ${held18} · ${defIds18.join(',')} · ${flat1(text18c).slice(0, 300)} · ${flat1(saidOf(wrong18))}`);
+
+    // 19 · the auto-pilot reaches for the moves: at 100 in 100 it answers a
+    // strike with one and opens its turn with one, by the players' own
+    // rules; holding its only foe it keeps the grip rather than stall; at 0
+    // it never does
+    dbHandle.prepare("UPDATE guild_config SET npc_special=100 WHERE guild_id='G1'").run();
+    const realTO19 = globalThis.setTimeout;
+    globalThis.setTimeout = (fn, ms, ...a) => setImmediate(() => fn(...a));
+    armP([PA, 'npc:Pknight'], { auto_npc: 1 });
+    n0 = sent.length;
+    // PA strikes 12; the answer: yes, the first of its moves (Deflect), 18 → turned, PA disarmed; its turn: yes, the first (Grapple), its only foe, 14
+    await withDice([8, 1, 1, 18, 1, 1, 1, 14], async () => { const r = await asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Pknight', flavour: 'a cut' } }); await many(); return r; });
+    const text19a = textOf(newIn('CP1', n0)), f19a = fightP(), fx19a = fxP(PA);
+    // PA fails the save and is held; its disarmed turn goes to the weapon; the grappler has nobody else: it keeps the hold
+    await withDice([2], async () => { const r = await act(PA, { action: 'save' }); await many(); return r; });
+    const held19 = heldP(PA);
+    n0 = sent.length;
+    const rt19 = await withDice([1, 12], async () => { const r = await act(PA, { action: 'retrieve', flavour: 'snatches it up' }); await many(); return r; });
+    const text19b = textOf(newIn('CP1', n0)), f19b = fightP();
+    dbHandle.prepare("UPDATE guild_config SET npc_special=0 WHERE guild_id='G1'").run();
+    armP([PA, 'npc:Pknight'], { auto_npc: 1 });
+    n0 = sent.length;
+    await withDice([8, 5, 10, 12], async () => { const r = await asPl(PA, { commandName: 'fight', options: { _sub: 'atk', stat: 'str', target_npc: 'Pknight', flavour: 'a cut' } }); await many(); return r; });
+    const text19c = newIn('CP1', n0).map(m => m.content || '').join('\n'), f19c = fightP();
+    globalThis.setTimeout = realTO19;
+    ok('the auto-pilot reaches for the moves one time in the server’s figure, through the players’ own rules: it answers a strike with a deflection and opens its turn with a grab; holding its only foe it keeps the grip rather than stall; at 0 it only strikes and defends',
+      /\*\*Deflect\*\* — Pknight 🎭 shields against user\d+/.test(text19a) && /turns the blow aside/.test(text19a) && fx19a.disarmed === true
+        && /Attempts to grapple user\d+/.test(text19a) && f19a.phase === 'defend' && f19a.atk_kind === 'grapple' && f19a.current_target === PA && orderP()[f19a.turn_index] === 'npc:Pknight'
+        && held19 === 'npc:Pknight'
+        && /spends the turn retrieving/.test(saidOf(rt19)) && /\*\*Hold\*\* — Pknight 🎭 tightens their grip on user\d+/.test(text19b) && /fbreak/.test(text19b)
+        && f19b.phase === 'defend' && f19b.atk_kind === 'hold' && f19b.current_target === PA
+        && !/Deflect|grapple|feint|Disarm/i.test(text19c) && /defends with/i.test(text19c) && f19c.phase === 'defend' && f19c.current_target === PA && !f19c.atk_kind,
+      `chance ${dbHandle.prepare("SELECT npc_special FROM guild_config WHERE guild_id='G1'").get()?.npc_special} · ${flat1(text19a).slice(0, 700)} ·· ${f19a.phase}/${f19a.atk_kind}→${f19a.current_target} ${JSON.stringify(fx19a)} · ${held19} ·· ${flat1(saidOf(rt19)).slice(0, 160)} | ${flat1(text19b).slice(0, 500)} ${f19b.phase}/${f19b.atk_kind} ·· ${flat1(text19c).slice(0, 400)} ${f19c.phase}/${f19c.atk_kind}`);
+
+    // ── stage 5: /gm effect ──
+    const gfxLast = () => dbHandle.prepare("SELECT * FROM gm_effects WHERE guild_id='G1' ORDER BY id DESC LIMIT 1").get();
+    const gmFx = (o) => asGm({ commandName: 'gm', options: { _sub: 'effect', ...o } });
+
+    // 20 · a grenade in a fight: a player may not hand one out; the card
+    // pings its holder; only the holder (or a GM) uses it, on their turn;
+    // one roll against everyone on the other side; NPCs brace by
+    // themselves; a hit wounds, a 20 doubles; it takes the holder's turn
+    tok(PA, 0); tok(PB, 0);
+    dbHandle.prepare("UPDATE npcs SET hp_current=10 WHERE guild_id='G1' AND name IN ('Pfoe','Pgob','Pally')").run();
+    armP([PB, PA, 'npc:Pfoe', 'npc:Pgob', 'npc:Pally'], { sides: { 'npc:Pally': 'ally' }, hp_state: { [PA]: 10, [PB]: 10, 'npc:Pfoe': 10, 'npc:Pgob': 10, 'npc:Pally': 10 } });
+    const plFx20 = await asPl(PA, { commandName: 'gm', options: { _sub: 'effect', name: 'Grenade', wounds: 2 } });
+    n0 = sent.length;
+    const mk20 = await gmFx({ name: 'Grenade', wounds: 2, user: PA, stat: 'dex', flavour: 'a fizzing pot', uses: 2 });
+    const card20 = newIn('CP1', n0), e20 = gfxLast();
+    const notHolder20 = await press(`gfx:use:${e20.id}`, PB);
+    const notTurn20 = await press(`gfx:use:${e20.id}`, PA);
+    setP({ turn_index: 1 });
+    // one roll: 17 + DEX 3 = 20; Pfoe braces 5+…, Pgob braces 20 (avoids)
+    const use20 = await withDice([17, 5, 20], () => press(`gfx:use:${e20.id}`, PA));
+    const f20 = fightP(), e20b = gfxLast();
+    ok('/gm effect hands a GM’s effect to a player: the card pings them; only they use it, on their turn; one roll against everyone on the other side, NPCs bracing by themselves; it wounds where it hits and takes their turn',
+      /Effects are a GM’s to hand out/.test(saidOf(plFx20))
+        && card20.some(m => /🎁 \*\*Grenade\*\* — held by <@/.test(m.content) && /a fizzing pot/.test(m.content) && /\*\*2\*\* wounds a hit · rolled with \*\*DEX\*\*/.test(m.content) && /uses? left/.test(m.content) && idsOf(m).includes(`gfx:use:${e20.id}`))
+        && e20.holder === PA && e20.uses_left === 2 && !!e20.card_msg_id
+        && /is <@\d+>’s to use/.test(saidOf(notHolder20)) && /takes \*\*user\d+\*\*’s turn — wait for it/.test(saidOf(notTurn20))
+        && new RegExp(`\\*\\*${NPA}\\*\\* uses \\*\\*Grenade\\*\\*!`).test(saidOf(use20)) && /against them all/.test(saidOf(use20))
+        && /\*\*Pfoe 🎭\*\* \(.*\) — hit for \*\*2\*\*/.test(saidOf(use20)) && /\*\*Pgob 🎭\*\* \(.*\) — a natural 20: clear of it/.test(saidOf(use20)) && !/Pally 🎭\*\* braces/.test(saidOf(use20))
+        && hpP('npc:Pfoe') === 8 && hpP('npc:Pgob') === 10 && f20.turn_index === 2 && e20b.uses_left === 1 && e20b.state === 'ready',
+      `${flat1(saidOf(plFx20))} · ${card20.map(m => flat1(m.content) + ' [' + idsOf(m).join(',') + ']').join(' | ')} · ${JSON.stringify({ h: e20.holder, u: e20.uses_left, c: e20.card_msg_id })} · ${flat1(saidOf(notHolder20))} · ${flat1(saidOf(notTurn20))} · ${flat1(saidOf(use20)).slice(0, 700)} · ${hpP('npc:Pfoe')}/${hpP('npc:Pgob')} @${f20.turn_index} ${e20b.uses_left}/${e20b.state}`);
+
+    // 21 · an NPC's trap aimed at named players: the GM presses Use; the
+    // players brace by their buttons; the last to brace lands it; a defender's
+    // 1 doubles the wounds; uses_turn:false leaves the turn alone; a GM may
+    // land it before everyone has braced, the rest rolled for; Withdraw
+    armP([PA, PB, 'npc:Pfoe']);
+    await gmFx({ name: 'Spike trap', wounds: 1, npc: 'Pfoe', targets: `<@${PA}> <@${PB}>`, uses_turn: false });
+    const e21 = gfxLast();
+    const plUse21 = await press(`gfx:use:${e21.id}`, PA);
+    const use21 = await withDice([12], () => press(`gfx:use:${e21.id}`, 'U1'));   // 12
+    const notAimed21 = await press(`gfx:def:${e21.id}`, PC);
+    const dA21 = await withDice([1], () => press(`gfx:def:${e21.id}`, PA));
+    const twice21 = await press(`gfx:def:${e21.id}`, PA);
+    const dB21 = await withDice([19], () => press(`gfx:def:${e21.id}`, PB));
+    const f21 = fightP(), e21b = gfxLast(), hpA21 = hpP(PA);
+    await gmFx({ name: 'Rockfall', wounds: 1, targets: `<@${PA}> <@${PB}>` });
+    const e21c = gfxLast();
+    const use21c = await withDice([15], () => press(`gfx:use:${e21c.id}`, 'U1'));
+    await withDice([2], () => press(`gfx:def:${e21c.id}`, PA));
+    const plLand21 = await press(`gfx:land:${e21c.id}`, PA);
+    const land21 = await withDice([3], () => press(`gfx:land:${e21c.id}`, 'U1'));
+    const e21d = gfxLast();
+    await gmFx({ name: 'Bomb', wounds: 3, user: PB });
+    const e21e = gfxLast();
+    const drop21 = await press(`gfx:drop:${e21e.id}`, 'U1');
+    const after21 = await press(`gfx:use:${e21e.id}`, PB);
+    ok('an NPC’s effect aimed at named players: a GM presses Use, the players brace by their buttons and the last lands it — a defender’s 1 doubles the wounds; uses_turn:false leaves the turn; a GM may land it early, the rest rolled for; a withdrawn effect is used up',
+      /A GM presses this one/.test(saidOf(plUse21)) && /\*\*Pfoe 🎭\*\* uses \*\*Spike trap\*\*!/.test(saidOf(use21)) && idsIn(use21).includes(`gfx:def:${e21.id}`) && new RegExp(`<@${PA}> <@${PB}> — press \\*\\*Defend\\*\\*`).test(saidOf(use21))
+        && /It is not aimed at you/.test(saidOf(notAimed21)) && /braces/.test(saidOf(dA21)) && !/lands/.test(saidOf(dA21)) && /braced already/.test(saidOf(twice21))
+        && /Spike trap\*\* lands/.test(saidOf(dB21)) && new RegExp(`\\*\\*${NPA}\\*\\* \\(.*\\) — hit for \\*\\*2\\*\\* \\(a natural 1 doubles it\\)`).test(saidOf(dB21)) && new RegExp(`\\*\\*${NPB}\\*\\* \\(.*\\) — a natural 20|\\*\\*${NPB}\\*\\* \\(.*\\) — clear of it`).test(saidOf(dB21))
+        && hpA21 === 8 && f21.turn_index === 0 && e21b.state === 'spent'
+        && /Only a GM lands it/.test(saidOf(plLand21)) && new RegExp(`\\*\\*${NPB}\\*\\* is rolled for`).test(saidOf(land21)) && /Rockfall\*\* lands/.test(saidOf(land21)) && /\*\*Rockfall\*\* goes off!/.test(saidOf(use21c)) && e21d.state === 'spent'
+        && /Bomb\*\* is withdrawn/.test(saidOf(drop21)) && /used up/.test(saidOf(after21)),
+      `${flat1(saidOf(plUse21))} · ${flat1(saidOf(use21)).slice(0, 400)} [${idsIn(use21).join(',')}] · ${flat1(saidOf(notAimed21))} · ${flat1(saidOf(dA21))} · ${flat1(saidOf(twice21))} · ${flat1(saidOf(dB21)).slice(0, 500)} · ${hpP(PA)} @${f21.turn_index} ${e21b.state} · ${flat1(saidOf(plLand21))} · ${flat1(saidOf(land21)).slice(0, 400)} ${e21d.state} · ${flat1(saidOf(drop21))} · ${flat1(saidOf(after21))}`);
+
+    // 22 · outside a fight, the holder picks: a pick menu of who is here,
+    // then one roll at each picked target when each:true
+    endP();
+    dbHandle.prepare("UPDATE characters SET hp_current=10 WHERE guild_id='G1' AND user_id IN (?,?)").run(PA, PB);
+    dbHandle.prepare("UPDATE npcs SET hp_current=10 WHERE guild_id='G1' AND name IN ('Pfoe','Pgob')").run();
+    await gmFx({ name: 'Arrows', wounds: 1, user: PA, pick: 2, each: true, npcs: '' });
+    const e22 = gfxLast();
+    // nobody here outside a fight with no run: the pool is empty
+    const empty22 = await press(`gfx:use:${e22.id}`, PA);
+    await gmFx({ name: 'Volley', wounds: 1, user: PA, npcs: 'Pfoe, Pgob', each: true });
+    const e22b = gfxLast();
+    const use22 = await withDice([15, 2, 3, 5], () => press(`gfx:use:${e22b.id}`, PA));
+    ok('outside a fight it works as well: named NPCs brace by themselves and it lands at once; each:true rolls at every target; a pick with nobody here says so',
+      /Nobody it could reach is here/.test(saidOf(empty22))
+        && /at \*\*Pfoe 🎭\*\*/.test(saidOf(use22)) && /at \*\*Pgob 🎭\*\*/.test(saidOf(use22)) && /Volley\*\* lands/.test(saidOf(use22))
+        && npcP('Pfoe').hp_current === 9,
+      `${flat1(saidOf(empty22))} · ${flat1(saidOf(use22)).slice(0, 600)} · ${npcP('Pfoe').hp_current}`);
+
+    // ── stage 6: Reroll and Keep away from a fight ──
+    endP();
+    const cardMsgOf = (card) => ({ id: nextId(), content: card?.content || '', components: (card?.components || []).map(r => ({ components: ((r._d || r).components || []).map(b => ({ customId: (b._d || b).customId, label: (b._d || b).label, style: (b._d || b).style, disabled: false })) })) });
+    const holdIds = (r) => idsIn(r).filter(i => /^rhold:/.test(i));
+    // 23 · a called check with a token in hand waits: Reroll throws it again
+    // for a token and it lands; with none, it lands at once; Keep lets it stand
+    tok(PA, 1); tok(PB, 0);
+    dbHandle.prepare("UPDATE characters SET hp_current=10 WHERE guild_id='G1' AND user_id IN (?,?)").run(PA, PB);
+    const ask23 = await asGm({ commandName: 'gm', options: { _sub: 'dc', stat: 'str', dc: 12, target: PA, fail_damage: 2 } });
+    const card23 = (ask23.replies || []).find(x => idsOf(x).some(id => id.startsWith(`dcroll:${PA}:`)));
+    const id23 = card23 ? idsOf(card23).find(id => id.startsWith(`dcroll:${PA}:`)) : 'none';
+    const p23 = await withDice([3], () => press(id23, PA, chP, cardMsgOf(card23)));
+    const hold23 = holdIds(p23), hp23a = charP(PA).hp_current;
+    const wrong23 = hold23.length ? await press(hold23[0], PB) : null;
+    const rr23 = hold23.length ? await withDice([18], () => press(hold23[0], PA)) : null;
+    const hp23b = charP(PA).hp_current, tok23 = charP(PA).rerolls_current;
+    // PB, no token: it lands at once
+    const ask23b = await asGm({ commandName: 'gm', options: { _sub: 'dc', stat: 'str', dc: 12, target: PB, fail_damage: 2 } });
+    const card23b = (ask23b.replies || []).find(x => idsOf(x).some(id => id.startsWith(`dcroll:${PB}:`)));
+    const id23b = card23b ? idsOf(card23b).find(id => id.startsWith(`dcroll:${PB}:`)) : 'none';
+    const p23b = await withDice([3], () => press(id23b, PB, chP, cardMsgOf(card23b)));
+    // PA again, a token: kept, the failure lands
+    tok(PA, 1);
+    const ask23c = await asGm({ commandName: 'gm', options: { _sub: 'dc', stat: 'str', dc: 12, target: PA, fail_damage: 2 } });
+    const card23c = (ask23c.replies || []).find(x => idsOf(x).some(id => id.startsWith(`dcroll:${PA}:`)));
+    const id23c = card23c ? idsOf(card23c).find(id => id.startsWith(`dcroll:${PA}:`)) : 'none';
+    const p23c = await withDice([2], () => press(id23c, PA, chP, cardMsgOf(card23c)));
+    const keep23 = await press(holdIds(p23c).find(i => i.startsWith('rhold:keep:')) || 'none', PA);
+    const again23 = await press(holdIds(p23c)[0] || 'none', PA);
+    ok('a called check with a token in hand waits on 🔁 Reroll or ✅ Keep: nothing lands meanwhile, only its roller may throw it again, a reroll spends the token and lands; Keep lets the failure land; with no token it lands at once',
+      hold23.length === 2 && new RegExp(`Nothing lands yet — <@${PA}> may`).test(saidOf(p23)) && hp23a === 10
+        && /not yours|Nothing of yours/.test(saidOf(wrong23)) && /rerolls \*\(reroll\)\* — the check!/.test(saidOf(rr23)) && tok23 === 0 && hp23b === 10
+        && !holdIds(p23b).length && charP(PB).hp_current === 8
+        && /keeps the roll/.test(saidOf(keep23)) && charP(PA).hp_current === 8 && /landed already/.test(saidOf(again23)),
+      `${id23} · ${flat1(allOf(p23)).slice(0, 300)} [${hold23.join(',')}] ${hp23a} · ${flat1(saidOf(wrong23))} · ${flat1(saidOf(rr23)).slice(0, 300)} ${hp23b} · ${flat1(allOf(p23b)).slice(0, 200)} ${charP(PB).hp_current} · ${flat1(saidOf(keep23)).slice(0, 300)} ${charP(PA).hp_current} · ${flat1(saidOf(again23))}`);
+
+    // 24 · /deception with tokens: both players may throw their side again;
+    // the deceiver's reroll and the mark's Keep land it
+    tok(PA, 1); tok(PB, 1);
+    dbHandle.prepare("UPDATE characters SET next_mark=NULL, deception_spent=0 WHERE guild_id='G1' AND user_id IN (?,?)").run(PA, PB);
+    const wisA24 = charP(PA).wis;
+    dbHandle.prepare("UPDATE characters SET wis=5 WHERE guild_id='G1' AND user_id=?").run(PA);
+    const o24 = await asPl(PA, { commandName: 'deception', options: { target: PB } });
+    const m24 = modalOf(o24);
+    const s24 = m24 ? await withDice([3, 15], () => submit(m24, PA, chP, { claim: 'the bridge is safe', plan: 'cut the ropes', speech: '' })) : null;
+    const h24 = holdIds(s24);
+    const rr24 = h24.length ? await withDice([19], () => press(h24[0], PA)) : null;
+    const k24 = h24.length ? await press(h24[1], PB) : null;
+    dbHandle.prepare("UPDATE characters SET wis=?, next_mark=NULL WHERE guild_id='G1' AND user_id=?").run(wisA24, PA);
+    dbHandle.prepare("UPDATE characters SET next_mark=NULL WHERE guild_id='G1' AND user_id=?").run(PB);
+    ok('/deception with tokens in hand waits on both players’ 🔁 Reroll or ✅ Keep; the plan stays hidden until it lands; the deceiver’s reroll and the mark’s Keep land it',
+      !!m24 && h24.length === 2 && new RegExp(`Nothing lands yet — <@${PA}> and <@${PB}> may`).test(saidOf(s24)) && !/cut the ropes/.test(saidOf(s24))
+        && /rerolls \*\(reroll\)\* — the deception!/.test(saidOf(rr24)) && new RegExp(`Nothing lands yet — <@${PB}> may`).test(saidOf(rr24))
+        && /keeps the roll/.test(saidOf(k24)) && /believes it/.test(saidOf(k24)) && /was really planning: _cut the ropes_/.test(saidOf(k24)) && charP(PA).rerolls_current === 0 && charP(PB).rerolls_current === 1,
+      `${flat1(saidOf(o24)).slice(0, 120)} ${m24} · ${flat1(saidOf(s24)).slice(0, 400)} [${h24.join(',')}] · ${flat1(saidOf(rr24)).slice(0, 300)} · ${flat1(saidOf(k24)).slice(0, 500)}`);
+
+    endP();
+    guild.members.fetch = realFetchP;
+    const threwP = loggedP.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
+    console.error = realErrP;
+    ok('nothing in the P walk threw', threwP.length === 0, threwP.slice(0, 3).join('\n        '));
   }
 
   // ── No button, modal or select id throws on a junk payload ──────────

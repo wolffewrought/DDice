@@ -130,20 +130,24 @@ New verbs join their group; the wall is history until a single group nears 25.
 - A held roll is run again from what was asked, not from the moment: a typed `rra` rerolls whatever roll is last by the time it is allowed, and a denied fight command answers in the channel (what would have been the player's alone is said aloud to them).
 - `/roll action:` ignores `mode:` (the fight bridge reads `roll:`), so it is never held — and never rolls with advantage either.
 - An allowed Roll that opens a form stays live until the form comes back or the ten minutes run out; a form opened in time still rolls with advantage after the button has gone.
-- Keeping a hold by roll is a player's: an NPC holder has no Maintain, and the auto-pilot may still swing at its own captive. A held NPC on auto never tries Escape on its own turn (it swings flat); it struggles when a player keeps the hold.
 - A feint's or a deception's price in a fight is the fight's flag: it waits for the fighter's next fight roll, and goes with the fight if it ends first. Outside a fight it shares the sheet's one mark with a GM's 🔼 or 🔽: whichever is set later stands. An NPC's sheet mark is the same one slot.
 - The Break free and Stay buttons stay on the hold card after the answer; a late press is told no hold is waiting. A reroll of the hold's roll changes the total to beat; a 20 is read at the answer, and a 1 slips the hold at once.
 - In a fight a feint re-arms on your own turn's action (an attack, a grab, a disarm, Maintain, Escape), flat or not; a defence roll does not, flat or not. A retrieval is no roll and re-arms nothing.
 - A 5e skill check or saving throw does not strip the stat for a flat mark (a 5e sheet only gets one from a GM's check outcome).
 - A custom `/roll` standing in for a fight roll counts its first die as the natural, read against 20 whatever the dice: a d100 that shows 20 is a natural 20, and lands whatever the totals.
 - A disarmed fighter's turn carries Retrieve alone: one holding someone types `/fight act action:Release` (still free) — there is no button for it that turn.
-- Disarm on your own turn and a grapple against a strike are players' moves; NPCs never disarm, and an NPC never grapples a blow.
 - `/deception`'s form lives in memory for 15 minutes: a restart, or a late submit, says it has expired.
 - `/fight rr` of a flat attack that carried a banked +2 reads it from the numbers: with a stat of exactly 2 it labels the reroll as an honest roll (the total is right either way).
-- Disarm's grip roll for the NPC has no naturals; its flat defence, a fooled flag or a sheet mark clamps it to a straight d20.
 - A natural on initiative marks the fighter's first turn, whenever it comes: one downed before it keeps the mark until their turn does come round; one who re-joins rolls afresh and keeps only the new roll's mark.
 - A skip — `/fight skip`, `/gm override skip`, the clock's — is the whole turn: a natural 20's second action goes with it. The clock's attack for a quiet fighter is one of the two.
 - Out of combat, `back` does not give back a natural 20's second Done or a natural 1's roleplay turn once spent.
 - A level initiative follows the moment each roll was made; an order rolled before 2026-11-10 carries no moments, so a newcomer level with someone in it goes after them.
 - A called fight's card has no clock: it stays open until Begin, Cancel or `/fight end`, and no other fight starts in that channel meanwhile. With sign-ups open it never begins on its own.
 - A called fight's Add NPCs takes NPCs only: a name with no NPC behind it is left out (an initiative order takes it, at d20 + 0).
+
+- (build P, 2026-11-17) A roll waiting on Reroll or Keep holds the exchange: nothing lands, and the turn clock keeps it at its skip mark. A GM's Resolve keeps every open roll; a player's keeps only their own.
+- (build P) A called check or a `/deception` held for Reroll/Keep lives in `roll_holds` for a week; it has no clock — a GM's Keep lands it.
+- (build P) A `/gm effect` in the air holds no turn: the holder's turn passes when it lands, and only if it is still their turn then. Players' Defend uses their best defence stat, chosen for them.
+- (build P) An NPC's own move picked by the auto-pilot goes through the players' runner; if the runner declines it, the NPC strikes or defends as ever.
+- (build P) A player's Disarm and Deflect still work on NPCs only; an NPC's work on anyone.
+- (build P) `/help category:rules` now prints the whole table across several private messages — it had been cut at 1,900 characters.

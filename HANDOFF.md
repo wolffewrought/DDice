@@ -49,7 +49,7 @@ node --expose-internals verify.js test   # harnesses only
 node --expose-internals verify.js -v     # list every warning
 ```
 
-Green means every assertion passed (1332 as of 2026-11-10, build O) and no
+Green means every assertion passed (1358 as of 2026-11-17, build P) and no
 scanner found an ERROR. Then run the probe: `node --experimental-sqlite
 probe.js` (347 probes: the fight, encounter, override, autocomplete and
 every-leaf walks, the GM-gate walk, chat shorthands, scheduled ticks,
@@ -372,6 +372,22 @@ each copy located via that player's own quest_summaries.url and edited in
 place on a rewrite, so retelling never stacks; every record links that
 player's own copy. 150ms paced. Cost accepted knowingly: a six-player
 quest stores six copies, which is what makes each thread readable alone.
+
+## 10z · Build P: Reroll/Keep, sides and the cast, NPC moves, /gm effect, /health (2026-11-17)
+
+One combined build. In order of the code:
+
+- **Pending exchange.** Every fight roll is stored first (`fights.pend` holds who kept, what the bot threw, an answer's kind and words) and lands through one door, `settleExchange` → `landExchange`, shared by `/fight resolve`, the auto-pilot and the clock. `rollOpen`/`openRolls` say who may still throw again (a token in hand, not kept, not the bot's, not a custom roll, not an auto-piloted NPC). `finishRoll` shows a roll and waits, or lands it. The special moves split into a runner (rolls, `storeAnswer`) and a `settle*` (lands): Deflect, Disarm both ways, Grapple-as-defence, Escape. `atk_kind` gains `disarm` and `escape` for own-turn moves whose second roll is the bot's (`pend.db`).
+- **Reroll/Keep.** `/fight rr [npc:]` rewritten; `/fight keep [npc:]`; buttons `frr`, `fkeep`, `frrn:atk|def` (a GM choosing between two NPC rolls). Resolve is GM-only when `fightHasNpc`. `fightWaitingOn` has `keep` (with `ids`) and a `gm` flag on resolve; the clock reminds with the pair and keeps on timeout.
+- **React.** `offerDefRp` adds `fdrp:<fid>` under each landed exchange (on the end card for the last blow); the form posts words and strips the button.
+- **Sides & cast.** `fights.sides` (`ally`), `foesOf`, `fightWinners`, `dropFighter`; `quests.npc_cast` with `/session npcs`; `npcs.reveal` per-NPC HP visibility.
+- **NPC moves.** `actorId` through every runner; `npc:` on every `/fight act`; `fnact:<move>` buttons and the `fightactn:` picker; `autoPilotHand` lets the auto-pilot drive a runner (its whispers kept, its public lines posted; `recordRoll` files it as the bot). `autoNpcMove`/`autoNpcAnswer` at `getNpcSpecialChance` (`/config mechanics npcspecial`, default 33). `autoChainBusy` keeps one chain a fight.
+- **/gm effect.** Table `gm_effects`; buttons `gfx:use|def|land|drop`, select `gfx:pick`; `gfxLand` wounds, drops, passes the holder's turn.
+- **Away from fights.** `roll_holds` + `rhold:rr|keep` for called checks and `/deception` (`landDeception`).
+- **HP.** `/health adjust` (GM), `/heal`; `!hp` gone, `!heal`/`!h` point to `/heal`.
+- **Fixes found in the audit:** forfeit skipped a turn; `auto_npc` never reset by `standDownFight`; the picker read a non-existent `fight.practice`; a grappler NPC on auto with nobody else to fight stalled; `/help category:rules` was cut at 1,900 chars.
+
+**Tests.** probe: Build P section, probes 1–24 (fragments in the session scratchpad are disposable; the assembled section is in probe.js). Probes set `npc_special=0` globally (direct `UPDATE guild_config` — `setConfigProbe` does not reach that column) except the dedicated auto-move probe.
 
 ## 10y · Initiative: naturals first and last, two actions and a roleplay turn, the players' own rolls (2026-11-10, build O)
 
