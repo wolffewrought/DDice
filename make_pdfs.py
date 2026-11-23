@@ -135,7 +135,7 @@ PARTS['roll2'] = [
            ['Total 15+', 'Success'],
            ['Total 10–14', 'Partial Success'],
            ['Total 2–9', 'Fail']]),
-('note', 'The same holds for every check against a DC \u2014 a Game Master\u2019s called check, a planted button, a group check, a target: a natural 20 passes and a natural 1 fails, whatever the total. A natural 20 on a target beats it outright.'),
+('note', 'The same holds for every check against a DC \u2014 a Game Master\u2019s called check, a planted button, a group check, a target: a natural 20 passes and a natural 1 fails, whatever the total. A natural 20 on a target beats it outright. A hidden DC stays hidden: no card shows its number, and the recap and the story say <i>hidden DC</i>.'),
 ('h2', 'Targets'),
 ('p', 'A target is something the Game Master plants in the channel for the party to swing at \u2014 a door, a barricade, a Hollow with no sheet. Its card carries the buttons: one for each stat the Game Master allows, all five when they named none, so you pick the stat you swing with. Pressing opens a short form \u2014 what you do, what you say, both optional \u2014 and your words land above the roll. A natural 20 beats the target outright (<i>Roll critically succeeds</i>) and a natural 1 fails (<i>Roll critically fails</i>); anything else reads <i>The roll succeeds</i> or <i>The roll fails</i> and is the Game Master\u2019s call \u2014 <i>The player passes the check \u2014 Roll succeeds</i>, or <i>fails</i> \u2014 with their words on what happens beneath. A target can take several hits: the card says how many are left, and with a DC set a roll that meets it takes one off with no call. When a swing fails, the card comes back at the bottom of the channel with its buttons, counting its returns, ready for the next.'),
 ('h2', 'Critical Hits & Fails (all rolls)'),
@@ -145,8 +145,8 @@ PARTS['roll2'] = [
       'spending rerolls on the same roll until the dice agree with you. This holds everywhere: typed rerolls, '
       '<b>/fight rr</b>, and the prompt inside an activity.'),
 ('p', 'In a fight each side of an exchange gets its own second chance, so an attacker rerolling does not use '
-      'up the defender\u2019s. A fresh exchange resets both. While you hold a token a fight roll, a called check '
-      'and a deception wait on you: <b>Reroll</b> or <b>Keep</b>.'),
+      'up the defender\u2019s. A fresh exchange resets both. While you hold a token a fight roll, a called check, '
+      'a planted button, a group check and a deception wait on you: <b>Reroll</b> or <b>Keep</b>.'),
 ('note', 'Rerolls are still a resource \u2014 this is a limit on top of having one to spend, not instead of it.'),
 ('h2', 'Rerolls'),
 ('code', [('rr', 'costs 1 token'),
@@ -388,7 +388,7 @@ PARTS['fight'] = [
           ('/fight rr', 'reroll your open fight roll \u2014 1 token. The card says\nwhich roll it was; a hold rerolled into a 1 slips', 'player'),
           ('/fight keep', 'keep your open fight roll as it fell', 'player'),
           ('/fight rr npc:Hollow  \u00b7  /fight keep npc:Hollow', GM + ' rerolls or keeps for an NPC \u2014 on its own tokens;\nthe Reroll button with no roll of your own does it too', 'gm'),
-          ('(React)', 'after each exchange the one it was aimed at may say\nhow they take it \u2014 the fight does not wait', 'player'),
+          ('(React)', 'after each exchange the one it was aimed at may say\nhow they take it — the fight does not wait; the line\ncarries RP, Reply and GM like any roleplay line', 'player'),
           ('/fight atk stat:str target:@Players roll:adv', 'advantage on a fight roll waits on a GM\u2019s yes, as\nevery roll you pick it for does \u2014 name the stat with\nit (the stat buttons roll plain); the turn clock waits\nmeanwhile, and if the fight moves on, nothing rolls', 'player'),
           ('/fight resolve', 'resolve the exchange \u2014 in a fight with NPCs it is\nthe ' + GM + '\u2019s; on the auto-pilot the bot lands it once\nyou have kept or rerolled', 'player'),
           ('/fight side npc:Hollow side:Friendly', 'NPCs are enemies unless friendly \u2014 friendly: on\nstart, addnpc, auto and /session npcs; a fight with\nNPCs ends when one side is all down, ' + GM, 'gm'),
@@ -612,15 +612,16 @@ PARTS['quest'] = [
 ('h2', 'Your Party’s Thread'),
 ('p', 'When a run starts it opens its own thread in <b>quest-instances</b> with the whole party pulled in. That thread is where the quest happens: fights fought there log themselves on the quest’s timeline, the Game Master’s rally pings everyone in it, and the ending is written up there before it goes anywhere else. A player holds one seat at a time — you cannot be approved onto a second quest while a run is still live.'),
 ('h2', 'Instances — Encounters, Chapters and Older Quests'),
-('p', 'Not every session comes off the board. The Game Master can open a run with <b>/instance</b>: an <b>encounter</b> on the fly, a numbered <b>chapter</b> of a campaign, or a <b>quest from before the bot</b> picked up where it left off. No board, no applications — the Game Master ticks who is in it from the roster and opens it; it gets a thread of its own in quest-instances like any run, and pays out like one (an older quest pays only what the Game Master sets). The seats are the Game Master’s: there is no Join button, so if you want in, ask. An instance does not count as your one quest, so a party already out on a quest can still be jumped by bandits. A run may be <b>recorded</b>: then everything said in its thread goes into its log, not only what passes through the bot — the thread says so when it is. An instance keeps a quest’s clock: a time check every quarter-hour and a summary on the hour.'),
-('code', [('/instance list', 'every run going now, its kind, where, and its time so far')]),
+('p', 'Not every session comes off the board. The Game Master can open a run with <b>/instance</b>: an <b>encounter</b> on the fly, a numbered <b>chapter</b> of a campaign, or a <b>quest from before the bot</b> picked up where it left off. No board, no applications — the Game Master ticks who is in it from the roster and opens it; it gets a thread of its own in quest-instances like any run, and pays out like one (an older quest pays only what the Game Master sets). The seats are the Game Master’s: there is no Join button, so if you want in, ask. An instance does not count as your one quest, so a party already out on a quest can still be jumped by bandits. A run may be <b>recorded</b>: then everything said in its thread goes into its log, not only what passes through the bot — the thread says so when it is. An instance keeps a quest’s clock: a time check every quarter-hour and a summary on the hour. It can be opened ahead of the session: you are seated and its thread is open, but its clock waits and nothing is recorded — talk, rolls or story — until the Game Master starts it, and until then it holds nobody out of the rests. A fight called there before the start asks whoever called it whether to go ahead off the record.'),
+('code', [('/run time list', 'every run going now, its kind, where, and its clock'),
+          ('/run time show', 'this run’s clock — running, paused, winding down or\nnot started')]),
 ('h2', 'Campaigns'),
 ('p', 'A campaign is the long arc — quests and encounters under one name. Its card shows the premise, what is done and your own part in it; the Game Master’s notes and status stay on their side.'),
 ('code', [('/campaign list', 'every campaign on the server'),
           ('/campaign show campaign:The Falconer’s War', 'the premise, what is done, and your part')]),
 ('h2', 'Roleplay on the Record (/rp)'),
-('p', 'Outside a fight the same boxes the fight buttons open are a command away: <b>/rp</b> opens them — what you do, what you say (4,000 characters a box), a <b>Raw</b> box for longer writing (<i>*action*</i> in asterisks, <b>"speech"</b> in quotes, each part posted on its own line in the order you write it), a <b>stat to roll</b> from a dropdown of this server’s own, and any <b>dice</b> — and <b>/rp action:\u2026 speech:\u2026 roll:\u2026 dice:\u2026</b> skips the box. The line goes out in your own name and face, shaped as the cards are: <i>the action</i>, then \u201cthe speech\u201d, then the roll beneath; a line longer than one Discord message carries on in the next, the roll beneath the last. A roll keeps the rules a typed one does \u2014 the Hero\u2019s advantage, a mark you carry, a deception that fooled you \u2014 and <b>rr</b> rerolls it as it would a typed one. If the Game Master has called a check on you here, a <b>stat roll answers it</b>: the check\u2019s own terms, its button darkened, its outcome under your words. Inside a run the words become a beat on the timeline and the roll a roll in its log, in the recap and in the story that comes with the completion card — every word of it, under your name. Every roleplay box has Raw: the fight buttons’ forms, a target’s strike and a lost first turn too.'),
-('p', 'Every line carries a <b>Reply</b> button, and so does every line an NPC says and the Game Master’s <b>Narration</b> — press it and the same box opens as a reply. A reply wears a small line on top, <i>\u21AA replying to Name</i>, and that name is a link: tap it and you are taken to the line it answers. Several people can answer the same line; the button never moves. Beside it on your own lines sits <b>GM</b> \u2014 the Game Master\u2019s: they can answer your line as any NPC, and their answer links back to it the same way.'),
+('p', 'Outside a fight the same boxes the fight buttons open are a command away: <b>/rp</b> opens them — what you do, what you say (4,000 characters a box), a <b>Raw</b> box for longer writing (<i>*action*</i> in asterisks, <b>"speech"</b> in quotes, each part posted on its own line in the order you write it), a <b>stat to roll</b> from a dropdown of this server’s own, and any <b>dice</b> — and <b>/rp action:\u2026 speech:\u2026 roll:\u2026 dice:\u2026</b> skips the box. The line goes out in your own name and face, shaped as the cards are: <i>the action</i>, then \u201cthe speech\u201d, then the roll beneath; a line longer than one Discord message carries on in the next, the roll beneath the last. A roll keeps the rules a typed one does \u2014 the Hero\u2019s advantage, a mark you carry, a deception that fooled you \u2014 and <b>rr</b> rerolls it as it would a typed one. If the Game Master has called a check on you here, a <b>stat roll answers it</b>: the check\u2019s own terms, its button darkened, its outcome under your words. Inside a run the words become a beat on the timeline and the roll a roll in its log, in the recap and in the story that comes with the completion card — every word of it, under your name, the roll beneath it. Every roleplay box has Raw: the fight buttons’ forms, a target’s strike and a lost first turn too.'),
+('p', 'Every line carries <b>RP</b> and <b>Reply</b> buttons, and so does every line an NPC says, the Game Master’s <b>Narration</b> and a fight’s React line. <b>RP</b> comes first and opens the box for a line of your own, answering nobody; press <b>Reply</b> and the same box opens as a reply. A reply wears a small line on top, <i>\u21AA replying to Name</i>, and that name is a link: tap it and you are taken to the line it answers. Several people can answer the same line; the button never moves. Beside it on your own lines sits <b>GM</b> \u2014 the Game Master\u2019s: they can answer your line as any NPC, and their answer links back to it the same way.'),
 ('code', [('/rp', 'opens the box'),
           ('/rp action:draws her blade speech:Not one step closer.', 'posts at once'),
           ('/rp speech:Stand aside. roll:str', 'with a stat roll \u2014 it answers a check called on you here'),
@@ -640,7 +641,7 @@ PARTS['quest'] = [
 ('code', [('/session turn', 'the order, whose turn it is, which round'),
           ('/session turn action:next', 'Done, typed \u2014 for your own turn')]),
 ('h2', 'The Chronicle and the Review'),
-('p', 'When a run is completed, the Game Master’s telling of it lands in your own thread in <b>quest-chronicle</b> — one thread per adventurer, every quest they finished, told by whoever ran it — and the summary is linked on your standing page. The run’s thread then carries a review button: a score out of ten and a line or two, for the Game Masters alone to read \u2014 one each, and only from those who played the run. When a run winds down, its room is shown the run hour by hour, the story so far as a PDF, and the same button. The story holds every beat and every word said, in order: each speaker’s lines under their name, actions in italics, speech in quotes. <b>/quest record</b> lists what you have been on.'),
+('p', 'When a run is completed, the Game Master’s telling of it lands in your own thread in <b>quest-chronicle</b> — one thread per adventurer, every quest they finished, told by whoever ran it — and the summary is linked on your standing page. The run’s thread then carries a review button: a score out of ten and a line or two, for the Game Masters alone to read \u2014 one each, and only from those who played the run. When a run winds down, its room is shown the run hour by hour, the story so far as a PDF, and the same button. The story holds every beat and every word said, in order: each speaker’s lines under their name, actions in italics, speech in quotes. Every roll made in the room is there too, beneath the words it was made with — the dice, the bonus and any advantage, and what came of it — the game’s lines in blue, a natural 20’s roll in green and a natural 1’s in red; a hidden DC reads <i>hidden DC</i>. A page never cuts a post in two. <b>/quest record</b> lists what you have been on.'),
 ]
 
 PARTS['gmquest'] = [
@@ -667,13 +668,13 @@ PARTS['gmquest'] = [
 ('code', [('/quest party approve number:1 user:@Players force:true', 'approve · under spin-off this STAGES them on the\nlisting until you launch · force past a hard cap'),
           ('(one quest at a time)', 'a player may hold only one seat: approving someone\nalready on a live run is refused, and a launch leaves them\nan applicant rather than double-booking them'),
           ('/quest party kick number:1 user:@Players', 'remove a member or applicant'),
-          ('/quest run start number:1', 'lock the party, mark in progress'),
-          ('/quest run start number:1 (listing)', 'the launch: the whole staged group becomes one run\nwith its own thread and clock \u2014 or press on the post'),
+          ('/run time start name:Hollow Cave', 'lock the party, mark in progress, start the clock'),
+          ('/run time start name:Hollow Cave (listing)', 'under spin-off, the launch: the whole staged group becomes one run\nwith its own thread and clock \u2014 or press on the post'),
           ('/session add name:X [run:] user:@Players', 'seat a player on a run \u2014 name autocompletes, running\nones first; run blank = the latest active one. On an\ninstance it is your word: a sheet and a pulse required'),
           ('(naming a run)', 'paste the thread\u2019s own name if you like \u2014 the number\nprefix and \u201cRun 001 \u2026\u201d suffix are ignored. In a run\u2019s own\nthread you may leave name: blank entirely \u2014 it means\nthat very run'),
-          ('/session kick/rally/note/pause/resume/show/thread', 'the in-play leaves, for ANY run that is going \u2014 a board\nrun, an encounter, a chapter, an older quest. Most\nforward into /quest and behave as there; thread opens\nthe room itself, for a run that has none. Only show is\nopen to everyone \u2014 the rest are a GM\u2019s'),
+          ('/session kick/rally/note/show/thread', 'the in-play leaves, for ANY run that is going — a board\nrun, an encounter, a chapter, an older quest. Most\nforward into /quest and behave as there; thread opens\nthe room itself, for a run that has none. Only show is\nopen to everyone — the rest are a GM’s. Its clock is\n/run time'),
           ('/session summary [share:true] [filename:]', 'the run so far as a PDF, without closing it \u2014\nevery beat and every word said, first to last, in\nnumbered parts if it outgrows one file; filename:\nnames the file and heads its first page; private\nunless shared'),
-          ('/session complete [summary:] [title:]', 'pay out and write the chronicle. Leave summary:\nblank and a summary drafted from the log is offered:\nuse it, edit it, or end without one'),
+          ('/run time end [summary:] [title:]', 'pay out and write the chronicle. Leave summary:\nblank and a summary drafted from the log is offered:\nuse it, edit it, or end without one'),
           ('(run names)', 'every launch is christened \u201c<Quest> Run 001 <GM>\u201d \u2014\nthe thread and the ledger wear the same name'),
           ('/quest thread number:1 \u00b7 /quest thread all:true', 'open a quest thread for one that hasn\u2019t got one.\nUse it for quests that started before the\ninstance forum was set \u2014 all:true catches every\nrunning quest at once. Anything that already has\na room is left alone'),
           ('/quest handoff number:1 gm:@GMs', 'pass a quest to another GM \u2014 they become its DM.\nThe board, the book, the planning thread and the\nparty\u2019s room are all told')]),
@@ -688,17 +689,20 @@ PARTS['gmquest'] = [
          'summary. Completing one does nothing to the others. The board marks them: <i>One of 3 separate runs '
          'of this adventure.</i>'),
 ('h2', 'Running a Quest — the Clock'),
-('p', 'Starting a quest with <b>/quest run start</b> begins a stopwatch. From then on the bot posts a public time '
+('p', 'Starting a run with <b>/run time start</b> begins a stopwatch. From then on the bot posts a public time '
       'check in the quest\u2019s run channel <b>every 15 minutes</b>, and <b>on the hour</b> a recap of everything '
       'that happened during it. Set the channel first with <b>/quest runchannel</b>, or there is nowhere for '
-      'them to go. An instance keeps the same clock.'),
-('code', [('/quest run start number:1', 'the clock begins'),
+      'them to go. An instance keeps the same clock, and opens with it held: nothing is recorded until you start it. '
+      '<b>/run time</b> keeps every run’s clock, whatever opened it — in the run’s own room <b>name:</b> may be left blank.'),
+('code', [('/run time start name:Hollow Cave', 'the clock begins'),
           ('/quest run note number:1 text:They bribed the gatekeeper kind:Roleplay', 'mark a moment'),
           ('/quest run timeline number:1', 'the whole log so far'),
-          ('/quest run ready number:1', 'a ready check: one card with a tick per seated\nplayer and a Ready button \u2014 each press turns their\ntick; the last says all ready and names you, and on a\nrun not yet started turns the button into Start the\nrun \u2014 your press is /quest run start'),
-          ('/quest run pause number:1', 'stop the clock, keep the time'),
-          ('/quest run resume number:1', 'carry on where it left off'),
-          ('/quest run complete number:1', 'stop, award, and write it up')]),
+          ('/run time ready', 'a ready check: one card with a tick per seated\nplayer and a Ready button — each press turns their\ntick; the last says all ready and names you, and on a\nrun not yet started turns the button into Start the\nrun — your press is /run time start'),
+          ('/run time pause', 'stop the clock, keep the time — forward to the\nnext quarter-hour'),
+          ('/run time resume', 'carry on from the quarter-hour mark'),
+          ('/run time adjust by:-30m', 'correct the clock in quarter-hour steps, never below\nnought — a break nobody paused for, taken off'),
+          ('/run time show · /run time list', 'this run’s clock · every run going, with its clock\n— both open to everyone'),
+          ('/run time end', 'stop, award, and write it up')]),
 ('p', 'A timeline reads back like a ship\u2019s log:'),
 ('code', [('` 0h 00m` Quest begins \u2014 4 on the party', ''),
           ('` 0h 15m` Time check \u2014 0h 15m', ''),
@@ -709,8 +713,9 @@ PARTS['gmquest'] = [
       'speaking there through <b>/npc say</b>, is attached to whichever quest is running in that channel. '
       'Anything else you want on the record goes on with <b>/quest run note</b>, taggable as roleplay, combat or a '
       'plain note.'),
-('note', '<b>Pause keeps everything.</b> The time already run is banked and the clock stops \u2014 a paused quest '
-         'gets no reminders and logs nothing. Resuming picks up at exactly the same figure. Both counters live '
+('note', '<b>Pause keeps everything.</b> The time already run is banked, forward to the next quarter-hour, and the '
+         'clock stops — a paused run gets no reminders and logs nothing. Resuming picks up on that mark, and a '
+         'start, a wind-down and the end land on the quarter-hour too. Both counters live '
          'on the quest itself, so a restart or redeploy mid-session resumes rather than starting the count '
          'again.'),
 ('code', [('/quest runchannel number:1 channel:#thread', 'set where it runs & rewards'),
@@ -747,14 +752,14 @@ PARTS['gmquest'] = [
       'whoever they last swung at if still standing, else the weakest foe standing, with their best permitted stat. A defence '
       'is never skipped; the bot rolls it and the exchange resolves. With the other side all down, a quiet fighter is skipped, '
       'never set on a friend. A whole round gone by with nobody acting stops the clock, and it says so, until someone stirs; '
-      'a fight or an order already quiet six hours past its mark is left alone. A paused run holds the clock. The reminders '
+      'a fight or an order already quiet six hours past its mark is left alone. A paused run holds the clock; one not yet started does not. The reminders '
       'and the skips land on the second.'),
 ('code', [('/session clock remind:10 skip:30', 'this channel\u2019s clock \u2014 a slower table'),
           ('/session clock timeout:auto', 'a quiet fighter\u2019s attack is rolled for them'),
           ('/session clock reset:true', 'back to the server\u2019s clock'),
           ('/config mechanics turnclock remind:5 skip:15', 'the server\u2019s clock (Admin); 0 turns either off')]),
 ('h2', 'The Quest Summary'),
-('p', 'On <b>/quest run complete</b> the clock stops and the whole run is written up: who ran it, how they run a '
+('p', 'On <b>/run time end</b> the clock stops and the whole run is written up: who ran it, how they run a '
       'table, how long it took, who was on the party, and the full timeline. Set where it goes with '
       '<b>/config channels questlog channel:#chronicle</b>.'),
 ('code', [('/config channels questlog channel:#chronicle', 'where finished quests are written up'),
@@ -763,14 +768,15 @@ PARTS['gmquest'] = [
       '<b>/char view show full:true</b> both list the quests a character has finished, each one a link straight to its '
       'write-up, with how long it took and how long ago it was.'),
 ('h2', 'Ending a Run'),
-('code', [('/quest run winddown number:1', 'the story is over but the rewards are not settled:\nthe run stays live, its party is released to the rests\nand free to join other quests, and anyone kicked now is\nstill paid at completion. The run\u2019s room is shown, for\neveryone, the run hour by hour, the story so far as a\nPDF and Review this run. resume:true puts it back,\nand says only that (GM)'),
-          ('/quest run complete number:1', 'finish — auto-award merits, list rewards. The run\u2019s\nstory rides on the card as a PDF on parchment, in\nstandard type: the party, the length, every logged beat\nwith its roleplay words, your tale \u2014 woven, so /gm\nscroll can unfurl it again anywhere'),
-          ('/quest run complete number:1 summary:\u2026', 'add your telling \u2014 it lands in each adventurer\u2019s thread in\nquest-chronicle; timings, events and payouts go to the\nGM-only gm-quest-log instead'),
+('code', [('/run time winddown', 'the story is over but the rewards are not settled:\nthe clock stops, the run stays live, its party is\nreleased to the rests and free to join other quests,\nand anyone kicked now is still paid at completion. The\nrun’s room is shown, for everyone, the run hour by\nhour, the story so far as a PDF and Review this run.\n/run time resume puts it back (GM)'),
+          ('/run time end', 'finish — auto-award merits, list rewards. The run\u2019s\nstory rides on the card as a PDF on parchment, in\nstandard type: the party, the length, every logged beat\nwith its roleplay words, your tale \u2014 woven, so /gm\nscroll can unfurl it again anywhere'),
+          ('/run time end summary:…', 'add your telling \u2014 it lands in each adventurer\u2019s thread in\nquest-chronicle; timings, events and payouts go to the\nGM-only gm-quest-log instead'),
           ('/quest run log number:1 text:\u2026', 'write or rewrite the tale afterwards \u2014 it is mirrored into\nevery adventurer\u2019s own chronicle thread, and rewriting edits\neach copy in place (GM)'),
           ('(\u21A9 Reopen, on a completion message)', 'five minutes to take a completion back: payout reversed,\nthis run\u2019s titles revoked, party released; fix it and\ncomplete again (GM)'),
           ('(reviews)', 'a completed run posts a review button in its own\nthread, and a wind-down in its room \u2014 for those who\nplayed it, one review each; /quest show then carries\nthe count, the average and the latest few lines (GM)'),
           ('/quest archive number:1 summary:\u2026', 'the final shelf. Blank summary: opens a box for the final\nword \u2014 it goes on the record, into the run\u2019s thread and\nthe GM quest log, and marks the campaign card. A completed\nquest stays completed on everyone\u2019s record (GM)'),
           ('/quest delete number:1', 'remove a quest permanently: its board thread or\npost and its planning thread (applications and\nnotes included) and the party\u2019s room are deleted\nwith it \u2014 and any instances of it go the same way,\nthreads and all. A fight still running in the room\nis stood down first. If the quest is live, the\nconfirmation says so before you commit: the clock\nstops and the party is released. Its number returns\nto the pool: the next quest created takes the\nlowest free number, reborn with a clean history\n(the run ledger keeps counting for DM credit but\nno longer answers to that number)')]),
+('note', 'The story — on the completion card, in the wind-down and from <b>/session summary</b> — holds every public roll made in the run’s room, beneath the words it was made with: fight moves and what they came to, checks, planted and group buttons, targets, <b>/roll</b>, NPC and auto-pilot rolls. The game’s lines are blue, a natural 20’s roll green and a 1’s red, and a page never cuts a post. With NPC stats hidden the story leaves an NPC’s bonus out; the GM record shows it, and the number behind a hidden DC. Secret GM rolls never go in.'),
 ('h2', 'GM Style'),
 ('p', 'A quest can advertise how its ' + GM + ' runs a table, so a player knows what they are applying to. Set '
       'it on <b>/quest create</b> or per instance; it shows on the quest card, the board post and the final '
@@ -783,15 +789,16 @@ PARTS['gmquest'] = [
            ['Puzzle & investigation', 'problems to work out'],
            ['Sandbox', 'the players decide where it goes']]),
 ('h2', 'Instances — Runs Opened Without the Board'),
-('p', '<b>/instance</b> opens a run with no listing and no applications, in three kinds \u2014 <b>as:</b> says which. An <b>encounter</b> is a session on the fly. A <b>chapter</b> is a numbered part of a campaign \u2014 it needs <b>campaign:</b>, and <b>part:</b> is the next number if you leave it blank. A <b>legacy</b> run picks up a quest that began before the bot: <b>started:</b> says when, <b>played:</b> how long it has already been played (<b>6h</b>, <b>2h30m</b>, <b>90m</b>) \u2014 banked into its clock, so its runtime counts the sessions before the bot \u2014 and it pays only the merits you set. All three are the same thing underneath, so everything that works on one works on all.'),
+('p', '<b>/instance</b> opens a run with no listing and no applications, in three kinds \u2014 <b>as:</b> says which. An <b>encounter</b> is a session on the fly. A <b>chapter</b> is a numbered part of a campaign \u2014 it needs <b>campaign:</b>, and <b>part:</b> is the next number if you leave it blank. A <b>legacy</b> run picks up a quest that began before the bot: <b>started:</b> says when, <b>played:</b> how long it has already been played (<b>6h</b>, <b>2h30m</b>, <b>90m</b>) \u2014 banked into its clock, so its runtime counts the sessions before the bot \u2014 and it pays only the merits you set. All three are the same thing underneath, so everything that works on one works on all. Every instance opens <b>held</b>: the party seated and the room open, the clock at nought (a legacy run at its played time) and nothing recorded — no talk, rolls or story — until <b>/run time start</b>; until then it holds nobody out of the rests. A fight or an initiative called in its room before the start asks whoever called it to <b>Confirm</b>, going ahead off the record, or <b>Deny</b>, calling it off.'),
 ('code', [('/instance start name:\u2026 [as:] merits:2 campaign:\u2026', 'the bot lists every living character with HP and\nwhat holds them; tick who is in it and press Open \u2014\nit opens its own thread in quest-instances, the party\npulled in by mention. No Join button, ever (GM)'),
           ('/instance start name:The Siege as:chapter campaign:\u2026', 'Part 4 of the campaign, numbered for you; its card\nand the campaign card both say so (GM)'),
           ('/instance start name:\u2026 as:legacy started:12/09 played:6h merits:3', 'a quest from before the bot, on the books at last,\nits six hours already played on its clock (GM)'),
           ('/instance start quest:7 record:true', 'adopt a board quest that is already running: it gets\nits room if it has none, and the recording switch (GM)'),
           ('record:true', 'on start or adopt: every message typed in the run’s own\nthread goes into its log as table talk, every word. An edit\ncorrects its line and keeps the first wording; a deletion\ntakes it out. At the end it is in the story for everyone,\nunder each speaker’s name; the raw transcript — as first\ntyped, edits and deletions shown — goes to the GMs.\nCounted in the GM record, left out of the hourly recap.\nTyped rolls stay in the roll log. A run with no thread of\nits own is not recorded. Off unless you say so'),
           ('/session add \u00b7 /session kick', 'the seats are yours: in its thread, or by name: (GM)'),
-          ('/session complete [summary:] [title:]', 'pays out, writes the chronicle, posts the review button\n\u2014 the ordinary completion; blank summary: offers one\ndrafted from the log (GM)'),
-          ('/instance list', 'every run going now, its kind, where, and its time so far'),
+          ('/run time start', 'in its room when the table sits down: the clock and\nthe record begin, from nought or the played time, with\nEncounter begins as the first line (GM)'),
+          ('/run time end [summary:] [title:]', 'pays out, writes the chronicle, posts the review button\n— the ordinary completion; blank summary: offers one\ndrafted from the log (GM)'),
+          ('/run time list', 'every run going now, its kind, where, and its clock'),
           ('/instance preset save name:\u2026 merits:2 npcs:Hollow x3', 'a saved scene; `/instance start \u2026 preset:` runs it with the\nmerits set and the monsters summoned as temps;\n`preset list` \u00b7 `preset remove` (GM)')]),
 ('note', 'An instance keeps a quest’s clock \u2014 a time check every quarter-hour, a summary on the hour \u2014 and one left quiet for six hours pings the GM roles in its room; it never ends itself. A preset’s <b>npcs:</b> are summoned from the 5e library where there is one — and where there is not, an NPC of that name is cloned as temporary fighters, so <b>Hollow x3</b> works on a Knightfall server from a single Hollow you made once.'),
 ('h2', 'Campaigns — the Long Arc'),
@@ -849,7 +856,7 @@ PARTS['standing'] = [
           ('/standing title revoke user:@Players title:…', 'take one back (GM)', 'gm'),
           ('/standing association add user:@Players group:… note:…', 'the company, order or cause they stand with (GM)', 'gm'),
           ('/standing association remove user:@Players group:…', 'they part ways (GM)', 'gm'),
-          ('/quest run complete number:1 title:…', 'every survivor earns the title, stamped with the quest it came from (GM)', 'gm')]),
+          ('/run time end title:…', 'every survivor earns the title, stamped with the quest it came from (GM)', 'gm')]),
 ('h2', 'Renown'),
 ('p', '<b>Renown is not a currency.</b> It is a running tally of how a character <b>stands in the world</b> '
       '\u2014 what they have done, who has noticed, and how far their name carries. It is earned from quests, '
@@ -1453,14 +1460,15 @@ PARTS['gmroll'] = [
           ('gmr 1d20+5 perception', 'typed chat shortcut for the same roll'),
           ('gmrs 1d20+5 stealth', 'typed shortcut, secret — sent to your DMs')]),
 ('h2', 'Calling for a Check'),
-('note', 'A player holding a reroll token gets Reroll or Keep on a check you call before it lands \u2014 /deception waits the same way.'),
+('note', 'A player holding a reroll token gets Reroll or Keep on a check you call before it lands — /deception waits the same way. An NPC on the card holding reroll tokens waits on you: a Reroll button with its name (its own token, once) or Keep; one with none lands at once. A hidden DC is kept by the bot, not on the button — the recap and the story say <i>hidden DC</i> — for sixty days: a button pressed after that asks for the check to be called again.'),
 ('code', [('/gm dc dc:14 stat:dex targets:@Artorius @Meliora npcs:Hollow tank', 'call a check. Players get a roll button each \u2014 a\npress rolls their own d20 (+stat, signature\nhonoured) vs the DC and lands in the audit; named\nNPCs roll instantly on the card. dice: swaps the\nstat for any notation (2d6+1); mode: sets how they roll it \u2014\nadvantage, disadvantage, or a bare d20 (no stat,\nno signature); modifier: adjusts totals \u00b120;\nsecret:true hides the DC (you get it privately)\nand reveal:@Players whispers it to chosen players when\nthey press \u2014 per-player sight on one check;\non_fail: and on_success: each mark their NEXT\nroll \u2014 advantage or disadvantage \u2014 and the\nmark is GENERAL: it rides the character, needs no\nfight to be set, and is spent by whatever they\nroll next, anywhere \u2014 a chat !r, /roll, an\nactivity, any fight action, or another check\n(specialist abilities keep their chosen mode).\nflat stays a fight mark: their next fight\naction as a bare d20. fail_damage: and success_damage:\ncost HP on that outcome, sheet and fight kept in\nsync. Nat 20 always\npasses, nat 1 always fails; pressed buttons go\ndark. Works mid-fight and with /fight auto\nnpconly \u2014 full-auto runs start to finish, so a\ncheck lands after it.\nsuccess_flavour: and fail_flavour: stay hidden on\nthe card and are revealed with each roller\u2019s\nresult; success_sanction: and fail_sanction: shift\na stat by decree (pattern dex-1 or lck+2, \u00b15 at\nmost, floor 0) \u2014 the stakes show on the card, the\nwords wait for the outcome'),
           ('/gm dc target:@Players npcs:Hollow tank', 'leave dc: out and a WRITING WINDOW opens \u2014 the\ncheck as a form: the scene \u00b7 the check line (e.g.\n\u201cdex 14 hidden\u201d, or \u201c2d6+1 8 bare adv -2\u201d) \u00b7 on\nsuccess \u00b7 on failure \u00b7 targets. Each outcome box takes\na tag line first \u2014 [adv] [dis] [bare] [dex-1] [-3hp],\nany order, either outcome \u2014 then the words the\nplayers read. Targets\npicked on the command carry into the form; the last\nbox adds any you missed. Naming dc: keeps the fast\npath with every option instead'),
           ('/gm dc dc:13 stat:stealth targets:@Artorius', 'on a 5e server stat: is any of the six abilities or\neighteen skills, and save:true makes it a saving throw;\nproficiency is added where the sheet has it. The window\nreads stealth 14, dex save 13, sleight of hand 11, and\na sanction is a 5e score: [cha+1], kept 1\u201330'),
           ('/gm dc \u2026 hold:true skipfail:true', 'bind the check to the fight: the target\u2019s actions\nwait on the card, and a failed check passes their turn')]),
 ('h2', 'Buttons and Targets'),
-('code', [('/button roll dice:2d6+1 dc:9 reason:\u2026 for:@Players once:true', 'plant a roll: dice OR a stat, an optional DC, the reason\nshown above it, and who it is for \u2014 anyone if left open.\naudience:@Artorius @Meliora @GMs addresses several players\nand/or a role: only they may press, and the card names\nthem all. Pressed inside a quest, it joins that quest\u2019s\ntimeline and the GM log (GM)'),
-          ('/button group stat:wis dc:12 reason:\u2026', 'one check the whole party rolls \u2014 each presses once, the\nmessage keeps the tally, and Call it closes the scene\nwith how many got through. A natural 20 passes and a\nnatural 1 fails, whatever the total (GM)'),
+('code', [('/button roll dice:2d6+1 dc:9 reason:\u2026 for:@Players once:true', 'plant a roll: dice OR a stat, an optional DC, the reason\nshown above it, and who it is for \u2014 anyone if left open.\naudience:@Artorius @Meliora @GMs addresses several players\nand/or a role: only they may press, and the card names\nthem all. Pressed inside a quest, it joins that quest’s\ntimeline, the GM log and the story; every press goes\nto the roll audit. A presser holding a reroll token\ngets Reroll or Keep before it lands — a GM may\nKeep for them (GM)'),
+          ('/button roll stat:wis dc:15 secret:true reason:…', 'the DC hidden: the card says a hidden DC and only\nyou are told the number; the recap and the story\nsay hidden DC too (GM)'),
+          ('/button group stat:wis dc:12 reason:\u2026', 'one check the whole party rolls \u2014 each presses once, the\nmessage keeps the tally, and Call it closes the scene\nwith how many got through. A natural 20 passes and a\nnatural 1 fails, whatever the total. A roller holding a\ntoken may Reroll (once) or Keep before theirs counts —\nthe tally marks it waiting — and Call it keeps any\nstill waiting (GM)'),
           ('/target create name:Barricade [dc:12] [stat:Flat d20, STR, DEX] [dice:2d6+1] [hp:3] [for:@Players] [audience:@Artorius @Meliora @GMs] [success_flavour:\u2026] [fail_flavour:\u2026] [write:true]', 'plant something to swing at \u2014 no sheet, no roster. for: addresses one player, audience: several and/or a role \u2014 only they may swing, and the card names them. hp: is the hits it takes: with a DC a roll that meets it takes one off with no call, with no DC each pass you call does; it falls at 0. write:true opens a box for the scene and the two flavours. A d20 unless dice: says otherwise; stat: lists as few or as many stats as you like, one button each in that order \u2014 leave it out and all five are buttons; leave dc: out and every blow is your call. A press opens a short form \u2014 what they do, what they say, both optional \u2014 and the words land above the roll. A natural 20 beats it (Roll critically succeeds) and a natural 1 fails (Roll critically fails) on their own, posting your flavour if set; anything else says The roll succeeds / fails and asks YOU \u2014 the player passes the check, or fails it \u2014 each opening a What happens? form prefilled with your flavour (blank still sends the verdict). A fail posts the card again below with its buttons and a counter; secret:true asks in the GM channel and tells the players Roll succeeds / fails in theirs (GM)'),
           ('/target list', 'what still stands in this channel, with a Retire button per target to take it down without a swing (GM)')]),
 ('h2', 'Timers'),
@@ -1720,8 +1728,9 @@ PARTS['npcs'] = [
       'NPC’s mouth: never a role, never everyone, whatever is typed. A Game Master’s own <b>/rp</b> takes '
       '<b>to:</b> and a To picker the same way, its Raw box where Dice was (<b>/rp dice:</b> still rolls); a '
       'player’s never pings.'),
-('p', 'Under every line an NPC says sit two buttons, and sometimes a third \u2014 everyone sees them; what they do '
-      'depends on who presses. <b>Reply</b> opens the roleplay box titled as a reply to that NPC, for anyone (a '
+('p', 'Under every line an NPC says sit three buttons, and sometimes a fourth — everyone sees them; what they do '
+      'depends on who presses. <b>RP</b> comes first: the roleplay box for anyone, answering nobody (a Game Master’s '
+      'has the To picker). <b>Reply</b> opens the roleplay box titled as a reply to that NPC, for anyone (a '
       'Game Master replies as their own character, with the To picker); the reply carries a small '
       '<i>\u21AA replying to Garrick</i> line on top that jumps back to the line it answers. <b>GM</b> opens the speak-as box; a player pressing it is told '
       'quietly whose it is. A player\u2019s own <b>/rp</b> line carries a <b>GM</b> button too: it opens a box that '
@@ -1852,7 +1861,7 @@ PARTS['scrolls'] = [
 ('code', [('/dd message:\u2026 header:\u2026 user:@Players channels:#one #two', 'speak AS THE BOT \u2014 so a GM who also plays a character\nnever blurs the two. Plain words by default; a bold\nheader only if you write one; posted in every channel\nyou name, or here. Who said it goes to the roll-audit,\nnot the room (GM)'),
           ('/dd', 'bare, a box opens: Message (4,000), Header and someone\nto address — the header, the channels and the person\nnamed with the command carry into it. However long,\nit goes on in the next message (GM)')]),
 ('h2', 'Narration'),
-('p', '<b>/narrate</b> tells the scene in its own voice: the words go out as <b>Narration</b> under the bot’s picture, with a <b>Reply</b> under them like any roleplay line, so the table can answer the telling. Bare, it opens a box for paragraphs with a To picker; <b>text:</b> posts at once. In a run’s room the narration goes on that run’s record — recording on or off — and so into the timeline, the hourly recap, the previously-on and summary drafts, the GM record and the story. In the story it stands on its own as prose, a blank line about each paragraph; <b>/config mechanics narrator enabled:true</b> puts <i>0h 12m - Narration</i> over it instead, like any speaker.'),
+('p', '<b>/narrate</b> tells the scene in its own voice: the words go out as <b>Narration</b> under the bot’s picture, with <b>RP</b> and <b>Reply</b> under them like any roleplay line, so the table can answer the telling. Bare, it opens a box for paragraphs with a To picker; <b>text:</b> posts at once. In a run’s room the narration goes on that run’s record — recording on or off — and so into the timeline, the hourly recap, the previously-on and summary drafts, the GM record and the story. In the story it stands on its own as prose, a blank line about each paragraph; <b>/config mechanics narrator enabled:true</b> puts <i>0h 12m - Narration</i> over it instead, like any speaker.'),
 ('code', [('/narrate', 'opens the box: Narration (4,000, paragraphs kept)\nand To, up to twenty-five (GM)'),
           ('/narrate text:The rain thickens as the gate groans open.', 'posts at once (GM)'),
           ('/narrate text:… to:@Artorius, @Meliora', 'pings the people named under it — @people, a\ngroup or a knight order, completed as you type (GM)'),
@@ -1860,7 +1869,7 @@ PARTS['scrolls'] = [
 ('h2', 'Fixing What Was Said'),
 ('code', [('Edit (DDice)  — long-press a message → Apps', 'edit anything the bot posted — its own messages, NPC\nspeech from /npc say and narration alike. The text opens prefilled,\nsave replaces it, and the roll-audit records what\nchanged (GM)'),
           ('/edit [link:\u2026] [delete:true]', 'the same box without the Apps menu: a dropdown only\nyou see lists the last 25 lines the bot and its NPCs\nsaid here, newest first; pick one and the text opens\nprefilled; delete:true takes the picked line down\ninstead. link: a message link or id goes straight\nto it. Nothing shows in the channel. A player gets\nthe same for the lines they posted with /rp. A post\ncarried on into several messages is one post: every\npart opens in one form, and delete:true takes every\npart (GM)')]),
-('p', 'Only messages the bot itself posted — its own, and NPC speech sent through <b>/npc say</b>. A line carrying only <b>Reply</b>, <b>GM</b> or <b>Interaction</b> is still words to fix, and keeps its buttons; a card with other buttons stays the bot\u2019s. A player editing their own <b>/rp</b> line sees only their words: the roll beneath and the reply link on top are the bot\u2019s and stay. The roll audit records what changed. A narration, <b>/rp</b> or NPC line fixed or taken down is fixed or taken out of the run’s story too; one deleted in Discord itself leaves the story as well, and a post in parts keeps what is left of it. A line said through a webhook that has since been deleted cannot be edited by anyone — Discord ties the edit to the webhook — so the bot says so: delete it and have the NPC say it again.'),
+('p', 'Only messages the bot itself posted — its own, and NPC speech sent through <b>/npc say</b>. A line carrying only <b>RP</b>, <b>Reply</b>, <b>GM</b> or <b>Interaction</b> is still words to fix, and keeps its buttons; a card with other buttons stays the bot\u2019s. A player editing their own <b>/rp</b> line sees only their words: the roll beneath and the reply link on top are the bot\u2019s and stay. The roll audit records what changed. A narration, <b>/rp</b> or NPC line fixed or taken down is fixed or taken out of the run’s story too; one deleted in Discord itself leaves the story as well, and a post in parts keeps what is left of it. A line said through a webhook that has since been deleted cannot be edited by anyone — Discord ties the edit to the webhook — so the bot says so: delete it and have the NPC say it again.'),
 ]
 
 PARTS['keeping'] = [
@@ -2377,7 +2386,8 @@ EXAMPLES = [
 ('sec', 'Roleplay'),
 ('code', [('/rp action:draws her blade speech:Not one step closer.', 'Posts in your name: the action in italics, the speech in quotes.'),
           ('/rp', 'Opens the box. In Raw write *steps forward* "Now." The gate creaks. — it posts as three lines, in that order.'),
-          ('(press Reply under a Narration line)', 'The same box, as an answer to the Game Master’s telling.')]),
+          ('(press Reply under a Narration line)', 'The same box, as an answer to the Game Master’s telling.'),
+          ('(press RP under any line)', 'The same box again, for a line of your own — a reply to nobody.')]),
 
 ('aud', 'gm'),
 ('sec', 'Calling initiative'),
@@ -2392,8 +2402,9 @@ EXAMPLES = [
 ('code', [('/quest create', 'Write a new quest.'),
           ('/quest post number:1', 'Put it on the board so players can ask to join.'),
           ('/quest party approve number:1 user:@Artorius', 'Let Artorius in.'),
-          ('/quest run start number:1', 'Begin a run with everyone who was let in.'),
-          ('/quest run complete number:1 summary:\u2026', 'Finish it, pay merits, and tell the story.')]),
+          ('/run time start name:Hollow Cave', 'Begin a run with everyone who was let in. The clock starts.'),
+          ('/run time pause', 'A break: the clock stops on the next quarter-hour; /run time resume carries on from there.'),
+          ('/run time end summary:…', 'Finish it, pay merits, and tell the story.')]),
 
 ('aud', 'gm'),
 ('sec', 'Being an NPC'),
@@ -2406,7 +2417,7 @@ EXAMPLES = [
 
 ('aud', 'gm'),
 ('sec', 'Narrating the scene'),
-('code', [('/narrate', 'A box for paragraphs. What you write posts as Narration, with a Reply under it, and goes into the run’s story.'),
+('code', [('/narrate', 'A box for paragraphs. What you write posts as Narration, with RP and Reply under it, and goes into the run’s story.'),
           ('/narrate text:The rain thickens as the gate groans open. to:@Artorius', 'Posts at once, and pings Artorius under it.'),
           ('/config mechanics narrator enabled:true', 'The story puts “0h 12m - Narration” over each telling; left off, the prose stands alone.'),
           ('/dd', 'The bot’s own voice, for announcements — a box for paragraphs when message: is left blank.')]),
@@ -2416,7 +2427,9 @@ EXAMPLES = [
 ('code', [('/button roll stat:dex dc:12 reason:The ledge is slippery',
            'Puts a button in the channel. Anyone can press it to try climbing.'),
           ('/button roll dice:2d6+1 for:@Artorius once:true',
-           'Only Artorius can press it, and only once.'),
+           'Only Artorius can press it, and only once. He holds a reroll token, so his roll waits: Reroll for the token, once, or Keep.'),
+          ('/button roll stat:wis dc:15 secret:true reason:Something watches from the trees',
+           'The card says a hidden DC; only you are told it is 15. The recap and the story keep it hidden.'),
           ('/target create name:Barricade dc:12 stat:STR, DEX success_flavour:The planks give way. fail_flavour:It does not budge.',
            'Something to hit, a d20 against 12, STR and DEX as buttons. A press opens a short form \u2014 what you do, what you say \u2014 then rolls. A natural 20 beats it outright and posts the success flavour; otherwise each hit asks the GM to call it, and the verdict opens a What happens? form prefilled with the flavour. A fail brings the card back below with a counter.')]),
 
@@ -2424,7 +2437,8 @@ EXAMPLES = [
 ('sec', 'A check for everybody'),
 ('code', [('/button group stat:wis dc:12 reason:The bridge groans',
            'Everyone presses once and rolls. The message keeps score.'),
-          ('(the presses)', 'Artorius rolls 17 and Meliora 14 \u2014 across. Zeus rolls 6 \u2014 not.'),
+          ('(the presses)', 'Artorius rolls 17 and Meliora 14 — across. Zeus rolls 6 — not.'),
+          ('(Zeus holds a reroll token)', 'His 6 waits, marked on the tally, for Reroll or Keep. He rerolls: 9 — still short.'),
           ('(press Call it)', 'The GM closes it, and the bot says how many got across: two of three.')]),
 ('p', 'This is for moments when the whole party is doing the same thing at once \u2014 '
       'climbing, hiding, holding a door. One message, one answer.'),
@@ -2453,12 +2467,13 @@ EXAMPLES = [
 ('sec', 'Instances \u2014 runs opened without the board'),
 ('code', [('/instance start name:Hollows on the ridge merits:2', 'No board, no applications. The bot lists the roster; tick who is in it, press Open, and it opens its own thread in quest-instances with the party pulled in.'),
           ('/session add user:@Artorius', 'In its thread: Artorius arrives late. The seats are yours; nobody can press their own way in.'),
+          ('/run time start', 'When the table sits down: the clock starts and the record opens. Until then nothing is recorded, and a fight called there asks first.'),
           ('/instance start name:The Siege as:chapter campaign:The Falconer\u2019s War', 'Part 4 of the campaign, numbered for you.'),
           ('/instance start name:The Drowned Bell as:legacy started:12/09 played:6h merits:3', 'A quest that began before the bot, on the books at last, its six hours on the clock.'),
           ('/instance start quest:7 record:true', 'A board quest already running gets its room, and everything said there is kept.'),
           ('/instance preset save name:Ridge hollows merits:2 npcs:Hollow x3', 'Save the scene once.'),
           ('/instance start name:Hollows again preset:Ridge hollows', 'Next time it is one command: merits set, three Hollows step out.'),
-          ('/session complete', 'Pays out and writes the chronicle; with no summary: it offers one drafted from the log.')]),
+          ('/run time end', 'Pays out and writes the chronicle; with no summary: it offers one drafted from the log.')]),
 ('p', 'An instance does not count toward one quest at a time, so a player already on a quest can still be jumped by bandits. '
       'Its seats are the GM\'s: no Join button, `/session add` and `/session kick` in its thread. '
       'One left quiet for six hours pings the GMs in its room; it never ends itself.'),
@@ -2474,11 +2489,11 @@ EXAMPLES = [
           ('/campaign show campaign:\u2026', 'Players see the premise, what is done, and their own part. GMs see everything.')]),
 
 ('sec', 'Wrapping up'),
-('code', [('/quest run winddown number:1', 'The story is over; rewards are not settled. The party may rest and join other quests while you decide. The room is shown the run hour by hour, the story so far and a Review button.'),
-          ('/quest run complete number:1 summary:\u2026 title:\u2026', 'Pays everyone seated when the story ended \u2014 even someone kicked during the winddown.'),
+('code', [('/run time winddown', 'The story is over; rewards are not settled. The clock stops; the party may rest and join other quests while you decide. The room is shown the run hour by hour, the story so far and a Review button.'),
+          ('/run time end summary:… title:…', 'Pays everyone seated when the story ended \u2014 even someone kicked during the winddown.'),
           ('(press \u21A9 Reopen within five minutes)', 'Wrong number? The payout is reversed and the party released. Fix it, complete again.'),
           ('/quest archive number:1', 'A box opens for the final word. It goes on the record, into the thread, and the GM quest log.'),
-          ('/session summary filename:The Night Watch', 'The whole story so far as The-Night-Watch.pdf, headed The Night Watch — every beat and every word said.'),
+          ('/session summary filename:The Night Watch', 'The whole story so far as The-Night-Watch.pdf, headed The Night Watch — every beat and every word said, each roll beneath the words it went with: blue, a natural 20 green, a natural 1 red.'),
           ('/gm check stalled', 'What is waiting on a GM: winding-down runs, quiet encounters, staged parties never launched, targets standing over a day — each with its date and a link. gm-daily lists it all at eight each morning, gm-weekly each week and gm-monthly on the 1st.')]),
 
 ('sec', 'Fixing what was said'),

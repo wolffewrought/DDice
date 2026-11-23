@@ -817,6 +817,14 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS roll_holds (
   channel_id TEXT, payload TEXT, at INTEGER,
   PRIMARY KEY (guild_id, token)
 )`); } catch (e) { console.error('roll_holds schema', e); }
+// A hidden DC lives here, not in the button that asks for it (T,
+// 2026-11-23): a button's id rides every message to every client, and a
+// curious player could read the number off it. The button carries `s` and
+// a token; the press reads the number back. Kept sixty days.
+try { db.exec(`CREATE TABLE IF NOT EXISTS hidden_dcs (
+  guild_id TEXT NOT NULL, token TEXT NOT NULL, dc INTEGER NOT NULL, at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, token)
+)`); } catch (e) { console.error('hidden_dcs schema', e); }
 // A post longer than Discord's 2,000 goes out in parts (T, 2026-11-17): the
 // parts of each, in order, so /edit and the take-down treat them as one.
 try { db.exec(`CREATE TABLE IF NOT EXISTS post_parts (
@@ -847,6 +855,8 @@ try { db.exec("ALTER TABLE turn_orders ADD COLUMN roll_mode TEXT DEFAULT 'bot'")
 try { db.exec('ALTER TABLE turn_orders ADD COLUMN open INTEGER DEFAULT 1'); } catch {}
 try { db.exec('ALTER TABLE guild_config ADD COLUMN heal_charges INTEGER DEFAULT 3'); } catch {}
 try { db.exec('ALTER TABLE npcs ADD COLUMN rerolls_current INTEGER DEFAULT 0'); } catch {}
+// A group roll waiting on its roller's Reroll or Keep (T, 2026-11-23).
+try { db.exec('ALTER TABLE group_check_rolls ADD COLUMN held INTEGER DEFAULT 0'); } catch {}
 // The last time anyone touched a called fight (T, 2026-11-17: a day untouched and it lapses).
 try { db.exec('ALTER TABLE fight_calls ADD COLUMN touched_at INTEGER'); } catch {}
 // A temporary NPC is a real fighter in every way the engine cares about —
@@ -1664,6 +1674,98 @@ async function handleConfirmButton(interaction) {
   }
 }
 
+// ── Off the record (T, 2026-11-23) ──────────────────────────────────────
+// A fight or an initiative called in the room of a run its GM has not
+// started would be played off the record: nothing there is recorded until
+// /run time start. Whoever called it is asked first — Confirm goes
+// ahead off the record, Deny calls it off; the ask never starts the run.
+// The command is kept as it was typed and played again on Confirm.
+const offRecordAsks = new Map();
+function saveSlashOptions(interaction) {
+  const leaves = [];
+  const walk = (arr) => {
+    for (const x of arr || []) {
+      if (x.type === 1 || x.type === 2) { if (Array.isArray(x.options)) walk(x.options); }
+      else leaves.push(x);
+    }
+  };
+  walk(interaction.options?.data);
+  return { command: interaction.commandName, group: interaction.options?.getSubcommandGroup?.(false) ?? null,
+    sub: interaction.options?.getSubcommand?.(false) ?? null, leaves };
+}
+function slashOptionsShim(saved) {
+  const leaf = (n) => saved.leaves.find(x => x.name === n) || null;
+  const val = (n, required) => {
+    const x = leaf(n);
+    if (!x && required) throw new Error(`The option ${n} is missing.`);
+    return x ? (x.value ?? null) : null;
+  };
+  return {
+    data: saved.leaves, get: (n) => leaf(n),
+    getSubcommand: () => saved.sub, getSubcommandGroup: () => saved.group,
+    getString: val, getBoolean: val, getInteger: val, getNumber: val,
+    getUser: (n) => leaf(n)?.user ?? null, getMember: (n) => leaf(n)?.member ?? null,
+    getChannel: (n) => leaf(n)?.channel ?? null, getRole: (n) => leaf(n)?.role ?? null,
+    getMentionable: (n) => { const x = leaf(n); return x?.member ?? x?.user ?? x?.role ?? null; },
+    getAttachment: (n) => leaf(n)?.attachment ?? null, getFocused: () => null,
+  };
+}
+// The Confirm press, dressed as the slash command it stands for: its
+// options as typed, its answers as follow-ups to the press (the press
+// itself has answered the warning). The rehearsal room does the same.
+function replayAsSlash(btn, saved) {
+  const p = Object.create(btn);
+  let first = null;
+  const shape = (o) => (typeof o === 'string' ? { content: o } : { ...(o || {}) });
+  const own = {
+    options: slashOptionsShim(saved), commandName: saved.command, customId: undefined, message: undefined,
+    replied: false, deferred: false, ddiceOffRecordOk: true,
+    isChatInputCommand: () => true, isCommand: () => true, isButton: () => false, isMessageComponent: () => false,
+    isAnySelectMenu: () => false, isStringSelectMenu: () => false, isModalSubmit: () => false,
+    isAutocomplete: () => false, isRepliable: () => true,
+    async reply(o) { const x = shape(o); delete x.fetchReply; first = await btn.followUp(x); p.replied = true; return first; },
+    async deferReply(o) { first = await btn.followUp({ content: '⏳', ephemeral: !!o?.ephemeral }); p.deferred = true; return first; },
+    async editReply(o) {
+      const x = shape(o);
+      if (!first || !btn.webhook?.editMessage) { first = await btn.followUp(x); p.replied = true; return first; }
+      return btn.webhook.editMessage(first, x);
+    },
+    async fetchReply() { return first; },
+    async followUp(o) { return btn.followUp(shape(o)); },
+    async deleteReply() { if (first && btn.webhook?.deleteMessage) await btn.webhook.deleteMessage(first).catch(() => {}); },
+    async showModal() { throw new Error('A form cannot open from this press.'); },
+  };
+  for (const [k, v] of Object.entries(own)) Object.defineProperty(p, k, { value: v, writable: true, configurable: true, enumerable: true });
+  return p;
+}
+async function offRecordGate(interaction, cmd) {
+  if (interaction.ddiceOffRecordOk || !interaction.isChatInputCommand?.()) return false;
+  const run = unstartedRunIn(interaction.guild?.id, interactionChannelId(interaction));
+  if (!run) return false;
+  for (const [k, v] of offRecordAsks) if (Date.now() - v.at > 15 * 60000) offRecordAsks.delete(k);
+  const token = `${Date.now().toString(36)}${Math.floor(Math.random() * 46656).toString(36)}`;
+  offRecordAsks.set(token, { cmd, uid: interaction.user.id, saved: saveSlashOptions(interaction), at: Date.now() });
+  const { ActionRowBuilder: OR, ButtonBuilder: OB, ButtonStyle: OS } = require('discord.js');
+  const row = new OR().addComponents(
+    new OB().setCustomId(`offrec:go:${token}`).setLabel('✅ Confirm').setStyle(OS.Success),
+    new OB().setCustomId(`offrec:no:${token}`).setLabel('✖️ Deny').setStyle(OS.Secondary));
+  await interaction.reply({ ephemeral: true, components: [row], allowedMentions: { parse: [] },
+    content: `⚠️ **${questTag(run)}** has not started — nothing here is recorded until \`/run time start\`. Go ahead off the record?` });
+  return true;
+}
+async function handleOffRecordButton(interaction) {
+  const [, what, token] = interaction.customId.split(':');
+  const ask = offRecordAsks.get(token);
+  if (!ask) return interaction.update({ content: '⏳ That warning has lapsed — call it again.', components: [] }).catch(() => {});
+  if (interaction.user.id !== ask.uid) return interaction.reply({ ephemeral: true, content: '❌ That warning is not yours.' });
+  offRecordAsks.delete(token);
+  if (what !== 'go') return interaction.update({ content: '✖️ Called off. Once the run starts — `/run time start` — call it again.', components: [] }).catch(() => {});
+  await interaction.update({ content: '✅ Going ahead off the record.', components: [] }).catch(() => {});
+  const p = replayAsSlash(interaction, ask.saved);
+  if (ask.cmd === 'fight') return handleFight(p);
+  if (ask.cmd === 'initiative') return handleSessionInitiative(p);
+}
+
 // ══════════════════════════════════════════════════════════════════════
 //  DICE
 //  Notation, rolling, crits, the roll card, the last-roll memory, the roll audit mirror
@@ -1998,7 +2100,8 @@ async function handleRoll(message, rest, mode, isReroll, successCheck = false, a
   const successResult = successCheck ? getSuccessResult(result.total, naturalRoll, result.sides ?? result.sides) : null;
   const rollLine = buildRollLine(result, mode, critType, successResult);
   recordRoll(gid, { userId: uid, channelId: cid, messageId: message.id, input: message.content,
-    rollLine, result, context: isReroll ? 'reroll' : (successCheck ? 'success check' : null) });
+    rollLine, result, context: isReroll ? 'reroll' : (successCheck ? 'success check' : null),
+    story: { label: storyRollLabel(label, statRolled, isReroll), flat: /flat d20/.test(String(label || '')) } });
   // A reroll does not overwrite the saved roll, so its own result can't be
   // rerolled in turn — the mark set above stays put.
   await sendRollEmbed(message, rollLine, label, isReroll, uid, flavour, result.total, critType, !!statRolled);
@@ -2009,6 +2112,8 @@ function recordRoll(gid, opts) {
   // hand threw it, so it files as the bot's, under the NPC's name.
   if (opts?.interaction?.autoPilot) opts = { ...opts, userId: null, actor: opts.interaction.autoPilot, interaction: null, kind: opts.kind || 'npcs',
     context: String(opts.context || '').replace(/GM as (.*?) \u{1F3AD}/u, 'auto-pilot as $1 \u{1F3AD}') || null };
+  // A roll in the open in a run's room goes into its story (T, 2026-11-23).
+  try { storyRollFromRecord(gid, opts); } catch (e) { console.error('[story] dice -', e?.message || e); }
   // Tally every die that was physically rolled, not just the one that counted:
   // an advantage roll threw two d20s and both belong in a lifetime history.
   // `result` is the object from rollNotation/rollAdvantage/rollDisadvantage;
@@ -2088,6 +2193,8 @@ function mirrorRoll(gid, { userId = null, actor = null, channelId, messageId = n
 // demo bouts. There's no human to attribute it to, so the fighter is named
 // instead and the entry is tagged so a GM can tell it from a hand-rolled one.
 function mirrorAutoRoll(gid, cid, name, notation, nat, total, context) {
+  // Into the story of the run whose room it is (T, 2026-11-23).
+  try { storyRollFromAuto(gid, cid, name, notation, nat, total, context); } catch (e) { console.error('[story] auto dice -', e?.message || e); }
   // An auto roll may come whole ({ nat, adv, dropped }): advantage keeps both
   // dice in the audit line, as a manual roll's line does (2026-11-08).
   const dropped = (nat && typeof nat === 'object' && (nat.adv || nat.dis) && nat.dropped != null) ? nat.dropped : null;
@@ -2336,7 +2443,8 @@ async function handleRollSlash(interaction) {
 
   recordRoll(gid, { userId: uid, channelId: cid, interaction, result,
     input: `/roll ${stat ? `stat:${stat}` : `dice:${dice}`}${effMode !== 'normal' ? ` mode:${effMode}` : ''}${successCheck ? ' success_check:true' : ''}`,
-    rollLine, context: successCheck ? 'success check' : null });
+    rollLine, context: successCheck ? 'success check' : null,
+    story: { label: storyRollLabel(finalLabel, stat), flat: !!flatMk, mode: effMode } });
 
   // Same rule as a typed stat roll: 1d20+4 says nothing about which stat it was
   // or where the 4 came from, so a stat roll always shows at least the
@@ -2386,7 +2494,7 @@ const RULES = [
   { key: 'deflect-disarm', text: 'Deflect: beat the attack and the enemy loses its next turn retrieving the weapon. A natural 20 turns the blow whatever the totals, a named enemy takes 2, and your flat next attack gets +2; a natural 1 fails for 2 wounds, your next defence flat as well as your next attack. Disarm needs DEX 4+, works on NPCs only and needs no blade: against a strike, beat the attack; on your turn, beat their best of STR and DEX, ties to them. Disarmed, they spend their next turn retrieving the weapon. A natural 20 disarms whatever the totals and wounds 1 \u2014 against a strike it banks +2 too, riding even a flat attack; a natural 1 fails for 2 wounds and disarms you. After any disarm your very next roll is a flat d20.' },
   { key: 'disarmed',       text: 'Disarmed, your next turn goes to retrieving the weapon \u2014 no attack, grab, feint, disarm, escape or hold until you have. A skipped turn counts; the auto-pilot and the turn clock retrieve on their own.' },
   { key: 'defence-once',   text: 'One answer per strike: once a defence is in — a roll, a deflection, a disarm, a feint or a grapple — it is rerolled with a token, never rolled again.' },
-  { key: 'reroll-keep',    text: 'Every fight roll you could reroll waits on you: \u{1F501} Reroll (a token, once a roll) or ✅ Keep — nothing lands until you choose, and silence by the turn clock is a Keep. No token, no wait. The same goes for a check a GM calls on you and for `/deception`. A GM rerolls for an NPC on the NPC’s own tokens, and can Keep for anyone.' },
+  { key: 'reroll-keep',    text: 'Every fight roll you could reroll waits on you: \u{1F501} Reroll (a token, once a roll) or ✅ Keep — nothing lands until you choose, and silence by the turn clock is a Keep. No token, no wait. The same goes for a check a GM calls on you, a planted roll, a group check and `/deception`. A GM rerolls for an NPC on the NPC’s own tokens — in a fight or on a called check — and can Keep for anyone.' },
   { key: 'twenty-twenty',  text: 'Twenty against twenty goes to whoever started the roll, everywhere: an attack over a parry, a disarm over the grip, a kept hold over the break, an escape over the hold, a lie over the insight.' },
   { key: 'sides',          text: 'NPCs fight as enemies unless a GM makes them friendly; a fight with NPCs ends when one side is all down, and the friendly ones win it with the players. The auto-pilot never attacks its own side; by hand anyone can be targeted.' },
   { key: 'resolve-gm',     text: 'In a fight with NPCs the ⚖️ Resolve is the GM’s; players alone resolve their own. On the auto-pilot the bot lands an exchange itself once you have kept or rerolled.' },
@@ -3273,7 +3381,8 @@ async function handleConfig(interaction, forced) {
         else if (busyW.has(r.user_id)) outW.push(`\u{1F5FA}\uFE0F **${nm}** \u2014 on an active quest`);
         else if (fightW.has(r.user_id)) outW.push(`\u2694\uFE0F **${nm}** \u2014 in an active fight`);
       }
-      const staleQ = db.prepare("SELECT number, name FROM quests WHERE guild_id=? AND status='active' ORDER BY number").all(gid);
+      // Only the runs that do hold people: not one winding down, not one not yet started.
+      const staleQ = db.prepare("SELECT number, name FROM quests WHERE guild_id=? AND status='active' AND COALESCE(winding_down,0)=0 AND COALESCE(unstarted,0)=0 ORDER BY number").all(gid);
       const staleF = db.prepare("SELECT channel_id FROM fights WHERE guild_id=? AND state='active'").all(gid);
       return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] }, content: [
         outW.length ? '\u{1F6AB} **The rest will pass these over**' : '\u2705 Nobody is excluded \u2014 every sheet will be restored.',
@@ -6763,8 +6872,9 @@ async function handleHealSlash(interaction) {
     content = `**heal**\n${rollLine}\n${resultText}`;
   }
   await interaction.reply({ content, allowedMentions: { parse: [] } });
-  recordRoll(gid, { userId: uid, channelId: cid, interaction, result, input: '/heal', rollLine, context: `heal on ${tn}` });
-  try { noteQuestActivity(gid, cid, 'roll', `${dn} heals ${tn}: ${total} — ${healAmount ? `${healAmount} HP restored` : 'no heal'}`, uid); } catch {}
+  recordRoll(gid, { userId: uid, channelId: cid, interaction, result, input: '/heal', rollLine, context: `heal on ${tn}`,
+    story: { note: healAmount ? `${healAmount} HP restored` : 'no heal' } });
+  try { noteQuestActivity(gid, cid, 'roll', `${dn} heals ${tn}: ${total} — ${healAmount ? `${healAmount} HP restored` : 'no heal'}`, uid, { parts: { recap: 1 } }); } catch {}
 }
 
 // `!hp` is gone and `!heal` / `!h` are `/heal` now (T, 2026-11-15: "Remove
@@ -9941,6 +10051,7 @@ function npcInteractRow(gid, npc, offer = null) {
   const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
   const key = npcKey(npc.name);
   const row = new ActionRowBuilder().addComponents(
+    rpNewButton(),
     new ButtonBuilder().setCustomId(`npcreply:${key}`).setLabel('💬 Reply').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`npcx:${key}`).setLabel('🎭 GM').setStyle(ButtonStyle.Secondary));
   if (offer) row.addComponents(new ButtonBuilder().setCustomId(`npctalk:${key}:${activityKey(offer)}`).setLabel('🎮 Interaction').setStyle(ButtonStyle.Success));
@@ -10007,6 +10118,12 @@ async function handleNpcReplyButton(interaction) {
   if (!npc) return interaction.reply({ content: '❌ That NPC is gone.', ephemeral: true });
   const gm = await isGm(interaction.guild, interaction.user.id);
   return interaction.showModal(rpModal({ gid, gm, title: `Reply to ${npc.name}`, replyTo: interaction.message?.id || null }));
+}
+// ✍️ RP on any roleplay line: the roleplay box, not a reply (T, 2026-11-23).
+async function handleRpNewButton(interaction) {
+  const gid = interaction.guild.id;
+  const gm = await isGm(interaction.guild, interaction.user.id);
+  return interaction.showModal(rpModal({ gid, gm }));
 }
 // Reply on an /rp line: the same box, as a reply to whoever wrote it.
 async function handleRpReplyButton(interaction) {
@@ -13605,7 +13722,7 @@ async function resolveBreakFree(guild, gid, cid, fight, { roll = null, flavour =
   }
   try {
     const freed = !fightGrapples(getFight(gid, cid))[captiveId];
-    noteQuestActivity(gid, cid, 'combat', freed ? `${capF.name} breaks free of ${hF.name}` : `${hF.name} keeps ${capF.name} held`);
+    noteQuestActivity(gid, cid, 'combat', freed ? `${capF.name} breaks free of ${hF.name}` : `${hF.name} keeps ${capF.name} held`, null, { parts: { recap: 1 } });
   } catch {}
   return passTurn(guild, gid, cid, hpState, order, roster, floor, lines, holderId);
 }
@@ -14115,6 +14232,8 @@ async function offerDefRp(guild, gid, fight, ret) {
 // open, a Keep, a Reroll, a GM's Resolve, the auto-pilot and the clock.
 async function settleExchange(guild, gid, cid, fight = getFight(gid, cid)) {
   const r = await landExchange(guild, gid, cid, fight);
+  // What it came to goes into the story, after the dice (T, 2026-11-23).
+  try { noteStoryOutcome(gid, cid, storyOutcomeOf(r?.lines, fightPend(fight).words)); } catch {}
   // An escape is the captive's own move against a hold already standing:
   // there is nobody it was aimed at to ask.
   return fight.atk_kind === 'escape' ? r : offerDefRp(guild, gid, fight, r);
@@ -14414,7 +14533,14 @@ async function runFightAttack({ interaction, gid, cid, actorId, targetId, stat, 
       const usedSoFar = (Number(fight.atk_used) || 0) + 1;
       const heldIndex = fight.turn_index;
       const fightAc = getFight(gid, cid);
-      const res = await offerDefRp(interaction.guild, gid, fightAc, await resolveExchange(interaction.guild, gid, cid, fightAc, { midAction: usedSoFar < allowed }));
+      // The strike into the audit and the story before what it came to (T,
+      // 2026-11-23: it never reached the audit on 5e).
+      recordRoll(gid, { userId: uid, channelId: cid, interaction, kind: isNpcFighter(actorId) ? 'npcs' : null, card: auditCard,
+        input: `/fight atk stat:${stat}${isNpcFighter(actorId) ? ` npc:${actor.name}` : ''}`, rollLine, nat, sides: 20, total,
+        context: isNpcFighter(actorId) ? `fight · GM as ${actor.name} \u{1F3AD} attacks ${targetF.name}` : `fight · attacks ${targetF.name}` });
+      const landedAc = await resolveExchange(interaction.guild, gid, cid, fightAc, { midAction: usedSoFar < allowed });
+      try { noteStoryOutcome(gid, cid, storyOutcomeOf(landedAc?.lines)); } catch {}
+      const res = await offerDefRp(interaction.guild, gid, fightAc, landedAc);
       const head = `⚔️  **${actor.name}** strikes at **${targetF.name}** — ${fightTotalStr(total, nat, 20)} vs **AC ${ac}**${advNote}${feintEdgeUsed ? ' \u2014 \u{1F3AD} the feint pays off' : ''}`;
       const extra = [];
       const after = getFight(gid, cid);
@@ -15726,7 +15852,7 @@ async function settleDisarmAttack(guild, gid, cid, fight) {
       setEffectFlag(gid, cid, targetId, 'disarmed');
       lines.push(`⚔️ The weapon spins from **${targetName}**'s grip \u2014 their next turn goes to retrieving it!`);
     } else lines.push(`\u{1F6E1}\uFE0F **${targetName}** keeps hold of the weapon${total === g.total ? ' \u2014 a tie goes to the one holding it' : ''}.`);
-    try { noteQuestActivity(gid, cid, 'combat', `${actor.name} goes for ${targetF.name}'s weapon${took ? ' and takes it' : ''}`); } catch {}
+    try { noteQuestActivity(gid, cid, 'combat', `${actor.name} goes for ${targetF.name}'s weapon${took ? ' and takes it' : ''}`, null, { parts: { recap: 1 } }); } catch {}
     return passTurn(guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, uid);
   }
   lines.push(`**${actorName}** (**DEX**): ${actor.isNpc ? maskNpcRollLine(gid, v.line || '') : (v.line || '')}`);
@@ -15775,7 +15901,7 @@ async function settleDisarmAttack(guild, gid, cid, fight) {
       : `\u{1F6E1}\uFE0F **${targetName}** keeps hold of the weapon${total === g.total ? ' \u2014 ties go to the one holding it' : ''}.`);
   }
   lines.push('', `_⚔️ The price: **${actorName}**'s very next roll is a flat d20._`);
-  try { noteQuestActivity(gid, cid, 'combat', `${actor.name} goes for ${targetF.name}'s weapon${won ? ' and takes it' : ''}`); } catch {}
+  try { noteQuestActivity(gid, cid, 'combat', `${actor.name} goes for ${targetF.name}'s weapon${won ? ' and takes it' : ''}`, null, { parts: { recap: 1 } }); } catch {}
   return passTurn(guild, gid, cid, hpState, order, turnOrder, floor, lines, uid);
 }
 
@@ -15884,7 +16010,7 @@ async function settleGrappleDef(guild, gid, cid, fight) {
     }
     lines.push(`\u{1F512} **${actorName}** catches the blow and seizes **${attackerName}** \u2014 no damage!`);
     lines.push(`_Held \u2022 the wounds start once ${actorName}'s turn has come round, 1 a round \u2022 break free (STR) on their turn with \`/fight act action:Escape\`, or when ${actorName} keeps the hold \u2022 or act on a flat d20. ${actorName} may \`/fight act action:Release\` freely, and cannot strike their captive._`);
-    try { noteQuestActivity(gid, cid, 'combat', `${actor.name} catches ${attackerF.name}'s blow and seizes them`); } catch {}
+    try { noteQuestActivity(gid, cid, 'combat', `${actor.name} catches ${attackerF.name}'s blow and seizes them`, null, { parts: { recap: 1 } }); } catch {}
     // The striker's turn ends with no wound: the hold is new.
     return passTurn(guild, gid, cid, hpState, [...turnOrder], turnOrder, floor, lines, attackerId, { strain: false });
   }
@@ -16515,6 +16641,8 @@ async function handleFight(interaction, forced) {
     }
     // A fight called and not yet begun holds the channel (T, 2026-11-10).
     if (liveFightCall(gid, cid)) return interaction.reply({ ephemeral: true, content: '\u274C A fight is being called here \u2014 \u2694\uFE0F **Begin** on its card starts it; \u2716 **Cancel** or `/fight end` calls it off.' });
+    // In a run's room before its GM has started it, ask first (T, 2026-11-23).
+    if (!forced && await offRecordGate(interaction, 'fight')) return;
 
     const fighters = [];
     // Players from the @mention list
@@ -16878,6 +17006,11 @@ async function handleFight(interaction, forced) {
   if (sub === 'auto') {
     if (!(await isGm(interaction.guild, uid))) return interaction.reply({ content: '❌ Only GMs can use /fight auto.', ephemeral: true });
     const mode = interaction.options?.getString?.('mode');
+    // A new fight in a run's room before its GM has started it: ask first
+    // (T, 2026-11-23). A demo is nobody's, and a fight already going was
+    // asked about when it began.
+    if (!forced && mode !== 'demo' && !(getFight(gid, cid)?.state && getFight(gid, cid).state !== 'idle')
+        && await offRecordGate(interaction, 'fight')) return;
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     const channel = chan;
     const send = async (txt) => { await channel.send(txt).catch(()=>{}); };
@@ -17212,6 +17345,7 @@ async function handleFight(interaction, forced) {
         outcome = `🛡️ **${defF.name}** blocks — no damage.`;
       }
       for (const l of effectNoteLines(fxNotes, `**${atkF.name}${atkF.isNpc?' 🎭':''}**`, `**${defF.name}${defF.isNpc?' 🎭':''}**`)) outcome += `\n${l}`;
+      try { noteStoryOutcome(gid, cid, storyOutcomeOf([outcome])); } catch {}
       await sleep(700); await send(outcome);
 
       // A natural 20 on initiative: a second exchange before the turn passes.
@@ -18419,7 +18553,8 @@ function questBusyUsers(gid) {
   const rows = db.prepare(`SELECT DISTINCT m.user_id FROM quest_members m
                            JOIN quests q ON q.guild_id = m.guild_id AND q.number = m.number
                            WHERE m.guild_id = ? AND m.state = 'party'
-                             AND q.status = 'active' AND COALESCE(q.winding_down, 0) = 0`).all(gid);
+                             AND q.status = 'active' AND COALESCE(q.winding_down, 0) = 0
+                             AND COALESCE(q.unstarted, 0) = 0`).all(gid);
   return new Set(rows.map(r => r.user_id));
 }
 
@@ -18448,6 +18583,35 @@ function fmtElapsed(ms) {
   const total = Math.max(0, Math.floor(ms / 60000));
   return `${Math.floor(total / 60)}h ${String(total % 60).padStart(2, '0')}m`;
 }
+// The run clock lands forward on the quarter-hour whenever it stops or
+// starts again (T, 2026-11-23: "always rounds forward to the nearest 15
+// minutes when pausing and resuming") — a pause, a resume, a start, a
+// wind-down and the end.
+function quarterUp(ms) {
+  return Math.ceil(Math.max(0, Number(ms) || 0) / QUARTER_MS) * QUARTER_MS;
+}
+// Opened ahead and not yet begun: seated, held at its time, recording
+// nothing until /run time start (T, 2026-11-23).
+function isUnstarted(q) {
+  return !!q && q.status === 'active' && Number(q.unstarted) === 1;
+}
+// The run whose room this is, while its GM has not started it.
+function unstartedRunIn(gid, cid) {
+  if (!gid || !cid) return null;
+  try {
+    return db.prepare(`SELECT * FROM quests WHERE guild_id=? AND status='active' AND COALESCE(unstarted,0)=1
+                         AND (run_thread_id=? OR run_channel_id=?) ORDER BY number DESC LIMIT 1`).get(gid, cid, cid) || null;
+  } catch { return null; }
+}
+// A run's clock in words: not started, running, paused, winding down, done.
+function runClockWords(q) {
+  if (isUnstarted(q)) return `⏸️ not started${Number(q.elapsed_ms) > 0 ? ` (${fmtElapsed(Number(q.elapsed_ms))} played before)` : ''}`;
+  if (q.status === 'completed') return `✅ ran **${fmtElapsed(Number(q.elapsed_ms) || 0)}**`;
+  if (q.status !== 'active') return 'not running';
+  if (q.winding_down) return `\u{1F6CC} winding down, stopped at **${fmtElapsed(questElapsed(q))}**`;
+  if (q.paused) return `⏸️ paused at **${fmtElapsed(questElapsed(q))}**`;
+  return `▶️ running, **${fmtElapsed(questElapsed(q))}**`;
+}
 
 // Recorded talk (2026-11-07) follows its message: `msg_id` finds it again,
 // `first_text` keeps the wording as first typed once an edit corrects it,
@@ -18467,14 +18631,18 @@ try { db.exec('ALTER TABLE quest_events ADD COLUMN whole INTEGER'); } catch {}
 // gives each its date): a member's place, a run's winding down, a draft.
 try { db.exec('ALTER TABLE quest_members ADD COLUMN state_at INTEGER'); } catch {}
 try { db.exec('ALTER TABLE quests ADD COLUMN winding_at INTEGER'); } catch {}
+// A run opened ahead of play (T, 2026-11-23): seated, its room open, the
+// clock held and nothing recorded until its GM says /run time start.
+try { db.exec('ALTER TABLE quests ADD COLUMN unstarted INTEGER DEFAULT 0'); } catch {}
 try { db.exec('ALTER TABLE stories ADD COLUMN draft_at INTEGER'); } catch {}
 function logQuestEvent(gid, number, kind, text, actor = null, { msgId = null, parts = null, whole = null } = {}) {
   const q = getQuest(gid, number);
   if (!q) return null;
   const partsJson = parts == null ? null : (typeof parts === 'string' ? parts : JSON.stringify(parts));
-  db.prepare('INSERT INTO quest_events (guild_id,number,at_ms,kind,text,actor,wall_at,msg_id,parts,whole) VALUES (?,?,?,?,?,?,?,?,?,?)')
+  const info = db.prepare('INSERT INTO quest_events (guild_id,number,at_ms,kind,text,actor,wall_at,msg_id,parts,whole) VALUES (?,?,?,?,?,?,?,?,?,?)')
     .run(gid, number, questElapsed(q), kind, text ?? null, actor, Date.now(), msgId, partsJson, whole);
-  return true;
+  // The row's id (T, 2026-11-23): a roll made with a post rides under it.
+  return Number(info?.lastInsertRowid) || true;
 }
 function questEvents(gid, number, sinceMs = null) {
   return sinceMs === null
@@ -18484,7 +18652,7 @@ function questEvents(gid, number, sinceMs = null) {
 const QUEST_EVENT_ICON = {
   start: '🚩', pause: '⏸️', resume: '▶️', remind: '⏱️', recap: '📻',
   combat: '⚔️', rp: '🎭', activity: '🎮', note: '📝', end: '🏁',
-  roll: '\u{1F3B2}', talk: '\u{1F4AC}', turn: '\u{1F504}', narration: '\u{1F4DC}',
+  roll: '\u{1F3B2}', talk: '\u{1F4AC}', turn: '\u{1F504}', narration: '\u{1F4DC}', dice: '\u{1F3B2}',
 };
 function questEventLine(e) {
   // The log keeps every word for the story (T, 2026-11-17); a line of it in
@@ -18764,7 +18932,7 @@ function runArchiveHeader(gid, gmId, gmName) {
   ];
   if (live.length) {
     lines.push('', '\u25B6\uFE0F **Running now**');
-    for (const q of live.slice(0, 12)) lines.push(`\u00b7 ${instanceIcon(q)} ${questTag(q)} \u2014 ${fmtElapsed(questElapsed(q))}${q.paused ? ' (paused)' : ''}`);
+    for (const q of live.slice(0, 12)) lines.push(`\u00b7 ${instanceIcon(q)} ${questTag(q)} \u2014 ${fmtElapsed(questElapsed(q))}${isUnstarted(q) ? ' (not started)' : q.winding_down ? ' (winding down)' : q.paused ? ' (paused)' : ''}`);
     if (live.length > 12) lines.push(`\u00b7 \u2026and ${live.length - 12} more`);
   }
   lines.push('', `-# Updated <t:${Math.floor(Date.now() / 1000)}:R> \u00b7 a post below for every finished run`);
@@ -18841,12 +19009,28 @@ async function archiveHourly(client, guild) {
   }
 }
 // The GM record as a scroll: the machine's account, timings to payout.
+// The record's lines as the scroll prints them (T, 2026-11-23): a roll, a
+// fight's line or a turn's in blue after its time — a natural 20's roll
+// green, a natural 1's red — the rest in ink.
+function recordParas(lines) {
+  const paras = [];
+  for (const l of lines || []) {
+    const t = String(l ?? '');
+    if (!t.trim()) { if (paras.length && paras[paras.length - 1] !== null) paras.push(null); continue; }
+    const m = t.match(/^(`[^`]*`)\s*(\S+)\s+([\s\S]*)$/);
+    if (!m || !/^(?:\u{1F3B2}|⚔|\u{1F504})/u.test(m[2])) { paras.push(scrollRuns(t, 'r')); continue; }
+    const tint = /— natural 20\b/.test(m[3]) ? 'green' : /— natural 1\b/.test(m[3]) ? 'red' : 'blue';
+    paras.push([...scrollRuns(`${m[1]} `, 'r'), ...scrollRuns(m[3], 'r').map(r => ({ ...r, c: tint }))]);
+  }
+  while (paras.length && paras[paras.length - 1] === null) paras.pop();
+  return paras;
+}
 function runRecordScroll(gid, quest, recordLines) {
   // Printed, as the story is (T, 2026-11-17): every line of it, the names
   // in bold where the record marks them.
   const lines = (Array.isArray(recordLines) ? recordLines : String(recordLines || '').split('\n'))
-    .filter(l => !/^\u2500+$/.test(String(l ?? '').trim()));
-  const found = scrollParasOf(lines);
+    .filter(l => !/^─+$/.test(String(l ?? '').trim()));
+  const found = recordParas(lines);
   const paras = found.length ? found : scrollParasOf(['Nothing was logged.']);
   const title = `${questTag(quest)} \u2014 the record`;
   const stem = fileSlug(`${questTag(quest)} record`, 'run-record');
@@ -18935,7 +19119,7 @@ async function backfillRunArchive(client, guild, gid) {
         `\u{1F3B2} Run by **${runnerName}**`,
         `\u23F1\uFE0F **${fmtElapsed(runMs)}** \u00b7 \u{1F465} ${partyNames.join(', ')}`,
         '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500',
-        ...(events.filter(e => e.kind !== 'talk' && !e.gone).map(questEventLine)),
+        ...(events.filter(e => e.kind !== 'talk' && !e.gone && !recapOnly(e)).map(questEventLine)),
       ];
       let story = null, recordFile = null;
       try { story = runStoryScroll(gid, q, { runnerName, partyNames, runMs, events, tale: '', nameOf: memberNameOf(guild) }); } catch {}
@@ -18962,11 +19146,258 @@ function startRunArchiveBackfill(client, gid, guild = null) {
 }
 // Note something against whichever quest is running in this channel, if any.
 function noteQuestActivity(gid, cid, kind, text, actor = null, opts = {}) {
+  // The rows written, run by run ({ number: id }): a roll made with a post
+  // rides under it (T, 2026-11-23).
+  const ids = {};
   for (const q of activeQuestsInChannel(gid, cid)) {
     if (q.paused) continue;               // a paused quest records nothing
-    logQuestEvent(gid, q.number, kind, text, actor, opts);
+    const id = logQuestEvent(gid, q.number, kind, text, actor, opts);
+    if (typeof id === 'number') ids[q.number] = id;
     if (isEncounter(q)) { try { updateQuest(gid, q.number, { last_activity: Date.now() }); } catch {} }
   }
+  return ids;
+}
+
+// ── Every roll in the story (T, 2026-11-23) ─────────────────────────────────
+// "Record every public roll in a run's room", the fight's moves and what
+// they came to with them: a roll made in the open in a run's room goes on
+// that run's record as `dice` — who, what, and the dice as they fell: the
+// bonus, advantage or disadvantage, every face, the total. The story prints
+// it in blue — a natural 20's line green, a natural 1's red — and the GM
+// record carries it; the hourly recap, the hour blocks and the timeline
+// leave it out, as they leave out talk, since one fight would flood them.
+// A GM's secret roll never comes here. A short line a recap already
+// carries (a check, a press, a heal, an /rp roll) is marked `recap`: the
+// recap keeps it, the story and the record take the dice instead. With NPC
+// stats hidden the story leaves an NPC's bonus out, as its card does; the
+// record shows it. A roll made with a post — a fight form's words, an /rp
+// line — rides under that post (`rp`, the post's row in each run).
+const STORY_MODE_WORD = { adv: 'advantage', dis: 'disadvantage' };
+// A row the recap keeps and the story and the record leave to the dice.
+function recapOnly(e) {
+  if (!e?.parts) return false;
+  try { return !!JSON.parse(e.parts)?.recap; } catch { return false; }
+}
+// The dice of one roll as the story keeps them, from a roll object or from
+// a line built by hand: the faces kept and the faces set aside, the total,
+// the bonus (the total less the faces kept: whatever was added, said
+// once), advantage or disadvantage, and a flat d20.
+function storyDiceOf({ result = null, nat = null, total = null, sides = null, line = '', mode = null } = {}) {
+  const ln = String(line || '');
+  const said = /\(dis\)|\bdisadvantage\b/i.test(ln) ? 'dis' : /\(adv\)|\badvantage\b/i.test(ln) ? 'adv' : null;
+  let n = 1, sd = Number(sides) || 20, kept = [], dropped = [];
+  let m = mode && mode !== 'normal' ? mode : (said || 'normal');
+  let tot = (total !== null && total !== undefined && Number.isFinite(Number(total))) ? Number(total) : null;
+  if (result && (Array.isArray(result.rolls) || result.chosen != null)) {
+    sd = Number(result.sides) || sd;
+    if (result.multi) {
+      kept = [...(result.keptSet || [])]; dropped = [...(result.droppedSet || [])];
+      n = Number(result.dice) || kept.length || 1;
+      if (m === 'normal') m = 'adv';
+    } else if (result.chosen != null) {
+      kept = [result.chosen]; dropped = result.dropped != null ? [result.dropped] : [];
+      if (m === 'normal') m = result.chosen >= (result.dropped ?? result.chosen) ? 'adv' : 'dis';
+    } else {
+      kept = [...result.rolls]; n = kept.length || 1; m = 'normal';
+    }
+    if (tot === null) tot = Number(result.total);
+  } else {
+    const pair = ln.match(/\[(\d+),\s*~~(\d+)~~\]/);
+    const k = (nat !== null && nat !== undefined && Number.isFinite(Number(nat))) ? Number(nat) : pair ? Number(pair[1]) : null;
+    if (k === null) return null;
+    kept = [k];
+    if (pair && m !== 'normal') dropped = [Number(pair[2])];
+    if (tot === null) { const t = ln.match(/=\s*[^\d=\-]*(-?\d+)[^=]*$/); tot = t ? Number(t[1]) : k; }
+  }
+  if (!kept.length || !Number.isFinite(tot)) return null;
+  const sum = kept.reduce((a, b) => a + b, 0);
+  return { n, sides: sd, bonus: tot - sum, mode: m, kept, dropped, total: tot,
+    nat: n === 1 && sd === 20 ? kept[0] : null, flat: /flat d20/i.test(ln) };
+}
+// A roll as the story says it: "Attacks Hollow with DEX — 1d20+4,
+// advantage → [17, 9] = 21". `full` shows a hidden NPC bonus and a
+// hidden DC's number (the GM record); the story leaves both out.
+function storyDiceText(d, { full = false } = {}) {
+  const faces = (k, x) => (x && x.length ? `[${k.join(', ')}${(d.n || 1) > 1 ? '] [' : ', '}${x.join(', ')}]` : `[${k.join(', ')}]`);
+  const bonus = (!d.hide || full) && d.bonus ? (d.bonus > 0 ? `+${d.bonus}` : `${d.bonus}`) : '';
+  const how = [d.flat ? 'flat' : null, STORY_MODE_WORD[d.mode] || null].filter(Boolean).join(', ');
+  const first = d.first ? `${faces(d.first.kept || [], d.first.dropped)} = ${d.first.total}, rerolled → ` : '';
+  let s = `${d.n || 1}d${d.sides || 20}${bonus}${how ? `, ${how}` : ''} → ${first}${faces(d.kept || [], d.dropped)} = ${d.total}`;
+  if (d.dc != null && Number(d.dc) > 0) s += ` vs ${d.dcHidden ? (full ? `DC ${d.dc} (hidden)` : 'hidden DC') : `DC ${d.dc}`}`;
+  if (d.passed === true || d.passed === false) s += ` — ${d.passed ? 'passed' : 'failed'}`;
+  if (d.note) s += ` — ${d.note}`;
+  if (d.nat === 20 || d.nat === 1) s += ` — natural ${d.nat}`;
+  return d.label ? `${d.label} — ${s}` : s;
+}
+function noteStoryDice(gid, cid, d, { actor = null, rp = null } = {}) {
+  if (!d || !cid) return;
+  const text = `${d.who ? `${d.who}: ` : ''}${storyDiceText(d, { full: true })}`;
+  for (const q of activeQuestsInChannel(gid, cid)) {
+    if (q.paused) continue;               // a paused quest records nothing
+    const link = rp && typeof rp === 'object' ? rp[q.number] : null;
+    try { logQuestEvent(gid, q.number, 'dice', text, actor, { parts: { dice: d, ...(link ? { rp: link } : {}) } }); } catch {}
+    if (isEncounter(q)) { try { updateQuest(gid, q.number, { last_activity: Date.now() }); } catch {} }
+  }
+}
+// What an exchange came to, as the story keeps it: one line of sentences.
+const storyStop = (l) => (/[.!?…:)\]]$/.test(l) ? l : `${l}.`);
+function noteStoryOutcome(gid, cid, lines, actor = null) {
+  const out = (lines || []).map(l => String(l || '').trim()).filter(Boolean);
+  if (!out.length || !cid) return;
+  const text = out.map(storyStop).join(' ');
+  for (const q of activeQuestsInChannel(gid, cid)) {
+    if (q.paused) continue;
+    try { logQuestEvent(gid, q.number, 'dice', text, actor, { parts: { out } }); } catch {}
+  }
+}
+// What an exchange came to, read off the card it lands with: the hits and
+// the misses, the holds, the naturals and the HP — an NPC whose HP is
+// hidden by its condition word alone, as the card shows it. Not the card's
+// title or its rules, the totals (the dice lines say them), the words said
+// with it, the how-to hints, or anything from the turn handed on.
+function storyOutcomeOf(lines, words = null) {
+  const said = words ? String(words).split('\n').map(l => (l.trim() ? `_${l}_` : '')).join('\n') : null;
+  const out = [];
+  for (const el of lines || []) {
+    const s = String(el ?? '');
+    if (/^\n?\u{1F3AF} \*\*/u.test(s)) break;
+    if (said && s === said) continue;
+    for (const raw of s.split('\n')) {
+      const l = raw.trim();
+      if (!l || /^[─═]+$/.test(l) || /^-#/.test(l) || /`/.test(l) || /^⏳/u.test(l)) continue;
+      if (/^\S+\s+\*\*[^*]+\*\*$/u.test(l)) continue;
+      if (/\(\*\*[^)]*\):\s/.test(l)) continue;
+      // An NPC's mask after its name is the card's; the story names it plainly.
+      out.push(l.replace(/ \u{1F3AD}/gu, ''));
+    }
+  }
+  return out;
+}
+// Who threw it, as the story names them: the name the table sees.
+function storyNameOf(gid, uid, interaction = null) {
+  if (!uid) return null;
+  if (interaction?.user?.id === uid) return interaction.member?.displayName || interaction.user.globalName || interaction.user.username || null;
+  try { const m = client.guilds.cache.get(gid)?.members?.cache?.get(uid); return m?.displayName || m?.user?.username || null; } catch { return null; }
+}
+// The NPC a roll was thrown for, from how the audit was told it.
+function storyNpcOf(opts) {
+  const am = String(opts?.actor || '').match(/\*\*(.+?)\*\*/);
+  if (am) return am[1];
+  if (opts?.kind !== 'npcs') return null;
+  const inp = String(opts.input || ''), ctx = String(opts.context || '');
+  const m = inp.match(/\bnpc:(.+)$/) || ctx.match(/(?:GM|auto-pilot) as (.+?) \u{1F3AD}/u) || ctx.match(/as NPC \*\*(.+?)\*\*/)
+    || ctx.match(/as NPC (.+?) —/) || ctx.match(/^effect · (.+?) uses /);
+  return m ? m[1].replace(/\s*\u{1F3AD}$/u, '').trim() : null;
+}
+// A roll's own label as typed or picked: a stat word read as the stat.
+function storyRollLabel(label, stat = null, reroll = false) {
+  let l = String(label || '').replace(/\s*·\s*\u{1F3AD}\s*flat d20$/u, '').trim();
+  const w = l.toLowerCase();
+  if (stat && (!l || w === String(stat).toLowerCase())) l = STAT_LABELS[stat] || String(stat).toUpperCase();
+  else if (STAT_LABELS[w]) l = STAT_LABELS[w];
+  if (reroll) l = l ? `${l}, rerolled` : 'Rerolled';
+  return l || null;
+}
+// What a roll was, from how the audit was told it.
+function storyLabelOf(opts) {
+  const ctx = String(opts?.context || ''), input = String(opts?.input || '');
+  const st = (input.match(/\bstat:(\w+)/) || [])[1];
+  const withStat = st ? ` with ${STAT_LABELS[st] || st.toUpperCase()}` : '';
+  let m;
+  if ((m = ctx.match(/^fight · (?:(?:GM|auto-pilot) as .+? \u{1F3AD} )?(.+)$/u))) {
+    const w = m[1];
+    const rules = [
+      [/^attacks (.+)$/, x => `Attacks ${x[1]}${withStat}`],
+      [/^defends$/, () => `Defends${withStat}`],
+      [/^custom attack on (.+)$/, x => `Attacks ${x[1]}, a custom roll`],
+      [/^custom defence$/, () => 'Defends, a custom roll'],
+      [/^grapples (.+)'s strike$/, x => `Grapples ${x[1]}'s strike`],
+      [/^grapples (.+)$/, x => `Grapples ${x[1]}`],
+      [/^feints at (.+)$/, x => `Feints at ${x[1]}`],
+      [/^feint insight$/, () => 'Reads the feint'],
+      [/^grapple save$/, () => 'Resists the grapple'],
+      [/^keeps the hold on (.+)$/, x => `Keeps the hold on ${x[1]}`],
+      [/^breaks against a hold$/, () => 'Breaks against the hold'],
+      [/^escape attempt$/, () => 'Tries to break free'],
+      [/^shield deflection vs (.+)$/, x => `Deflects ${x[1]}'s blow`],
+      [/^weapon disarm vs (.+)$/, x => `Disarms ${x[1]}`],
+      [/^disarm vs (.+)$/, x => `Disarms ${x[1]}`],
+      [/^reroll$/, () => 'Rerolls'],
+    ];
+    for (const [re, f] of rules) { const x = w.match(re); if (x) return f(x); }
+    return w.charAt(0).toUpperCase() + w.slice(1);
+  }
+  if ((m = ctx.match(/^heal on (.+)$/))) return `Heals ${m[1]}`;
+  if ((m = ctx.match(/^effect · .+? uses (.+)$/))) return `Uses ${m[1]}`;
+  if ((m = ctx.match(/deception vs (.+)$/))) return `Deceives ${m[1]}`;
+  if ((m = ctx.match(/^activity roll \((.+)\)$/))) return m[1];
+  if (/^initiative/.test(ctx)) return 'Initiative';
+  if (/^GM correction/.test(ctx)) return 'Rerolled by a GM';
+  if (/reroll$/.test(ctx)) return 'Rerolls';
+  if ((m = input.match(/^\/npc (?:re)?roll \S+\s+(.+)$/))) return m[1];
+  if (/^\/roll (?:skill|save):/.test(input)) return ctx || null;
+  if (ctx === 'success check') return 'Success check';
+  return null;
+}
+// The bot's own rolls (the auto-pilot, the clock, initiative): what the
+// audit was told, said plainly.
+function storyAutoLabel(context) {
+  const c = String(context || '').replace(/\s+— the turn clock$/, '').replace(/^(?:auto fight|fight) /, '');
+  const w = (s) => (s && !/flat/.test(s) ? ` with ${s}` : '');
+  let m;
+  if (/^attack reroll/.test(c)) return 'Rerolls the attack';
+  if (/^defen[cs]e reroll/.test(c)) return 'Rerolls the defence';
+  if ((m = c.match(/^attack(?: \(([^),]+))?/))) return `Attacks${w(m[1])}`;
+  if ((m = c.match(/^defen[cs]e(?: \(([^),]+))?/))) return `Defends${w(m[1])}`;
+  if ((m = c.match(/^grapple save(?: \(([^),]+))?/))) return `Resists the grapple${w(m[1])}`;
+  if ((m = c.match(/^grapple hold(?: \(([^),]+))?/))) return `Keeps the hold${w(m[1])}`;
+  if ((m = c.match(/^feint insight(?: \(([^),]+))?/))) return `Reads the feint${w(m[1])}`;
+  if ((m = c.match(/^break free(?: \(([^),]+))?/))) return `Breaks free${w(m[1])}`;
+  if ((m = c.match(/^disarm grip(?: \(([^),]+))?/))) return `Keeps hold of the weapon${w(m[1])}`;
+  if ((m = c.match(/^deception insight(?: \(([^),]+))?/))) return `Reads the deception${w(m[1])}`;
+  if (/^initiative/.test(c)) return 'Initiative';
+  return c ? c.charAt(0).toUpperCase() + c.slice(1) : null;
+}
+// recordRoll's half: a roll someone threw, or a runner threw for an NPC.
+function storyRollFromRecord(gid, opts) {
+  if (!opts || opts.story === false || !opts.channelId) return;
+  if (!activeQuestsInChannel(gid, opts.channelId).length) return;
+  const hint = (opts.story && typeof opts.story === 'object') ? opts.story : {};
+  const d = storyDiceOf({ result: opts.result || null, nat: opts.nat ?? null, total: opts.total ?? null, sides: opts.sides ?? null,
+    line: opts.rollLine, mode: hint.mode || null });
+  if (!d) return;
+  const npcName = storyNpcOf(opts);
+  const who = hint.who || npcName || storyNameOf(gid, opts.userId, opts.interaction) || 'Someone';
+  const uid = npcName ? null : (opts.userId || null);
+  Object.assign(d, { who, uid, npc: !!npcName, hide: !!npcName && !npcStatsVisible(gid),
+    label: hint.label !== undefined ? hint.label : storyLabelOf(opts) });
+  if (hint.flat) d.flat = true;
+  for (const k of ['dc', 'dcHidden', 'passed', 'note', 'first']) if (hint[k] != null) d[k] = hint[k];
+  noteStoryDice(gid, opts.channelId, d, { actor: uid, rp: hint.rp || opts.interaction?.ddiceRpLinks || null });
+}
+// mirrorAutoRoll's half: a roll the bot threw itself. A called check's
+// NPC is told when its check lands; a demonstration is not a story.
+function storyRollFromAuto(gid, cid, name, notation, whole, total, context) {
+  const ctx = String(context || '');
+  if (!cid || /^(demo|GM check)\b/.test(ctx)) return;
+  if (!activeQuestsInChannel(gid, cid).length) return;
+  const o = (whole && typeof whole === 'object') ? whole : { nat: whole };
+  const nat = Number(o.nat), tot = Number(total);
+  if (!Number.isFinite(nat) || !Number.isFinite(tot)) return;
+  const nt = String(notation || '');
+  const mode = o.dis ? 'dis' : o.adv ? 'adv' : /\(dis\)|disadvantage/i.test(nt) ? 'dis' : /\(adv\)|advantage/i.test(nt) ? 'adv' : 'normal';
+  const npc = !!getNpc(gid, name);
+  noteStoryDice(gid, cid, { who: String(name || 'Someone'), uid: null, npc, hide: npc && !npcStatsVisible(gid), label: storyAutoLabel(ctx),
+    n: 1, sides: 20, kept: [nat], dropped: mode !== 'normal' && o.dropped != null ? [Number(o.dropped)] : [],
+    total: tot, bonus: tot - nat, mode, nat, flat: /flat d20/i.test(ctx) });
+}
+// A GM's roll in the open is a roll like any other; a secret one never is.
+function storyGmRoll(gid, cid, uid, who, result, mode, label) {
+  if (!cid || !activeQuestsInChannel(gid, cid).length) return;
+  const d = storyDiceOf({ result, mode });
+  if (!d) return;
+  Object.assign(d, { who: who || storyNameOf(gid, uid) || 'A GM', uid, npc: false, hide: false, label: storyRollLabel(label) });
+  noteStoryDice(gid, cid, d, { actor: uid });
 }
 
 // The quest clock. Ticks every minute so a 15-minute reminder lands close to
@@ -19320,7 +19751,7 @@ async function questTick(client) {
             const room = await client.channels.fetch(q.run_thread_id || q.run_channel_id).catch(() => null);
             const gmRoles = getGmRoleIds(guild.id);
             if (room?.send) await room.send({ allowedMentions: { roles: gmRoles },
-              content: `\u23F3 **${questTag(q)}** has been quiet for ${Math.round(quiet / 3600000)}h ${gmRoles.map(r => `<@&${r}>`).join(' ')} \u2014 \`/session complete\` when it is done, or it keeps holding its party out of rests.` }).catch(() => {});
+              content: `\u23F3 **${questTag(q)}** has been quiet for ${Math.round(quiet / 3600000)}h ${gmRoles.map(r => `<@&${r}>`).join(' ')} \u2014 \`/run time end\` when it is done, or it keeps holding its party out of rests.` }).catch(() => {});
             updateQuest(guild.id, q.number, { idle_nagged_at: Date.now() });
           }
           // And the hourly summary and the quarter-hour time checks, as a
@@ -19333,7 +19764,7 @@ async function questTick(client) {
         if (now - (Number(q.last_recap_ms) || 0) >= QUEST_RECAP_MS) {
           const since = Number(q.last_recap_ms) || 0;
           const events = questEvents(guild.id, q.number, since)
-            .filter(e => !['remind', 'recap', 'talk'].includes(e.kind) && !e.gone);
+            .filter(e => !['remind', 'recap', 'talk', 'dice'].includes(e.kind) && !e.gone);
           const lines = [`📻 **${questTag(q)}** — **${fmtElapsed(now)}** in. The last hour:`];
           lines.push(...(events.length ? events.map(questEventLine) : ['`      ` _Quiet hour — nothing logged._']));
           logQuestEvent(guild.id, q.number, 'recap', `Hourly recap — ${events.length} event${events.length === 1 ? '' : 's'}`);
@@ -19720,8 +20151,10 @@ async function fightClockTick(client) {
       if (w && !isNpcFighter(w.id) && heldPendingFor(gid, cid, w.id)) { db.prepare('UPDATE fights SET last_at=? WHERE guild_id=? AND channel_id=?').run(now, gid, cid); continue; }
       const clock = turnClockFor(gid, cid);
       if (!clock.remind && !clock.skip) continue;
-      // A paused run holds the clock of a fight in its room.
-      if (activeQuestsInChannel(gid, cid).some(q => q.paused)) { db.prepare('UPDATE fights SET last_at=? WHERE guild_id=? AND channel_id=?').run(now, gid, cid); continue; }
+      // A paused run holds the clock of a fight in its room; one not yet
+      // started does not: a fight there goes ahead off the record, as it
+      // would anywhere (T, 2026-11-23).
+      if (activeQuestsInChannel(gid, cid).some(q => q.paused && !isUnstarted(q))) { db.prepare('UPDATE fights SET last_at=? WHERE guild_id=? AND channel_id=?').run(now, gid, cid); continue; }
       if (quiet > (clock.skip || clock.remind) * 60000 + CLOCK_DORMANT_MS || Number(f.clock_idle) >= fightClockHands(f)) continue;
       if (clock.skip && quiet >= clock.skip * 60000) await fightClockTimeout(client, f, clock);
       else if (clock.remind && !Number(f.nudged) && quiet >= clock.remind * 60000) await fightClockRemind(client, f, clock);
@@ -20799,8 +21232,9 @@ async function orderClockTick(client) {
       if (!o || o.state !== 'running' || !orderCurrent(o)) continue;
       const now = Date.now();
       // A fight here has the floor, and a paused run holds everything in
-      // its room: the order's clock waits, and starts afresh after.
-      if (getFight(gid, cid)?.state === 'active' || activeQuestsInChannel(gid, cid).some(q => q.paused)
+      // its room: the order's clock waits, and starts afresh after. A run
+      // not yet started holds nothing: its order is off the record.
+      if (getFight(gid, cid)?.state === 'active' || activeQuestsInChannel(gid, cid).some(q => q.paused && !isUnstarted(q))
           || heldPendingFor(gid, cid, orderCurrent(o).id)) {
         db.prepare('UPDATE turn_orders SET last_sign_at=? WHERE guild_id=? AND channel_id=?').run(now, gid, cid);
         continue;
@@ -21061,6 +21495,8 @@ async function handleSessionInitiative(interaction) {
   if (!ch?.send) return interaction.reply({ ephemeral: true, content: MSG_NO_ACCESS_HERE });
   const live = liveTurnOrder(gid, cid);
   if (live) return interaction.reply({ ephemeral: true, content: `❌ This channel has an initiative ${live.state === 'signup' ? 'taking sign-ups' : live.state === 'paused' ? 'paused' : 'running'} — \`/session turn action:end\` ends it, \`action:show\` shows it.` });
+  // In a run's room before its GM has started it, ask first (T, 2026-11-23).
+  if (await offRecordGate(interaction, 'initiative')) return;
   const ask = readClockOptions(interaction);
   if (ask.any) { const bad = applyChannelClock(gid, cid, ask, uid); if (bad) return interaction.reply({ ephemeral: true, content: bad }); }
   // Who rolls, and whether Join is open (T, 2026-11-10).
@@ -21774,17 +22210,6 @@ async function handleEncounter(interaction) {
     return interaction.reply({ ephemeral: true, content: `\u2705 Scene **${nameP}** saved \u2014 \`/instance start name:${nameP} preset:${nameP}\` runs it.` });
   }
 
-  if (sub === 'list') {
-    // Every run going now, whatever opened it — the board's runs too.
-    const rows = db.prepare("SELECT * FROM quests WHERE guild_id=? AND status='active' ORDER BY number").all(gid);
-    if (!rows.length) return interaction.reply({ ephemeral: true, content: '\u{1F5FA}\uFE0F Nothing is running.' });
-    return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] }, content: [
-      '\u{1F5FA}\uFE0F **Running now**',
-      ...rows.map(q => { const aside = instanceAside(gid, q); const home = q.run_thread_id || q.run_channel_id;
-        return `${instanceIcon(q)} **${questTag(q)}**${aside ? ` \u2014 _${aside}_` : ''} \u00b7 \u23F1\uFE0F ${fmtElapsed(questElapsed(q))}${q.paused ? ' (paused)' : ''} \u00b7 ${getQuestMembers(gid, q.number, 'party').length} in it${home ? ` \u00b7 <#${home}>` : ''}${q.record_all ? ' \u00b7 \u{1F4DD} recording' : ''}${q.winding_down ? ' \u00b7 \u{1F6CC} winding down' : ''}`; }),
-      '', '_`/session` works any of them \u2014 in its thread, or by `name:`._',
-    ].join('\n').slice(0, 1900) });
-  }
   if (!gm) return interaction.reply({ content: '\u274C Only GMs open instances.', ephemeral: true });
 
   if (sub === 'start') {
@@ -21861,7 +22286,8 @@ async function seatOnInstance(interaction, quest) {
   if (!getChar(gid, who.id)) return interaction.reply({ ephemeral: true, content: `\u274C **${nm}** has no character sheet.` });
   if (getQuestMembers(gid, quest.number, 'party').includes(who.id)) return interaction.reply({ ephemeral: true, content: `\u2705 **${nm}** is already in it.` });
   setQuestMember(gid, quest.number, who.id, 'party');
-  logQuestEvent(gid, quest.number, 'note', `${nm} is seated`, uid);
+  // Before the start nothing is recorded; its first line says who is in it.
+  if (!isUnstarted(getQuest(gid, quest.number) || quest)) logQuestEvent(gid, quest.number, 'note', `${nm} is seated`, uid);
   updateQuest(gid, quest.number, { last_activity: Date.now() });
   // The mention pulls them into the thread.
   return encounterRoomSay(interaction, quest, `\u2694\uFE0F <@${who.id}> is seated in **${questTag(quest)}**.`, [who.id],
@@ -21996,16 +22422,17 @@ async function openEncounter(client, guild, p, party) {
   // A chapter with no part asked for takes the next one now, as it opens.
   const part = p.kind === 'chapter' ? (p.part ?? (camp ? nextChapterPart(gid, camp.id) : null)) : null;
   const number = createQuest(gid, { name: p.name, merit_reward: p.merits, created_by: p.uid, run_channel_id: p.cid });
-  // createQuest writes a listing; an encounter is already running.
+  // createQuest writes a listing; an instance is a run from its opening —
+  // seated and roomed, its clock held and nothing recorded until its GM
+  // says /run time start (T, 2026-11-23).
   updateQuest(gid, number, {
-    kind: 'encounter', status: 'active', gm_id: p.uid, started_at: Date.now(), elapsed_ms: Number(p.playedMs) || 0, played_ms: Number(p.playedMs) || 0,
-    paused: 0, last_tick_ms: 0, last_recap_ms: 0, stage: 'approved', stage_at: Date.now(),
+    kind: 'encounter', status: 'active', gm_id: p.uid, started_at: null, elapsed_ms: Number(p.playedMs) || 0, played_ms: Number(p.playedMs) || 0,
+    paused: 1, unstarted: 1, last_tick_ms: 0, last_recap_ms: 0, stage: 'approved', stage_at: Date.now(),
     run_thread_id: null, campaign_id: camp?.id ?? null, last_activity: Date.now(),
     instance_kind: p.kind || 'encounter', part, legacy_since: p.legacySince ?? null, record_all: p.record ? 1 : 0,
   });
   for (const id of party) setQuestMember(gid, number, id, 'party');
-  const startWords = { encounter: 'Encounter begins', chapter: `Part ${part ?? '?'} begins`, legacy: `Picked up from before the bot${p.legacySince ? ` (begun ${p.legacySince})` : ''}${p.playedMs ? `, ${fmtElapsed(p.playedMs)} already played` : ''}` };
-  logQuestEvent(gid, number, 'start', `${startWords[p.kind || 'encounter']} \u2014 ${party.length} in it`, p.uid);
+  // Its first line — "Encounter begins" — is written by /run time start.
   archiveHeaderTouch(client, guild, gid, getQuest(gid, number));
   const opened = await openRunThread(client, guild, gid, getQuest(gid, number));
   const room = opened.thread;
@@ -22040,24 +22467,64 @@ async function openEncounter(client, guild, p, party) {
     stepped?.made?.length ? `\u{1F9DF} Out of the library: ${stepped.made.join(', ')}` : '',
     stepped?.missing?.length ? `\u26A0\uFE0F Not in the library: ${stepped.missing.join(', ')}` : '',
     castNames.length ? `\u{1F3AD} The cast, as enemies: ${castNames.join(', ')} \u2014 they join every fight and initiative here; \`/session npcs\` changes it.` : '',
-    quest.record_all ? '\u{1F4DD} _Everything said in this thread is recorded for the log._' : '',
-    '', '_Seats are the GM\'s: `/session add` and `/session kick`. `/session note`, `rally`, `pause` work here; `/session complete` finishes it._',
+    quest.record_all ? '\u{1F4DD} _Everything said in this thread is recorded for the log once it starts._' : '',
+    '⏸️ **Not started** — the clock and the record wait for `/run time start`.',
+    '', '_Seats are the GM\'s: `/session add` and `/session kick`; `/session note` and `rally` work here. `/run time` keeps its clock — `start`, `pause`, `resume`, `winddown`, `end`._',
   ].filter(Boolean).join('\n');
   const home = room || await client.channels.fetch(quest.run_channel_id).catch(() => null);
   try { await home?.send?.({ content: card, allowedMentions: { parse: [] } }); } catch (e) { console.error('[encounter] card -', e?.message || e); }
   // One line where the command was run, pointing at the room.
   if (room && p.cid && p.cid !== room.id) {
     const origin = await client.channels.fetch(p.cid).catch(() => null);
-    try { await origin?.send?.({ content: `${kw.icon} **${questTag(quest)}** has begun \u2014 <#${room.id}>`, allowedMentions: { parse: [] } }); } catch {}
+    try { await origin?.send?.({ content: `${kw.icon} **${questTag(quest)}** is open — <#${room.id}>`, allowedMentions: { parse: [] } }); } catch {}
   }
   try { await syncQuestBook(client, guild, gid, quest); } catch {}
   if (camp) refreshCampaignCard(client, guild, camp.id).catch(() => {});
   return { quest, room, gmLine: [
-    `\u2705 **${questTag(quest)}** is open${room ? ` in <#${room.id}>` : ' here'} with ${party.length} in it.`,
+    `✅ **${questTag(quest)}** is open${room ? ` in <#${room.id}>` : ' here'} with ${party.length} in it.`,
+    '⏸️ Its clock waits — `/run time start` when you begin; nothing is recorded until then.',
     opened.why ? `\u26A0\uFE0F **No room opened.** ${opened.why}` : '',
     unrecorded ? '\u{1F4DD} Nothing is recorded: recording needs a thread of its own, and this runs in a shared channel.' : '',
     stepped?.missing?.length ? `\u26A0\uFE0F Not in the library: ${stepped.missing.join(', ')}` : '',
   ].filter(Boolean).join('\n') };
+}
+
+// The line a run opened ahead begins its record with.
+function instanceStartWords(q, n) {
+  const kind = instanceKindOf(q) || 'encounter';
+  const played = Number(q.played_ms) || 0;
+  const words = kind === 'chapter' ? `Part ${q.part ?? '?'} begins`
+    : kind === 'legacy' ? `Picked up from before the bot${q.legacy_since ? ` (begun ${q.legacy_since})` : ''}${played ? `, ${fmtElapsed(played)} already played` : ''}`
+    : 'Encounter begins';
+  return `${words} — ${n} in it`;
+}
+
+// /run time start on a run opened ahead (T, 2026-11-23): the clock runs
+// from its banked time, forward on the quarter-hour, and the record opens
+// with the line that used to be written as the room opened.
+async function startUnstartedRun(interaction, gid, run) {
+  const q = getQuest(gid, run.number) || run;
+  if (!isUnstarted(q)) return interaction.reply({ ephemeral: true, content: `❌ **${questTag(q)}** is already running.` });
+  const party = getQuestMembers(gid, q.number, 'party');
+  if (!party.length) return interaction.reply({ ephemeral: true, content: `❌ Nobody is seated in **${questTag(q)}** — \`/session add\` seats them first.` });
+  const banked = quarterUp(q.elapsed_ms);
+  updateQuest(gid, q.number, { unstarted: 0, paused: 0, started_at: Date.now(), elapsed_ms: banked,
+    last_tick_ms: banked, last_recap_ms: banked, last_activity: Date.now(), idle_nagged_at: null });
+  logQuestEvent(gid, q.number, 'start', instanceStartWords(q, party.length), interaction.user.id);
+  const live = getQuest(gid, q.number);
+  archiveHeaderTouch(interaction.client, interaction.guild, gid, live);
+  try { await syncQuestBook(interaction.client, interaction.guild, gid, live); } catch {}
+  if (live.campaign_id) refreshCampaignCard(interaction.client, interaction.guild, live.campaign_id).catch(() => {});
+  const line = `▶️ **${questTag(live)}** begins — the clock is running${banked ? ` from **${fmtElapsed(banked)}**` : ''} and the record is on.`;
+  const roomId = live.run_thread_id || live.run_channel_id;
+  if (roomId && roomId !== interactionChannelId(interaction)) {
+    const room = await interaction.client.channels.fetch(roomId).catch(() => null);
+    if (room?.send) {
+      await room.send({ content: line, allowedMentions: { parse: [] } }).catch(() => {});
+      return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] }, content: `${line} <#${room.id}>` });
+    }
+  }
+  return interaction.reply({ content: line, allowedMentions: { parse: [] } });
 }
 
 // ── Campaigns ────────────────────────────────────────────────────────
@@ -22071,7 +22538,7 @@ function campaignCardText(guild, gid, camp) {
   const parts = campaignParticipants(gid, camp.id);
   const merits = done.reduce((a, q) => a + (q.merit_reward || 0) * getQuestMembers(gid, q.number, 'party').length, 0);
   const notes = db.prepare('SELECT text, at FROM campaign_notes WHERE guild_id=? AND campaign_id=? ORDER BY at DESC LIMIT 5').all(gid, camp.id);
-  const mark = (q) => q.archived_at ? '\u{1F4E6}' : q.status === 'completed' ? '\u2705' : q.status === 'active' ? (q.winding_down ? '\u{1F6CC}' : '\u25B6\uFE0F') : '\u{1F4CB}';
+  const mark = (q) => q.archived_at ? '\u{1F4E6}' : q.status === 'completed' ? '\u2705' : q.status === 'active' ? (isUnstarted(q) ? '⏸️' : q.winding_down ? '\u{1F6CC}' : '▶️') : '\u{1F4CB}';
   const kindOf = (q) => isEncounter(q) ? ` ${instanceIcon(q)}${instanceKindOf(q) === 'chapter' && q.part ? ` Part ${q.part}` : ''}` : q.instance_of ? '' : ' \u{1F4DC}';
   return [
     `\u{1F5FA}\uFE0F **${camp.name}**${camp.status === 'completed' ? ' \u2014 _completed_' : ''}`,
@@ -22349,7 +22816,8 @@ async function postFeedbackCard(interaction, gid, key, scale, body, extra = '') 
 }
 
 // ── QUEST helpers (rendering + routing) ───────────────────────────────────────
-function questStatusBadge(status) {
+function questStatusBadge(status, q = null) {
+  if (status === 'active' && isUnstarted(q)) return '⏸️ Not started';
   return status === 'open' ? '🟢 Open' : status === 'active' ? '🟡 In progress' : status === 'completed' ? '🔵 Completed' : status;
 }
 
@@ -22360,7 +22828,7 @@ async function renderQuest(guild, quest, { applyHint = true } = {}) {
   const applied = getQuestMembers(gid, quest.number, 'applied');
   const lines = [];
   lines.push(`📜 **${questTag(quest)}**`);
-  lines.push(`${questStatusBadge(quest.status)}`);
+  lines.push(`${questStatusBadge(quest.status, quest)}`);
   // Who is running it and how they run a table — the two things a player wants
   // before applying, especially when several GMs are running the same adventure.
   const gmBits = [];
@@ -22393,7 +22861,8 @@ async function renderQuest(guild, quest, { applyHint = true } = {}) {
   // far. Kept in elapsed_ms all along, but never shown here (T, 2026-09-29).
   if (quest.instance_of || isEncounter(quest)) {
     const ranMs = quest.status === 'active' ? questElapsed(quest) : Number(quest.elapsed_ms) || 0;
-    if (ranMs > 0) lines.push(`\u23F1\uFE0F ${quest.status === 'active' ? 'Running for' : 'Ran for'} **${fmtElapsed(ranMs)}**`, '');
+    if (isUnstarted(quest)) lines.push(`⏸️ Not started${ranMs > 0 ? ` — ${fmtElapsed(ranMs)} played before` : ''}`, '');
+    else if (ranMs > 0) lines.push(`\u23F1\uFE0F ${quest.status === 'active' ? 'Running for' : 'Ran for'} **${fmtElapsed(ranMs)}**`, '');
   }
   // The final word, if the GM wrote one at archive time.
   if (quest.archive_summary) lines.push(`\u{1F4DC} **The final word**\n${String(quest.archive_summary).slice(0, 700)}`, '');
@@ -22570,7 +23039,8 @@ async function questIndexEntry(guild, gid, quest) {
   // it has sat where it is, so a concept from June stops looking like one
   // written this morning.
   if (quest.status === 'active' || quest.status === 'paused') {
-    bits.push(`⏱️ running ${fmtElapsed(questElapsed(quest))}${quest.paused ? ' · ⏸️ paused' : ''}`);
+    bits.push(isUnstarted(quest) ? '⏸️ not started'
+      : `⏱️ running ${fmtElapsed(questElapsed(quest))}${quest.winding_down ? ' · 🛌 winding down' : quest.paused ? ' · ⏸️ paused' : ''}`);
   } else if (quest.stage_at) {
     const days = Math.floor((Date.now() - quest.stage_at) / 86400000);
     if (days >= 3) bits.push(`📅 here ${days} day${days === 1 ? '' : 's'}`);
@@ -22698,6 +23168,11 @@ function waitingItems(gid) {
   for (const q of all("SELECT * FROM quests WHERE guild_id=? AND status='active' AND COALESCE(winding_down,0)=1 ORDER BY number"))
     add('winding', `**${questTag(q)}**`, q.winding_at || q.last_activity || q.started_at, at(q.run_thread_id || q.run_channel_id));
   for (const q of all("SELECT * FROM quests WHERE guild_id=? AND status='active' AND kind='encounter' ORDER BY number")) {
+    // Opened ahead and not begun, it waits on its GM, not on the table.
+    if (isUnstarted(q)) {
+      add('staged', `**${questTag(q)}** — ${getQuestMembers(gid, q.number, 'party').length} seated, not started`, Number(q.stage_at) || Number(q.created_at) || now, at(q.run_thread_id || q.run_channel_id));
+      continue;
+    }
     const last = Number(q.last_activity) || Number(q.started_at) || now;
     if (now - last >= ENCOUNTER_IDLE_MS) add('quiet', `**${questTag(q)}** \u2014 ${Math.round((now - last) / 3600000)}h quiet`, last, at(q.run_thread_id || q.run_channel_id));
   }
@@ -22957,14 +23432,97 @@ async function handleSession(interaction) {
   if (sub === 'thread') return sessionThread(interaction, gid, run);
   if (sub === 'summary') return sessionSummary(interaction, gid, run);
   if (sub === 'npcs') return sessionNpcs(interaction, gid, run);
-  if (sub === 'complete') {
+  const map = { add: 'approve' };
+  return handleQuest(interaction, { sub: map[sub] ?? sub, number: run.number });
+}
+
+// /run time (T, 2026-11-23): a run's clock in one place, whatever opened it
+// — a board run, an encounter, a chapter, an older quest. Found as
+// /session finds it: in its own room, or by name: and run:. A board
+// listing named from outside is what start starts (or launches, under
+// spin-off) and what a ready check before the start is called on.
+async function handleRunTime(interaction) {
+  const gid = interaction.guild.id, uid = interaction.user.id;
+  const sub = interaction.options.getSubcommand();
+  if (sub === 'list') return runTimeList(interaction, gid);
+  if (sub !== 'show' && !(await isGm(interaction.guild, uid)))
+    return interaction.reply({ ephemeral: true, content: '❌ Only GMs keep a run’s clock — `/run time show` and `/run time list` are open to everyone.' });
+  const hereCid = interactionChannelId(interaction);
+  const hereRun = db.prepare(`SELECT number, instance_of, run_thread_id FROM quests
+                              WHERE guild_id=? AND (run_thread_id=? OR run_channel_id=?)
+                              ORDER BY (status='active') DESC, number DESC
+                              LIMIT 1`).get(gid, hereCid, hereCid);
+  const askedName = interaction.options.getString('name');
+  let L = askedName ? resolveListingByName(gid, askedName) : { err: null };
+  if ((!askedName || (L.err && hereRun?.run_thread_id === hereCid)) && hereRun) {
+    const root = getQuest(gid, hereRun.instance_of ?? hereRun.number);
+    if (root) L = { listing: root, fromHere: true };
+  }
+  if (!askedName && !L.listing) L = { err: '❌ Name the run, or use this in its own room.' };
+  if (L.err) return interaction.reply({ ephemeral: true, content: L.err });
+  const runSeq = interaction.options.getInteger('run');
+  if (!L.fromHere && runSeq == null && !isEncounter(L.listing)
+      && (sub === 'start' || (sub === 'ready' && L.listing.status === 'open')))
+    return handleQuest(interaction, { sub, group: 'run', number: L.listing.number });
+  const R = (L.fromHere && runSeq == null) ? { run: getQuest(gid, hereRun.number) } : resolveRun(gid, L.listing, runSeq);
+  if (R.err) return interaction.reply({ ephemeral: true, content: R.err });
+  const run = R.run;
+  if (sub === 'show') return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] },
+    content: `⏱️ **${questTag(run)}** — ${runClockWords(run)}${run.status === 'active' && !run.paused && run.started_at ? ` · last started <t:${Math.floor(Number(run.started_at) / 1000)}:t>` : ''}` });
+  if (sub === 'adjust') return runTimeAdjust(interaction, gid, run);
+  if (sub === 'end') {
+    if (run.status === 'completed') return interaction.reply({ ephemeral: true, content: `❌ **${questTag(run)}** is already completed.` });
+    if (run.status !== 'active') return interaction.reply({ ephemeral: true, content: `❌ **${questTag(run)}** is not running.` });
+    if (isUnstarted(run)) return interaction.reply({ ephemeral: true, content: `❌ **${questTag(run)}** never started — \`/run time start\` starts it; \`/quest delete number:${run.number}\` drops it.` });
     const summary = interaction.options.getString('summary');
     const title = interaction.options.getString('title');
     if (summary && summary.trim()) return handleQuest(interaction, { sub: 'complete', group: 'run', number: run.number, summary, title });
     return offerDraftedEnding(interaction, gid, run, title);
   }
-  const map = { add: 'approve' };
-  return handleQuest(interaction, { sub: map[sub] ?? sub, number: run.number });
+  // start, pause, resume, winddown and ready are the run's own leaves.
+  return handleQuest(interaction, { sub, group: 'run', number: run.number });
+}
+
+// /run time list: every run going, each with its clock.
+async function runTimeList(interaction, gid) {
+  const rows = db.prepare("SELECT * FROM quests WHERE guild_id=? AND status='active' ORDER BY number").all(gid);
+  if (!rows.length) return interaction.reply({ ephemeral: true, content: '\u{1F5FA}️ Nothing is running.' });
+  return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] }, content: [
+    '\u{1F5FA}️ **Runs going now**',
+    ...rows.map(q => { const aside = instanceAside(gid, q); const home = q.run_thread_id || q.run_channel_id;
+      return `${instanceIcon(q)} **${questTag(q)}**${aside ? ` — _${aside}_` : ''} · ${runClockWords(q)} · ${getQuestMembers(gid, q.number, 'party').length} in it${home ? ` · <#${home}>` : ''}`; }),
+    '', '_`/run time` keeps any of them — in its room, or by `name:`._',
+  ].join('\n').slice(0, 1900) });
+}
+
+// /run time adjust by: (T, 2026-11-23): a forgotten pause, put right, in
+// quarter-hour steps so the clock stays on its marks; never below nought.
+// The quarter-hour checks and the hourly recap keep their spacing.
+async function runTimeAdjust(interaction, gid, run) {
+  const q = getQuest(gid, run.number) || run;
+  if (q.status !== 'active') return interaction.reply({ ephemeral: true, content: `❌ **${questTag(q)}** is not running.` });
+  const raw = String(interaction.options.getString('by') || '').replace(/\s+/g, '');
+  const m = /^([+\-−]?)(.+)$/.exec(raw);
+  const sign = m && (m[1] === '-' || m[1] === '−') ? -1 : 1;
+  const ms = m ? parsePlayedMs(m[2]) : null;
+  if (!ms || ms % QUARTER_MS) return interaction.reply({ ephemeral: true, content: '❌ `by:` moves the clock in steps of 15 minutes — `+15m`, `-30m`, `+1h`, `-1h15m`.' });
+  const before = questElapsed(q);
+  const clamped = before + sign * ms < 0;
+  const after = clamped ? 0 : before + sign * ms;
+  const delta = after - before;
+  const fields = { elapsed_ms: after,
+    last_tick_ms: Math.max(0, (Number(q.last_tick_ms) || 0) + delta),
+    last_recap_ms: Math.max(0, (Number(q.last_recap_ms) || 0) + delta) };
+  // A running clock is banked and set going again from now.
+  if (!q.paused && q.started_at) fields.started_at = Date.now();
+  updateQuest(gid, q.number, fields);
+  const said = `${sign > 0 ? '+' : '−'}${fmtElapsed(ms)}`;
+  if (!isUnstarted(q)) try { logQuestEvent(gid, q.number, 'note', `Clock corrected ${said} — now ${fmtElapsed(after)}`, interaction.user.id); } catch {}
+  const live = getQuest(gid, q.number);
+  archiveHeaderTouch(interaction.client, interaction.guild, gid, live);
+  try { await syncQuestBook(interaction.client, interaction.guild, gid, live); } catch {}
+  return interaction.reply({ ephemeral: true, allowedMentions: { parse: [] },
+    content: `⏱️ **${questTag(q)}** — the clock moved ${said}: now **${fmtElapsed(after)}**${clamped ? ' (it stops at nought)' : ''}.` });
 }
 
 // /session npcs (T, 2026-11-15): the run's cast — who is in it and on which
@@ -23061,7 +23619,7 @@ async function runSoFarFile(guild, gid, live, fallbackGmId = null, { filename = 
   // Talk cut at 300 before build R is read again from its thread, once.
   await mendCutTalk(guild?.client, gid, live).catch(() => 0);
   const events = questEvents(gid, live.number);
-  const beatN = events.filter(e => !['remind', 'recap', 'talk'].includes(e.kind) && !e.gone).length;
+  const beatN = events.filter(e => !['remind', 'recap', 'talk', 'dice'].includes(e.kind) && !e.gone).length;
   const talkN = events.filter(e => e.kind === 'talk' && !e.gone).length;
   let files = null;
   try { files = runStoryScroll(gid, live, { runnerName, partyNames, runMs, events, tale: '', sofar: true, filename, nameOf: memberNameOf(guild) }).files; }
@@ -23070,8 +23628,8 @@ async function runSoFarFile(guild, gid, live, fallbackGmId = null, { filename = 
     // The printed scroll failed: the same record in plain print, every page.
     const own = filename ? scrollFileName(filename) : null;
     const body = [`Run by ${runnerName}`, `The party: ${partyNames.join(', ') || 'nobody'}`, `It has run for ${fmtElapsed(runMs)} so far.`, '',
-      ...(events.some(e => !['remind', 'recap'].includes(e.kind) && !e.gone)
-        ? events.filter(e => !['remind', 'recap'].includes(e.kind) && !e.gone)
+      ...(events.some(e => !['remind', 'recap'].includes(e.kind) && !e.gone && !recapOnly(e))
+        ? events.filter(e => !['remind', 'recap'].includes(e.kind) && !e.gone && !recapOnly(e))
           .map(e => `${fmtElapsed(e.at_ms)} - ${String(e.text || e.kind).replace(/<@[!&]?\d+>/g, 'someone').replace(/[*_`]+/g, '').replace(/\s*\n\s*/g, ' ')}`)
         : ['Nothing has been written down yet.'])].join('\n');
     files = [{ pdf: makeTextPdf({ title: own?.heading || `${questTag(live)} — so far`, body }), name: `${own?.stem || fileSlug(`${questTag(live)} so far`, 'run-so-far')}.pdf` }];
@@ -23085,7 +23643,7 @@ async function runSoFarFile(guild, gid, live, fallbackGmId = null, { filename = 
 // live summaries before this build), the story so far, the party's review.
 function hourBlocks(events, nowMs) {
   const HOUR = QUEST_RECAP_MS;
-  const ev = (events || []).filter(e => !['remind', 'recap', 'talk'].includes(e.kind) && !e.gone);
+  const ev = (events || []).filter(e => !['remind', 'recap', 'talk', 'dice'].includes(e.kind) && !e.gone);
   const hours = Math.max(1, Math.ceil(Math.max(0, Number(nowMs) || 0) / HOUR));
   const byHour = new Map();
   for (const e of ev) {
@@ -23142,7 +23700,7 @@ async function sessionThread(interaction, gid, run) {
   return interaction.editReply({ content: `\u{1F6AA} **${questTag(run)}** \u2192 <#${opened.thread.id}>. The party has been pulled in.${opened.moved ? `\n${opened.moved}` : ''}` });
 }
 
-// /session complete with no summary: the log drafted into a telling, for
+// /run time end with no summary: the log drafted into a telling, for
 // the GM to take, change or leave out. With nothing logged it simply ends.
 const pendingEndings = new Map();
 function draftEndingFromLog(gid, quest, names) {
@@ -23195,7 +23753,7 @@ async function handleSessionEnd(interaction) {
   const [kind, what, key] = interaction.customId.split(':');
   const p = pendingEndings.get(kind === 'sessendform' ? what : key);
   if (!p || p.gid !== interaction.guild.id)
-    return interaction.reply({ ephemeral: true, content: '\u23F3 That draft has gone \u2014 run `/session complete` again.' });
+    return interaction.reply({ ephemeral: true, content: '\u23F3 That draft has gone \u2014 run `/run time end` again.' });
   if (interaction.user.id !== p.uid) return interaction.reply({ ephemeral: true, content: '\u274C That draft is another GM\'s.' });
   if (kind === 'sessend' && what === 'edit') {
     const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
@@ -23237,7 +23795,7 @@ async function nudgeIfPartyFull(client, gid, quest) {
   updateQuest(gid, quest.number, { full_pinged: 1 });
   const who = quest.gm_id ? `<@${quest.gm_id}>` : 'GMs';
   await announceStage(client, gid, getQuest(gid, quest.number),
-    `👥 **Party full** — ${party.length}/${quest.party_size}. ${who}, start it with \`/quest run start number:${quest.number}\` when you're ready.`);
+    `👥 **Party full** — ${party.length}/${quest.party_size}. ${who}, start it with \`/run time start name:${quest.name}\` when you're ready.`);
 }
 
 // The party's own room. One thread per started quest in the instance forum,
@@ -23270,7 +23828,7 @@ async function openRunThread(client, guild, gid, quest) {
         quest.gm_id ? `🎲 DM: <@${quest.gm_id}>` : '',
         roll.length ? `👥 ${roll.join(' ')}` : '',
         quest.record_all ? '\u{1F4DD} _Everything said in this thread is recorded for the quest\'s log._' : '',
-        '', enc ? `_This is the ${kindW.noun}\'s room. Seats are the GM\'s — \`/session add\` and \`/session kick\`; \`/session complete\` finishes it._`
+        '', enc ? `_This is the ${kindW.noun}\'s room. Seats are the GM\'s — \`/session add\` and \`/session kick\`; \`/run time\` keeps its clock and \`/run time end\` finishes it._`
                 : '_This is your quest thread: rolls, planning and the run itself. `/session rally` calls everyone back._',
       ].filter(Boolean).join('\n'), allowedMentions: { users: mentionList(party, quest.gm_id) } },
     });
@@ -23470,7 +24028,7 @@ async function handleQuest(interaction, forced) {
       const party = getQuestMembers(gid, q.number, 'party').length;
       const cap = q.party_size ? `${party}/${q.party_size}${q.party_hard ? '' : '~'}` : `${party}`;
       const merit = q.merit_reward > 0 ? ` · 🎖️${q.merit_reward}` : '';
-      lines.push(`${questStatusBadge(q.status)} **${questTag(q)}** — 👥 ${cap}${merit}`);
+      lines.push(`${questStatusBadge(q.status, q)} **${questTag(q)}** — 👥 ${cap}${merit}`);
     }
     lines.push('', '_Use_ `/quest show number:N` _for full details._');
     return replyLong(interaction, lines);
@@ -23832,6 +24390,14 @@ async function handleQuest(interaction, forced) {
     const quest = await requireQuest(interaction, gid, (forced && typeof forced === 'object') ? forced.number : null);
     if (!quest) return;
     const number = quest.number;
+    // A run opened ahead begins here (T, 2026-11-23). One already going is
+    // refused: starting it again cleared its whole log and its clock
+    // (audit, 2026-11-23). An instance never launches like a listing.
+    if (isUnstarted(quest)) return startUnstartedRun(interaction, gid, quest);
+    if (isEncounter(quest)) return interaction.reply({ ephemeral: true, content: quest.status === 'completed'
+      ? `❌ **${questTag(quest)}** is already completed.` : `❌ **${questTag(quest)}** is already running.` });
+    if (quest.status === 'active' && (quest.instance_of || !(getConfig(gid)?.quest_spinoff ?? 0)))
+      return interaction.reply({ ephemeral: true, content: `❌ **${questTag(quest)}** is already running.` });
     // Under spin-off, a board listing never starts ITSELF — starting it IS
     // the launch: the staged group becomes one run with its own thread and
     // clock, and the listing stands clean for the next wave.
@@ -23907,19 +24473,36 @@ async function handleQuest(interaction, forced) {
     if (!quest) return;
     const number = quest.number;
     if (quest.status !== 'active') return interaction.reply({ content: '❌ That quest is not running.', ephemeral: true });
+    // Opened ahead, there is nothing to pause or resume until it starts.
+    if (isUnstarted(quest)) return interaction.reply({ ephemeral: true, content: `❌ **${questTag(quest)}** has not started — \`/run time start\` starts its clock.` });
     const paused = !!quest.paused;
     if (sub === 'pause') {
+      if (quest.winding_down) return interaction.reply({ ephemeral: true, content: `❌ **${questTag(quest)}** is winding down — its clock has stopped already.` });
       if (paused) return interaction.reply({ content: '❌ It is already paused.', ephemeral: true });
-      // Bank the running stretch, then stop the clock.
-      updateQuest(gid, number, { elapsed_ms: Math.ceil(questElapsed(quest) / QUARTER_MS) * QUARTER_MS, paused: 1, started_at: null });
+      // Bank the running stretch, forward to the quarter-hour, and stop the clock.
+      updateQuest(gid, number, { elapsed_ms: quarterUp(questElapsed(quest)), paused: 1, started_at: null });
       await syncQuestBook(interaction.client, interaction.guild, gid, getQuest(gid, number));
       logQuestEvent(gid, number, 'pause', 'Paused', uid);
       archiveHeaderTouch(interaction.client, interaction.guild, gid, getQuest(gid, number));
       await questAnnounce(interaction.client, getQuest(gid, number), `⏸️ Paused at **${fmtElapsed(questElapsed(getQuest(gid, number)))}**.`);
       return interaction.reply({ content: `⏸️ **${questTag(quest)}** paused at **${fmtElapsed(questElapsed(getQuest(gid, number)))}**. The clock and the log are kept.` });
     }
+    // A resume lands the clock forward on the quarter-hour as well (T,
+    // 2026-11-23), and takes a winding-down run back to running.
+    const banked = quarterUp(questElapsed(quest));
+    if (quest.winding_down) {
+      updateQuest(gid, number, { winding_down: 0, winding_at: null, paused: 0, started_at: Date.now(), elapsed_ms: banked });
+      try { logQuestEvent(gid, number, 'note', 'Back to running', uid); } catch {}
+      await syncQuestBook(interaction.client, interaction.guild, gid, getQuest(gid, number));
+      archiveHeaderTouch(interaction.client, interaction.guild, gid, getQuest(gid, number));
+      const roomR = quest.run_thread_id || quest.run_channel_id;
+      const chR = roomR ? await interaction.client.channels.fetch(roomR).catch(() => null) : null;
+      if (chR?.send) await chR.send({ allowedMentions: { parse: [] }, content:
+        `▶️ **${questTag(quest)}** is running again at **${fmtElapsed(banked)}** — rests will pass the party over once more.` }).catch(() => {});
+      return interaction.reply({ ephemeral: true, content: `✅ **${questTag(quest)}** is running again at **${fmtElapsed(banked)}**.` });
+    }
     if (!paused) return interaction.reply({ content: '❌ It is already running.', ephemeral: true });
-    updateQuest(gid, number, { paused: 0, started_at: Date.now() });
+    updateQuest(gid, number, { paused: 0, started_at: Date.now(), elapsed_ms: banked });
     await syncQuestBook(interaction.client, interaction.guild, gid, getQuest(gid, number));
     logQuestEvent(gid, number, 'resume', 'Resumed', uid);
     archiveHeaderTouch(interaction.client, interaction.guild, gid, getQuest(gid, number));
@@ -24043,6 +24626,8 @@ async function handleQuest(interaction, forced) {
     if (!quest) return;
     const number = quest.number;
     if (quest.status !== 'active') return interaction.reply({ content: '❌ That quest is not running.', ephemeral: true });
+    // Nothing goes on a run's record before its start (T, 2026-11-23).
+    if (isUnstarted(quest)) return interaction.reply({ ephemeral: true, content: `❌ **${questTag(quest)}** has not started — nothing is recorded until \`/run time start\`.` });
     const text = interaction.options?.getString?.('text');
     const kind = interaction.options?.getString?.('kind') || 'note';
     logQuestEvent(gid, number, kind, text, uid);
@@ -24071,10 +24656,10 @@ async function handleQuest(interaction, forced) {
     if (!quest) return;
     const number = quest.number;
     // A line taken back is not shown again (cold audit; an /edit take-down too).
-    const events = questEvents(gid, number).filter(e => !e.gone);
+    const events = questEvents(gid, number).filter(e => !e.gone && e.kind !== 'dice');
     if (!events.length) return interaction.reply({ content: `📜 **${questTag(quest)}** has nothing logged yet.`, ephemeral: true });
     return replyLong(interaction, [
-      `📜 **${questTag(quest)}** — ${quest.paused ? '⏸️ paused at' : 'running,'} **${fmtElapsed(questElapsed(quest))}**`, '',
+      `📜 **${questTag(quest)}** — ${isUnstarted(quest) ? '⏸️ not started,' : quest.winding_down ? '🛌 winding down, stopped at' : quest.paused ? '⏸️ paused at' : 'running,'} **${fmtElapsed(questElapsed(quest))}**`, '',
       ...events.map(questEventLine)], { ephemeral: true });
   }
 
@@ -24088,29 +24673,33 @@ async function handleQuest(interaction, forced) {
     if (!quest) return;
     if (quest.status !== 'active')
       return interaction.reply({ ephemeral: true, content: `\u274C **${questTag(quest)}** is not running.` });
-    const back = !!interaction.options.getBoolean('resume');
-    updateQuest(gid, quest.number, { winding_down: back ? 0 : 1, winding_at: back ? null : Date.now() });
-    try {
-      logQuestEvent(gid, quest.number, 'note',
-        back ? 'Back to running' : 'Winding down \u2014 rewards being settled', interaction.user.id);
-    } catch {}
+    // Opened ahead and never begun, there is nothing to wind down.
+    if (isUnstarted(quest))
+      return interaction.reply({ ephemeral: true, content: `❌ **${questTag(quest)}** has not started — there is nothing to wind down. \`/quest delete number:${quest.number}\` drops it.` });
+    if (quest.winding_down)
+      return interaction.reply({ ephemeral: true, content: `❌ **${questTag(quest)}** is already winding down — \`/run time end\` finishes it; \`/run time resume\` takes it back.` });
+    // The story is over, so the clock stops, forward on the quarter-hour
+    // (T, 2026-11-23). It used to run on through the paperwork — a
+    // weekend's rewards and all — and the room kept its time checks.
+    const stoppedAt = quarterUp(questElapsed(quest));
+    updateQuest(gid, quest.number, { winding_down: 1, winding_at: Date.now(), elapsed_ms: stoppedAt, paused: 1, started_at: null });
+    try { logQuestEvent(gid, quest.number, 'note', 'Winding down — rewards being settled', interaction.user.id); } catch {}
+    try { await syncQuestBook(interaction.client, interaction.guild, gid, getQuest(gid, quest.number)); } catch {}
+    archiveHeaderTouch(interaction.client, interaction.guild, gid, getQuest(gid, quest.number));
+    const told = `✅ **${questTag(quest)}** is winding down — the clock stopped at **${fmtElapsed(stoppedAt)}**, and its party will be healed by the next rest. Finish with \`/run time end\` when the rewards are right.`;
     const room = quest.run_thread_id || quest.run_channel_id;
     if (room) {
       const ch = await interaction.client.channels.fetch(room).catch(() => null);
       // Winding down, the room gets the run hour by hour, the story so far
       // and the party's review button (T, 2026-11-17); the GM is answered
       // first, as the scroll takes a moment to paint.
-      if (ch && back) await ch.send({ allowedMentions: { parse: [] }, content:
-        `\u25B6\uFE0F **${questTag(quest)}** is running again \u2014 rests will pass the party over once more.` }).catch(() => {});
-      else if (ch) {
-        await interaction.reply({ ephemeral: true, content: `\u2705 **${questTag(quest)}** is winding down \u2014 its party will be healed by the next rest. Finish with \`/quest run complete\` when the rewards are right.` });
-        await postWindDown(interaction.guild, gid, quest, ch, interaction.user.id).catch(e => console.error('[winddown]', e?.message || e));
+      if (ch) {
+        await interaction.reply({ ephemeral: true, content: told });
+        await postWindDown(interaction.guild, gid, getQuest(gid, quest.number) || quest, ch, interaction.user.id).catch(e => console.error('[winddown]', e?.message || e));
         return;
       }
     }
-    return interaction.reply({ ephemeral: true, content: back
-      ? `\u2705 **${questTag(quest)}** is running again.`
-      : `\u2705 **${questTag(quest)}** is winding down \u2014 its party will be healed by the next rest. Finish with \`/quest run complete\` when the rewards are right.` });
+    return interaction.reply({ ephemeral: true, content: told });
   }
 
   if (sub === 'recap') {
@@ -24189,6 +24778,7 @@ async function handleQuest(interaction, forced) {
     if (!quest) return;
     const number = quest.number;
     if (quest.status === 'completed') return interaction.reply({ content: '❌ That quest is already completed.', ephemeral: true });
+    if (isUnstarted(quest)) return interaction.reply({ ephemeral: true, content: `❌ **${questTag(quest)}** never started — \`/run time start\` starts it; \`/quest delete number:${quest.number}\` drops it.` });
     // Everyone seated when the story ended is paid — including anyone who
     // departed during the winding-down (see the kick above).
     const party = [...new Set([...getQuestMembers(gid, number, 'party'), ...getQuestMembers(gid, number, 'departed')])];
@@ -24209,8 +24799,9 @@ async function handleQuest(interaction, forced) {
       awarded.push({ id, after });
     }
     // Stop the stopwatch before anything else, so the summary reports the run
-    // rather than however long the paperwork took.
-    const runMs = questElapsed(quest);
+    // rather than however long the paperwork took — forward on the
+    // quarter-hour, as every stop is (T, 2026-11-23).
+    const runMs = quarterUp(questElapsed(quest));
     logQuestEvent(gid, number, 'end', 'Quest complete', uid);
     updateQuest(gid, number, { status: 'completed', elapsed_ms: runMs, paused: 1, started_at: null });
     // Snapshot for Reopen: reversal needs to know exactly what was done.
@@ -24282,7 +24873,7 @@ async function handleQuest(interaction, forced) {
     const styleLabel = gmStyleLabel(quest.gm_style);
     // Recorded table talk has its transcripts; the record counts it.
     const talkN = events.filter(e => e.kind === 'talk' && !e.gone).length;
-    const logged = events.filter(e => e.kind !== 'talk' && !e.gone);
+    const logged = events.filter(e => e.kind !== 'talk' && !e.gone && !recapOnly(e));
     const summary = [
       `📜 **${questTag(quest)}** — quest summary`,
       `🎲 Run by **${runnerName}**${styleLabel ? ` · ${styleLabel}` : ''}`,
@@ -24412,7 +25003,8 @@ async function handleQuest(interaction, forced) {
     for (const q of [quest, ...db.prepare("SELECT * FROM quests WHERE guild_id=? AND instance_of=?").all(gid, number)]) {
       if (q.status === 'active' || q.status === 'paused') {
         const heads = getQuestMembers(gid, q.number, 'party').length;
-        liveBits.push(`${questTag(q)} — ${q.paused ? 'paused' : 'running'} ${fmtElapsed(questElapsed(q))} with ${heads} on the party`);
+        const clockQ = isUnstarted(q) ? 'not started' : `${q.winding_down ? 'winding down at' : q.paused ? 'paused at' : 'running'} ${fmtElapsed(questElapsed(q))}`;
+        liveBits.push(`${questTag(q)} — ${clockQ} with ${heads} on the party`);
       }
     }
     const liveNote = liveBits.length
@@ -30169,6 +30761,47 @@ async function sweepOldUpdatePosts(client, gid) {
 }
 
 const CHANGELOG = [
+  { key: '2026-11-23', gm: [
+      { line: '`/run time` keeps a run’s clock in one place, whatever opened it: `start`, `pause`, `resume`, `winddown`, `end`, `ready`, `adjust`, `show`, `list`',
+        detail: 'Each finds its run as `/session` does — in its own room, or by `name:` and `run:`. `/session pause|resume|complete`, `/quest run start|pause|resume|ready|winddown|complete` and `/instance list` are gone; their work is here. `show` and `list` are open to everyone. `/timer` is untouched.' },
+      { line: 'An instance opens without starting: the party seated, its room open, the clock held at nought — an older quest at its played time — and nothing recorded until `/run time start`',
+        detail: 'Before the start there is no talk, roll or story on its record, and it holds nobody out of the rests. Its first line, “Encounter begins”, is written when it starts. A ready check in its room offers ▶️ Start once everyone has ticked. Runs open before this build carry on as they were.' },
+      { line: 'A fight or an initiative called in a run’s room before it starts asks whoever called it first: ✅ Confirm goes ahead off the record, ✖️ Deny calls it off',
+        detail: '`/fight start`, `/fight auto` (not a demo), `/initiative` and `/session initiative`. The question never starts the run. A fight or an order played off the record keeps its turn clock, as anywhere; a note waits for the start.' },
+      { line: 'The run clock lands forward on the quarter-hour at every pause, resume, start, wind-down and end',
+        detail: 'A pause at 1h 07m reads 1h 15m, as before; a resume, a start, a wind-down and the end now land on the mark too. `/run time adjust by:` corrects the clock in quarter-hour steps — `+30m`, `-1h` — never below nought, and the time checks and the hourly recap keep their spacing.' },
+      { line: 'Winding down stops the clock; `/run time resume` takes the run back to running',
+        detail: 'The clock used to run on through the paperwork, so a run wound down on a Friday and ended on the Monday counted the weekend, and its room kept getting time checks.' },
+      { line: 'Fixed: starting a run that was already going cleared its whole log and set its clock back to nought',
+        detail: '`/quest run start` on a running quest wiped its record; the ready card’s Start refused, the command did not. `/run time start` refuses a run that is going.' },
+      { line: 'Fixed: planted, group and target presses were written into a paused run',
+        detail: 'A paused run records nothing, and its button presses now keep to that.' },
+      { line: 'The run’s story holds every public roll made in its room now — fight moves and what they came to, checks, planted and group buttons, targets, `/roll`, NPC and auto-pilot rolls — each under the words it was made with; secret GM rolls never go in',
+        detail: 'A roll reads as it fell: `Attacks Hollow with STR — 1d20+3, advantage → [17, 9] = 20`, the first throw beside it when it was rerolled, its DC and whether it passed. With NPC stats hidden the story leaves an NPC’s bonus out; the GM record shows it. The hourly recap keeps its short lines. Fight rolls had dropped out of the story — only an NPC’s card still slipped in; they are back, from this build on.' },
+      { line: 'The story in colour: the game’s lines blue, a natural 20’s roll line green, a natural 1’s red — only the roll’s own line; the words, and the name leading a line, stay in ink',
+        detail: 'A post and the rolls made with it stay on one page: a page never cuts one, and only a post longer than a page carries on to the next. The `????` where the type had no character are gone; an NPC whose HP is hidden shows its condition alone. The GM record’s rolls and fight lines are blue the same way; `/fight log scroll:true` stays in ink.' },
+      { line: 'Fixed: a secret `/gm dc` put its DC in the hourly recap and the story, which players see; both now say “hidden DC”, and the number is kept by the bot, not on the button',
+        detail: 'Cards from before keep working. A hidden DC is kept 60 days; a button pressed after that is told to ask a GM to call the check again.' },
+      { line: '`/button roll secret:true` — the card says **hidden DC**, and only you are told the number',
+        detail: 'It needs `dc:`. The recap and the story say “hidden DC” too.' },
+      { line: 'Reroll and Keep on `/button roll` and `/button group`: a presser holding a token gets \u{1F501} Reroll (a token, once a roll) or ✅ Keep before the roll lands; a GM can Keep for anyone, and ⚖️ Call it keeps every group roll still waiting',
+        detail: 'The group card marks a waiting roll ⏳ and counts it once it lands. Every press, and every reroll, goes to the roll audit now.' },
+      { line: 'NPCs on a `/gm dc` card: one holding reroll tokens waits for your \u{1F501} Reroll (its own token, once) or ✅ Keep; one with none lands at once',
+        detail: 'A button for each NPC waiting, and Keep for the rest; they land together once none is left.' },
+      { line: '✍️ **RP** leads the row under every roleplay line — `/rp`, NPC lines, Narration and the fight’s React lines: the roleplay box, not as a reply',
+        detail: 'Then \u{1F4AC} Reply, \u{1F3AD} GM and \u{1F3AE} Interaction as before; a GM’s box has the To picker. A React line carries the row now. Lines posted before this build keep the buttons they had.' },
+      { line: 'Fixed: a strike against Armour Class on 5e, and the presses of planted and group buttons, never reached the roll audit',
+        detail: 'A 5e strike that met Armour Class went straight to its outcome without a word to the audit, and a press on a planted button or a group check was written to the run’s log alone. Each is mirrored to the roll audit now, as every other roll is, and so is a reroll of one.' },
+    ], player: [
+      'The run’s story shows every roll made in the room, under the words it went with — the bonus and any advantage — the game’s lines in blue, a natural 20 green and a natural 1 red',
+      'A page of the story never cuts a post in two',
+      'A hidden DC stays hidden: no card shows its number, and the recap and the story say “hidden DC”',
+      'Holding a reroll token, a planted roll or a group check waits for you: \u{1F501} Reroll (a token, once) or ✅ Keep',
+      'Every roleplay line starts with ✍️ RP now — the box for a line of your own, without replying',
+      'A run can open before it starts: you are seated and its room is open, but nothing is recorded until the GM starts it',
+      'A fight called in a run’s room before it starts asks first — Confirm goes ahead off the record, Deny calls it off',
+      'The run clock stops and starts on the quarter-hour',
+    ] },
   { key: '2026-11-17', gm: [
       { line: 'Reroll and Keep on every fight roll: a roll whose maker holds a token waits for \u{1F501} Reroll or ✅ Keep before it lands — hit or miss — and the turn clock treats silence as Keep',
         detail: 'Grapples, saves, feints, holds, breaks, deflections, disarms and escapes too, which could never be rerolled before. A GM can Keep for anyone. No token, no wait. Checks you call and `/deception` wait the same way.' },
@@ -30919,11 +31552,12 @@ async function showRoster(interaction) {
 
   // Which quest, by name, rather than merely "a quest".
   const questOf = new Map();
-  for (const r of db.prepare(`SELECT m.user_id, q.number, q.name, q.winding_down, q.kind, q.instance_kind FROM quest_members m
+  for (const r of db.prepare(`SELECT m.user_id, q.number, q.name, q.winding_down, q.unstarted, q.kind, q.instance_kind FROM quest_members m
                               JOIN quests q ON q.guild_id = m.guild_id AND q.number = m.number
                               WHERE m.guild_id=? AND m.state='party' AND q.status='active'`).all(gid)) {
     // A winding-down run still shows, but marked — its party is resting.
-    questOf.set(r.user_id, { label: `#${String(r.number).padStart(3, '0')} ${r.name}`, winding: !!r.winding_down, icon: instanceIcon(r) });
+    // One not yet started shows as seated, waiting on its GM.
+    questOf.set(r.user_id, { label: `#${String(r.number).padStart(3, '0')} ${r.name}${Number(r.unstarted) ? ' (not started)' : ''}`, winding: !!r.winding_down, icon: instanceIcon(r) });
   }
   const fightOf = new Map();
   for (const f of db.prepare("SELECT channel_id, turn_order FROM fights WHERE guild_id=? AND state='active'").all(gid)) {
@@ -31764,27 +32398,28 @@ function scrollWrap(runs, faces, size, maxW) {
   const lines = [];
   let cur = [], w = 0, space = null;
   const width = (t, s) => faceWidth(faces[s], t, size);
-  const put = (t, s) => { const last = cur[cur.length - 1]; if (last && last.s === s) last.t += t; else cur.push({ t, s }); };
+  // A run keeps its face and its colour (T, 2026-11-23).
+  const put = (t, s, c) => { const last = cur[cur.length - 1]; if (last && last.s === s && last.c === c) last.t += t; else cur.push(c ? { t, s, c } : { t, s }); };
   for (const r of runs || []) {
     for (const m of String(r.t).matchAll(/\s+|\S+/g)) {
       const tok = m[0];
-      if (/^\s/.test(tok)) { if (cur.length) space = r.s; continue; }
+      if (/^\s/.test(tok)) { if (cur.length) space = r; continue; }
       let word = tok, ww = width(word, r.s);
-      const sw = space ? width(' ', space) : 0;
+      const sw = space ? width(' ', space.s) : 0;
       if (cur.length && w + sw + ww > maxW) { lines.push(cur); cur = []; w = 0; space = null; }
       while (ww > maxW - w && Array.from(word).length > 1) {
         // A word wider than the line: as much as fits, the rest on.
         const chars = Array.from(word);
         let k = chars.length - 1;
-        while (k > 1 && width(chars.slice(0, k).join(''), r.s) > maxW - w - (cur.length && space ? width(' ', space) : 0)) k--;
-        if (cur.length && space) { put(' ', space); }
-        put(chars.slice(0, k).join(''), r.s);
+        while (k > 1 && width(chars.slice(0, k).join(''), r.s) > maxW - w - (cur.length && space ? width(' ', space.s) : 0)) k--;
+        if (cur.length && space) { put(' ', space.s, space.c); }
+        put(chars.slice(0, k).join(''), r.s, r.c);
         lines.push(cur); cur = []; w = 0; space = null;
         word = chars.slice(k).join(''); ww = width(word, r.s);
       }
-      if (cur.length && space) { put(' ', space); w += width(' ', space); }
+      if (cur.length && space) { put(' ', space.s, space.c); w += width(' ', space.s); }
       space = null;
-      put(word, r.s); w += ww;
+      put(word, r.s, r.c); w += ww;
     }
   }
   if (cur.length) lines.push(cur);
@@ -31793,6 +32428,34 @@ function scrollWrap(runs, faces, size, maxW) {
 // The sheet's measures, /gm scroll's own.
 const PSCROLL = { W: 1000, PAD: 90, TITLE: 62, BODY: 40, LINE: 54, TLINE: 78, TGAP: 34, MAXH: 2600 };
 const PSCROLL_INK = '0.220 0.173 0.098', PSCROLL_RED = '0.420 0.122 0.122';
+// The game's lines (T, 2026-11-23): every roll and every mechanic in blue,
+// a natural 20's roll line green, a natural 1's red — the line itself,
+// never the words above it, and never the name that leads it.
+const PSCROLL_TINT = { blue: '0.122 0.306 0.612', red: '0.651 0.110 0.110', green: '0.110 0.451 0.169' };
+// What the type cannot draw is left out rather than printed as "?" — a
+// card's ─── rule, a bar, an emoji the cleaner missed (T, 2026-11-23).
+function scrollInked(runs, faces) {
+  return (runs || []).map(r => {
+    const face = faces[r.s] || faces.r;
+    let t = '';
+    for (const ch of String(r.t ?? '')) { const cp = ch.codePointAt(0); if (cp === 32 || cp === 10 || face.gid.has(cp)) t += ch; }
+    return { ...r, t: t.replace(/ {2,}/g, ' ') };
+  }).filter(r => r.t);
+}
+// Where a scroll too big for one file is cut into parts: near an even
+// share, never inside a block.
+function scrollPartCuts(lines, of) {
+  const per = Math.ceil(lines.length / Math.max(1, of));
+  const cuts = [0];
+  for (let k = 1; k < of; k++) {
+    let at = Math.max(cuts[cuts.length - 1] + 1, Math.min(lines.length, k * per));
+    while (at < lines.length && lines[at].block != null && lines[at - 1]?.block === lines[at].block) at++;
+    if (at >= lines.length) break;
+    cuts.push(at);
+  }
+  cuts.push(lines.length);
+  return cuts;
+}
 // The speckle, drawn once and laid on every sheet: age spots in a fixed
 // scatter, faint as the painted ones.
 function speckleOps() {
@@ -31825,8 +32488,13 @@ function scrollSheetOps(lines, titleLines, faces) {
     ops.push(`${PSCROLL_RED} rg ${dx} ${dy - d} m ${dx + d} ${dy} l ${dx} ${dy + d} l ${dx - d} ${dy} l h f`);
   let y = PAD + (titleLines.length ? TITLE : BODY) * 0.2;
   const text = (runs, x, yy, size, color) => {
-    const parts = [`BT ${color} rg 1 0 0 1 ${x.toFixed(2)} ${(H - yy).toFixed(2)} Tm`];
-    for (const r of runs) parts.push(`/F${r.s} ${size} Tf <${faceHex(faces[r.s], r.t)}> Tj`);
+    const parts = [`BT 1 0 0 1 ${x.toFixed(2)} ${(H - yy).toFixed(2)} Tm`];
+    let was = null;
+    for (const r of runs) {
+      const col = (r.c && PSCROLL_TINT[r.c]) || color;
+      if (col !== was) { parts.push(`${col} rg`); was = col; }
+      parts.push(`/F${r.s} ${size} Tf <${faceHex(faces[r.s], r.t)}> Tj`);
+    }
     parts.push('ET');
     ops.push(parts.join(' '));
   };
@@ -31900,17 +32568,36 @@ function scrollPdf(sheets, faces) {
 // ends a sheet without its first line, and no sheet opens on a blank.
 function scrollSheets(lines, titleLines) {
   const { PAD, LINE, TLINE, TGAP, MAXH } = PSCROLL;
+  const capOf = (tl) => Math.max(4, Math.floor((MAXH - PAD * 2 - (tl.length ? tl.length * TLINE + TGAP : 0)) / LINE));
+  const whole = capOf([]);
   const sheets = [];
   let i = 0, first = true;
   while (i < lines.length || first) {
     const tl = first ? titleLines : [];
-    const cap = Math.max(4, Math.floor((MAXH - PAD * 2 - (tl.length ? tl.length * TLINE + TGAP : 0)) / LINE));
+    const cap = capOf(tl);
     while (!first && i < lines.length && !lines[i].runs.length) i++;
     if (!first && i >= lines.length) break;
     let end = Math.min(lines.length, i + cap);
-    // A character's heading is not left alone at the foot of a sheet.
-    if (end < lines.length && end - 1 > i && lines[end - 1].head) end--;
-    sheets.push({ lines: lines.slice(i, end).map(l => l.runs), titleLines: tl });
+    if (end < lines.length) {
+      // A block is never cut (T, 2026-11-23: one post and its roll, one
+      // line of the record): the sheet ends before the block that would run
+      // off it, and that block opens the next sheet whole — unless it is
+      // longer than a whole sheet, which starts where it falls and runs on.
+      const b = lines[end].block;
+      if (b != null && lines[end - 1].block === b) {
+        let s = end - 1;
+        while (s > i && lines[s - 1].block === b) s--;
+        let e2 = end;
+        while (e2 < lines.length && lines[e2].block === b) e2++;
+        if (s > i && e2 - s <= whole) end = s;
+      }
+      // A character's heading is not left alone at the foot of a sheet.
+      if (end < lines.length && end - 1 > i && lines[end - 1].head) end--;
+    }
+    // No sheet ends on a blank line.
+    let stop = end;
+    while (stop > i + 1 && !lines[stop - 1].runs.length) stop--;
+    sheets.push({ lines: lines.slice(i, stop).map(l => l.runs), titleLines: tl });
     i = end; first = false;
   }
   return sheets;
@@ -31920,29 +32607,37 @@ function scrollSheets(lines, titleLines) {
 function printScroll({ title, paras, stem }) {
   const faces = scrollFaces();
   const { W, PAD, BODY, TITLE } = PSCROLL;
+  // Every paragraph a block of its own unless it names one (the story's:
+  // a post and its roll); a blank line belongs to none.
   const lines = [];
+  let auto = 0;
   for (const p of paras || []) {
-    if (!p) { lines.push({ runs: [] }); continue; }
-    const runs = Array.isArray(p) ? p : p.runs;
+    if (!p) { lines.push({ runs: [], block: null }); continue; }
+    const runs = scrollInked(Array.isArray(p) ? p : p.runs, faces);
+    if (!runs.some(r => r.t.trim())) continue;
+    const block = (!Array.isArray(p) && p.block != null) ? `s${p.block}` : `p${++auto}`;
     const wrapped = scrollWrap(runs, faces, BODY, W - PAD * 2);
-    wrapped.forEach((ln, k) => lines.push({ runs: ln, head: !!p.head && k === wrapped.length - 1 }));
-    if (!wrapped.length) lines.push({ runs: [] });
+    wrapped.forEach((ln, k) => lines.push({ runs: ln, head: !Array.isArray(p) && !!p.head && k === wrapped.length - 1, block }));
   }
   while (lines.length && !lines[lines.length - 1].runs.length) lines.pop();
-  const titleOf = (t) => scrollWrap(scrollRuns(t, 'r'), faces, TITLE, W - PAD * 2);
+  const titleOf = (t) => scrollWrap(scrollInked(scrollRuns(t, 'r'), faces), faces, TITLE, W - PAD * 2);
   const build = (part, of, slice) => {
+    let a = 0, z = slice.length;
+    while (a < z && !slice[a].runs.length) a++;
+    while (z > a && !slice[z - 1].runs.length) z--;
     const head = of > 1 ? `${title} — part ${part} of ${of}` : title;
-    const sheets = scrollSheets(slice, head ? titleOf(head) : []).map(s => scrollSheetOps(s.lines, s.titleLines, faces));
+    const sheets = scrollSheets(slice.slice(a, z), head ? titleOf(head) : []).map(s => scrollSheetOps(s.lines, s.titleLines, faces));
     return scrollPdf(sheets, faces);
   };
   const limit = Number(process.env.DDICE_SCROLL_FILE_MAX) || SCROLL_FILE_MAX;
   let of = 1, files = [build(1, 1, lines)];
-  // Too big for one file: split into parts by lines, each with its heading.
+  // Too big for one file: split into parts by lines, each with its heading,
+  // never inside a block.
   while (files.some(f => f.length > limit) && of < 64) {
     of = Math.max(of + 1, Math.ceil(files.reduce((a, f) => a + f.length, 0) / (limit * 0.9)));
-    const per = Math.ceil(lines.length / of);
+    const cuts = scrollPartCuts(lines, of);
     files = [];
-    for (let k = 0; k < of; k++) files.push(build(k + 1, of, lines.slice(k * per, (k + 1) * per)));
+    for (let k = 0; k < cuts.length - 1; k++) files.push(build(k + 1, cuts.length - 1, lines.slice(cuts[k], cuts[k + 1])));
   }
   return files.map((pdf, k) => ({ pdf, part: k + 1, of: files.length,
     name: `${stem}${files.length > 1 ? `-part-${k + 1}-of-${files.length}` : ''}.pdf` }));
@@ -32004,11 +32699,27 @@ function scrollParasOf(lines) {
 function storyEntries(events, nameOf = null) {
   const named = (t) => String(t ?? '').replace(/<@!?(\d+)>/g, (_, id) => `@${(nameOf && nameOf(id)) || 'someone'}`);
   const out = [];
+  // A speaker's entry by its row, so a roll made with those words rides
+  // under them (T, 2026-11-23).
+  const byRow = new Map();
   for (const e of events || []) {
     if (['remind', 'recap'].includes(e.kind) || e.gone) continue;
     const at = Number(e.at_ms) || 0;
     let parts = null;
     if (e.parts) { try { parts = JSON.parse(e.parts); } catch { parts = null; } }
+    // The recap's short line: the story has the dice and what they came to.
+    if (parts?.recap) continue;
+    if (e.kind === 'dice') {
+      if (parts?.dice) {
+        const en = { at, dice: { ...parts.dice, who: named(parts.dice.who || '') || 'Someone' } };
+        const host = parts.rp != null ? byRow.get(Number(parts.rp)) : null;
+        if (host) host.rolls.push(en); else out.push(en);
+      } else if (Array.isArray(parts?.out)) {
+        const lines = parts.out.map(l => named(l)).filter(l => l.trim());
+        if (lines.length) out.push({ at, out: lines });
+      } else if (String(e.text || '').trim()) out.push({ at, text: named(e.text), mech: true });
+      continue;
+    }
     if (e.kind === 'narration') {
       // The GM's telling: its paragraphs, each whole (T, 2026-11-17).
       const segs = (parts && Array.isArray(parts.segs) ? parts.segs : [{ k: 'p', t: String(e.text || '') }])
@@ -32021,9 +32732,12 @@ function storyEntries(events, nameOf = null) {
       const segs = parts.segs.filter(sg => sg && String(sg.t || '').trim()).map(sg => ({ k: sg.k, t: named(sg.t) }));
       if (!segs.length) continue;
       en = parts.who ? { at, who: String(parts.who), segs }
-        : { at, text: segs.map(sg => (sg.k === 's' ? `\u201C${sg.t}\u201D` : sg.t)).join(' ') };
+        : { at, text: segs.map(sg => (sg.k === 's' ? `“${sg.t}”` : sg.t)).join(' ') };
     } else en = oldStoryEntry(e, at, named);
-    if (en) out.push(en);
+    if (!en) continue;
+    if (en.who) { en.rolls = []; if (e.id != null) byRow.set(Number(e.id), en); }
+    else if (['roll', 'combat', 'turn'].includes(e.kind)) { en.mech = true; if (e.kind === 'roll') en.named = true; }
+    out.push(en);
   }
   return out;
 }
@@ -32049,7 +32763,7 @@ function oldStoryEntry(e, at, named) {
   const said = text.slice(i + 2).trim();
   if (npcLine && /^\u201C[\s\S]*\u201D$/.test(said)) {
     const inner = said.slice(1, -1).trim();
-    if (/\u{1F3B2}|\u2694|\u{1F6E1}|\u{1F3AF}|\u2764|\u{1F4A5}|\u2192|\bvs\b|\bDC \d/u.test(inner)) return { at, text: `${who}: ${inner}` };
+    if (/\u{1F3B2}|⚔|\u{1F6E1}|\u{1F3AF}|❤|\u{1F4A5}|→|\bvs\b|\bDC \d/u.test(inner)) return { at, text: `${who}: ${inner}`, mech: true, named: true };
     const segs = rpSegments(inner);
     return segs.length ? { at, who, segs } : null;
   }
@@ -32058,17 +32772,22 @@ function oldStoryEntry(e, at, named) {
   return segs.length ? { at, who, segs } : { at, text };
 }
 function storyParas(entries, { narrator = false } = {}) {
+  // Each paragraph names its block (T, 2026-11-23): one post with the rolls
+  // made with it, one line, one paragraph of a telling — a page never cuts
+  // one. The game's lines are blue; a natural 20's roll line green, a 1's
+  // red; the time and the name that leads a line stay in ink.
   const paras = [];
-  let prev = null;
-  const seg = (sg) => {
-    const lines = String(sg.t || '').split('\n').map(l => l.trim()).filter(Boolean);
-    if (!lines.length) return;
-    if (sg.k === 's') { lines[0] = `\u201C${lines[0]}`; lines[lines.length - 1] += '\u201D'; }
-    for (const l of lines) paras.push(scrollRuns(l, sg.k === 'a' ? 'i' : 'r'));
-  };
+  let prev = null, blk = 0;
+  const T = (runs, c) => runs.map(r => ({ ...r, c }));
+  const tintOf = (d) => (d.nat === 20 ? 'green' : d.nat === 1 ? 'red' : 'blue');
+  const put = (runs, block, head = false) => paras.push(head ? { runs, block, head: true } : { runs, block });
+  const linesOf = (sg) => String(sg.t || '').split('\n').map(l => l.trim()).filter(Boolean);
+  // A line's words as runs, what the type drops dropped first, so no
+  // double space is left where an emoji led.
+  const R = (t, base = 'r') => scrollRuns(scrollClean(t).replace(/^\s+/, ''), base);
   for (const en of entries || []) {
     const time = fmtElapsed(en.at);
-    const linesOf = (sg) => String(sg.t || '').split('\n').map(l => l.trim()).filter(Boolean);
+    const b = ++blk;
     if (en.narr) {
       // Narration: prose on its own, a blank line about each paragraph; with
       // the server's narrator heading, "time - Narration" over it like any
@@ -32076,14 +32795,15 @@ function storyParas(entries, { narrator = false } = {}) {
       if (narrator) {
         if (prev !== 'narr') {
           if (paras.length) paras.push(null);
-          paras.push({ runs: [{ t: `${time} - `, s: 'r' }, { t: NARRATION_NAME, s: 'b' }], head: true });
+          put([{ t: `${time} - `, s: 'r' }, { t: NARRATION_NAME, s: 'b' }], b, true);
         }
-        for (const sg of en.segs) for (const l of linesOf(sg)) paras.push(scrollRuns(l, 'r'));
+        for (const sg of en.segs) for (const l of linesOf(sg)) put(scrollRuns(l, 'r'), b);
         prev = 'narr';
       } else {
         for (const sg of en.segs) {
           if (paras.length) paras.push(null);
-          for (const l of linesOf(sg)) paras.push(scrollRuns(l, 'r'));
+          const bb = ++blk;
+          for (const l of linesOf(sg)) put(scrollRuns(l, 'r'), bb);
         }
         prev = 'narr-alone';
       }
@@ -32093,15 +32813,32 @@ function storyParas(entries, { narrator = false } = {}) {
       const key = `w:${String(en.who).toLowerCase()}`;
       if (prev !== key) {
         if (paras.length) paras.push(null);
-        paras.push({ runs: [{ t: `${time} - `, s: 'r' }, { t: scrollClean(en.who).trim() || 'Someone', s: 'b' }], head: true });
+        put([{ t: `${time} - `, s: 'r' }, { t: scrollClean(en.who).trim() || 'Someone', s: 'b' }], b, true);
       }
-      en.segs.forEach(seg);
+      for (const sg of en.segs) {
+        const ls = linesOf(sg);
+        if (!ls.length) continue;
+        if (sg.k === 's') { ls[0] = `“${ls[0]}`; ls[ls.length - 1] += '”'; }
+        for (const l of ls) put(scrollRuns(l, sg.k === 'a' ? 'i' : 'r'), b);
+      }
+      // The rolls made with these words, under them and with them.
+      for (const r of en.rolls || []) put(T(scrollRuns(storyDiceText(r.dice), 'r'), tintOf(r.dice)), b);
       prev = key;
-    } else {
-      if (prev && prev !== 'line') paras.push(null);
-      paras.push([{ t: `${time} - `, s: 'r' }, ...scrollRuns(en.text, 'r')]);
-      prev = 'line';
+      continue;
     }
+    if (prev && prev !== 'line') paras.push(null);
+    const stamp = { t: `${time} - `, s: 'r' };
+    if (en.dice) {
+      put([stamp, { t: scrollClean(en.dice.who || '').trim() || 'Someone', s: 'b' }, { t: ': ', s: 'r' },
+        ...T(scrollRuns(storyDiceText(en.dice), 'r'), tintOf(en.dice))], b);
+    } else if (en.out) {
+      put([stamp, ...T(R(en.out.map(storyStop).join(' ')), 'blue')], b);
+    } else if (en.mech) {
+      const m = en.named ? String(en.text).match(/^([^:.!?"“”\n]{1,60}): ([\s\S]+)$/) : null;
+      put(m ? [stamp, ...R(m[1], 'b'), { t: ': ', s: 'r' }, ...T(R(m[2]), 'blue')]
+        : [stamp, ...T(R(en.text), 'blue')], b);
+    } else put([stamp, ...scrollRuns(en.text, 'r')], b);
+    prev = 'line';
   }
   return paras;
 }
@@ -32433,8 +33170,8 @@ async function handleGmTest(interaction) {
     return interaction.reply({ ephemeral: true, content: [
       `🧪 Created **${questTag(quest)}** with you on the party, running in this channel.`,
       '',
-      `Try: \`/quest run start number:${number}\` → \`/quest run note number:${number} text:Something happened\``,
-      `→ \`/quest run timeline number:${number}\` → \`/quest run pause\` / \`/quest run resume\` → \`/quest run complete number:${number}\``,
+      `Try: \`/run time start name:${quest.name}\` → \`/quest run note number:${number} text:Something happened\``,
+      `→ \`/quest run timeline number:${number}\` → \`/run time pause\` / \`/run time resume\` → \`/run time end\``,
       '',
       '_Reminders land every 15 minutes and a recap on the hour. `/gm test clean` removes it._',
     ].join('\n') });
@@ -33087,35 +33824,43 @@ async function postDcCheck(interaction, { stat, notation, dc, gmMode, flat, modi
   if (terms.length) lines.push(`_${terms.join(' · ')}_`);
   if (flavour) lines.push('', flavour);
 
-  // NPCs never press — they roll right here, in the open.
+  // NPCs never press — they roll right here, in the open. One with a
+  // reroll token in hand waits on a GM's Reroll or Keep before its outcome
+  // lands, as a fight's roll does (T, 2026-11-23); one with none lands now.
+  const callC = { stat, notation, dc, secret: !!secret, sF, fF, sS, fS, onSucc, onFail, damage, sDamage };
+  const heldNpcs = [];
   for (const name of npcNames.slice(0, 10)) {
     const npc = getNpc(gid, name);
     if (!npc) { lines.push('', `❌ No NPC named **${name}**.`); continue; }
     // An NPC's flat mark strips the stat here too, its rider at disadvantage
     // (2026-11-10), as a player's does on the press.
     const flatN = stat && !flat ? consumeFlatMark(gid, npcFighterId(npc.name)) : false;
-    const r = rollDcCheck({ gid, stat, notation, dc, gmMode: flatN === 'dis' && (gmMode || 'normal') === 'normal' ? 'dis' : gmMode,
-      flat: flat || !!flatN, modifier, subject: npc, sig: npc });
+    const modeN = flatN === 'dis' && (gmMode || 'normal') === 'normal' ? 'dis' : gmMode;
+    const r = rollDcCheck({ gid, stat, notation, dc, gmMode: modeN, flat: flat || !!flatN, modifier, subject: npc, sig: npc });
     if (!r) continue;
+    r.args = { stat, notation, dc, gmMode: modeN, flat: flat || !!flatN, modifier };
     mirrorAutoRoll(gid, cid, npc.name, `${notation ?? '1d20'}${r.mode !== 'normal' ? ` (${r.mode})` : ''}`, r.nat, r.total, `GM check vs DC ${dc}`);
-    lines.push('', `🎭 **${npc.name}**${flatN ? ' (\u{1F3AD} flat d20)' : ''} — ${r.rollLine}`, secret ? r.band : `${r.band} vs DC ${dc}`);
-    const oFlav = r.passed ? sF : fF;
-    if (oFlav) lines.push(`_${oFlav}_`);
-    applyDcSanction({ gid, id: npcFighterId(npc.name), isNpc: true, sanction: r.passed ? sS : fS, lines });
-    applyDcOutcome({ gid, cid, id: npcFighterId(npc.name), isNpc: true,
-      mark: r.passed ? onSucc : onFail, damage: r.passed ? sDamage : damage, lines });
+    if ((Number(npc.rerolls_current) || 0) > 0) {
+      lines.push('', `🎭 **${npc.name}**${flatN ? ' (\u{1F3AD} flat d20)' : ''} — ${r.rollLine}`,
+        '⏳ _Nothing lands yet — a GM may \u{1F501} reroll it on its own tokens, or ✅ keep it (below)._');
+      heldNpcs.push({ name: npc.name, r, flatN: !!flatN });
+      continue;
+    }
+    landNpcCheck(gid, cid, callC, { name: npc.name, r, flatN: !!flatN }, lines);
   }
 
   const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
   const buttons = [];
   const field = notation ?? (stat ?? 'x');
+  // A secret DC is kept by the bot, not in the buttons (T, 2026-11-23).
+  const dcSlot = secret && ids.length ? hideDc(gid, dc) : dc;
   for (const uid of ids) {
     const nm = await getDisplayName(interaction.guild, uid);
     const secCode = !secret ? 0 : revealSet.has(uid) ? 2 : 1;
     // Numerics and short tokens only. The free-text marks ride the card row
     // keyed by this message \u2014 an id built from what a GM typed overflows
     // the 100-char ceiling and a colon in it shifts the whole split.
-    buttons.push(new ButtonBuilder().setCustomId(`dcroll:${uid}:${field}:${dc}:${gmMode}:${flat ? 1 : 0}:${modifier}:${secCode}:${damage}:${sDamage}`)
+    buttons.push(new ButtonBuilder().setCustomId(`dcroll:${uid}:${field}:${dcSlot}:${gmMode}:${flat ? 1 : 0}:${modifier}:${secCode}:${damage}:${sDamage}`)
       .setLabel(`🎲 ${nm.slice(0, 70)}`).setStyle(ButtonStyle.Primary));
   }
   const rows = [];
@@ -33136,17 +33881,84 @@ async function postDcCheck(interaction, { stat, notation, dc, gmMode, flat, modi
       if (hold) sendRollAudit(interaction.client, gid, `⏳ Override — <@${one?.id}> bound to a DC check by the GM${skipFail ? ' (turn skips on fail)' : ''} in <#${interaction.channelId}>.`);
     } catch { /* trimmings only */ }
   }
+  if (heldNpcs.length) {
+    const tokenN = rollHoldPut(gid, cid, 'npccheck', { c: callC, npcs: heldNpcs });
+    await interaction.followUp({ content: npcHoldText(heldNpcs), components: npcHoldRows(tokenN, heldNpcs), allowedMentions: { parse: [] } }).catch(() => {});
+  }
   if (secret) await interaction.followUp({ ephemeral: true, content: `🤫 The DC is **${dc}**.` }).catch(() => {});
   return;
 }
+// An NPC's called check lands: its band (the DC's number left out when it
+// is hidden), the GM's flavour, sanction, mark and damage, and the dice
+// into the story.
+function landNpcCheck(gid, cid, c, n, lines) {
+  const { name, r, flatN = false, first = null } = n;
+  lines.push('', `🎭 **${name}**${flatN ? ' (\u{1F3AD} flat d20)' : ''} — ${r.rollLine}`, c.secret ? r.band : `${r.band} vs DC ${c.dc}`);
+  const oFlav = r.passed ? c.sF : c.fF;
+  if (oFlav) lines.push(`_${oFlav}_`);
+  applyDcSanction({ gid, id: npcFighterId(name), isNpc: true, sanction: r.passed ? c.sS : c.fS, lines });
+  applyDcOutcome({ gid, cid, id: npcFighterId(name), isNpc: true,
+    mark: r.passed ? c.onSucc : c.onFail, damage: r.passed ? c.sDamage : c.damage, lines });
+  try { noteCheckStory(gid, cid, { stat: c.stat, notation: c.notation, dc: c.dc, secret: c.secret }, r, name, { npc: true, first }); } catch {}
+}
+// NPC rolls on a called check waiting on a GM.
+function npcHoldText(npcs) {
+  return ['⏳ **Nothing lands yet for the NPCs** — a GM may \u{1F501} reroll one on its own tokens (once), or ✅ keep them.',
+    ...npcs.filter(n => !n.done).map(n => `\u{1F3AD} **${n.name}** — ${n.r.rollLine}`)].join('\n');
+}
+function npcHoldRows(token, npcs) {
+  const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+  const btns = npcs.map((n, i) => ({ n, i })).filter(x => !x.n.done)
+    .map(x => new ButtonBuilder().setCustomId(`rhold:rrn:${token}:${x.i}`).setLabel(`\u{1F501} ${x.n.name}`.slice(0, 80)).setStyle(ButtonStyle.Secondary));
+  btns.push(new ButtonBuilder().setCustomId(`rhold:keep:${token}`).setLabel('✅ Keep').setStyle(ButtonStyle.Success));
+  const rows = [];
+  for (let i = 0; i < btns.length && rows.length < 5; i += 5) rows.push(new ActionRowBuilder().addComponents(...btns.slice(i, i + 5)));
+  return rows;
+}
+// A called check into the story once it lands: the dice as they fell — the
+// first throw too, when it was thrown again — against its DC, a hidden one
+// said so, and the verdict (T, 2026-11-23).
+function noteCheckStory(gid, cid, p, r, who, { uid = null, rp = null, first = null, npc = false } = {}) {
+  const d = storyDiceOf({ result: r?.result, total: r?.total, line: r?.rollLine, mode: r?.mode });
+  if (!d) return;
+  Object.assign(d, { who: who || 'Someone', uid: npc ? null : uid, npc, hide: npc && !npcStatsVisible(gid),
+    label: `${dcFaceOf(p, gid)} check`, dc: p.dc, dcHidden: !!p.secret, passed: r.passed });
+  if (first) {
+    const f = storyDiceOf({ result: first.result, total: first.total, line: first.rollLine, mode: first.mode });
+    if (f) d.first = { kept: f.kept, dropped: f.dropped, total: f.total };
+  }
+  noteStoryDice(gid, cid, d, { actor: npc ? null : uid, rp });
+}
+// A hidden DC put away (T, 2026-11-23): the slot a button carries for it.
+const HIDDEN_DC_DAYS = 60;
+function hideDc(gid, dc) {
+  const token = `${Date.now().toString(36).slice(-5)}${Math.random().toString(36).slice(2, 6)}`;
+  try { db.prepare('DELETE FROM hidden_dcs WHERE at < ?').run(Date.now() - HIDDEN_DC_DAYS * 86400000); } catch {}
+  db.prepare('INSERT OR REPLACE INTO hidden_dcs (guild_id, token, dc, at) VALUES (?,?,?,?)').run(String(gid), token, Number(dc) || 0, Date.now());
+  return `s${token}`;
+}
+// A button's DC slot read back: the number it carries, or a hidden one from
+// the table (`lost` when it is no longer kept).
+function dcSlotOf(gid, slot) {
+  const s = String(slot ?? '');
+  const m = /^s([a-z0-9]{1,16})$/.exec(s);
+  if (!m) return { dc: parseInt(s, 10) || 0, hidden: false, lost: false };
+  let dc = null;
+  try { dc = db.prepare('SELECT dc FROM hidden_dcs WHERE guild_id=? AND token=?').get(String(gid), m[1])?.dc ?? null; } catch {}
+  return { dc: dc == null ? 0 : Number(dc), hidden: true, lost: dc == null };
+}
+const HIDDEN_DC_LOST = '❌ That check’s hidden DC is no longer kept — ask a GM to call it again.';
 // A called check's button, read: who it is for and on what terms.
-function dcPressParams(customId) {
-  const [, uid, field, dcS, gmMode, flatS, modS, secS, dmgS, sDmgS] = String(customId || '').split(':');
+function dcPressParams(customId, gid = null) {
+  const [, uid, field, dcS0, gmMode, flatS, modS, secS, dmgS, sDmgS] = String(customId || '').split(':');
+  // A hidden DC rides as a token since 2026-11-23; an older card's number is read as ever.
+  const slotD = gid && /^s[a-z0-9]/.test(String(dcS0 || '')) ? dcSlotOf(gid, dcS0) : null;
+  const dcS = slotD ? String(slotD.dc) : dcS0;
   // Notation is dice ("2d6", "d20+1") \u2014 not any word with a d in it: `dex`
   // read as notation left every DEX check unanswerable (cold audit; older
   // than this build, carried through its refactor).
   const notation = /^\d*d\d+/i.test(String(field || '')) ? field : null;
-  return { uid, field, dc: parseInt(dcS), gmMode, flat: flatS === '1', modifier: parseInt(modS) || 0,
+  return { uid, field, dc: parseInt(dcS), dcLost: !!slotD?.lost, gmMode, flat: flatS === '1', modifier: parseInt(modS) || 0,
     secret: secS !== '0', whisper: secS === '2', damage: parseInt(dmgS) || 0, sDmg: parseInt(sDmgS) || 0,
     notation, stat: notation ? null : (field === 'x' ? null : field) };
 }
@@ -33154,7 +33966,8 @@ const dcFaceOf = (p, gid = null) => p.notation ?? (p.stat ? checkLabel(gid, gid 
 // The roll under the card's conditions, and its beat in the quest's account
 // (T, 2026-08-19: a DC check inside a quest belongs in that quest's account,
 // or the GM log shows a silent stretch where the table was rolling all evening).
-async function rollCalledCheck(guild, gid, cid, p, ch) {
+// Its callers await it as they did when it wrote the record itself.
+function rollCalledCheck(guild, gid, cid, p, ch) {
   // A notation that no longer reads spends nothing \u2014 not even a mark.
   if (p.notation && !parseNotation(p.notation)) return null;
   // A flat mark strips the stat from a called check too (2026-11-09); its
@@ -33167,17 +33980,20 @@ async function rollCalledCheck(guild, gid, cid, p, ch) {
   if (p.stat) noteHonestRoll(gid, p.uid);
   // How it was rolled, so a reroll throws the very same check (build P).
   r.args = { stat: p.stat, notation: p.notation, dc: p.dc, gmMode: markedMode, flat: p.flat || !!flatMk, modifier: p.modifier };
-  try {
-    const whoDc = await getDisplayName(guild, p.uid).catch(() => 'Someone');
-    noteQuestActivity(gid, cid, 'roll', `${whoDc}: ${dcFaceOf(p, gid)} ${r.total} vs DC ${p.dc} \u2014 ${r.passed ? 'passed' : 'failed'}`, p.uid);
-  } catch {}
+  // Its line in the run's record waits for it to land (settleCalledCheck,
+  // T, 2026-11-23): a roll held for Reroll or Keep is not a verdict yet.
   return r;
 }
 // What the card said would follow: its flavour, sanction, mark and damage,
 // the bind released, the book written. Returns the lines to show.
-async function settleCalledCheck(guild, gid, cid, p, r, cardMsgId) {
+async function settleCalledCheck(guild, gid, cid, p, r, cardMsgId, { rp = null, first = null, story = true } = {}) {
   const marks = getDcCard(gid, cardMsgId) || {};
   const nm = await getDisplayName(guild, p.uid);
+  // Into the run's record as it lands (T, 2026-08-19; 2026-11-23): the
+  // recap's short line — a hidden DC said so, never its number, since the
+  // recap is the room's — and the dice for the story.
+  try { noteQuestActivity(gid, cid, 'roll', `${nm}: ${dcFaceOf(p, gid)} ${r.total} vs ${p.secret ? 'a hidden DC' : `DC ${p.dc}`} — ${r.passed ? 'passed' : 'failed'}`, p.uid, { parts: { recap: 1 } }); } catch {}
+  if (story) { try { noteCheckStory(gid, cid, p, r, nm, { uid: p.uid, rp, first }); } catch {} }
   const out = [`🎯 **${nm}** — ${dcFaceOf(p, gid)} vs **DC ${p.secret ? '???' : p.dc}**`, r.rollLine, r.band];
   const oFlav = marks.message_id ? (r.passed ? marks.s_flavour : marks.f_flavour) : null;
   if (oFlav) out.push(`_${oFlav}_`);
@@ -33230,7 +34046,8 @@ async function runDcRollPress(interaction) {
   // The marks live on the card row, keyed by the message this button sits
   // on. A card older than the seven-day prune simply has no marks left,
   // which is the same graceful dark a restart always gave these buttons.
-  const p = dcPressParams(interaction.customId);
+  const p = dcPressParams(interaction.customId, gid);
+  if (p.dcLost) return interaction.reply({ content: HIDDEN_DC_LOST, ephemeral: true });
   if (interaction.user.id !== p.uid) return interaction.reply({ content: '🎯 That button belongs to someone else — yours has your name on it.', ephemeral: true });
   const gate = sheetGate(gid, p.uid);
   if (gate && !(await isGm(interaction.guild, p.uid))) return interaction.reply({ content: gate, ephemeral: true });
@@ -33238,7 +34055,7 @@ async function runDcRollPress(interaction) {
   if (!ch) return interaction.reply({ content: forSystem(gid, '❌ You need a character sheet — `/char create`.'), ephemeral: true });
   const r = await rollCalledCheck(interaction.guild, gid, cid, p, ch);
   if (!r) return interaction.reply({ content: '❌ That check\'s notation no longer reads.', ephemeral: true });
-  recordRoll(gid, { userId: p.uid, channelId: cid, interaction, result: r.result,
+  recordRoll(gid, { userId: p.uid, channelId: cid, interaction, result: r.result, story: false,
     input: '/gm dc', rollLine: r.rollLine, context: `GM check (${dcFaceOf(p, gid)} vs DC ${p.dc}${p.flat ? ', flat' : ''}${p.secret ? ', secret' : ''})` });
   await interaction.update({ components: darkenButton(interaction.message.components, interaction.customId) });
   // A token in hand: the roll waits on their Reroll or Keep (build P).
@@ -33278,7 +34095,7 @@ function rollHoldRow(token) {
     new ButtonBuilder().setCustomId(`rhold:keep:${token}`).setLabel('✅ Keep').setStyle(ButtonStyle.Success));
 }
 async function handleRollHoldButton(interaction) {
-  const [, what, token] = interaction.customId.split(':');
+  const [, what, token, idxS] = interaction.customId.split(':');
   const gid = interaction.guild.id, uid = interaction.user.id;
   const no = (content) => interaction.reply({ ephemeral: true, content });
   const h = rollHoldGet(gid, token);
@@ -33286,6 +34103,38 @@ async function handleRollHoldButton(interaction) {
   const v = h.payload, open = Array.isArray(v.open) ? v.open : [];
   const gm = await isGm(interaction.guild, uid);
   const head = [];
+  // NPCs on a called check (T, 2026-11-23): a GM rerolls one on its own
+  // tokens, once, or keeps them; they land together once none is open.
+  if (h.kind === 'npccheck') {
+    if (!gm) return no('\u{1F3AD} Those rolls are a GM’s to reroll or keep.');
+    const npcs = Array.isArray(v.npcs) ? v.npcs : [];
+    if (what === 'rrn') {
+      const n = npcs[parseInt(idxS, 10)];
+      if (!n || n.done) return no('✅ That roll has landed already.');
+      const npc = getNpc(gid, n.name);
+      if (!npc || (Number(npc.rerolls_current) || 0) <= 0) return no(`❌ **${n.name}** has no reroll tokens left.`);
+      const r2 = rollDcCheck({ ...(n.r.args || {}), gid, subject: npc, sig: npc });
+      if (!r2) return no('❌ That check no longer reads.');
+      upsertNpc(gid, npc.name, { rerolls_current: npc.rerolls_current - 1 });
+      r2.args = n.r.args;
+      mirrorAutoRoll(gid, h.channel_id, npc.name, `${n.r.args?.notation ?? '1d20'}${r2.mode !== 'normal' ? ` (${r2.mode})` : ''}`, r2.nat, r2.total, `GM check vs DC ${v.c?.dc} · reroll`);
+      n.first = n.first || n.r; n.r = r2; n.done = true;
+      head.push(`\u{1F501} **${npc.name}** rolls again *(reroll)* — ${r2.rollLine}`);
+    } else if (what === 'keep') {
+      const kept = npcs.filter(n => !n.done).map(n => `**${n.name}**`);
+      for (const n of npcs) n.done = true;
+      if (kept.length) head.push(`✅ A GM keeps ${andList(kept)}.`);
+    } else return no('❌ That roll is not yours to reroll.');
+    if (npcs.some(n => !n.done)) {
+      db.prepare('UPDATE roll_holds SET payload=? WHERE guild_id=? AND token=?').run(JSON.stringify({ ...v, npcs }), gid, token);
+      return interaction.reply({ content: [...head, '', npcHoldText(npcs)].join('\n'), components: npcHoldRows(token, npcs), allowedMentions: { parse: [] } });
+    }
+    db.prepare('DELETE FROM roll_holds WHERE guild_id=? AND token=?').run(gid, token);
+    try { if (interaction.message?.edit) await interaction.message.edit({ components: [] }); } catch {}
+    const linesN = [...head];
+    for (const n of npcs) landNpcCheck(gid, h.channel_id, v.c || {}, n, linesN);
+    return replyLong(interaction, linesN, { allowedMentions: { parse: [] } });
+  }
   if (what === 'rr') {
     if (!open.includes(uid)) return no(NO_ROLL_OF_YOURS);
     const ch = getChar(gid, uid);
@@ -33296,9 +34145,21 @@ async function handleRollHoldButton(interaction) {
       const r2 = rollDcCheck({ ...(v.r.args || {}), gid, subject: ch, sig: ch });
       if (!r2) return no('❌ That check no longer reads.');
       r2.args = v.r.args;
+      v.first = v.first || v.r;
       v.r = r2;
       head.push(`**${nm}** rerolls *(reroll)* — the check!`, r2.rollLine);
-      recordRoll(gid, { userId: uid, channelId: h.channel_id, interaction, result: r2.result, input: '/gm dc (reroll)', rollLine: r2.rollLine, context: 'GM check · reroll' });
+      recordRoll(gid, { userId: uid, channelId: h.channel_id, interaction, result: r2.result, input: '/gm dc (reroll)', rollLine: r2.rollLine, context: 'GM check · reroll', story: false });
+    } else if (h.kind === 'planted' || h.kind === 'group') {
+      // A planted press or a group roll thrown again, on the same terms (T, 2026-11-23).
+      const r2 = v.chk ? rollDcCheck({ ...(v.r.args || {}), gid, subject: ch, sig: ch })
+        : (() => { const rr = rollNotation(v.dice); return rr ? plantedDiceRoll(rr, v.dc || null) : null; })();
+      if (!r2) return no('❌ That roll no longer reads.');
+      if (v.r.args) r2.args = v.r.args;
+      v.first = v.first || v.r;
+      v.r = r2;
+      head.push(`**${nm}** rerolls *(reroll)*!`, r2.rollLine);
+      recordRoll(gid, { userId: uid, channelId: h.channel_id, interaction, result: r2.result, input: h.kind === 'group' ? 'group check (reroll)' : 'planted button (reroll)',
+        rollLine: r2.rollLine, context: `${h.kind === 'group' ? 'group check' : 'planted roll'} · reroll`, story: false });
     } else {
       const side = v.p.deceiverId === uid ? 'me' : 'them';
       const s = v[side];
@@ -33323,8 +34184,18 @@ async function handleRollHoldButton(interaction) {
   }
   db.prepare('DELETE FROM roll_holds WHERE guild_id=? AND token=?').run(gid, token);
   try { if (interaction.message?.edit) await interaction.message.edit({ components: [] }); } catch {}
+  if (h.kind === 'planted') {
+    await replyLong(interaction, [...head, '', ...plantedLines(v)], { allowedMentions: { users: [v.uid] } });
+    return notePlanted(interaction, gid, v, { first: v.first || null });
+  }
+  if (h.kind === 'group') {
+    const g = landGroupHold(gid, v);
+    await replyLong(interaction, [...head, '', ...groupHoldLines(g, v)], { allowedMentions: { users: [v.uid] } });
+    if (g) await noteGroupHold(interaction, gid, h, g, v);
+    return;
+  }
   if (h.kind === 'check') {
-    const out = await settleCalledCheck(interaction.guild, gid, h.channel_id, v.p, v.r, v.cardMsgId);
+    const out = await settleCalledCheck(interaction.guild, gid, h.channel_id, v.p, v.r, v.cardMsgId, { first: v.first || null });
     await replyLong(interaction, [...head, '', ...out]);
     if (v.p.whisper) {
       const w = dcWhisper(v.p, v.r);
@@ -33366,6 +34237,7 @@ async function runGmRollSlash(interaction) {
     input: `/gm roll ${notation}${label ? ' ' + label : ''}${secret ? ' 🔒' : ''}`, rollLine,
     context: secret ? 'GM roll · 🔒 secret' : 'GM roll',
   });
+  if (!secret) { try { storyGmRoll(gid, interactionChannelId(interaction), uid, interaction.member?.displayName || null, result, mode, label); } catch {} }
   if (secret) return interaction.reply({ content: `🔒 **Secret GM Roll**\n${content}`, ephemeral: true });
   return interaction.reply({ content });
 }
@@ -33398,6 +34270,7 @@ async function handleGmRoll(message, rest, secret) {
     input: message.content, rollLine,
     context: secret ? 'GM roll · 🔒 secret' : 'GM roll',
   });
+  if (!secret) { try { storyGmRoll(gid, message.channel.id, uid, message.member?.displayName || null, result, 'normal', parsed.label); } catch {} }
 
   if (secret) {
     try {
@@ -33580,9 +34453,16 @@ function rollForRp(gid, uid, ch, { stat = null, notation = null }) {
 }
 // The row under every /rp line: Reply, for anyone, and \u{1F3AD} GM \u2014 a GM's
 // way to answer the line as any NPC (2026-11-07, T).
+// ✍️ RP leads every roleplay row (T, 2026-11-23): the roleplay box
+// itself, for anyone, not as a reply to that line.
+function rpNewButton() {
+  const { ButtonBuilder, ButtonStyle } = require('discord.js');
+  return new ButtonBuilder().setCustomId('rpnew').setLabel('✍️ RP').setStyle(ButtonStyle.Secondary);
+}
 function rpLineRow() {
   const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
   return new ActionRowBuilder().addComponents(
+    rpNewButton(),
     new ButtonBuilder().setCustomId('rpreply').setLabel('\u{1F4AC} Reply').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('rpnpc').setLabel('\u{1F3AD} GM').setStyle(ButtonStyle.Secondary));
 }
@@ -33660,11 +34540,11 @@ async function postRpLine(interaction, { action = '', speech = '', raw = '', rol
   if (stat) {
     const card = await findOpenDcCard(chan, uid, stat);
     if (card) {
-      const p = dcPressParams(card.customId);
-      const r = await rollCalledCheck(interaction.guild, gid, chan.id, p, ch);
+      const p = dcPressParams(card.customId, gid);
+      const r = p.dcLost ? null : await rollCalledCheck(interaction.guild, gid, chan.id, p, ch);
       if (r) {
         await card.msg.edit?.({ components: darkenButton(card.msg.components, card.customId) }).catch(() => {});
-        const out = await settleCalledCheck(interaction.guild, gid, chan.id, p, r, card.msg.id);
+        const out = await settleCalledCheck(interaction.guild, gid, chan.id, p, r, card.msg.id, { story: false });
         foot.push(`\u{1F3AF} ${dcFaceOf(p, gid)} vs **DC ${p.secret ? '???' : p.dc}**`, ...out.slice(1));
         dc = { p, r };
       }
@@ -33719,17 +34599,20 @@ async function postRpLine(interaction, { action = '', speech = '', raw = '', rol
     try { db.prepare('INSERT OR REPLACE INTO rp_lines (guild_id, message_id, channel_id, user_id, at) VALUES (?,?,?,?,?)').run(gid, String(m.id), chan.id, uid, Date.now()); } catch {}
   }
   notePostParts(gid, chan.id, sentAll);
-  if (words) { try { noteQuestActivity(gid, chan.id, 'rp', `${name}: ${segsBeat(segs)}`, uid, { msgId: String((sentAll[0] || sent).id), parts: { who: name, segs: segsForLog(interaction.guild, segs) } }); } catch {} }
+  let rpLinks = null;
+  if (words) { try { rpLinks = noteQuestActivity(gid, chan.id, 'rp', `${name}: ${segsBeat(segs)}`, uid, { msgId: String((sentAll[0] || sent).id), parts: { who: name, segs: segsForLog(interaction.guild, segs) } }); } catch {} }
   // Each roll: its beat in the run's account, the audit, the tallies; the
   // first is saved so `rr` rerolls it as it would a typed roll. A check
   // answered here wrote its beat already, as its button does.
   for (const r of rolled) {
-    try { noteQuestActivity(gid, chan.id, 'roll', `${name}: ${r.label} ${r.result.total}`, uid); } catch {}
+    try { noteQuestActivity(gid, chan.id, 'roll', `${name}: ${r.label} ${r.result.total}`, uid, { parts: { recap: 1 } }); } catch {}
     recordRoll(gid, { userId: uid, channelId: chan.id, messageId: sent.id, result: r.result, rollLine: r.rollLine,
-      input: r.stat ? `/rp roll:${r.stat}` : `/rp dice:${r.notation}`, context: 'roleplay' });
+      input: r.stat ? `/rp roll:${r.stat}` : `/rp dice:${r.notation}`, context: 'roleplay',
+      story: { label: r.stat ? storyRollLabel(r.label, r.stat) : null, who: name, mode: r.mode, rp: rpLinks, flat: /flat d20/.test(String(r.label || '')) } });
   }
   if (rolled[0]) saveRoll(gid, chan.id, uid, rolled[0].notation, rolled[0].label);
-  if (dc) recordRoll(gid, { userId: uid, channelId: chan.id, messageId: sent.id, result: dc.r.result, rollLine: dc.r.rollLine,
+  if (dc) { try { noteCheckStory(gid, chan.id, dc.p, dc.r, name, { uid, rp: rpLinks }); } catch {} }
+  if (dc) recordRoll(gid, { userId: uid, channelId: chan.id, messageId: sent.id, result: dc.r.result, rollLine: dc.r.rollLine, story: false,
     input: `/rp roll:${stat}`, context: `GM check (${dcFaceOf(dc.p, gid)} vs DC ${dc.p.dc}${dc.p.flat ? ', flat' : ''}${dc.p.secret ? ', secret' : ''}) \u00b7 roleplay` });
   return answer([
     dc ? '\u{1F3AD} Posted \u2014 and it answered the check called on you.' : '\u{1F3AD} Posted.',
@@ -33768,7 +34651,7 @@ const EDIT_LIST_FETCH = 100;
 // Reply, GM and Interaction are buttons on words, not on a card: a line
 // carrying only those is still words to fix (2026-11-06). An edit sends
 // content alone, so the buttons stay.
-const RP_BUTTON_RE = /^(npcreply|npcx|npctalk|rpreply|rpnpc)(:|$)/;
+const RP_BUTTON_RE = /^(rpnew|npcreply|npcx|npctalk|rpreply|rpnpc)(:|$)/;
 function onlyRoleplayButtons(m) {
   // Rows it cannot read count as a card's: at least one button, and every
   // one of them a roleplay button.
@@ -34963,9 +35846,11 @@ async function strikeTarget(interaction, msgId, pick) {
   const stat = pick && pick !== '-' && offered.includes(pick) ? pick : (offered.length === 1 ? offered[0] : (pick && pick !== '-' ? pick : null));
 
   let line, total, natT = null, sidesT = 20, withText;
+  const strikeRoll = { result: null, rollLine: '', mode: 'normal', stat: null };
   if (t.dice) {
     const rolled = rollNotation(t.dice);
-    if (!rolled) return interaction.reply({ ephemeral: true, content: '\u274C That expression no longer reads.' });
+    if (!rolled) return interaction.reply({ ephemeral: true, content: '❌ That expression no longer reads.' });
+    strikeRoll.result = rolled;
     total = rolled.total; natT = rolled.rolls[0] ?? null; sidesT = rolled.sides;
     const mod = rolled.modifier ? ` ${rolled.modifier > 0 ? '+' : ''}${rolled.modifier}` : '';
     line = `**${t.dice}** \u2014 [${rolled.rolls.join(', ')}]${mod} = **${total}**`;
@@ -34978,6 +35863,7 @@ async function strikeTarget(interaction, msgId, pick) {
     if (!r) return interaction.reply({ ephemeral: true, content: '\u274C That check would not roll.' });
     total = r.total; natT = r.nat; sidesT = r.result?.sides ?? 20;
     line = r.rollLine;
+    Object.assign(strikeRoll, { result: r.result, rollLine: r.rollLine, mode: r.mode, stat: flat ? null : stat });
     withText = flat ? 'a flat d20' : `**${STAT_LABELS[stat]}**`;
   }
   const passed = dcVerdict(natT, sidesT, total, t.dc || null);
@@ -34988,8 +35874,18 @@ async function strikeTarget(interaction, msgId, pick) {
   const swing = (t.hits || 0) + 1;
 
   const nmT = await getDisplayName(interaction.guild, uidT).catch(() => 'Someone');
-  await logButtonPress(interaction, gidT, uidT, `${t.name}: ${total}${t.dc ? ` vs DC ${t.dc}` : ''}`, passed);
-  if (segsT.length) { try { noteQuestActivity(gidT, t.channel_id, 'rp', `${nmT}: ${segsBeat(segsT)}`, uidT, { parts: { who: nmT, segs: segsForLog(interaction.guild, segsT) } }); } catch {} }
+  let rpT = null;
+  if (segsT.length) { try { rpT = noteQuestActivity(gidT, t.channel_id, 'rp', `${nmT}: ${segsBeat(segsT)}`, uidT, { parts: { who: nmT, segs: segsForLog(interaction.guild, segsT) } }); } catch {} }
+  await logButtonPress(interaction, gidT, uidT, `${t.name}: ${total}${t.dc ? ` vs DC ${t.dc}` : ''}`, passed, { recap: true });
+  // The strike's dice, under its words in the story (T, 2026-11-23).
+  try {
+    const dT = storyDiceOf({ result: strikeRoll.result, total, line: strikeRoll.rollLine, mode: strikeRoll.mode });
+    if (dT) {
+      Object.assign(dT, { who: nmT, uid: uidT, npc: false, hide: false, label: `Strikes at ${t.name}${strikeRoll.stat ? ` with ${STAT_LABELS[strikeRoll.stat] || strikeRoll.stat}` : ''}`,
+        ...(t.dc ? { dc: t.dc, passed } : {}) });
+      noteStoryDice(gidT, t.channel_id, dT, { actor: uidT, rp: rpT });
+    }
+  } catch {}
   // The die's own verdicts carry the GM's prewritten flavour, since no
   // form will be opened for them.
   const flavour = decided ? (passed ? t.success_text : t.fail_text) : null;
@@ -35128,31 +36024,37 @@ async function handleButton(interaction) {
     const dice = (interaction.options.getString('dice') || '').trim();
     const stat = interaction.options.getString('stat');
     const dc = interaction.options.getInteger('dc');
+    // secret:true (T, 2026-11-23): the DC is the GM's alone — kept by the
+    // bot, never in the button, and never shown to the table.
+    const secret = !!interaction.options.getBoolean('secret');
     const reason = (interaction.options.getString('reason') || '').trim();
     if (dice && stat)
-      return interaction.reply({ ephemeral: true, content: '\u274C Dice or a stat, not both.' });
+      return interaction.reply({ ephemeral: true, content: '❌ Dice or a stat, not both.' });
     if (!dice && !stat)
-      return interaction.reply({ ephemeral: true, content: '\u274C Give dice (`2d6+1`) or a stat to roll.' });
+      return interaction.reply({ ephemeral: true, content: '❌ Give dice (`2d6+1`) or a stat to roll.' });
     if (dice && !/^\d{0,2}d\d{1,3}([+-]\d{1,3})?$/i.test(dice))
-      return interaction.reply({ ephemeral: true, content: '\u274C That is not dice I can read — try `2d6+1`.' });
+      return interaction.reply({ ephemeral: true, content: '❌ That is not dice I can read — try `2d6+1`.' });
+    if (secret && !dc)
+      return interaction.reply({ ephemeral: true, content: '❌ `secret:true` hides a DC — give it one with `dc:`.' });
 
     const faceName = dice || (stat === 'x' ? 'Flat d20' : STAT_LABELS[stat]);
     const label = (interaction.options.getString('label') || '').trim()
-      || `\u{1F3B2} ${faceName}${dc ? ` vs DC ${dc}` : ''}`;
+      || `\u{1F3B2} ${faceName}${dc ? (secret ? ' vs hidden DC' : ` vs DC ${dc}`) : ''}`;
+    const dcSlot = secret ? hideDc(gid, dc) : (dc || 0);
     const id = dice
-      ? `btnroll:${dice}:${dc || 0}:${once}:${owner}`
-      : `btnchk:${stat}:${dc || 0}:${once}:${owner}`;
+      ? `btnroll:${dice}:${dcSlot}:${once}:${owner}`
+      : `btnchk:${stat}:${dcSlot}:${once}:${owner}`;
     const row = new ActionRowBuilder().addComponents(new ButtonBuilder()
       .setCustomId(id).setLabel(label.slice(0, 80)).setStyle(ButtonStyle.Secondary));
     const addressed = audienceList ? `${audienceMentions(audienceList)} — ` : forUser ? `<@${forUser.id}> — ` : '';
     const line = reason || (dc
-      ? `\u{1F3AF} **${faceName}** against **DC ${dc}**.`
+      ? `\u{1F3AF} **${faceName}** against ${secret ? 'a **hidden DC**' : `**DC ${dc}**`}.`
       : `\u{1F3B2} **${faceName}** — ${forUser || audienceList ? 'yours to roll.' : 'anyone may roll.'}`);
     const planted = await interaction.channel.send({ content: addressed + line,
       components: [row],
       allowedMentions: audienceMentionsAllowed(audienceList || owner) });
     if (audienceList) db.prepare('INSERT OR REPLACE INTO button_audience (guild_id, message_id, owners) VALUES (?, ?, ?)').run(interaction.guild.id, planted.id, audienceList);
-    return interaction.reply({ ephemeral: true, content: '\u2705 Planted.' });
+    return interaction.reply({ ephemeral: true, content: secret ? `✅ Planted. \u{1F92B} The DC is **${dc}** — only you see this.` : '✅ Planted.' });
   }
 
   return interaction.reply({ ephemeral: true, content: '\u274C Unknown button.' });
@@ -35161,17 +36063,132 @@ async function handleButton(interaction) {
 // A press inside a quest's channel or thread joins that quest's timeline,
 // and so reaches the GM's log when the run is completed. Outside a quest
 // there is nothing to attach it to, so nothing is written (T, 2026-08-16).
-async function logButtonPress(interaction, gid, uid, detail, passed) {
+// ── Planted rolls (T, 2026-11-23) ──
+// A planted press: into the roll audit; with a reroll token in hand it
+// waits on the presser's \u{1F501} Reroll or ✅ Keep (a GM may Keep for
+// them), as a called check does; then it lands — its verdict, a hidden DC
+// never named, the recap's line and the story's dice.
+function plantedDiceRoll(rolled, dc) {
+  const nat = rolled.rolls[0] ?? null;
+  const critType = rolled.rolls.length === 1 && rolled.sides === 20 ? (nat === 20 ? 'crit' : nat === 1 ? 'fail' : null) : null;
+  return { result: rolled, nat, total: rolled.total, passed: dcVerdict(nat, rolled.sides, rolled.total, dc || null),
+    rollLine: buildRollLine(rolled, 'normal', critType, null), mode: 'normal' };
+}
+function plantedVs(press) { return press.dc ? (press.secret ? ' vs a **hidden DC**' : ` vs **DC ${press.dc}**`) : ''; }
+function plantedHead(press) {
+  return press.chk ? `\u{1F3AF} <@${press.uid}> — **${press.face}**${plantedVs(press)}` : `\u{1F3B2} <@${press.uid}> rolled **${press.dice}**${plantedVs(press)}`;
+}
+async function pressPlanted(interaction, gid, press) {
+  const cid = interactionChannelId(interaction);
+  recordRoll(gid, { userId: press.uid, channelId: cid, interaction, result: press.r.result, rollLine: press.r.rollLine, story: false,
+    input: `planted button (${press.face})`, context: `planted roll${press.dc ? ` vs DC ${press.dc}${press.secret ? ', hidden' : ''}` : ''}` });
+  if ((Number(getChar(gid, press.uid)?.rerolls_current) || 0) > 0) {
+    const token = rollHoldPut(gid, cid, 'planted', { ...press, open: [press.uid] });
+    return interaction.reply({ content: [plantedHead(press), press.r.rollLine, '', `⏳ Nothing lands yet — <@${press.uid}> may \u{1F501} **Reroll** or ✅ **Keep**.`].join('\n'),
+      components: [rollHoldRow(token)], allowedMentions: { users: [press.uid] } });
+  }
+  await interaction.reply({ content: plantedLines(press).join('\n'), allowedMentions: { users: [press.uid] } });
+  return notePlanted(interaction, gid, press);
+}
+// What a planted roll says as it lands.
+function plantedLines(press) {
+  const r = press.r;
+  if (press.chk) return [plantedHead(press), r.rollLine, r.passed ? '✅ **Passed.**' : '❌ **Failed.**'];
+  const res = r.result || {};
+  const faces = (res.rolls || []).join(', ');
+  const mod = res.modifier ? ` ${res.modifier > 0 ? '+' : ''}${res.modifier}` : '';
+  const verdict = press.dc && r.passed !== null ? (r.passed ? '\n✅ **Passed.**' : '\n❌ **Failed.**') : '';
+  return [`${plantedHead(press)} — [${faces}]${mod} = **${r.total}**${verdict}`];
+}
+// A planted roll into the run's record once it has landed.
+async function notePlanted(interaction, gid, press, { first = null } = {}) {
+  const r = press.r;
+  const dcWords = press.dc ? ` vs ${press.secret ? 'a hidden DC' : `DC ${press.dc}`}` : '';
+  await logButtonPress(interaction, gid, press.uid, `${press.chk ? press.face : press.dice} ${r.total}${dcWords}`, press.dc ? !!r.passed : null, { recap: true });
+  try {
+    const d = storyDiceOf({ result: r.result, total: r.total, line: r.rollLine, mode: r.mode });
+    if (d) {
+      const nm = await getDisplayName(interaction.guild, press.uid).catch(() => 'Someone');
+      Object.assign(d, { who: nm, uid: press.uid, npc: false, hide: false, label: press.chk ? press.face : null,
+        ...(press.dc ? { dc: press.dc, dcHidden: !!press.secret, passed: r.passed } : {}) });
+      if (first) { const f = storyDiceOf({ result: first.result, total: first.total, line: first.rollLine, mode: first.mode }); if (f) d.first = { kept: f.kept, dropped: f.dropped, total: f.total }; }
+      noteStoryDice(gid, interactionChannelId(interaction), d, { actor: press.uid });
+    }
+  } catch {}
+}
+// A group roll lands: the recap's line and the story's dice.
+async function landGroupRoll(interaction, gid, g, uid, r, { first = null } = {}) {
+  const face = g.dice || (g.stat === 'x' ? 'flat d20' : STAT_LABELS[g.stat]);
+  const passed = g.dc ? !!dcVerdict(r.nat, r.result?.sides ?? 20, r.total, g.dc) : null;
+  await logButtonPress(interaction, gid, uid, `group ${face} ${r.total}${g.dc ? ` vs DC ${g.dc}` : ''}`, passed, { recap: true });
+  try {
+    const d = storyDiceOf({ result: r.result, total: r.total, line: r.rollLine, mode: r.mode });
+    if (d) {
+      const nm = await getDisplayName(interaction.guild, uid).catch(() => 'Someone');
+      Object.assign(d, { who: nm, uid, npc: false, hide: false, label: `Group check (${face})`, ...(g.dc ? { dc: g.dc, passed } : {}) });
+      if (first) { const f = storyDiceOf({ result: first.result, total: first.total, line: first.rollLine, mode: first.mode }); if (f) d.first = { kept: f.kept, dropped: f.dropped, total: f.total }; }
+      noteStoryDice(gid, g.channel_id || interactionChannelId(interaction), d, { actor: uid });
+    }
+  } catch {}
+  return passed;
+}
+// A group roll kept or thrown again: its row first (the scoreboard reads
+// it), then the answer, then the record and the card.
+function landGroupHold(gid, v) {
+  const g = db.prepare('SELECT * FROM group_checks WHERE guild_id=? AND message_id=?').get(gid, v.mid) || null;
+  const r = v.r;
+  if (!g) return null;
+  const passed = g.dc ? (dcVerdict(r.nat, r.result?.sides ?? 20, r.total, g.dc) ? 1 : 0) : null;
+  db.prepare('UPDATE group_check_rolls SET total=?, nat=?, passed=?, held=0 WHERE guild_id=? AND message_id=? AND user_id=?')
+    .run(r.total, r.nat, passed, gid, v.mid, v.uid);
+  return g;
+}
+function groupHoldLines(g, v) {
+  const r = v.r;
+  if (!g) return [`\u{1F3B2} <@${v.uid}> — ${r.rollLine}`];
+  const face = g.dice || (g.stat === 'x' ? 'flat d20' : STAT_LABELS[g.stat]);
+  const passed = g.dc ? dcVerdict(r.nat, r.result?.sides ?? 20, r.total, g.dc) : null;
+  return [`\u{1F3B2} <@${v.uid}> — **${face}**${g.dc ? ` vs **DC ${g.dc}**` : ''}`, r.rollLine,
+    passed === null ? '' : passed ? '✅ **Passed.**' : '❌ **Failed.**'].filter(Boolean);
+}
+async function noteGroupHold(interaction, gid, h, g, v) {
+  try { await landGroupRoll(interaction, gid, g, v.uid, v.r, { first: v.first || null }); } catch {}
+  try {
+    const ch = await interaction.client.channels.fetch(g.channel_id || h.channel_id).catch(() => null);
+    const msg = await ch?.messages?.fetch?.(v.mid).catch(() => null);
+    if (msg?.edit) await msg.edit({ content: groupCheckBody(interaction.guild, gid, v.mid) }).catch(() => {});
+  } catch {}
+}
+// Call it: every roll still waiting stands as it fell. Its hold is taken
+// away and its row kept now; what it says is told once the card is called.
+function takeGroupHolds(gid, g) {
+  const out = [];
+  let rows = [];
+  try { rows = db.prepare("SELECT * FROM roll_holds WHERE guild_id=? AND kind='group'").all(gid); } catch {}
+  for (const row of rows) {
+    let v = null;
+    try { v = JSON.parse(row.payload || '{}'); } catch { v = null; }
+    if (!v || String(v.mid) !== String(g.message_id)) continue;
+    db.prepare('DELETE FROM roll_holds WHERE guild_id=? AND token=?').run(gid, row.token);
+    out.push(v);
+  }
+  db.prepare('UPDATE group_check_rolls SET held=0 WHERE guild_id=? AND message_id=?').run(gid, g.message_id);
+  return out;
+}
+
+async function logButtonPress(interaction, gid, uid, detail, passed, { recap = false } = {}) {
   try {
     const chId = interaction.channel?.id;
     const parentId = interaction.channel?.isThread?.() ? interaction.channel.parentId : null;
-    const q = db.prepare(`SELECT number FROM quests WHERE guild_id=? AND status='active'
+    // A paused run records nothing, its button presses too (audit, 2026-11-23).
+    const q = db.prepare(`SELECT number FROM quests WHERE guild_id=? AND status='active' AND COALESCE(paused,0)=0
                             AND (run_channel_id=? OR run_thread_id=? OR run_channel_id=?) LIMIT 1`)
       .get(gid, chId, chId, parentId || chId);
     if (!q) return;
     const nm = await getDisplayName(interaction.guild, uid).catch(() => 'Someone');
     const mark = passed === null ? '' : passed ? ' \u2014 passed' : ' \u2014 failed';
-    logQuestEvent(gid, q.number, 'roll', `${nm}: ${detail}${mark}`, uid);
+    // A planted or group roll's line is the recap's; the story takes its dice.
+    logQuestEvent(gid, q.number, 'roll', `${nm}: ${detail}${mark}`, uid, recap ? { parts: { recap: 1 } } : {});
   } catch {}
 }
 
@@ -35189,11 +36206,11 @@ function groupCheckBody(guild, gid, msgId) {
   ];
   if (!rolls.length) return [...head, '_Nobody has rolled yet._'].join('\n');
   const lines = rolls.map(r => {
-    const mark = r.passed === null ? '\u00b7' : (r.passed ? '\u2705' : '\u274c');
+    const mark = r.held ? '⏳' : r.passed === null ? '·' : (r.passed ? '✅' : '❌');
     const crit = r.nat === 20 ? ' \u{1F7E1}' : r.nat === 1 ? ' \u{1F534}' : '';
-    return `${mark} <@${r.user_id}> \u2014 **${r.total}**${crit}`;
+    return `${mark} <@${r.user_id}> — **${r.total}**${crit}${r.held ? ' _(may reroll)_' : ''}`;
   });
-  const passed = rolls.filter(r => r.passed).length;
+  const passed = rolls.filter(r => r.passed && !r.held).length;
   const tail = g.dc
     ? (g.closed
         ? [`\u2696\uFE0F **${passed} of ${rolls.length} made it.** ${passed === rolls.length ? 'A clean sweep.' : passed === 0 ? 'Nobody got through.' : passed > rolls.length / 2 ? 'Most of the party is through.' : 'Only a few got through.'}`]
@@ -36629,7 +37646,7 @@ const slashCommands = [
       return g; }),
 
   new SlashCommandBuilder()
-    .setName('session').setDescription('Work a run \u2014 seat, kick, rally, note, pause, complete; initiative and the turn clock (GM)')
+    .setName('session').setDescription('Work a run — seat, kick, rally, note, its cast and story; initiative and the turn clock (GM)')
     .addSubcommand(s=>s.setName('add').setDescription('Seat a player on this run')
       // Discord insists required options come first, so `user` leads here
       // now that `name` is optional.
@@ -36650,17 +37667,6 @@ const slashCommands = [
             .addStringOption(o=>o.setName('text').setDescription('The note').setRequired(true))
 .addStringOption(o=>o.setName('name').setDescription('The quest listing \u2014 blank in its own thread').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('pause').setDescription('Stop this run\'s clock')
-      .addStringOption(o=>o.setName('name').setDescription('The quest listing \u2014 blank in its own thread').setRequired(false).setAutocomplete(true))
-      .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('resume').setDescription('Start this run\'s clock again')
-      .addStringOption(o=>o.setName('name').setDescription('The quest listing \u2014 blank in its own thread').setRequired(false).setAutocomplete(true))
-      .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
-    .addSubcommand(s=>s.setName('complete').setDescription('Finish it \u2014 payout, chronicle, scroll; no summary drafts one from the log')
-      .addStringOption(o=>o.setName('name').setDescription('The quest listing \u2014 blank in its own thread').setRequired(false).setAutocomplete(true))
-      .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true))
-      .addStringOption(o=>o.setName('summary').setDescription('Your telling of it \u2014 blank offers one drafted from the log').setRequired(false))
-      .addStringOption(o=>o.setName('title').setDescription('A title every survivor earns').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s=>s.setName('show').setDescription('This run in full')
       .addStringOption(o=>o.setName('name').setDescription('The quest listing \u2014 blank in its own thread').setRequired(false).setAutocomplete(true))
       .addIntegerOption(o=>o.setName('run').setDescription('Which run \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)))
@@ -36783,13 +37789,7 @@ const slashCommands = [
     .addSubcommand(s=>s.setName('record').setDescription('One player\'s finished quests — what they have been on')
       .addUserOption(o=>o.setName('user').setDescription('Player (defaults to you)').setRequired(false)))
     .addSubcommandGroup(g => {
-      g.setName('run').setDescription('Running a quest — start to completion');
-      g.addSubcommand(s=>s.setName('start').setDescription('Mark a quest in progress, locking the party (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)));
-      g.addSubcommand(s=>s.setName('pause').setDescription('Stop the clock — the time so far is kept (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)));
-      g.addSubcommand(s=>s.setName('resume').setDescription('Start the clock again where it left off (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)));
+      g.setName('run').setDescription('A run’s record — notes, the recap, your telling, the timeline');
       g.addSubcommand(s=>s.setName('note').setDescription('Mark something on the quest log (GM)')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
       .addStringOption(o=>o.setName('text').setDescription('What happened').setRequired(true))
@@ -36804,15 +37804,6 @@ const slashCommands = [
       .addStringOption(o=>o.setName('text').setDescription('How it went, in your words').setRequired(true)));
       g.addSubcommand(s=>s.setName('timeline').setDescription('The full log of a quest so far')
       .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)));
-      g.addSubcommand(s=>s.setName('ready').setDescription('A ready check \u2014 a card with a tick per seated player (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true)));
-            g.addSubcommand(s=>s.setName('winddown').setDescription('The story is over \u2014 party rests while you settle rewards (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
-      .addBooleanOption(o=>o.setName('resume').setDescription('true = back to running').setRequired(false)));
-g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — award merits to the party (GM)')
-      .addIntegerOption(o=>o.setName('number').setDescription('Quest number').setRequired(true).setAutocomplete(true))
-      .addStringOption(o=>o.setName('summary').setDescription('Your telling of it, for the players\' chronicle').setRequired(false))
-      .addStringOption(o=>o.setName('title').setDescription('A title every survivor earns, e.g. Siren\'s Bane').setRequired(false).setAutocomplete(true)));
       return g;
     })
     .addSubcommand(s=>s.setName('handoff').setDescription('Hand this quest to another GM — they become its DM (GM)')
@@ -36865,7 +37856,8 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
     .setName('button').setDescription('Plant a button in this channel for players to press (GM)')
     .addSubcommand(s=>s.setName('roll').setDescription('Plant a roll anyone \u2014 or one named player \u2014 may press (GM)')
       .addStringOption(o=>o.setName('dice').setDescription('e.g. 2d6+1 \u2014 leave blank to roll a stat').setRequired(false))
-      .addIntegerOption(o=>o.setName('dc').setDescription('The number to beat \u2014 blank for a plain roll').setRequired(false).setMinValue(1).setMaxValue(40))
+      .addIntegerOption(o=>o.setName('dc').setDescription('The number to beat — blank for a plain roll').setRequired(false).setMinValue(1).setMaxValue(40))
+      .addBooleanOption(o=>o.setName('secret').setDescription('true = players do not see the DC; only you are told it').setRequired(false))
       .addStringOption(o=>o.setName('stat').setDescription('Roll this stat instead of dice').setRequired(false)
         .addChoices({name:'STR',value:'str'},{name:'CON',value:'con'},{name:'DEX',value:'dex'},{name:'WIS',value:'wis'},{name:'LCK',value:'lck'},{name:'Flat d20',value:'x'}))
       .addStringOption(o=>o.setName('reason').setDescription('The why of it \u2014 shown above the button').setRequired(false))
@@ -36992,7 +37984,6 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
       .addBooleanOption(o=>o.setName('record').setDescription('true = keep every message typed in its thread for the log').setRequired(false))
       .addStringOption(o=>o.setName('started').setDescription('An older quest: when it began, e.g. 12/09').setRequired(false))
       .addStringOption(o=>o.setName('played').setDescription('An older quest: time already played before the bot, e.g. 6h or 2h30m').setRequired(false)))
-    .addSubcommand(s=>s.setName('list').setDescription('Every run going right now, with its time so far'))
     .addSubcommandGroup(g => { g.setName('preset').setDescription('Saved scenes \u2014 start one in a single command (GM)');
       g.addSubcommand(x=>x.setName('save').setDescription('Save a scene: name, merits, and the monsters it summons (GM)')
         .addStringOption(o=>o.setName('name').setDescription('The scene, e.g. Bandits on the ridge').setRequired(true).setAutocomplete(true))
@@ -37001,6 +37992,42 @@ g.addSubcommand(s=>s.setName('complete').setDescription('Complete a quest — aw
       g.addSubcommand(x=>x.setName('list').setDescription('Every saved scene'));
       g.addSubcommand(x=>x.setName('remove').setDescription('Forget a scene (GM)')
         .addStringOption(o=>o.setName('name').setDescription('Which scene').setRequired(true).setAutocomplete(true)));
+      return g; }),
+  // /run time (T, 2026-11-23): a run's clock in one place, whatever opened
+  // it. Every leaf but list takes name: and run: as /session does, or
+  // nothing in the run's own room.
+  new SlashCommandBuilder()
+    .setName('run').setDescription('A run’s clock — start, pause, resume, wind down, end (GM)')
+    .addSubcommandGroup(g => {
+      g.setName('time').setDescription('The run clock — start, pause, resume, wind down, end, ready, adjust, show, list');
+      g.addSubcommand(s=>s.setName('start').setDescription('Start the clock and the record; a board quest starts, or launches under spin-off (GM)')
+        .addStringOption(o=>o.setName('name').setDescription('The run or quest listing \u2014 blank in its own room').setRequired(false).setAutocomplete(true))
+        .addIntegerOption(o=>o.setName('run').setDescription('Which run of a listing \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('pause').setDescription('Stop the clock \u2014 it lands forward on the quarter-hour (GM)')
+        .addStringOption(o=>o.setName('name').setDescription('The run or quest listing \u2014 blank in its own room').setRequired(false).setAutocomplete(true))
+        .addIntegerOption(o=>o.setName('run').setDescription('Which run of a listing \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('resume').setDescription('Start it again on the quarter-hour \u2014 a wound-down run too (GM)')
+        .addStringOption(o=>o.setName('name').setDescription('The run or quest listing \u2014 blank in its own room').setRequired(false).setAutocomplete(true))
+        .addIntegerOption(o=>o.setName('run').setDescription('Which run of a listing \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('winddown').setDescription('The story is over \u2014 the clock stops, the party rests while you settle rewards (GM)')
+        .addStringOption(o=>o.setName('name').setDescription('The run or quest listing \u2014 blank in its own room').setRequired(false).setAutocomplete(true))
+        .addIntegerOption(o=>o.setName('run').setDescription('Which run of a listing \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('end').setDescription('Finish it \u2014 payout, chronicle, story; no summary drafts one from the log (GM)')
+        .addStringOption(o=>o.setName('name').setDescription('The run or quest listing \u2014 blank in its own room').setRequired(false).setAutocomplete(true))
+        .addIntegerOption(o=>o.setName('run').setDescription('Which run of a listing \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true))
+        .addStringOption(o=>o.setName('summary').setDescription('Your telling of it \u2014 blank offers one drafted from the log').setRequired(false))
+        .addStringOption(o=>o.setName('title').setDescription('A title every survivor earns').setRequired(false).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('ready').setDescription('A ready check; the last tick gives you \u25B6\uFE0F Start if it has not started (GM)')
+        .addStringOption(o=>o.setName('name').setDescription('The run or quest listing \u2014 blank in its own room').setRequired(false).setAutocomplete(true))
+        .addIntegerOption(o=>o.setName('run').setDescription('Which run of a listing \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('adjust').setDescription('Correct the clock in 15-minute steps (GM)')
+        .addStringOption(o=>o.setName('by').setDescription('How far: +15m, -30m, +1h, -1h15m').setRequired(true))
+        .addStringOption(o=>o.setName('name').setDescription('The run or quest listing \u2014 blank in its own room').setRequired(false).setAutocomplete(true))
+        .addIntegerOption(o=>o.setName('run').setDescription('Which run of a listing \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('show').setDescription('This run\u2019s clock \u2014 running, paused, winding down or not started')
+        .addStringOption(o=>o.setName('name').setDescription('The run or quest listing \u2014 blank in its own room').setRequired(false).setAutocomplete(true))
+        .addIntegerOption(o=>o.setName('run').setDescription('Which run of a listing \u2014 blank means the latest active one').setRequired(false).setAutocomplete(true)));
+      g.addSubcommand(s=>s.setName('list').setDescription('Every run going, with its clock'));
       return g; }),
   new SlashCommandBuilder()
     .setName('campaign').setDescription('The long arc \u2014 quests, mini-quests and encounters under one name (GM)')
@@ -37061,7 +38088,7 @@ const HELP_CATEGORIES = {
       '**5 · Fights** — a GM opens one with `/fight start` and initiative sets the order. On your turn, tap a stat on the card (or `/fight atk stat:str`): with one foe it opens the form at once, with more a menu asks whom first. Every button — attack, defence, Grapple, Feint, Deflect, Disarm, the holds, Save, Insight — opens a short form, what you do and what you say, both optional; your words sit on the card. The defender answers with a stat of their own, either side may spend a token on 🔁 Reroll, and ⚖️ Resolve settles the exchange — a GM\'s press asks what happens. Every turn line carries everyone\'s HP. A quiet spell (ten minutes unless the GM sets otherwise) and the bot pings whoever the fight is waiting on, once a turn. When it all ends, a 🏁 result and a full recap post on their own.',
       '**6 · Duels** — `/duel opponent:@Players terms:first blood` raises one. A GM signs it off and starts the fight.',
       '**7 · Quests** — `/quest board` shows what\'s posted. Tap **Apply** on a quest post (or `/quest party apply number:N`), a GM approves the party, and merits pay out when it completes.',
-      '**Roleplay** — `/rp` opens the boxes the fight buttons do \u2014 what you do, what you say, and **Raw** for longer writing (`*action*` in asterisks, `"speech"` in quotes, each part posted on its own line in the order you write it) \u2014 with a **stat to roll** and any **dice** beside them, and posts it all in your name; `/rp action:… speech:… roll:… dice:…` skips the box. A stat roll answers a check the GM called on you there; `rr` rerolls an ordinary one. Every line, yours, the NPCs’ and the GM’s **Narration**, carries \u{1F4AC} **Reply**: the box again, as a reply that links back to the line. Inside a run your words go on its timeline and into the story \u2014 every word, under your name. Every roleplay box has Raw: the fight forms, a target\u2019s strike, a lost first turn. `/edit` fixes the words of a line of yours afterwards (the roll stays), `/edit delete:true` takes it back — the story follows either way.',
+      '**Roleplay** — `/rp` opens the boxes the fight buttons do \u2014 what you do, what you say, and **Raw** for longer writing (`*action*` in asterisks, `"speech"` in quotes, each part posted on its own line in the order you write it) \u2014 with a **stat to roll** and any **dice** beside them, and posts it all in your name; `/rp action:… speech:… roll:… dice:…` skips the box. A stat roll answers a check the GM called on you there; `rr` rerolls an ordinary one. Every line, yours, the NPCs’ and the GM’s **Narration**, carries ✍️ **RP** first — the box, for a line of your own — then \u{1F4AC} **Reply**: the box again, as a reply that links back to the line. Inside a run your words go on its timeline and into the story — every word, under your name, the rolls you make with them beneath. Every roleplay box has Raw: the fight forms, a target\u2019s strike, a lost first turn. `/edit` fixes the words of a line of yours afterwards (the roll stays), `/edit delete:true` takes it back — the story follows either way.',
       '**8 · Activities** — minigames written for this server: branching scenes with rolls and rewards. `/activity list` to browse, `/activity run name:Fishing` to start one here. When a scene asks for a roll, just type the stat word — `wis`, or `wis steady does it` to add flavour — and the story moves.',
       '**9 · Renown & merits** — renown is the coin quests, encounters and activities pay out; spend it as the server allows (`/standing renown view`). Merits are lifetime honour that only climbs, and ranks hang off them (`/standing merit view`, `/standing rank list`). You can offer merit to a friend with `/standing merit give` — a GM signs it off. GMs move the coin with `/standing renown gain/loss`.',
       '**10 · Death** — characters can fall. That call belongs to a GM: a memorial is posted, the sheet locks, and the fallen keep their history. Revival is possible when the story allows it.',
@@ -37164,7 +38191,7 @@ const HELP_CATEGORIES = {
       '🔁 **Reroll** / ✅ **Keep** — every fight roll you could reroll waits on you before it lands; Reroll costs a token, once a roll; the turn clock keeps it if you go quiet. No token, no wait · `/fight rr` · `/fight keep` · GMs add `npc:` for an NPC, on its own tokens',
       '`/fight resolve` — resolve a clash; in a fight with NPCs it is the GM\'s, and on the auto-pilot the bot lands it once you have kept or rerolled',
       '`/roll action:Grapple` \u2014 any fight move straight from `/roll`, the same menu as `/fight act`; `mode:` does not apply to a move, and the bot says so \u2014 `roll:` on `/fight act` carries advantage',
-      '🎭 **React** — after each exchange the one it was aimed at may say how they take it; the fight does not wait (GMs for an NPC)',
+      '🎭 **React** — after each exchange the one it was aimed at may say how they take it; the fight does not wait (GMs for an NPC). The line carries ✍️ RP, 💬 Reply and 🎭 GM like any roleplay line',
       'NPCs are enemies unless friendly: `friendly:` on `/fight start`, `/fight addnpc`, `/fight auto`, `/session npcs`; `/fight side npc: side:` moves one. A fight with NPCs ends when one side is all down; the auto-pilot never attacks its own side (GM)',
       'NPCs use every move a player can — `npc:` on any `/fight act`, or the 🎭 buttons on their card; the auto-pilot reaches for one now and then (`/config mechanics npcspecial`, 0 = never) (GM)',
       '`reveal:` on `/fight start`, `/fight addnpc`, `/fight side` — show or hide an NPC\'s HP to the players, over the server setting (GM)',
@@ -37268,7 +38295,7 @@ const HELP_CATEGORIES = {
       '`/standing rank remove name:X` — delete a rank (GM)',
       '`/standing title grant|revoke|list title:... user:@Players|npc:X [source:]` \u2014 titles earned on quests or granted by a GM; they show on the character page and the NPC sheet',
       '`/standing association add|remove|list group:... user:@Players|npc:X [note:]` \u2014 the companies and causes someone stands with; `list group:` names everyone in one',
-      '`/quest run complete number:N title:...` \u2014 every survivor earns the title, stamped with the quest it came from',
+      '`/run time end title:...` — every survivor earns the title, stamped with the quest it came from',
     ],
   },
   quests: {
@@ -37318,13 +38345,12 @@ const HELP_CATEGORIES = {
       '`/config channels questinstances channel:#forum` — every started quest opens its own thread there, DM and members pulled in (Admin)',
       '`/quest handoff number:N gm:@GMs` — pass a quest to another GM; they become its DM (GM)',
       '_The first GM to approve an applicant becomes that quest\'s DM. When approvals reach the party size, that DM is pinged once._',
-      '`/quest run start/note/pause/resume/timeline/complete` — the running of a quest: start the clock · log a detail · pause and resume · read the full log so far · finish and reward (GM)',
+      '`/run time start|pause|resume|winddown|end [name:] [run:]` — a run’s clock, whatever opened it; in its own room `name:` may be left blank. `start` begins the clock and the record — on a board quest it starts it, or launches a run under spin-off · `pause` and `resume` land the clock forward on the quarter-hour · `winddown` stops it while you settle rewards, and `resume` takes it back · `end [summary:] [title:]` pays out; leave `summary:` blank and one drafted from the log is offered (GM)',
       '`/quest instance number:N [label:]` — run your own copy: it keeps the original\'s number and adds which run it is — `#002.2-Testing the waters · Blackfen party` (GM)',
-      '`/quest run start number:N` — lock the party and mark in progress (GM)',
-      '`/quest run pause|resume number:N` \u2014 stop and restart the clock (a pause rounds it up to the quarter-hour); a paused run logs nothing until resumed',
+      '`/run time ready|adjust|show|list` — `ready` a ready check: a tick per seated player, and the last tick turns its button into ▶️ Start for you when the run has not started · `adjust by:+30m` corrects the clock in quarter-hour steps, never below nought · `show` a run’s clock and `list` every run going, both open to everyone. A paused run, one winding down and one not yet started record nothing (GM)',
       '`/quest run note number:N text:... kind:rp|combat|note [public:true]` \u2014 mark a moment in the run\'s account',
       '`/quest run timeline number:N` \u2014 the raw log \u00b7 `/quest run recap number:N [post:true]` \u2014 a "previously on\u2026" drafted from it, private until you post it (GM)',
-      '`/quest run winddown number:N [resume:true]` \u2014 the story is over but rewards are not settled: the run stays live, its party is released to the rests and free to join other quests, and anyone kicked now is still paid at completion. The run\u2019s room is shown, for everyone, the run hour by hour, the story so far as a PDF \u2014 every beat and every word said \u2014 and \u{1F4DD} Review this run; `resume:true` only says it runs again (GM)',
+      '`/run time winddown` — the story is over but rewards are not settled: the clock stops, the run stays live, its party is released to the rests and free to join other quests, and anyone kicked now is still paid at completion. The run’s room is shown, for everyone, the run hour by hour, the story so far as a PDF — every beat and every word said — and \u{1F4DD} Review this run; `/run time resume` runs it again (GM)',
       '`/quest run log number:N text:...` \u2014 your telling of a finished run, into each player\'s chronicle thread; rewrites edit in place (GM)',
       '`/quest archive number:N [summary:]` \u2014 the final shelf. Leave `summary:` blank and a box opens for the final word; it goes on the record, into the run\'s thread and the GM quest log, and marks the campaign card. A completed quest stays completed on everyone\'s record (GM)',
       '**\u21A9\uFE0F Reopen** \u2014 a completion message carries a Reopen button for five minutes: the payout is reversed, this run\'s titles revoked, the party released; fix it and complete again (GM)',
@@ -37332,18 +38358,18 @@ const HELP_CATEGORIES = {
       '`/gm check stalled` \u2014 what has stalled: winding-down runs, quiet encounters, staged parties never launched, idle campaigns, targets standing over a day, drafts, the week\u2019s reviews \u2014 each with the date it has stood since and a link to it. The GM forums carry the whole list: **gm-daily** at 08:00 each day, no ping, the day\u2019s restart reports beneath; **gm-weekly** each week with the week\u2019s activities; **gm-monthly** on the 1st with the month\u2019s figures and what has waited since before it \u2014 those two ping the GMs (GM)',
       '`/gm check usage` \u2014 sixty days of command use, quietest first \u2014 a report only; nothing is removed by it \u00b7 `/gm check rehearse` \u2014 a private sparring thread against a dummy the bot runs, to try new buttons before the table sees them (GM)',
       '`/help category:rules` \u2014 the live table rules, as the bot enforces them, for everyone. Every deploy posts **What\'s new** (the summary, then **In detail** beneath it) as a dated thread in the **gm-updates** forum, and the player half of the news in **updates** \u2014 the whole back-catalogue is there from the first boot; a day\'s entry that grows between two pushes is posted again whole. What each restart mended, the **Deploy mend**, goes beneath the day\'s list in **gm-daily**. Once a week the **chronicle** forum gets the players\' **Weekly chronicle**: quests completed, titles granted, fights won, the fallen, and the dice of the week (natural 20s and 1s, the biggest total) \u2014 nothing on a quiet week',
-      '`/session add|kick|rally|note|pause|resume|complete|show|thread [name:] [run:]` \u2014 work any run that is going, whatever opened it (a board run, an encounter, a chapter, an older quest), by NAME rather than number; leave `name:` blank inside its own thread. `add` seats (on an instance it is your word: a sheet and a pulse required) \u00b7 `kick` takes them out, still paid if the run is winding down \u00b7 `complete [summary:] [title:]` pays out; leave `summary:` blank and a summary drafted from the log is offered to use, edit or skip \u00b7 `thread` opens its room if it has none. `show` is open to everyone (GM)',
+      '`/session add|kick|rally|note|show|thread [name:] [run:]` — work any run that is going, whatever opened it (a board run, an encounter, a chapter, an older quest), by NAME rather than number; leave `name:` blank inside its own thread. `add` seats (on an instance it is your word: a sheet and a pulse required) · `kick` takes them out, still paid if the run is winding down · `thread` opens its room if it has none. `show` is open to everyone; the run’s clock is `/run time` (GM)',
       '`/initiative` or `/session initiative [players:] [npcs:Goblin x3, category:Bandits] [roll:Bot|Players] [signup:] [remind:] [skip:] [timeout:]` — a card here: players press 🙋 Join (`signup:false` takes only those named), 🎭 Add NPCs is yours (copies with `x3`, a whole category, or any name), and 🎲 Close & roll rolls d20 + DEX for everyone and sets the order \u2014 or with `roll:Players` each player presses \u{1F3B2} Roll (Join rolls you on the spot), the bot rolls the NPCs, and Close rolls for anyone left; with only those named, the last roll sets it, and with the bot rolling the order is set at once. Natural 20s go first and their first turn takes two \u2705 Dones; natural 1s go last and their first turn is \u{1F3AD} Roleplay \u2014 their words, then it passes; a level total goes to whoever rolled first. Each turn then gets a card pinging whoever it is, with ✅ Done (theirs or yours), ⏭️ Skip, ⏸️ Pause and 🏁 End, and the rounds are counted; a run going here keeps the order, each round and every skipped turn on its timeline. One order a channel, waiting while a fight runs there (GM)',
       '`/session npcs action:add npcs:Hollow, Ghoul [friendly:]` — the run\'s cast: they join its fights and its initiative unless `cast:false` · `remove`, `reveal`, `list` (GM)',
       '`/session summary [share:true] [filename:]` — the run so far as a PDF, without closing it: every beat and every word said, first to last, in numbered parts if it outgrows one file; `filename:` names the file and heads its first page; private unless shared (GM)',
+      'The story — the summary’s, the wind-down’s, the completion card’s — holds every public roll made in the run’s room: fight moves and what they came to, checks, planted and group buttons, targets, `/roll`, NPC and auto-pilot rolls, each under the words it was made with, its bonus and any advantage shown. The game’s lines are blue, a natural 20’s roll line green and a 1’s red; a page never cuts a post. A hidden DC reads “hidden DC”; with NPC stats hidden an NPC’s bonus stays out (the GM record shows it); secret GM rolls never go in (GM)',
       '`/session turn [action:] [who:]` — the order here: `show` for anyone, `next` (Done) for whoever\'s turn it is; `skip`, `back`, `pause`, `resume`, `close`, `add` (a newcomer rolls and takes their place by the same rule), `remove` and `end` are the GM\'s',
       '`/session clock [remind:] [skip:] [timeout:skip|auto] [reset:true]` — this channel\'s turn clock, for its fights and its initiative: minutes to the reminder (with ✍️ Still writing) and to the turn passing, 0 for never; `timeout:auto` has the bot attack for a quiet fighter instead of skipping them. Typing, a message or any press from the one it waits on holds the turn (GM)',
       '_One quest at a time: approving someone already seated on a live run prompts for a second press to override (audited), and a launch leaves them an applicant rather than double-booking them._',
-      '`/instance start name:... [as:] [merits:] [campaign:] [part:] [preset:] [record:true] [started:] [played:]` — open a run without the board: no listing, no applications. `as:` says what it is: **encounter** (the default) is a session on the fly; **chapter** is a numbered part of a campaign (`campaign:` needed, `part:` the next one if blank); **legacy** picks up a quest from before the bot (`started:` when it began, `played:` the time already played — `6h`, `2h30m` — banked into its clock) and pays only the merits you set. The bot lists every living character with HP and what is holding them; tick who is in it and press **Open** \u2014 it opens its own thread in quest-instances (where it was called if no forum is set), the party pulled in by mention. Nobody can join by themselves: `/session add` and `/session kick`. `/session complete` pays out, writes the chronicle and posts the review button. Instances do not count toward one-quest-at-a-time; each keeps a quest\u2019s clock \u2014 the hourly summary, the quarter-hour time check \u2014 and one left quiet six hours reminds the room and pings the GMs (GM)',
-      '`/instance start quest:N [record:true|false]` \u2014 adopt a board quest that is already running: it gets its room if it has none, and the recording switch. `record:true` keeps every message typed in the run\'s own thread for its log as table talk, every word, not only what goes through the bot — an edit corrects its line, a deletion takes it out; at completion it is in the story for everyone, under each speaker\'s name, and the raw transcript, as first typed, goes to the GMs; never re-posted by the hourly recap; typed rolls stay in the roll log, and a run with no thread of its own is not recorded; off by default · `/instance list` — every run going, its kind, where, and its time so far (GM)',
+      '`/instance start name:... [as:] [merits:] [campaign:] [part:] [preset:] [record:true] [started:] [played:]` — open a run without the board: no listing, no applications. `as:` says what it is: **encounter** (the default) is a session on the fly; **chapter** is a numbered part of a campaign (`campaign:` needed, `part:` the next one if blank); **legacy** picks up a quest from before the bot (`started:` when it began, `played:` the time already played — `6h`, `2h30m` — banked into its clock) and pays only the merits you set. The bot lists every living character with HP and what is holding them; tick who is in it and press **Open** \u2014 it opens its own thread in quest-instances (where it was called if no forum is set), the party pulled in by mention. Nobody can join by themselves: `/session add` and `/session kick`. It opens with its clock held at nought (an older quest at its played time) and records nothing — no talk, rolls or story — until `/run time start`; a fight or an initiative called in its room before then asks whoever called it to ✅ Confirm, off the record, or ✖️ Deny. `/run time end` pays out, writes the chronicle and posts the review button. Instances do not count toward one-quest-at-a-time, and one not yet started holds nobody out of the rests; each keeps a quest’s clock \u2014 the hourly summary, the quarter-hour time check \u2014 and one left quiet six hours reminds the room and pings the GMs (GM)',
+      '`/instance start quest:N [record:true|false]` \u2014 adopt a board quest that is already running: it gets its room if it has none, and the recording switch. `record:true` keeps every message typed in the run\'s own thread for its log as table talk, every word, not only what goes through the bot — an edit corrects its line, a deletion takes it out; at completion it is in the story for everyone, under each speaker\'s name, and the raw transcript, as first typed, goes to the GMs; never re-posted by the hourly recap; typed rolls stay in the roll log, and a run with no thread of its own is not recorded; off by default (GM) · `/run time list` — every run going, its kind, where, and its clock, open to everyone',
       '`/campaign create name:... [description:]` \u2014 the long arc: quests, mini-quests and encounters under one name, with a GM-only thread in the campaigns forum. `campaign:` on `/quest create` or `/instance start` links at birth (`as:chapter` numbers the parts); `/campaign add|remove` afterwards — `add part:N` makes an instance that numbered chapter, and a chapter unlinked is an encounter again. `note` for beats between runs, `status` for where things stand, `recap` across every run, `complete` to close it. Players get `/campaign show` \u2014 the premise, what is done, and their own part (GM)',
-      '`/quest run complete number:N` — finish it; merits auto-awarded, other rewards listed; the run\'s story rides on the card as a PDF on parchment \u2014 the party, the length, every beat and every word said in order, each speaker\'s lines under their name, your tale \u2014 in numbered parts if it outgrows one file (GM)',
-      '`/quest run ready number:N` \u2014 a ready check: one card with a tick per seated player and a \u2705 Ready button; each press turns their tick, the last says all ready and names you \u2014 and, if the run has not started, turns the button into \u25B6\uFE0F Start the run: your press is `/quest run start` (GM)',
+      '`/run time end` — finish it; merits auto-awarded, other rewards listed; the run\'s story rides on the card as a PDF on parchment \u2014 the party, the length, every beat and every word said in order, each speaker\'s lines under their name, your tale \u2014 in numbered parts if it outgrows one file (GM)',
       '`/quest delete number:N` — remove a quest (GM)',
     ],
   },
@@ -37371,7 +38397,7 @@ const HELP_CATEGORIES = {
       '`/npc show name:Hollow` — full stat block for one NPC',
       '`/npc hero name:X stat:str` — make an NPC a Hero with a signature stat (GM)',
       '`/npc say name:X speech:... [action:...] [raw:...] [to:...] [offer:Activity]` — speak or act as an NPC, no dice: action, speech, then who it is for, a blank line between; `raw:` posts exactly as typed. `to:` takes @people, a knight order or a group from `/standing association`, commas between, and completes as you type \u2014 every living player in a group is pinged, fifty at most. The box has **Raw** for longer writing (`*action*`, `"speech"`, each part on its own line in the order written), a **To** picker (up to twenty-five) and an **Interaction** dropdown; `@Name` in the words pings that person too; only people are ever pinged, never a role or everyone. `reply:` takes a message link and answers that line, the jump link on top (GM)',
-      '↳ Under every NPC line, and it stays there: 💬 **Reply** (anyone \u2014 the roleplay box as a reply that links back to the line; a GM\u2019s box has the To picker), 🎭 **GM** (the speak-as box), and 🎮 **Interaction** when you offered an activity on that line — it starts for whoever presses. `/npc edit name:X talk:Activity` sets the default pick (GM)',
+      '↳ Under every NPC line, and it stays there: ✍️ **RP** (anyone — the roleplay box, not as a reply), 💬 **Reply** (anyone — the roleplay box as a reply that links back to the line; a GM\u2019s box has the To picker), 🎭 **GM** (the speak-as box), and 🎮 **Interaction** when you offered an activity on that line — it starts for whoever presses. `/npc edit name:X talk:Activity` sets the default pick (GM)',
       '`/npc list category:Hollows` — list only one category\'s NPCs',
       '',
       '**Faces** — post a picture in the portrait forum:',
@@ -37397,10 +38423,10 @@ const HELP_CATEGORIES = {
     body: [
       '_Server wiring: roles, approvals, audits, rests, backups. Admins always count as GMs._',
       '`/gm effect name:Grenade wounds:2 user:@Players` (or `npc:`, or neither for a hazard of yours) — a card with 💥 Use: one roll (`stat:`, `roll:`) against everyone on the other side, or `targets:`/`npcs:`, or `pick:N`; `each:true` rolls per target; each target defends; in a fight it takes the holder\'s turn unless `uses_turn:false`; `uses:` for more than one (GM)',
-      'A check you call waits on the player\'s 🔁 Reroll or ✅ Keep when they hold a token, as `/deception` does',
+      'A check you call waits on the player\'s 🔁 Reroll or ✅ Keep when they hold a token, as `/deception` does; an NPC on it holding reroll tokens waits on yours — 🔁 its name (its own token, once) or ✅ Keep — and one with none lands at once (GM)',
       '`/gm dc target:@Players` (no `dc:`) — opens a writing window: the scene, the check line (`dex 14 hidden`; on 5e `stealth 14`, `dex save 13`), and an on-success and on-failure box that each take `[adv] [dis] [bare] [dex-1] [-3hp]` tags before the words (GM)',
 
-      '`/gm dc stat: dc: targets:@Artorius @Meliora` — call a check: each target gets a roll button, named NPCs roll at once. On 5e `stat:` is any of the six abilities or eighteen skills and `save:true` makes a saving throw, proficiency added where the sheet has it. `mode:` advantage, disadvantage or a bare d20 that strips stat and signature; `modifier:` adjusts the total; `flavour:` sets the scene; `secret:true` hides the DC, `reveal:@Players` whispers it to chosen eyes (GM)',
+      '`/gm dc stat: dc: targets:@Artorius @Meliora` — call a check: each target gets a roll button, named NPCs roll at once. On 5e `stat:` is any of the six abilities or eighteen skills and `save:true` makes a saving throw, proficiency added where the sheet has it. `mode:` advantage, disadvantage or a bare d20 that strips stat and signature; `modifier:` adjusts the total; `flavour:` sets the scene; `secret:true` hides the DC — the bot keeps it, not the button, and the recap and the story say “hidden DC” — `reveal:@Players` whispers it to chosen eyes (GM)',
 
       '↳ _Outcomes:_ `success_flavour:`/`fail_flavour:` are revealed with each result · `success_sanction:`/`fail_sanction:` shift a stat (`dex-1`) · `fail_damage:`/`success_damage:` cost HP · `on_success:`/`on_fail:` mark their next roll 🔼/🔽 anywhere, fight or free RP (🎭 flat stays a fight mark)',
 
@@ -37451,15 +38477,15 @@ const HELP_CATEGORIES = {
     blurb: 'buttons, targets, group checks, roleplay, narration, feedback, speaking as the bot',
     body: [
       '_Things a GM plants in the channel for the table to press, and the ways players talk back._',
-      '`/rp [action:] [speech:] [roll:] [dice:]` \u2014 roleplay as your character: bare opens the box (what you do, what you say \u2014 4,000 characters each \u2014 a stat to roll from this server\u2019s own, any dice); filled, it posts at once, a long one carried on into the next message with the roll beneath the last. The line goes out in your name and face, shaped as the cards are \u2014 *action*, \u201cspeech\u201d, then the roll beneath \u2014 and inside a run it is a \u{1F3AD} beat on the timeline and in the story scroll, the roll a roll in its log. A roll keeps the marks and signatures a typed one obeys, and `rr` rerolls it; a **stat roll answers a check the GM called on you here**, on the card\u2019s terms. Every line carries 💬 **Reply**, and beside it 🎭 **GM**: a GM answers the line as any NPC — those heard there lately first — the answer jumping back to it. A GM’s `/rp` also takes `to:` and its box a To picker; a player’s pings nobody. `/edit` fixes the words afterwards, `/edit delete:true` takes it back',
-      '`/button roll stat:dex dc:12 reason:...` \u2014 plant a check anyone may press; `dice:2d6+1` instead of a stat, `for:@Players` to address one person, `audience:@Artorius @Meliora @GMs` to address several players and/or a role (only they may press; the card names them all), `once:true` for one press each',
-      '`/button group stat:wis dc:12 reason:...` \u2014 one check the whole party rolls; the message keeps the tally and \u2696\uFE0F Call it closes it with how many got through (GM)',
+      '`/rp [action:] [speech:] [roll:] [dice:]` \u2014 roleplay as your character: bare opens the box (what you do, what you say \u2014 4,000 characters each \u2014 a stat to roll from this server\u2019s own, any dice); filled, it posts at once, a long one carried on into the next message with the roll beneath the last. The line goes out in your name and face, shaped as the cards are \u2014 *action*, \u201cspeech\u201d, then the roll beneath \u2014 and inside a run it is a \u{1F3AD} beat on the timeline and in the story scroll, the roll a roll in its log. A roll keeps the marks and signatures a typed one obeys, and `rr` rerolls it; a **stat roll answers a check the GM called on you here**, on the card\u2019s terms. Every line carries ✍️ **RP** — the box, for a line of your own — then 💬 **Reply**, and beside it 🎭 **GM**: a GM answers the line as any NPC — those heard there lately first — the answer jumping back to it. A GM’s `/rp` also takes `to:` and its box a To picker; a player’s pings nobody. `/edit` fixes the words afterwards, `/edit delete:true` takes it back',
+      '`/button roll stat:dex dc:12 reason:...` \u2014 plant a check anyone may press; `dice:2d6+1` instead of a stat, `for:@Players` to address one person, `audience:@Artorius @Meliora @GMs` to address several players and/or a role (only they may press; the card names them all), `once:true` for one press each, `secret:true` to hide the DC — the card says a **hidden DC** and only you are told the number. A presser holding a reroll token gets 🔁 Reroll (a token, once) or ✅ Keep before it lands; a GM may Keep for them (GM)',
+      '`/button group stat:wis dc:12 reason:...` \u2014 one check the whole party rolls; the message keeps the tally and ⚖️ Call it closes it with how many got through. A roller holding a token may 🔁 Reroll (once) or ✅ Keep before theirs counts — the tally marks it ⏳ — and Call it keeps any still waiting (GM)',
       '`/timer set [hours:] [minutes:] [seconds:] players:@Artorius @Players [note:]` \u2014 a countdown, 5 seconds to 24 hours: the card counts down with \u274C Cancel, and on time \u23F0 Time\u2019s up rings here, pinging the players and roles named, on the second \u2014 due while the bot was away, it rings on its return, marked late \u00b7 `/timer list` \u00b7 `/timer cancel number:` (GM)',
       '`/target create name:Barricade [dc:12] [stat:Flat d20, STR, DEX] [dice:2d6+1] [hp:3] [for:@Players] [audience:@Artorius @Meliora @GMs] [success_flavour:] [fail_flavour:] [write:true]` \u2014 something to strike, with no sheet. `for:` addresses one player, `audience:` several and/or a role \u2014 only they may swing, and the card names them. `hp:` is the hits it takes: with a DC a roll that meets it takes one off with no call, with no DC each pass you call does; it falls at 0. `write:true` opens a box for the scene and the two flavours instead of typing them into options. A d20 unless `dice:` says otherwise; `stat:` lists as few or as many stats as you like, one button each in that order \u2014 leave it out and all five are buttons; leave `dc:` out and every blow is your call. A press opens a short form \u2014 what they do, what they say, both optional \u2014 and the words land above the roll. A natural 20 beats it (**Roll critically succeeds**) and a natural 1 fails (**Roll critically fails**) on their own, each posting your flavour if set; anything else says **The roll succeeds / fails** and asks you \u2014 **The player passes the check** / **The player fails the check** \u2014 each opening a *What happens?* form prefilled with your flavour (blank still sends the verdict). A fail posts the card again below with its buttons and a counter; `secret:true` asks in the GM log and tells the players **Roll succeeds / fails** in theirs \u00b7 `/target list` \u2014 what stands here, with a \u{1FAA6} button per target to retire it without a swing',
       '`/dd message:... [header:] [user:@Players] [channels:#one #two]` \u2014 speak AS THE BOT: plain words by default, a bold header only if you write one, in every channel you name (or here); leave `message:` blank for a box of paragraphs — however long, it goes on in the next message; who said it goes to the roll-audit, not the room (GM)',
-      '`/narrate [text:] [to:]` — live narration: posted as **Narration** under the bot\u2019s picture, with \u{1F4AC} Reply under it like a `/rp` line; bare, it opens a box for paragraphs (4,000) with a To picker of twenty-five; `to:` takes @people, a group or a knight order, commas between, and completes as you type. In a run\u2019s room it goes on that run\u2019s record as narration, recording on or off \u2014 the story, the timeline, the hourly recap, the drafts. In the story it stands on its own as prose, or under `0h 12m - Narration` with `/config mechanics narrator enabled:true` (GM)',
+      '`/narrate [text:] [to:]` — live narration: posted as **Narration** under the bot\u2019s picture, with ✍️ RP and \u{1F4AC} Reply under it like a `/rp` line; bare, it opens a box for paragraphs (4,000) with a To picker of twenty-five; `to:` takes @people, a group or a knight order, commas between, and completes as you type. In a run\u2019s room it goes on that run\u2019s record as narration, recording on or off \u2014 the story, the timeline, the hourly recap, the drafts. In the story it stands on its own as prose, or under `0h 12m - Narration` with `/config mechanics narrator enabled:true` (GM)',
       '**Edit (DDice)** \u2014 long-press any message the bot sent \u2192 Apps \u2192 Edit (DDice): the text opens prefilled, save replaces it, the roll-audit records what changed. Covers the bot\'s own messages and NPC speech from `/npc say` alike; a line said through a webhook that has since been deleted cannot be edited by anyone \u2014 delete it and say it again (GM)',
-      '`/edit [delete:true]` \u2014 the same box without the Apps menu: a dropdown only you see lists the last 25 lines the bot and its NPCs said here, newest first; pick one and the text opens prefilled; `delete:true` takes the picked line down instead. `link:` a message link or id goes straight to it. Nothing shows in the channel. Players get the same for their own `/rp` lines. A line carrying only Reply, GM or Interaction is listed and keeps its buttons; a player sees only their own words \u2014 the roll beneath and the reply link stay the bot\u2019s. A post carried on into several messages is one post: every part opens in one form, and `delete:true` takes every part down. A narration, `/rp` or NPC line fixed or taken down is fixed or taken out of the run\u2019s story too; one deleted in Discord itself leaves it as well',
+      '`/edit [delete:true]` \u2014 the same box without the Apps menu: a dropdown only you see lists the last 25 lines the bot and its NPCs said here, newest first; pick one and the text opens prefilled; `delete:true` takes the picked line down instead. `link:` a message link or id goes straight to it. Nothing shows in the channel. Players get the same for their own `/rp` lines. A line carrying only RP, Reply, GM or Interaction is listed and keeps its buttons; a player sees only their own words \u2014 the roll beneath and the reply link stay the bot\u2019s. A post carried on into several messages is one post: every part opens in one form, and `delete:true` takes every part down. A narration, `/rp` or NPC line fixed or taken down is fixed or taken out of the run\u2019s story too; one deleted in Discord itself leaves it as well',
       '`/feedback send [room:] [quest:]` \u2014 name a room to go straight to the form, or leave it blank for a menu; score it out of ten, say your piece; only GMs see it. Name a run you were on (or ran) and the card says which',
       '`/feedback category add|remove|list` \u2014 the rooms feedback lands in (GM) \u00b7 `/button feedback` plants a standing feedback button',
       '_A completed run posts its own \u{1F4DD} review button in its thread, and so does a wind-down \u2014 for those who played the run, seated or since departed, one review each; `/quest show` then carries the count, the average \u2b50 and the latest lines._',
@@ -37593,11 +38619,13 @@ async function routeButton(interaction) {
     if (interaction.customId.startsWith('actvw:')) return handleWriterButton(interaction);
     if (interaction.customId.startsWith('npcx:')) return handleNpcInteractButton(interaction);
     if (interaction.customId.startsWith('npcreply:')) return handleNpcReplyButton(interaction);
+    if (interaction.customId === 'rpnew') return handleRpNewButton(interaction);
     if (interaction.customId === 'rpreply') return handleRpReplyButton(interaction);
     if (interaction.customId === 'rpnpc') return handleRpNpcButton(interaction);
     if (interaction.customId.startsWith('npctalk:')) return handleNpcTalkButton(interaction);
     if (interaction.customId.startsWith('loreok:') || interaction.customId.startsWith('loreno:')) return handleLoreButton(interaction);
     if (interaction.customId.startsWith('tradeok:') || interaction.customId.startsWith('tradeno:')) return handleMeritTradeButton(interaction);
+    if (interaction.customId.startsWith('offrec:')) return handleOffRecordButton(interaction);
     if (interaction.customId.startsWith('revive:')) return handleReviveButton(interaction);
     if (/^duel(join|out|send|cancel|ok|no):/.test(interaction.customId)) return handleDuelButton(interaction);
     if (interaction.customId.startsWith('qready:')) {
@@ -37609,7 +38637,7 @@ async function routeButton(interaction) {
       const all = db.prepare('SELECT COUNT(*) AS c FROM quest_ready WHERE guild_id=? AND number=?').get(gidQ, quest.number).c >= party.length;
       // The last tick turns the card's button into the GM's Start (T, 2026-10-15).
       const { ActionRowBuilder: QR2, ButtonBuilder: QB2, ButtonStyle: QS2 } = require('discord.js');
-      const rowDone = all && quest.status !== 'active'
+      const rowDone = all && (quest.status !== 'active' || isUnstarted(quest))
         ? [new QR2().addComponents(new QB2().setCustomId(`qstart:${quest.number}`).setLabel('\u25B6\uFE0F Start the run').setStyle(QS2.Primary))]
         : undefined;
       return interaction.update({ content: await questReadyCard(interaction.guild, gidQ, quest),
@@ -37617,14 +38645,14 @@ async function routeButton(interaction) {
         allowedMentions: all && quest.gm_id ? { users: [quest.gm_id] } : { parse: [] } });
     }
     if (interaction.customId.startsWith('qstart:')) {
-      // The ready card's Start: /quest run start for the GM, no number to type.
+      // The ready card's Start: /run time start for the GM, nothing to type.
       // The cheap refusals come before the button goes, so a refused press
       // leaves it to press again (audit, 2026-10-15).
       const number = parseInt(interaction.customId.split(':')[1], 10);
       if (!(await isGm(interaction.guild, interaction.user.id))) return interaction.reply({ content: '\u274C Only a GM starts the run.', ephemeral: true });
       const qs = getQuest(interaction.guild.id, number);
       if (!qs) return interaction.reply({ content: '\u274C That run is gone.', ephemeral: true });
-      if (qs.status === 'active') return interaction.reply({ content: `\u274C **${questTag(qs)}** is already running.`, ephemeral: true });
+      if (qs.status === 'active' && !isUnstarted(qs)) return interaction.reply({ content: `❌ **${questTag(qs)}** is already running.`, ephemeral: true });
       if (qs.status === 'completed') return interaction.reply({ content: '\u274C That quest is already completed.', ephemeral: true });
       if (!getQuestMembers(interaction.guild.id, number, 'party').length) return interaction.reply({ content: '\u274C No party members yet \u2014 approve applicants first.', ephemeral: true });
       try { await interaction.message?.edit?.({ components: [] }); } catch {}
@@ -37959,7 +38987,7 @@ async function routeButton(interaction) {
       sendRollAudit(interaction.client, gidR, `\u21A9\uFE0F **${gmR}** reopened ${questTag(q)}: ${snap.merits || 0} merits reversed for ${(snap.party || []).length}${snap.title ? `, title \u201c${snap.title}\u201d revoked` : ''}`);
       try { await interaction.message.edit({ components: [] }); } catch {}
       return interaction.reply({ allowedMentions: { parse: [] },
-        content: `\u21A9\uFE0F **${questTag(q)}** reopened by **${gmR}** \u2014 payout reversed, party released. Fix it, then \`/quest run complete\` again.` });
+        content: `\u21A9\uFE0F **${questTag(q)}** reopened by **${gmR}** \u2014 payout reversed, party released. Fix it, then \`/run time end\` again.` });
     }
 
     if (interaction.customId.startsWith('encgo:') || interaction.customId.startsWith('encno:')) {
@@ -37984,33 +39012,55 @@ async function routeButton(interaction) {
 
       if (interaction.customId === 'grpclose') {
         if (!(await isGm(interaction.guild, uidG)))
-          return interaction.reply({ ephemeral: true, content: '\u274C Only a GM calls it.' });
+          return interaction.reply({ ephemeral: true, content: '❌ Only a GM calls it.' });
+        // A roll still waiting on its Reroll or Keep stands as it fell (T, 2026-11-23).
+        const waitingG = takeGroupHolds(gidG, g);
         db.prepare('UPDATE group_checks SET closed=1 WHERE guild_id=? AND message_id=?').run(gidG, mid);
-        return interaction.update({ content: groupCheckBody(interaction.guild, gidG, mid), components: [] });
+        await interaction.update({ content: groupCheckBody(interaction.guild, gidG, mid), components: [] });
+        for (const v of waitingG) { try { await landGroupRoll(interaction, gidG, g, v.uid, v.r, { first: v.first || null }); } catch {} }
+        try {
+          const all = db.prepare('SELECT * FROM group_check_rolls WHERE guild_id=? AND message_id=?').all(gidG, mid);
+          const faceC = g.dice || (g.stat === 'x' ? 'flat d20' : STAT_LABELS[g.stat]);
+          if (all.length) noteStoryOutcome(gidG, g.channel_id || interactionChannelId(interaction), [`Group check (${faceC}${g.dc ? ` vs DC ${g.dc}` : ''}) called — ${g.dc ? `${all.filter(x => x.passed).length} of ${all.length} made it` : `${all.length} rolled`}`]);
+        } catch {}
+        return;
       }
 
       if (g.closed) return interaction.reply({ ephemeral: true, content: '\u274C That check has been called.' });
       const had = db.prepare('SELECT 1 FROM group_check_rolls WHERE guild_id=? AND message_id=? AND user_id=?').get(gidG, mid, uidG);
       if (had) return interaction.reply({ ephemeral: true, content: '\u274C You have had your roll \u2014 one each.' });
 
-      let total, nat = null, passed = null, sidesG = 20;
+      let rG;
+      const argsG = { stat: g.stat === 'x' ? null : g.stat, dc: g.dc || 10, flat: g.stat === 'x' };
       if (g.dice) {
         const r = rollNotation(g.dice);
-        if (!r) return interaction.reply({ ephemeral: true, content: '\u274C That expression no longer reads.' });
-        total = r.total; nat = r.rolls[0] ?? null; sidesG = r.sides;
+        if (!r) return interaction.reply({ ephemeral: true, content: '❌ That expression no longer reads.' });
+        rG = plantedDiceRoll(r, g.dc || null);
       } else {
         const ch = getChar(gidG, uidG);
         if (!ch) return interaction.reply({ ephemeral: true, content: forSystem(gidG, '❌ You need a character sheet — `/char create`.') });
-        const r = rollDcCheck({ gid: gidG, stat: g.stat === 'x' ? null : g.stat, dc: g.dc || 10, flat: g.stat === 'x', subject: ch, sig: ch });
-        if (!r) return interaction.reply({ ephemeral: true, content: '\u274C That check would not roll.' });
-        total = r.total; nat = r.nat;
+        rG = rollDcCheck({ gid: gidG, ...argsG, subject: ch, sig: ch });
+        if (!rG) return interaction.reply({ ephemeral: true, content: '❌ That check would not roll.' });
+        rG.args = argsG;
       }
-      if (g.dc) passed = dcVerdict(nat, sidesG, total, g.dc) ? 1 : 0;
-      db.prepare(`INSERT INTO group_check_rolls (guild_id, message_id, user_id, total, nat, passed, at)
-                  VALUES (?,?,?,?,?,?,?)`).run(gidG, mid, uidG, total, nat, passed, Date.now());
-      await logButtonPress(interaction, gidG, uidG, `group ${g.dice || (g.stat === 'x' ? 'flat d20' : STAT_LABELS[g.stat])} ${total}${g.dc ? ` vs DC ${g.dc}` : ''}`, passed === null ? null : !!passed);
+      const sidesG = rG.result?.sides ?? 20;
+      const passed = g.dc ? (dcVerdict(rG.nat, sidesG, rG.total, g.dc) ? 1 : 0) : null;
+      // A roller with a reroll token waits on their Reroll or Keep (T, 2026-11-23).
+      const held = (Number(getChar(gidG, uidG)?.rerolls_current) || 0) > 0 ? 1 : 0;
+      db.prepare(`INSERT INTO group_check_rolls (guild_id, message_id, user_id, total, nat, passed, at, held)
+                  VALUES (?,?,?,?,?,?,?,?)`).run(gidG, mid, uidG, rG.total, rG.nat, passed, Date.now(), held);
+      const faceG = g.dice || (g.stat === 'x' ? 'flat d20' : STAT_LABELS[g.stat]);
+      recordRoll(gidG, { userId: uidG, channelId: interactionChannelId(interaction), interaction, result: rG.result, rollLine: rG.rollLine,
+        input: `group check (${faceG})`, context: `group check${g.dc ? ` vs DC ${g.dc}` : ''}`, story: false });
       // The message itself is the scoreboard, so everyone watches it fill.
-      return interaction.update({ content: groupCheckBody(interaction.guild, gidG, mid), components: interaction.message.components });
+      await interaction.update({ content: groupCheckBody(interaction.guild, gidG, mid), components: interaction.message.components });
+      if (!held) await landGroupRoll(interaction, gidG, g, uidG, rG);
+      if (held) {
+        const tokenG = rollHoldPut(gidG, interactionChannelId(interaction), 'group', { mid, uid: uidG, chk: g.dice ? 0 : 1, dice: g.dice || null, dc: g.dc || null, r: rG, open: [uidG] });
+        await interaction.followUp({ content: [`\u{1F3B2} <@${uidG}> — **${faceG}**${g.dc ? ` vs **DC ${g.dc}**` : ''}`, rG.rollLine, '',
+          `⏳ Nothing lands yet — <@${uidG}> may \u{1F501} **Reroll** or ✅ **Keep**.`].join('\n'), components: [rollHoldRow(tokenG)], allowedMentions: { users: [uidG] } }).catch(() => {});
+      }
+      return;
     }
 
     if (interaction.customId.startsWith('gmbar:')) return pressGmBar(interaction, interaction.customId.slice(6));
@@ -38080,7 +39130,10 @@ async function routeButton(interaction) {
       // …:<dc>:<once>:<owner> on both kinds now.
       const ownerSlot = parts[parts.length - 1];
       const once = parts[parts.length - 2] === '1';
-      const pressDc = parseInt(parts[parts.length - 3], 10) || 0;
+      // A hidden DC is read back from the table (T, 2026-11-23).
+      const slotB = dcSlotOf(gidB, parts[parts.length - 3]);
+      if (slotB.lost) return interaction.reply({ ephemeral: true, content: HIDDEN_DC_LOST });
+      const pressDc = slotB.dc || 0;
       // 'list' \u2014 several players or a role; the list sits under the message id.
       const owner = ownerSlot === 'list'
         ? (db.prepare('SELECT owners FROM button_audience WHERE guild_id = ? AND message_id = ?').get(gidB, interaction.message.id)?.owners || 'any')
@@ -38094,27 +39147,18 @@ async function routeButton(interaction) {
         const stat = parts[1], dc = pressDc;
         const ch = getChar(gidB, uidB);
         if (!ch) return interaction.reply({ ephemeral: true, content: forSystem(gidB, '❌ You need a character sheet — `/char create`.') });
-        const r = rollDcCheck({ gid: gidB, stat: stat === 'x' ? null : stat, dc, flat: stat === 'x', subject: ch, sig: ch });
-        if (!r) return interaction.reply({ ephemeral: true, content: '\u274C That check would not roll.' });
+        const args = { stat: stat === 'x' ? null : stat, dc, flat: stat === 'x' };
+        const r = rollDcCheck({ gid: gidB, ...args, subject: ch, sig: ch });
+        if (!r) return interaction.reply({ ephemeral: true, content: '❌ That check would not roll.' });
+        r.args = args;
         const face = stat === 'x' ? 'flat d20' : STAT_LABELS[stat];
-        await logButtonPress(interaction, gidB, uidB, `${face} ${r.total}${dc ? ` vs DC ${dc}` : ''}`, dc ? r.passed : null);
-        return interaction.reply({ content: [
-          `\u{1F3AF} <@${uidB}> \u2014 **${face}**${dc ? ` vs **DC ${dc}**` : ''}`,
-          r.rollLine,
-          r.passed ? '\u2705 **Passed.**' : '\u274C **Failed.**',
-        ].join('\n'), allowedMentions: { users: [uidB] } });
+        return pressPlanted(interaction, gidB, { uid: uidB, chk: 1, stat, dice: null, dc, secret: slotB.hidden ? 1 : 0, face, r });
       }
 
       const dice = parts[1];
       const rolled = rollNotation(dice);
-      if (!rolled) return interaction.reply({ ephemeral: true, content: '\u274C That expression no longer reads.' });
-      const faces = rolled.rolls.join(', ');
-      const mod = rolled.modifier ? ` ${rolled.modifier > 0 ? '+' : ''}${rolled.modifier}` : '';
-      const passedDice = dcVerdict(rolled.rolls[0] ?? null, rolled.sides, rolled.total, pressDc || null);
-      const verdict = passedDice === null ? '' : (passedDice ? '\n\u2705 **Passed.**' : '\n\u274C **Failed.**');
-      await logButtonPress(interaction, gidB, uidB, `${dice} = ${rolled.total}${pressDc ? ` vs DC ${pressDc}` : ''}`, pressDc ? rolled.total >= pressDc : null);
-      return interaction.reply({ content: `\u{1F3B2} <@${uidB}> rolled **${dice}**${pressDc ? ` vs **DC ${pressDc}**` : ''} \u2014 [${faces}]${mod} = **${rolled.total}**${verdict}`,
-        allowedMentions: { users: [uidB] } });
+      if (!rolled) return interaction.reply({ ephemeral: true, content: '❌ That expression no longer reads.' });
+      return pressPlanted(interaction, gidB, { uid: uidB, chk: 0, stat: null, dice, dc: pressDc, secret: slotB.hidden ? 1 : 0, face: dice, r: plantedDiceRoll(rolled, pressDc || null) });
     }
 
     if (interaction.customId.startsWith('fbq:')) {
@@ -38296,7 +39340,7 @@ async function handleInteraction(interaction) {
         return await interaction.respond(acShape(getAssocs(acGid, acSubject()).map(a => a.name))).catch(() => {});
       if (acCmd === 'standing' && acGrp === 'association' && acSub === 'add' && focusedOption.name === 'group')
         return await interaction.respond(acShape(assocGroupNames(acGid), { free: true })).catch(() => {});
-      if (focusedOption.name === 'title' && ((acCmd === 'quest' && acSub === 'complete') || (acCmd === 'session' && acSub === 'complete')))
+      if (focusedOption.name === 'title' && acCmd === 'run' && acSub === 'end')
         return await interaction.respond(acShape(db.prepare('SELECT DISTINCT title FROM subject_titles WHERE guild_id=? ORDER BY title').all(acGid).map(r => r.title), { free: true })).catch(() => {});
       if (acCmd === 'instance' && acGrp === 'preset' && acSub === 'save' && focusedOption.name === 'npcs') {
         const mons = db.prepare('SELECT name FROM library_monsters WHERE guild_id=? ORDER BY name').all(acGid).map(r => r.name);
@@ -38377,7 +39421,7 @@ async function handleInteraction(interaction) {
       // /session name: the listings, shown as "Name · #012" with the
       // NUMBER as the value, so twins can never ambiguate. run: that
       // listing's runs newest-first, values are run_seq.
-      if (interaction.commandName === 'session' && focusedOption.name === 'name') {
+      if ((interaction.commandName === 'session' || interaction.commandName === 'run') && focusedOption.name === 'name') {
         // What is running comes first, each with its kind's mark.
         const v = String(focusedOption.value || '').toLowerCase();
         const gidS = interaction.guild.id;
@@ -38385,7 +39429,7 @@ async function handleInteraction(interaction) {
         const ls = db.prepare('SELECT * FROM quests WHERE guild_id=? AND instance_of IS NULL ORDER BY number DESC').all(gidS)
           .filter(q => (q.name || '').toLowerCase().includes(v))
           .sort((a, b) => (live.has(b.number) ? 1 : 0) - (live.has(a.number) ? 1 : 0)).slice(0, 25)
-          .map(q => ({ name: `${isEncounter(q) ? `${instanceIcon(q)} ` : ''}${q.name} · #${String(q.number).padStart(3, '0')}${live.has(q.number) ? ' · running' : ''}`.slice(0, 100), value: String(q.number) }));
+          .map(q => ({ name: `${isEncounter(q) ? `${instanceIcon(q)} ` : ''}${q.name} · #${String(q.number).padStart(3, '0')}${live.has(q.number) ? (Number(q.unstarted) ? ' · not started' : ' · running') : ''}`.slice(0, 100), value: String(q.number) }));
         return await interaction.respond(ls);
       }
       // /session turn who: those in this channel's order first (to remove),
@@ -38398,7 +39442,7 @@ async function handleInteraction(interaction) {
         for (const n of getAllNpcs(gidW)) if (!n.died_at && !inIt.some(e => e.name === n.name)) optsW.push({ name: `🎭 ${n.name}`.slice(0, 100), value: String(n.name).slice(0, 100) });
         return await interaction.respond(optsW.filter(x => !typedW || x.name.toLowerCase().includes(typedW)).slice(0, 25));
       }
-      if (interaction.commandName === 'session' && focusedOption.name === 'run') {
+      if ((interaction.commandName === 'session' || interaction.commandName === 'run') && focusedOption.name === 'run') {
         const picked = resolveListingByName(interaction.guild.id, interaction.options.getString('name') || '');
         if (picked.err) return await interaction.respond([]);
         const runs = db.prepare('SELECT number, run_seq, name, status FROM quests WHERE guild_id=? AND instance_of=? ORDER BY run_seq DESC')
@@ -38410,13 +39454,11 @@ async function handleInteraction(interaction) {
         const sub = interaction.options.getSubcommand(false);
         let quests = listQuests(interaction.guild.id);
         if (sub === 'apply') quests = quests.filter(q => q.status === 'open');
-        else if (sub === 'start') quests = quests.filter(q => q.status === 'open');
-        else if (sub === 'complete') quests = quests.filter(q => q.status !== 'completed');
         const v = String(focusedOption.value).toLowerCase();
         const choices = quests
           .filter(q => questTag(q).toLowerCase().includes(v) || String(q.number).includes(v))
           .slice(0, 25)
-          .map(q => ({ name: `${questTag(q)} · ${questStatusBadge(q.status)}`.slice(0, 100), value: q.number }));
+          .map(q => ({ name: `${questTag(q)} · ${questStatusBadge(q.status, q)}`.slice(0, 100), value: q.number }));
         return await interaction.respond(choices);
       }
 
@@ -38973,7 +40015,9 @@ async function handleInteraction(interaction) {
         try {
           const who = p.npc || await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'Someone');
           const segsM = rpFormSegs(interaction);
-          noteQuestActivity(gidM, cidM, 'rp', `${who}: ${segsBeat(segsM)}`, interaction.user.id, { parts: { who, segs: segsForLog(interaction.guild, segsM) } });
+          const links = noteQuestActivity(gidM, cidM, 'rp', `${who}: ${segsBeat(segsM)}`, interaction.user.id, { parts: { who, segs: segsForLog(interaction.guild, segsM) } });
+          // The roll this form throws rides under its words in the story (T, 2026-11-23).
+          if (links && Object.keys(links).length) interaction.ddiceRpLinks = links;
         } catch {}
       }
       switch (p.kind) {
@@ -39028,7 +40072,8 @@ async function handleInteraction(interaction) {
           // into the run's record above, with every other form's.
           if (!flavour) return interaction.reply({ ephemeral: true, content: '\u{1F3AD} Nothing written \u2014 the button is still there.' });
           const whoD = p.npc ? `${p.npc} \u{1F3AD}` : await getDisplayName(interaction.guild, interaction.user.id).catch(() => 'Someone');
-          await interaction.reply({ content: `\u{1F3AD} **${whoD}**\n${flavour}`, allowedMentions: { parse: [] } });
+          // A roleplay line like any other: RP, Reply and GM under it (T, 2026-11-23).
+          await interaction.reply({ content: `\u{1F3AD} **${whoD}**\n${flavour}`, components: [rpLineRow()], allowedMentions: { parse: [] } });
           try {
             const had = interaction.message?.components || [];
             const left = had.filter(r => !(r.components || []).some(c => String(c.customId ?? c.data?.custom_id ?? '').startsWith('fdrp:')));
@@ -39283,6 +40328,7 @@ async function handleInteraction(interaction) {
       if (sg === 'title' || sg === 'association') return await handleTitles(interaction, sg);
     }
     if (interaction.commandName === 'session') return await handleSession(interaction);
+    if (interaction.commandName === 'run') return await handleRunTime(interaction);
     if (interaction.commandName === 'initiative') return await handleSessionInitiative(interaction);
     if (interaction.commandName === 'dd') return await handleDd(interaction);
     if (interaction.commandName === 'narrate') return await handleNarrate(interaction);

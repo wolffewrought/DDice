@@ -386,7 +386,7 @@ function makeInteraction(over = {}) {
       getChannel: (n) => opts[n] || null,
       getAttachment: () => null,
       getFocused: () => ({ name: opts._focused || 'name', value: opts._focusedValue || '' }),
-      data: [],
+      data: probeOptionData(opts),
     },
     fields: { getTextInputValue: (n) => (over.fields || {})[n] ?? '',
       // discord.js 14.27: a modal's user picker, read back as a Collection of users; a string select as its values
@@ -407,6 +407,15 @@ function makeInteraction(over = {}) {
   return i;
 }
 const norm = (p) => (typeof p === 'string' ? { content: p } : (p || {}));
+// discord.js keeps what was typed as data: the group, the leaf, its options
+// (build U: the off-the-record replay reads it back).
+function probeOptionData(opts) {
+  const leaves = Object.entries(opts).filter(([k]) => !k.startsWith('_'))
+    .map(([name, value]) => ({ name, value, type: typeof value === 'boolean' ? 5 : typeof value === 'number' ? 4 : 3 }));
+  if (opts._sub && opts._group) return [{ type: 2, name: opts._group, options: [{ type: 1, name: opts._sub, options: leaves }] }];
+  if (opts._sub) return [{ type: 1, name: opts._sub, options: leaves }];
+  return leaves;
+}
 // Discord's 2,000 on an interaction's answers too (build Q).
 const tooLong = (p) => { const c = norm(p).content; if (typeof c === 'string' && c.length > 2000) throw new Error(`Invalid Form Body: content: Must be 2000 or fewer in length (${c.length}).`); };
 const client = new FakeClient();
@@ -803,9 +812,10 @@ async function fire(over) {
     ok('the ticked player is seated by the press', seatedP?.state === 'party', `state ${seatedP?.state}`);
     ok('the room carries the card and the party is pulled in by mention', !!roomP && sent.some(x => x.channel === roomP.id && /<@U2>/.test(x.content))
       && sent.some(x => x.channel === roomP.id && /merits each at the end/.test(x.content)));
-    ok('one pointer line lands where the command was run', sent.some(x => x.channel === 'C1' && /has begun/.test(x.content) && x.content.includes(`<#${roomP?.id}>`)));
+    ok('one pointer line lands where the command was run', sent.some(x => x.channel === 'C1' && /is open/.test(x.content) && x.content.includes(`<#${roomP?.id}>`)));
     const before = dbHandle.prepare("SELECT merits FROM characters WHERE guild_id='G1' AND user_id='U2'").get()?.merits ?? 0;
-    await press('session complete (pays 3)', { commandName: 'session', options: { _sub: 'complete', summary: 'They scattered.' }, channel: roomP });
+    await press('run time start (the preset run)', { commandName: 'run', options: { _group: 'time', _sub: 'start' }, channel: roomP });
+    await press('run time end (pays 3)', { commandName: 'run', options: { _group: 'time', _sub: 'end', summary: 'They scattered.' }, channel: roomP });
     const paid = dbHandle.prepare("SELECT merits FROM characters WHERE guild_id='G1' AND user_id='U2'").get()?.merits ?? 0;
     ok('completion pays the preset merits', paid - before === 3, `delta ${paid - before}`);
     await press('qreopen press (5-min undo)', { isButton: true, customId: `qreopen:${enc2.number}`, message: { id: 'M6', content: '', components: [], edit: async () => {} } });
@@ -859,7 +869,8 @@ async function fire(over) {
       dbHandle.prepare(`INSERT OR REPLACE INTO quest_members (guild_id, number, user_id, state) VALUES ('G1', 900, 'U2', 'applied')`).run();
       const r2 = await press('approve U2 elsewhere while 901 winds down', { commandName: 'quest', options: { _group: 'party', _sub: 'approve', number: 902, user: 'U2' } });
       ok('a winding-down seat does not block another quest', !/Seat them anyway/.test(JSON.stringify(r2.replies)));
-      await press('session complete',         { commandName: 'session', options: { _sub: 'complete', summary: 'They fled.' }, channel: roomW });
+      await press('run time start (the ridge)', { commandName: 'run', options: { _group: 'time', _sub: 'start' }, channel: roomW });
+      await press('run time end',             { commandName: 'run', options: { _group: 'time', _sub: 'end', summary: 'They fled.' }, channel: roomW });
       const after = dbHandle.prepare("SELECT status FROM quests WHERE guild_id='G1' AND number=?").get(enc.number);
       ok('ending an encounter completes it', after?.status === 'completed', `status ${after?.status}`);
     }
@@ -956,7 +967,7 @@ async function fire(over) {
   if (dbHandle && registered.length) {
     // /gm scroll opens its writing window before any await (a deferred
     // interaction cannot show a modal), so its gate is on the submit — probed below.
-    const OPEN_ON_PURPOSE = new Set(['/instance list', '/instance preset list', '/session show', '/session turn', '/campaign show', '/campaign list', '/npc sheet', '/gm scroll']);
+    const OPEN_ON_PURPOSE = new Set(['/run time list', '/run time show', '/instance preset list', '/session show', '/session turn', '/campaign show', '/campaign list', '/npc sheet', '/gm scroll']);
     const byName = new Map();
     for (const body of registered) for (const c of body) byName.set(c.name, c);
     const plain = 'U7';
@@ -1376,7 +1387,10 @@ async function fire(over) {
     Math.random = () => 0.5;
     const pressed = planted ? await fire({ isButton: true, customId: idsOf(planted)[0], message: planted, userId: 'U2' }).catch(e => ({ replies: [{ content: 'THREW ' + e.message }] })) : null;
     Math.random = realRandom;
-    const pressedSaid = pressed ? pressed.replies.map(x => x.content || '').join(' ') : '';
+    let pressedSaid = pressed ? pressed.replies.map(x => x.content || '').join(' ') : '';
+    // Build U: a presser with a reroll token waits on Reroll or Keep; Keep lands it.
+    const keepPlanted = pressed ? pressed.replies.flatMap(r => (r.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''))).find(id => /^rhold:keep:/.test(id)) : null;
+    if (keepPlanted) { const kp = await fire({ isButton: true, customId: keepPlanted, message: pressed.replies[0], userId: 'U2' }); pressedSaid += ' ' + kp.replies.map(x => x.content || '').join(' '); }
     ok('a planted stat button: a die of 11 plus the stat against DC 10 is "Passed", not a NaN fail', !!planted && /\*\*Passed\.\*\*/.test(pressedSaid) && !/NaN/.test(pressedSaid), pressedSaid.slice(0, 120) || 'no planted button');
     const sentBeforeGrp = sent.length;
     await fire({ commandName: 'button', options: { _sub: 'group', stat: 'str', dc: 10, reason: 'Probe ford' }, userId: 'U1' });
@@ -1500,13 +1514,13 @@ async function fire(over) {
     // 3 · the ready check
     dbHandle.prepare(`INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, gm_id, started_at) VALUES ('G1', 910, 'Probe Tale', 'active', 'quest', ?, 'C1', 'U1', ?)`).run(Date.now(), Date.now());
     for (const u of ['U1', 'U2']) dbHandle.prepare("INSERT OR REPLACE INTO quest_members (guild_id, number, user_id, state) VALUES ('G1', 910, ?, 'party')").run(u);
-    const rdy = await fire({ commandName: 'quest', options: { _group: 'run', _sub: 'ready', number: 910 }, userId: 'U1' });
+    const rdy = await fire({ commandName: 'run', options: { _group: 'time', _sub: 'ready', name: '910' }, userId: 'U1' });
     const rdyCard = rdy.replies[0] || {};
     const rdyMsg = { id: nextId(), content: rdyCard.content || '', components: rdyCard.components || [], edit: async () => {} };
     const q3 = await fire({ isButton: true, customId: 'qready:910', message: rdyMsg, userId: 'U3' });
     const q2 = await fire({ isButton: true, customId: 'qready:910', message: rdyMsg, userId: 'U2' });
     const q1 = await fire({ isButton: true, customId: 'qready:910', message: rdyMsg, userId: 'U1' });
-    ok('/quest run ready: a tick per seated player, a stranger turned away, each press re-draws the card, the last says all ready and names the GM',
+    ok('/run time ready: a tick per seated player, a stranger turned away, each press re-draws the card, the last says all ready and names the GM',
       /ready check/.test(rdyCard.content || '') && ((rdyCard.content || '').match(/⬜ <@U/g) || []).length === 2 && idsOf(rdyCard).includes('qready:910')
         && /seated party/.test(saidOf(q3)) && /✅ <@U2>/.test(saidOf(q2)) && /1 of 2/.test(saidOf(q2)) && /All 2 ready/.test(saidOf(q1)) && /<@U1>/.test(saidOf(q1)),
       `${(rdyCard.content || '').replace(/\s+/g, ' ').slice(0, 80)} · U3 ${saidOf(q3).slice(0, 40)} · U2 ${saidOf(q2).replace(/\s+/g, ' ').slice(0, 70)} · U1 ${saidOf(q1).replace(/\s+/g, ' ').slice(-70)}`);
@@ -1520,7 +1534,7 @@ async function fire(over) {
     const rpRows = dbHandle.prepare("SELECT text FROM quest_events WHERE guild_id='G1' AND number=910 AND kind='rp'").all().map(r => r.text);
     ok('the words from a target strike go into the running quest\'s chronicle as story',
       rpRows.some(t => /topples the idol/.test(t) && /“Down you go”/.test(t)), rpRows.join(' | ').slice(0, 160) || 'no rp rows');
-    const done = await fire({ commandName: 'quest', options: { _group: 'run', _sub: 'complete', number: 910, summary: 'They toppled the idol and went home.' }, userId: 'U1' });
+    const done = await fire({ commandName: 'run', options: { _group: 'time', _sub: 'end', name: '910', summary: 'They toppled the idol and went home.' }, userId: 'U1' });
     const storyAtt = done.replies.flatMap(x => x.files || []).find(f => /story\.pdf$/.test(f?.b?.name || ''));
     const storyBuf = storyAtt?.a;
     let woven = null; try { woven = JSON.parse(storyBuf.slice(storyBuf.indexOf('DDICESCROLLv1') + 13).toString('utf8')); } catch {}
@@ -1793,7 +1807,7 @@ async function fire(over) {
     // 5 · the ready check's last tick grows a Start button; the GM's press starts the run
     dbHandle.prepare(`INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, gm_id) VALUES ('G1', 912, 'Probe Ready', 'open', 'quest', ?, 'C1', 'U1')`).run(Date.now());
     for (const u of ['U1', 'U2']) dbHandle.prepare("INSERT OR REPLACE INTO quest_members (guild_id, number, user_id, state) VALUES ('G1', 912, ?, 'party')").run(u);
-    const rdyC = await fire({ commandName: 'quest', options: { _group: 'run', _sub: 'ready', number: 912 }, userId: 'U1' });
+    const rdyC = await fire({ commandName: 'run', options: { _group: 'time', _sub: 'ready', name: '912' }, userId: 'U1' });
     const rdyMsgC = { id: nextId(), content: rdyC.replies[0]?.content || '', components: rdyC.replies[0]?.components || [], edit: async () => {} };
     await fire({ isButton: true, customId: 'qready:912', message: rdyMsgC, userId: 'U2' });
     const lastTick = await fire({ isButton: true, customId: 'qready:912', message: rdyMsgC, userId: 'U1' });
@@ -2250,6 +2264,9 @@ async function fire(over) {
       if (!key) return { r0, room: null, row: null };
       await fire({ isSelect: true, customId: menu.customId, values: users, message: { id: nextId(), content: 'x', components: [] }, userId: 'U1', channel: chanH });
       await fire({ isButton: true, customId: `encgo:${key}`, message: { id: nextId(), content: 'x', components: [] }, userId: 'U1', channel: chanH });
+      const held = dbHandle.prepare("SELECT number FROM quests WHERE guild_id='G1' AND kind='encounter' ORDER BY number DESC LIMIT 1").get();
+      // An instance opens held (build U): this walk's runs are played, so each starts.
+      if (held) await fire({ commandName: 'run', options: { _group: 'time', _sub: 'start', name: String(held.number) }, userId: 'U1', channel: chanH });
       const row = dbHandle.prepare("SELECT * FROM quests WHERE guild_id='G1' AND kind='encounter' ORDER BY number DESC LIMIT 1").get();
       // The room is the run's own thread \u2014 a campaign card may open a thread of its own on the way.
       return { r0, room: row?.run_thread_id ? channelsById.get(row.run_thread_id) || null : null, row };
@@ -2286,22 +2303,22 @@ async function fire(over) {
       lg.row?.instance_kind === 'legacy' && lg.row?.merit_reward === 0 && lg.row?.legacy_since === '12/09' && /^🗝️ /.test(lg.room?.name || '')
         && /Picked up from before the bot · begun 12\/09/.test(cardL) && /no merits unless you set them/.test(saidOf(lg.r0)),
       `${lg.row?.instance_kind} merits ${lg.row?.merit_reward} since ${lg.row?.legacy_since} · ${lg.room?.name} · ${saidOf(lg.r0).slice(0, 120)}`);
-    const listH = await fire({ commandName: 'instance', options: { _sub: 'list' }, userId: 'U1', channel: chanH });
-    ok('/instance list shows every run going with its mark and its time so far', /📖 \*\*/.test(saidOf(listH)) && /🗝️ \*\*/.test(saidOf(listH)) && /Part 2 of/.test(saidOf(listH)) && /⏱️ \d+h \d\dm/.test(saidOf(listH)), saidOf(listH).slice(0, 200));
+    const listH = await fire({ commandName: 'run', options: { _group: 'time', _sub: 'list' }, userId: 'U1', channel: chanH });
+    ok('/run time list shows every run going with its mark and its clock', /📖 \*\*/.test(saidOf(listH)) && /🗝️ \*\*/.test(saidOf(listH)) && /Part 2 of/.test(saidOf(listH)) && /running, \*\*\d+h \d\dm\*\*/.test(saidOf(listH)), saidOf(listH).slice(0, 200));
 
     // 2 · /session by name: the leaves that answered "No quest #null" now reach the run
     const nNote = await fire({ commandName: 'session', options: { _sub: 'note', name: 'The Drowned Bell', text: 'They found the bell.' }, userId: 'U1', channel: chanH });
     const nShow = await fire({ commandName: 'session', options: { _sub: 'show', name: 'The Drowned Bell' }, userId: PLAIN, member: plainM, channel: chanH });
     const nRally = await fire({ commandName: 'session', options: { _sub: 'rally', name: 'The Drowned Bell' }, userId: 'U1', channel: chanH });
-    const nPause = await fire({ commandName: 'session', options: { _sub: 'pause', name: 'The Drowned Bell' }, userId: 'U1', channel: chanH });
+    const nPause = await fire({ commandName: 'run', options: { _group: 'time', _sub: 'pause', name: 'The Drowned Bell' }, userId: 'U1', channel: chanH });
     const pausedL = qrow(lg.row?.number)?.paused;
-    const nResume = await fire({ commandName: 'session', options: { _sub: 'resume', name: 'The Drowned Bell' }, userId: 'U1', channel: chanH });
+    const nResume = await fire({ commandName: 'run', options: { _group: 'time', _sub: 'resume', name: 'The Drowned Bell' }, userId: 'U1', channel: chanH });
     const nPlain = await fire({ commandName: 'session', options: { _sub: 'note', name: 'The Drowned Bell', text: 'sneaky' }, userId: PLAIN, member: plainM, channel: chanH });
     const nTypo = await fire({ commandName: 'session', options: { _sub: 'note', name: 'The Drownd Bel', text: 'typo' }, userId: 'U1', channel: chanH });
     ok('a mistyped name in a shared channel is an error, not the newest run there', /No listing|not found|No quest/i.test(saidOf(nTypo)) && !evs(lg.row?.number, 'note').some(t => /typo/.test(t)), saidOf(nTypo).slice(0, 80));
     const inRoom = lg.room ? await fire({ commandName: 'session', options: { _sub: 'note', text: 'Said in the room.' }, userId: 'U1', channel: lg.room }) : { replies: [] };
     const allSaid = [nNote, nShow, nRally, nPause, nResume, inRoom].map(saidOf).join(' | ');
-    ok('/session note, show, rally, pause and resume reach an instance by name; in its thread no name is needed; show is anyone\'s, the rest the GM\'s',
+    ok('/session note, show and rally, and /run time pause and resume, reach an instance by name; in its thread no name is needed; show is anyone\'s, the rest the GM\'s',
       !/No quest #null|no runs yet/.test(allSaid) && evs(lg.row?.number, 'note').some(t => /They found the bell/.test(t)) && evs(lg.row?.number, 'note').some(t => /Said in the room/.test(t))
         && /Drowned Bell/.test(saidOf(nShow)) && pausedL === 1 && qrow(lg.row?.number)?.paused === 0 && /Only GMs work a run/.test(saidOf(nPlain)) && !evs(lg.row?.number, 'note').some(t => /sneaky/.test(t)),
       `${allSaid.replace(/\s+/g, ' ').slice(0, 260)} · paused ${pausedL}→${qrow(lg.row?.number)?.paused} · plain ${saidOf(nPlain).slice(0, 40)}`);
@@ -2494,22 +2511,22 @@ async function fire(over) {
         `${JSON.stringify(evs(c1.row.number, 'roll'))} · ${JSON.stringify(lineT?.content)}`);
     }
 
-    // 11 · /session complete with no summary offers one drafted from the log: use, edit, or none
-    const endL = await fire({ commandName: 'session', options: { _sub: 'complete', name: 'The Drowned Bell' }, userId: 'U1', channel: chanH });
+    // 11 · /run time end with no summary offers one drafted from the log: use, edit, or none
+    const endL = await fire({ commandName: 'run', options: { _group: 'time', _sub: 'end', name: 'The Drowned Bell' }, userId: 'U1', channel: chanH });
     const endIds = idsOf(endL.replies[0]);
     const keyL = (endIds.find(id => id.startsWith('sessend:edit:')) || '').split(':')[2];
     const editL = keyL ? await fire({ isButton: true, customId: `sessend:edit:${keyL}`, message: { id: nextId(), content: '', components: [] }, userId: 'U1', channel: chanH }) : { replies: [] };
     const doneL = keyL ? await fire({ isModal: true, customId: `sessendform:${keyL}`, fields: { summary: 'The bell rang once, and was still.' }, userId: 'U1', channel: chanH }) : { replies: [] };
-    ok('/session complete with no summary drafts one from the log \u2014 the beats, not the seating \u2014 and Edit opens it prefilled; the save completes the run',
+    ok('/run time end with no summary drafts one from the log \u2014 the beats, not the seating \u2014 and Edit opens it prefilled; the save completes the run',
       /drafted from the log/.test(saidOf(endL)) && /They found the bell/.test(saidOf(endL)) && !/is seated/.test(saidOf(endL)) && ['sessend:use:', 'sessend:edit:', 'sessend:none:'].every(p => endIds.some(id => id.startsWith(p)))
         && modalOf(editL) === `sessendform:${keyL}` && /They found the bell/.test(modalFieldsOf(editL).summary || '') && qrow(lg.row?.number)?.status === 'completed' && /complete/.test(saidOf(doneL)),
       `${saidOf(endL).replace(/\s+/g, ' ').slice(0, 160)} · ${modalOf(editL)} · ${qrow(lg.row?.number)?.status}`);
-    const endC2 = await fire({ commandName: 'session', options: { _sub: 'complete', name: 'The Bridge Falls' }, userId: 'U1', channel: chanH });
+    const endC2 = await fire({ commandName: 'run', options: { _group: 'time', _sub: 'end', name: 'The Bridge Falls' }, userId: 'U1', channel: chanH });
     const useKey = (idsOf(endC2.replies[0]).find(id => id.startsWith('sessend:use:')) || '');
     const plainUse = useKey ? await fire({ isButton: true, customId: useKey, message: { id: nextId(), content: '', components: [] }, userId: PLAIN, member: plainM, channel: chanH }) : { replies: [] };
     // Nothing logged on that one but its start: it simply ends.
     ok('a run with nothing to tell simply completes, no draft offered', !useKey ? qrow(c2.row?.number)?.status === 'completed' : /another GM/.test(saidOf(plainUse)), `${saidOf(endC2).slice(0, 80)} · ${useKey}`);
-    const endC1 = await fire({ commandName: 'session', options: { _sub: 'complete', name: 'The Ford Holds' }, userId: 'U1', channel: chanH });
+    const endC1 = await fire({ commandName: 'run', options: { _group: 'time', _sub: 'end', name: 'The Ford Holds' }, userId: 'U1', channel: chanH });
     const useC1 = idsOf(endC1.replies[0]).find(id => id.startsWith('sessend:use:'));
     const usedC1 = useC1 ? await fire({ isButton: true, customId: useC1, message: { id: nextId(), content: '', components: [] }, userId: 'U1', channel: chanH }) : { replies: [] };
     const again = useC1 ? await fire({ isButton: true, customId: useC1, message: { id: nextId(), content: '', components: [] }, userId: 'U1', channel: chanH }) : { replies: [] };
@@ -2617,7 +2634,7 @@ async function fire(over) {
         && /Running now/.test(headerA) && /The Long Siege — 2h 3\dm/.test(headerA) && /\d+ runs? · \d+h \d\dm\*\* in all/.test(headerA),
       `${JSON.stringify(cfgA)} · ${archThreads.map(t => t.name).join(',')} · filed ${filedN} · ${headerA.replace(/\s+/g, ' ').slice(0, 260)} · ${saidOf(setA).slice(0, 80)}`);
     before = sent.length;
-    const end951 = await fire({ commandName: 'session', options: { _sub: 'complete', name: 'Long Road', summary: 'They reached the city walls.' }, userId: 'U1', channel: chanI });
+    const end951 = await fire({ commandName: 'run', options: { _group: 'time', _sub: 'end', name: 'Long Road', summary: 'They reached the city walls.' }, userId: 'U1', channel: chanI });
     for (let i = 0; i < 4; i++) await settle();
     // The run's home is its own thread, so the story posts there, review button and all \u2014 the talk inside it (build R).
     const pubPost = sent.slice(before).filter(x => x.channel === room951?.id).map(x => x.msg).find(m => (m.files || []).length);
@@ -5452,13 +5469,13 @@ async function fire(over) {
     for (const [at, kind, text] of [[600000, 'rp', 'Ash: we hold the stair'], [1200000, 'combat', 'A rat bites Ash'], [1500000, 'remind', 'Time check — 0h 25m'], [1800000, 'talk', 'brb tea'], [7800000, 'note', 'The cellar door gives']])
       dbHandle.prepare("INSERT INTO quest_events (guild_id, number, at_ms, kind, text, wall_at) VALUES ('G1', 977, ?, ?, ?, ?)").run(at, kind, text, startW + at);
     n0 = markQ();
-    const wd = await gmQ({ commandName: 'quest', options: { _group: 'run', _sub: 'winddown', number: 977 } });
+    const wd = await gmQ({ commandName: 'run', options: { _group: 'time', _sub: 'winddown', name: '977' } });
     await settle();
     const wdMsgs = newIn('CQW', n0);
     const wdText = wdMsgs.map(m => m.content).join('\n');
     const wdLast = wdMsgs[wdMsgs.length - 1];
     const iH1 = wdText.indexOf('\u{1F4FB} **Hour 1**'), iH2 = wdText.indexOf('\u{1F4FB} **Hour 2** — _quiet, nothing logged._'), iH3 = wdText.indexOf('\u{1F4FB} **Hour 3** (so far)');
-    ok('/quest run winddown answers the GM, then posts in the run’s room for all: the run hour by hour in order — a quiet hour said, the last one so far, the clock’s lines and table talk left out — then the story so far and 📝 Review this run',
+    ok('/run time winddown answers the GM, then posts in the run’s room for all: the run hour by hour in order — a quiet hour said, the last one so far, the clock’s lines and table talk left out — then the story so far and 📝 Review this run',
       /is winding down/.test(saidOf(wd)) && wd.replies[0]?.ephemeral === true
         && /is winding down\. The story is told/.test(wdText) && /The run, hour by hour/.test(wdText)
         && iH1 >= 0 && iH2 > iH1 && iH3 > iH2 && wdText.indexOf('Ash: we hold the stair') > iH1 && wdText.indexOf('A rat bites Ash') < iH2 && wdText.indexOf('The cellar door gives') > iH3
@@ -5467,7 +5484,7 @@ async function fire(over) {
         && dbHandle.prepare("SELECT winding_down FROM quests WHERE guild_id='G1' AND number=977").get().winding_down === 1,
       `${flat1(saidOf(wd)).slice(0, 80)} · ${wdMsgs.length} msgs · ${flat1(wdText).slice(0, 600)} · files ${(wdLast?.files || []).length} [${idsOf(wdLast)}]`);
     n0 = markQ();
-    const wr = await gmQ({ commandName: 'quest', options: { _group: 'run', _sub: 'winddown', number: 977, resume: true } });
+    const wr = await gmQ({ commandName: 'run', options: { _group: 'time', _sub: 'resume', name: '977' } });
     const wrMsgs = newIn('CQW', n0);
     ok('resumed, the room is told the run goes on — no summaries, no review',
       /running again/.test(saidOf(wr)) && wrMsgs.length === 1 && /running again/.test(wrMsgs[0].content) && !/hour by hour/.test(wrMsgs[0].content),
@@ -6128,6 +6145,470 @@ async function fire(over) {
     const threwT = loggedT.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
     console.error = realErrT;
     ok('nothing in the T walk threw', threwT.length === 0, threwT.slice(0, 3).join('\n        '));
+  }
+
+  // ── Build U (2026-11-23): every roll in the story — the dice, the bonus,
+  // advantage, the outcome — coloured as the game's lines; a hidden DC kept
+  // off the buttons and out of the room's recap; Reroll and Keep on planted
+  // and group rolls and for NPCs on a called check; ✍️ RP on every
+  // roleplay line ──
+  if (dbHandle) {
+    const realErrU = console.error; const loggedU = [];
+    console.error = (...a) => { loggedU.push(a.map(x => (x && x.stack) ? x.stack.split('\n').slice(0, 2).join(' | ') : String(x)).join(' ')); };
+    const realFetchU = guild.members.fetch;
+    const realRandU = Math.random;
+    try {
+      const saidOf = (r) => (r?.replies || []).map(x => x.content || '').join('\n');
+      const modalOf = (r) => (r?.replies || []).find(x => x.modal)?.modal || null;
+      const idsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+      const idsIn = (r) => (r?.replies || []).flatMap(x => idsOf(x));
+      const settle = async () => { for (let i = 0; i < 80; i++) await new Promise(r => setImmediate(r)); };
+      const sinceIn = (cid, n) => sent.slice(n).filter(x => x.channel === cid).map(x => x.msg);
+      const woven = (buf) => { try { const b = Buffer.from(buf); return JSON.parse(b.slice(b.indexOf('DDICESCROLLv1') + 13).toString('utf8')); } catch { return null; } };
+      const filesOf = (r) => (r?.replies || []).flatMap(x => x.files || []);
+      const flatU = (t) => String(t || '').replace(/\s+/g, ' ');
+      const withDice = async (nats, fn) => {
+        const q = nats.map(n => (n - 0.5) / 20);
+        Math.random = () => (q.length ? q.shift() : 0.525);
+        try { const r = await fn(); await settle(); return r; } finally { Math.random = realRandU; }
+      };
+      const UA = '100000000000000601', UB = '100000000000000602';
+      const plainU = (id) => ({ id, displayName: `user${id}`, roles: { cache: new Map() }, permissions: { has: () => false } });
+      guild.members.fetch = async (uid) => { const mb = await realFetchU(uid); if (uid === UA || uid === UB) { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+      const putCharU = (id, { str = 4, dex = 3, rr = 0 } = {}) => dbHandle.prepare("INSERT OR REPLACE INTO characters (guild_id, user_id, str, con, dex, wis, lck, hp_current, rerolls_current) VALUES ('G1', ?, ?, 5, ?, 3, 1, 12, ?)").run(id, str, dex, rr);
+      const putNpcU = (name, { str = 5, dex = 3, rr = 0 } = {}) => dbHandle.prepare("INSERT OR REPLACE INTO npcs (guild_id, name, str, con, dex, wis, lck, hp_current, rerolls_current) VALUES ('G1', ?, ?, 4, ?, 1, 2, 8, ?)").run(name, str, dex, rr);
+      putCharU(UA); putCharU(UB);
+      putNpcU('Uhollow'); putNpcU('Utank', { rr: 2 });
+      dbHandle.prepare("UPDATE guild_config SET npc_stats_visible=0, npc_special=0 WHERE guild_id='G1'").run();
+      const chU = new FakeChannel('CU1', 0, 'u-walk', guild); chU.guildId = 'G1'; channelsById.set('CU1', chU);
+      const tU = Date.now() - 600000;
+      dbHandle.prepare("INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, gm_id, started_at, record_all, paused) VALUES ('G1', 993, 'Abyss Road', 'active', 'quest', ?, 'CU1', 'U1', ?, 0, 0)").run(tU, tU);
+      const evU = (kind = null) => dbHandle.prepare(`SELECT * FROM quest_events WHERE guild_id='G1' AND number=993${kind ? ' AND kind=?' : ''} ORDER BY id`).all(...(kind ? [kind] : []));
+      const partsOf = (row) => { try { return JSON.parse(row?.parts || 'null'); } catch { return null; } };
+      const asGmU = (o) => fire({ channel: chU, userId: 'U1', ...o });
+      const asPlU = (uid, o) => fire({ channel: chU, userId: uid, member: plainU(uid), ...o });
+      const fightU = () => dbHandle.prepare("SELECT * FROM fights WHERE guild_id='G1' AND channel_id='CU1'").get();
+      const storyU = async () => woven(filesOf(await asGmU({ commandName: 'session', options: { _sub: 'summary' } }))[0]?.a)?.body || '';
+
+      // 1 · a fight form's words, the roll they come with under them, the
+      // NPC's answer with its bonus kept from the story, what it came to
+      await asGmU({ commandName: 'fight', options: { _sub: 'start', players: `<@${UA}>`, npcs: 'Uhollow', manual: true } });
+      const ordU = JSON.parse(fightU()?.turn_order || '[]');
+      dbHandle.prepare("UPDATE fights SET turn_index=?, phase='attack', current_target=NULL, atk_kind=NULL, pend=NULL WHERE guild_id='G1' AND channel_id='CU1'").run(Math.max(0, ordU.indexOf(UA)));
+      const formU = modalOf(await asPlU(UA, { isButton: true, customId: 'fatk:str', message: { id: nextId(), content: 'x', components: [] } }));
+      const n0 = evU().length;
+      await withDice([17], () => asPlU(UA, { isModal: true, customId: formU || 'frp:none', fields: { action: 'swings low', speech: 'Down you go', raw: '' } }));
+      const defForm = modalOf(await asGmU({ commandName: 'fight', options: { _sub: 'def', stat: 'str', npc: 'Uhollow' } }));
+      const defU = await withDice([11], () => asGmU({ isModal: true, customId: defForm || 'frp:none', fields: { action: 'raises its shield', speech: '', raw: '' } }));
+      const resU = await withDice([10], () => asGmU({ commandName: 'fight', options: { _sub: 'resolve' } }));
+      const rows1 = evU().slice(n0);
+      const rp1 = rows1.find(r => r.kind === 'rp' && partsOf(r)?.who);
+      const atk1 = rows1.find(r => r.kind === 'dice' && partsOf(r)?.dice?.who === `user${UA}`);
+      const def1 = rows1.find(r => r.kind === 'dice' && partsOf(r)?.dice?.who === 'Uhollow');
+      const rpN1 = rows1.find(r => r.kind === 'rp' && partsOf(r)?.who === 'Uhollow');
+      const out1 = rows1.find(r => r.kind === 'dice' && Array.isArray(partsOf(r)?.out));
+      const dA = partsOf(atk1)?.dice || {}, dD = partsOf(def1)?.dice || {};
+      ok('a fight form’s words go in, and the roll they come with rides under them: who, what, the bonus and the dice',
+        /^frp:/.test(formU || '') && !!rp1 && !!atk1 && partsOf(atk1)?.rp === rp1.id && dA.label === 'Attacks Uhollow with STR' && dA.bonus === 4 && dA.total === 21 && dA.nat === 17
+          && JSON.stringify(dA.kept) === '[17]' && dA.mode === 'normal' && dA.npc === false && rows1.indexOf(rp1) < rows1.indexOf(atk1),
+        `${formU} · ${rows1.map(r => `${r.kind}:${flatU(r.text).slice(0, 60)}`).join(' | ')} · ${JSON.stringify(partsOf(atk1)).slice(0, 220)}`);
+      ok('the NPC’s answer is a dice line too — its bonus kept for the record and left out of the story while NPC stats are hidden — and what the exchange came to follows, its HP by word alone',
+        !!def1 && dD.npc === true && dD.hide === true && dD.bonus === 5 && dD.total === 16 && /Uhollow: Defends with STR — 1d20\+5 → \[11\] = 16/.test(def1.text) && !!rpN1 && partsOf(def1)?.rp === rpN1.id
+          && !!out1 && rows1.indexOf(def1) < rows1.indexOf(out1) && /Uhollow/.test(out1.text) && !/Uhollow HP:/.test(out1.text) && /hits/.test(out1.text),
+        `${def1?.text} · ${JSON.stringify(dD).slice(0, 160)} · ${out1?.text} · def: ${flatU(saidOf(defU)).slice(0, 160)} · res: ${flatU(saidOf(resU)).slice(0, 300)}`);
+      const body1 = await storyU();
+      ok('the story prints the roll under the words, the NPC’s without its bonus, and the outcome after them',
+        new RegExp(`- user${UA}\\nswings low\\n“Down you go”\\nAttacks Uhollow with STR — 1d20\\+4 → \\[17\\] = 21\\n`).test(body1)
+          && /- Uhollow\nraises its shield\nDefends with STR — 1d20 → \[11\] = 16/.test(body1) && !/1d20\+5/.test(body1) && /hits \*?\*?Uhollow|hits Uhollow/.test(body1.replace(/\*/g, '')),
+        flatU(body1).slice(0, 600));
+      ok('the timeline and the hourly recap leave the dice out; the dice lines are not counted as beats',
+        !/Defends with STR — 1d20/.test(saidOf(await asGmU({ commandName: 'quest', options: { _sub: 'timeline', number: 993 } }))),
+        flatU(saidOf(await asGmU({ commandName: 'quest', options: { _sub: 'timeline', number: 993 } }))).slice(0, 200));
+
+      // 2 · a natural 20 and a natural 1 are said so; a roll's own label
+      await withDice([20], () => asPlU(UB, { commandName: 'roll', options: { stat: 'str' } }));
+      await withDice([1], () => asPlU(UB, { commandName: 'roll', options: { dice: '1d20', label: 'luck' } }));
+      const n20 = evU('dice').filter(r => partsOf(r)?.dice?.nat === 20).pop(), n1 = evU('dice').filter(r => partsOf(r)?.dice?.nat === 1).pop();
+      const body2 = await storyU();
+      ok('a natural 20 and a natural 1 are kept and said; a stat roll is labelled by its stat, a typed label kept',
+        !!n20 && !!n1 && /STR — 1d20\+4 → \[20\] = 24 — natural 20/.test(n20.text) && /luck — 1d20 → \[1\] = 1 — natural 1/.test(n1.text)
+          && /STR — 1d20\+4 → \[20\] = 24 — natural 20/.test(body2) && /luck — 1d20 → \[1\] = 1 — natural 1/.test(body2),
+        `${n20?.text} · ${n1?.text}`);
+
+      // 3 · a secret /gm dc: the number kept off the button, out of the
+      // room's recap and the story; the record knows it
+      const dcAsk = await asGmU({ commandName: 'gm', options: { _sub: 'dc', stat: 'str', dc: 15, target: UB, secret: true } });
+      const dcCard = dcAsk.replies.find(x => idsOf(x).some(id => id.startsWith(`dcroll:${UB}:`)));
+      const dcId = dcCard ? idsOf(dcCard).find(id => id.startsWith(`dcroll:${UB}:`)) : '';
+      const slot = dcId.split(':')[3] || '';
+      const hid = dbHandle.prepare("SELECT dc FROM hidden_dcs WHERE guild_id='G1' AND token=?").get(slot.slice(1));
+      const nDc = evU().length;
+      const dcMsg = dcCard ? { id: nextId(), content: dcCard.content || '', components: dcCard.components.map(r => ({ components: ((r._d || r).components || []).map(b => ({ customId: (b._d || b).customId, label: (b._d || b).label, style: (b._d || b).style, disabled: false })) })) } : null;
+      const dcPress = dcCard ? await withDice([16], () => asPlU(UB, { isButton: true, customId: dcId, message: dcMsg })) : null;
+      const dcRows = evU().slice(nDc);
+      const recapDc = dcRows.find(r => r.kind === 'roll'), diceDc = dcRows.find(r => r.kind === 'dice');
+      const body3 = await storyU();
+      ok('a secret DC rides the button as a token, never its number; the bot keeps the number and the GM alone is told it',
+        /^s[a-z0-9]+$/.test(slot) && hid?.dc === 15 && !dcId.includes(':15:') && /DC \?\?\?/.test(dcCard?.content || '') && /The DC is \*\*15\*\*/.test(saidOf(dcAsk)),
+        `${dcId} · ${JSON.stringify(hid)} · ${flatU(saidOf(dcAsk)).slice(0, 200)}`);
+      ok('the press reads it back: the verdict lands; the recap’s line says “a hidden DC”, the story “hidden DC”, the record the number',
+        /Success|Fail/.test(saidOf(dcPress)) && !!recapDc && /vs a hidden DC — (passed|failed)/.test(recapDc.text) && !/15/.test(recapDc.text.replace(/^[^:]*:/, '')) && partsOf(recapDc)?.recap === 1
+          && !!diceDc && partsOf(diceDc)?.dice?.dcHidden === true && partsOf(diceDc)?.dice?.dc === 15 && /vs DC 15 \(hidden\)/.test(diceDc.text)
+          && /STR check — 1d20\+4 → \[16\] = 20 vs hidden DC — passed/.test(body3) && !/vs DC 15/.test(body3) && !/vs a hidden DC/.test(body3),
+        `${flatU(saidOf(dcPress)).slice(0, 160)} · ${recapDc?.text} ${recapDc?.parts} · ${diceDc?.text}`);
+
+      // 4 · /button roll secret:true; a press with a token waits, a reroll
+      // lands it with both throws in the story; a GM may keep for them
+      let before = sent.length;
+      const plantU = await asGmU({ commandName: 'button', options: { _sub: 'roll', stat: 'str', dc: 12, secret: true } });
+      const plantedU = sinceIn('CU1', before).find(m => idsOf(m).some(id => /^btnchk:/.test(id)));
+      const plId = plantedU ? idsOf(plantedU).find(id => /^btnchk:/.test(id)) : '';
+      ok('/button roll secret:true: the card and the button say “hidden DC”, the id carries a token, the GM alone is told the number',
+        /^btnchk:str:s[a-z0-9]+:0:any$/.test(plId) && /hidden DC/.test(plantedU?.content || '') && !/12/.test(plantedU?.content || '') && /The DC is \*\*12\*\*/.test(saidOf(plantU)) && plantU.replies[0]?.ephemeral === true,
+        `${plId} · ${plantedU?.content} · ${saidOf(plantU)}`);
+      const plB = await withDice([5], () => asPlU(UB, { isButton: true, customId: plId, message: plantedU }));
+      ok('pressed without a token it lands at once: a hidden DC, never its number',
+        /vs a \*\*hidden DC\*\*/.test(saidOf(plB)) && /\*\*Failed\.\*\*/.test(saidOf(plB)) && !/12/.test(saidOf(plB).replace(/\[\d+\]/g, '')) && !idsIn(plB).some(id => /^rhold:/.test(id)),
+        flatU(saidOf(plB)));
+      putCharU(UA, { rr: 1 });
+      const plA = await withDice([3], () => asPlU(UA, { isButton: true, customId: plId, message: plantedU }));
+      const rrId = idsIn(plA).find(id => /^rhold:rr:/.test(id));
+      const nPl = evU().length;
+      const plA2 = rrId ? await withDice([15], () => asPlU(UA, { isButton: true, customId: rrId, message: plA.replies[0] })) : null;
+      const plRows = evU().slice(nPl);
+      const plDice = plRows.find(r => r.kind === 'dice');
+      const tokA = dbHandle.prepare("SELECT rerolls_current FROM characters WHERE guild_id='G1' AND user_id=?").get(UA)?.rerolls_current;
+      ok('with a token in hand the press waits — 🔁 Reroll or ✅ Keep — and a reroll spends it and lands with both throws in the story',
+        /Nothing lands yet/.test(saidOf(plA)) && !!rrId && idsIn(plA).some(id => /^rhold:keep:/.test(id)) && /rerolls \*\(reroll\)\*/.test(saidOf(plA2)) && /\*\*Passed\.\*\*/.test(saidOf(plA2))
+          && tokA === 0 && !!plDice && /STR — 1d20\+4 → \[3\] = 7, rerolled → \[15\] = 19 vs DC 12 \(hidden\) — passed/.test(plDice.text) && plRows.some(r => r.kind === 'roll' && partsOf(r)?.recap === 1 && /a hidden DC/.test(r.text)),
+        `${flatU(saidOf(plA)).slice(0, 160)} · ${flatU(saidOf(plA2)).slice(0, 200)} · tok ${tokA} · ${plDice?.text}`);
+      putCharU(UA, { rr: 1 });
+      const plA3 = await withDice([9], () => asPlU(UA, { isButton: true, customId: plId, message: plantedU }));
+      const keepId = idsIn(plA3).find(id => /^rhold:keep:/.test(id));
+      const notYours = keepId ? await asPlU(UB, { isButton: true, customId: keepId, message: plA3.replies[0] }) : null;
+      const gmKeep = keepId ? await asGmU({ isButton: true, customId: keepId, message: plA3.replies[0] }) : null;
+      const lateKeep = keepId ? await asPlU(UA, { isButton: true, customId: keepId, message: plA3.replies[0] }) : null;
+      ok('a roll waiting is its roller’s to throw again; a GM may keep it for them; once landed it stays landed',
+        /not yours to keep/.test(saidOf(notYours)) && /keeps the roll/.test(saidOf(gmKeep)) && /\*\*Passed\.\*\*/.test(saidOf(gmKeep)) && /landed already/.test(saidOf(lateKeep)),
+        `${flatU(saidOf(notYours))} · ${flatU(saidOf(gmKeep)).slice(0, 160)} · ${flatU(saidOf(lateKeep))}`);
+
+      // 5 · a group roll with a token waits; Call it keeps the waiting
+      putCharU(UA, { rr: 1 });
+      before = sent.length;
+      await asGmU({ commandName: 'button', options: { _sub: 'group', stat: 'str', dc: 10, reason: 'The ford' } });
+      const grpU = sinceIn('CU1', before).find(m => idsOf(m).includes('grproll'));
+      grpU.edit = async (o) => { if (o?.content) grpU.content = o.content; return grpU; };
+      const gA = grpU ? await withDice([12], () => asPlU(UA, { isButton: true, customId: 'grproll', message: grpU })) : null;
+      const gRow = dbHandle.prepare("SELECT * FROM group_check_rolls WHERE guild_id='G1' AND message_id=? AND user_id=?").get(grpU?.id, UA);
+      const gKeepId = idsIn(gA).find(id => /^rhold:keep:/.test(id));
+      const nG = evU().length;
+      const gClose = await asGmU({ isButton: true, customId: 'grpclose', message: grpU });
+      const gRow2 = dbHandle.prepare("SELECT * FROM group_check_rolls WHERE guild_id='G1' AND message_id=? AND user_id=?").get(grpU?.id, UA);
+      const gLate = gKeepId ? await asPlU(UA, { isButton: true, customId: gKeepId, message: gA.replies[1] || gA.replies[0] }) : null;
+      const gRows = evU().slice(nG);
+      ok('a group roll with a token in hand waits — ⏳ on the board, its own Reroll and Keep — and Call it lets it stand, into the story with the call',
+        gRow?.held === 1 && /⏳/.test(saidOf(gA)) && /may reroll/.test(saidOf(gA)) && !!gKeepId && gRow2?.held === 0 && /made it/.test(saidOf(gClose))
+          && /landed already/.test(saidOf(gLate)) && gRows.some(r => r.kind === 'dice' && /Group check \(STR\) — 1d20\+4 → \[12\] = 16 vs DC 10 — passed/.test(r.text))
+          && gRows.some(r => r.kind === 'dice' && /Group check \(STR vs DC 10\) called — 1 of 1 made it/.test(r.text)),
+        `held ${gRow?.held}→${gRow2?.held} · ${flatU(saidOf(gA)).slice(0, 200)} · ${flatU(saidOf(gClose)).slice(0, 120)} · ${flatU(saidOf(gLate))} · ${gRows.map(r => r.text).join(' | ')}`);
+
+      // 6 · NPCs on a called check: one with a token waits on a GM, one
+      // without lands at once; a GM's reroll spends the NPC's own token
+      const nNpc = evU().length;
+      const npcAsk = await withDice([4, 13], () => asGmU({ commandName: 'gm', options: { _sub: 'dc', stat: 'str', dc: 10, npcs: 'Utank, Uhollow' } }));
+      const holdMsg = npcAsk.replies.find(x => idsOf(x).some(id => /^rhold:rrn:/.test(id)));
+      const rrnId = holdMsg ? idsOf(holdMsg).find(id => /^rhold:rrn:/.test(id)) : '';
+      const plTry = rrnId ? await asPlU(UB, { isButton: true, customId: rrnId, message: holdMsg }) : null;
+      const npcRr = rrnId ? await withDice([18], () => asGmU({ isButton: true, customId: rrnId, message: holdMsg })) : null;
+      const npcRows = evU().slice(nNpc).filter(r => r.kind === 'dice');
+      const tankTok = dbHandle.prepare("SELECT rerolls_current FROM npcs WHERE guild_id='G1' AND name='Utank'").get()?.rerolls_current;
+      ok('an NPC with a token waits on a GM’s 🔁 or ✅; one without lands on the card at once',
+        /Utank\*\* — [^\n]*\n⏳ _Nothing lands yet/.test(saidOf(npcAsk)) && /Uhollow\*\* — [^\n]*\n(✅|❌|🌟|💀)/.test(saidOf(npcAsk)) && !!rrnId && idsOf(holdMsg).some(id => /^rhold:keep:/.test(id))
+          && npcRows.some(r => /^Uhollow: STR check — 1d20\+5 → \[13\] = 18 vs DC 10 — passed/.test(r.text)) && /a GM’s to reroll or keep/.test(saidOf(plTry)),
+        `${flatU(saidOf(npcAsk)).slice(0, 400)} · ${idsOf(holdMsg)} · ${flatU(saidOf(plTry))}`);
+      ok('a GM’s reroll spends the NPC’s own token, once, and the check lands — both throws in the story',
+        tankTok === 1 && /rolls again \*\(reroll\)\*/.test(saidOf(npcRr)) && /Utank\*\* — /.test(saidOf(npcRr))
+          && npcRows.some(r => /^Utank: STR check — 1d20\+5 → \[4\] = 9, rerolled → \[18\] = 23 vs DC 10 — passed/.test(r.text)),
+        `tok ${tankTok} · ${flatU(saidOf(npcRr)).slice(0, 300)} · ${npcRows.map(r => r.text).join(' | ')}`);
+
+      // 7 · ✍️ RP leads every roleplay row and opens the roleplay box
+      before = sent.length;
+      await asPlU(UA, { commandName: 'rp', options: { speech: 'Onward.' } });
+      await asGmU({ commandName: 'npc', options: { _sub: 'say', name: 'Uhollow', speech: 'You will not pass.' } });
+      await asGmU({ commandName: 'narrate', options: { text: 'The bridge sways.' } });
+      const lines7 = sinceIn('CU1', before).filter(m => idsOf(m).length);
+      const rpOpen = await asPlU(UB, { isButton: true, customId: 'rpnew', message: lines7[0] });
+      ok('✍️ RP comes first under an /rp line, an NPC’s line and a narration, before Reply and GM; it opens the roleplay box, not a reply',
+        lines7.length >= 3 && lines7.every(m => idsOf(m)[0] === 'rpnew' && idsOf(m).some(id => /reply/.test(id))) && modalOf(rpOpen) === 'rpform',
+        `${lines7.map(m => idsOf(m).join(',')).join(' | ')} · ${modalOf(rpOpen)}`);
+
+      // 8 · the printed story: the game's lines in blue, a 20 green, a 1 red
+      const sumU = await asGmU({ commandName: 'session', options: { _sub: 'summary' } });
+      const pdfU = filesOf(sumU)[0]?.a ? Buffer.from(filesOf(sumU)[0].a) : null;
+      const zlib = require('zlib');
+      let opsU = '';
+      if (pdfU) {
+        const s = pdfU.toString('latin1');
+        for (const m of s.matchAll(/<<\/Filter\/FlateDecode\/Length (\d+)>>\nstream\n/g)) {
+          const start = m.index + m[0].length;
+          try { opsU += zlib.inflateSync(pdfU.slice(start, start + Number(m[1]))).toString('latin1') + '\n'; } catch {}
+        }
+      }
+      ok('the printed story carries the game’s lines in blue, a natural 20’s in green and a natural 1’s in red',
+        /0\.122 0\.306 0\.612 rg/.test(opsU) && /0\.110 0\.451 0\.169 rg/.test(opsU) && /0\.651 0\.110 0\.110 rg/.test(opsU),
+        `${pdfU ? pdfU.length : 0} bytes · ${(opsU.match(/[\d.]+ [\d.]+ [\d.]+ rg/g) || []).slice(0, 12).join(' / ')}`);
+      // DDICE_PROBE_STORY=<dir> keeps the walk's printed story and its rows, to look at.
+      if (process.env.DDICE_PROBE_STORY && pdfU) {
+        try { require('fs').writeFileSync(require('path').join(process.env.DDICE_PROBE_STORY, 'u-walk-story.pdf'), pdfU);
+          require('fs').writeFileSync(require('path').join(process.env.DDICE_PROBE_STORY, 'u-walk-events.json'), JSON.stringify(evU(), null, 1)); } catch {}
+      }
+      dbHandle.prepare("UPDATE quests SET status='completed' WHERE guild_id='G1' AND number=993").run();
+      dbHandle.prepare("UPDATE fights SET state='idle', turn_order='[]', pend=NULL WHERE guild_id='G1' AND channel_id='CU1'").run();
+    } finally {
+      guild.members.fetch = realFetchU;
+      Math.random = realRandU;
+    }
+    const threwU = loggedU.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
+    console.error = realErrU;
+    ok('nothing in the U walk threw', threwU.length === 0, threwU.slice(0, 3).join('\n        '));
+  }
+
+  // ── Build U · the run clock (2026-11-23): an instance opens held and
+  // starts on /run time start; pause, resume, wind-down and the end land on
+  // the quarter-hour; adjust, show and list; a fight or an initiative called
+  // before the start asks first; start refuses a run going; a paused run
+  // records no press ──
+  if (dbHandle) {
+    const realErrR = console.error; const loggedR = [];
+    console.error = (...a) => { loggedR.push(a.map(x => (x && x.stack) ? x.stack.split('\n').slice(0, 2).join(' | ') : String(x)).join(' ')); };
+    const realFetchR = guild.members.fetch;
+    const spinWas = dbHandle.prepare("SELECT quest_spinoff FROM guild_config WHERE guild_id='G1'").get()?.quest_spinoff ?? 0;
+    try {
+      const saidOf = (r) => (r?.replies || []).map(x => x.content || '').join('\n');
+      const idsOf = (m) => (m?.components || []).flatMap(row => ((row._d || row).components || []).map(b => (b._d || b).customId || ''));
+      const idsIn = (r) => (r?.replies || []).flatMap(x => idsOf(x));
+      const settle = async () => { for (let i = 0; i < 80; i++) await new Promise(r => setImmediate(r)); };
+      const sinceIn = (cid, n) => sent.slice(n).filter(x => x.channel === cid).map(x => x.msg);
+      const flatR = (t) => String(t || '').replace(/\s+/g, ' ');
+      const M = 60000;
+      const chR = new FakeChannel('CR1', 0, 'r-walk', guild); chR.guildId = 'G1'; channelsById.set('CR1', chR);
+      const chR2 = new FakeChannel('CR2', 0, 'r-paused', guild); chR2.guildId = 'G1'; channelsById.set('CR2', chR2);
+      const PL = '100000000000000603';
+      const plainR = { id: PL, displayName: `user${PL}`, roles: { cache: new Map() }, permissions: { has: () => false } };
+      guild.members.fetch = async (uid) => { const mb = await realFetchR(uid); if (uid === PL) { mb.permissions = { has: () => false }; mb.roles = { cache: new Map() }; } return mb; };
+      dbHandle.prepare("INSERT OR REPLACE INTO characters (guild_id, user_id, str, con, dex, wis, lck, hp_current, rerolls_current) VALUES ('G1', ?, 4, 5, 3, 3, 2, 10, 0)").run(PL);
+      dbHandle.prepare("UPDATE characters SET rerolls_current=0 WHERE guild_id='G1' AND user_id='U2'").run();
+      dbHandle.prepare("INSERT OR REPLACE INTO npcs (guild_id, name, str, con, dex, wis, lck, hp_current, rerolls_current) VALUES ('G1', 'Rgob', 3, 4, 2, 1, 1, 6, 0)").run();
+      dbHandle.prepare("UPDATE guild_config SET quest_spinoff=0, npc_special=0 WHERE guild_id='G1'").run();
+      const asGm = (o, ch = chR) => fire({ channel: ch, userId: 'U1', ...o });
+      const runT = (sub, opts = {}, ch = chR, as = 'U1') => fire({ channel: ch, userId: as, ...(as === PL ? { member: plainR } : {}), commandName: 'run', options: { _group: 'time', _sub: sub, ...opts } });
+      const press = (ch, uid, id, msg = null) => fire({ channel: ch, userId: uid, isButton: true, customId: id, message: msg || { id: nextId(), content: '', components: [], edit: async () => {} } });
+      const qr = (n) => dbHandle.prepare("SELECT * FROM quests WHERE guild_id='G1' AND number=?").get(n);
+      const evR = (n) => dbHandle.prepare("SELECT kind, text, at_ms FROM quest_events WHERE guild_id='G1' AND number=? ORDER BY id").all(n);
+      const fightIn = (cid) => dbHandle.prepare("SELECT state, turn_order FROM fights WHERE guild_id='G1' AND channel_id=?").get(cid);
+      const openHeld = async (options, users) => {
+        const r0 = await asGm({ commandName: 'instance', options: { _sub: 'start', ...options } });
+        const menu = (r0.replies[0]?.components || [])[0]?._d?.components?.[0]?._d || {};
+        const key = String(menu.customId || '').split(':')[1];
+        if (!key) return { r0, r2: null, row: null, room: null };
+        await fire({ channel: chR, userId: 'U1', isSelect: true, customId: menu.customId, values: users, message: { id: nextId(), content: 'x', components: [] } });
+        const r2 = await fire({ channel: chR, userId: 'U1', isButton: true, customId: `encgo:${key}`, message: { id: nextId(), content: 'x', components: [] } });
+        // Numbers fill gaps, so the run is found by its name, not as the highest.
+        const row = dbHandle.prepare("SELECT * FROM quests WHERE guild_id='G1' AND name=? ORDER BY created_at DESC, number DESC LIMIT 1").get(options.name);
+        return { r0, r2, row, room: row?.run_thread_id ? channelsById.get(row.run_thread_id) || null : null };
+      };
+
+      // 1 · opened held
+      let n0 = sent.length;
+      const h = await openHeld({ name: 'Held Gate', merits: 1 }, ['U2', PL]);
+      const N = h.row?.number;
+      const cardH = h.room ? sent.slice(n0).filter(x => x.channel === h.room.id).map(x => x.content).join('\n') : '';
+      ok('an instance opens held: seated and roomed, the clock at nought and stopped, nothing on its record; its card, its pointer and its GM say so',
+        !!h.room && h.row?.unstarted === 1 && h.row?.paused === 1 && !h.row?.started_at && Number(h.row?.elapsed_ms) === 0 && evR(N).length === 0
+          && /Not started\*\* — the clock and the record wait for `\/run time start`/.test(cardH) && /Its clock waits/.test(saidOf(h.r2))
+          && sent.slice(n0).some(x => x.channel === 'CR1' && /is open — <#/.test(x.content)),
+        `${JSON.stringify({ u: h.row?.unstarted, p: h.row?.paused, s: h.row?.started_at, e: h.row?.elapsed_ms, ev: evR(N).length })} · ${flatR(cardH).slice(0, 160)} · ${flatR(saidOf(h.r2)).slice(0, 300)}`);
+
+      // 2 · before the start: the clock's leaves refuse; a seat is not on the record
+      const pz = await runT('pause', {}, h.room), rs = await runT('resume', {}, h.room);
+      const wd = await runT('winddown', {}, h.room), en = await runT('end', { summary: 'x' }, h.room);
+      await asGm({ commandName: 'session', options: { _sub: 'add', user: 'U1' } }, h.room);
+      const seatU1 = dbHandle.prepare("SELECT state FROM quest_members WHERE guild_id='G1' AND number=? AND user_id='U1'").get(N)?.state;
+      const nt = await asGm({ commandName: 'session', options: { _sub: 'note', text: 'Early word' } }, h.room);
+      ok('before the start: pause, resume, wind-down, end and a note refuse and point at /run time start; a seat added is not on the record',
+        /has not started — `\/run time start` starts its clock/.test(saidOf(pz)) && /has not started/.test(saidOf(rs))
+          && /has not started — nothing is recorded until `\/run time start`/.test(saidOf(nt))
+          && /has not started — there is nothing to wind down/.test(saidOf(wd)) && /never started — `\/run time start` starts it/.test(saidOf(en))
+          && qr(N)?.status === 'active' && qr(N)?.unstarted === 1 && evR(N).length === 0 && seatU1 === 'party',
+        `${[pz, rs, wd, en, nt].map(r => flatR(saidOf(r)).slice(0, 60)).join(' | ')} · seat ${seatU1} · ev ${evR(N).length}`);
+
+      // 3 · a fight called in its room asks first
+      const ask1 = await asGm({ commandName: 'fight', options: { _sub: 'start', players: `<@${PL}>`, npcs: 'Rgob' } }, h.room);
+      const go1 = idsIn(ask1).find(id => id.startsWith('offrec:go:')), no1 = idsIn(ask1).find(id => id.startsWith('offrec:no:'));
+      const notMine = no1 ? await press(h.room, 'U2', no1) : { replies: [] };
+      const denied = no1 ? await press(h.room, 'U1', no1) : { replies: [] };
+      const lapsed = go1 ? await press(h.room, 'U1', go1) : { replies: [] };
+      const fNo = fightIn(h.room?.id);
+      ok('a fight called in a run’s room before the start asks whoever called it; another’s press is refused; Deny calls it off, and its Confirm lapses with it',
+        !!go1 && !!no1 && ask1.replies[0]?.ephemeral === true && /has not started — nothing here is recorded until `\/run time start`\. Go ahead off the record\?/.test(saidOf(ask1))
+          && /not yours/.test(saidOf(notMine)) && /Called off/.test(saidOf(denied)) && /lapsed/.test(saidOf(lapsed)) && (!fNo || fNo.state === 'idle'),
+        `${flatR(saidOf(ask1)).slice(0, 100)} · ${flatR(saidOf(notMine))} · ${flatR(saidOf(denied))} · ${flatR(saidOf(lapsed))} · ${JSON.stringify(fNo || {})}`);
+      const ask2 = await asGm({ commandName: 'fight', options: { _sub: 'start', players: `<@${PL}>`, npcs: 'Rgob', manual: true } }, h.room);
+      const go2 = idsIn(ask2).find(id => id.startsWith('offrec:go:'));
+      const conf = go2 ? await press(h.room, 'U1', go2) : { replies: [] };
+      await settle();
+      const fOn = fightIn(h.room?.id);
+      ok('Confirm goes ahead off the record: the fight runs with the options as typed, and nothing reaches the run’s record',
+        /Going ahead off the record/.test(saidOf(conf)) && fOn?.state === 'active' && (fOn?.turn_order || '').includes(PL) && /Rgob/.test(fOn?.turn_order || '') && evR(N).length === 0,
+        `${flatR(saidOf(conf)).slice(0, 140)} · ${JSON.stringify(fOn || {}).slice(0, 140)} · ev ${evR(N).length}`);
+      // Off the record is a fight like any other: its turn clock runs.
+      const tickClk = async () => { for (const t of ticks.filter(t => /turnClockTick/.test(String(t.fn)))) { try { await t.fn(); } catch (e) { loggedR.push(`tick: ${e.message}`); } } await settle(); };
+      await asGm({ commandName: 'session', options: { _sub: 'clock', remind: 3, skip: 20 } }, h.room);
+      dbHandle.prepare("UPDATE fights SET last_at=?, nudged=0, clock_idle=0 WHERE guild_id='G1' AND channel_id=?").run(Date.now() - 5 * M, h.room?.id);
+      n0 = sent.length;
+      await tickClk();
+      const nudgeR = sinceIn(h.room?.id, n0).find(m => /3 minutes quiet/.test(m.content || ''));
+      ok('a fight played off the record keeps its turn clock: a quiet turn is reminded, and nothing reaches the record',
+        !!nudgeR && nudgeR.content.includes(`<@${PL}>`) && evR(N).length === 0, `${flatR(nudgeR?.content).slice(0, 140)} · ev ${evR(N).length}`);
+      dbHandle.prepare("DELETE FROM turn_clocks WHERE guild_id='G1' AND channel_id=?").run(h.room?.id);
+      dbHandle.prepare("DELETE FROM fights WHERE guild_id='G1' AND channel_id=?").run(h.room?.id);
+
+      // 4 · /initiative, /session initiative and /fight auto ask as well
+      const ini = await asGm({ commandName: 'initiative', options: { players: `<@${PL}>`, npcs: 'Rgob', signup: false } }, h.room);
+      const sini = await asGm({ commandName: 'session', options: { _sub: 'initiative', npcs: 'Rgob' } }, h.room);
+      const fa = await asGm({ commandName: 'fight', options: { _sub: 'auto', mode: 'full', players: `<@${PL}>`, npcs: 'Rgob' } }, h.room);
+      ok('/initiative, /session initiative and /fight auto ask first in a room not yet started',
+        [ini, sini, fa].every(r => idsIn(r).some(id => id.startsWith('offrec:go:'))) && (!fightIn(h.room?.id) || fightIn(h.room?.id).state === 'idle'),
+        [ini, sini, fa].map(r => flatR(saidOf(r)).slice(0, 50)).join(' | '));
+      const goI = idsIn(ini).find(id => id.startsWith('offrec:go:'));
+      const confI = goI ? await press(h.room, 'U1', goI) : { replies: [] };
+      await settle();
+      const ordI = dbHandle.prepare("SELECT state, entrants FROM turn_orders WHERE guild_id='G1' AND channel_id=?").get(h.room?.id);
+      ok('Confirm on /initiative sets the order off the record, with the options as typed, its answer following the press',
+        /Going ahead off the record/.test(saidOf(confI)) && /Rolled — the order is set/.test(saidOf(confI)) && ordI?.state === 'running'
+          && (ordI?.entrants || '').includes(PL) && /Rgob/.test(ordI?.entrants || '') && evR(N).length === 0,
+        `${flatR(saidOf(confI)).slice(0, 200)} · ${JSON.stringify(ordI || {}).slice(0, 160)} · ev ${evR(N).length}`);
+      dbHandle.prepare("DELETE FROM turn_orders WHERE guild_id='G1' AND channel_id=?").run(h.room?.id);
+
+      // 5 · the start, by name from elsewhere
+      n0 = sent.length;
+      const st = await runT('start', { name: String(N) });
+      const rowS = qr(N);
+      ok('/run time start: the clock runs from nought, the record opens with its first line, the room is told and the GM answered privately',
+        rowS?.unstarted === 0 && rowS?.paused === 0 && !!rowS?.started_at && Number(rowS?.elapsed_ms) === 0
+          && evR(N).length === 1 && evR(N)[0].kind === 'start' && evR(N)[0].text === 'Encounter begins — 3 in it'
+          && sent.slice(n0).some(x => x.channel === h.room?.id && /begins — the clock is running and the record is on/.test(x.content))
+          && st.replies[0]?.ephemeral === true,
+        `${JSON.stringify({ u: rowS?.unstarted, p: rowS?.paused, e: rowS?.elapsed_ms })} · ${JSON.stringify(evR(N))} · ${flatR(saidOf(st)).slice(0, 100)}`);
+      const st2 = await runT('start', {}, h.room);
+      const askAfter = await asGm({ commandName: 'initiative', options: { npcs: 'Rgob', signup: false } }, h.room);
+      ok('once started, start refuses and nothing asks any more', /already running/.test(saidOf(st2)) && !idsIn(askAfter).some(id => id.startsWith('offrec:')),
+        `${flatR(saidOf(st2))} · ${flatR(saidOf(askAfter)).slice(0, 80)}`);
+
+      // 6 · the quarter-hour
+      dbHandle.prepare("UPDATE quests SET started_at=? WHERE guild_id='G1' AND number=?").run(Date.now() - 7 * M, N);
+      const p1 = await runT('pause', {}, h.room);
+      const e1 = Number(qr(N)?.elapsed_ms);
+      dbHandle.prepare("UPDATE quests SET elapsed_ms=? WHERE guild_id='G1' AND number=?").run(20 * M, N);
+      const r1 = await runT('resume', {}, h.room);
+      const rowR = qr(N);
+      ok('pause and resume land the clock forward on the quarter-hour: 0h 07m pauses at 0h 15m, 0h 20m resumes at 0h 30m',
+        e1 === 15 * M && /paused at \*\*0h 15m\*\*/.test(saidOf(p1)) && Number(rowR?.elapsed_ms) === 30 * M && rowR?.paused === 0 && /resumed at \*\*0h 30m\*\*/.test(saidOf(r1)),
+        `${e1 / M}m · ${flatR(saidOf(p1))} · ${Number(rowR?.elapsed_ms) / M}m · ${flatR(saidOf(r1))}`);
+
+      // 7 · adjust
+      dbHandle.prepare("UPDATE quests SET paused=1, started_at=NULL, elapsed_ms=? WHERE guild_id='G1' AND number=?").run(30 * M, N);
+      const a1 = await runT('adjust', { by: '+30m' }, h.room); const v1 = Number(qr(N)?.elapsed_ms);
+      const a2 = await runT('adjust', { by: '-2h' }, h.room); const v2 = Number(qr(N)?.elapsed_ms);
+      const a3 = await runT('adjust', { by: '7m' }, h.room);
+      const aPl = await runT('adjust', { by: '+15m' }, h.room, PL);
+      ok('adjust moves the clock in quarter-hour steps and never below nought, noted on the record; seven minutes is refused, and so is a player',
+        v1 === 60 * M && /now \*\*1h 00m\*\*/.test(saidOf(a1)) && v2 === 0 && /stops at nought/.test(saidOf(a2)) && /steps of 15 minutes/.test(saidOf(a3))
+          && /Only GMs keep a run/.test(saidOf(aPl)) && evR(N).some(e => /^Clock corrected \+0h 30m — now 1h 00m$/.test(e.text)),
+        `${v1 / M} ${v2 / M} · ${flatR(saidOf(a1))} · ${flatR(saidOf(a2))} · ${flatR(saidOf(a3))} · ${flatR(saidOf(aPl))}`);
+
+      // 8 · show and list are anyone's
+      dbHandle.prepare("UPDATE quests SET paused=0, started_at=?, elapsed_ms=0 WHERE guild_id='G1' AND number=?").run(Date.now() - 67 * M, N);
+      const sh = await runT('show', {}, h.room, PL);
+      const ls = await runT('list', {}, chR, PL);
+      ok('/run time show and list are open to everyone and say the clock in words',
+        /running, \*\*1h 07m\*\*/.test(saidOf(sh)) && /Runs going now/.test(saidOf(ls)) && saidOf(ls).includes('Held Gate') && /running, \*\*1h 07m\*\*/.test(saidOf(ls)),
+        `${flatR(saidOf(sh))} · ${flatR(saidOf(ls)).slice(0, 160)}`);
+
+      // 9 · wind-down stops the clock; resume brings it back on the mark
+      const w1 = await runT('winddown', {}, h.room);
+      await settle();
+      const rowW = qr(N);
+      const pW = await runT('pause', {}, h.room), wW = await runT('winddown', {}, h.room);
+      ok('wind-down stops the clock forward on the quarter-hour and says so; pause and a second wind-down refuse',
+        rowW?.winding_down === 1 && rowW?.paused === 1 && !rowW?.started_at && Number(rowW?.elapsed_ms) === 75 * M
+          && /the clock stopped at \*\*1h 15m\*\*/.test(saidOf(w1)) && /Finish with `\/run time end`/.test(saidOf(w1))
+          && /its clock has stopped already/.test(saidOf(pW)) && /already winding down/.test(saidOf(wW)),
+        `${JSON.stringify({ w: rowW?.winding_down, p: rowW?.paused, e: Number(rowW?.elapsed_ms) / M })} · ${flatR(saidOf(w1)).slice(0, 120)} · ${flatR(saidOf(pW))} · ${flatR(saidOf(wW))}`);
+      n0 = sent.length;
+      const rW = await runT('resume', {}, h.room);
+      const rowB = qr(N);
+      ok('resume takes a wound-down run back to running from its mark, and the room is told',
+        rowB?.winding_down === 0 && rowB?.paused === 0 && Number(rowB?.elapsed_ms) === 75 * M && /running again at \*\*1h 15m\*\*/.test(saidOf(rW))
+          && sent.slice(n0).some(x => x.channel === h.room?.id && /running again at \*\*1h 15m\*\*/.test(x.content)),
+        `${JSON.stringify({ w: rowB?.winding_down, p: rowB?.paused, e: Number(rowB?.elapsed_ms) / M })} · ${flatR(saidOf(rW))}`);
+
+      // 10 · the end lands on the quarter-hour too
+      dbHandle.prepare("UPDATE quests SET started_at=?, elapsed_ms=? WHERE guild_id='G1' AND number=?").run(Date.now() - 1 * M, 75 * M, N);
+      const e2 = await runT('end', { summary: 'The gate held.' }, h.room);
+      await settle();
+      const rowE = qr(N);
+      ok('the end lands the clock forward on the quarter-hour: 1h 16m ends at 1h 30m',
+        rowE?.status === 'completed' && Number(rowE?.elapsed_ms) === 90 * M && /Ran for \*\*1h 30m\*\*/.test(saidOf(e2)),
+        `${rowE?.status} ${Number(rowE?.elapsed_ms) / M}m · ${flatR(saidOf(e2)).slice(0, 120)}`);
+
+      // 11 · an older quest waits at its played time and starts from it
+      const lgR = await openHeld({ name: 'Toll Road', as: 'legacy', played: '6h10m' }, ['U2']);
+      const NL = lgR.row?.number;
+      await runT('start', { name: String(NL) });
+      ok('an older quest waits at its played time and starts from it, forward on the quarter-hour, its first line saying so',
+        Number(lgR.row?.elapsed_ms) === 370 * M && lgR.row?.unstarted === 1 && Number(qr(NL)?.elapsed_ms) === 375 * M && qr(NL)?.unstarted === 0
+          && evR(NL).some(e => e.kind === 'start' && e.text === 'Picked up from before the bot, 6h 10m already played — 1 in it'),
+        `${Number(lgR.row?.elapsed_ms) / M} → ${Number(qr(NL)?.elapsed_ms) / M} · ${JSON.stringify(evR(NL))}`);
+
+      // 12 · the ready card's Start, for a run opened ahead
+      const rd = await openHeld({ name: 'Ready Rock' }, ['U2']);
+      const NR = rd.row?.number;
+      const card = await runT('ready', {}, rd.room);
+      const cardMsg = { id: nextId(), content: card.replies[0]?.content || '', components: card.replies[0]?.components || [], edit: async () => {} };
+      const tick = await press(rd.room, 'U2', `qready:${NR}`, cardMsg);
+      const startId = idsIn(tick).find(id => id.startsWith('qstart:'));
+      const pressStart = startId ? await press(rd.room, 'U1', startId) : { replies: [] };
+      ok('the ready card offers ▶️ Start once all have ticked on a run opened ahead, and the GM’s press starts it',
+        idsIn(card).includes(`qready:${NR}`) && startId === `qstart:${NR}` && qr(NR)?.unstarted === 0 && qr(NR)?.paused === 0 && /begins — the clock is running/.test(saidOf(pressStart)),
+        `${idsIn(card)} · ${startId} · ${qr(NR)?.unstarted} · ${flatR(saidOf(pressStart)).slice(0, 100)}`);
+
+      // 13 · start refuses a run going, and its record is kept
+      dbHandle.prepare("DELETE FROM quest_events WHERE guild_id='G1' AND number IN (995, 996)").run();
+      dbHandle.prepare("DELETE FROM quest_members WHERE guild_id='G1' AND number IN (995, 996)").run();
+      dbHandle.prepare("INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, gm_id, started_at) VALUES ('G1', 995, 'Busy Road', 'active', 'quest', 0, 'CR9', 'U1', ?)").run(Date.now() - 30 * M);
+      dbHandle.prepare("INSERT OR REPLACE INTO quest_members (guild_id, number, user_id, state) VALUES ('G1', 995, 'U2', 'party')").run();
+      dbHandle.prepare("INSERT INTO quest_events (guild_id, number, at_ms, kind, text, wall_at) VALUES ('G1', 995, 60000, 'note', 'Kept', ?)").run(Date.now());
+      const sg = await runT('start', { name: '995' });
+      ok('start on a run already going refuses, and its record is kept', /already running/.test(saidOf(sg)) && evR(995).some(e => e.text === 'Kept') && !!qr(995)?.started_at,
+        `${flatR(saidOf(sg))} · ${JSON.stringify(evR(995))}`);
+
+      // 14 · a paused run records no button press
+      dbHandle.prepare("INSERT OR REPLACE INTO quests (guild_id, number, name, status, kind, created_at, run_channel_id, gm_id, started_at, paused, elapsed_ms) VALUES ('G1', 996, 'Quiet Cellar', 'active', 'quest', 0, 'CR2', 'U1', NULL, 1, ?)").run(15 * M);
+      n0 = sent.length;
+      await asGm({ commandName: 'button', options: { _sub: 'roll', stat: 'str', dc: 5 } }, chR2);
+      const planted = sinceIn('CR2', n0).find(m => idsOf(m).some(id => /^btnchk:/.test(id)));
+      const plId = planted ? idsOf(planted).find(id => /^btnchk:/.test(id)) : '';
+      const pr = plId ? await fire({ channel: chR2, userId: 'U2', isButton: true, customId: plId, message: planted }) : { replies: [] };
+      ok('a press on a planted button in a paused run’s room lands, and nothing reaches its record',
+        !!plId && /STR|str/.test(saidOf(pr)) && evR(996).length === 0, `${plId} · ${flatR(saidOf(pr)).slice(0, 100)} · ${JSON.stringify(evR(996))}`);
+    } finally {
+      guild.members.fetch = realFetchR;
+      dbHandle.prepare("UPDATE guild_config SET quest_spinoff=? WHERE guild_id='G1'").run(spinWas);
+    }
+    const threwR = loggedR.filter(l => /ReferenceError|TypeError|is not a function|Cannot read|is not defined|SqliteError|no such column/.test(l));
+    console.error = realErrR;
+    ok('nothing in the run-clock walk threw', threwR.length === 0, threwR.slice(0, 3).join('\n        '));
   }
 
   // ── No button, modal or select id throws on a junk payload ──────────

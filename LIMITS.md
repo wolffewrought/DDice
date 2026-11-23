@@ -167,3 +167,15 @@ New verbs join their group; the wall is history until a single group nears 25.
 - (build S) What `/dd` named (channels, a person) waits for its box an hour, in memory: after a restart the box asks for `/dd` again.
 - (build S) `/config` is at 6,599 of the builders' 6,600 tripwire (Discord's wall is 8,000): the next setting needs its channels group moved out, or the tripwire raised.
 - (build T, 2026-11-17) The command books' sweep reads a channel's last fifty messages: a stray copy further back stays until someone deletes it.
+- (build U, 2026-11-23) A hidden DC is kept 60 days (`hidden_dcs`): a button pressed after that refuses and asks for the check to be called again. A card from before build U carries its number in the button, as ever.
+- (build U) A planted roll, a group roll or an NPC's called check held for Reroll or Keep has no clock: nothing lands until someone presses — a GM's Keep, or Call it for a group. The hold lives a week in `roll_holds`; one never answered never lands.
+- (build U) The story's outcome lines are read off the settled card's words (`storyOutcomeOf`): a card worded a new way may let a line through, or leave one out.
+- (build U) A post and its rolls stay on one page up to a whole page (44 lines); a longer block starts where it falls and runs on. A roll rides under a post only when it was made with it (a fight form, an `/rp` line, a stat roll answering a check there); a roll made apart stands as its own line.
+- (build U) Only a roll of one d20 has a natural, at advantage or not: several dice, or any other die, print blue whatever they show.
+- (build U) Rolls made before build U are not in the story; a fight before it shows what was logged then (an NPC's card).
+- (build U) `/fight log scroll:true` prints in ink: the colours are the story's and the GM record's alone.
+- (build U) Old roleplay lines keep the buttons they were posted with; ✍️ RP is on lines posted from build U on.
+- (build U · `/run time`) An instance opens held: nothing is recorded, no time check or recap posts, and its party is not held out of a rest until `/run time start`. A held run never nags as idle; `/quest delete` drops one never started.
+- (build U · `/run time`) The off-the-record warning lives in memory: its ✅ Confirm and ✖️ Deny lapse after 15 minutes and on a restart, and only whoever called the command may press them. On Confirm the command runs as typed and answers through follow-ups to the press; a step that opens a form cannot run from it.
+- (build U · `/run time`) The run clock lands forward on the quarter-hour at start, pause, resume, wind-down and the end, so each pause, wind-down and end can add up to 14 minutes to what was played; `adjust by:` takes only whole quarter-hours and stops at nought. Wind-down stops the clock; `/run time resume` sets it going again.
+- (build U · `/run time`) Runs already going when build U landed keep their clocks as they were; the quarter-hour applies from their next pause, resume, wind-down or end.
